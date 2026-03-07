@@ -517,7 +517,7 @@ class StatsDB:
             total = conn.execute(
                 "SELECT COUNT(*) FROM coverage_samples WHERE ts >= ?", (cutoff,)
             ).fetchone()[0]
-            stride = max(1, total // max_points)
+            stride = max(1, -(-total // max_points))  # ceiling division → result ≤ max_points
             rows = conn.execute("""
                 SELECT bearing_deg, range_nm, altitude, signal
                 FROM coverage_samples
@@ -1283,7 +1283,7 @@ class StatsDB:
                 SELECT COUNT(*) FROM coverage_samples
                 WHERE ts >= ? AND range_nm > 0 AND altitude IS NOT NULL AND altitude > 0
             """, (cutoff,)).fetchone()[0]
-            stride = max(1, total // max_points)
+            stride = max(1, -(-total // max_points))  # ceiling division → result ≤ max_points
             rows = conn.execute("""
                 SELECT bearing_deg, range_nm, altitude
                 FROM coverage_samples
