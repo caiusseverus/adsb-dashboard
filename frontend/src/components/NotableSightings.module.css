@@ -71,6 +71,15 @@
   font-weight: 500;
 }
 
+.sortable {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.sortable:hover { color: #8b949e; }
+
+.sortIcon { opacity: 0.5; font-size: 0.65rem; }
+
 .table td {
   padding: 0.45rem 0.75rem;
   border-bottom: 1px solid #161b22;

@@ -1,8 +1,26 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import styles from './NotableSightings.module.css'
 import { formatOperator } from '../utils/formatOperator'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
+
+function flagScore(ac) {
+  return (ac.foreign_military ? 8 : 0) + (ac.interesting ? 4 : 0) +
+         (ac.rare ? 2 : 0) + (ac.first_seen_flag || ac.sighting_count === 1 ? 1 : 0)
+}
+
+const COLUMNS = [
+  { key: 'icao',          label: 'ICAO',       cmp: (a, b) => a.icao.localeCompare(b.icao) },
+  { key: 'registration',  label: 'Reg',        cmp: (a, b) => (a.registration ?? '').localeCompare(b.registration ?? '') },
+  { key: 'type_code',     label: 'Type',       cmp: (a, b) => (a.type_code ?? '').localeCompare(b.type_code ?? '') },
+  { key: 'operator',      label: 'Operator',   cmp: (a, b) => (formatOperator(a.operator) ?? '').localeCompare(formatOperator(b.operator) ?? '') },
+  { key: 'year',          label: 'Year',       cmp: (a, b) => (a.year ?? '').localeCompare(b.year ?? '') },
+  { key: 'country',       label: 'Country',    cmp: (a, b) => (a.country ?? '').localeCompare(b.country ?? '') },
+  { key: 'flags',         label: 'Flags',      cmp: (a, b) => flagScore(b) - flagScore(a) },
+  { key: 'first_seen',    label: 'First seen', cmp: (a, b) => (a.first_seen ?? 0) - (b.first_seen ?? 0) },
+  { key: 'last_seen',     label: 'Last seen',  cmp: (a, b) => (a.last_seen ?? 0) - (b.last_seen ?? 0) },
+  { key: 'sighting_count',label: 'Sessions',   cmp: (a, b) => (a.sighting_count ?? 0) - (b.sighting_count ?? 0) },
+]
 
 const FLAGS = [
   { value: 'all',              label: 'All notable' },
@@ -72,6 +90,8 @@ export default function NotableSightings({ onSelectIcao, refreshKey }) {
   const [days, setDays] = useState(30)
   const [data, setData] = useState([])
   const [loading, setLoading] = useState(true)
+  const [sortKey, setSortKey] = useState('last_seen')
+  const [sortAsc, setSortAsc] = useState(false)
 
   useEffect(() => {
     setLoading(true)
@@ -81,6 +101,17 @@ export default function NotableSightings({ onSelectIcao, refreshKey }) {
       .then(d => { setData(d); setLoading(false) })
       .catch(() => setLoading(false))
   }, [flag, days, refreshKey])
+
+  function handleSort(key) {
+    if (key === sortKey) setSortAsc(v => !v)
+    else { setSortKey(key); setSortAsc(key === 'last_seen' ? false : true) }
+  }
+
+  const sorted = useMemo(() => {
+    const col = COLUMNS.find(c => c.key === sortKey)
+    if (!col) return data
+    return [...data].sort((a, b) => sortAsc ? col.cmp(a, b) : col.cmp(b, a))
+  }, [data, sortKey, sortAsc])
 
   return (
     <div className={styles.container}>
@@ -117,20 +148,18 @@ export default function NotableSightings({ onSelectIcao, refreshKey }) {
           <table className={styles.table}>
             <thead>
               <tr>
-                <th>ICAO</th>
-                <th>Reg</th>
-                <th>Type</th>
-                <th>Operator</th>
-                <th>Year</th>
-                <th>Country</th>
-                <th>Flags</th>
-                <th>First seen</th>
-                <th>Last seen</th>
-                <th>Sessions</th>
+                {COLUMNS.map(({ key, label }) => (
+                  <th key={key} className={styles.sortable} onClick={() => handleSort(key)}>
+                    {label}
+                    <span className={styles.sortIcon}>
+                      {sortKey === key ? (sortAsc ? ' ▲' : ' ▼') : ' ⇅'}
+                    </span>
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody>
-              {data.map(ac => <AircraftRow key={ac.icao} ac={ac} onSelectIcao={onSelectIcao} />)}
+              {sorted.map(ac => <AircraftRow key={ac.icao} ac={ac} onSelectIcao={onSelectIcao} />)}
             </tbody>
           </table>
         </div>

@@ -154,9 +154,7 @@ export default function AircraftDetailPanel({ icao, onClose, onRefreshed }) {
   }, [onClose])
 
   return (
-    <>
-      <div className={styles.backdrop} onClick={onClose} />
-      <aside className={styles.panel}>
+    <aside className={styles.panel}>
         <div className={styles.panelHeader}>
           <div className={styles.panelTitle}>
             {icao}
@@ -178,7 +176,6 @@ export default function AircraftDetailPanel({ icao, onClose, onRefreshed }) {
 
         {data && !loading && (
           <div className={styles.body}>
-
             <PhotoSection icao={icao} />
 
             <Section title="Identity">
@@ -261,6 +258,5 @@ export default function AircraftDetailPanel({ icao, onClose, onRefreshed }) {
           </div>
         )}
       </aside>
-    </>
   )
 }

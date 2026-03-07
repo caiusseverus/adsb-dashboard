@@ -208,7 +208,7 @@ async def notable(
         rows = await asyncio.to_thread(stats_db.query_unique_sightings, limit, days)
     else:
         rows = await asyncio.to_thread(stats_db.query_notable, limit, flag, days)
-    # Enrich with ADSBExchange + hexdb cached data (in-memory lookups, no I/O)
+    # Overlay ADSBExchange + hexdb in-memory data; fall back to registry-stored fields
     for row in rows:
         icao = row["icao"]
         adsbx = enrichment.db.get_adsbx(icao)
@@ -216,10 +216,12 @@ async def notable(
         row["operator"] = (
             (adsbx and adsbx.get("ownop"))
             or (hexdb and hexdb.get("RegisteredOwners"))
+            or row.get("operator")
             or None
         )
-        row["year"] = adsbx and adsbx.get("year") or None
+        row["year"] = (adsbx and adsbx.get("year")) or row.get("year") or None
         mfr   = (adsbx and adsbx.get("manufacturer")) or (hexdb and hexdb.get("Manufacturer")) or ""
         model = (adsbx and adsbx.get("model")) or (hexdb and hexdb.get("Type")) or ""
-        row["type_desc"] = (f"{mfr} {model}".strip()) or None
+        type_desc = (f"{mfr} {model}".strip()) or None
+        row["type_desc"] = type_desc or row.get("manufacturer") or None
     return rows
