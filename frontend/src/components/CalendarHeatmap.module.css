@@ -1,0 +1,174 @@
+.container {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+  position: relative;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.heading {
+  font-size: 0.75rem;
+  color: #484f58;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.btn, .btnActive {
+  padding: 0.2rem 0.55rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  border: 1px solid #30363d;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+
+.btn { background: transparent; color: #484f58; }
+.btn:hover { color: #8b949e; }
+.btnActive { background: #21262d; color: #e6edf3; border-color: #388bfd; }
+
+.sep { width: 1px; height: 16px; background: #21262d; margin: 0 2px; }
+
+.select {
+  background: #0b0c10;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  color: #c9d1d9;
+  font-size: 0.75rem;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+}
+.select:focus { outline: none; border-color: #388bfd; }
+
+.scrollWrap { width: 100%; }
+
+.calWrap { display: flex; flex-direction: column; gap: 4px; width: 100%; }
+
+.monthRow {
+  display: flex;
+  align-items: flex-end;
+  padding-bottom: 2px;
+  width: 100%;
+}
+
+.dayNameSpacer { width: 28px; flex-shrink: 0; }
+
+.monthLabels {
+  position: relative;
+  height: 14px;
+  flex: 1;
+}
+
+.monthLabel {
+  position: absolute;
+  font-size: 10px;
+  color: #484f58;
+  white-space: nowrap;
+}
+
+.body {
+  display: flex;
+  gap: 4px;
+}
+
+.dayNames {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 24px;
+}
+
+.dayName {
+  height: 25px;
+  font-size: 9px;
+  color: #484f58;
+  line-height: 25px;
+  text-align: right;
+}
+
+.weekGrid {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  gap: 2px;
+}
+
+.week {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  gap: 2px;
+}
+
+.cell, .futureCell {
+  width: 100%;
+  height: 25px;
+  border-radius: 2px;
+  cursor: default;
+}
+
+.futureCell { background: transparent; }
+
+.legend {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-top: 6px;
+  justify-content: flex-end;
+}
+
+.legendLabel { font-size: 10px; color: #484f58; }
+
+.legendCell {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+}
+
+.empty {
+  color: #484f58;
+  font-size: 0.85rem;
+  padding: 2rem 0;
+  text-align: center;
+}
+
+.tooltip {
+  position: absolute;
+  background: #1c2128;
+  border: 1px solid #30363d;
+  border-radius: 5px;
+  padding: 0.3rem 0.6rem;
+  pointer-events: none;
+  z-index: 50;
+  white-space: nowrap;
+}
+
+.tooltipDate {
+  font-size: 11px;
+  color: #484f58;
+  margin-bottom: 1px;
+}
+
+.tooltipVal {
+  font-size: 13px;
+  color: #e6edf3;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}

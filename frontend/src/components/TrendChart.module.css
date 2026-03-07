@@ -1,0 +1,70 @@
+.container {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+}
+
+.heading {
+  font-size: 0.75rem;
+  color: #484f58;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+}
+
+.controls { display: flex; gap: 4px; }
+
+.btn, .btnActive {
+  padding: 0.2rem 0.55rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  border: 1px solid #30363d;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+
+.btn { background: transparent; color: #484f58; }
+.btn:hover { color: #8b949e; }
+.btnActive { background: #21262d; color: #e6edf3; border-color: #388bfd; }
+
+.legend {
+  display: flex;
+  gap: 1rem;
+  justify-content: flex-end;
+  margin-bottom: 0.4rem;
+}
+
+.legendItem {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.75rem;
+  color: #8b949e;
+}
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.empty {
+  color: #484f58;
+  font-size: 0.85rem;
+  padding: 2rem 0;
+  text-align: center;
+  height: 180px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}

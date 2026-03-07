@@ -1,0 +1,185 @@
+.container {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+  position: relative;
+}
+
+.header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.heading {
+  font-size: 0.75rem;
+  color: #484f58;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+  padding-top: 2px;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.btn, .btnActive {
+  padding: 0.2rem 0.55rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  border: 1px solid #30363d;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+  white-space: nowrap;
+}
+.btn { background: transparent; color: #484f58; }
+.btn:hover { color: #8b949e; }
+.btnActive { background: #21262d; color: #e6edf3; border-color: #388bfd; }
+
+.sep { width: 1px; height: 16px; background: #21262d; margin: 0 2px; }
+
+.searchGroup { display: flex; align-items: center; }
+
+.searchInput {
+  background: #0b0c10;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  color: #c9d1d9;
+  font-size: 0.75rem;
+  padding: 0.2rem 0.5rem;
+  width: 130px;
+}
+.searchInput:focus { outline: none; border-color: #388bfd; }
+.searchInput::placeholder { color: #484f58; }
+
+.filterLabel {
+  font-size: 0.75rem;
+  color: #388bfd;
+  font-weight: 500;
+}
+
+.select {
+  background: #0b0c10;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  color: #c9d1d9;
+  font-size: 0.75rem;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+}
+.select:focus { outline: none; border-color: #388bfd; }
+
+.clearBtn {
+  padding: 0.2rem 0.55rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  border: 1px solid #f85149;
+  background: transparent;
+  color: #f85149;
+  cursor: pointer;
+}
+.clearBtn:hover { background: rgba(248, 81, 73, 0.1); }
+
+/* ------------------------------------------------------------------ */
+/* Fixed-height heatmap grid                                           */
+/* ------------------------------------------------------------------ */
+
+.heatmapWrap {
+  display: grid;
+  /* label col + data cols filling remaining width */
+  grid-template-columns: 2.8rem 1fr;
+  /* label row + data rows filling remaining height */
+  grid-template-rows: 1.4rem 1fr;
+}
+
+.corner {
+  /* top-left placeholder aligns y-axis with x-axis row */
+}
+
+.xAxis {
+  display: grid;
+  grid-template-columns: repeat(var(--cols, 30), 1fr);
+  gap: 1px;
+  align-items: end;
+  padding-bottom: 3px;
+}
+
+.dayLabel {
+  font-size: 9px;
+  color: #484f58;
+  overflow: hidden;
+  white-space: nowrap;
+  text-align: center;
+}
+
+.yAxis {
+  position: relative;
+  /* spans the data row only (grid row 2) */
+}
+
+.hourLabel {
+  position: absolute;
+  right: 4px;
+  font-size: 9px;
+  color: #484f58;
+  white-space: nowrap;
+  transform: translateY(-50%);
+  line-height: 1;
+}
+
+.cells {
+  display: grid;
+  grid-template-columns: repeat(var(--cols, 30), 1fr);
+  grid-template-rows: repeat(var(--rows, 96), 1fr);
+  gap: 1px;
+}
+
+.cell {
+  border-radius: 1px;
+  cursor: default;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Tooltip                                                             */
+/* ------------------------------------------------------------------ */
+
+.tooltip {
+  position: absolute;
+  background: #1c2128;
+  border: 1px solid #30363d;
+  border-radius: 5px;
+  padding: 0.3rem 0.6rem;
+  pointer-events: none;
+  z-index: 50;
+  white-space: nowrap;
+}
+
+.tooltipTime {
+  font-size: 11px;
+  color: #484f58;
+  margin-bottom: 1px;
+}
+
+.tooltipVal {
+  font-size: 13px;
+  color: #e6edf3;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.empty {
+  color: #484f58;
+  font-size: 0.85rem;
+  padding: 2rem 0;
+  text-align: center;
+}

@@ -1,0 +1,229 @@
+.main {
+  flex: 1;
+  padding: 1.25rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  max-width: 1600px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.25rem;
+}
+
+@media (max-width: 900px) {
+  .row { grid-template-columns: 1fr; }
+}
+
+/* Card */
+.card {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+}
+
+.cardHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.cardTitle {
+  font-size: 0.75rem;
+  color: #484f58;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+}
+
+.cardControls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* Select */
+.select {
+  background: #0b0c10;
+  border: 1px solid #30363d;
+  color: #8b949e;
+  font-size: 0.78rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.select:focus { outline: none; border-color: #388bfd; }
+
+/* Empty / loading */
+.empty {
+  color: #484f58;
+  font-size: 0.85rem;
+  text-align: center;
+  padding: 2rem 0;
+}
+
+/* Tooltip */
+.tooltip {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.78rem;
+  color: #c9d1d9;
+  line-height: 1.6;
+}
+
+/* DF Calendar heatmap */
+.calWrap {
+  position: relative;
+  overflow-x: auto;
+  padding-bottom: 0.5rem;
+}
+
+.monthRow {
+  display: flex;
+  margin-bottom: 4px;
+}
+
+.dayNameSpacer {
+  width: 28px;
+  flex-shrink: 0;
+}
+
+.monthLabels {
+  position: relative;
+  flex: 1;
+  height: 14px;
+}
+
+.monthLabel {
+  position: absolute;
+  font-size: 10px;
+  color: #484f58;
+  white-space: nowrap;
+}
+
+.calBody {
+  display: flex;
+  gap: 4px;
+}
+
+.dayNames {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: 1px;
+  width: 24px;
+  flex-shrink: 0;
+}
+
+.dayName {
+  height: 12px;
+  font-size: 9px;
+  color: #484f58;
+  line-height: 12px;
+}
+
+.weekGrid {
+  display: grid;
+  grid-template-columns: repeat(var(--weeks), 12px);
+  gap: 2px;
+}
+
+.week {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.cell {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  cursor: default;
+}
+
+.futureCell {
+  width: 12px;
+  height: 12px;
+}
+
+.legend {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-top: 6px;
+}
+
+.legendLabel {
+  font-size: 10px;
+  color: #484f58;
+}
+
+.legendCell {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+}
+
+.calTooltip {
+  position: absolute;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  padding: 0.35rem 0.6rem;
+  font-size: 0.78rem;
+  color: #c9d1d9;
+  line-height: 1.5;
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 10;
+}
+
+/* Baseline */
+.baselineGrid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 1rem;
+  padding-top: 0.5rem;
+}
+
+@media (max-width: 700px) {
+  .baselineGrid { grid-template-columns: repeat(3, 1fr); }
+}
+
+.baselineStat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.baselineLabel {
+  font-size: 0.72rem;
+  color: #484f58;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.baselineCurrent {
+  font-size: 1.6rem;
+  font-weight: 700;
+  color: #e6edf3;
+  font-variant-numeric: tabular-nums;
+}
+
+.baselineRef {
+  font-size: 0.78rem;
+  color: #8b949e;
+}
+
+.baselineDiff {
+  font-size: 0.85rem;
+  font-weight: 600;
+}

@@ -1,0 +1,239 @@
+.container {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+}
+
+.heading {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 0.75rem;
+  color: #484f58;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+  margin-bottom: 0.75rem;
+}
+
+.count {
+  background: #21262d;
+  color: #8b949e;
+  border-radius: 10px;
+  padding: 0.1rem 0.5rem;
+  font-size: 0.75rem;
+}
+
+.scrollWrap {
+  overflow-x: auto;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  white-space: nowrap;
+}
+
+.table th {
+  text-align: left;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid #21262d;
+  color: #484f58;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+}
+
+.sortable {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.sortable:hover {
+  color: #8b949e;
+}
+
+.sortIcon {
+  opacity: 0.4;
+  font-size: 0.65rem;
+}
+
+.sortable:hover .sortIcon {
+  opacity: 0.7;
+}
+
+.table td {
+  padding: 0.45rem 0.75rem;
+  border-bottom: 1px solid #161b22;
+  font-variant-numeric: tabular-nums;
+  color: #8b949e;
+}
+
+.table tbody tr:hover td {
+  background: #1c2128;
+  color: #c9d1d9;
+}
+
+.icao {
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  color: #388bfd !important;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.callsign {
+  color: #e6edf3 !important;
+  font-weight: 500;
+}
+
+.msgCount {
+  font-weight: 600;
+}
+
+.fresh { color: #3fb950 !important; }
+.stale { color: #484f58 !important; }
+
+.signalWrap {
+  width: 60px;
+  height: 6px;
+  background: #21262d;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.signalBar {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.5s ease;
+}
+
+.empty {
+  text-align: center;
+  color: #484f58;
+  padding: 2rem !important;
+}
+
+.militaryRow { background: rgba(188, 140, 255, 0.08); }
+.militaryRow td:first-child { border-left: 2px solid #bc8cff; }
+
+.emergencyRow { background: rgba(248, 81, 73, 0.10); }
+.emergencyRow td:first-child { border-left: 2px solid #f85149; }
+
+.interestingRow { background: rgba(210, 153, 34, 0.07); }
+.interestingRow td:first-child { border-left: 2px solid #d29922; }
+
+.emergencyBadge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  background: rgba(248, 81, 73, 0.2);
+  color: #f85149;
+  border-radius: 3px;
+  vertical-align: middle;
+  animation: emergencyPulse 1s ease-in-out infinite alternate;
+}
+
+@keyframes emergencyPulse {
+  from { opacity: 1; }
+  to   { opacity: 0.4; }
+}
+.milBadge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(188, 140, 255, 0.2);
+  color: #bc8cff;
+  border-radius: 3px;
+  vertical-align: middle;
+}
+
+.intBadge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(210, 153, 34, 0.2);
+  color: #d29922;
+  border-radius: 3px;
+  vertical-align: middle;
+}
+
+.queueHint {
+  font-size: 0.7rem;
+  color: #484f58;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.filterGroup {
+  display: flex;
+  gap: 3px;
+  margin-left: 0.25rem;
+}
+
+.filterBtn, .filterBtnActive {
+  padding: 0.15rem 0.45rem;
+  border-radius: 4px;
+  font-size: 0.7rem;
+  border: 1px solid #30363d;
+  cursor: pointer;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+}
+
+.filterBtn { background: transparent; color: #484f58; }
+.filterBtn:hover { color: #8b949e; }
+.filterBtnActive { background: #21262d; color: #e6edf3; border-color: #388bfd; }
+
+.operator {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.clickable {
+  cursor: pointer;
+}
+
+.typeCell {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.newBadge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  background: rgba(63, 185, 80, 0.2);
+  color: #3fb950;
+  border-radius: 3px;
+  vertical-align: middle;
+}
+
+.wtcBadge {
+  display: inline-block;
+  padding: 1px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 3px;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+.wtcL { background: rgba(63, 185, 80, 0.2);  color: #3fb950; }
+.wtcM { background: rgba(56, 139, 253, 0.2); color: #388bfd; }
+.wtcH { background: rgba(210, 153, 34, 0.2); color: #d29922; }
+.wtcJ { background: rgba(248, 81, 73, 0.2);  color: #f85149; }

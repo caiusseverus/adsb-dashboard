@@ -1,0 +1,84 @@
+.layout {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1.5rem;
+  background: #161b22;
+  border-bottom: 1px solid #21262d;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #e6edf3;
+  letter-spacing: 0.01em;
+}
+
+.titleIcon {
+  font-size: 1.2rem;
+}
+
+.live   { color: #3fb950; font-size: 0.85rem; font-weight: 500; }
+.offline { color: #f85149; font-size: 0.85rem; font-weight: 500; }
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  background: #0b0c10;
+  border-radius: 6px;
+  padding: 3px;
+}
+
+.tab, .tabActive {
+  padding: 0.3rem 0.9rem;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  border: none;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.tab {
+  background: transparent;
+  color: #484f58;
+}
+
+.tab:hover {
+  color: #8b949e;
+}
+
+.tabActive {
+  background: #161b22;
+  color: #e6edf3;
+}
+
+.main {
+  flex: 1;
+  padding: 1.25rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  max-width: 1600px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.waiting {
+  margin-top: 6rem;
+  text-align: center;
+  color: #484f58;
+  font-size: 1rem;
+}

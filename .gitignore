@@ -1,0 +1,22 @@
+# Claude memory files and development documents
+memory/
+MEMORY.md
+CLAUDE.md
+IMPROVEMENTS.md
+stage*.md
+
+# Environment files
+.env
+*.env
+
+# Frontend build output and dependencies
+frontend/node_modules/
+frontend/dist/
+
+# Python
+__pycache__/
+*.py[oc]
+backend/.venv/
+
+# Backend data (DB, caches)
+backend/data/
