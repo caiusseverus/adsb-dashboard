@@ -42,10 +42,19 @@ function buildDayList() {
   return days
 }
 
+// Continuous HSL gradient matching scatter plots, reversed: purple (low) → blue → yellow → green (high)
 function cellColor(value, maxVal) {
   if (!value) return '#21262d'
-  const t = Math.max(0.05, Math.min(1, value / maxVal))
-  return `rgba(56, 139, 253, ${t})`
+  const t = Math.max(0, Math.min(1, value / maxVal))
+  let h
+  if (t < 0.444) {
+    h = 280 - (t / 0.444) * 70           // purple → blue (280→210)
+  } else if (t < 0.778) {
+    h = 210 - ((t - 0.444) / 0.334) * 150 // blue → yellow (210→60)
+  } else {
+    h = 60 + ((t - 0.778) / 0.222) * 60   // yellow → green (60→120)
+  }
+  return `hsl(${Math.round(h)},80%,55%)`
 }
 
 const ALL_DAYS = buildDayList()

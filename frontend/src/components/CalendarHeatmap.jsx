@@ -74,15 +74,20 @@ function buildMonthLabels(weeks) {
   return labels
 }
 
-// 5-level GitHub-style colour thresholds
+// Continuous HSL gradient matching scatter plots, reversed: purple (low) → blue → yellow → green (high)
 function cellColor(value, maxVal) {
   if (value === null) return '#161b22'   // future / no data
   if (value === 0)    return '#21262d'   // zero
-  const t = value / maxVal
-  if (t < 0.25) return 'rgba(56,139,253,0.25)'
-  if (t < 0.50) return 'rgba(56,139,253,0.50)'
-  if (t < 0.75) return 'rgba(56,139,253,0.75)'
-  return '#388bfd'
+  const t = Math.max(0, Math.min(1, value / maxVal))
+  let h
+  if (t < 0.444) {
+    h = 280 - (t / 0.444) * 70           // purple → blue (280→210)
+  } else if (t < 0.778) {
+    h = 210 - ((t - 0.444) / 0.334) * 150 // blue → yellow (210→60)
+  } else {
+    h = 60 + ((t - 0.778) / 0.222) * 60   // yellow → green (60→120)
+  }
+  return `hsl(${Math.round(h)},80%,55%)`
 }
 
 function buildGroupUrl(group, months) {
