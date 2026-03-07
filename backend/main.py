@@ -58,15 +58,11 @@ async def _hexdb_task() -> None:
         batch = state.pop_hexdb_queue(max_n=10)
         for icao in batch:
             data = await asyncio.to_thread(enrichment.db.lookup_hexdb, icao)
+            data_source = "hexdb"
             if not data:
                 # tar1090-db shard as final fallback (downloads shard on first access)
                 data = await asyncio.to_thread(enrichment.db.get_tar1090, icao)
-            if config.DEBUG_ENRICHMENT:
-                if data:
-                    owners = data.get("RegisteredOwners") or data.get("OperatorFlagCode") or "—"
-                    log.info("[hexdb] %s  hit  owners=%r", icao, owners)
-                else:
-                    log.info("[hexdb] %s  miss", icao)
+                data_source = "tar1090"
             if data:
                 state.apply_hexdb(icao, data)
                 # Also persist enrichment to DB so offline (historical) aircraft get updated.
@@ -88,10 +84,21 @@ async def _hexdb_task() -> None:
                         operator = op.get("n")
                 if not operator:
                     operator = (data.get("RegisteredOwners") or "").strip() or None
+                if config.DEBUG_ENRICHMENT == 1:
+                    log.info(
+                        "[enrich] %-8s  %-8s  reg=%-9s type=%-6s op=%s",
+                        icao, data_source,
+                        registration or "—",
+                        type_code or "—",
+                        repr(operator) if operator else "—",
+                    )
                 await asyncio.to_thread(
                     stats_db.update_aircraft_enrichment,
                     icao, registration, type_code, type_category, operator, manufacturer,
                 )
+            else:
+                if config.DEBUG_ENRICHMENT == 1:
+                    log.info("[enrich] %-8s  miss", icao)
             await asyncio.sleep(1)  # 1 req/sec rate limit
         await asyncio.sleep(5)
 

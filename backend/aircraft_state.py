@@ -6,6 +6,7 @@ import math
 import time
 import threading
 import logging
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import date
@@ -22,6 +23,9 @@ from utils import country_from_registration
 log = logging.getLogger(__name__)
 
 _R_NM = 3440.065  # Earth radius in nautical miles
+_ICAO_HEX_RE = re.compile(r"^[0-9A-F]{6}$")
+_ACAS_CONFIRM_WINDOW_S = 12
+_ACAS_MIN_CONFIRM_FRAMES = 2
 
 def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """True bearing from (lat1,lon1) to (lat2,lon2) in degrees (0=N, 90=E)."""
@@ -41,17 +45,17 @@ def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 def _log_enrichment(icao: str, ac, adsbx: dict | None, op_source: str) -> None:
     log.info(
-        "[enrichment] NEW %-8s  reg=%-8s type=%-6s year=%-4s  adsbx=%-4s  "
-        "operator=%s [%s]  country=%s  mil=%s",
+        "[enrich] %-8s  NEW     adsbx=%-4s  reg=%-9s type=%-6s year=%-4s  "
+        "op=%-30s [%s]  country=%-4s  mil=%s",
         icao,
+        "hit" if adsbx else "miss",
         ac.registration or "—",
         ac.type_code or "—",
         ac.year or "—",
-        "hit" if adsbx else "miss",
         repr(ac.operator) if ac.operator else "—",
         op_source,
         ac.country or "—",
-        ac.military,
+        "Y" if ac.military else "N",
     )
 
 
@@ -167,6 +171,9 @@ class AircraftState:
         # ACAS event queue: drained by main._db_writer() every minute
         self._pending_acas_events: deque[dict] = deque(maxlen=500)
         self._last_acas_ts: dict[str, tuple[float, str]] = {}  # icao → (ts, ra_desc)
+        # Require repeated matching DF16 RA frames before persisting an event;
+        # suppresses single-frame parity/noise artefacts.
+        self._acas_candidates: dict[str, tuple[str, float, int]] = {}  # icao -> (signature, ts, count)
 
         # Unique aircraft seen today (resets at midnight; seeded from DB on startup)
         self._today_date: str = date.today().isoformat()
@@ -274,7 +281,7 @@ class AircraftState:
                 "mach":             ac.mach,
                 "selected_alt":       ac.selected_alt,
                 "sighting_count":     ac.sighting_count,
-                "acas_ra_active":     ac.acas_ra_active,
+                "acas_ra_active":     ac.acas_ra_ts is not None and (now - ac.acas_ra_ts) < 60,
                 "acas_ra_desc":       ac.acas_ra_desc,
                 "acas_ra_corrective": ac.acas_ra_corrective,
                 "acas_threat_icao":   ac.acas_threat_icao,
@@ -345,7 +352,7 @@ class AircraftState:
                     "selected_alt":     ac.selected_alt,
                     "interesting":        bool(ac.type_code and ac.type_code.upper() in INTERESTING_TYPE_CODES),
                     "sighting_count":     ac.sighting_count,
-                    "acas_ra_active":     ac.acas_ra_active,
+                    "acas_ra_active":     ac.acas_ra_ts is not None and (now - ac.acas_ra_ts) < 60,
                     "acas_ra_desc":       ac.acas_ra_desc,
                     "acas_ra_corrective": ac.acas_ra_corrective,
                     "acas_threat_icao":   ac.acas_threat_icao,
@@ -489,7 +496,7 @@ class AircraftState:
             if not ac.operator or not ac.registration or not ac.type_code:
                 self._hexdb_queue.add(icao)
 
-            if config.DEBUG_ENRICHMENT:
+            if config.DEBUG_ENRICHMENT == 1:
                 _log_enrichment(icao, ac, adsbx, op_source)
 
             self._aircraft[icao] = ac
@@ -717,21 +724,51 @@ class AircraftState:
 
     def _apply_acas(self, ac: "Aircraft", result: dict, now: float) -> None:
         """Apply a decoded ACAS RA to the aircraft and enqueue a DB event.
-        Deduplicates: events within 30s with the same description are skipped."""
+        Deduplicates: events within 30s with the same description are skipped.
+
+        DF16 air-air messages are AP/DP parity protected, so occasional one-off bit
+        errors can appear as false RA activations. Persist only after repeated matching
+        frames in a short window.
+        """
         ra_desc = result["ra_description"]
-        last = self._last_acas_ts.get(ac.icao)
-        if last and (now - last[0]) < 30 and last[1] == ra_desc:
-            return  # duplicate
+        threat_icao = self._sanitize_threat_icao(result.get("threat_icao"), ac.icao, now)
 
         ac.acas_ra_active     = True
         ac.acas_ra_desc       = ra_desc
         ac.acas_ra_corrective = result.get("ra_corrective", False)
-        ac.acas_threat_icao   = result.get("threat_icao")
+        ac.acas_threat_icao   = threat_icao
         if result.get("sensitivity_level") is not None:
             ac.acas_sensitivity = result["sensitivity_level"]
         ac.acas_ra_ts = now
 
+        sig = self._acas_signature(result, threat_icao)
+        prev = self._acas_candidates.get(ac.icao)
+        if prev and prev[0] == sig and (now - prev[1]) <= _ACAS_CONFIRM_WINDOW_S:
+            confirm_count = prev[2] + 1
+        else:
+            confirm_count = 1
+        self._acas_candidates[ac.icao] = (sig, now, confirm_count)
+
+        if confirm_count < _ACAS_MIN_CONFIRM_FRAMES:
+            return
+
+        last = self._last_acas_ts.get(ac.icao)
+        if last and (now - last[0]) < 30 and last[1] == ra_desc:
+            return  # duplicate
+
         self._last_acas_ts[ac.icao] = (now, ra_desc)
+
+        if config.DEBUG_ENRICHMENT >= 1:
+            log.info(
+                "[acas]   %-8s  %-35s  tti=%d  threat=%-8s  alt=%-8s  sl=%s%s",
+                ac.icao,
+                ra_desc,
+                result.get("tti", 0),
+                threat_icao or "—",
+                f"{ac.altitude}ft" if ac.altitude is not None else "?",
+                result.get("sensitivity_level") if result.get("sensitivity_level") is not None else "?",
+                "  MTE" if result.get("mte") else "",
+            )
 
         self._pending_acas_events.append({
             "ts":              int(now),
@@ -744,10 +781,58 @@ class AircraftState:
             "rat":             int(result.get("rat", False)),
             "mte":             int(result.get("mte", False)),
             "tti":             result.get("tti", 0),
-            "threat_icao":     result.get("threat_icao"),
+            "threat_icao":     threat_icao,
             "threat_alt":      result.get("threat_alt"),
             "threat_range_nm": result.get("threat_range_nm"),
             "threat_bearing_deg": result.get("threat_bearing_deg"),
             "sensitivity_level":  result.get("sensitivity_level"),
             "altitude":        ac.altitude,
         })
+
+    def _acas_signature(self, result: dict, threat_icao: Optional[str]) -> str:
+        """Return a compact signature used to corroborate repeated RA frames."""
+        return "|".join((
+            str(result.get("ara_bits") or ""),
+            str(result.get("rac_bits") or ""),
+            str(int(result.get("rat", False))),
+            str(int(result.get("mte", False))),
+            str(result.get("tti", 0)),
+            threat_icao or "",
+        ))
+
+    def _sanitize_threat_icao(self, threat_icao: Optional[str], own_icao: str, now: float) -> Optional[str]:
+        """Filter implausible DF16 threat ICAOs caused by uncorrectable bit errors.
+
+        DF16 (and other AP/DP parity messages) do not carry an explicit ICAO field, so a
+        single bit error can produce a plausible-looking but bogus 24-bit address.
+        Keep threat ICAO only when it has at least one corroboration signal:
+          - currently tracked locally, or
+          - present in cached aircraft datasets (ADSBx/tar1090/hexdb).
+        Also reject malformed/self/unallocated ICAO blocks.
+        """
+        if not threat_icao:
+            return None
+
+        code = threat_icao.upper()
+        if not _ICAO_HEX_RE.fullmatch(code):
+            return None
+        if code == own_icao:
+            return None
+        if enrichment.db.get_country_by_icao(code) is None:
+            return None
+
+        seen_live = False
+        thr = self._aircraft.get(code)
+        if thr and (now - thr.last_seen) <= 120:
+            seen_live = True
+
+        known_cached = any((
+            enrichment.db.get_adsbx(code),
+            enrichment.db.get_tar1090_cached(code),
+            enrichment.db.get_hexdb_cached(code),
+        ))
+
+        if not (seen_live or known_cached):
+            return None
+
+        return code

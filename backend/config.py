@@ -14,7 +14,8 @@ _rlon = os.getenv("RECEIVER_LON")
 RECEIVER_LAT: Optional[float] = float(_rlat) if _rlat else None
 RECEIVER_LON: Optional[float] = float(_rlon) if _rlon else None
 
-DEBUG_ENRICHMENT: bool = os.getenv("DEBUG_ENRICHMENT", "").lower() in ("1", "true", "yes")
+# DEBUG_ENRICHMENT: 0=off, 1=all (enrichment + ACAS), 2=ACAS only
+DEBUG_ENRICHMENT: int = int(os.getenv("DEBUG_ENRICHMENT", "0"))
 
 HOME_COUNTRY: str = os.getenv("HOME_COUNTRY", "")
 RARE_THRESHOLD: int = int(os.getenv("RARE_THRESHOLD", "5"))

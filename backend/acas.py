@@ -5,12 +5,26 @@ Decodes BDS 3.0 (ACAS RA) data from DF16 (Long Air-Air Surveillance) messages.
 Ground receivers capture these opportunistically; events are a lower bound on
 actual TCAS activations in the coverage area.
 
-IMPORTANT — bit offset difference between DF16 and Comm-B:
-  Comm-B MB field (DF20/21): first byte is BDS register code (0x30),
-    so ACAS data begins at bit 8 of the MB field.
-  DF16 MV field: NO register header — ACAS data begins at bit 0.
-  Using the wrong offset (8 instead of 0) causes ~50% false-positive rate
-  because the ARA-active check fires on a random bit.
+Bit layout matches readsb (wiedehopf/readsb json_out.c ~line 246).
+All bit positions are 1-indexed from the start of the 7-byte (56-bit) MV field;
+in 0-indexed Python terms subtract 1 (e.g. bit 9 → mv_bin[8]).
+
+Both DF16 MV and Comm-B BDS 3.0 MB fields share the same layout:
+  byte 0 (bits 1-8):  capability/register prefix — not used for ACAS data
+  byte 1+ (bit 9 onwards): ACAS payload
+
+  Bit 9  (mv_bin[8])  — ARA active: 1 = RA has been generated
+  Bit 10 (mv_bin[9])  — Corrective: 1 = corrective, 0 = preventive
+  Bit 11 (mv_bin[10]) — Downward sense: 1 = descend, 0 = climb
+  Bit 12 (mv_bin[11]) — Increase rate
+  Bit 13 (mv_bin[12]) — Sense reversal
+  Bit 14 (mv_bin[13]) — Altitude crossing
+  Bit 15 (mv_bin[14]) — Positive RA: 1 = positive action required
+  Bits 23-26 (mv_bin[22:26]) — RAC (Resolution Advisory Complement)
+  Bit 27 (mv_bin[26]) — RAT: RA terminated / Clear of Conflict
+  Bit 28 (mv_bin[27]) — MTE: Multiple Threat Encounter
+  Bits 29-30 (mv_bin[28:30]) — TTI: 01=Mode-S threat ICAO, 10=non-Mode-S
+  Bits 31-54 (mv_bin[30:54]) — Threat identity (24 bits)
 """
 
 import asyncio
@@ -35,102 +49,85 @@ def _hex2bin(hex_str: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Decoders
+# Core decoder — shared by DF16 and Comm-B BDS 3.0
 # ---------------------------------------------------------------------------
 
-def decode_df0_sensitivity(msg: str) -> int | None:
-    """DF0 (14-char hex). Extract Sensitivity Level (SL) = bits 6-8, values 0-7."""
-    if len(msg) != 14:
-        return None
-    try:
-        return int(_hex2bin(msg)[5:8], 2)
-    except Exception:
-        return None
-
-
 def _decode_acas_mv(mv_bin: str, sensitivity_level: int | None = None) -> dict | None:
-    """Decode a 56-bit ACAS MV field (DF16) where data starts at bit 0.
+    """Decode a 56-bit ACAS MV/MB field.
 
-    DF16 MV field layout (ICAO Annex 10, no register-byte header):
-      [0:14]  ARA — Active Resolution Advisory (14 bits)
-                bit 0: RA active
-                bit 1: 0=corrective, 1=preventive
-                bits 2-5: corrective sense (up, down, crossing-up, crossing-down)
-                bit 6: reversal / sense change
-      [14:18] RAC — RA Complement (4 bits)
-      [18]    RAT — RA Terminated
-      [19]    MTE — Multiple Threat Encounter
-      [20:22] TTI — Threat Type Indicator (01=Mode-S ICAO, 10=non-Mode-S)
-      [22:46] Threat Identity (24 bits)
+    Expects the full 56-bit binary string including the leading capability/
+    register byte (bits 1-8). ACAS data starts at bit 9 (mv_bin[8]).
+
+    Returns None if:
+      - No active RA (ARA bit = 0)
+      - RAT = 1 (Clear of Conflict — RA terminated, not worth logging)
+      - SL = 0 (ACAS in standby, cannot generate real RAs)
+      - TTI = 3 (reserved, invalid)
     """
-    if len(mv_bin) < 46:
+    if len(mv_bin) < 54:
         return None
 
-    # Bit 0: RA active indicator — must be 1 for a real RA
-    if mv_bin[0] == '0':
-        return None
-
-    # SL=0 means ACAS is in standby / not operational; genuine RAs can't fire
+    # SL=0 → ACAS standby, no valid RA possible
     if sensitivity_level is not None and sensitivity_level == 0:
         return None
 
-    ara_bits = mv_bin[0:14]
-    rac_bits = mv_bin[14:18]
-    rat      = mv_bin[18] == '1'
-    mte      = mv_bin[19] == '1'
-    tti      = int(mv_bin[20:22], 2)
+    ara = mv_bin[8] == '1'   # bit 9: ARA active
+    rat = mv_bin[26] == '1'  # bit 27: RA terminated / Clear of Conflict
 
-    # TTI=3 is reserved/invalid
-    if tti == 3:
+    if rat or not ara:
         return None
 
-    threat_bits = mv_bin[22:46]
+    tti = int(mv_bin[28:30], 2)
+    if tti == 3:              # reserved — invalid
+        return None
 
-    # --- ARA sense ---
-    ra_corrective = mv_bin[1] == '0'   # bit 1: 0=corrective, 1=preventive
-    reversal      = mv_bin[6] == '1'   # bit 6: sense change / reversal
+    # --- Decode ARA sense bits (bits 10-15, mv_bin[9:15]) ---
+    corr     = mv_bin[9]  == '1'  # bit 10: corrective (1) vs preventive (0)
+    down     = mv_bin[10] == '1'  # bit 11: downward sense
+    increase = mv_bin[11] == '1'  # bit 12: increase rate
+    reversal = mv_bin[12] == '1'  # bit 13: sense reversal
+    crossing = mv_bin[13] == '1'  # bit 14: altitude crossing
+    positive = mv_bin[14] == '1'  # bit 15: positive RA (action required)
 
-    # --- RAC ---
+    mte      = mv_bin[27] == '1'  # bit 28: multiple threat encounter
+    rac_bits = mv_bin[22:26]      # bits 23-26
+
+    # --- Build RA sense and description (mirrors readsb logic) ---
+    if corr and positive:
+        direction = "Descend" if down else "Climb"
+        parts = [direction]
+        if crossing: parts.append("crossing")
+        if increase: parts.append("increase rate")
+        ra_sense = ", ".join(parts)
+        ra_corrective = True
+    elif corr:
+        # Negative corrective: reduce current vertical rate
+        ra_sense = "Reduce descent" if down else "Reduce climb"
+        ra_corrective = True
+    else:
+        # Preventive — maintain current vertical speed
+        ra_sense = "Preventive"
+        ra_corrective = False
+
+    ra_description = ra_sense
+    if corr and reversal:
+        ra_description += " — reversal"
+    if mte:
+        ra_description += " (MTE)"
+
+    # --- RAC complement bits ---
     rac_dont_pass_below = rac_bits[0] == '1'
     rac_dont_pass_above = rac_bits[1] == '1'
     rac_dont_turn_left  = rac_bits[2] == '1'
     rac_dont_turn_right = rac_bits[3] == '1'
 
-    # --- Corrective sense bits (bits 2-5 of ARA) ---
-    if ra_corrective:
-        sense_bits = mv_bin[2:6]
-        if   sense_bits == '1000': ra_sense = "Climb"
-        elif sense_bits == '0100': ra_sense = "Descend"
-        elif sense_bits == '0010': ra_sense = "Climb — crossing"
-        elif sense_bits == '0001': ra_sense = "Descend — crossing"
-        else:
-            upward   = mv_bin[2] == '1' or mv_bin[4] == '1'
-            downward = mv_bin[3] == '1' or mv_bin[5] == '1'
-            if upward and not downward:   ra_sense = "Climb"
-            elif downward and not upward: ra_sense = "Descend"
-            else:                         ra_sense = "Unknown"
-        ra_description = ra_sense
-        if reversal:
-            ra_description += " — reversal"
-    else:
-        if   rac_dont_pass_below:                        ra_sense = "Do not pass below"
-        elif rac_dont_pass_above:                        ra_sense = "Do not pass above"
-        elif rac_dont_turn_left and rac_dont_turn_right: ra_sense = "Do not turn"
-        elif rac_dont_turn_left:                         ra_sense = "Do not turn left"
-        elif rac_dont_turn_right:                        ra_sense = "Do not turn right"
-        else:                                            ra_sense = "Preventive"
-        ra_description = ra_sense
-
-    if mte:
-        ra_description += " (MTE)"
-
-    # --- Threat identity ---
+    # --- Threat identity (bits 31-54, mv_bin[30:54]) ---
     threat_icao = threat_alt = threat_range_nm = threat_bearing_deg = None
+    threat_bits = mv_bin[30:54]
 
     if tti == 1:
-        val = int(threat_bits[:24], 2)
-        # Filter degenerate values (all-zeros or all-ones are not real ICAO addresses)
-        if 0 < val < 0xFFFFFF:
+        val = int(threat_bits, 2)
+        if 0 < val < 0xFFFFFF:      # filter all-zeros / all-ones
             threat_icao = f"{val:06X}"
     elif tti == 2:
         threat_alt         = int(threat_bits[0:13], 2)
@@ -146,7 +143,7 @@ def _decode_acas_mv(mv_bin: str, sensitivity_level: int | None = None) -> dict |
         "rac_dont_pass_above": rac_dont_pass_above,
         "rac_dont_turn_left":  rac_dont_turn_left,
         "rac_dont_turn_right": rac_dont_turn_right,
-        "rat":                 rat,
+        "rat":                 False,  # always False here (we return None for RAT=1)
         "mte":                 mte,
         "tti":                 tti,
         "threat_icao":         threat_icao,
@@ -154,46 +151,56 @@ def _decode_acas_mv(mv_bin: str, sensitivity_level: int | None = None) -> dict |
         "threat_range_nm":     threat_range_nm,
         "threat_bearing_deg":  threat_bearing_deg,
         "sensitivity_level":   sensitivity_level,
-        "ara_bits":            ara_bits,
+        "ara_bits":            mv_bin[8:22],   # bits 9-22 for debug
         "rac_bits":            rac_bits,
     }
 
 
+# ---------------------------------------------------------------------------
+# Public decoders
+# ---------------------------------------------------------------------------
+
 def decode_df16_mv(msg: str) -> dict | None:
-    """Decode DF16 (28-char hex). Extracts SL then decodes MV field as ACAS data."""
+    """Decode DF16 (28-char hex). Extract SL from header, then decode MV field."""
     if len(msg) != 28:
         return None
     try:
         bits = _hex2bin(msg)
-        sensitivity_level = int(bits[5:8], 2)
-        # MV field = hex chars 8-21 (56 bits, starting after the first 8 chars / 32 bits)
-        mv_bin = _hex2bin(msg[8:22])
+        sensitivity_level = int(bits[5:8], 2)   # DF16 SL: bits 6-8
+        mv_bin = _hex2bin(msg[8:22])             # 56-bit MV field
     except Exception:
         return None
 
     return _decode_acas_mv(mv_bin, sensitivity_level)
 
 
+def decode_df0_sensitivity(msg: str) -> int | None:
+    """DF0 (14-char hex). Extract Sensitivity Level (SL) = bits 6-8, values 0-7."""
+    if len(msg) != 14:
+        return None
+    try:
+        return int(_hex2bin(msg)[5:8], 2)
+    except Exception:
+        return None
+
+
 def decode_bds30(msg: str) -> dict | None:
     """Decode BDS 3.0 from a Comm-B message (DF20/21, 28-char hex).
 
-    In Comm-B the MB field (hex chars 8-21) begins with a 1-byte BDS register
-    code (0x30), so the actual ACAS data starts at bit 8 of the MB field.
-    This is DIFFERENT from DF16 — do not use this for DF16 decoding.
+    MB field = hex chars 8-21. First byte is BDS register code 0x30,
+    followed by ACAS data at bit 9 — same layout as DF16 MV field.
     """
     if len(msg) != 28:
         return None
     try:
-        mb_bin = _hex2bin(msg[8:22])  # 56-bit MB field
+        mb_bin = _hex2bin(msg[8:22])
     except Exception:
         return None
 
-    # First byte should be register 0x30 = 00110000
-    if mb_bin[0:8] != '00110000':
+    if mb_bin[0:8] != '00110000':   # verify BDS register = 0x30
         return None
 
-    # ACAS data begins at bit 8 (after the register byte)
-    return _decode_acas_mv(mb_bin[8:], sensitivity_level=None)
+    return _decode_acas_mv(mb_bin, sensitivity_level=None)
 
 
 # ---------------------------------------------------------------------------
