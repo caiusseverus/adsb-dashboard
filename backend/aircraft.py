@@ -16,7 +16,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 import enrichment
 from db import stats_db
-from utils import country_from_registration, format_operator
+from utils import country_from_registration
 
 log = logging.getLogger(__name__)
 

@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import date
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -119,7 +119,6 @@ async def _db_writer() -> None:
         await asyncio.sleep(60)
         today = date.today().isoformat()
         if today != last_day:
-            yesterday = (date.today() - timedelta(days=1)).isoformat()
             await asyncio.to_thread(stats_db.rollup_yesterday)
             await asyncio.to_thread(stats_db.prune)
             last_day = today

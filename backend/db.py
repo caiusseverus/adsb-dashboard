@@ -10,7 +10,6 @@ import sqlite3
 import time
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 
 import config
 

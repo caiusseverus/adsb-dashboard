@@ -22,7 +22,7 @@ _REG_PREFIXES: dict[str, str] = {
     'YV': 'Venezuela',      'CP': 'Bolivia',        'HC': 'Ecuador',
     'OB': 'Peru',           'ZP': 'Paraguay',       'CX': 'Uruguay',
     'HP': 'Panama',         'TI': 'Costa Rica',     'HR': 'Honduras',
-    'TG': 'Guatemala',      'YS': 'El Salvador',    'TI': 'Costa Rica',
+    'TG': 'Guatemala',      'YS': 'El Salvador',
     'XA': 'Mexico',         'XB': 'Mexico',         'XC': 'Mexico',
     '4X': 'Israel',         '5B': 'Cyprus',         '9H': 'Malta',
     'MM': 'Mexico',         'VP': None,             'VQ': None,
