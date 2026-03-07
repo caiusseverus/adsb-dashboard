@@ -17,6 +17,7 @@ from history import router as history_router
 from aircraft import router as aircraft_router
 from fleet import router as fleet_router
 from coverage import router as coverage_router
+from acas import router as acas_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -154,6 +155,11 @@ async def _db_writer() -> None:
             ]
             await asyncio.to_thread(stats_db.write_coverage, samples)
 
+        # Drain pending ACAS events to DB
+        acas_evts = state.pop_acas_events()
+        if acas_evts:
+            await asyncio.to_thread(stats_db.write_acas_events, acas_evts)
+
 
 async def _push_updates() -> None:
     """Broadcast a state snapshot to every connected WebSocket client every second."""
@@ -225,6 +231,7 @@ aircraft_router._state = state  # type: ignore[attr-defined]
 app.include_router(aircraft_router)
 app.include_router(fleet_router)
 app.include_router(coverage_router)
+app.include_router(acas_router)
 
 app.add_middleware(
     CORSMiddleware,

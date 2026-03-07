@@ -13,6 +13,7 @@ from typing import Optional
 
 import pyModeS as pms
 
+import acas as acas_decoder
 import config
 import enrichment
 from db import INTERESTING_TYPE_CODES
@@ -129,6 +130,13 @@ class Aircraft:
     cpr_even: Optional[tuple] = field(default=None, repr=False)   # (raw_msg, timestamp)
     cpr_odd:  Optional[tuple] = field(default=None, repr=False)
     sighting_count: int = 1               # from aircraft_registry; 1 = unique (never seen before)
+    # ACAS/TCAS fields
+    acas_ra_active:     bool           = False
+    acas_ra_desc:       Optional[str]  = None
+    acas_ra_corrective: bool           = False
+    acas_sensitivity:   Optional[int]  = None
+    acas_threat_icao:   Optional[str]  = None
+    acas_ra_ts:         Optional[float]= None
 
 
 class AircraftState:
@@ -155,6 +163,10 @@ class AircraftState:
 
         self._total: int = 0
         self._hexdb_queue: set[str] = set()  # ICAOs awaiting hexdb.io operator lookup
+
+        # ACAS event queue: drained by main._db_writer() every minute
+        self._pending_acas_events: deque[dict] = deque(maxlen=500)
+        self._last_acas_ts: dict[str, tuple[float, str]] = {}  # icao → (ts, ra_desc)
 
         # Unique aircraft seen today (resets at midnight; seeded from DB on startup)
         self._today_date: str = date.today().isoformat()
@@ -218,6 +230,13 @@ class AircraftState:
             self._hexdb_queue -= batch
             return batch
 
+    def pop_acas_events(self) -> list[dict]:
+        """Return and clear all pending ACAS events (called every minute by db writer)."""
+        with self._lock:
+            evts = list(self._pending_acas_events)
+            self._pending_acas_events.clear()
+            return evts
+
     def get_aircraft_live(self, icao: str) -> dict | None:
         """Return a point-in-time snapshot of a single aircraft, or None if not tracked."""
         now = time.time()
@@ -253,8 +272,13 @@ class AircraftState:
                 "heading_deg":      ac.heading_deg,
                 "vertical_rate_fpm": ac.vertical_rate_fpm,
                 "mach":             ac.mach,
-                "selected_alt":     ac.selected_alt,
-                "sighting_count":   ac.sighting_count,
+                "selected_alt":       ac.selected_alt,
+                "sighting_count":     ac.sighting_count,
+                "acas_ra_active":     ac.acas_ra_active,
+                "acas_ra_desc":       ac.acas_ra_desc,
+                "acas_ra_corrective": ac.acas_ra_corrective,
+                "acas_threat_icao":   ac.acas_threat_icao,
+                "acas_sensitivity":   ac.acas_sensitivity,
             }
 
     def apply_hexdb(self, icao: str, data: dict) -> None:
@@ -319,8 +343,13 @@ class AircraftState:
                     "vertical_rate_fpm": ac.vertical_rate_fpm,
                     "mach":             ac.mach,
                     "selected_alt":     ac.selected_alt,
-                    "interesting":      bool(ac.type_code and ac.type_code.upper() in INTERESTING_TYPE_CODES),
-                    "sighting_count":   ac.sighting_count,
+                    "interesting":        bool(ac.type_code and ac.type_code.upper() in INTERESTING_TYPE_CODES),
+                    "sighting_count":     ac.sighting_count,
+                    "acas_ra_active":     ac.acas_ra_active,
+                    "acas_ra_desc":       ac.acas_ra_desc,
+                    "acas_ra_corrective": ac.acas_ra_corrective,
+                    "acas_threat_icao":   ac.acas_threat_icao,
+                    "acas_sensitivity":   ac.acas_sensitivity,
                 }
                 for ac in self._aircraft.values()
             ]
@@ -653,6 +682,30 @@ class AircraftState:
                 except Exception:
                     pass
 
+        # --- DF16: Long Air-Air Surveillance (ACAS RA in MV field) ---
+        elif df == 16 and len(raw) == 28:
+            try:
+                alt = pms.altcode(raw)
+                if alt is not None:
+                    ac.altitude = alt
+            except Exception:
+                pass
+            try:
+                result = acas_decoder.decode_df16_mv(raw)
+                if result and result.get("ara_active"):
+                    self._apply_acas(ac, result, now)
+            except Exception:
+                pass
+
+        # --- DF0: Short Air-Air Surveillance (sensitivity level only) ---
+        elif df == 0 and len(raw) == 14:
+            try:
+                sl = acas_decoder.decode_df0_sensitivity(raw)
+                if sl is not None:
+                    ac.acas_sensitivity = sl
+            except Exception:
+                pass
+
         # --- Squawk from identity reply (DF 5 / DF 21) ---
         if df in (5, 21):
             try:
@@ -661,3 +714,40 @@ class AircraftState:
                     ac.squawk = sq
             except Exception:
                 pass
+
+    def _apply_acas(self, ac: "Aircraft", result: dict, now: float) -> None:
+        """Apply a decoded ACAS RA to the aircraft and enqueue a DB event.
+        Deduplicates: events within 30s with the same description are skipped."""
+        ra_desc = result["ra_description"]
+        last = self._last_acas_ts.get(ac.icao)
+        if last and (now - last[0]) < 30 and last[1] == ra_desc:
+            return  # duplicate
+
+        ac.acas_ra_active     = True
+        ac.acas_ra_desc       = ra_desc
+        ac.acas_ra_corrective = result.get("ra_corrective", False)
+        ac.acas_threat_icao   = result.get("threat_icao")
+        if result.get("sensitivity_level") is not None:
+            ac.acas_sensitivity = result["sensitivity_level"]
+        ac.acas_ra_ts = now
+
+        self._last_acas_ts[ac.icao] = (now, ra_desc)
+
+        self._pending_acas_events.append({
+            "ts":              int(now),
+            "icao":            ac.icao,
+            "ra_description":  ra_desc,
+            "ra_corrective":   int(result.get("ra_corrective", False)),
+            "ra_sense":        result.get("ra_sense"),
+            "ara_bits":        result.get("ara_bits"),
+            "rac_bits":        result.get("rac_bits"),
+            "rat":             int(result.get("rat", False)),
+            "mte":             int(result.get("mte", False)),
+            "tti":             result.get("tti", 0),
+            "threat_icao":     result.get("threat_icao"),
+            "threat_alt":      result.get("threat_alt"),
+            "threat_range_nm": result.get("threat_range_nm"),
+            "threat_bearing_deg": result.get("threat_bearing_deg"),
+            "sensitivity_level":  result.get("sensitivity_level"),
+            "altitude":        ac.altitude,
+        })

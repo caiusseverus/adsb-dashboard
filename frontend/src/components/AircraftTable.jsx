@@ -88,6 +88,7 @@ const FILTERS = [
   { value: 'all',         label: 'All' },
   { value: 'military',    label: 'Military' },
   { value: 'interesting', label: 'Interesting' },
+  { value: 'acas',        label: 'ACAS' },
 ]
 
 export default function AircraftTable({ aircraft, onSelectIcao, queueSize = 0 }) {
@@ -104,8 +105,11 @@ export default function AircraftTable({ aircraft, onSelectIcao, queueSize = 0 })
     }
   }
 
+  const threatSet = new Set(aircraft.filter(a => a.acas_threat_icao).map(a => a.acas_threat_icao))
+
   const filtered = filter === 'military'    ? aircraft.filter(ac => ac.military)
                  : filter === 'interesting' ? aircraft.filter(ac => ac.interesting)
+                 : filter === 'acas'        ? aircraft.filter(ac => ac.acas_ra_active || threatSet.has(ac.icao))
                  : aircraft
 
   const sorted = sortAircraft(filtered, sortCol, sortAsc)
@@ -152,8 +156,9 @@ export default function AircraftTable({ aircraft, onSelectIcao, queueSize = 0 })
               const { label, fresh, stale } = fmtAge(ac.age)
               const emergency = ac.squawk ? EMERGENCY_SQUAWKS[ac.squawk] : null
               const rowClass = emergency ? styles.emergencyRow
-                : ac.military     ? styles.militaryRow
-                : ac.interesting  ? styles.interestingRow
+                : ac.acas_ra_active          ? styles.acasRow
+                : ac.military                ? styles.militaryRow
+                : ac.interesting             ? styles.interestingRow
                 : undefined
               return (
                 <tr
@@ -166,6 +171,12 @@ export default function AircraftTable({ aircraft, onSelectIcao, queueSize = 0 })
                     {ac.military       && <span className={styles.milBadge}>MIL</span>}
                     {ac.interesting    && <span className={styles.intBadge}>INT</span>}
                     {ac.sighting_count === 1 && <span className={styles.newBadge}>NEW</span>}
+                    {ac.acas_ra_active && (
+                      <span className={styles.acasBadge} title={ac.acas_ra_desc ?? 'ACAS RA active'}>TCAS</span>
+                    )}
+                    {!ac.acas_ra_active && threatSet.has(ac.icao) && (
+                      <span className={styles.thrBadge} title="Threat aircraft in active RA">THR</span>
+                    )}
                   </td>
                   <td>{ac.registration ?? '—'}</td>
                   <td className={styles.callsign}>{ac.callsign ?? '—'}</td>

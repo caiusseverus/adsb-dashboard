@@ -291,6 +291,37 @@ class StatsDB:
                 except Exception:
                     pass  # column already exists
 
+        # acas_events table (new — added for ACAS/TCAS RA logging)
+        with self._connect() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS acas_events (
+                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts                 INTEGER NOT NULL,
+                    icao               TEXT    NOT NULL,
+                    ra_description     TEXT    NOT NULL,
+                    ra_corrective      INTEGER NOT NULL DEFAULT 0,
+                    ra_sense           TEXT,
+                    ara_bits           TEXT,
+                    rac_bits           TEXT,
+                    rat                INTEGER NOT NULL DEFAULT 0,
+                    mte                INTEGER NOT NULL DEFAULT 0,
+                    tti                INTEGER NOT NULL DEFAULT 0,
+                    threat_icao        TEXT,
+                    threat_alt         INTEGER,
+                    threat_range_nm    REAL,
+                    threat_bearing_deg REAL,
+                    sensitivity_level  INTEGER,
+                    altitude           INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS acas_events_ts
+                    ON acas_events(ts);
+                CREATE INDEX IF NOT EXISTS acas_events_icao
+                    ON acas_events(icao);
+                CREATE INDEX IF NOT EXISTS acas_events_threat_icao
+                    ON acas_events(threat_icao)
+                    WHERE threat_icao IS NOT NULL;
+            """)
+
         log.info("DB: schema ready at %s", config.DB_PATH)
 
     # ------------------------------------------------------------------
@@ -490,6 +521,7 @@ class StatsDB:
             conn.execute("DELETE FROM minute_operator_counts WHERE ts < ?", (cutoff_ts,))
             conn.execute("DELETE FROM daily_aircraft_seen WHERE date < ?", (cutoff_date,))
             conn.execute("DELETE FROM coverage_samples WHERE ts < ?", (coverage_cutoff_ts,))
+            conn.execute("DELETE FROM acas_events WHERE ts < ?", (coverage_cutoff_ts,))
         log.info("DB: pruned data older than %s", cutoff_date)
 
     # ------------------------------------------------------------------
@@ -544,6 +576,162 @@ class StatsDB:
             """, (cutoff,)).fetchall()
         return [{"bearing": round(r["sector"] * sector_width + sector_width / 2, 1),
                  "max_range": round(r["max_range"], 1)} for r in rows]
+
+    # ------------------------------------------------------------------
+    # ACAS events (called via asyncio.to_thread from main.py / acas.py)
+    # ------------------------------------------------------------------
+
+    def write_acas_events(self, events: list[dict]) -> None:
+        """Persist a batch of ACAS RA events."""
+        if not events:
+            return
+        with self._connect() as conn:
+            conn.executemany("""
+                INSERT INTO acas_events
+                    (ts, icao, ra_description, ra_corrective, ra_sense,
+                     ara_bits, rac_bits, rat, mte, tti,
+                     threat_icao, threat_alt, threat_range_nm, threat_bearing_deg,
+                     sensitivity_level, altitude)
+                VALUES
+                    (:ts, :icao, :ra_description, :ra_corrective, :ra_sense,
+                     :ara_bits, :rac_bits, :rat, :mte, :tti,
+                     :threat_icao, :threat_alt, :threat_range_nm, :threat_bearing_deg,
+                     :sensitivity_level, :altitude)
+            """, events)
+
+    def query_acas_events(self, days: int, limit: int) -> list[sqlite3.Row]:
+        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT e.*,
+                       r.registration,  r.type_code,   r.operator,  r.country,
+                       t.registration AS threat_reg,
+                       t.type_code    AS threat_type_code,
+                       t.operator     AS threat_operator,
+                       t.country      AS threat_country
+                FROM acas_events e
+                LEFT JOIN aircraft_registry r ON e.icao       = r.icao
+                LEFT JOIN aircraft_registry t ON e.threat_icao = t.icao
+                WHERE e.ts >= ?
+                ORDER BY e.ts DESC
+                LIMIT ?
+            """, (cutoff, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def query_acas_stats(self, days: int) -> dict:
+        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        with self._connect() as conn:
+            totals = conn.execute("""
+                SELECT COUNT(*) AS total,
+                       SUM(ra_corrective) AS corrective
+                FROM acas_events WHERE ts >= ?
+            """, (cutoff,)).fetchone()
+
+            by_sense = conn.execute("""
+                SELECT ra_sense, COUNT(*) AS cnt
+                FROM acas_events WHERE ts >= ?
+                GROUP BY ra_sense ORDER BY cnt DESC
+            """, (cutoff,)).fetchall()
+
+            by_country = conn.execute("""
+                SELECT r.country, COUNT(*) AS cnt
+                FROM acas_events e
+                LEFT JOIN aircraft_registry r ON e.icao = r.icao
+                WHERE e.ts >= ? AND r.country IS NOT NULL
+                GROUP BY r.country ORDER BY cnt DESC LIMIT 10
+            """, (cutoff,)).fetchall()
+
+            by_type = conn.execute("""
+                SELECT r.type_code, COUNT(*) AS cnt
+                FROM acas_events e
+                LEFT JOIN aircraft_registry r ON e.icao = r.icao
+                WHERE e.ts >= ? AND r.type_code IS NOT NULL
+                GROUP BY r.type_code ORDER BY cnt DESC LIMIT 10
+            """, (cutoff,)).fetchall()
+
+            by_operator = conn.execute("""
+                SELECT r.operator, COUNT(*) AS cnt
+                FROM acas_events e
+                LEFT JOIN aircraft_registry r ON e.icao = r.icao
+                WHERE e.ts >= ? AND r.operator IS NOT NULL
+                GROUP BY r.operator ORDER BY cnt DESC LIMIT 10
+            """, (cutoff,)).fetchall()
+
+        total    = totals["total"]    or 0
+        correct  = totals["corrective"] or 0
+        return {
+            "total":       total,
+            "corrective":  correct,
+            "preventive":  total - correct,
+            "by_sense":    [{"ra_sense": r["ra_sense"],  "count": r["cnt"]} for r in by_sense],
+            "by_country":  [{"country":  r["country"],   "count": r["cnt"]} for r in by_country],
+            "by_type":     [{"type_code": r["type_code"], "count": r["cnt"]} for r in by_type],
+            "by_operator": [{"operator": r["operator"],  "count": r["cnt"]} for r in by_operator],
+        }
+
+    def query_acas_timeline(self, days: int) -> list[dict]:
+        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT date(ts, 'unixepoch') AS day,
+                       COUNT(*) AS total,
+                       SUM(ra_corrective) AS corrective
+                FROM acas_events
+                WHERE ts >= ?
+                GROUP BY day
+                ORDER BY day
+            """, (cutoff,)).fetchall()
+        return [
+            {
+                "day":        r["day"],
+                "total":      r["total"],
+                "corrective": r["corrective"] or 0,
+                "preventive": r["total"] - (r["corrective"] or 0),
+            }
+            for r in rows
+        ]
+
+    def query_acas_context(self, event_id: int) -> dict:
+        with self._connect() as conn:
+            ev = conn.execute(
+                "SELECT * FROM acas_events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if not ev:
+                return {}
+            ev = dict(ev)
+            icaos = [ev["icao"]]
+            if ev.get("threat_icao"):
+                icaos.append(ev["threat_icao"])
+            window_lo = ev["ts"] - 120
+            window_hi = ev["ts"] + 120
+            placeholders = ",".join("?" * len(icaos))
+            track_rows = conn.execute(f"""
+                SELECT ts, icao, altitude
+                FROM coverage_samples
+                WHERE icao IN ({placeholders})
+                  AND ts BETWEEN ? AND ?
+                ORDER BY ts
+            """, (*icaos, window_lo, window_hi)).fetchall()
+
+        return {
+            "event":  ev,
+            "tracks": [dict(r) for r in track_rows],
+        }
+
+    def query_acas_for_icao(self, icao: str, limit: int) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT e.*,
+                       t.registration AS threat_reg,
+                       t.type_code    AS threat_type_code,
+                       t.operator     AS threat_operator
+                FROM acas_events e
+                LEFT JOIN aircraft_registry t ON e.threat_icao = t.icao
+                WHERE e.icao = ? OR e.threat_icao = ?
+                ORDER BY e.ts DESC
+                LIMIT ?
+            """, (icao, icao, limit)).fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # History queries (called via asyncio.to_thread from history.py)

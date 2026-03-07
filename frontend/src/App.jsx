@@ -6,6 +6,7 @@ import AircraftDetailPanel from './components/AircraftDetailPanel'
 import HistoryPage from './pages/HistoryPage'
 import ReceiverPage from './pages/ReceiverPage'
 import FleetPage from './pages/FleetPage'
+import EventsPage from './pages/EventsPage'
 import styles from './App.module.css'
 
 const WS_URL = import.meta.env.PROD
@@ -71,6 +72,10 @@ export default function App() {
             className={tab === 'fleet' ? styles.tabActive : styles.tab}
             onClick={() => setTab('fleet')}
           >Fleet</button>
+          <button
+            className={tab === 'events' ? styles.tabActive : styles.tab}
+            onClick={() => setTab('events')}
+          >Events</button>
         </nav>
         <span className={connected ? styles.live : styles.offline}>
           {connected ? '● Live' : '○ Reconnecting…'}
@@ -96,6 +101,7 @@ export default function App() {
       {tab === 'history' && <HistoryPage onSelectIcao={setSelectedIcao} snapshot={snapshot} notableRefreshKey={notableRefreshKey} />}
       {tab === 'receiver' && <ReceiverPage snapshot={snapshot} />}
       {tab === 'fleet' && <FleetPage onSelectIcao={setSelectedIcao} />}
+      {tab === 'events' && <EventsPage onSelectIcao={setSelectedIcao} />}
 
       {selectedIcao && (
         <AircraftDetailPanel
