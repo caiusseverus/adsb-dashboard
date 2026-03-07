@@ -1163,7 +1163,8 @@ class StatsDB:
                 return {"bins": [], "max_range": 0, "band_nm": 0,
                         "sectors": bearing_sectors, "bands": range_bands}
             # Round up to nearest 50 nm for clean ring labels
-            max_range = ((int(max_range_row) + 49) // 50) * 50
+            import math
+            max_range = math.ceil(max_range_row / 50) * 50
             band_nm = max_range / range_bands
             rows = conn.execute("""
                 SELECT CAST(bearing_deg / ? AS INTEGER)  AS b,
@@ -1308,14 +1309,15 @@ class StatsDB:
                     GROUP BY day
                 ),
                 daily_pos AS (
-                    SELECT date(ts, 'unixepoch') AS day,
-                           COUNT(*)              AS pos_ac_mins
-                    FROM coverage_samples
-                    WHERE ts >= ?
+                    SELECT date(cs.ts, 'unixepoch') AS day,
+                           COUNT(*)                 AS pos_ac_mins
+                    FROM coverage_samples cs
+                    INNER JOIN minute_stats ms ON ms.ts = cs.ts
+                    WHERE cs.ts >= ?
                     GROUP BY day
                 )
                 SELECT a.day,
-                       ROUND(COALESCE(p.pos_ac_mins, 0) * 100.0 / a.total_ac_mins, 1) AS pct
+                       MIN(100.0, ROUND(COALESCE(p.pos_ac_mins, 0) * 100.0 / a.total_ac_mins, 1)) AS pct
                 FROM daily_ac a
                 LEFT JOIN daily_pos p ON a.day = p.day
                 ORDER BY a.day
