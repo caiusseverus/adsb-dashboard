@@ -510,16 +510,20 @@ class StatsDB:
                 samples,
             )
 
-    def query_polar(self, days: int) -> list[dict]:
-        """All coverage samples for the last N days, for polar scatter plot."""
+    def query_polar(self, days: int, max_points: int = 8000) -> list[dict]:
+        """Coverage samples for the last N days, downsampled to max_points for polar scatter plot."""
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
         with self._connect() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM coverage_samples WHERE ts >= ?", (cutoff,)
+            ).fetchone()[0]
+            stride = max(1, -(-total // max_points))  # ceiling division → result ≤ max_points
             rows = conn.execute("""
                 SELECT bearing_deg, range_nm, altitude, signal
                 FROM coverage_samples
-                WHERE ts >= ?
+                WHERE ts >= ? AND (rowid % ?) = 0
                 ORDER BY ts
-            """, (cutoff,)).fetchall()
+            """, (cutoff, stride)).fetchall()
         return [{"bearing": round(r["bearing_deg"], 1),
                  "range":   round(r["range_nm"], 1),
                  "alt":     r["altitude"],
@@ -1279,7 +1283,7 @@ class StatsDB:
                 SELECT COUNT(*) FROM coverage_samples
                 WHERE ts >= ? AND range_nm > 0 AND altitude IS NOT NULL AND altitude > 0
             """, (cutoff,)).fetchone()[0]
-            stride = max(1, total // max_points)
+            stride = max(1, -(-total // max_points))  # ceiling division → result ≤ max_points
             rows = conn.execute("""
                 SELECT bearing_deg, range_nm, altitude
                 FROM coverage_samples
