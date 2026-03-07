@@ -176,6 +176,26 @@ async def receiver_baseline() -> list[dict]:
     return await asyncio.to_thread(stats_db.query_receiver_baseline)
 
 
+@router.get("/receiver/distributions")
+async def receiver_distributions() -> dict:
+    return await asyncio.to_thread(stats_db.query_distributions)
+
+
+@router.get("/receiver/unique_aircraft")
+async def receiver_unique_aircraft(days: int = Query(90, ge=7, le=365)) -> list[dict]:
+    return await asyncio.to_thread(stats_db.query_unique_aircraft_per_day, days)
+
+
+@router.get("/receiver/completeness")
+async def receiver_completeness(days: int = Query(90, ge=7, le=365)) -> list[dict]:
+    return await asyncio.to_thread(stats_db.query_completeness, days)
+
+
+@router.get("/receiver/position_decode_rate")
+async def receiver_position_decode_rate(days: int = Query(90, ge=7, le=365)) -> list[dict]:
+    return await asyncio.to_thread(stats_db.query_position_decode_rate, days)
+
+
 @router.get("/notable")
 async def notable(
     limit: int = Query(50, ge=1, le=200),

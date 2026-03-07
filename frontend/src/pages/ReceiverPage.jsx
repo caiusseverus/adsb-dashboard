@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import {
   ScatterChart, Scatter, XAxis, YAxis, ZAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, BarChart, Bar, Cell, AreaChart, Area, Legend,
@@ -28,21 +28,6 @@ function signalColour(raw) {
   if (pct > 33) return '#d29922'
   return '#f85149'
 }
-// Continuous HSL gradient: green (0 ft) → yellow (10k) → blue (25k) → purple (45k+)
-function altColour(alt) {
-  if (alt == null) return '#484f58'
-  const t = Math.max(0, Math.min(1, alt / 45000))
-  let h
-  if (t < 0.222) {        // 0–10k ft: green → yellow (120→60)
-    h = 120 - (t / 0.222) * 60
-  } else if (t < 0.556) { // 10k–25k ft: yellow → blue (60→210)
-    h = 60 + ((t - 0.222) / 0.334) * 150
-  } else {                // 25k–45k ft: blue → purple (210→280)
-    h = 210 + ((t - 0.556) / 0.444) * 70
-  }
-  return `hsl(${Math.round(h)},80%,55%)`
-}
-const ALT_GRADIENT = 'linear-gradient(to right, hsl(120,80%,55%), hsl(60,80%,55%), hsl(210,80%,55%), hsl(280,80%,55%))'
 
 function useFetch(url) {
   const [data, setData] = useState(null)
@@ -338,35 +323,60 @@ function RangePercentiles({ days, onDaysChange }) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Polar coverage scatter with max-range envelope
+// 6. Polar coverage heatmap — binned arc cells, max-range envelope
 // ---------------------------------------------------------------------------
-function PolarCoverage({ days, onDaysChange }) {
-  const { data, loading } = useFetch(`${API_BASE}/api/coverage/polar?days=${days}`)
-  const { data: envelopeData } = useFetch(`${API_BASE}/api/coverage/max_range?days=${days}`)
+function arcPath(cx, cy, r1, r2, aDeg1, aDeg2) {
+  const a1 = (aDeg1 - 90) * Math.PI / 180
+  const a2 = (aDeg2 - 90) * Math.PI / 180
+  const c1 = Math.cos(a1), s1 = Math.sin(a1)
+  const c2 = Math.cos(a2), s2 = Math.sin(a2)
+  const large = (aDeg2 - aDeg1) > 180 ? 1 : 0
+  if (r1 < 0.5) {
+    return `M ${cx} ${cy} L ${cx + r2*c1} ${cy + r2*s1} A ${r2} ${r2} 0 ${large} 1 ${cx + r2*c2} ${cy + r2*s2} Z`
+  }
+  return [
+    `M ${cx + r1*c1} ${cy + r1*s1}`,
+    `A ${r1} ${r1} 0 ${large} 1 ${cx + r1*c2} ${cy + r1*s2}`,
+    `L ${cx + r2*c2} ${cy + r2*s2}`,
+    `A ${r2} ${r2} 0 ${large} 0 ${cx + r2*c1} ${cy + r2*s1}`,
+    'Z',
+  ].join(' ')
+}
 
-  const SIZE = 560
+function binColour(count, maxCount) {
+  if (!count || !maxCount) return 'transparent'
+  const t = count / maxCount
+  return `hsl(210,80%,${Math.round(10 + t * 65)}%)`
+}
+
+function PolarCoverage({ days, onDaysChange }) {
+  const { data, loading } = useFetch(`${API_BASE}/api/coverage/polar_bins?days=${days}`)
+  const { data: envelopeData } = useFetch(`${API_BASE}/api/coverage/max_range?days=${days}`)
+  const [hover, setHover] = useState(null)
+  const wrapperRef = useRef(null)
+
+  const SIZE = 500
   const CX = SIZE / 2
   const CY = SIZE / 2
   const R  = SIZE / 2 - 48
 
-  const maxRange = useMemo(() => {
-    const m1 = data?.length ? Math.max(...data.map(p => p.range)) : 0
-    const m2 = envelopeData?.length ? Math.max(...envelopeData.map(p => p.max_range)) : 0
-    return Math.ceil(Math.max(m1, m2, 1) / 50) * 50
-  }, [data, envelopeData])
+  const { bins, maxRange, sectors, bands } = useMemo(() => ({
+    bins:     data?.bins     ?? [],
+    maxRange: data?.max_range ?? 0,
+    sectors:  data?.sectors  ?? 36,
+    bands:    data?.bands    ?? 10,
+  }), [data])
+
+  const sectorWidth = 360 / sectors
+  const maxCount = useMemo(() => bins.reduce((m, b) => Math.max(m, b.count), 1), [bins])
 
   const rings = useMemo(() => {
+    if (!maxRange) return []
     const step = maxRange <= 200 ? 50 : maxRange <= 400 ? 100 : 200
     const out = []
     for (let r = step; r <= maxRange; r += step) out.push(r)
     return out
   }, [maxRange])
-
-  function toXY(bearing, range) {
-    const ang = (bearing - 90) * Math.PI / 180
-    const pr  = (range / maxRange) * R
-    return [CX + pr * Math.cos(ang), CY + pr * Math.sin(ang)]
-  }
 
   const envelopePoints = useMemo(() => {
     if (!envelopeData?.length || !maxRange) return ''
@@ -378,44 +388,69 @@ function PolarCoverage({ days, onDaysChange }) {
         return `${CX + pr * Math.cos(ang)},${CY + pr * Math.sin(ang)}`
       })
       .join(' ')
-  }, [envelopeData, maxRange])
+  }, [envelopeData, maxRange, R])
 
   const cardinals = [
-    { label: 'N', dx: 0,      dy: -R - 20 },
-    { label: 'E', dx: R + 20, dy: 0 },
-    { label: 'S', dx: 0,      dy: R + 24 },
+    { label: 'N', dx: 0,       dy: -R - 20 },
+    { label: 'E', dx: R + 20,  dy: 0 },
+    { label: 'S', dx: 0,       dy: R + 24 },
     { label: 'W', dx: -R - 20, dy: 0 },
   ]
 
   return (
     <Card
-      title="Polar coverage — altitude coloured, max-range envelope"
+      title="Polar coverage — directional heatmap, max-range envelope"
       controls={<DaySelect value={days} onChange={onDaysChange} options={[7, 14, 30, 90]} />}
     >
       {loading ? <div className={styles.empty}>Loading…</div>
-       : !data?.length ? (
+       : !bins.length ? (
         <div className={styles.empty}>
           No coverage data yet — requires RECEIVER_LAT/RECEIVER_LON and at least one minute write with aircraft positions.
         </div>
        ) : (
         <>
+          <div ref={wrapperRef} style={{ position: 'relative' }}>
           <svg
             viewBox={`0 0 ${SIZE} ${SIZE}`}
-            style={{ width: '100%', maxWidth: 700, aspectRatio: '1', display: 'block', margin: '0 auto' }}
+            style={{ width: '100%', maxWidth: 600, aspectRatio: '1', display: 'block', margin: '0 auto' }}
+            onMouseLeave={() => setHover(null)}
           >
+            {/* Heatmap cells — one arc per (bearing sector × range band) bin */}
+            {bins.map(({ b, r, count }) => (
+              <path
+                key={`${b}-${r}`}
+                d={arcPath(CX, CY, (r / bands) * R, ((r + 1) / bands) * R,
+                           b * sectorWidth, (b + 1) * sectorWidth)}
+                fill={binColour(count, maxCount)}
+                stroke="none"
+                onMouseEnter={e => {
+                  const rect = wrapperRef.current.getBoundingClientRect()
+                  setHover({
+                    count,
+                    bearing1: Math.round(b * sectorWidth),
+                    bearing2: Math.round((b + 1) * sectorWidth),
+                    range1: Math.round(r * (data.max_range / bands)),
+                    range2: Math.round((r + 1) * (data.max_range / bands)),
+                    x: e.clientX - rect.left,
+                    y: e.clientY - rect.top,
+                  })
+                }}
+              />
+            ))}
             {/* Range rings */}
             {rings.map(r => (
               <g key={r}>
                 <circle cx={CX} cy={CY} r={(r / maxRange) * R}
                   fill="none" stroke="#21262d" strokeWidth={1} />
                 <text x={CX + 4} y={CY - (r / maxRange) * R + 14}
-                  fill="#484f58" fontSize={12} textAnchor="start">{r} nm</text>
+                  fill="#484f58" fontSize={11} textAnchor="start">{r} nm</text>
               </g>
             ))}
             {/* Bearing lines */}
             {[0, 45, 90, 135, 180, 225, 270, 315].map(b => {
-              const [x2, y2] = toXY(b, maxRange)
-              return <line key={b} x1={CX} y1={CY} x2={x2} y2={y2}
+              const ang = (b - 90) * Math.PI / 180
+              return <line key={b} x1={CX} y1={CY}
+                x2={CX + R * Math.cos(ang)} y2={CY + R * Math.sin(ang)}
                 stroke="#21262d" strokeWidth={1} />
             })}
             {/* Cardinal labels */}
@@ -427,22 +462,29 @@ function PolarCoverage({ days, onDaysChange }) {
             {/* Max-range envelope */}
             {envelopePoints && (
               <polygon points={envelopePoints}
-                fill="#388bfd" fillOpacity={0.10}
-                stroke="#388bfd" strokeWidth={1.5} strokeOpacity={0.7}
+                fill="none"
+                stroke="#388bfd" strokeWidth={1.5} strokeOpacity={0.8}
                 strokeLinejoin="round" />
             )}
-            {/* Data points coloured by altitude */}
-            {data.map((p, i) => {
-              const [x, y] = toXY(p.bearing, p.range)
-              return <circle key={i} cx={x} cy={y} r={1.5}
-                fill={altColour(p.alt)} fillOpacity={0.7} />
-            })}
           </svg>
-          {/* Altitude legend — continuous gradient */}
+          {hover && (
+            <div style={{
+              position: 'absolute', left: hover.x + 14, top: hover.y - 8,
+              background: '#161b22', border: '1px solid #30363d', borderRadius: 4,
+              padding: '4px 8px', fontSize: 12, color: '#c9d1d9', pointerEvents: 'none',
+              whiteSpace: 'nowrap',
+            }}>
+              <div>{hover.bearing1}°–{hover.bearing2}°</div>
+              <div>{hover.range1}–{hover.range2} nm</div>
+              <div style={{ color: '#8b949e' }}>{hover.count.toLocaleString()} samples</div>
+            </div>
+          )}
+          </div>
+          {/* Legend */}
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', justifyContent: 'center', marginTop: '0.75rem', flexWrap: 'wrap' }}>
-            <span style={{ fontSize: '0.72rem', color: '#484f58' }}>0 ft</span>
-            <div style={{ background: ALT_GRADIENT, height: 8, borderRadius: 4, width: 160 }} />
-            <span style={{ fontSize: '0.72rem', color: '#484f58' }}>45k+ ft</span>
+            <span style={{ fontSize: '0.72rem', color: '#484f58' }}>Few</span>
+            <div style={{ background: 'linear-gradient(to right, hsl(210,80%,10%), hsl(210,80%,45%), hsl(210,80%,75%))', height: 8, borderRadius: 4, width: 120 }} />
+            <span style={{ fontSize: '0.72rem', color: '#484f58' }}>Many</span>
             {envelopePoints && (
               <span style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.75rem', color: '#8b949e', marginLeft: '0.75rem' }}>
                 <span style={{ width: 18, height: 2, background: '#388bfd', display: 'inline-block', flexShrink: 0 }} />
@@ -457,75 +499,99 @@ function PolarCoverage({ days, onDaysChange }) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Azimuth vs elevation scatter (coloured by range)
+// 7. Performance distribution box plots (msgs, aircraft, range, signal)
 // ---------------------------------------------------------------------------
-function rangeColour(range) {
-  const t = Math.max(0, Math.min(1, range / 250))
-  let h
-  if (t < 0.2)      h = 120
-  else if (t < 0.6) h = 120 + ((t - 0.2) / 0.4) * 90   // green → blue
-  else              h = 210 + ((t - 0.6) / 0.4) * 70    // blue → purple
-  return `hsl(${Math.round(h)},80%,55%)`
-}
-const RANGE_GRADIENT = 'linear-gradient(to right, hsl(120,80%,55%), hsl(210,80%,55%), hsl(280,80%,55%))'
+function BoxPlotSVG({ data, formatVal, minZero = true }) {
+  const WINDOWS = ['1d', '7d', '30d', '365d']
+  const W = 300, H = 160
+  const ML = 50, MR = 12, MT = 14, MB = 28
+  const plotW = W - ML - MR
+  const plotH = H - MT - MB
+  const colW  = plotW / WINDOWS.length
+  const BOX_H = colW * 0.22
 
-function AzimuthElevation({ days, onDaysChange }) {
-  const { data, loading } = useFetch(`${API_BASE}/api/coverage/azimuth_elevation?days=${days}`)
+  const allVals = WINDOWS.flatMap(w => {
+    const d = data?.[w]
+    return d ? [d.p5, d.p95].filter(v => v != null) : []
+  })
+  if (!allVals.length) return <div className={styles.empty}>No data yet</div>
 
-  const points = useMemo(() => (data || []).map(d => ({
-    bearing: d.bearing, elevation: d.elevation, range: d.range,
-  })), [data])
-
-  const maxEl = 15  // zoom to horizon — most aircraft are <10°; clipping high-elevation is acceptable
+  const lo = Math.min(...allVals), hi = Math.max(...allVals)
+  const pad = (hi - lo) * 0.15 || 1
+  const yLo = (minZero ? Math.max(0, lo - pad) : lo - pad), yHi = hi + pad
+  const sy = v => MT + plotH - ((v - yLo) / (yHi - yLo)) * plotH
+  const ticks = [0, 1, 2, 3].map(i => yLo + (i / 3) * (yHi - yLo))
 
   return (
-    <Card
-      title="Azimuth vs elevation — coloured by range"
-      controls={<DaySelect value={days} onChange={onDaysChange} options={[7, 14, 30, 90]} />}
-    >
-      {!points.length ? <Empty loading={loading} /> : (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: H }}>
+      {ticks.map((t, i) => (
+        <g key={i}>
+          <line x1={ML} x2={ML + plotW} y1={sy(t)} y2={sy(t)} stroke="#21262d" strokeWidth={1} />
+          <text x={ML - 5} y={sy(t)} fill="#484f58" fontSize={9} textAnchor="end" dominantBaseline="middle">
+            {formatVal(t)}
+          </text>
+        </g>
+      ))}
+      {WINDOWS.map((w, i) => {
+        const d = data?.[w]
+        const cx = ML + (i + 0.5) * colW
+        if (!d || d.p50 == null) return (
+          <text key={w} x={cx} y={MT + plotH / 2} fill="#484f58" fontSize={10}
+            textAnchor="middle" dominantBaseline="middle">—</text>
+        )
+        const x1 = cx - BOX_H, x2 = cx + BOX_H
+        const cap1 = cx - BOX_H * 0.5, cap2 = cx + BOX_H * 0.5
+        return (
+          <g key={w}>
+            {/* Whiskers p5–p25 and p75–p95 */}
+            <line x1={cx} x2={cx} y1={sy(d.p5)}  y2={sy(d.p25)} stroke="#484f58" strokeWidth={1.5} />
+            <line x1={cap1} x2={cap2} y1={sy(d.p5)}  y2={sy(d.p5)}  stroke="#484f58" strokeWidth={1} />
+            <line x1={cx} x2={cx} y1={sy(d.p75)} y2={sy(d.p95)} stroke="#484f58" strokeWidth={1.5} />
+            <line x1={cap1} x2={cap2} y1={sy(d.p95)} y2={sy(d.p95)} stroke="#484f58" strokeWidth={1} />
+            {/* IQR box p25–p75 */}
+            <rect x={x1} y={sy(d.p75)} width={BOX_H * 2}
+              height={Math.max(1, sy(d.p25) - sy(d.p75))}
+              fill="#1c2128" stroke="#388bfd" strokeWidth={1.5} rx={2} />
+            {/* Median */}
+            <line x1={x1} x2={x2} y1={sy(d.p50)} y2={sy(d.p50)} stroke="#388bfd" strokeWidth={2.5} />
+            {/* Mean dot */}
+            {d.mean != null && <circle cx={cx} cy={sy(d.mean)} r={3} fill="#d29922" />}
+            {/* Window label */}
+            <text x={cx} y={H - 6} fill="#8b949e" fontSize={11} textAnchor="middle">{w}</text>
+          </g>
+        )
+      })}
+    </svg>
+  )
+}
+
+const DIST_METRICS = [
+  { key: 'msgs',     label: 'Messages per second', fmt: v => v.toFixed(1) },
+  { key: 'aircraft', label: 'Aircraft visible',    fmt: v => Math.round(v) },
+  { key: 'range',    label: 'Range (nm)',           fmt: v => `${Math.round(v)} nm` },
+]
+
+function DistributionStats() {
+  const { data, loading } = useFetch(`${API_BASE}/api/history/receiver/distributions`)
+
+  return (
+    <Card title="Performance distributions — 1d / 7d / 30d">
+      {loading || !data ? <Empty loading={loading} /> : (
         <>
-          <ResponsiveContainer width="100%" height={340}>
-            <ScatterChart margin={{ top: 8, right: 16, bottom: 32, left: 8 }}>
-              <CartesianGrid stroke="#21262d" />
-              <XAxis dataKey="bearing" name="Azimuth" type="number"
-                domain={[0, 360]} allowDataOverflow
-                ticks={[0, 45, 90, 135, 180, 225, 270, 315, 360]}
-                tickFormatter={v => `${v}°`}
-                label={{ value: 'Azimuth (°)', position: 'insideBottom', offset: -18, fill: '#484f58', fontSize: 11 }}
-                tick={{ fill: '#484f58', fontSize: 10 }}
-              />
-              <YAxis dataKey="elevation" name="Elevation" type="number"
-                domain={[0, maxEl]} allowDataOverflow
-                tickFormatter={v => `${v}°`}
-                label={{ value: 'Elevation (°)', angle: -90, position: 'insideLeft', offset: 8, fill: '#484f58', fontSize: 11 }}
-                tick={{ fill: '#484f58', fontSize: 11 }} width={48}
-              />
-              <ZAxis range={[4, 4]} />
-              <Tooltip cursor={{ stroke: '#30363d' }}
-                content={({ payload }) => {
-                  if (!payload?.length) return null
-                  const d = payload[0].payload
-                  return (
-                    <div className={styles.tooltip}>
-                      <div>Azimuth: {d.bearing}°</div>
-                      <div>Elevation: {d.elevation}°</div>
-                      <div>Range: {d.range} nm</div>
-                    </div>
-                  )
-                }}
-              />
-              <Scatter data={points} isAnimationActive={false}>
-                {points.map((p, i) => (
-                  <Cell key={i} fill={rangeColour(p.range)} fillOpacity={0.55} />
-                ))}
-              </Scatter>
-            </ScatterChart>
-          </ResponsiveContainer>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', justifyContent: 'center', marginTop: '0.5rem' }}>
-            <span style={{ fontSize: '0.72rem', color: '#484f58' }}>Near (0 nm)</span>
-            <div style={{ background: RANGE_GRADIENT, height: 8, borderRadius: 4, width: 160 }} />
-            <span style={{ fontSize: '0.72rem', color: '#484f58' }}>Far (250+ nm)</span>
+          {DIST_METRICS.map(({ key, label, fmt }, i) => (
+            <div key={key}>
+              {i > 0 && <div style={{ borderTop: '1px solid #21262d', margin: '0.75rem 0 0.5rem' }} />}
+              <div style={{ fontSize: '0.72rem', color: '#8b949e', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.25rem' }}>
+                {label}
+              </div>
+              <BoxPlotSVG data={data[key]} formatVal={fmt} />
+            </div>
+          ))}
+          <div style={{ display: 'flex', gap: '1.25rem', marginTop: '0.75rem', fontSize: '0.72rem', color: '#484f58', flexWrap: 'wrap' }}>
+            <span><span style={{ display: 'inline-block', width: 20, height: 2.5, background: '#388bfd', verticalAlign: 'middle', marginRight: 4 }} />Median</span>
+            <span><span style={{ display: 'inline-block', width: 12, height: 12, border: '1.5px solid #388bfd', background: '#1c2128', verticalAlign: 'middle', marginRight: 4 }} />IQR p25–p75</span>
+            <span><span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: '#d29922', verticalAlign: 'middle', marginRight: 4 }} />Mean</span>
+            <span>Whiskers: p5–p95</span>
           </div>
         </>
       )}
@@ -534,7 +600,7 @@ function AzimuthElevation({ days, onDaysChange }) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Baseline comparison
+// 8. Baseline comparison
 // ---------------------------------------------------------------------------
 function BaselineComparison({ snapshot }) {
   const { data: baseline, loading } = useFetch(`${API_BASE}/api/history/receiver/baseline`)
@@ -593,6 +659,92 @@ function BaselineComparison({ snapshot }) {
 }
 
 // ---------------------------------------------------------------------------
+// 9. Unique aircraft per day
+// ---------------------------------------------------------------------------
+function UniqueAircraftPerDay({ days, onDaysChange }) {
+  const { data, loading } = useFetch(`${API_BASE}/api/history/receiver/unique_aircraft?days=${days}`)
+  return (
+    <Card
+      title="Unique aircraft per day"
+      controls={<DaySelect value={days} onChange={onDaysChange} options={[30, 90, 365]} />}
+    >
+      {!data?.length ? <Empty loading={loading} /> : (
+        <ResponsiveContainer width="100%" height={200}>
+          <AreaChart data={data} margin={{ top: 8, right: 12, bottom: 8, left: 8 }}>
+            <CartesianGrid stroke="#21262d" />
+            <XAxis dataKey="date" tick={{ fill: '#484f58', fontSize: 10 }}
+              interval={Math.max(0, Math.floor(data.length / 6))} />
+            <YAxis tick={{ fill: '#484f58', fontSize: 11 }} width={44} allowDecimals={false} />
+            <Tooltip contentStyle={{ background: '#161b22', border: '1px solid #30363d', fontSize: 12 }}
+              formatter={v => [v, 'aircraft']} />
+            <Area type="monotone" dataKey="count" name="Aircraft" stroke="#3fb950"
+              fill="#3fb95020" strokeWidth={2} dot={false} isAnimationActive={false} />
+          </AreaChart>
+        </ResponsiveContainer>
+      )}
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 10. Reception completeness
+// ---------------------------------------------------------------------------
+function ReceptionCompleteness({ days, onDaysChange }) {
+  const { data, loading } = useFetch(`${API_BASE}/api/history/receiver/completeness?days=${days}`)
+  return (
+    <Card
+      title="Reception completeness — % of minutes with data"
+      controls={<DaySelect value={days} onChange={onDaysChange} options={[30, 90, 365]} />}
+    >
+      {!data?.length ? <Empty loading={loading} /> : (
+        <ResponsiveContainer width="100%" height={200}>
+          <AreaChart data={data} margin={{ top: 8, right: 12, bottom: 8, left: 8 }}>
+            <CartesianGrid stroke="#21262d" />
+            <XAxis dataKey="date" tick={{ fill: '#484f58', fontSize: 10 }}
+              interval={Math.max(0, Math.floor(data.length / 6))} />
+            <YAxis domain={[0, 100]} tick={{ fill: '#484f58', fontSize: 11 }} width={44}
+              tickFormatter={v => `${v}%`} />
+            <Tooltip contentStyle={{ background: '#161b22', border: '1px solid #30363d', fontSize: 12 }}
+              formatter={v => [`${v}%`, 'completeness']} />
+            <Area type="monotone" dataKey="pct" name="Completeness" stroke="#388bfd"
+              fill="#388bfd20" strokeWidth={2} dot={false} isAnimationActive={false} />
+          </AreaChart>
+        </ResponsiveContainer>
+      )}
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 11. Position decode rate
+// ---------------------------------------------------------------------------
+function PositionDecodeRate({ days, onDaysChange }) {
+  const { data, loading } = useFetch(`${API_BASE}/api/history/receiver/position_decode_rate?days=${days}`)
+  return (
+    <Card
+      title="Position decode rate — % of aircraft with position per day"
+      controls={<DaySelect value={days} onChange={onDaysChange} options={[30, 90, 365]} />}
+    >
+      {!data?.length ? <Empty loading={loading} /> : (
+        <ResponsiveContainer width="100%" height={200}>
+          <AreaChart data={data} margin={{ top: 8, right: 12, bottom: 8, left: 8 }}>
+            <CartesianGrid stroke="#21262d" />
+            <XAxis dataKey="date" tick={{ fill: '#484f58', fontSize: 10 }}
+              interval={Math.max(0, Math.floor(data.length / 6))} />
+            <YAxis domain={[0, 100]} tick={{ fill: '#484f58', fontSize: 11 }} width={44}
+              tickFormatter={v => `${v}%`} />
+            <Tooltip contentStyle={{ background: '#161b22', border: '1px solid #30363d', fontSize: 12 }}
+              formatter={v => [`${v}%`, 'with position']} />
+            <Area type="monotone" dataKey="pct" name="Decode rate" stroke="#bc8cff"
+              fill="#bc8cff20" strokeWidth={2} dot={false} isAnimationActive={false} />
+          </AreaChart>
+        </ResponsiveContainer>
+      )}
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Page layout
 // ---------------------------------------------------------------------------
 export default function ReceiverPage({ snapshot }) {
@@ -600,7 +752,9 @@ export default function ReceiverPage({ snapshot }) {
   const [signalDays,  setSignalDays]    = useState(14)
   const [polarDays,   setPolarDays]     = useState(30)
   const [rangePctDays, setRangePctDays] = useState(30)
-  const [azElDays,    setAzElDays]      = useState(30)
+  const [uniqueDays,   setUniqueDays]   = useState(90)
+  const [completeDays, setCompleteDays] = useState(90)
+  const [decodeDays,   setDecodeDays]   = useState(90)
 
   const aircraft = snapshot?.aircraft || []
 
@@ -618,8 +772,15 @@ export default function ReceiverPage({ snapshot }) {
         <RangePercentiles days={rangePctDays} onDaysChange={setRangePctDays} />
         <SignalPercentiles days={signalDays} onDaysChange={setSignalDays} />
       </div>
-      <PolarCoverage days={polarDays} onDaysChange={setPolarDays} />
-      <AzimuthElevation days={azElDays} onDaysChange={setAzElDays} />
+      <div className={styles.row}>
+        <PolarCoverage days={polarDays} onDaysChange={setPolarDays} />
+        <DistributionStats />
+      </div>
+      <div className={styles.row3}>
+        <UniqueAircraftPerDay  days={uniqueDays}   onDaysChange={setUniqueDays} />
+        <ReceptionCompleteness days={completeDays} onDaysChange={setCompleteDays} />
+        <PositionDecodeRate    days={decodeDays}   onDaysChange={setDecodeDays} />
+      </div>
       <DFHeatmap />
     </main>
   )
