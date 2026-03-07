@@ -1068,7 +1068,7 @@ class StatsDB:
                     GROUP BY type_code
                 )
                 SELECT ar.icao, ar.registration, ar.type_code, ar.type_category,
-                       ar.military, ar.country,
+                       ar.military, ar.country, ar.operator, ar.manufacturer, ar.year,
                        ar.foreign_military, ar.interesting, ar.rare, ar.first_seen_flag,
                        ar.first_seen, ar.last_seen, ar.sighting_count,
                        COALESCE(tc.tc, 1)          AS type_count,
@@ -1105,7 +1105,7 @@ class StatsDB:
                     GROUP BY icao
                 )
                 SELECT ar.icao, ar.registration, ar.type_code, ar.type_category,
-                       ar.military, ar.country,
+                       ar.military, ar.country, ar.operator, ar.manufacturer, ar.year,
                        ar.foreign_military, ar.interesting, ar.rare, ar.first_seen_flag,
                        ar.first_seen, ar.last_seen, ar.sighting_count,
                        COALESCE(tc.tc, 1)         AS type_count,

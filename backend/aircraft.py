@@ -201,8 +201,8 @@ async def aircraft_refresh(icao: str) -> dict:
 
     # Always make a fresh hexdb HTTP request — updates the persistent cache too
     hexdb = await asyncio.to_thread(enrichment.db.force_lookup_hexdb, icao)
-    # tar1090-db shard as supplementary fallback (downloads shard on first access)
-    tar1090 = await asyncio.to_thread(enrichment.db.get_tar1090, icao) if not hexdb else None
+    # Always try tar1090-db as supplementary source — hexdb may have registration but no type code
+    tar1090 = await asyncio.to_thread(enrichment.db.get_tar1090, icao)
     adsbx = enrichment.db.get_adsbx(icao)
 
     if hexdb or tar1090 or adsbx:
