@@ -17,6 +17,11 @@ async def coverage_polar(days: int = Query(default=30, ge=1, le=90)) -> list[dic
     return await asyncio.to_thread(stats_db.query_polar, days)
 
 
+@router.get("/polar_bins")
+async def coverage_polar_bins(days: int = Query(default=30, ge=1, le=90)) -> dict:
+    return await asyncio.to_thread(stats_db.query_polar_bins, days)
+
+
 @router.get("/max_range")
 async def coverage_max_range(days: int = Query(default=30, ge=1, le=90)) -> list[dict]:
     return await asyncio.to_thread(stats_db.query_max_range_by_bearing, days)

@@ -1150,37 +1150,177 @@ class StatsDB:
                 return []
         return [{"date": r["date"], "value": r["value"]} for r in rows]
 
+    def query_polar_bins(self, days: int, bearing_sectors: int = 36, range_bands: int = 10) -> dict:
+        """Bin coverage samples into a polar grid for heatmap rendering.
+        Returns aggregated cell counts rather than individual points."""
+        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        sector_width = 360.0 / bearing_sectors
+        with self._connect() as conn:
+            max_range_row = conn.execute(
+                "SELECT MAX(range_nm) FROM coverage_samples WHERE ts >= ?", (cutoff,)
+            ).fetchone()[0]
+            if not max_range_row:
+                return {"bins": [], "max_range": 0, "band_nm": 0,
+                        "sectors": bearing_sectors, "bands": range_bands}
+            # Round up to nearest 50 nm for clean ring labels
+            max_range = ((int(max_range_row) + 49) // 50) * 50
+            band_nm = max_range / range_bands
+            rows = conn.execute("""
+                SELECT CAST(bearing_deg / ? AS INTEGER)  AS b,
+                       CAST(range_nm    / ? AS INTEGER)  AS r,
+                       COUNT(*)                          AS count
+                FROM coverage_samples
+                WHERE ts >= ?
+                GROUP BY b, r
+                ORDER BY b, r
+            """, (sector_width, band_nm, cutoff)).fetchall()
+        return {
+            "bins": [{"b": r["b"], "r": min(r["r"], range_bands - 1), "count": r["count"]}
+                     for r in rows],
+            "max_range": max_range,
+            "band_nm": band_nm,
+            "sectors": bearing_sectors,
+            "bands": range_bands,
+        }
+
     def query_range_percentiles(self, days: int, sectors: int = 36) -> list[dict]:
-        """Range percentiles (p50/p90/p95) per 10° bearing sector."""
-        from collections import defaultdict
+        """Range percentiles (p50/p90/p95) per 10° bearing sector, computed in SQL."""
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
         sector_width = 360.0 / sectors
         with self._connect() as conn:
             rows = conn.execute("""
-                SELECT CAST(bearing_deg / ? AS INTEGER) AS sector, range_nm
-                FROM coverage_samples
-                WHERE ts >= ?
-                ORDER BY sector, range_nm
-            """, (sector_width, cutoff)).fetchall()
-        by_sector: dict = defaultdict(list)
-        for r in rows:
-            by_sector[r["sector"]].append(r["range_nm"])
-
-        def pct(vals: list, p: int) -> float:
-            idx = max(0, min(len(vals) - 1, int(p / 100 * len(vals))))
-            return round(vals[idx], 1)
+                WITH ranked AS (
+                    SELECT CAST(bearing_deg / ? AS INTEGER) AS sector,
+                           range_nm,
+                           ROW_NUMBER() OVER (PARTITION BY CAST(bearing_deg / ? AS INTEGER)
+                                              ORDER BY range_nm)        AS rn,
+                           COUNT(*)    OVER (PARTITION BY CAST(bearing_deg / ? AS INTEGER)) AS total
+                    FROM coverage_samples
+                    WHERE ts >= ?
+                )
+                SELECT sector,
+                       COUNT(*) AS count,
+                       MIN(CASE WHEN rn * 100 >= total * 50 THEN range_nm END) AS p50,
+                       MIN(CASE WHEN rn * 100 >= total * 90 THEN range_nm END) AS p90,
+                       MIN(CASE WHEN rn * 100 >= total * 95 THEN range_nm END) AS p95
+                FROM ranked
+                GROUP BY sector
+                ORDER BY sector
+            """, (sector_width, sector_width, sector_width, cutoff)).fetchall()
 
         result = []
-        for sector in sorted(by_sector.keys()):
-            vals = by_sector[sector]  # sorted ascending from SQL ORDER BY
+        for r in rows:
             result.append({
-                "bearing": round(sector * sector_width + sector_width / 2, 1),
-                "p50": pct(vals, 50),
-                "p90": pct(vals, 90),
-                "p95": pct(vals, 95),
-                "count": len(vals),
+                "bearing": round(r["sector"] * sector_width + sector_width / 2, 1),
+                "p50": round(r["p50"], 1) if r["p50"] is not None else None,
+                "p90": round(r["p90"], 1) if r["p90"] is not None else None,
+                "p95": round(r["p95"], 1) if r["p95"] is not None else None,
+                "count": r["count"],
             })
         return result
+
+    def query_distributions(self) -> dict:
+        """Percentile stats for key metrics across 1d, 7d, 30d windows.
+        Returns p5/p25/p50/p75/p95 + mean + n for each metric/window.
+        Signal values are returned as dBFS (negative; 0 = strongest)."""
+        now = int(datetime.now(timezone.utc).timestamp())
+        cutoffs = {"1d": now - 86400, "7d": now - 7 * 86400, "30d": now - 30 * 86400, "365d": now - 365 * 86400}
+
+        def pct_sql(conn, col, table, cutoff, extra=""):
+            row = conn.execute(f"""
+                WITH ranked AS (
+                    SELECT {col} AS v,
+                           ROW_NUMBER() OVER (ORDER BY {col}) AS rn,
+                           COUNT(*)    OVER ()               AS n
+                    FROM {table}
+                    WHERE ts >= ? {extra}
+                )
+                SELECT COUNT(*) AS n,
+                       AVG(v)   AS mean,
+                       MIN(CASE WHEN rn * 100 >= n *  5 THEN v END) AS p5,
+                       MIN(CASE WHEN rn * 100 >= n * 25 THEN v END) AS p25,
+                       MIN(CASE WHEN rn * 100 >= n * 50 THEN v END) AS p50,
+                       MIN(CASE WHEN rn * 100 >= n * 75 THEN v END) AS p75,
+                       MIN(CASE WHEN rn * 100 >= n * 95 THEN v END) AS p95
+                FROM ranked
+            """, (cutoff,)).fetchone()
+            if not row or not row["n"]:
+                return None
+            return {k: (round(row[k], 2) if row[k] is not None else None)
+                    for k in ("n", "mean", "p5", "p25", "p50", "p75", "p95")}
+
+        def to_dbfs(d):
+            """Convert a percentile dict from raw RSSI bytes to dBFS."""
+            if d is None:
+                return None
+            return {k: (round(-v / 2, 1) if k != "n" and v is not None else v)
+                    for k, v in d.items()}
+
+        result: dict = {}
+        with self._connect() as conn:
+            for window, cutoff in cutoffs.items():
+                msgs   = pct_sql(conn, "msg_mean",   "minute_stats",    cutoff)
+                ac     = pct_sql(conn, "ac_total",   "minute_stats",    cutoff)
+                sig    = to_dbfs(pct_sql(conn, "signal_avg", "minute_stats",    cutoff,
+                                         "AND signal_avg IS NOT NULL"))
+                rng    = pct_sql(conn, "range_nm",   "coverage_samples", cutoff, "AND range_nm > 0")
+                for metric, val in (("msgs", msgs), ("aircraft", ac), ("signal", sig), ("range", rng)):
+                    result.setdefault(metric, {})[window] = val
+        return result
+
+    def query_unique_aircraft_per_day(self, days: int) -> list[dict]:
+        """Daily count of unique aircraft seen, from day_stats."""
+        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT date, unique_aircraft
+                FROM day_stats
+                WHERE date >= ?
+                ORDER BY date
+            """, (cutoff,)).fetchall()
+        return [{"date": r["date"], "count": r["unique_aircraft"]} for r in rows]
+
+    def query_completeness(self, days: int) -> list[dict]:
+        """Daily reception completeness: % of the day's 1440 minutes that had data."""
+        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT date(ts, 'unixepoch') AS day,
+                       MIN(100.0, ROUND(COUNT(*) * 100.0 / 1440, 1)) AS pct
+                FROM minute_stats
+                WHERE ts >= ?
+                GROUP BY day
+                ORDER BY day
+            """, (cutoff,)).fetchall()
+        return [{"date": r["day"], "pct": r["pct"]} for r in rows]
+
+    def query_position_decode_rate(self, days: int) -> list[dict]:
+        """Daily average position decode rate: % of tracked aircraft per minute
+        that had a decoded position, averaged across each day."""
+        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        with self._connect() as conn:
+            rows = conn.execute("""
+                WITH daily_ac AS (
+                    SELECT date(ts, 'unixepoch') AS day,
+                           SUM(ac_total)         AS total_ac_mins
+                    FROM minute_stats
+                    WHERE ts >= ? AND ac_total > 0
+                    GROUP BY day
+                ),
+                daily_pos AS (
+                    SELECT date(ts, 'unixepoch') AS day,
+                           COUNT(*)              AS pos_ac_mins
+                    FROM coverage_samples
+                    WHERE ts >= ?
+                    GROUP BY day
+                )
+                SELECT a.day,
+                       ROUND(COALESCE(p.pos_ac_mins, 0) * 100.0 / a.total_ac_mins, 1) AS pct
+                FROM daily_ac a
+                LEFT JOIN daily_pos p ON a.day = p.day
+                ORDER BY a.day
+            """, (cutoff, cutoff)).fetchall()
+        return [{"date": r["day"], "pct": r["pct"]} for r in rows]
 
     def update_aircraft_enrichment(
         self, icao: str,
