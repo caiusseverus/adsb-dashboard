@@ -15,7 +15,14 @@ RECEIVER_LAT: Optional[float] = float(_rlat) if _rlat else None
 RECEIVER_LON: Optional[float] = float(_rlon) if _rlon else None
 
 # DEBUG_ENRICHMENT: 0=off, 1=all (enrichment + ACAS), 2=ACAS only
-DEBUG_ENRICHMENT: int = int(os.getenv("DEBUG_ENRICHMENT", "0"))
+# Accepts integer (0/1/2) or boolean-style string (true/false)
+def _parse_debug_level(val: str) -> int:
+    if val.lower() in ("true", "yes"):
+        return 1
+    if val.lower() in ("false", "no", ""):
+        return 0
+    return int(val)
+DEBUG_ENRICHMENT: int = _parse_debug_level(os.getenv("DEBUG_ENRICHMENT", "0"))
 
 HOME_COUNTRY: str = os.getenv("HOME_COUNTRY", "")
 RARE_THRESHOLD: int = int(os.getenv("RARE_THRESHOLD", "5"))

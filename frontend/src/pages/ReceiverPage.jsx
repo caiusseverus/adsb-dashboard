@@ -184,14 +184,35 @@ const DF_LABELS = {
 
 function LiveDFBreakdown({ snapshot }) {
   const data = useMemo(() => {
-    const counts = snapshot?.df_history?.slice(-1)[0]?.counts ?? {}
+    const history = snapshot?.df_history ?? []
+    if (!history.length) return []
+
+    // Build a rolling 60-second window by blending the current partial minute
+    // with a proportional share of the previous completed minute.
+    const cur = history[history.length - 1]
+    const prev = history.length >= 2 ? history[history.length - 2] : null
+
+    const curCounts = cur?.counts ?? {}
+    const prevCounts = prev?.counts ?? {}
+
+    // Seconds elapsed since current minute started
+    const curMinStart = (cur?.minute ?? 0) * 60
+    const secsIntoCurMin = Math.min(59, Math.max(1, Math.floor(Date.now() / 1000) - curMinStart))
+    const prevWeight = (60 - secsIntoCurMin) / 60
+
+    const allDfs = new Set([...Object.keys(curCounts), ...Object.keys(prevCounts)])
+    const counts = {}
+    allDfs.forEach(df => {
+      counts[df] = Math.round((curCounts[df] ?? 0) + (prevCounts[df] ?? 0) * prevWeight)
+    })
+
     return Object.entries(counts)
       .map(([df, count]) => ({ label: DF_LABELS[Number(df)] ?? `DF${df}`, count, df: Number(df) }))
       .sort((a, b) => b.count - a.count)
   }, [snapshot?.df_history])
 
   return (
-    <Card title="Live message types — current minute">
+    <Card title="Live message types — rolling 60s">
       {!data.length ? <Empty loading={false} /> : (
         <ResponsiveContainer width="100%" height={220}>
           <BarChart data={data} layout="vertical" margin={{ top: 4, right: 48, bottom: 4, left: 0 }}>

@@ -25,6 +25,7 @@ const COLUMNS = [
 const FLAGS = [
   { value: 'all',              label: 'All notable' },
   { value: 'foreign_military', label: 'Foreign military' },
+  { value: 'home_military',    label: 'Home military' },
   { value: 'interesting',      label: 'Interesting' },
   { value: 'rare',             label: 'Rare' },
   { value: 'unique_sighting',  label: 'Unique' },

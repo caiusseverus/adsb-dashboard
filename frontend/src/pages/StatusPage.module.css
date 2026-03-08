@@ -1,0 +1,179 @@
+.main {
+  flex: 1;
+  padding: 1.25rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  max-width: 1400px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.empty {
+  color: #484f58;
+  padding: 2rem;
+  text-align: center;
+}
+
+/* Summary cards */
+.summaryRow {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1rem;
+}
+
+@media (max-width: 900px) {
+  .summaryRow { grid-template-columns: 1fr 1fr; }
+}
+
+.summaryCard {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+}
+
+.summaryLabel {
+  font-size: 0.72rem;
+  color: #484f58;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+  margin-bottom: 0.5rem;
+}
+
+.summaryValue {
+  font-size: 1.6rem;
+  font-weight: 600;
+  color: #c9d1d9;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Card */
+.card {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+}
+
+.cardHeader {
+  margin-bottom: 1rem;
+}
+
+.cardTitle {
+  font-size: 0.75rem;
+  color: #484f58;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+}
+
+/* Table */
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.table th {
+  text-align: left;
+  padding: 0.35rem 0.75rem;
+  color: #484f58;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border-bottom: 1px solid #21262d;
+  font-weight: 500;
+}
+
+.table td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid #161b22;
+  color: #c9d1d9;
+  vertical-align: top;
+}
+
+.table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.table tbody tr:hover td {
+  background: #1c2128;
+}
+
+.tableName {
+  font-family: monospace;
+  font-size: 0.78rem;
+  color: #388bfd;
+  white-space: nowrap;
+}
+
+.desc {
+  color: #8b949e;
+  font-size: 0.78rem;
+}
+
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.muted {
+  color: #8b949e;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+/* Retention badges */
+.permanent {
+  display: inline-block;
+  font-size: 0.68rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(63,185,80,0.12);
+  color: #3fb950;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.expiring {
+  display: inline-block;
+  font-size: 0.68rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(210,153,34,0.12);
+  color: #d29922;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* Config section */
+.configGrid {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.configRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #21262d;
+  font-size: 0.85rem;
+}
+
+.configRow:last-child {
+  border-bottom: none;
+}
+
+.configLabel {
+  color: #8b949e;
+}
+
+.configValue {
+  color: #c9d1d9;
+  font-variant-numeric: tabular-nums;
+}

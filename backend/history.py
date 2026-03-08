@@ -26,7 +26,7 @@ _CALENDAR_METRICS = {
     "msg_max":           "msg_max",
     "unique_aircraft":   "unique_aircraft",
 }
-_VALID_FLAGS = {"all", "foreign_military", "interesting", "rare", "first_seen_flag", "unique_sighting"}
+_VALID_FLAGS = {"all", "foreign_military", "home_military", "interesting", "rare", "first_seen_flag", "unique_sighting"}
 
 
 _VALID_BUCKETS = {15, 60}

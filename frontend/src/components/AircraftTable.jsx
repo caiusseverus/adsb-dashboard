@@ -172,7 +172,7 @@ export default function AircraftTable({ aircraft, onSelectIcao, queueSize = 0 })
                     {ac.interesting    && <span className={styles.intBadge}>INT</span>}
                     {ac.sighting_count === 1 && <span className={styles.newBadge}>NEW</span>}
                     {ac.acas_ra_active && (
-                      <span className={styles.acasBadge} title={ac.acas_ra_desc ?? 'ACAS RA active'}>TCAS</span>
+                      <span className={styles.acasBadge} title={ac.acas_ra_desc ?? 'ACAS RA active'}>ACAS</span>
                     )}
                     {!ac.acas_ra_active && threatSet.has(ac.icao) && (
                       <span className={styles.thrBadge} title="Threat aircraft in active RA">THR</span>

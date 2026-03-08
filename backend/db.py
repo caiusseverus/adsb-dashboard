@@ -1240,7 +1240,12 @@ class StatsDB:
 
     def query_notable(self, limit: int, flag: str, days: int | None = None) -> list[dict]:
         # flag is validated by caller against a whitelist
-        where = "ar.foreign_military OR ar.interesting OR ar.rare OR ar.first_seen_flag" if flag == "all" else f"ar.{flag}"
+        if flag == "all":
+            where = "ar.foreign_military OR ar.interesting OR ar.rare OR ar.first_seen_flag"
+        elif flag == "home_military":
+            where = "ar.military AND NOT ar.foreign_military"
+        else:
+            where = f"ar.{flag}"
         params: list = []
         if days is not None:
             cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
@@ -1344,8 +1349,18 @@ class StatsDB:
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
         sector_width = 360.0 / bearing_sectors
         with self._connect() as conn:
+            total_samples = conn.execute(
+                "SELECT COUNT(*) FROM coverage_samples WHERE ts >= ?", (cutoff,)
+            ).fetchone()[0]
+            if not total_samples:
+                return {"bins": [], "max_range": 0, "band_nm": 0,
+                        "sectors": bearing_sectors, "bands": range_bands}
+            # Use 95th percentile of range to exclude bogus outlier decodes
+            p95_offset = max(0, int(0.95 * total_samples) - 1)
             max_range_row = conn.execute(
-                "SELECT MAX(range_nm) FROM coverage_samples WHERE ts >= ?", (cutoff,)
+                "SELECT range_nm FROM coverage_samples WHERE ts >= ? "
+                "ORDER BY range_nm ASC LIMIT 1 OFFSET ?",
+                (cutoff, p95_offset)
             ).fetchone()[0]
             if not max_range_row:
                 return {"bins": [], "max_range": 0, "band_nm": 0,
@@ -1662,6 +1677,54 @@ class StatsDB:
                 icaos,
             ).fetchall()
         return {r["icao"]: r["sighting_count"] for r in rows}
+
+    def query_status(self) -> dict:
+        """DB size, per-table row counts, date ranges, and retention policy summary."""
+        import os
+        db_size = os.path.getsize(str(config.DB_PATH)) if config.DB_PATH.exists() else 0
+
+        tables = [
+            ("minute_stats",          "ts",        True,  config.MINUTE_STATS_RETENTION_DAYS),
+            ("minute_df_counts",      "ts",        True,  config.MINUTE_STATS_RETENTION_DAYS),
+            ("minute_type_counts",    "ts",        True,  config.MINUTE_STATS_RETENTION_DAYS),
+            ("minute_operator_counts","ts",        True,  config.MINUTE_STATS_RETENTION_DAYS),
+            ("daily_aircraft_seen",   "date",      True,  config.MINUTE_STATS_RETENTION_DAYS),
+            ("day_stats",             "date",      False, None),
+            ("aircraft_registry",     None,        False, None),
+            ("coverage_samples",      "ts",        True,  90),
+            ("acas_events",           "ts",        True,  90),
+        ]
+
+        result = []
+        with self._connect() as conn:
+            for tbl, ts_col, expires, ret_days in tables:
+                row_count = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                oldest = newest = None
+                if ts_col and row_count:
+                    bounds = conn.execute(
+                        f"SELECT MIN({ts_col}), MAX({ts_col}) FROM {tbl}"
+                    ).fetchone()
+                    oldest, newest = bounds[0], bounds[1]
+                result.append({
+                    "table":       tbl,
+                    "rows":        row_count,
+                    "oldest":      oldest,
+                    "newest":      newest,
+                    "expires":     expires,
+                    "retain_days": ret_days,
+                })
+
+        return {
+            "db_size_bytes": db_size,
+            "tables": result,
+            "config": {
+                "minute_stats_retention_days": config.MINUTE_STATS_RETENTION_DAYS,
+                "coverage_retention_days":     90,
+                "acas_retention_days":         90,
+                "ghost_filter_msgs":           config.GHOST_FILTER_MSGS,
+                "rare_threshold":              config.RARE_THRESHOLD,
+            },
+        }
 
 
 # Module-level singleton

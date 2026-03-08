@@ -733,14 +733,6 @@ class AircraftState:
         ra_desc = result["ra_description"]
         threat_icao = self._sanitize_threat_icao(result.get("threat_icao"), ac.icao, now)
 
-        ac.acas_ra_active     = True
-        ac.acas_ra_desc       = ra_desc
-        ac.acas_ra_corrective = result.get("ra_corrective", False)
-        ac.acas_threat_icao   = threat_icao
-        if result.get("sensitivity_level") is not None:
-            ac.acas_sensitivity = result["sensitivity_level"]
-        ac.acas_ra_ts = now
-
         sig = self._acas_signature(result, threat_icao)
         prev = self._acas_candidates.get(ac.icao)
         if prev and prev[0] == sig and (now - prev[1]) <= _ACAS_CONFIRM_WINDOW_S:
@@ -751,6 +743,14 @@ class AircraftState:
 
         if confirm_count < _ACAS_MIN_CONFIRM_FRAMES:
             return
+
+        # Only update live badge fields once confirmation threshold is met
+        ac.acas_ra_desc       = ra_desc
+        ac.acas_ra_corrective = result.get("ra_corrective", False)
+        ac.acas_threat_icao   = threat_icao
+        if result.get("sensitivity_level") is not None:
+            ac.acas_sensitivity = result["sensitivity_level"]
+        ac.acas_ra_ts = now
 
         last = self._last_acas_ts.get(ac.icao)
         if last and (now - last[0]) < 30 and last[1] == ra_desc:
