@@ -45,6 +45,15 @@ async def _beast_runner() -> None:
     await client.run()
 
 
+async def _mlat_runner(name: str, host: str, port: int) -> None:
+    def on_mlat_message(msg: dict) -> None:
+        state.process_message(msg, mlat_source=name)
+
+    client = BeastClient(host, port, on_mlat_message)
+    log.info("MLAT runner starting: %s (%s:%s)", name, host, port)
+    await client.run()
+
+
 async def _db_update_checker() -> None:
     while True:
         await asyncio.sleep(86400)
@@ -109,6 +118,9 @@ def _ghost_credible(ac: dict) -> bool:
     if config.GHOST_FILTER_MSGS <= 0:
         return True
     if ac.get("msg_count", 0) >= config.GHOST_FILTER_MSGS:
+        return True
+    # MLAT-confirmed aircraft are real (multilaterated by multiple receivers)
+    if ac.get("mlat"):
         return True
     icao = ac["icao"]
     if enrichment.db.get_adsbx(icao):
@@ -224,6 +236,8 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(stats_db.purge_ghost_aircraft)
 
     asyncio.create_task(_beast_runner())
+    for name, host, port in config.MLAT_SERVERS:
+        asyncio.create_task(_mlat_runner(name, host, port))
     asyncio.create_task(_push_updates())
     asyncio.create_task(_db_writer())
     asyncio.create_task(_db_update_checker())

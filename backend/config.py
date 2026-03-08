@@ -9,6 +9,49 @@ BEAST_HOST: str = os.getenv("BEAST_HOST", "localhost")
 BEAST_PORT: int = int(os.getenv("BEAST_PORT", "30005"))
 AIRCRAFT_TIMEOUT: int = int(os.getenv("AIRCRAFT_TIMEOUT", "60"))
 
+
+def _parse_mlat_servers(val: str, default_host: str) -> list[tuple[str, str, int]]:
+    """Parse MLAT_SERVERS env var into list of (name, host, port).
+
+    Two formats are supported per entry:
+      Name@host:port  — explicit host (required when host differs from BEAST_HOST)
+      Name:port       — host defaults to BEAST_HOST
+
+    Example: "ADSBx@adsbpi:30158,FlightAware:30105,Airplanes:30157"
+      → ('ADSBx', 'adsbpi', 30158), ('FlightAware', 'adsbpi', 30105), ('Airplanes', 'adsbpi', 30157)
+    """
+    servers: list[tuple[str, str, int]] = []
+    for i, entry in enumerate(val.split(","), 1):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            if "@" in entry:
+                # Name@host:port
+                name, hostport = entry.split("@", 1)
+                host, port_str = hostport.rsplit(":", 1)
+            else:
+                # Name:port  — use default_host
+                name, port_str = entry.rsplit(":", 1)
+                host = default_host
+            servers.append((name.strip(), host.strip(), int(port_str.strip())))
+        except (ValueError, AttributeError):
+            pass  # malformed entry; skip silently
+    return servers
+
+
+_mlat_servers_raw = os.getenv("MLAT_SERVERS", "")
+# Backward-compat: honour legacy MLAT_HOST / MLAT_PORT if MLAT_SERVERS not set
+if not _mlat_servers_raw:
+    _legacy_host = os.getenv("MLAT_HOST", "")
+    _legacy_port = os.getenv("MLAT_PORT", "30105")
+    if _legacy_host:
+        _mlat_servers_raw = f"mlat@{_legacy_host}:{_legacy_port}"
+
+MLAT_SERVERS: list[tuple[str, str, int]] = _parse_mlat_servers(
+    _mlat_servers_raw, default_host=os.getenv("BEAST_HOST", "localhost")
+)
+
 _rlat = os.getenv("RECEIVER_LAT")
 _rlon = os.getenv("RECEIVER_LON")
 RECEIVER_LAT: Optional[float] = float(_rlat) if _rlat else None

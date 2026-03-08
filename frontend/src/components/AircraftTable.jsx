@@ -86,6 +86,7 @@ function sortAircraft(aircraft, col, asc) {
 
 const FILTERS = [
   { value: 'all',         label: 'All' },
+  { value: 'mlat',        label: 'MLAT' },
   { value: 'military',    label: 'Military' },
   { value: 'interesting', label: 'Interesting' },
   { value: 'acas',        label: 'ACAS' },
@@ -107,7 +108,8 @@ export default function AircraftTable({ aircraft, onSelectIcao, queueSize = 0 })
 
   const threatSet = new Set(aircraft.filter(a => a.acas_threat_icao).map(a => a.acas_threat_icao))
 
-  const filtered = filter === 'military'    ? aircraft.filter(ac => ac.military)
+  const filtered = filter === 'mlat'        ? aircraft.filter(ac => ac.mlat)
+                 : filter === 'military'    ? aircraft.filter(ac => ac.military)
                  : filter === 'interesting' ? aircraft.filter(ac => ac.interesting)
                  : filter === 'acas'        ? aircraft.filter(ac => ac.acas_ra_active || threatSet.has(ac.icao))
                  : aircraft
@@ -171,6 +173,7 @@ export default function AircraftTable({ aircraft, onSelectIcao, queueSize = 0 })
                     {ac.military       && <span className={styles.milBadge}>MIL</span>}
                     {ac.interesting    && <span className={styles.intBadge}>INT</span>}
                     {ac.sighting_count === 1 && <span className={styles.newBadge}>NEW</span>}
+                    {ac.mlat           && <span className={styles.mlatBadge} title={[ac.mlat_source, `${ac.mlat_msg_count} msgs`].filter(Boolean).join(' · ')}>MLAT</span>}
                     {ac.acas_ra_active && (
                       <span className={styles.acasBadge} title={ac.acas_ra_desc ?? 'ACAS RA active'}>ACAS</span>
                     )}

@@ -23,6 +23,12 @@ from utils import country_from_registration
 log = logging.getLogger(__name__)
 
 _R_NM = 3440.065  # Earth radius in nautical miles
+# Beast timestamp value used by mlat-client for all synthesized positions.
+# Bytes: FF 00 4D 4C 41 54  ("FF00" + "MLAT" in ASCII).
+# Aggregators recognise this as non-real so they don't ingest MLAT positions as ADS-B.
+# We use it as ground truth: any Beast frame with this timestamp is MLAT-derived,
+# regardless of which TCP stream delivered it.
+_MLAT_TS_MARKER: int = int.from_bytes(b'\xff\x00MLAT', 'big')  # 0xFF004D4C4154
 _ICAO_HEX_RE = re.compile(r"^[0-9A-F]{6}$")
 _ACAS_CONFIRM_WINDOW_S = 12
 _ACAS_MIN_CONFIRM_FRAMES = 2
@@ -134,6 +140,12 @@ class Aircraft:
     cpr_even: Optional[tuple] = field(default=None, repr=False)   # (raw_msg, timestamp)
     cpr_odd:  Optional[tuple] = field(default=None, repr=False)
     sighting_count: int = 1               # from aircraft_registry; 1 = unique (never seen before)
+    # MLAT
+    has_adsb: bool = False               # True once a DF17 WITHOUT the MLAT timestamp is seen
+                                         # (guarantees a real ADS-B transponder; blocks MLAT tag)
+    mlat: bool = False                    # True if position is MLAT-derived (timestamp-confirmed)
+    mlat_source: Optional[str] = None    # name of the MLAT server that established the position
+    mlat_msg_count: int = 0              # Beast frames with the MLAT timestamp marker
     # ACAS/TCAS fields
     acas_ra_active:     bool           = False
     acas_ra_desc:       Optional[str]  = None
@@ -166,6 +178,13 @@ class AircraftState:
         self._min_df_stats: deque[tuple] = deque(maxlen=60)  # (minute, df_counts_dict)
 
         self._total: int = 0
+        # MLAT stats (parallel to the regular per-sec/per-min counters)
+        self._mlat_total: int = 0
+        self._cur_sec_mlat_count: int = 0
+        self._mlat_sec_counts: deque[tuple[int, int]] = deque(maxlen=60)
+        self._cur_min_mlat_count: int = 0
+        self._min_mlat_counts: deque[tuple[int, int]] = deque(maxlen=60)  # (minute, count)
+
         self._hexdb_queue: set[str] = set()  # ICAOs awaiting hexdb.io operator lookup
 
         # ACAS event queue: drained by main._db_writer() every minute
@@ -187,15 +206,42 @@ class AircraftState:
     # Public API
     # ------------------------------------------------------------------
 
-    def process_message(self, msg: dict) -> None:
+    def process_message(self, msg: dict, mlat_source: Optional[str] = None) -> None:
+        """Process a decoded Beast message.
+
+        mlat_source: name of the MLAT server this message came from, or None for
+        the primary Beast stream.
+
+        MLAT detection uses the Beast timestamp marker (0xFF004D4C4154) as ground
+        truth.  This works on any stream — including the regular port 30005 feed
+        where readsb echoes synthesized MLAT positions back.  ADS-B frames forwarded
+        by the mlat-client carry their original real timestamp and are NOT tagged MLAT.
+        """
         raw: str = msg["raw"]
         signal: int = msg.get("signal", 0)
+        timestamp: int = msg.get("timestamp", 0)
         now = time.time()
+
+        # Timestamp-based MLAT detection: definitive regardless of stream.
+        if timestamp == _MLAT_TS_MARKER:
+            # Synthesized MLAT frame — keep the supplied source name, or fall back
+            # to "mlat" for frames detected on the regular stream via timestamp only.
+            if mlat_source is None:
+                mlat_source = "mlat"
+        else:
+            # Real timestamp → genuine ADS-B (or Mode-S without position).
+            # Clear any stream-level MLAT hint: the mlat-client forwards real ADS-B
+            # frames with their original timestamps, so stream origin is not reliable.
+            mlat_source = None
+
+        mlat = mlat_source is not None
 
         with self._lock:
             self._total += 1
-            self._tick(now)
-            self._decode(raw, signal, now)
+            if mlat:
+                self._mlat_total += 1
+            self._tick(now, mlat=mlat)
+            self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
 
     def expire_aircraft(self) -> None:
         now = time.time()
@@ -280,7 +326,10 @@ class AircraftState:
                 "vertical_rate_fpm": ac.vertical_rate_fpm,
                 "mach":             ac.mach,
                 "selected_alt":       ac.selected_alt,
-                "sighting_count":     ac.sighting_count,
+                "sighting_count":  ac.sighting_count,
+                "mlat":            ac.mlat,
+                "mlat_source":       ac.mlat_source,
+                "mlat_msg_count":    ac.mlat_msg_count,
                 "acas_ra_active":     ac.acas_ra_ts is not None and (now - ac.acas_ra_ts) < 60,
                 "acas_ra_desc":       ac.acas_ra_desc,
                 "acas_ra_corrective": ac.acas_ra_corrective,
@@ -303,6 +352,10 @@ class AircraftState:
             recent = list(self._sec_counts)[-10:]
             msg_per_sec = round(sum(c for _, c in recent) / max(len(recent), 1), 1)
 
+            # MLAT msg/sec (same rolling 10-second window)
+            mlat_recent = list(self._mlat_sec_counts)[-10:]
+            mlat_per_sec = round(sum(c for _, c in mlat_recent) / max(len(mlat_recent), 1), 1)
+
             # Rate history for the chart (completed minutes + current partial minute)
             secs = list(self._cur_min_sec_counts)
             if secs:
@@ -319,6 +372,7 @@ class AircraftState:
                          max(cur_sigs) if cur_sigs else None)
             rate_history = list(self._min_stats) + [cur_stats]
             df_history = list(self._min_df_stats) + [(self._cur_min, dict(self._cur_min_df_counts))]
+            mlat_history = list(self._min_mlat_counts) + [(self._cur_min, self._cur_min_mlat_count)]
 
             aircraft_list = [
                 {
@@ -352,6 +406,9 @@ class AircraftState:
                     "selected_alt":     ac.selected_alt,
                     "interesting":        bool(ac.type_code and ac.type_code.upper() in INTERESTING_TYPE_CODES),
                     "sighting_count":     ac.sighting_count,
+                    "mlat":              ac.mlat,
+                    "mlat_source":       ac.mlat_source,
+                    "mlat_msg_count":    ac.mlat_msg_count,
                     "acas_ra_active":     ac.acas_ra_ts is not None and (now - ac.acas_ra_ts) < 60,
                     "acas_ra_desc":       ac.acas_ra_desc,
                     "acas_ra_corrective": ac.acas_ra_corrective,
@@ -362,12 +419,16 @@ class AircraftState:
             ]
 
         live_military = sum(1 for ac in self._aircraft.values() if ac.military)
+        mlat_aircraft_count = sum(1 for ac in self._aircraft.values() if ac.mlat)
 
         return {
             "aircraft_count": len(aircraft_list),
             "live_military": live_military,
             "msg_per_sec": msg_per_sec,
             "total_messages": self._total,
+            "mlat_total": self._mlat_total,
+            "mlat_per_sec": mlat_per_sec,
+            "mlat_aircraft_count": mlat_aircraft_count,
             "unique_today": len(self._today_icaos),
             "unique_today_military": len(self._today_mil_icaos),
             "hexdb_queue_size": len(self._hexdb_queue),
@@ -382,20 +443,28 @@ class AircraftState:
                 {"minute": m, "counts": counts}
                 for m, counts in df_history[-60:]
             ],
+            "mlat_history": [
+                {"minute": m, "count": c}
+                for m, c in mlat_history[-60:]
+            ],
         }
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _tick(self, now: float) -> None:
+    def _tick(self, now: float, mlat: bool = False) -> None:
         sec = int(now)
         if sec != self._cur_sec:
             self._sec_counts.append((self._cur_sec, self._cur_sec_count))
+            self._mlat_sec_counts.append((self._cur_sec, self._cur_sec_mlat_count))
             self._cur_min_sec_counts.append(self._cur_sec_count)
             self._cur_sec = sec
             self._cur_sec_count = 0
+            self._cur_sec_mlat_count = 0
         self._cur_sec_count += 1
+        if mlat:
+            self._cur_sec_mlat_count += 1
 
         minute = int(now // 60)
         if minute != self._cur_min:
@@ -415,12 +484,16 @@ class AircraftState:
                  sig_avg, sig_min, sig_max)
             )
             self._min_df_stats.append((self._cur_min, dict(self._cur_min_df_counts)))
+            self._min_mlat_counts.append((self._cur_min, self._cur_min_mlat_count))
             self._cur_min = minute
             self._cur_min_sec_counts = []
             self._cur_min_signals = []
             self._cur_min_df_counts = {}
+            self._cur_min_mlat_count = 0
+        if mlat:
+            self._cur_min_mlat_count += 1
 
-    def _decode(self, raw: str, signal: int, now: float) -> None:
+    def _decode(self, raw: str, signal: int, now: float, mlat: bool = False, mlat_source: Optional[str] = None) -> None:
         if len(raw) < 14:          # Too short to contain an ICAO address
             return
 
@@ -505,6 +578,24 @@ class AircraftState:
         ac.last_seen = now
         ac.msg_count += 1
         ac.signal = signal
+        if mlat:
+            # MLAT-timestamp frame.  Only tag if we haven't confirmed a real ADS-B
+            # transponder: some clients stamp ALL forwarded messages (including genuine
+            # ADS-B DF17) with the MLAT marker.  has_adsb (set below by non-MLAT DF17)
+            # acts as the tiebreak.
+            if not ac.has_adsb:
+                ac.mlat = True
+                # Prefer a named server source over the auto-detected "mlat" label.
+                if mlat_source != "mlat" or ac.mlat_source is None:
+                    ac.mlat_source = mlat_source
+            ac.mlat_msg_count += 1
+        elif df == 17:
+            # Non-MLAT-timestamp DF17 = genuine ADS-B transponder.  This is the only
+            # frame type we can be sure is NOT an MLAT injection (synthesized MLAT
+            # frames always carry the MLAT timestamp; real transponders never do).
+            ac.has_adsb = True
+            ac.mlat = False
+            ac.mlat_source = None
 
         # Track unique aircraft seen today; reset sets at midnight
         today = date.today().isoformat()

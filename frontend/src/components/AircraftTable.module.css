@@ -224,6 +224,18 @@
   vertical-align: middle;
 }
 
+.mlatBadge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(56, 139, 253, 0.2);
+  color: #388bfd;
+  border-radius: 3px;
+  vertical-align: middle;
+}
+
 .acasRow { background: rgba(248, 81, 73, 0.07); }
 .acasRow td:first-child { border-left: 2px solid #f85149; }
 
