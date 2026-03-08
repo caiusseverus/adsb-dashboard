@@ -370,9 +370,19 @@ function binColour(count, maxCount) {
   return `hsl(210,80%,${Math.round(10 + t * 65)}%)`
 }
 
+const COMPASS = [
+  { label: 'N',   deg: 0     }, { label: 'NNE', deg: 22.5  },
+  { label: 'NE',  deg: 45    }, { label: 'ENE', deg: 67.5  },
+  { label: 'E',   deg: 90    }, { label: 'ESE', deg: 112.5 },
+  { label: 'SE',  deg: 135   }, { label: 'SSE', deg: 157.5 },
+  { label: 'S',   deg: 180   }, { label: 'SSW', deg: 202.5 },
+  { label: 'SW',  deg: 225   }, { label: 'WSW', deg: 247.5 },
+  { label: 'W',   deg: 270   }, { label: 'WNW', deg: 292.5 },
+  { label: 'NW',  deg: 315   }, { label: 'NNW', deg: 337.5 },
+]
+
 function PolarCoverage({ days, onDaysChange }) {
   const { data, loading } = useFetch(`${API_BASE}/api/coverage/polar_bins?days=${days}`)
-  const { data: envelopeData } = useFetch(`${API_BASE}/api/coverage/max_range?days=${days}`)
   const [hover, setHover] = useState(null)
   const wrapperRef = useRef(null)
 
@@ -393,34 +403,14 @@ function PolarCoverage({ days, onDaysChange }) {
 
   const rings = useMemo(() => {
     if (!maxRange) return []
-    const step = maxRange <= 200 ? 50 : maxRange <= 400 ? 100 : 200
     const out = []
-    for (let r = step; r <= maxRange; r += step) out.push(r)
+    for (let r = 25; r <= maxRange; r += 25) out.push(r)
     return out
   }, [maxRange])
 
-  const envelopePoints = useMemo(() => {
-    if (!envelopeData?.length || !maxRange) return ''
-    return [...envelopeData]
-      .sort((a, b) => a.bearing - b.bearing)
-      .map(p => {
-        const ang = (p.bearing - 90) * Math.PI / 180
-        const pr  = (p.max_range / maxRange) * R
-        return `${CX + pr * Math.cos(ang)},${CY + pr * Math.sin(ang)}`
-      })
-      .join(' ')
-  }, [envelopeData, maxRange, R])
-
-  const cardinals = [
-    { label: 'N', dx: 0,       dy: -R - 20 },
-    { label: 'E', dx: R + 20,  dy: 0 },
-    { label: 'S', dx: 0,       dy: R + 24 },
-    { label: 'W', dx: -R - 20, dy: 0 },
-  ]
-
   return (
     <Card
-      title="Polar coverage — directional heatmap, max-range envelope"
+      title="Polar coverage — directional heatmap"
       controls={<DaySelect value={days} onChange={onDaysChange} options={[7, 14, 30, 90]} />}
     >
       {loading ? <div className={styles.empty}>Loading…</div>
@@ -436,8 +426,8 @@ function PolarCoverage({ days, onDaysChange }) {
             style={{ width: '100%', maxWidth: 600, aspectRatio: '1', display: 'block', margin: '0 auto' }}
             onMouseLeave={() => setHover(null)}
           >
-            {/* Heatmap cells — one arc per (bearing sector × range band) bin */}
-            {bins.map(({ b, r, count }) => (
+            {/* Heatmap cells — one arc per (bearing sector × range band) bin, skip 360°+ wrapping */}
+            {bins.filter(({ b }) => b * sectorWidth < 360).map(({ b, r, count }) => (
               <path
                 key={`${b}-${r}`}
                 d={arcPath(CX, CY, (r / bands) * R, ((r + 1) / bands) * R,
@@ -458,35 +448,41 @@ function PolarCoverage({ days, onDaysChange }) {
                 }}
               />
             ))}
-            {/* Range rings */}
+            {/* Range rings at 25nm intervals */}
             {rings.map(r => (
               <g key={r}>
                 <circle cx={CX} cy={CY} r={(r / maxRange) * R}
                   fill="none" stroke="#21262d" strokeWidth={1} />
                 <text x={CX + 4} y={CY - (r / maxRange) * R + 14}
-                  fill="#484f58" fontSize={11} textAnchor="start">{r} nm</text>
+                  fill="#484f58" fontSize={10} textAnchor="start">{r}</text>
               </g>
             ))}
-            {/* Bearing lines */}
-            {[0, 45, 90, 135, 180, 225, 270, 315].map(b => {
-              const ang = (b - 90) * Math.PI / 180
-              return <line key={b} x1={CX} y1={CY}
+            {/* Bearing lines at 22.5° intervals */}
+            {COMPASS.map(({ deg }) => {
+              const ang = (deg - 90) * Math.PI / 180
+              return <line key={deg} x1={CX} y1={CY}
                 x2={CX + R * Math.cos(ang)} y2={CY + R * Math.sin(ang)}
                 stroke="#21262d" strokeWidth={1} />
             })}
-            {/* Cardinal labels */}
-            {cardinals.map(({ label, dx, dy }) => (
-              <text key={label} x={CX + dx} y={CY + dy}
-                fill="#8b949e" fontSize={16} fontWeight={600}
-                textAnchor="middle" dominantBaseline="middle">{label}</text>
-            ))}
-            {/* Max-range envelope */}
-            {envelopePoints && (
-              <polygon points={envelopePoints}
-                fill="none"
-                stroke="#388bfd" strokeWidth={1.5} strokeOpacity={0.8}
-                strokeLinejoin="round" />
-            )}
+            {/* 16-point compass labels */}
+            {COMPASS.map(({ label, deg }) => {
+              const rad = (deg - 90) * Math.PI / 180
+              const offset = label.length > 1 ? R + 22 : R + 18
+              const fontSize = label.length > 2 ? 9 : label.length > 1 ? 10 : 14
+              const fontWeight = label.length === 1 ? 700 : 400
+              return (
+                <text
+                  key={label}
+                  x={CX + offset * Math.cos(rad)}
+                  y={CY + offset * Math.sin(rad)}
+                  fill={label.length === 1 ? '#8b949e' : '#484f58'}
+                  fontSize={fontSize}
+                  fontWeight={fontWeight}
+                  textAnchor="middle"
+                  dominantBaseline="middle"
+                >{label}</text>
+              )
+            })}
           </svg>
           {hover && (
             <div style={{
@@ -502,16 +498,10 @@ function PolarCoverage({ days, onDaysChange }) {
           )}
           </div>
           {/* Legend */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', justifyContent: 'center', marginTop: '0.75rem', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', justifyContent: 'center', marginTop: '0.75rem' }}>
             <span style={{ fontSize: '0.72rem', color: '#484f58' }}>Few</span>
             <div style={{ background: 'linear-gradient(to right, hsl(210,80%,10%), hsl(210,80%,45%), hsl(210,80%,75%))', height: 8, borderRadius: 4, width: 120 }} />
             <span style={{ fontSize: '0.72rem', color: '#484f58' }}>Many</span>
-            {envelopePoints && (
-              <span style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.75rem', color: '#8b949e', marginLeft: '0.75rem' }}>
-                <span style={{ width: 18, height: 2, background: '#388bfd', display: 'inline-block', flexShrink: 0 }} />
-                Max range envelope
-              </span>
-            )}
           </div>
         </>
        )}
@@ -769,7 +759,7 @@ function PositionDecodeRate({ days, onDaysChange }) {
 // Page layout
 // ---------------------------------------------------------------------------
 export default function ReceiverPage({ snapshot }) {
-  const [scatterDays, setScatterDays]   = useState(7)
+  const [scatterDays, setScatterDays]   = useState(1)
   const [signalDays,  setSignalDays]    = useState(14)
   const [polarDays,   setPolarDays]     = useState(30)
   const [rangePctDays, setRangePctDays] = useState(30)

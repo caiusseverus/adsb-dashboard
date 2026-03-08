@@ -15,6 +15,7 @@ export default function StatsBar({ snapshot }) {
       )}
       <StatCard label="Aircraft Today"   value={snapshot.unique_today ?? '—'}     accent="blue"   />
       <StatCard label="Military Today"   value={snapshot.unique_today_military ?? '—'} accent="purple" />
+      <StatCard label="Total Messages"   value={(snapshot.total_messages ?? 0).toLocaleString()} accent="green"  />
     </div>
   )
 }

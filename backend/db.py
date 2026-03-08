@@ -811,7 +811,8 @@ class StatsDB:
                 WHERE date >= ?
                 ORDER BY date
             """, (cutoff,)).fetchall()
-        return [{"date": r["date"], "total": r["ac_peak"],
+        return [{"date": r["date"],
+                 "total": r["ac_civil_peak"] + r["ac_military_peak"],
                  "civil": r["ac_civil_peak"], "military": r["ac_military_peak"]}
                 for r in rows]
 
@@ -1275,13 +1276,14 @@ class StatsDB:
         return [dict(r) for r in rows]
 
     def query_unique_sightings(self, limit: int, days: int | None = None) -> list[dict]:
-        """Aircraft seen on exactly 1 distinct day within the timeframe.
-        If days is None, counts across all of daily_aircraft_seen."""
-        cutoff_date = (date.today() - timedelta(days=days)).isoformat() if days else None
-        date_filter = "WHERE date >= ?" if cutoff_date else ""
+        """Aircraft with sighting_count = 1 (seen in only one session ever).
+        Optional days filter restricts to aircraft last seen within that window."""
         params: list = []
-        if cutoff_date:
-            params.append(cutoff_date)
+        extra_where = ""
+        if days is not None:
+            cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+            extra_where = "AND ar.last_seen >= ?"
+            params.append(cutoff_ts)
         params.append(limit)
         with self._connect() as conn:
             rows = conn.execute(f"""
@@ -1290,12 +1292,6 @@ class StatsDB:
                     FROM aircraft_registry
                     WHERE type_code IS NOT NULL AND type_code != ''
                     GROUP BY type_code
-                ),
-                session_counts AS (
-                    SELECT icao, COUNT(DISTINCT date) AS days_seen
-                    FROM daily_aircraft_seen
-                    {date_filter}
-                    GROUP BY icao
                 )
                 SELECT ar.icao, ar.registration, ar.type_code, ar.type_category,
                        ar.military, ar.country, ar.operator, ar.manufacturer, ar.year,
@@ -1304,9 +1300,9 @@ class StatsDB:
                        COALESCE(tc.tc, 1)         AS type_count,
                        1.0 / COALESCE(tc.tc, 1)  AS type_rarity
                 FROM aircraft_registry ar
-                JOIN session_counts sc ON ar.icao = sc.icao
                 LEFT JOIN type_counts tc ON ar.type_code = tc.type_code
-                WHERE sc.days_seen = 1
+                WHERE ar.sighting_count = 1
+                {extra_where}
                 ORDER BY ar.last_seen DESC
                 LIMIT ?
             """, params).fetchall()

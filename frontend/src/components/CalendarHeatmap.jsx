@@ -228,7 +228,7 @@ export default function CalendarHeatmap() {
                 <div
                   key={t}
                   className={styles.legendCell}
-                  style={{ background: t === 0 ? '#21262d' : `rgba(56,139,253,${t})` }}
+                  style={{ background: cellColor(t, 1) }}
                 />
               ))}
               <span className={styles.legendLabel}>More</span>
