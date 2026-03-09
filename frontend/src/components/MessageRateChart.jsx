@@ -88,7 +88,7 @@ export default function MessageRateChart({ data }) {
           />
           <YAxis
             yAxisId="msgs"
-            tick={{ fill: '#484f58', fontSize: 11 }}
+            tick={{ fill: '#388bfd', fontSize: 11 }}
             tickLine={false}
             axisLine={false}
             width={40}

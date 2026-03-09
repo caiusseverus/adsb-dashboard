@@ -177,3 +177,90 @@
   color: #c9d1d9;
   font-variant-numeric: tabular-nums;
 }
+
+/* Debug lookup */
+.icaoInput {
+  font-family: monospace;
+  font-size: 0.95rem;
+  background: #0b0c10;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  color: #c9d1d9;
+  padding: 0.4rem 0.75rem;
+  width: 180px;
+  letter-spacing: 0.08em;
+}
+.icaoInput:focus {
+  outline: none;
+  border-color: #388bfd;
+}
+
+.lookupBtn {
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  color: #c9d1d9;
+  font-size: 0.85rem;
+  padding: 0.4rem 1rem;
+  cursor: pointer;
+}
+.lookupBtn:hover:not(:disabled) { background: #30363d; }
+.lookupBtn:disabled { opacity: 0.5; cursor: default; }
+
+.debugError {
+  font-size: 0.82rem;
+  color: #f85149;
+  margin-bottom: 0.75rem;
+}
+.debugOk {
+  font-size: 0.82rem;
+  color: #3fb950;
+  margin-bottom: 0.75rem;
+}
+
+.debugTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+.debugTable th {
+  text-align: left;
+  padding: 0.35rem 0.6rem;
+  color: #484f58;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border-bottom: 1px solid #21262d;
+  white-space: nowrap;
+}
+.debugFieldCol {
+  width: 100px;
+  min-width: 80px;
+}
+.debugFieldName {
+  color: #8b949e;
+  font-size: 0.78rem;
+  padding: 0.45rem 0.6rem;
+  white-space: nowrap;
+  border-bottom: 1px solid #1c2128;
+}
+.debugCell {
+  padding: 0.45rem 0.6rem;
+  color: #c9d1d9;
+  border-bottom: 1px solid #1c2128;
+  vertical-align: middle;
+}
+.debugRegistry {
+  background: rgba(56, 139, 253, 0.05);
+}
+.debugApplyable {
+  border-bottom: 1px dashed #388bfd55;
+  color: #c9d1d9;
+}
+.debugApplyable:hover {
+  color: #388bfd;
+  border-bottom-color: #388bfd;
+}
+.debugMissing {
+  color: #30363d;
+}

@@ -277,7 +277,8 @@ class StatsDB:
 
         # Migrate existing databases that predate signal columns in minute_stats
         with self._connect() as conn:
-            for col in ("signal_avg REAL", "signal_min REAL", "signal_max REAL"):
+            for col in ("signal_avg REAL", "signal_min REAL", "signal_max REAL",
+                        "ac_with_pos INTEGER", "ac_mlat INTEGER"):
                 try:
                     conn.execute(f"ALTER TABLE minute_stats ADD COLUMN {col}")
                 except Exception:
@@ -343,10 +344,14 @@ class StatsDB:
                 if ts <= self._last_written_ts:
                     continue
                 conn.execute(
-                    "INSERT OR REPLACE INTO minute_stats VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT OR REPLACE INTO minute_stats"
+                    " (ts,msg_min,msg_max,msg_mean,ac_total,ac_civil,ac_military,"
+                    "signal_avg,signal_min,signal_max,ac_with_pos,ac_mlat)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (ts, entry["min"], entry["max"], entry["mean"],
                      entry["ac_total"], entry["ac_civil"], entry["ac_military"],
-                     entry.get("signal_avg"), entry.get("signal_min"), entry.get("signal_max")),
+                     entry.get("signal_avg"), entry.get("signal_min"), entry.get("signal_max"),
+                     entry.get("ac_with_pos"), entry.get("ac_mlat")),
                 )
                 self._last_written_ts = ts
 
@@ -1495,11 +1500,26 @@ class StatsDB:
         return [{"date": r["day"], "pct": r["pct"]} for r in rows]
 
     def query_position_decode_rate(self, days: int) -> list[dict]:
-        """Daily average position decode rate: % of tracked aircraft per minute
-        that had a decoded position, averaged across each day."""
+        """Daily position decode breakdown: adsb_pct, mlat_pct, no_pos_pct.
+        Uses ac_with_pos/ac_mlat columns when available, else falls back to
+        coverage_samples join (pos only, no MLAT split)."""
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
         with self._connect() as conn:
-            rows = conn.execute("""
+            # New data: minutes that have the ac_with_pos column populated
+            new_rows = conn.execute("""
+                SELECT date(ts, 'unixepoch') AS day,
+                       ROUND(AVG(CASE WHEN ac_total > 0
+                             THEN ac_with_pos * 100.0 / ac_total END), 1) AS pos_pct,
+                       ROUND(AVG(CASE WHEN ac_total > 0
+                             THEN ac_mlat * 100.0 / ac_total END), 1) AS mlat_pct
+                FROM minute_stats
+                WHERE ts >= ? AND ac_with_pos IS NOT NULL AND ac_total > 0
+                GROUP BY day ORDER BY day
+            """, (cutoff,)).fetchall()
+            new_days = {r["day"] for r in new_rows}
+
+            # Legacy data: use coverage_samples join, no MLAT split
+            old_rows = conn.execute("""
                 WITH daily_ac AS (
                     SELECT date(ts, 'unixepoch') AS day,
                            SUM(ac_total)         AS total_ac_mins
@@ -1510,18 +1530,43 @@ class StatsDB:
                 daily_pos AS (
                     SELECT date(cs.ts, 'unixepoch') AS day,
                            COUNT(*)                 AS pos_ac_mins
-                    FROM coverage_samples cs
-                    INNER JOIN minute_stats ms ON ms.ts = cs.ts
-                    WHERE cs.ts >= ?
+                    FROM coverage_samples cs WHERE cs.ts >= ?
                     GROUP BY day
                 )
                 SELECT a.day,
-                       MIN(100.0, ROUND(COALESCE(p.pos_ac_mins, 0) * 100.0 / a.total_ac_mins, 1)) AS pct
+                       MIN(100.0, ROUND(COALESCE(p.pos_ac_mins, 0) * 100.0 / a.total_ac_mins, 1)) AS pos_pct
                 FROM daily_ac a
                 LEFT JOIN daily_pos p ON a.day = p.day
                 ORDER BY a.day
             """, (cutoff, cutoff)).fetchall()
-        return [{"date": r["day"], "pct": r["pct"]} for r in rows]
+
+        new_by_day = {r["day"]: {"pos_pct": r["pos_pct"], "mlat_pct": r["mlat_pct"]}
+                      for r in new_rows}
+        result = []
+        for r in old_rows:
+            day = r["day"]
+            if day in new_by_day:
+                d = new_by_day[day]
+                result.append({"date": day, "pos_pct": d["pos_pct"], "mlat_pct": d["mlat_pct"]})
+            else:
+                result.append({"date": day, "pos_pct": r["pos_pct"], "mlat_pct": None})
+        return result
+
+    def get_aircraft_registry_entry(self, icao: str) -> dict | None:
+        """Return raw aircraft_registry row as a dict, or None if not found."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM aircraft_registry WHERE icao = ?", (icao.upper(),)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def update_aircraft_field(self, icao: str, field: str, value) -> None:
+        """Overwrite a single field in aircraft_registry (field already validated by router)."""
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE aircraft_registry SET {field} = ? WHERE icao = ?",
+                (value, icao.upper()),
+            )
 
     def update_aircraft_enrichment(
         self, icao: str,

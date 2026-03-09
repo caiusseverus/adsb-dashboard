@@ -19,6 +19,7 @@ from fleet import router as fleet_router
 from coverage import router as coverage_router
 from acas import router as acas_router
 from status import router as status_router
+from debug import router as debug_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -255,6 +256,7 @@ app.include_router(fleet_router)
 app.include_router(coverage_router)
 app.include_router(acas_router)
 app.include_router(status_router)
+app.include_router(debug_router)
 
 app.add_middleware(
     CORSMiddleware,

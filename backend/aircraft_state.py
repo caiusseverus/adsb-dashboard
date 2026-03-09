@@ -364,12 +364,15 @@ class AircraftState:
                 cur_mn = cur_mx = cur_me = 0.0
             cur_total = len(self._aircraft)
             cur_mil = sum(1 for ac in self._aircraft.values() if ac.military)
+            cur_with_pos = sum(1 for ac in self._aircraft.values() if ac.lat is not None)
+            cur_mlat_pos = sum(1 for ac in self._aircraft.values() if ac.mlat and ac.lat is not None)
             cur_sigs = self._cur_min_signals
             cur_sig_avg = round(sum(cur_sigs) / len(cur_sigs), 1) if cur_sigs else None
             cur_stats = (self._cur_min, cur_mn, cur_mx, cur_me,
                          cur_total, cur_total - cur_mil, cur_mil,
                          cur_sig_avg, min(cur_sigs) if cur_sigs else None,
-                         max(cur_sigs) if cur_sigs else None)
+                         max(cur_sigs) if cur_sigs else None,
+                         cur_with_pos, cur_mlat_pos)
             rate_history = list(self._min_stats) + [cur_stats]
             df_history = list(self._min_df_stats) + [(self._cur_min, dict(self._cur_min_df_counts))]
             mlat_history = list(self._min_mlat_counts) + [(self._cur_min, self._cur_min_mlat_count)]
@@ -436,8 +439,9 @@ class AircraftState:
             "rate_history": [
                 {"minute": m, "min": mn, "max": mx, "mean": me,
                  "ac_total": t, "ac_civil": c, "ac_military": mil,
-                 "signal_avg": sa, "signal_min": sn, "signal_max": sx}
-                for m, mn, mx, me, t, c, mil, sa, sn, sx in rate_history[-60:]
+                 "signal_avg": sa, "signal_min": sn, "signal_max": sx,
+                 "ac_with_pos": wp, "ac_mlat": ml}
+                for m, mn, mx, me, t, c, mil, sa, sn, sx, wp, ml in rate_history[-60:]
             ],
             "df_history": [
                 {"minute": m, "counts": counts}
@@ -475,13 +479,15 @@ class AircraftState:
                 mn = mx = me = 0.0
             total = len(self._aircraft)
             mil = sum(1 for ac in self._aircraft.values() if ac.military)
+            with_pos = sum(1 for ac in self._aircraft.values() if ac.lat is not None)
+            mlat_pos = sum(1 for ac in self._aircraft.values() if ac.mlat and ac.lat is not None)
             sigs = self._cur_min_signals
             sig_avg = round(sum(sigs) / len(sigs), 1) if sigs else None
             sig_min = min(sigs) if sigs else None
             sig_max = max(sigs) if sigs else None
             self._min_stats.append(
                 (self._cur_min, mn, mx, me, total, total - mil, mil,
-                 sig_avg, sig_min, sig_max)
+                 sig_avg, sig_min, sig_max, with_pos, mlat_pos)
             )
             self._min_df_stats.append((self._cur_min, dict(self._cur_min_df_counts)))
             self._min_mlat_counts.append((self._cur_min, self._cur_min_mlat_count))

@@ -44,6 +44,8 @@ router = APIRouter(prefix="/api/acas")
 
 def _hex2bin(hex_str: str) -> str:
     """Convert hex string to zero-padded binary string."""
+    if not hex_str or len(hex_str) % 2 != 0:
+        raise ValueError(f"Invalid hex string length: {len(hex_str)!r}")
     n = int(hex_str, 16)
     return bin(n)[2:].zfill(len(hex_str) * 4)
 
@@ -64,7 +66,7 @@ def _decode_acas_mv(mv_bin: str, sensitivity_level: int | None = None) -> dict |
       - SL = 0 (ACAS in standby, cannot generate real RAs)
       - TTI = 3 (reserved, invalid)
     """
-    if len(mv_bin) < 54:
+    if len(mv_bin) != 56:
         return None
 
     # SL=0 → ACAS standby, no valid RA possible
@@ -101,8 +103,8 @@ def _decode_acas_mv(mv_bin: str, sensitivity_level: int | None = None) -> dict |
         ra_sense = ", ".join(parts)
         ra_corrective = True
     elif corr:
-        # Negative corrective: reduce current vertical rate
-        ra_sense = "Reduce descent" if down else "Reduce climb"
+        # Negative corrective: reduce vertical rate (down bit indicates advisory sense, not motion)
+        ra_sense = "Reduce vertical rate"
         ra_corrective = True
     else:
         # Preventive — maintain current vertical speed
@@ -130,9 +132,10 @@ def _decode_acas_mv(mv_bin: str, sensitivity_level: int | None = None) -> dict |
         if 0 < val < 0xFFFFFF:      # filter all-zeros / all-ones
             threat_icao = f"{val:06X}"
     elif tti == 2:
-        threat_alt         = int(threat_bits[0:13], 2)
-        threat_range_nm    = round(int(threat_bits[13:19], 2) * 0.1, 1)
-        threat_bearing_deg = round(int(threat_bits[19:25], 2) * 360 / 64, 1)
+        # 24-bit non-Mode-S field: 12 bits altitude, 6 bits range, 6 bits bearing
+        threat_alt         = int(threat_bits[0:12], 2)
+        threat_range_nm    = round(int(threat_bits[12:18], 2) * 0.1, 1)
+        threat_bearing_deg = round(int(threat_bits[18:24], 2) * 360 / 64, 1)
 
     return {
         "ara_active":          True,
@@ -143,7 +146,6 @@ def _decode_acas_mv(mv_bin: str, sensitivity_level: int | None = None) -> dict |
         "rac_dont_pass_above": rac_dont_pass_above,
         "rac_dont_turn_left":  rac_dont_turn_left,
         "rac_dont_turn_right": rac_dont_turn_right,
-        "rat":                 False,  # always False here (we return None for RAT=1)
         "mte":                 mte,
         "tti":                 tti,
         "threat_icao":         threat_icao,
@@ -208,6 +210,7 @@ def decode_bds30(msg: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def _fmt_row(row: dict) -> dict:
+    row = dict(row)
     row["operator_display"]        = format_operator(row.get("operator"))
     row["threat_operator_display"] = format_operator(row.get("threat_operator"))
     return row

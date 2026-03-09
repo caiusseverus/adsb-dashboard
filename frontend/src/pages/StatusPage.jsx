@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import styles from './StatusPage.module.css'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
@@ -121,6 +121,9 @@ export default function StatusPage() {
         </table>
       </div>
 
+      {/* Aircraft debug lookup */}
+      <AircraftDebug />
+
       {/* Config */}
       <div className={styles.card}>
         <div className={styles.cardHeader}>
@@ -143,6 +146,179 @@ function ConfigRow({ label, value }) {
     <div className={styles.configRow}>
       <span className={styles.configLabel}>{label}</span>
       <span className={styles.configValue}>{value}</span>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Aircraft debug lookup
+// ---------------------------------------------------------------------------
+
+const DEBUG_FIELDS = [
+  { key: 'country',       label: 'Country' },
+  { key: 'registration',  label: 'Registration' },
+  { key: 'type_code',     label: 'Type code' },
+  { key: 'operator',      label: 'Operator' },
+  { key: 'manufacturer',  label: 'Manufacturer' },
+  { key: 'year',          label: 'Year' },
+  { key: 'military',      label: 'Military' },
+]
+
+// Map each source's field names to the canonical field keys
+function extractField(source, sourceKey, field) {
+  if (!source || Object.keys(source).length === 0) return null
+  if (sourceKey === 'icao_block') {
+    return field === 'country' ? (source.country || null) : null
+  }
+  if (sourceKey === 'adsbexchange') {
+    const map = { country: null, registration: source.reg, type_code: source.icaotype,
+      operator: source.ownop, manufacturer: source.manufacturer, year: source.year,
+      military: source.mil != null ? (source.mil ? 'Yes' : 'No') : null }
+    return map[field] ?? null
+  }
+  if (sourceKey === 'hexdb') {
+    const map = { country: source.Country, registration: source.Registration,
+      type_code: source.ICAOTypeCode, operator: source.RegisteredOwners,
+      manufacturer: null, year: null, military: null }
+    return map[field] ?? null
+  }
+  if (sourceKey === 'tar1090') {
+    const map = { country: null, registration: source.Registration,
+      type_code: source.ICAOTypeCode, operator: source.RegisteredOwners,
+      manufacturer: null, year: null, military: null }
+    return map[field] ?? null
+  }
+  if (sourceKey === 'registry') {
+    const v = source[field]
+    if (field === 'military') return v != null ? (v ? 'Yes' : 'No') : null
+    return v ?? null
+  }
+  return null
+}
+
+const SOURCES = [
+  { key: 'icao_block',   label: 'ICAO block',    overrideable: false },
+  { key: 'adsbexchange', label: 'ADSBExchange',  overrideable: true  },
+  { key: 'hexdb',        label: 'hexdb.io',       overrideable: true  },
+  { key: 'tar1090',      label: 'tar1090-db',     overrideable: true  },
+  { key: 'registry',     label: 'Registry (current)', overrideable: false },
+]
+
+function AircraftDebug() {
+  const [input,    setInput]    = useState('')
+  const [result,   setResult]   = useState(null)
+  const [loading,  setLoading]  = useState(false)
+  const [error,    setError]    = useState(null)
+  const [override, setOverride] = useState(null)  // {field, value, status}
+
+  const lookup = useCallback(async () => {
+    const icao = input.trim().toUpperCase()
+    if (!/^[0-9A-F]{6}$/.test(icao)) {
+      setError('Enter a 6-character hex ICAO (e.g. 3C6444)')
+      return
+    }
+    setLoading(true); setError(null); setResult(null); setOverride(null)
+    try {
+      const r = await fetch(`${API_BASE}/api/debug/aircraft/${icao}`)
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      setResult(await r.json())
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [input])
+
+  const applyOverride = useCallback(async (field, value) => {
+    if (!result) return
+    setOverride({ field, value, status: 'saving' })
+    try {
+      const r = await fetch(`${API_BASE}/api/debug/aircraft/${result.icao}/override`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ field, value }),
+      })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      setOverride({ field, value, status: 'ok' })
+      // Refresh registry row
+      const fresh = await fetch(`${API_BASE}/api/debug/aircraft/${result.icao}`)
+      if (fresh.ok) setResult(await fresh.json())
+    } catch (e) {
+      setOverride({ field, value, status: 'error', msg: String(e) })
+    }
+  }, [result])
+
+  return (
+    <div className={styles.card}>
+      <div className={styles.cardHeader}>
+        <span className={styles.cardTitle}>Aircraft data source debug</span>
+      </div>
+      <div style={{ display: 'flex', gap: '0.6rem', marginBottom: '1.25rem', alignItems: 'center' }}>
+        <input
+          className={styles.icaoInput}
+          placeholder="ICAO hex (e.g. 3C6444)"
+          value={input}
+          onChange={e => setInput(e.target.value.toUpperCase().slice(0, 6))}
+          onKeyDown={e => e.key === 'Enter' && lookup()}
+          maxLength={6}
+          spellCheck={false}
+        />
+        <button className={styles.lookupBtn} onClick={lookup} disabled={loading}>
+          {loading ? 'Looking up…' : 'Look up'}
+        </button>
+      </div>
+
+      {error && <div className={styles.debugError}>{error}</div>}
+
+      {override?.status === 'ok' && (
+        <div className={styles.debugOk}>
+          Override saved: {override.field} = {String(override.value)}
+        </div>
+      )}
+      {override?.status === 'error' && (
+        <div className={styles.debugError}>Override failed: {override.msg}</div>
+      )}
+
+      {result && (
+        <div style={{ overflowX: 'auto' }}>
+          <table className={styles.debugTable}>
+            <thead>
+              <tr>
+                <th className={styles.debugFieldCol}>Field</th>
+                {SOURCES.map(s => <th key={s.key}>{s.label}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {DEBUG_FIELDS.map(({ key, label }) => (
+                <tr key={key}>
+                  <td className={styles.debugFieldName}>{label}</td>
+                  {SOURCES.map(src => {
+                    const val = extractField(result[src.key], src.key, key)
+                    const isRegistry = src.key === 'registry'
+                    const canOverride = src.overrideable && val && !isRegistry
+                    return (
+                      <td key={src.key}
+                        className={`${styles.debugCell} ${isRegistry ? styles.debugRegistry : ''}`}
+                        title={canOverride ? `Click to apply "${val}" to registry` : undefined}
+                        style={{ cursor: canOverride ? 'pointer' : 'default' }}
+                        onClick={canOverride ? () => applyOverride(key, val) : undefined}
+                      >
+                        {val != null
+                          ? <span className={canOverride ? styles.debugApplyable : undefined}>{String(val)}</span>
+                          : <span className={styles.debugMissing}>—</span>
+                        }
+                      </td>
+                    )
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div style={{ marginTop: '0.6rem', fontSize: '0.72rem', color: '#484f58' }}>
+            Click a value in any source column to write it to the registry.
+          </div>
+        </div>
+      )}
     </div>
   )
 }
