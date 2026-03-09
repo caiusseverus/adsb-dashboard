@@ -399,15 +399,19 @@ class StatsDB:
         self.recalculate_type_rarity()
 
     def _upsert_aircraft(self, conn: sqlite3.Connection, ac: dict, now_ts: int) -> None:
+        home = (config.HOME_COUNTRY or "").lower()
         foreign_mil = bool(
-            ac.get("military")
-            and config.HOME_COUNTRY
-            and ac.get("country")
-            and ac["country"].lower() != config.HOME_COUNTRY.lower()
+            ac.get("military") and home and ac.get("country")
+            and ac["country"].lower() != home
         )
         interesting = bool(
             ac.get("type_code") and ac["type_code"].upper() in INTERESTING_TYPE_CODES
         )
+        # On UPDATE, country is kept from registry for military aircraft (their serials
+        # don't follow civil prefix rules, so a stale live-state value must not overwrite
+        # a manually corrected entry).  foreign_military is recomputed from whichever
+        # country value will actually be stored, so a stale live-state country cannot
+        # flip it back to the wrong value.
         conn.execute("""
             INSERT INTO aircraft_registry
                 (icao, first_seen, last_seen, sighting_count,
@@ -423,8 +427,18 @@ class StatsDB:
                 type_code        = COALESCE(excluded.type_code, type_code),
                 type_category    = COALESCE(excluded.type_category, type_category),
                 military         = excluded.military,
-                country          = COALESCE(excluded.country, country),
-                foreign_military = excluded.foreign_military,
+                country          = CASE
+                    WHEN excluded.military = 1 AND country IS NOT NULL THEN country
+                    ELSE COALESCE(excluded.country, country) END,
+                foreign_military = CASE
+                    WHEN excluded.military = 0 THEN 0
+                    WHEN ? = '' THEN 0
+                    ELSE CASE
+                        WHEN LOWER(CASE
+                            WHEN excluded.military = 1 AND country IS NOT NULL THEN country
+                            ELSE COALESCE(excluded.country, country) END) != ?
+                        THEN 1 ELSE 0 END
+                    END,
                 interesting      = excluded.interesting,
                 lat              = COALESCE(excluded.lat, lat),
                 lon              = COALESCE(excluded.lon, lon),
@@ -438,6 +452,8 @@ class StatsDB:
             int(foreign_mil), int(interesting),
             ac.get("lat"), ac.get("lon"),
             ac.get("operator"), ac.get("manufacturer"), ac.get("year"),
+            # extra params for foreign_military recomputation in UPDATE path:
+            home, home,
         ))
 
     # ------------------------------------------------------------------
@@ -1561,12 +1577,27 @@ class StatsDB:
             return dict(row) if row else None
 
     def update_aircraft_field(self, icao: str, field: str, value) -> None:
-        """Overwrite a single field in aircraft_registry (field already validated by router)."""
+        """Overwrite a single field in aircraft_registry (field already validated by router).
+        When country or military changes, foreign_military is recalculated immediately."""
+        icao = icao.upper()
         with self._connect() as conn:
             conn.execute(
                 f"UPDATE aircraft_registry SET {field} = ? WHERE icao = ?",
-                (value, icao.upper()),
+                (value, icao),
             )
+            # Recalculate foreign_military whenever country or military changes
+            if field in ("country", "military"):
+                home = (config.HOME_COUNTRY or "").lower()
+                conn.execute("""
+                    UPDATE aircraft_registry
+                    SET foreign_military = CASE
+                        WHEN military = 1
+                             AND ? != ''
+                             AND country IS NOT NULL
+                             AND LOWER(country) != ?
+                        THEN 1 ELSE 0 END
+                    WHERE icao = ?
+                """, (home, home, icao))
 
     def update_aircraft_enrichment(
         self, icao: str,
