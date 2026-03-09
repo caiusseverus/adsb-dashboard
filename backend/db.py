@@ -1356,8 +1356,9 @@ class StatsDB:
                 return []
         return [{"date": r["date"], "value": r["value"]} for r in rows]
 
-    def query_polar_bins(self, days: int, bearing_sectors: int = 36, range_bands: int = 10) -> dict:
+    def query_polar_bins(self, days: int, bearing_sectors: int = 32) -> dict:
         """Bin coverage samples into a polar grid for heatmap rendering.
+        Range bands are always 25 nm wide so they align with the ring labels.
         Returns aggregated cell counts rather than individual points."""
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
         sector_width = 360.0 / bearing_sectors
@@ -1366,8 +1367,8 @@ class StatsDB:
                 "SELECT COUNT(*) FROM coverage_samples WHERE ts >= ?", (cutoff,)
             ).fetchone()[0]
             if not total_samples:
-                return {"bins": [], "max_range": 0, "band_nm": 0,
-                        "sectors": bearing_sectors, "bands": range_bands}
+                return {"bins": [], "max_range": 0, "band_nm": 25,
+                        "sectors": bearing_sectors, "bands": 0}
             # Use 95th percentile of range to exclude bogus outlier decodes
             p95_offset = max(0, int(0.95 * total_samples) - 1)
             max_range_row = conn.execute(
@@ -1376,12 +1377,13 @@ class StatsDB:
                 (cutoff, p95_offset)
             ).fetchone()[0]
             if not max_range_row:
-                return {"bins": [], "max_range": 0, "band_nm": 0,
-                        "sectors": bearing_sectors, "bands": range_bands}
-            # Round up to nearest 50 nm for clean ring labels
+                return {"bins": [], "max_range": 0, "band_nm": 25,
+                        "sectors": bearing_sectors, "bands": 0}
             import math
-            max_range = math.ceil(max_range_row / 50) * 50
-            band_nm = max_range / range_bands
+            # Round up to nearest 25 nm so bands align exactly with ring labels
+            band_nm = 25
+            max_range = math.ceil(max_range_row / band_nm) * band_nm
+            range_bands = max_range // band_nm
             rows = conn.execute("""
                 SELECT CAST(bearing_deg / ? AS INTEGER)  AS b,
                        CAST(range_nm    / ? AS INTEGER)  AS r,

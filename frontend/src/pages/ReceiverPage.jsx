@@ -371,22 +371,14 @@ function binColour(count, maxCount) {
 }
 
 const COMPASS = [
-  { label: 'N',    deg: 0      }, { label: 'NbE',  deg: 11.25 },
-  { label: 'NNE',  deg: 22.5  }, { label: 'NEbN', deg: 33.75 },
-  { label: 'NE',   deg: 45    }, { label: 'NEbE', deg: 56.25 },
-  { label: 'ENE',  deg: 67.5  }, { label: 'EbN',  deg: 78.75 },
-  { label: 'E',    deg: 90    }, { label: 'EbS',  deg: 101.25},
-  { label: 'ESE',  deg: 112.5 }, { label: 'SEbE', deg: 123.75},
-  { label: 'SE',   deg: 135   }, { label: 'SEbS', deg: 146.25},
-  { label: 'SSE',  deg: 157.5 }, { label: 'SbE',  deg: 168.75},
-  { label: 'S',    deg: 180   }, { label: 'SbW',  deg: 191.25},
-  { label: 'SSW',  deg: 202.5 }, { label: 'SWbS', deg: 213.75},
-  { label: 'SW',   deg: 225   }, { label: 'SWbW', deg: 236.25},
-  { label: 'WSW',  deg: 247.5 }, { label: 'WbS',  deg: 258.75},
-  { label: 'W',    deg: 270   }, { label: 'WbN',  deg: 281.25},
-  { label: 'WNW',  deg: 292.5 }, { label: 'NWbW', deg: 303.75},
-  { label: 'NW',   deg: 315   }, { label: 'NWbN', deg: 326.25},
-  { label: 'NNW',  deg: 337.5 }, { label: 'NbW',  deg: 348.75},
+  { label: 'N',   deg: 0     }, { label: 'NNE', deg: 22.5  },
+  { label: 'NE',  deg: 45    }, { label: 'ENE', deg: 67.5  },
+  { label: 'E',   deg: 90    }, { label: 'ESE', deg: 112.5 },
+  { label: 'SE',  deg: 135   }, { label: 'SSE', deg: 157.5 },
+  { label: 'S',   deg: 180   }, { label: 'SSW', deg: 202.5 },
+  { label: 'SW',  deg: 225   }, { label: 'WSW', deg: 247.5 },
+  { label: 'W',   deg: 270   }, { label: 'WNW', deg: 292.5 },
+  { label: 'NW',  deg: 315   }, { label: 'NNW', deg: 337.5 },
 ]
 
 function PolarCoverage({ days, onDaysChange }) {
@@ -472,23 +464,18 @@ function PolarCoverage({ days, onDaysChange }) {
                 x2={CX + R * Math.cos(ang)} y2={CY + R * Math.sin(ang)}
                 stroke="#21262d" strokeWidth={1} />
             })}
-            {/* 32-point compass labels */}
+            {/* 16-point compass labels */}
             {COMPASS.map(({ label, deg }) => {
               const rad = (deg - 90) * Math.PI / 180
-              const isCardinal  = label.length === 1                        // N E S W
-              const isOrdinal   = label.length === 2                        // NE SE SW NW
-              const isHalf      = label.length === 3 && !label.includes('b') // NNE ENE etc
-              const isByPoint   = label.includes('b')                       // NbE NEbN etc
-              const offset      = isCardinal ? R + 16 : isOrdinal ? R + 20 : isHalf ? R + 22 : R + 26
-              const fontSize    = isCardinal ? 13 : isOrdinal ? 10 : isHalf ? 8.5 : 7
-              const fontWeight  = isCardinal ? 700 : 400
-              const fill        = isCardinal ? '#8b949e' : isOrdinal ? '#6e7681' : isHalf ? '#484f58' : '#30363d'
+              const offset = label.length > 1 ? R + 22 : R + 18
+              const fontSize = label.length > 2 ? 9 : label.length > 1 ? 10 : 14
+              const fontWeight = label.length === 1 ? 700 : 400
               return (
                 <text
                   key={label}
                   x={CX + offset * Math.cos(rad)}
                   y={CY + offset * Math.sin(rad)}
-                  fill={fill}
+                  fill={label.length === 1 ? '#8b949e' : '#484f58'}
                   fontSize={fontSize}
                   fontWeight={fontWeight}
                   textAnchor="middle"
