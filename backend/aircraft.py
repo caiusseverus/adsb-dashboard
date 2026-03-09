@@ -100,19 +100,31 @@ async def aircraft_detail(icao: str) -> dict:
     )
 
     # --- Country + military ---
-    # Prefer registration-derived country (most accurate for GA), fall back to ICAO block
-    result["country"] = (
-        country_from_registration(result.get("registration"))
-        or (live and live.get("country"))
-        or (row and row.get("country"))
-        or country
-        or None
-    )
-    result["military"] = bool(
+    is_military = bool(
         (live and live.get("military"))
         or (row and row.get("military"))
         or military
     )
+    result["military"] = is_military
+
+    if is_military:
+        # Military serials don't follow civil registration prefix conventions
+        # (e.g. RAF ZK341 starts with 'ZK' but is NOT New Zealand).
+        # Prefer the registry value — it may have been manually corrected.
+        result["country"] = (
+            (row and row.get("country"))
+            or (live and live.get("country"))
+            or country
+            or None
+        )
+    else:
+        result["country"] = (
+            country_from_registration(result.get("registration"))
+            or (live and live.get("country"))
+            or (row and row.get("country"))
+            or country
+            or None
+        )
 
     # --- Year ---
     result["year"] = (live and live.get("year")) or (adsbx and adsbx.get("year")) or None
