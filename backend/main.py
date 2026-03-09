@@ -236,6 +236,16 @@ async def lifespan(app: FastAPI):
     if config.GHOST_FILTER_MSGS > 0:
         await asyncio.to_thread(stats_db.purge_ghost_aircraft)
 
+    # Correct country/foreign_military for all military aircraft using ICAO block.
+    # Repairs entries written before the registration-prefix bug was fixed.
+    mil_icaos = await asyncio.to_thread(stats_db.query_military_icaos)
+    corrections = {
+        icao: enrichment.db.get_country_by_icao(icao)
+        for icao in mil_icaos
+        if enrichment.db.get_country_by_icao(icao)
+    }
+    await asyncio.to_thread(stats_db.fix_military_countries, corrections, config.HOME_COUNTRY)
+
     asyncio.create_task(_beast_runner())
     for name, host, port in config.MLAT_SERVERS:
         asyncio.create_task(_mlat_runner(name, host, port))

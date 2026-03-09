@@ -427,16 +427,12 @@ class StatsDB:
                 type_code        = COALESCE(excluded.type_code, type_code),
                 type_category    = COALESCE(excluded.type_category, type_category),
                 military         = excluded.military,
-                country          = CASE
-                    WHEN excluded.military = 1 AND country IS NOT NULL THEN country
-                    ELSE COALESCE(excluded.country, country) END,
+                country          = COALESCE(excluded.country, country),
                 foreign_military = CASE
                     WHEN excluded.military = 0 THEN 0
                     WHEN ? = '' THEN 0
                     ELSE CASE
-                        WHEN LOWER(CASE
-                            WHEN excluded.military = 1 AND country IS NOT NULL THEN country
-                            ELSE COALESCE(excluded.country, country) END) != ?
+                        WHEN LOWER(COALESCE(excluded.country, country)) != ?
                         THEN 1 ELSE 0 END
                     END,
                 interesting      = excluded.interesting,
@@ -1567,6 +1563,27 @@ class StatsDB:
             else:
                 result.append({"date": day, "pos_pct": r["pos_pct"], "mlat_pct": None})
         return result
+
+    def query_military_icaos(self) -> list[str]:
+        """Return all ICAO addresses flagged military in the registry."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT icao FROM aircraft_registry WHERE military = 1"
+            ).fetchall()
+            return [r["icao"] for r in rows]
+
+    def fix_military_countries(self, corrections: dict, home_country: str) -> None:
+        """Bulk-update country and foreign_military for military aircraft using ICAO block data.
+        Called at startup to repair entries written before the registration-prefix bug was fixed."""
+        home = (home_country or "").lower()
+        with self._connect() as conn:
+            for icao, country in corrections.items():
+                foreign_mil = int(bool(home and country and country.lower() != home))
+                conn.execute(
+                    "UPDATE aircraft_registry SET country = ?, foreign_military = ? WHERE icao = ?",
+                    (country, foreign_mil, icao),
+                )
+        log.info("DB: corrected country/foreign_military for %d military aircraft", len(corrections))
 
     def get_aircraft_registry_entry(self, icao: str) -> dict | None:
         """Return raw aircraft_registry row as a dict, or None if not found."""
