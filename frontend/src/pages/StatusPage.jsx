@@ -197,7 +197,7 @@ function extractField(source, sourceKey, field) {
 }
 
 const SOURCES = [
-  { key: 'icao_block',   label: 'ICAO block',    overrideable: false },
+  { key: 'icao_block',   label: 'ICAO block',    overrideable: true  },
   { key: 'adsbexchange', label: 'ADSBExchange',  overrideable: true  },
   { key: 'hexdb',        label: 'hexdb.io',       overrideable: true  },
   { key: 'tar1090',      label: 'tar1090-db',     overrideable: true  },

@@ -565,8 +565,10 @@ class AircraftState:
             else:
                 op_source = "queued"
 
-            # Registration prefix overrides ICAO-block country (more accurate for GA)
-            if ac.registration:
+            # Registration prefix overrides ICAO-block country (more accurate for GA).
+            # Skip for military aircraft — their serials don't follow civil prefix
+            # conventions (e.g. RAF ZK341 starts with 'ZK' but is NOT New Zealand).
+            if ac.registration and not ac.military:
                 reg_country = country_from_registration(ac.registration)
                 if reg_country:
                     ac.country = reg_country
