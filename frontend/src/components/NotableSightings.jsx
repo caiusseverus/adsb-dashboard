@@ -1,8 +1,9 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import styles from './NotableSightings.module.css'
 import { formatOperator } from '../utils/formatOperator'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
+const PAGE_SIZE = 50
 
 function flagScore(ac) {
   return (ac.foreign_military ? 8 : 0) + (ac.interesting ? 4 : 0) +
@@ -10,21 +11,23 @@ function flagScore(ac) {
 }
 
 const COLUMNS = [
-  { key: 'icao',          label: 'ICAO',       cmp: (a, b) => a.icao.localeCompare(b.icao) },
-  { key: 'registration',  label: 'Reg',        cmp: (a, b) => (a.registration ?? '').localeCompare(b.registration ?? '') },
-  { key: 'type_code',     label: 'Type',       cmp: (a, b) => (a.type_code ?? '').localeCompare(b.type_code ?? '') },
-  { key: 'operator',      label: 'Operator',   cmp: (a, b) => (formatOperator(a.operator) ?? '').localeCompare(formatOperator(b.operator) ?? '') },
-  { key: 'year',          label: 'Year',       cmp: (a, b) => (a.year ?? '').localeCompare(b.year ?? '') },
-  { key: 'country',       label: 'Country',    cmp: (a, b) => (a.country ?? '').localeCompare(b.country ?? '') },
-  { key: 'flags',         label: 'Flags',      cmp: (a, b) => flagScore(b) - flagScore(a) },
-  { key: 'first_seen',    label: 'First seen', cmp: (a, b) => (a.first_seen ?? 0) - (b.first_seen ?? 0) },
-  { key: 'last_seen',     label: 'Last seen',  cmp: (a, b) => (a.last_seen ?? 0) - (b.last_seen ?? 0) },
-  { key: 'sighting_count',label: 'Sessions',   cmp: (a, b) => (a.sighting_count ?? 0) - (b.sighting_count ?? 0) },
+  { key: 'icao',          label: 'ICAO'       },
+  { key: 'registration',  label: 'Reg'        },
+  { key: 'type_code',     label: 'Type'       },
+  { key: 'operator',      label: 'Operator'   },
+  { key: 'year',          label: 'Year'       },
+  { key: 'country',       label: 'Country'    },
+  { key: 'flags',         label: 'Flags'      },
+  { key: 'first_seen',    label: 'First seen' },
+  { key: 'last_seen',     label: 'Last seen'  },
+  { key: 'sighting_count',label: 'Sessions'   },
 ]
 
 const FLAGS = [
   { value: 'all',              label: 'All notable' },
+  { value: 'all_aircraft',     label: 'All aircraft' },
   { value: 'foreign_military', label: 'Foreign military' },
+  { value: 'home_military',    label: 'Home military' },
   { value: 'interesting',      label: 'Interesting' },
   { value: 'rare',             label: 'Rare' },
   { value: 'unique_sighting',  label: 'Unique' },
@@ -55,11 +58,11 @@ function FlagBadge({ label, color }) {
 
 function AircraftRow({ ac, onSelectIcao }) {
   const flags = []
-  if (ac.foreign_military) flags.push(<FlagBadge key="fm"      label="Foreign Military" color="#f85149" />)
-  if (ac.interesting)      flags.push(<FlagBadge key="int"     label="Interesting"      color="#d29922" />)
-  if (ac.rare)             flags.push(<FlagBadge key="rare"    label="Rare"             color="#bc8cff" />)
+  if (ac.foreign_military) flags.push(<FlagBadge key="fm"     label="Foreign Military" color="#f85149" />)
+  if (ac.interesting)      flags.push(<FlagBadge key="int"    label="Interesting"      color="#d29922" />)
+  if (ac.rare)             flags.push(<FlagBadge key="rare"   label="Rare"             color="#bc8cff" />)
   if (ac.sighting_count === 1 || ac.first_seen_flag)
-                           flags.push(<FlagBadge key="unique"  label="Unique"           color="#3fb950" />)
+                           flags.push(<FlagBadge key="unique" label="Unique"           color="#3fb950" />)
 
   return (
     <tr
@@ -86,41 +89,81 @@ function AircraftRow({ ac, onSelectIcao }) {
 }
 
 export default function NotableSightings({ onSelectIcao, refreshKey }) {
-  const [flag, setFlag] = useState('all')
-  const [days, setDays] = useState(30)
-  const [data, setData] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [sortKey, setSortKey] = useState('last_seen')
-  const [sortAsc, setSortAsc] = useState(false)
+  const [flag, setFlag]         = useState('all')
+  const [days, setDays]         = useState(1)
+  const [typeInput, setTypeInput] = useState('')
+  const [typeFilter, setTypeFilter] = useState('')
+  const [typeOptions, setTypeOptions] = useState([])
+  const [data, setData]         = useState([])
+  const [total, setTotal]       = useState(0)
+  const [loading, setLoading]   = useState(true)
+  const [page, setPage]         = useState(0)
+  const [sortKey, setSortKey]   = useState('last_seen')
+  const [sortAsc, setSortAsc]   = useState(false)
+
+  // Fetch type options once on mount
+  useEffect(() => {
+    fetch(`${API_BASE}/api/history/heatmap/options`)
+      .then(r => r.json())
+      .then(d => setTypeOptions([...( d.types ?? [])].sort()))
+      .catch(() => {})
+  }, [])
+
+  // Reset page to 0 when any filter or sort changes
+  const fetchKey = `${flag}|${days}|${typeFilter}|${sortKey}|${sortAsc}`
+  const prevFetchKey = useRef(fetchKey)
+  useEffect(() => {
+    if (prevFetchKey.current !== fetchKey) {
+      setPage(0)
+      prevFetchKey.current = fetchKey
+    }
+  }, [fetchKey])
 
   useEffect(() => {
     setLoading(true)
-    const daysParam = days != null ? `&days=${days}` : ''
-    fetch(`${API_BASE}/api/history/notable?flag=${flag}&limit=200${daysParam}`)
+    const daysParam   = days != null ? `&days=${days}` : ''
+    const typeParam   = typeFilter   ? `&type_code=${encodeURIComponent(typeFilter)}` : ''
+    const sortParam   = `&sort_col=${sortKey}&sort_dir=${sortAsc ? 'asc' : 'desc'}`
+    const offsetParam = `&offset=${page * PAGE_SIZE}`
+    fetch(`${API_BASE}/api/history/notable?flag=${flag}&limit=${PAGE_SIZE}${offsetParam}${daysParam}${typeParam}${sortParam}`)
       .then(r => r.json())
-      .then(d => { setData(d); setLoading(false) })
+      .then(d => {
+        setData(d.items ?? [])
+        setTotal(d.total ?? 0)
+        setLoading(false)
+      })
       .catch(() => setLoading(false))
-  }, [flag, days, refreshKey])
+  }, [flag, days, typeFilter, page, sortKey, sortAsc, refreshKey])
 
   function handleSort(key) {
     if (key === sortKey) setSortAsc(v => !v)
     else { setSortKey(key); setSortAsc(key === 'last_seen' ? false : true) }
   }
 
-  const sorted = useMemo(() => {
-    const col = COLUMNS.find(c => c.key === sortKey)
-    if (!col) return data
-    return [...data].sort((a, b) => sortAsc ? col.cmp(a, b) : col.cmp(b, a))
-  }, [data, sortKey, sortAsc])
+  function applyType(val) {
+    const v = val.trim().toUpperCase()
+    setTypeFilter(v)
+    setTypeInput(v)
+  }
+
+  function clearType() {
+    setTypeFilter('')
+    setTypeInput('')
+  }
+
+  const totalPages  = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const showingFrom = total === 0 ? 0 : page * PAGE_SIZE + 1
+  const showingTo   = Math.min((page + 1) * PAGE_SIZE, total)
 
   return (
     <div className={styles.container}>
       <div className={styles.header}>
         <div className={styles.titleRow}>
           <span className={styles.heading}>Notable Sightings</span>
-          <span className={styles.count}>{data.length}</span>
+          <span className={styles.count}>{total.toLocaleString()}</span>
         </div>
         <div className={styles.controls}>
+          {/* Category flag buttons */}
           {FLAGS.map(f => (
             <button
               key={f.value}
@@ -128,7 +171,34 @@ export default function NotableSightings({ onSelectIcao, refreshKey }) {
               onClick={() => setFlag(f.value)}
             >{f.label}</button>
           ))}
+
           <div className={styles.sep} />
+
+          {/* Type filter — datalist autocomplete matching the heatmap */}
+          <div className={styles.searchGroup}>
+            <input
+              className={styles.searchInput}
+              list="notable-type-list"
+              placeholder="Filter by type…"
+              value={typeInput}
+              onChange={e => setTypeInput(e.target.value)}
+              onBlur={e => { if (e.target.value) applyType(e.target.value) }}
+              onKeyDown={e => {
+                if (e.key === 'Enter') applyType(e.target.value)
+                if (e.key === 'Escape') clearType()
+              }}
+            />
+            <datalist id="notable-type-list">
+              {typeOptions.map(t => <option key={t} value={t} />)}
+            </datalist>
+            {typeFilter && (
+              <button className={styles.clearBtn} onClick={clearType} title="Clear type filter">×</button>
+            )}
+          </div>
+
+          <div className={styles.sep} />
+
+          {/* Timeframe buttons */}
           {TIMEFRAMES.map(t => (
             <button
               key={String(t.value)}
@@ -141,28 +211,40 @@ export default function NotableSightings({ onSelectIcao, refreshKey }) {
 
       {loading ? (
         <div className={styles.empty}>Loading…</div>
-      ) : data.length === 0 ? (
-        <div className={styles.empty}>No notable aircraft recorded yet.</div>
+      ) : total === 0 ? (
+        <div className={styles.empty}>No aircraft match the selected filters.</div>
       ) : (
-        <div className={styles.scrollWrap}>
-          <table className={styles.table}>
-            <thead>
-              <tr>
-                {COLUMNS.map(({ key, label }) => (
-                  <th key={key} className={styles.sortable} onClick={() => handleSort(key)}>
-                    {label}
-                    <span className={styles.sortIcon}>
-                      {sortKey === key ? (sortAsc ? ' ▲' : ' ▼') : ' ⇅'}
-                    </span>
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {sorted.map(ac => <AircraftRow key={ac.icao} ac={ac} onSelectIcao={onSelectIcao} />)}
-            </tbody>
-          </table>
-        </div>
+        <>
+          <div className={styles.scrollWrap}>
+            <table className={styles.table}>
+              <thead>
+                <tr>
+                  {COLUMNS.map(({ key, label }) => (
+                    <th key={key} className={styles.sortable} onClick={() => handleSort(key)}>
+                      {label}
+                      <span className={styles.sortIcon}>
+                        {sortKey === key ? (sortAsc ? ' ▲' : ' ▼') : ' ⇅'}
+                      </span>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {data.map(ac => <AircraftRow key={ac.icao} ac={ac} onSelectIcao={onSelectIcao} />)}
+              </tbody>
+            </table>
+          </div>
+
+          {totalPages > 1 && (
+            <div className={styles.pagination}>
+              <button className={styles.pageBtn} onClick={() => setPage(0)} disabled={page === 0}>«</button>
+              <button className={styles.pageBtn} onClick={() => setPage(p => p - 1)} disabled={page === 0}>‹</button>
+              <span className={styles.pageInfo}>{showingFrom}–{showingTo} of {total.toLocaleString()}</span>
+              <button className={styles.pageBtn} onClick={() => setPage(p => p + 1)} disabled={page >= totalPages - 1}>›</button>
+              <button className={styles.pageBtn} onClick={() => setPage(totalPages - 1)} disabled={page >= totalPages - 1}>»</button>
+            </div>
+          )}
+        </>
       )}
     </div>
   )

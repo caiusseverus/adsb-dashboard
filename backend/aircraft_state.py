@@ -6,6 +6,7 @@ import math
 import time
 import threading
 import logging
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import date
@@ -13,6 +14,7 @@ from typing import Optional
 
 import pyModeS as pms
 
+import acas as acas_decoder
 import config
 import enrichment
 from db import INTERESTING_TYPE_CODES
@@ -21,6 +23,15 @@ from utils import country_from_registration
 log = logging.getLogger(__name__)
 
 _R_NM = 3440.065  # Earth radius in nautical miles
+# Beast timestamp value used by mlat-client for all synthesized positions.
+# Bytes: FF 00 4D 4C 41 54  ("FF00" + "MLAT" in ASCII).
+# Aggregators recognise this as non-real so they don't ingest MLAT positions as ADS-B.
+# We use it as ground truth: any Beast frame with this timestamp is MLAT-derived,
+# regardless of which TCP stream delivered it.
+_MLAT_TS_MARKER: int = int.from_bytes(b'\xff\x00MLAT', 'big')  # 0xFF004D4C4154
+_ICAO_HEX_RE = re.compile(r"^[0-9A-F]{6}$")
+_ACAS_CONFIRM_WINDOW_S = 12
+_ACAS_MIN_CONFIRM_FRAMES = 2
 
 def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """True bearing from (lat1,lon1) to (lat2,lon2) in degrees (0=N, 90=E)."""
@@ -40,17 +51,17 @@ def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 def _log_enrichment(icao: str, ac, adsbx: dict | None, op_source: str) -> None:
     log.info(
-        "[enrichment] NEW %-8s  reg=%-8s type=%-6s year=%-4s  adsbx=%-4s  "
-        "operator=%s [%s]  country=%s  mil=%s",
+        "[enrich] %-8s  NEW     adsbx=%-4s  reg=%-9s type=%-6s year=%-4s  "
+        "op=%-30s [%s]  country=%-4s  mil=%s",
         icao,
+        "hit" if adsbx else "miss",
         ac.registration or "—",
         ac.type_code or "—",
         ac.year or "—",
-        "hit" if adsbx else "miss",
         repr(ac.operator) if ac.operator else "—",
         op_source,
         ac.country or "—",
-        ac.military,
+        "Y" if ac.military else "N",
     )
 
 
@@ -129,6 +140,19 @@ class Aircraft:
     cpr_even: Optional[tuple] = field(default=None, repr=False)   # (raw_msg, timestamp)
     cpr_odd:  Optional[tuple] = field(default=None, repr=False)
     sighting_count: int = 1               # from aircraft_registry; 1 = unique (never seen before)
+    # MLAT
+    has_adsb: bool = False               # True once a DF17 WITHOUT the MLAT timestamp is seen
+                                         # (guarantees a real ADS-B transponder; blocks MLAT tag)
+    mlat: bool = False                    # True if position is MLAT-derived (timestamp-confirmed)
+    mlat_source: Optional[str] = None    # name of the MLAT server that established the position
+    mlat_msg_count: int = 0              # Beast frames with the MLAT timestamp marker
+    # ACAS/TCAS fields
+    acas_ra_active:     bool           = False
+    acas_ra_desc:       Optional[str]  = None
+    acas_ra_corrective: bool           = False
+    acas_sensitivity:   Optional[int]  = None
+    acas_threat_icao:   Optional[str]  = None
+    acas_ra_ts:         Optional[float]= None
 
 
 class AircraftState:
@@ -154,7 +178,21 @@ class AircraftState:
         self._min_df_stats: deque[tuple] = deque(maxlen=60)  # (minute, df_counts_dict)
 
         self._total: int = 0
+        # MLAT stats (parallel to the regular per-sec/per-min counters)
+        self._mlat_total: int = 0
+        self._cur_sec_mlat_count: int = 0
+        self._mlat_sec_counts: deque[tuple[int, int]] = deque(maxlen=60)
+        self._cur_min_mlat_count: int = 0
+        self._min_mlat_counts: deque[tuple[int, int]] = deque(maxlen=60)  # (minute, count)
+
         self._hexdb_queue: set[str] = set()  # ICAOs awaiting hexdb.io operator lookup
+
+        # ACAS event queue: drained by main._db_writer() every minute
+        self._pending_acas_events: deque[dict] = deque(maxlen=500)
+        self._last_acas_ts: dict[str, tuple[float, str]] = {}  # icao → (ts, ra_desc)
+        # Require repeated matching DF16 RA frames before persisting an event;
+        # suppresses single-frame parity/noise artefacts.
+        self._acas_candidates: dict[str, tuple[str, float, int]] = {}  # icao -> (signature, ts, count)
 
         # Unique aircraft seen today (resets at midnight; seeded from DB on startup)
         self._today_date: str = date.today().isoformat()
@@ -168,15 +206,42 @@ class AircraftState:
     # Public API
     # ------------------------------------------------------------------
 
-    def process_message(self, msg: dict) -> None:
+    def process_message(self, msg: dict, mlat_source: Optional[str] = None) -> None:
+        """Process a decoded Beast message.
+
+        mlat_source: name of the MLAT server this message came from, or None for
+        the primary Beast stream.
+
+        MLAT detection uses the Beast timestamp marker (0xFF004D4C4154) as ground
+        truth.  This works on any stream — including the regular port 30005 feed
+        where readsb echoes synthesized MLAT positions back.  ADS-B frames forwarded
+        by the mlat-client carry their original real timestamp and are NOT tagged MLAT.
+        """
         raw: str = msg["raw"]
         signal: int = msg.get("signal", 0)
+        timestamp: int = msg.get("timestamp", 0)
         now = time.time()
+
+        # Timestamp-based MLAT detection: definitive regardless of stream.
+        if timestamp == _MLAT_TS_MARKER:
+            # Synthesized MLAT frame — keep the supplied source name, or fall back
+            # to "mlat" for frames detected on the regular stream via timestamp only.
+            if mlat_source is None:
+                mlat_source = "mlat"
+        else:
+            # Real timestamp → genuine ADS-B (or Mode-S without position).
+            # Clear any stream-level MLAT hint: the mlat-client forwards real ADS-B
+            # frames with their original timestamps, so stream origin is not reliable.
+            mlat_source = None
+
+        mlat = mlat_source is not None
 
         with self._lock:
             self._total += 1
-            self._tick(now)
-            self._decode(raw, signal, now)
+            if mlat:
+                self._mlat_total += 1
+            self._tick(now, mlat=mlat)
+            self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
 
     def expire_aircraft(self) -> None:
         now = time.time()
@@ -218,6 +283,13 @@ class AircraftState:
             self._hexdb_queue -= batch
             return batch
 
+    def pop_acas_events(self) -> list[dict]:
+        """Return and clear all pending ACAS events (called every minute by db writer)."""
+        with self._lock:
+            evts = list(self._pending_acas_events)
+            self._pending_acas_events.clear()
+            return evts
+
     def get_aircraft_live(self, icao: str) -> dict | None:
         """Return a point-in-time snapshot of a single aircraft, or None if not tracked."""
         now = time.time()
@@ -253,8 +325,16 @@ class AircraftState:
                 "heading_deg":      ac.heading_deg,
                 "vertical_rate_fpm": ac.vertical_rate_fpm,
                 "mach":             ac.mach,
-                "selected_alt":     ac.selected_alt,
-                "sighting_count":   ac.sighting_count,
+                "selected_alt":       ac.selected_alt,
+                "sighting_count":  ac.sighting_count,
+                "mlat":            ac.mlat,
+                "mlat_source":       ac.mlat_source,
+                "mlat_msg_count":    ac.mlat_msg_count,
+                "acas_ra_active":     ac.acas_ra_ts is not None and (now - ac.acas_ra_ts) < 60,
+                "acas_ra_desc":       ac.acas_ra_desc,
+                "acas_ra_corrective": ac.acas_ra_corrective,
+                "acas_threat_icao":   ac.acas_threat_icao,
+                "acas_sensitivity":   ac.acas_sensitivity,
             }
 
     def apply_hexdb(self, icao: str, data: dict) -> None:
@@ -272,6 +352,10 @@ class AircraftState:
             recent = list(self._sec_counts)[-10:]
             msg_per_sec = round(sum(c for _, c in recent) / max(len(recent), 1), 1)
 
+            # MLAT msg/sec (same rolling 10-second window)
+            mlat_recent = list(self._mlat_sec_counts)[-10:]
+            mlat_per_sec = round(sum(c for _, c in mlat_recent) / max(len(mlat_recent), 1), 1)
+
             # Rate history for the chart (completed minutes + current partial minute)
             secs = list(self._cur_min_sec_counts)
             if secs:
@@ -280,14 +364,18 @@ class AircraftState:
                 cur_mn = cur_mx = cur_me = 0.0
             cur_total = len(self._aircraft)
             cur_mil = sum(1 for ac in self._aircraft.values() if ac.military)
+            cur_with_pos = sum(1 for ac in self._aircraft.values() if ac.lat is not None)
+            cur_mlat_pos = sum(1 for ac in self._aircraft.values() if ac.mlat and ac.lat is not None)
             cur_sigs = self._cur_min_signals
             cur_sig_avg = round(sum(cur_sigs) / len(cur_sigs), 1) if cur_sigs else None
             cur_stats = (self._cur_min, cur_mn, cur_mx, cur_me,
                          cur_total, cur_total - cur_mil, cur_mil,
                          cur_sig_avg, min(cur_sigs) if cur_sigs else None,
-                         max(cur_sigs) if cur_sigs else None)
+                         max(cur_sigs) if cur_sigs else None,
+                         cur_with_pos, cur_mlat_pos)
             rate_history = list(self._min_stats) + [cur_stats]
             df_history = list(self._min_df_stats) + [(self._cur_min, dict(self._cur_min_df_counts))]
+            mlat_history = list(self._min_mlat_counts) + [(self._cur_min, self._cur_min_mlat_count)]
 
             aircraft_list = [
                 {
@@ -319,19 +407,31 @@ class AircraftState:
                     "vertical_rate_fpm": ac.vertical_rate_fpm,
                     "mach":             ac.mach,
                     "selected_alt":     ac.selected_alt,
-                    "interesting":      bool(ac.type_code and ac.type_code.upper() in INTERESTING_TYPE_CODES),
-                    "sighting_count":   ac.sighting_count,
+                    "interesting":        bool(ac.type_code and ac.type_code.upper() in INTERESTING_TYPE_CODES),
+                    "sighting_count":     ac.sighting_count,
+                    "mlat":              ac.mlat,
+                    "mlat_source":       ac.mlat_source,
+                    "mlat_msg_count":    ac.mlat_msg_count,
+                    "acas_ra_active":     ac.acas_ra_ts is not None and (now - ac.acas_ra_ts) < 60,
+                    "acas_ra_desc":       ac.acas_ra_desc,
+                    "acas_ra_corrective": ac.acas_ra_corrective,
+                    "acas_threat_icao":   ac.acas_threat_icao,
+                    "acas_sensitivity":   ac.acas_sensitivity,
                 }
                 for ac in self._aircraft.values()
             ]
 
         live_military = sum(1 for ac in self._aircraft.values() if ac.military)
+        mlat_aircraft_count = sum(1 for ac in self._aircraft.values() if ac.mlat)
 
         return {
             "aircraft_count": len(aircraft_list),
             "live_military": live_military,
             "msg_per_sec": msg_per_sec,
             "total_messages": self._total,
+            "mlat_total": self._mlat_total,
+            "mlat_per_sec": mlat_per_sec,
+            "mlat_aircraft_count": mlat_aircraft_count,
             "unique_today": len(self._today_icaos),
             "unique_today_military": len(self._today_mil_icaos),
             "hexdb_queue_size": len(self._hexdb_queue),
@@ -339,12 +439,17 @@ class AircraftState:
             "rate_history": [
                 {"minute": m, "min": mn, "max": mx, "mean": me,
                  "ac_total": t, "ac_civil": c, "ac_military": mil,
-                 "signal_avg": sa, "signal_min": sn, "signal_max": sx}
-                for m, mn, mx, me, t, c, mil, sa, sn, sx in rate_history[-60:]
+                 "signal_avg": sa, "signal_min": sn, "signal_max": sx,
+                 "ac_with_pos": wp, "ac_mlat": ml}
+                for m, mn, mx, me, t, c, mil, sa, sn, sx, wp, ml in rate_history[-60:]
             ],
             "df_history": [
                 {"minute": m, "counts": counts}
                 for m, counts in df_history[-60:]
+            ],
+            "mlat_history": [
+                {"minute": m, "count": c}
+                for m, c in mlat_history[-60:]
             ],
         }
 
@@ -352,14 +457,18 @@ class AircraftState:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _tick(self, now: float) -> None:
+    def _tick(self, now: float, mlat: bool = False) -> None:
         sec = int(now)
         if sec != self._cur_sec:
             self._sec_counts.append((self._cur_sec, self._cur_sec_count))
+            self._mlat_sec_counts.append((self._cur_sec, self._cur_sec_mlat_count))
             self._cur_min_sec_counts.append(self._cur_sec_count)
             self._cur_sec = sec
             self._cur_sec_count = 0
+            self._cur_sec_mlat_count = 0
         self._cur_sec_count += 1
+        if mlat:
+            self._cur_sec_mlat_count += 1
 
         minute = int(now // 60)
         if minute != self._cur_min:
@@ -370,21 +479,27 @@ class AircraftState:
                 mn = mx = me = 0.0
             total = len(self._aircraft)
             mil = sum(1 for ac in self._aircraft.values() if ac.military)
+            with_pos = sum(1 for ac in self._aircraft.values() if ac.lat is not None)
+            mlat_pos = sum(1 for ac in self._aircraft.values() if ac.mlat and ac.lat is not None)
             sigs = self._cur_min_signals
             sig_avg = round(sum(sigs) / len(sigs), 1) if sigs else None
             sig_min = min(sigs) if sigs else None
             sig_max = max(sigs) if sigs else None
             self._min_stats.append(
                 (self._cur_min, mn, mx, me, total, total - mil, mil,
-                 sig_avg, sig_min, sig_max)
+                 sig_avg, sig_min, sig_max, with_pos, mlat_pos)
             )
             self._min_df_stats.append((self._cur_min, dict(self._cur_min_df_counts)))
+            self._min_mlat_counts.append((self._cur_min, self._cur_min_mlat_count))
             self._cur_min = minute
             self._cur_min_sec_counts = []
             self._cur_min_signals = []
             self._cur_min_df_counts = {}
+            self._cur_min_mlat_count = 0
+        if mlat:
+            self._cur_min_mlat_count += 1
 
-    def _decode(self, raw: str, signal: int, now: float) -> None:
+    def _decode(self, raw: str, signal: int, now: float, mlat: bool = False, mlat_source: Optional[str] = None) -> None:
         if len(raw) < 14:          # Too short to contain an ICAO address
             return
 
@@ -435,6 +550,10 @@ class AircraftState:
             ac.military = enrichment.db.is_military(icao)
             ac.country  = enrichment.db.get_country_by_icao(icao)
 
+            # For US military aircraft, derive year from the FY serial (e.g. '06-6160' → '2006')
+            if ac.military and not ac.year and ac.registration:
+                ac.year = enrichment.extract_us_mil_serial_year(ac.registration)
+
             # Apply any previously cached hexdb data immediately (no HTTP, no wait)
             hexdb_cached = enrichment.db.get_hexdb_cached(icao)
             if hexdb_cached:
@@ -450,8 +569,10 @@ class AircraftState:
             else:
                 op_source = "queued"
 
-            # Registration prefix overrides ICAO-block country (more accurate for GA)
-            if ac.registration:
+            # Registration prefix overrides ICAO-block country (more accurate for GA).
+            # Skip for military aircraft — their serials don't follow civil prefix
+            # conventions (e.g. RAF ZK341 starts with 'ZK' but is NOT New Zealand).
+            if ac.registration and not ac.military:
                 reg_country = country_from_registration(ac.registration)
                 if reg_country:
                     ac.country = reg_country
@@ -460,7 +581,7 @@ class AircraftState:
             if not ac.operator or not ac.registration or not ac.type_code:
                 self._hexdb_queue.add(icao)
 
-            if config.DEBUG_ENRICHMENT:
+            if config.DEBUG_ENRICHMENT == 1:
                 _log_enrichment(icao, ac, adsbx, op_source)
 
             self._aircraft[icao] = ac
@@ -469,6 +590,24 @@ class AircraftState:
         ac.last_seen = now
         ac.msg_count += 1
         ac.signal = signal
+        if mlat:
+            # MLAT-timestamp frame.  Only tag if we haven't confirmed a real ADS-B
+            # transponder: some clients stamp ALL forwarded messages (including genuine
+            # ADS-B DF17) with the MLAT marker.  has_adsb (set below by non-MLAT DF17)
+            # acts as the tiebreak.
+            if not ac.has_adsb:
+                ac.mlat = True
+                # Prefer a named server source over the auto-detected "mlat" label.
+                if mlat_source != "mlat" or ac.mlat_source is None:
+                    ac.mlat_source = mlat_source
+            ac.mlat_msg_count += 1
+        elif df == 17:
+            # Non-MLAT-timestamp DF17 = genuine ADS-B transponder.  This is the only
+            # frame type we can be sure is NOT an MLAT injection (synthesized MLAT
+            # frames always carry the MLAT timestamp; real transponders never do).
+            ac.has_adsb = True
+            ac.mlat = False
+            ac.mlat_source = None
 
         # Track unique aircraft seen today; reset sets at midnight
         today = date.today().isoformat()
@@ -653,6 +792,30 @@ class AircraftState:
                 except Exception:
                     pass
 
+        # --- DF16: Long Air-Air Surveillance (ACAS RA in MV field) ---
+        elif df == 16 and len(raw) == 28:
+            try:
+                alt = pms.altcode(raw)
+                if alt is not None:
+                    ac.altitude = alt
+            except Exception:
+                pass
+            try:
+                result = acas_decoder.decode_df16_mv(raw)
+                if result and result.get("ara_active"):
+                    self._apply_acas(ac, result, now)
+            except Exception:
+                pass
+
+        # --- DF0: Short Air-Air Surveillance (sensitivity level only) ---
+        elif df == 0 and len(raw) == 14:
+            try:
+                sl = acas_decoder.decode_df0_sensitivity(raw)
+                if sl is not None:
+                    ac.acas_sensitivity = sl
+            except Exception:
+                pass
+
         # --- Squawk from identity reply (DF 5 / DF 21) ---
         if df in (5, 21):
             try:
@@ -661,3 +824,118 @@ class AircraftState:
                     ac.squawk = sq
             except Exception:
                 pass
+
+    def _apply_acas(self, ac: "Aircraft", result: dict, now: float) -> None:
+        """Apply a decoded ACAS RA to the aircraft and enqueue a DB event.
+        Deduplicates: events within 30s with the same description are skipped.
+
+        DF16 air-air messages are AP/DP parity protected, so occasional one-off bit
+        errors can appear as false RA activations. Persist only after repeated matching
+        frames in a short window.
+        """
+        ra_desc = result["ra_description"]
+        threat_icao = self._sanitize_threat_icao(result.get("threat_icao"), ac.icao, now)
+
+        sig = self._acas_signature(result, threat_icao)
+        prev = self._acas_candidates.get(ac.icao)
+        if prev and prev[0] == sig and (now - prev[1]) <= _ACAS_CONFIRM_WINDOW_S:
+            confirm_count = prev[2] + 1
+        else:
+            confirm_count = 1
+        self._acas_candidates[ac.icao] = (sig, now, confirm_count)
+
+        if confirm_count < _ACAS_MIN_CONFIRM_FRAMES:
+            return
+
+        # Only update live badge fields once confirmation threshold is met
+        ac.acas_ra_desc       = ra_desc
+        ac.acas_ra_corrective = result.get("ra_corrective", False)
+        ac.acas_threat_icao   = threat_icao
+        if result.get("sensitivity_level") is not None:
+            ac.acas_sensitivity = result["sensitivity_level"]
+        ac.acas_ra_ts = now
+
+        last = self._last_acas_ts.get(ac.icao)
+        if last and (now - last[0]) < 30 and last[1] == ra_desc:
+            return  # duplicate
+
+        self._last_acas_ts[ac.icao] = (now, ra_desc)
+
+        if config.DEBUG_ENRICHMENT >= 1:
+            log.info(
+                "[acas]   %-8s  %-35s  tti=%d  threat=%-8s  alt=%-8s  sl=%s%s",
+                ac.icao,
+                ra_desc,
+                result.get("tti", 0),
+                threat_icao or "—",
+                f"{ac.altitude}ft" if ac.altitude is not None else "?",
+                result.get("sensitivity_level") if result.get("sensitivity_level") is not None else "?",
+                "  MTE" if result.get("mte") else "",
+            )
+
+        self._pending_acas_events.append({
+            "ts":              int(now),
+            "icao":            ac.icao,
+            "ra_description":  ra_desc,
+            "ra_corrective":   int(result.get("ra_corrective", False)),
+            "ra_sense":        result.get("ra_sense"),
+            "ara_bits":        result.get("ara_bits"),
+            "rac_bits":        result.get("rac_bits"),
+            "rat":             int(result.get("rat", False)),
+            "mte":             int(result.get("mte", False)),
+            "tti":             result.get("tti", 0),
+            "threat_icao":     threat_icao,
+            "threat_alt":      result.get("threat_alt"),
+            "threat_range_nm": result.get("threat_range_nm"),
+            "threat_bearing_deg": result.get("threat_bearing_deg"),
+            "sensitivity_level":  result.get("sensitivity_level"),
+            "altitude":        ac.altitude,
+        })
+
+    def _acas_signature(self, result: dict, threat_icao: Optional[str]) -> str:
+        """Return a compact signature used to corroborate repeated RA frames."""
+        return "|".join((
+            str(result.get("ara_bits") or ""),
+            str(result.get("rac_bits") or ""),
+            str(int(result.get("rat", False))),
+            str(int(result.get("mte", False))),
+            str(result.get("tti", 0)),
+            threat_icao or "",
+        ))
+
+    def _sanitize_threat_icao(self, threat_icao: Optional[str], own_icao: str, now: float) -> Optional[str]:
+        """Filter implausible DF16 threat ICAOs caused by uncorrectable bit errors.
+
+        DF16 (and other AP/DP parity messages) do not carry an explicit ICAO field, so a
+        single bit error can produce a plausible-looking but bogus 24-bit address.
+        Keep threat ICAO only when it has at least one corroboration signal:
+          - currently tracked locally, or
+          - present in cached aircraft datasets (ADSBx/tar1090/hexdb).
+        Also reject malformed/self/unallocated ICAO blocks.
+        """
+        if not threat_icao:
+            return None
+
+        code = threat_icao.upper()
+        if not _ICAO_HEX_RE.fullmatch(code):
+            return None
+        if code == own_icao:
+            return None
+        if enrichment.db.get_country_by_icao(code) is None:
+            return None
+
+        seen_live = False
+        thr = self._aircraft.get(code)
+        if thr and (now - thr.last_seen) <= 120:
+            seen_live = True
+
+        known_cached = any((
+            enrichment.db.get_adsbx(code),
+            enrichment.db.get_tar1090_cached(code),
+            enrichment.db.get_hexdb_cached(code),
+        ))
+
+        if not (seen_live or known_cached):
+            return None
+
+        return code

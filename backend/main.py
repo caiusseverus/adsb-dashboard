@@ -17,6 +17,9 @@ from history import router as history_router
 from aircraft import router as aircraft_router
 from fleet import router as fleet_router
 from coverage import router as coverage_router
+from acas import router as acas_router
+from status import router as status_router
+from debug import router as debug_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +46,15 @@ async def _beast_runner() -> None:
     await client.run()
 
 
+async def _mlat_runner(name: str, host: str, port: int) -> None:
+    def on_mlat_message(msg: dict) -> None:
+        state.process_message(msg, mlat_source=name)
+
+    client = BeastClient(host, port, on_mlat_message)
+    log.info("MLAT runner starting: %s (%s:%s)", name, host, port)
+    await client.run()
+
+
 async def _db_update_checker() -> None:
     while True:
         await asyncio.sleep(86400)
@@ -57,15 +69,11 @@ async def _hexdb_task() -> None:
         batch = state.pop_hexdb_queue(max_n=10)
         for icao in batch:
             data = await asyncio.to_thread(enrichment.db.lookup_hexdb, icao)
+            data_source = "hexdb"
             if not data:
                 # tar1090-db shard as final fallback (downloads shard on first access)
                 data = await asyncio.to_thread(enrichment.db.get_tar1090, icao)
-            if config.DEBUG_ENRICHMENT:
-                if data:
-                    owners = data.get("RegisteredOwners") or data.get("OperatorFlagCode") or "—"
-                    log.info("[hexdb] %s  hit  owners=%r", icao, owners)
-                else:
-                    log.info("[hexdb] %s  miss", icao)
+                data_source = "tar1090"
             if data:
                 state.apply_hexdb(icao, data)
                 # Also persist enrichment to DB so offline (historical) aircraft get updated.
@@ -87,10 +95,21 @@ async def _hexdb_task() -> None:
                         operator = op.get("n")
                 if not operator:
                     operator = (data.get("RegisteredOwners") or "").strip() or None
+                if config.DEBUG_ENRICHMENT == 1:
+                    log.info(
+                        "[enrich] %-8s  %-8s  reg=%-9s type=%-6s op=%s",
+                        icao, data_source,
+                        registration or "—",
+                        type_code or "—",
+                        repr(operator) if operator else "—",
+                    )
                 await asyncio.to_thread(
                     stats_db.update_aircraft_enrichment,
                     icao, registration, type_code, type_category, operator, manufacturer,
                 )
+            else:
+                if config.DEBUG_ENRICHMENT == 1:
+                    log.info("[enrich] %-8s  miss", icao)
             await asyncio.sleep(1)  # 1 req/sec rate limit
         await asyncio.sleep(5)
 
@@ -100,6 +119,9 @@ def _ghost_credible(ac: dict) -> bool:
     if config.GHOST_FILTER_MSGS <= 0:
         return True
     if ac.get("msg_count", 0) >= config.GHOST_FILTER_MSGS:
+        return True
+    # MLAT-confirmed aircraft are real (multilaterated by multiple receivers)
+    if ac.get("mlat"):
         return True
     icao = ac["icao"]
     if enrichment.db.get_adsbx(icao):
@@ -154,6 +176,11 @@ async def _db_writer() -> None:
             ]
             await asyncio.to_thread(stats_db.write_coverage, samples)
 
+        # Drain pending ACAS events to DB
+        acas_evts = state.pop_acas_events()
+        if acas_evts:
+            await asyncio.to_thread(stats_db.write_acas_events, acas_evts)
+
 
 async def _push_updates() -> None:
     """Broadcast a state snapshot to every connected WebSocket client every second."""
@@ -189,6 +216,8 @@ async def lifespan(app: FastAPI):
     enrichment.db.load_or_download()
     await asyncio.to_thread(stats_db.rollup_missed_days)
     await asyncio.to_thread(stats_db.prune)
+    await asyncio.to_thread(stats_db.backfill_daily_coverage)
+    await asyncio.to_thread(stats_db.backfill_us_mil_years)
 
     # Seed today's unique-aircraft sets from DB so counts survive restarts
     today = date.today().isoformat()
@@ -209,7 +238,19 @@ async def lifespan(app: FastAPI):
     if config.GHOST_FILTER_MSGS > 0:
         await asyncio.to_thread(stats_db.purge_ghost_aircraft)
 
+    # Correct country/foreign_military for all military aircraft using ICAO block.
+    # Repairs entries written before the registration-prefix bug was fixed.
+    mil_icaos = await asyncio.to_thread(stats_db.query_military_icaos)
+    corrections = {
+        icao: enrichment.db.get_country_by_icao(icao)
+        for icao in mil_icaos
+        if enrichment.db.get_country_by_icao(icao)
+    }
+    await asyncio.to_thread(stats_db.fix_military_countries, corrections, config.HOME_COUNTRY)
+
     asyncio.create_task(_beast_runner())
+    for name, host, port in config.MLAT_SERVERS:
+        asyncio.create_task(_mlat_runner(name, host, port))
     asyncio.create_task(_push_updates())
     asyncio.create_task(_db_writer())
     asyncio.create_task(_db_update_checker())
@@ -225,6 +266,9 @@ aircraft_router._state = state  # type: ignore[attr-defined]
 app.include_router(aircraft_router)
 app.include_router(fleet_router)
 app.include_router(coverage_router)
+app.include_router(acas_router)
+app.include_router(status_router)
+app.include_router(debug_router)
 
 app.add_middleware(
     CORSMiddleware,

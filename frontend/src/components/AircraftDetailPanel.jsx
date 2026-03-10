@@ -124,6 +124,7 @@ export default function AircraftDetailPanel({ icao, onClose, onRefreshed }) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
+  const [acasEvents, setAcasEvents] = useState([])
 
   const load = useCallback(() => {
     if (!icao) return
@@ -145,6 +146,14 @@ export default function AircraftDetailPanel({ icao, onClose, onRefreshed }) {
   }, [icao, refreshing, onRefreshed])
 
   useEffect(() => { load() }, [load])
+
+  useEffect(() => {
+    if (!icao) return
+    fetch(`${API_BASE}/api/acas/aircraft/${icao}?limit=10`)
+      .then(r => r.ok ? r.json() : [])
+      .then(setAcasEvents)
+      .catch(() => setAcasEvents([]))
+  }, [icao])
 
   // Close on Escape
   useEffect(() => {
@@ -252,6 +261,29 @@ export default function AircraftDetailPanel({ icao, onClose, onRefreshed }) {
                 {data.history.interesting     && <Field label="Flag" value="Interesting" />}
                 {data.history.rare            && <Field label="Flag" value="Rare" />}
                 {data.history.first_seen_flag && <Field label="Flag" value="First sighting" />}
+              </Section>
+            )}
+
+            {acasEvents.length > 0 && (
+              <Section title="ACAS Events">
+                {acasEvents.map(ev => (
+                  <div key={ev.ts + ev.icao} className={styles.acasEvent}>
+                    <span className={styles.acasEvTime}>{fmtTs(ev.ts)}</span>
+                    <span className={ev.ra_corrective ? styles.correctiveBadge : styles.preventiveBadge}>
+                      {ev.ra_description}
+                    </span>
+                    {ev.threat_icao && (
+                      <span className={styles.acasThreat}>
+                        vs {ev.threat_reg || ev.threat_icao}
+                        {ev.threat_type_code && ` (${ev.threat_type_code})`}
+                      </span>
+                    )}
+                    {ev.altitude != null && (
+                      <span className={styles.acasAlt}>{fmtAlt(ev.altitude)}</span>
+                    )}
+                    {ev.mte ? <span className={styles.mteBadge}>MTE</span> : null}
+                  </div>
+                ))}
               </Section>
             )}
 

@@ -144,9 +144,9 @@ export default function DFHeatmap() {
         </div>
       </div>
 
-      {loading ? (
+      {loading && data.length === 0 ? (
         <div className={styles.empty}>Loading…</div>
-      ) : data.length === 0 ? (
+      ) : !loading && data.length === 0 ? (
         <div className={styles.empty}>No data yet for {dfLabel}.</div>
       ) : (
         <div className={styles.heatmapWrap} style={{ height: GRID_HEIGHT }}>

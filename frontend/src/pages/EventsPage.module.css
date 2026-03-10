@@ -1,0 +1,288 @@
+.page {
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+/* Limitations notice */
+.notice {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 0.6rem 1rem;
+  font-size: 0.8rem;
+  color: #8b949e;
+}
+
+.notice summary {
+  cursor: pointer;
+  color: #484f58;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 500;
+}
+
+.notice p {
+  margin: 0.5rem 0 0;
+  line-height: 1.6;
+}
+
+.notice code {
+  background: #21262d;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 0.78rem;
+  color: #c9d1d9;
+}
+
+/* Stats section */
+.statsGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+@media (max-width: 900px) {
+  .statsGrid { grid-template-columns: 1fr; }
+}
+
+.statsCard {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+}
+
+.statsTitle {
+  font-size: 0.72rem;
+  color: #484f58;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+  margin-bottom: 0.6rem;
+}
+
+.statsEmpty {
+  color: #484f58;
+  font-size: 0.82rem;
+  font-style: italic;
+  padding: 1rem 0;
+}
+
+.statsSub {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.miniChart {}
+
+.miniChartTitle {
+  font-size: 0.68rem;
+  color: #484f58;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 0.25rem;
+}
+
+/* Events table card */
+.tableCard {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+}
+
+.tableHeader {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+.tableTitle {
+  font-size: 0.75rem;
+  color: #484f58;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+}
+
+.count {
+  background: #21262d;
+  color: #8b949e;
+  border-radius: 10px;
+  padding: 0.1rem 0.5rem;
+  font-size: 0.75rem;
+}
+
+.controls {
+  display: flex;
+  gap: 3px;
+  flex-wrap: wrap;
+  margin-left: auto;
+  align-items: center;
+}
+
+.sep { width: 1px; height: 16px; background: #21262d; margin: 0 2px; }
+
+.btn, .btnActive {
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  border: 1px solid #30363d;
+  cursor: pointer;
+}
+.btn { background: transparent; color: #484f58; }
+.btn:hover { color: #8b949e; }
+.btnActive { background: #21262d; color: #e6edf3; border-color: #388bfd; }
+
+.scrollWrap { overflow-x: auto; }
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  white-space: nowrap;
+}
+
+.table th {
+  text-align: left;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid #21262d;
+  color: #484f58;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+}
+
+.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+.sortable:hover { color: #8b949e; }
+
+.sortIcon { opacity: 0.4; font-size: 0.65rem; }
+
+.table td {
+  padding: 0.45rem 0.75rem;
+  border-bottom: 1px solid #1a1f27;
+  color: #8b949e;
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.eventRow { cursor: pointer; }
+.eventRow:hover td { background: #1c2128; color: #c9d1d9; }
+
+.corrRow { background: rgba(248, 81, 73, 0.04); }
+.prevRow { background: rgba(188, 140, 255, 0.04); }
+.expandedRow { background: #1c2128 !important; }
+
+.icao {
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  color: #388bfd !important;
+  font-weight: 600;
+  cursor: pointer;
+}
+.icao:hover { text-decoration: underline; }
+
+.threatIcao {
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  color: #f85149;
+  font-weight: 600;
+  cursor: pointer;
+}
+.threatIcao:hover { text-decoration: underline; }
+
+.operator {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.muted { color: #484f58 !important; font-size: 0.78rem; }
+
+/* RA badges */
+.correctiveBadge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  background: rgba(248, 81, 73, 0.2);
+  color: #f85149;
+}
+
+.preventiveBadge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  background: rgba(188, 140, 255, 0.2);
+  color: #bc8cff;
+}
+
+.mteBadge {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(210, 153, 34, 0.2);
+  color: #d29922;
+}
+
+.empty {
+  color: #484f58;
+  font-size: 0.85rem;
+  padding: 2rem 0;
+  text-align: center;
+}
+
+/* Context / altitude chart row */
+.contextRow {
+  padding: 0 !important;
+  background: #0d1117 !important;
+}
+
+.contextInner {
+  padding: 0.75rem 1.25rem;
+  border-left: 3px solid #d29922;
+}
+
+.contextClose {
+  float: right;
+  background: none;
+  border: 1px solid #30363d;
+  color: #484f58;
+  font-size: 0.72rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.contextClose:hover { color: #c9d1d9; border-color: #8b949e; }
+
+.contextMeta {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.6rem;
+  font-size: 0.8rem;
+  color: #8b949e;
+}
+
+.contextChart {
+  margin-top: 0.5rem;
+}
+
+.contextEmpty {
+  color: #484f58;
+  font-size: 0.82rem;
+  font-style: italic;
+  padding: 0.75rem 0;
+}

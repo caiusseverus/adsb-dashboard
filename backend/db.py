@@ -6,12 +6,14 @@ All public methods are synchronous and safe to call via asyncio.to_thread().
 """
 
 import logging
+import math
 import sqlite3
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
 
 import config
+import enrichment as _enrichment
 
 log = logging.getLogger(__name__)
 
@@ -210,9 +212,27 @@ class StatsDB:
                 );
 
                 CREATE TABLE IF NOT EXISTS daily_aircraft_seen (
-                    date TEXT NOT NULL,
-                    icao TEXT NOT NULL,
+                    date    TEXT NOT NULL,
+                    icao    TEXT NOT NULL,
+                    mlat    INTEGER NOT NULL DEFAULT 0,
+                    had_pos INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (date, icao)
+                );
+
+                CREATE TABLE IF NOT EXISTS coverage_daily_polar (
+                    date   TEXT    NOT NULL,
+                    sector INTEGER NOT NULL,
+                    band   INTEGER NOT NULL,
+                    count  INTEGER NOT NULL,
+                    PRIMARY KEY (date, sector, band)
+                );
+
+                CREATE TABLE IF NOT EXISTS coverage_daily_range_hist (
+                    date   TEXT    NOT NULL,
+                    sector INTEGER NOT NULL,
+                    bucket INTEGER NOT NULL,
+                    count  INTEGER NOT NULL,
+                    PRIMARY KEY (date, sector, bucket)
                 );
 
                 CREATE TABLE IF NOT EXISTS day_stats (
@@ -277,7 +297,8 @@ class StatsDB:
 
         # Migrate existing databases that predate signal columns in minute_stats
         with self._connect() as conn:
-            for col in ("signal_avg REAL", "signal_min REAL", "signal_max REAL"):
+            for col in ("signal_avg REAL", "signal_min REAL", "signal_max REAL",
+                        "ac_with_pos INTEGER", "ac_mlat INTEGER"):
                 try:
                     conn.execute(f"ALTER TABLE minute_stats ADD COLUMN {col}")
                 except Exception:
@@ -288,6 +309,45 @@ class StatsDB:
             for col in ("lat REAL", "lon REAL", "operator TEXT", "manufacturer TEXT", "year TEXT"):
                 try:
                     conn.execute(f"ALTER TABLE aircraft_registry ADD COLUMN {col}")
+                except Exception:
+                    pass  # column already exists
+
+        # acas_events table (new — added for ACAS/TCAS RA logging)
+        with self._connect() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS acas_events (
+                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts                 INTEGER NOT NULL,
+                    icao               TEXT    NOT NULL,
+                    ra_description     TEXT    NOT NULL,
+                    ra_corrective      INTEGER NOT NULL DEFAULT 0,
+                    ra_sense           TEXT,
+                    ara_bits           TEXT,
+                    rac_bits           TEXT,
+                    rat                INTEGER NOT NULL DEFAULT 0,
+                    mte                INTEGER NOT NULL DEFAULT 0,
+                    tti                INTEGER NOT NULL DEFAULT 0,
+                    threat_icao        TEXT,
+                    threat_alt         INTEGER,
+                    threat_range_nm    REAL,
+                    threat_bearing_deg REAL,
+                    sensitivity_level  INTEGER,
+                    altitude           INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS acas_events_ts
+                    ON acas_events(ts);
+                CREATE INDEX IF NOT EXISTS acas_events_icao
+                    ON acas_events(icao);
+                CREATE INDEX IF NOT EXISTS acas_events_threat_icao
+                    ON acas_events(threat_icao)
+                    WHERE threat_icao IS NOT NULL;
+            """)
+
+        # Migrate: add mlat/had_pos columns to daily_aircraft_seen
+        with self._connect() as conn:
+            for col in ("mlat INTEGER NOT NULL DEFAULT 0", "had_pos INTEGER NOT NULL DEFAULT 0"):
+                try:
+                    conn.execute(f"ALTER TABLE daily_aircraft_seen ADD COLUMN {col}")
                 except Exception:
                     pass  # column already exists
 
@@ -312,10 +372,14 @@ class StatsDB:
                 if ts <= self._last_written_ts:
                     continue
                 conn.execute(
-                    "INSERT OR REPLACE INTO minute_stats VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT OR REPLACE INTO minute_stats"
+                    " (ts,msg_min,msg_max,msg_mean,ac_total,ac_civil,ac_military,"
+                    "signal_avg,signal_min,signal_max,ac_with_pos,ac_mlat)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (ts, entry["min"], entry["max"], entry["mean"],
                      entry["ac_total"], entry["ac_civil"], entry["ac_military"],
-                     entry.get("signal_avg"), entry.get("signal_min"), entry.get("signal_max")),
+                     entry.get("signal_avg"), entry.get("signal_min"), entry.get("signal_max"),
+                     entry.get("ac_with_pos"), entry.get("ac_mlat")),
                 )
                 self._last_written_ts = ts
 
@@ -349,10 +413,16 @@ class StatsDB:
                     )
 
             # Daily aircraft seen (deduped by date + icao)
+            # mlat=1 if ever seen via MLAT; had_pos=1 if ever had a decoded position
             for ac in aircraft:
                 conn.execute(
-                    "INSERT OR IGNORE INTO daily_aircraft_seen VALUES (?,?)",
-                    (today, ac["icao"]),
+                    """INSERT INTO daily_aircraft_seen (date, icao, mlat, had_pos) VALUES (?,?,?,?)
+                       ON CONFLICT(date, icao) DO UPDATE SET
+                           mlat    = MAX(mlat,    excluded.mlat),
+                           had_pos = MAX(had_pos, excluded.had_pos)""",
+                    (today, ac["icao"],
+                     1 if ac.get("mlat") else 0,
+                     1 if ac.get("lat") is not None else 0),
                 )
 
             # Aircraft registry upserts
@@ -363,15 +433,19 @@ class StatsDB:
         self.recalculate_type_rarity()
 
     def _upsert_aircraft(self, conn: sqlite3.Connection, ac: dict, now_ts: int) -> None:
+        home = (config.HOME_COUNTRY or "").lower()
         foreign_mil = bool(
-            ac.get("military")
-            and config.HOME_COUNTRY
-            and ac.get("country")
-            and ac["country"].lower() != config.HOME_COUNTRY.lower()
+            ac.get("military") and home and ac.get("country")
+            and ac["country"].lower() != home
         )
         interesting = bool(
             ac.get("type_code") and ac["type_code"].upper() in INTERESTING_TYPE_CODES
         )
+        # On UPDATE, country is kept from registry for military aircraft (their serials
+        # don't follow civil prefix rules, so a stale live-state value must not overwrite
+        # a manually corrected entry).  foreign_military is recomputed from whichever
+        # country value will actually be stored, so a stale live-state country cannot
+        # flip it back to the wrong value.
         conn.execute("""
             INSERT INTO aircraft_registry
                 (icao, first_seen, last_seen, sighting_count,
@@ -388,7 +462,13 @@ class StatsDB:
                 type_category    = COALESCE(excluded.type_category, type_category),
                 military         = excluded.military,
                 country          = COALESCE(excluded.country, country),
-                foreign_military = excluded.foreign_military,
+                foreign_military = CASE
+                    WHEN excluded.military = 0 THEN 0
+                    WHEN ? = '' THEN 0
+                    ELSE CASE
+                        WHEN LOWER(COALESCE(excluded.country, country)) != ?
+                        THEN 1 ELSE 0 END
+                    END,
                 interesting      = excluded.interesting,
                 lat              = COALESCE(excluded.lat, lat),
                 lon              = COALESCE(excluded.lon, lon),
@@ -402,6 +482,8 @@ class StatsDB:
             int(foreign_mil), int(interesting),
             ac.get("lat"), ac.get("lon"),
             ac.get("operator"), ac.get("manufacturer"), ac.get("year"),
+            # extra params for foreign_military recomputation in UPDATE path:
+            home, home,
         ))
 
     # ------------------------------------------------------------------
@@ -467,6 +549,89 @@ class StatsDB:
             GROUP BY type_code
         """, (date_str,))
 
+        self._rollup_day_coverage(conn, date_str)
+
+    def _rollup_day_coverage(self, conn: sqlite3.Connection, date_str: str) -> None:
+        """Pre-aggregate coverage_samples for one calendar day into fast-query tables."""
+        # 32-sector polar bins (11.25° × 25 nm cells)
+        conn.execute("DELETE FROM coverage_daily_polar WHERE date = ?", (date_str,))
+        conn.execute("""
+            INSERT INTO coverage_daily_polar (date, sector, band, count)
+            SELECT ?,
+                   CAST(bearing_deg / 11.25 AS INTEGER),
+                   CAST(range_nm    / 25.0  AS INTEGER),
+                   COUNT(*)
+            FROM coverage_samples
+            WHERE date(ts, 'unixepoch') = ?
+              AND bearing_deg IS NOT NULL AND range_nm IS NOT NULL
+            GROUP BY CAST(bearing_deg / 11.25 AS INTEGER),
+                     CAST(range_nm    / 25.0  AS INTEGER)
+        """, (date_str, date_str))
+
+        # 36-sector range histogram (10° × 5 nm buckets) for percentile queries
+        conn.execute("DELETE FROM coverage_daily_range_hist WHERE date = ?", (date_str,))
+        conn.execute("""
+            INSERT INTO coverage_daily_range_hist (date, sector, bucket, count)
+            SELECT ?,
+                   CAST(bearing_deg / 10.0 AS INTEGER),
+                   CAST(range_nm    /  5.0 AS INTEGER),
+                   COUNT(*)
+            FROM coverage_samples
+            WHERE date(ts, 'unixepoch') = ?
+              AND bearing_deg IS NOT NULL AND range_nm > 0
+            GROUP BY CAST(bearing_deg / 10.0 AS INTEGER),
+                     CAST(range_nm    /  5.0 AS INTEGER)
+        """, (date_str, date_str))
+
+    def backfill_us_mil_years(self) -> None:
+        """Set year from FY serial number for US military aircraft lacking a manufacture year."""
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT icao, registration FROM aircraft_registry
+                WHERE military = 1
+                  AND (year IS NULL OR year = '')
+                  AND registration IS NOT NULL AND registration != ''
+            """).fetchall()
+        updates = [
+            (yr, r["icao"])
+            for r in rows
+            if (yr := _enrichment.extract_us_mil_serial_year(r["registration"]))
+        ]
+        if updates:
+            with self._connect() as conn:
+                conn.executemany("UPDATE aircraft_registry SET year = ? WHERE icao = ?", updates)
+        log.info("DB: backfilled year for %d US military aircraft from serial numbers", len(updates))
+
+    def backfill_daily_coverage(self) -> None:
+        """Populate coverage_daily_polar/range_hist for past dates not yet aggregated,
+        and backfill had_pos in daily_aircraft_seen from coverage_samples."""
+        # Backfill had_pos for existing rows that predate the column
+        with self._connect() as conn:
+            conn.execute("""
+                UPDATE daily_aircraft_seen SET had_pos = 1
+                WHERE had_pos = 0
+                  AND (date, icao) IN (
+                      SELECT DISTINCT date(ts, 'unixepoch'), icao FROM coverage_samples
+                  )
+            """)
+
+        # Backfill polar/range_hist tables for any past dates not already aggregated
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT DISTINCT date(ts, 'unixepoch') AS day
+                FROM coverage_samples
+                WHERE date(ts, 'unixepoch') < date('now')
+                  AND date(ts, 'unixepoch') NOT IN (
+                      SELECT DISTINCT date FROM coverage_daily_polar
+                  )
+                ORDER BY day
+            """).fetchall()
+        for row in rows:
+            day = row["day"]
+            with self._connect() as conn:
+                self._rollup_day_coverage(conn, day)
+            log.info("DB: backfilled coverage stats for %s", day)
+
     # ------------------------------------------------------------------
     # Prune
     # ------------------------------------------------------------------
@@ -490,6 +655,7 @@ class StatsDB:
             conn.execute("DELETE FROM minute_operator_counts WHERE ts < ?", (cutoff_ts,))
             conn.execute("DELETE FROM daily_aircraft_seen WHERE date < ?", (cutoff_date,))
             conn.execute("DELETE FROM coverage_samples WHERE ts < ?", (coverage_cutoff_ts,))
+            conn.execute("DELETE FROM acas_events WHERE ts < ?", (coverage_cutoff_ts,))
         log.info("DB: pruned data older than %s", cutoff_date)
 
     # ------------------------------------------------------------------
@@ -544,6 +710,162 @@ class StatsDB:
             """, (cutoff,)).fetchall()
         return [{"bearing": round(r["sector"] * sector_width + sector_width / 2, 1),
                  "max_range": round(r["max_range"], 1)} for r in rows]
+
+    # ------------------------------------------------------------------
+    # ACAS events (called via asyncio.to_thread from main.py / acas.py)
+    # ------------------------------------------------------------------
+
+    def write_acas_events(self, events: list[dict]) -> None:
+        """Persist a batch of ACAS RA events."""
+        if not events:
+            return
+        with self._connect() as conn:
+            conn.executemany("""
+                INSERT INTO acas_events
+                    (ts, icao, ra_description, ra_corrective, ra_sense,
+                     ara_bits, rac_bits, rat, mte, tti,
+                     threat_icao, threat_alt, threat_range_nm, threat_bearing_deg,
+                     sensitivity_level, altitude)
+                VALUES
+                    (:ts, :icao, :ra_description, :ra_corrective, :ra_sense,
+                     :ara_bits, :rac_bits, :rat, :mte, :tti,
+                     :threat_icao, :threat_alt, :threat_range_nm, :threat_bearing_deg,
+                     :sensitivity_level, :altitude)
+            """, events)
+
+    def query_acas_events(self, days: int, limit: int) -> list[sqlite3.Row]:
+        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT e.*,
+                       r.registration,  r.type_code,   r.operator,  r.country,
+                       t.registration AS threat_reg,
+                       t.type_code    AS threat_type_code,
+                       t.operator     AS threat_operator,
+                       t.country      AS threat_country
+                FROM acas_events e
+                LEFT JOIN aircraft_registry r ON e.icao       = r.icao
+                LEFT JOIN aircraft_registry t ON e.threat_icao = t.icao
+                WHERE e.ts >= ?
+                ORDER BY e.ts DESC
+                LIMIT ?
+            """, (cutoff, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def query_acas_stats(self, days: int) -> dict:
+        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        with self._connect() as conn:
+            totals = conn.execute("""
+                SELECT COUNT(*) AS total,
+                       SUM(ra_corrective) AS corrective
+                FROM acas_events WHERE ts >= ?
+            """, (cutoff,)).fetchone()
+
+            by_sense = conn.execute("""
+                SELECT ra_sense, COUNT(*) AS cnt
+                FROM acas_events WHERE ts >= ?
+                GROUP BY ra_sense ORDER BY cnt DESC
+            """, (cutoff,)).fetchall()
+
+            by_country = conn.execute("""
+                SELECT r.country, COUNT(*) AS cnt
+                FROM acas_events e
+                LEFT JOIN aircraft_registry r ON e.icao = r.icao
+                WHERE e.ts >= ? AND r.country IS NOT NULL
+                GROUP BY r.country ORDER BY cnt DESC LIMIT 10
+            """, (cutoff,)).fetchall()
+
+            by_type = conn.execute("""
+                SELECT r.type_code, COUNT(*) AS cnt
+                FROM acas_events e
+                LEFT JOIN aircraft_registry r ON e.icao = r.icao
+                WHERE e.ts >= ? AND r.type_code IS NOT NULL
+                GROUP BY r.type_code ORDER BY cnt DESC LIMIT 10
+            """, (cutoff,)).fetchall()
+
+            by_operator = conn.execute("""
+                SELECT r.operator, COUNT(*) AS cnt
+                FROM acas_events e
+                LEFT JOIN aircraft_registry r ON e.icao = r.icao
+                WHERE e.ts >= ? AND r.operator IS NOT NULL
+                GROUP BY r.operator ORDER BY cnt DESC LIMIT 10
+            """, (cutoff,)).fetchall()
+
+        total    = totals["total"]    or 0
+        correct  = totals["corrective"] or 0
+        return {
+            "total":       total,
+            "corrective":  correct,
+            "preventive":  total - correct,
+            "by_sense":    [{"ra_sense": r["ra_sense"],  "count": r["cnt"]} for r in by_sense],
+            "by_country":  [{"country":  r["country"],   "count": r["cnt"]} for r in by_country],
+            "by_type":     [{"type_code": r["type_code"], "count": r["cnt"]} for r in by_type],
+            "by_operator": [{"operator": r["operator"],  "count": r["cnt"]} for r in by_operator],
+        }
+
+    def query_acas_timeline(self, days: int) -> list[dict]:
+        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT date(ts, 'unixepoch') AS day,
+                       COUNT(*) AS total,
+                       SUM(ra_corrective) AS corrective
+                FROM acas_events
+                WHERE ts >= ?
+                GROUP BY day
+                ORDER BY day
+            """, (cutoff,)).fetchall()
+        return [
+            {
+                "day":        r["day"],
+                "total":      r["total"],
+                "corrective": r["corrective"] or 0,
+                "preventive": r["total"] - (r["corrective"] or 0),
+            }
+            for r in rows
+        ]
+
+    def query_acas_context(self, event_id: int) -> dict:
+        with self._connect() as conn:
+            ev = conn.execute(
+                "SELECT * FROM acas_events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if not ev:
+                return {}
+            ev = dict(ev)
+            icaos = [ev["icao"]]
+            if ev.get("threat_icao"):
+                icaos.append(ev["threat_icao"])
+            window_lo = ev["ts"] - 120
+            window_hi = ev["ts"] + 120
+            placeholders = ",".join("?" * len(icaos))
+            track_rows = conn.execute(f"""
+                SELECT ts, icao, altitude
+                FROM coverage_samples
+                WHERE icao IN ({placeholders})
+                  AND ts BETWEEN ? AND ?
+                ORDER BY ts
+            """, (*icaos, window_lo, window_hi)).fetchall()
+
+        return {
+            "event":  ev,
+            "tracks": [dict(r) for r in track_rows],
+        }
+
+    def query_acas_for_icao(self, icao: str, limit: int) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT e.*,
+                       t.registration AS threat_reg,
+                       t.type_code    AS threat_type_code,
+                       t.operator     AS threat_operator
+                FROM acas_events e
+                LEFT JOIN aircraft_registry t ON e.threat_icao = t.icao
+                WHERE e.icao = ? OR e.threat_icao = ?
+                ORDER BY e.ts DESC
+                LIMIT ?
+            """, (icao, icao, limit)).fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # History queries (called via asyncio.to_thread from history.py)
@@ -618,13 +940,20 @@ class StatsDB:
         cutoff = (date.today() - timedelta(days=days)).isoformat()
         with self._connect() as conn:
             rows = conn.execute("""
-                SELECT date, ac_peak, ac_civil_peak, ac_military_peak
-                FROM day_stats
-                WHERE date >= ?
-                ORDER BY date
+                SELECT
+                    das.date,
+                    COUNT(DISTINCT das.icao)                                                    AS total,
+                    COUNT(DISTINCT CASE WHEN COALESCE(ar.military, 0) = 0 THEN das.icao END)   AS civil,
+                    COUNT(DISTINCT CASE WHEN ar.military = 1               THEN das.icao END)   AS military,
+                    COUNT(DISTINCT CASE WHEN das.mlat = 1                  THEN das.icao END)   AS mlat
+                FROM daily_aircraft_seen das
+                LEFT JOIN aircraft_registry ar ON ar.icao = das.icao
+                WHERE das.date >= ?
+                GROUP BY das.date
+                ORDER BY das.date
             """, (cutoff,)).fetchall()
-        return [{"date": r["date"], "total": r["ac_peak"],
-                 "civil": r["ac_civil_peak"], "military": r["ac_military_peak"]}
+        return [{"date": r["date"], "total": r["total"],
+                 "civil": r["civil"], "military": r["military"], "mlat": r["mlat"]}
                 for r in rows]
 
     def query_heatmap_options(self) -> dict:
@@ -685,7 +1014,6 @@ class StatsDB:
                 ORDER BY hour, signal_avg
             """, (cutoff,)).fetchall()
 
-        from collections import defaultdict
         by_hour: dict = defaultdict(list)
         for r in rows:
             by_hour[r["hour"]].append(r["signal_avg"])
@@ -1050,59 +1378,75 @@ class StatsDB:
             """, params).fetchall()
         return [{"year": r["year"], "count": r["count"]} for r in rows]
 
-    def query_notable(self, limit: int, flag: str, days: int | None = None) -> list[dict]:
-        # flag is validated by caller against a whitelist
-        where = "ar.foreign_military OR ar.interesting OR ar.rare OR ar.first_seen_flag" if flag == "all" else f"ar.{flag}"
+    # Maps frontend sort key → SQL expression (no user data, all literals)
+    _NOTABLE_SORT_MAP = {
+        "icao":           "ar.icao",
+        "registration":   "ar.registration",
+        "type_code":      "ar.type_code",
+        "operator":       "ar.operator",
+        "year":           "ar.year",
+        "country":        "ar.country",
+        "flags":          "(ar.foreign_military * 8 + ar.interesting * 4 + ar.rare * 2 + ar.first_seen_flag)",
+        "first_seen":     "ar.first_seen",
+        "last_seen":      "ar.last_seen",
+        "sighting_count": "ar.sighting_count",
+    }
+
+    def _notable_order(self, flag: str, sort_col: str | None, sort_dir: str) -> str:
+        """Build ORDER BY clause for notable queries."""
+        if sort_col and sort_col in self._NOTABLE_SORT_MAP:
+            direction = "DESC" if sort_dir == "desc" else "ASC"
+            expr = self._NOTABLE_SORT_MAP[sort_col]
+            return f"{expr} {direction} NULLS LAST, ar.last_seen DESC"
+        # Default ordering
+        if flag in ("all_aircraft", "unique_sighting"):
+            return "ar.last_seen DESC"
+        return "type_rarity DESC, ar.last_seen DESC"
+
+    def query_notable(self, flag: str, limit: int = 100, offset: int = 0,
+                      days: int | None = None, type_code: str | None = None,
+                      sort_col: str | None = None, sort_dir: str = "desc",
+                      ) -> tuple[list[dict], int]:
+        """Returns (items, total_count). flag is validated by caller.
+        Bogus decodes (no registration, type, operator, or military flag) are
+        excluded from all flag modes except 'all_aircraft'."""
         params: list = []
+
+        if flag == "all_aircraft":
+            where = "1=1"
+        elif flag == "all":
+            where = "(ar.foreign_military OR ar.interesting OR ar.rare OR ar.first_seen_flag)"
+        elif flag == "home_military":
+            where = "ar.military AND NOT ar.foreign_military"
+        else:
+            where = f"ar.{flag}"
+
+        # Exclude unenriched aircraft from all flag modes except 'all_aircraft'
+        if flag != "all_aircraft":
+            where += (" AND (ar.registration IS NOT NULL OR ar.type_code IS NOT NULL"
+                      " OR ar.operator IS NOT NULL OR ar.military = 1)")
+
         if days is not None:
             cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
             where += " AND ar.last_seen >= ?"
             params.append(cutoff_ts)
-        params.append(limit)
-        with self._connect() as conn:
-            rows = conn.execute(f"""
-                WITH type_counts AS (
-                    SELECT type_code, COUNT(*) AS tc
-                    FROM aircraft_registry
-                    WHERE type_code IS NOT NULL AND type_code != ''
-                    GROUP BY type_code
-                )
-                SELECT ar.icao, ar.registration, ar.type_code, ar.type_category,
-                       ar.military, ar.country, ar.operator, ar.manufacturer, ar.year,
-                       ar.foreign_military, ar.interesting, ar.rare, ar.first_seen_flag,
-                       ar.first_seen, ar.last_seen, ar.sighting_count,
-                       COALESCE(tc.tc, 1)          AS type_count,
-                       1.0 / COALESCE(tc.tc, 1)   AS type_rarity
-                FROM aircraft_registry ar
-                LEFT JOIN type_counts tc ON ar.type_code = tc.type_code
-                WHERE {where}
-                ORDER BY type_rarity DESC, ar.last_seen DESC
-                LIMIT ?
-            """, params).fetchall()
-        return [dict(r) for r in rows]
 
-    def query_unique_sightings(self, limit: int, days: int | None = None) -> list[dict]:
-        """Aircraft seen on exactly 1 distinct day within the timeframe.
-        If days is None, counts across all of daily_aircraft_seen."""
-        cutoff_date = (date.today() - timedelta(days=days)).isoformat() if days else None
-        date_filter = "WHERE date >= ?" if cutoff_date else ""
-        params: list = []
-        if cutoff_date:
-            params.append(cutoff_date)
-        params.append(limit)
+        if type_code:
+            where += " AND ar.type_code = ?"
+            params.append(type_code)
+
+        order = self._notable_order(flag, sort_col, sort_dir)
+
         with self._connect() as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM aircraft_registry ar WHERE {where}", params
+            ).fetchone()[0]
             rows = conn.execute(f"""
                 WITH type_counts AS (
                     SELECT type_code, COUNT(*) AS tc
                     FROM aircraft_registry
                     WHERE type_code IS NOT NULL AND type_code != ''
                     GROUP BY type_code
-                ),
-                session_counts AS (
-                    SELECT icao, COUNT(DISTINCT date) AS days_seen
-                    FROM daily_aircraft_seen
-                    {date_filter}
-                    GROUP BY icao
                 )
                 SELECT ar.icao, ar.registration, ar.type_code, ar.type_category,
                        ar.military, ar.country, ar.operator, ar.manufacturer, ar.year,
@@ -1111,13 +1455,54 @@ class StatsDB:
                        COALESCE(tc.tc, 1)         AS type_count,
                        1.0 / COALESCE(tc.tc, 1)  AS type_rarity
                 FROM aircraft_registry ar
-                JOIN session_counts sc ON ar.icao = sc.icao
                 LEFT JOIN type_counts tc ON ar.type_code = tc.type_code
-                WHERE sc.days_seen = 1
-                ORDER BY ar.last_seen DESC
-                LIMIT ?
-            """, params).fetchall()
-        return [dict(r) for r in rows]
+                WHERE {where}
+                ORDER BY {order}
+                LIMIT ? OFFSET ?
+            """, params + [limit, offset]).fetchall()
+        return [dict(r) for r in rows], total
+
+    def query_unique_sightings(self, limit: int = 100, offset: int = 0,
+                               days: int | None = None, type_code: str | None = None,
+                               sort_col: str | None = None, sort_dir: str = "desc",
+                               ) -> tuple[list[dict], int]:
+        """Aircraft seen in only one session ever. Returns (items, total_count)."""
+        params: list = []
+        where = ("ar.sighting_count = 1"
+                 " AND (ar.registration IS NOT NULL OR ar.type_code IS NOT NULL"
+                 " OR ar.operator IS NOT NULL OR ar.military = 1)")
+        if days is not None:
+            cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+            where += " AND ar.last_seen >= ?"
+            params.append(cutoff_ts)
+        if type_code:
+            where += " AND ar.type_code = ?"
+            params.append(type_code)
+        order = self._notable_order("unique_sighting", sort_col, sort_dir)
+        with self._connect() as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM aircraft_registry ar WHERE {where}", params
+            ).fetchone()[0]
+            rows = conn.execute(f"""
+                WITH type_counts AS (
+                    SELECT type_code, COUNT(*) AS tc
+                    FROM aircraft_registry
+                    WHERE type_code IS NOT NULL AND type_code != ''
+                    GROUP BY type_code
+                )
+                SELECT ar.icao, ar.registration, ar.type_code, ar.type_category,
+                       ar.military, ar.country, ar.operator, ar.manufacturer, ar.year,
+                       ar.foreign_military, ar.interesting, ar.rare, ar.first_seen_flag,
+                       ar.first_seen, ar.last_seen, ar.sighting_count,
+                       COALESCE(tc.tc, 1)         AS type_count,
+                       1.0 / COALESCE(tc.tc, 1)  AS type_rarity
+                FROM aircraft_registry ar
+                LEFT JOIN type_counts tc ON ar.type_code = tc.type_code
+                WHERE {where}
+                ORDER BY {order}
+                LIMIT ? OFFSET ?
+            """, params + [limit, offset]).fetchall()
+        return [dict(r) for r in rows], total
 
     def query_calendar_group(
         self, months: int,
@@ -1150,34 +1535,77 @@ class StatsDB:
                 return []
         return [{"date": r["date"], "value": r["value"]} for r in rows]
 
-    def query_polar_bins(self, days: int, bearing_sectors: int = 36, range_bands: int = 10) -> dict:
+    def query_polar_bins(self, days: int, bearing_sectors: int = 32) -> dict:
         """Bin coverage samples into a polar grid for heatmap rendering.
-        Returns aggregated cell counts rather than individual points."""
-        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        Uses pre-aggregated daily tables for speed; falls back to raw samples for today
+        and for non-standard sector counts."""
+        band_nm = 25
+        today = date.today().isoformat()
+        cutoff = (date.today() - timedelta(days=days)).isoformat()
         sector_width = 360.0 / bearing_sectors
+
         with self._connect() as conn:
-            max_range_row = conn.execute(
-                "SELECT MAX(range_nm) FROM coverage_samples WHERE ts >= ?", (cutoff,)
-            ).fetchone()[0]
-            if not max_range_row:
-                return {"bins": [], "max_range": 0, "band_nm": 0,
-                        "sectors": bearing_sectors, "bands": range_bands}
-            # Round up to nearest 50 nm for clean ring labels
-            import math
-            max_range = math.ceil(max_range_row / 50) * 50
-            band_nm = max_range / range_bands
-            rows = conn.execute("""
-                SELECT CAST(bearing_deg / ? AS INTEGER)  AS b,
-                       CAST(range_nm    / ? AS INTEGER)  AS r,
-                       COUNT(*)                          AS count
+            if bearing_sectors == 32:
+                # Fast path: use pre-aggregated daily table
+                past_rows = conn.execute("""
+                    SELECT sector AS b, band AS r, SUM(count) AS count
+                    FROM coverage_daily_polar
+                    WHERE date >= ? AND date < ?
+                    GROUP BY sector, band
+                """, (cutoff, today)).fetchall()
+            else:
+                # Fallback for non-standard sector counts
+                cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+                past_rows = conn.execute("""
+                    SELECT CAST(bearing_deg / ? AS INTEGER) AS b,
+                           CAST(range_nm    / ? AS INTEGER) AS r,
+                           COUNT(*) AS count
+                    FROM coverage_samples
+                    WHERE ts >= ? AND bearing_deg IS NOT NULL AND range_nm IS NOT NULL
+                    GROUP BY b, r
+                """, (sector_width, band_nm, cutoff_ts)).fetchall()
+
+            # Today's data always from raw samples
+            today_rows = conn.execute("""
+                SELECT CAST(bearing_deg / ? AS INTEGER) AS b,
+                       CAST(range_nm    / ? AS INTEGER) AS r,
+                       COUNT(*) AS count
                 FROM coverage_samples
-                WHERE ts >= ?
+                WHERE date(ts, 'unixepoch') = ?
+                  AND bearing_deg IS NOT NULL AND range_nm IS NOT NULL
                 GROUP BY b, r
-                ORDER BY b, r
-            """, (sector_width, band_nm, cutoff)).fetchall()
+            """, (sector_width, band_nm, today)).fetchall()
+
+        bins_dict: dict = {}
+        for r in list(past_rows) + list(today_rows):
+            key = (r["b"], r["r"])
+            bins_dict[key] = bins_dict.get(key, 0) + r["count"]
+
+        if not bins_dict:
+            return {"bins": [], "max_range": 0, "band_nm": band_nm,
+                    "sectors": bearing_sectors, "bands": 0}
+
+        # Compute 95th-percentile range band to exclude outlier decodes
+        band_totals: dict = defaultdict(int)
+        for (_, r), c in bins_dict.items():
+            band_totals[r] += c
+        total = sum(band_totals.values())
+        target = int(0.95 * total)
+        cumulative = 0
+        cap_band = 0
+        for r in sorted(band_totals.keys()):
+            cumulative += band_totals[r]
+            cap_band = r
+            if cumulative >= target:
+                break
+        max_range = math.ceil((cap_band + 1) * band_nm / band_nm) * band_nm
+        range_bands = max_range // band_nm
+
+        bins = [{"b": b, "r": min(r, range_bands - 1), "count": c}
+                for (b, r), c in bins_dict.items()
+                if b * sector_width < 360]
         return {
-            "bins": [{"b": r["b"], "r": min(r["r"], range_bands - 1), "count": r["count"]}
-                     for r in rows],
+            "bins": bins,
             "max_range": max_range,
             "band_nm": band_nm,
             "sectors": bearing_sectors,
@@ -1185,47 +1613,77 @@ class StatsDB:
         }
 
     def query_range_percentiles(self, days: int, sectors: int = 36) -> list[dict]:
-        """Range percentiles (p50/p90/p95) per 10° bearing sector, computed in SQL."""
-        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
-        sector_width = 360.0 / sectors
+        """Range percentiles (p50/p90/p95) per 10° bearing sector.
+        Uses pre-aggregated daily histograms for speed; today's data from raw samples.
+        Bearing values are sector left-edges (0°, 10°, …, 350°) with 360° appended = wrap."""
+        sector_width = 360.0 / sectors  # 10.0 for default 36 sectors
+        today = date.today().isoformat()
+        cutoff = (date.today() - timedelta(days=days)).isoformat()
+
         with self._connect() as conn:
-            rows = conn.execute("""
-                WITH ranked AS (
-                    SELECT CAST(bearing_deg / ? AS INTEGER) AS sector,
-                           range_nm,
-                           ROW_NUMBER() OVER (PARTITION BY CAST(bearing_deg / ? AS INTEGER)
-                                              ORDER BY range_nm)        AS rn,
-                           COUNT(*)    OVER (PARTITION BY CAST(bearing_deg / ? AS INTEGER)) AS total
-                    FROM coverage_samples
-                    WHERE ts >= ?
-                )
-                SELECT sector,
-                       COUNT(*) AS count,
-                       MIN(CASE WHEN rn * 100 >= total * 50 THEN range_nm END) AS p50,
-                       MIN(CASE WHEN rn * 100 >= total * 90 THEN range_nm END) AS p90,
-                       MIN(CASE WHEN rn * 100 >= total * 95 THEN range_nm END) AS p95
-                FROM ranked
-                GROUP BY sector
-                ORDER BY sector
-            """, (sector_width, sector_width, sector_width, cutoff)).fetchall()
+            # Past days from pre-aggregated histogram (stored at 10° resolution)
+            past_rows = conn.execute("""
+                SELECT sector, bucket, SUM(count) AS count
+                FROM coverage_daily_range_hist
+                WHERE date >= ? AND date < ?
+                GROUP BY sector, bucket
+            """, (cutoff, today)).fetchall()
+
+            # Today from raw samples (use same 10° sector width)
+            today_rows = conn.execute("""
+                SELECT CAST(bearing_deg / ? AS INTEGER) AS sector,
+                       CAST(range_nm    / 5.0 AS INTEGER) AS bucket,
+                       COUNT(*) AS count
+                FROM coverage_samples
+                WHERE date(ts, 'unixepoch') = ?
+                  AND bearing_deg IS NOT NULL AND range_nm > 0
+                GROUP BY sector, bucket
+            """, (sector_width, today)).fetchall()
+
+        # Merge into {sector: {bucket: count}}
+        sector_buckets: dict = defaultdict(lambda: defaultdict(int))
+        for r in list(past_rows) + list(today_rows):
+            sector_buckets[r["sector"]][r["bucket"]] += r["count"]
+
+        if not sector_buckets:
+            return []
 
         result = []
-        for r in rows:
+        for sector_idx in sorted(sector_buckets.keys()):
+            buckets = sector_buckets[sector_idx]
+            total = sum(buckets.values())
+            if not total:
+                continue
+            cumulative = 0
+            p50 = p90 = p95 = None
+            for bkt in sorted(buckets.keys()):
+                cumulative += buckets[bkt]
+                nm = bkt * 5 + 2.5  # midpoint of 5 nm bucket
+                if p50 is None and cumulative * 100 >= total * 50:
+                    p50 = round(nm, 1)
+                if p90 is None and cumulative * 100 >= total * 90:
+                    p90 = round(nm, 1)
+                if p95 is None and cumulative * 100 >= total * 95:
+                    p95 = round(nm, 1)
             result.append({
-                "bearing": round(r["sector"] * sector_width + sector_width / 2, 1),
-                "p50": round(r["p50"], 1) if r["p50"] is not None else None,
-                "p90": round(r["p90"], 1) if r["p90"] is not None else None,
-                "p95": round(r["p95"], 1) if r["p95"] is not None else None,
-                "count": r["count"],
+                "bearing": round(sector_idx * sector_width, 1),  # left edge: 0°, 10°, …
+                "p50": p50, "p90": p90, "p95": p95,
+                "count": total,
             })
+
+        # Append 360° = same as 0° so the area chart closes the loop
+        if result and result[0]["bearing"] == 0.0:
+            result.append({**result[0], "bearing": 360.0})
         return result
 
     def query_distributions(self) -> dict:
-        """Percentile stats for key metrics across 1d, 7d, 30d windows.
+        """Percentile stats for key metrics across 1d, 7d, 30d, 365d windows.
         Returns p5/p25/p50/p75/p95 + mean + n for each metric/window.
-        Signal values are returned as dBFS (negative; 0 = strongest)."""
+        Signal values are returned as dBFS (negative; 0 = strongest).
+        Range uses pre-aggregated daily histograms for speed."""
         now = int(datetime.now(timezone.utc).timestamp())
         cutoffs = {"1d": now - 86400, "7d": now - 7 * 86400, "30d": now - 30 * 86400, "365d": now - 365 * 86400}
+        today = date.today().isoformat()
 
         def pct_sql(conn, col, table, cutoff, extra=""):
             row = conn.execute(f"""
@@ -1257,14 +1715,53 @@ class StatsDB:
             return {k: (round(-v / 2, 1) if k != "n" and v is not None else v)
                     for k, v in d.items()}
 
+        def range_from_hist(conn, cutoff_ts: int) -> dict | None:
+            """Compute range percentiles from pre-aggregated daily histograms + today's raw data."""
+            cutoff_date = datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).date().isoformat()
+            past = conn.execute("""
+                SELECT bucket, SUM(count) AS count
+                FROM coverage_daily_range_hist
+                WHERE date >= ? AND date < ?
+                GROUP BY bucket
+            """, (cutoff_date, today)).fetchall()
+            today_raw = conn.execute("""
+                SELECT CAST(range_nm / 5.0 AS INTEGER) AS bucket, COUNT(*) AS count
+                FROM coverage_samples
+                WHERE date(ts, 'unixepoch') = ? AND range_nm > 0
+                GROUP BY bucket
+            """, (today,)).fetchall()
+
+            buckets: dict = defaultdict(int)
+            for r in list(past) + list(today_raw):
+                buckets[r["bucket"]] += r["count"]
+            if not buckets:
+                return None
+
+            total = sum(buckets.values())
+            cumulative = 0
+            mean_sum = 0.0
+            p5 = p25 = p50 = p75 = p95 = None
+            for bkt in sorted(buckets.keys()):
+                cnt = buckets[bkt]
+                nm = bkt * 5 + 2.5
+                mean_sum += nm * cnt
+                cumulative += cnt
+                if p5  is None and cumulative * 100 >= total *  5: p5  = round(nm, 2)
+                if p25 is None and cumulative * 100 >= total * 25: p25 = round(nm, 2)
+                if p50 is None and cumulative * 100 >= total * 50: p50 = round(nm, 2)
+                if p75 is None and cumulative * 100 >= total * 75: p75 = round(nm, 2)
+                if p95 is None and cumulative * 100 >= total * 95: p95 = round(nm, 2)
+            return {"n": total, "mean": round(mean_sum / total, 2),
+                    "p5": p5, "p25": p25, "p50": p50, "p75": p75, "p95": p95}
+
         result: dict = {}
         with self._connect() as conn:
             for window, cutoff in cutoffs.items():
-                msgs   = pct_sql(conn, "msg_mean",   "minute_stats",    cutoff)
-                ac     = pct_sql(conn, "ac_total",   "minute_stats",    cutoff)
-                sig    = to_dbfs(pct_sql(conn, "signal_avg", "minute_stats",    cutoff,
-                                         "AND signal_avg IS NOT NULL"))
-                rng    = pct_sql(conn, "range_nm",   "coverage_samples", cutoff, "AND range_nm > 0")
+                msgs = pct_sql(conn, "msg_mean", "minute_stats", cutoff)
+                ac   = pct_sql(conn, "ac_total", "minute_stats", cutoff)
+                sig  = to_dbfs(pct_sql(conn, "signal_avg", "minute_stats", cutoff,
+                                        "AND signal_avg IS NOT NULL"))
+                rng  = range_from_hist(conn, cutoff)
                 for metric, val in (("msgs", msgs), ("aircraft", ac), ("signal", sig), ("range", rng)):
                     result.setdefault(metric, {})[window] = val
         return result
@@ -1296,33 +1793,86 @@ class StatsDB:
         return [{"date": r["day"], "pct": r["pct"]} for r in rows]
 
     def query_position_decode_rate(self, days: int) -> list[dict]:
-        """Daily average position decode rate: % of tracked aircraft per minute
-        that had a decoded position, averaged across each day."""
-        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        """Daily position breakdown as % of unique aircraft seen that day.
+        Three mutually-exclusive categories that sum to 100%:
+          adsb_pct  — had a decoded position but was NOT MLAT-sourced
+          mlat_pct  — had an MLAT-sourced position
+          no_pos_pct — no decoded position at all"""
+        cutoff = (date.today() - timedelta(days=days)).isoformat()
         with self._connect() as conn:
             rows = conn.execute("""
-                WITH daily_ac AS (
-                    SELECT date(ts, 'unixepoch') AS day,
-                           SUM(ac_total)         AS total_ac_mins
-                    FROM minute_stats
-                    WHERE ts >= ? AND ac_total > 0
-                    GROUP BY day
-                ),
-                daily_pos AS (
-                    SELECT date(cs.ts, 'unixepoch') AS day,
-                           COUNT(*)                 AS pos_ac_mins
-                    FROM coverage_samples cs
-                    INNER JOIN minute_stats ms ON ms.ts = cs.ts
-                    WHERE cs.ts >= ?
-                    GROUP BY day
+                SELECT
+                    date,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN had_pos = 1 AND mlat = 0 THEN 1 ELSE 0 END) AS adsb_count,
+                    SUM(mlat)                                                   AS mlat_count,
+                    SUM(CASE WHEN had_pos = 0             THEN 1 ELSE 0 END) AS no_pos_count
+                FROM daily_aircraft_seen
+                WHERE date >= ?
+                GROUP BY date
+                ORDER BY date
+            """, (cutoff,)).fetchall()
+        return [
+            {
+                "date":       r["date"],
+                "adsb_pct":   round(r["adsb_count"]   * 100.0 / r["total"], 1) if r["total"] else 0,
+                "mlat_pct":   round(r["mlat_count"]   * 100.0 / r["total"], 1) if r["total"] else 0,
+                "no_pos_pct": round(r["no_pos_count"] * 100.0 / r["total"], 1) if r["total"] else 0,
+            }
+            for r in rows
+        ]
+
+    def query_military_icaos(self) -> list[str]:
+        """Return all ICAO addresses flagged military in the registry."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT icao FROM aircraft_registry WHERE military = 1"
+            ).fetchall()
+            return [r["icao"] for r in rows]
+
+    def fix_military_countries(self, corrections: dict, home_country: str) -> None:
+        """Bulk-update country and foreign_military for military aircraft using ICAO block data.
+        Called at startup to repair entries written before the registration-prefix bug was fixed."""
+        home = (home_country or "").lower()
+        with self._connect() as conn:
+            for icao, country in corrections.items():
+                foreign_mil = int(bool(home and country and country.lower() != home))
+                conn.execute(
+                    "UPDATE aircraft_registry SET country = ?, foreign_military = ? WHERE icao = ?",
+                    (country, foreign_mil, icao),
                 )
-                SELECT a.day,
-                       MIN(100.0, ROUND(COALESCE(p.pos_ac_mins, 0) * 100.0 / a.total_ac_mins, 1)) AS pct
-                FROM daily_ac a
-                LEFT JOIN daily_pos p ON a.day = p.day
-                ORDER BY a.day
-            """, (cutoff, cutoff)).fetchall()
-        return [{"date": r["day"], "pct": r["pct"]} for r in rows]
+        log.info("DB: corrected country/foreign_military for %d military aircraft", len(corrections))
+
+    def get_aircraft_registry_entry(self, icao: str) -> dict | None:
+        """Return raw aircraft_registry row as a dict, or None if not found."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM aircraft_registry WHERE icao = ?", (icao.upper(),)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def update_aircraft_field(self, icao: str, field: str, value) -> None:
+        """Overwrite a single field in aircraft_registry (field already validated by router).
+        When country or military changes, foreign_military is recalculated immediately."""
+        icao = icao.upper()
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE aircraft_registry SET {field} = ? WHERE icao = ?",
+                (value, icao),
+            )
+            # Recalculate foreign_military whenever country or military changes
+            if field in ("country", "military"):
+                home = (config.HOME_COUNTRY or "").lower()
+                conn.execute("""
+                    UPDATE aircraft_registry
+                    SET foreign_military = CASE
+                        WHEN military = 1
+                             AND ? != ''
+                             AND country IS NOT NULL
+                             AND LOWER(country) != ?
+                        THEN 1 ELSE 0 END
+                    WHERE icao = ?
+                """, (home, home, icao))
 
     def update_aircraft_enrichment(
         self, icao: str,
@@ -1418,7 +1968,6 @@ class StatsDB:
     def query_azimuth_elevation(self, days: int, max_points: int = 4000) -> list[dict]:
         """Bearing vs elevation angle scatter, coloured by range.
         Elevation computed from altitude and slant range. Downsampled to max_points."""
-        import math
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
         with self._connect() as conn:
             total = conn.execute("""
@@ -1474,6 +2023,54 @@ class StatsDB:
                 icaos,
             ).fetchall()
         return {r["icao"]: r["sighting_count"] for r in rows}
+
+    def query_status(self) -> dict:
+        """DB size, per-table row counts, date ranges, and retention policy summary."""
+        import os
+        db_size = os.path.getsize(str(config.DB_PATH)) if config.DB_PATH.exists() else 0
+
+        tables = [
+            ("minute_stats",          "ts",        True,  config.MINUTE_STATS_RETENTION_DAYS),
+            ("minute_df_counts",      "ts",        True,  config.MINUTE_STATS_RETENTION_DAYS),
+            ("minute_type_counts",    "ts",        True,  config.MINUTE_STATS_RETENTION_DAYS),
+            ("minute_operator_counts","ts",        True,  config.MINUTE_STATS_RETENTION_DAYS),
+            ("daily_aircraft_seen",   "date",      True,  config.MINUTE_STATS_RETENTION_DAYS),
+            ("day_stats",             "date",      False, None),
+            ("aircraft_registry",     None,        False, None),
+            ("coverage_samples",      "ts",        True,  90),
+            ("acas_events",           "ts",        True,  90),
+        ]
+
+        result = []
+        with self._connect() as conn:
+            for tbl, ts_col, expires, ret_days in tables:
+                row_count = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                oldest = newest = None
+                if ts_col and row_count:
+                    bounds = conn.execute(
+                        f"SELECT MIN({ts_col}), MAX({ts_col}) FROM {tbl}"
+                    ).fetchone()
+                    oldest, newest = bounds[0], bounds[1]
+                result.append({
+                    "table":       tbl,
+                    "rows":        row_count,
+                    "oldest":      oldest,
+                    "newest":      newest,
+                    "expires":     expires,
+                    "retain_days": ret_days,
+                })
+
+        return {
+            "db_size_bytes": db_size,
+            "tables": result,
+            "config": {
+                "minute_stats_retention_days": config.MINUTE_STATS_RETENTION_DAYS,
+                "coverage_retention_days":     90,
+                "acas_retention_days":         90,
+                "ghost_filter_msgs":           config.GHOST_FILTER_MSGS,
+                "rare_threshold":              config.RARE_THRESHOLD,
+            },
+        }
 
 
 # Module-level singleton

@@ -177,7 +177,7 @@ export default function CalendarHeatmap() {
         </div>
       </div>
 
-      {loading ? (
+      {!data.length && loading ? (
         <div className={styles.empty}>Loading…</div>
       ) : data.length === 0 ? (
         <div className={styles.empty}>No data yet — check back after the app has been running for a while.</div>
@@ -228,7 +228,7 @@ export default function CalendarHeatmap() {
                 <div
                   key={t}
                   className={styles.legendCell}
-                  style={{ background: t === 0 ? '#21262d' : `rgba(56,139,253,${t})` }}
+                  style={{ background: cellColor(t, 1) }}
                 />
               ))}
               <span className={styles.legendLabel}>More</span>

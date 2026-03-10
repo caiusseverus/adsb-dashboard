@@ -184,14 +184,35 @@ const DF_LABELS = {
 
 function LiveDFBreakdown({ snapshot }) {
   const data = useMemo(() => {
-    const counts = snapshot?.df_history?.slice(-1)[0]?.counts ?? {}
+    const history = snapshot?.df_history ?? []
+    if (!history.length) return []
+
+    // Build a rolling 60-second window by blending the current partial minute
+    // with a proportional share of the previous completed minute.
+    const cur = history[history.length - 1]
+    const prev = history.length >= 2 ? history[history.length - 2] : null
+
+    const curCounts = cur?.counts ?? {}
+    const prevCounts = prev?.counts ?? {}
+
+    // Seconds elapsed since current minute started
+    const curMinStart = (cur?.minute ?? 0) * 60
+    const secsIntoCurMin = Math.min(59, Math.max(1, Math.floor(Date.now() / 1000) - curMinStart))
+    const prevWeight = (60 - secsIntoCurMin) / 60
+
+    const allDfs = new Set([...Object.keys(curCounts), ...Object.keys(prevCounts)])
+    const counts = {}
+    allDfs.forEach(df => {
+      counts[df] = Math.round((curCounts[df] ?? 0) + (prevCounts[df] ?? 0) * prevWeight)
+    })
+
     return Object.entries(counts)
       .map(([df, count]) => ({ label: DF_LABELS[Number(df)] ?? `DF${df}`, count, df: Number(df) }))
       .sort((a, b) => b.count - a.count)
   }, [snapshot?.df_history])
 
   return (
-    <Card title="Live message types — current minute">
+    <Card title="Live message types — rolling 60s">
       {!data.length ? <Empty loading={false} /> : (
         <ResponsiveContainer width="100%" height={220}>
           <BarChart data={data} layout="vertical" margin={{ top: 4, right: 48, bottom: 4, left: 0 }}>
@@ -349,9 +370,19 @@ function binColour(count, maxCount) {
   return `hsl(210,80%,${Math.round(10 + t * 65)}%)`
 }
 
+const COMPASS = [
+  { label: 'N',   deg: 0     }, { label: 'NNE', deg: 22.5  },
+  { label: 'NE',  deg: 45    }, { label: 'ENE', deg: 67.5  },
+  { label: 'E',   deg: 90    }, { label: 'ESE', deg: 112.5 },
+  { label: 'SE',  deg: 135   }, { label: 'SSE', deg: 157.5 },
+  { label: 'S',   deg: 180   }, { label: 'SSW', deg: 202.5 },
+  { label: 'SW',  deg: 225   }, { label: 'WSW', deg: 247.5 },
+  { label: 'W',   deg: 270   }, { label: 'WNW', deg: 292.5 },
+  { label: 'NW',  deg: 315   }, { label: 'NNW', deg: 337.5 },
+]
+
 function PolarCoverage({ days, onDaysChange }) {
-  const { data, loading } = useFetch(`${API_BASE}/api/coverage/polar_bins?days=${days}`)
-  const { data: envelopeData } = useFetch(`${API_BASE}/api/coverage/max_range?days=${days}`)
+  const { data, loading } = useFetch(`${API_BASE}/api/coverage/polar_bins?days=${days}&sectors=32`)
   const [hover, setHover] = useState(null)
   const wrapperRef = useRef(null)
 
@@ -372,34 +403,14 @@ function PolarCoverage({ days, onDaysChange }) {
 
   const rings = useMemo(() => {
     if (!maxRange) return []
-    const step = maxRange <= 200 ? 50 : maxRange <= 400 ? 100 : 200
     const out = []
-    for (let r = step; r <= maxRange; r += step) out.push(r)
+    for (let r = 25; r <= maxRange; r += 25) out.push(r)
     return out
   }, [maxRange])
 
-  const envelopePoints = useMemo(() => {
-    if (!envelopeData?.length || !maxRange) return ''
-    return [...envelopeData]
-      .sort((a, b) => a.bearing - b.bearing)
-      .map(p => {
-        const ang = (p.bearing - 90) * Math.PI / 180
-        const pr  = (p.max_range / maxRange) * R
-        return `${CX + pr * Math.cos(ang)},${CY + pr * Math.sin(ang)}`
-      })
-      .join(' ')
-  }, [envelopeData, maxRange, R])
-
-  const cardinals = [
-    { label: 'N', dx: 0,       dy: -R - 20 },
-    { label: 'E', dx: R + 20,  dy: 0 },
-    { label: 'S', dx: 0,       dy: R + 24 },
-    { label: 'W', dx: -R - 20, dy: 0 },
-  ]
-
   return (
     <Card
-      title="Polar coverage — directional heatmap, max-range envelope"
+      title="Polar coverage — directional heatmap"
       controls={<DaySelect value={days} onChange={onDaysChange} options={[7, 14, 30, 90]} />}
     >
       {loading ? <div className={styles.empty}>Loading…</div>
@@ -415,8 +426,8 @@ function PolarCoverage({ days, onDaysChange }) {
             style={{ width: '100%', maxWidth: 600, aspectRatio: '1', display: 'block', margin: '0 auto' }}
             onMouseLeave={() => setHover(null)}
           >
-            {/* Heatmap cells — one arc per (bearing sector × range band) bin */}
-            {bins.map(({ b, r, count }) => (
+            {/* Heatmap cells — one arc per (bearing sector × range band) bin, skip 360°+ wrapping */}
+            {bins.filter(({ b }) => b * sectorWidth < 360).map(({ b, r, count }) => (
               <path
                 key={`${b}-${r}`}
                 d={arcPath(CX, CY, (r / bands) * R, ((r + 1) / bands) * R,
@@ -437,35 +448,41 @@ function PolarCoverage({ days, onDaysChange }) {
                 }}
               />
             ))}
-            {/* Range rings */}
+            {/* Range rings at 25nm intervals */}
             {rings.map(r => (
               <g key={r}>
                 <circle cx={CX} cy={CY} r={(r / maxRange) * R}
                   fill="none" stroke="#21262d" strokeWidth={1} />
                 <text x={CX + 4} y={CY - (r / maxRange) * R + 14}
-                  fill="#484f58" fontSize={11} textAnchor="start">{r} nm</text>
+                  fill="#484f58" fontSize={10} textAnchor="start">{r}</text>
               </g>
             ))}
-            {/* Bearing lines */}
-            {[0, 45, 90, 135, 180, 225, 270, 315].map(b => {
-              const ang = (b - 90) * Math.PI / 180
-              return <line key={b} x1={CX} y1={CY}
+            {/* Bearing lines at 22.5° intervals */}
+            {COMPASS.map(({ deg }) => {
+              const ang = (deg - 90) * Math.PI / 180
+              return <line key={deg} x1={CX} y1={CY}
                 x2={CX + R * Math.cos(ang)} y2={CY + R * Math.sin(ang)}
                 stroke="#21262d" strokeWidth={1} />
             })}
-            {/* Cardinal labels */}
-            {cardinals.map(({ label, dx, dy }) => (
-              <text key={label} x={CX + dx} y={CY + dy}
-                fill="#8b949e" fontSize={16} fontWeight={600}
-                textAnchor="middle" dominantBaseline="middle">{label}</text>
-            ))}
-            {/* Max-range envelope */}
-            {envelopePoints && (
-              <polygon points={envelopePoints}
-                fill="none"
-                stroke="#388bfd" strokeWidth={1.5} strokeOpacity={0.8}
-                strokeLinejoin="round" />
-            )}
+            {/* 16-point compass labels */}
+            {COMPASS.map(({ label, deg }) => {
+              const rad = (deg - 90) * Math.PI / 180
+              const offset = label.length > 1 ? R + 22 : R + 18
+              const fontSize = label.length > 2 ? 9 : label.length > 1 ? 10 : 14
+              const fontWeight = label.length === 1 ? 700 : 400
+              return (
+                <text
+                  key={label}
+                  x={CX + offset * Math.cos(rad)}
+                  y={CY + offset * Math.sin(rad)}
+                  fill={label.length === 1 ? '#8b949e' : '#484f58'}
+                  fontSize={fontSize}
+                  fontWeight={fontWeight}
+                  textAnchor="middle"
+                  dominantBaseline="middle"
+                >{label}</text>
+              )
+            })}
           </svg>
           {hover && (
             <div style={{
@@ -476,21 +493,15 @@ function PolarCoverage({ days, onDaysChange }) {
             }}>
               <div>{hover.bearing1}°–{hover.bearing2}°</div>
               <div>{hover.range1}–{hover.range2} nm</div>
-              <div style={{ color: '#8b949e' }}>{hover.count.toLocaleString()} samples</div>
+              <div style={{ color: '#8b949e' }}>{hover.count.toLocaleString()} positions received</div>
             </div>
           )}
           </div>
           {/* Legend */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', justifyContent: 'center', marginTop: '0.75rem', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', justifyContent: 'center', marginTop: '0.75rem' }}>
             <span style={{ fontSize: '0.72rem', color: '#484f58' }}>Few</span>
             <div style={{ background: 'linear-gradient(to right, hsl(210,80%,10%), hsl(210,80%,45%), hsl(210,80%,75%))', height: 8, borderRadius: 4, width: 120 }} />
             <span style={{ fontSize: '0.72rem', color: '#484f58' }}>Many</span>
-            {envelopePoints && (
-              <span style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.75rem', color: '#8b949e', marginLeft: '0.75rem' }}>
-                <span style={{ width: 18, height: 2, background: '#388bfd', display: 'inline-block', flexShrink: 0 }} />
-                Max range envelope
-              </span>
-            )}
           </div>
         </>
        )}
@@ -720,25 +731,49 @@ function ReceptionCompleteness({ days, onDaysChange }) {
 // ---------------------------------------------------------------------------
 function PositionDecodeRate({ days, onDaysChange }) {
   const { data, loading } = useFetch(`${API_BASE}/api/history/receiver/position_decode_rate?days=${days}`)
+
+  const chartData = useMemo(() => {
+    if (!data?.length) return []
+    return data.map(d => ({
+      date:   d.date,
+      adsb:   d.adsb_pct   ?? 0,
+      mlat:   d.mlat_pct   ?? 0,
+      no_pos: d.no_pos_pct ?? 0,
+    }))
+  }, [data])
+
+  const hasMLAT = useMemo(() => chartData.some(d => d.mlat > 0), [chartData])
+
   return (
     <Card
-      title="Position decode rate — % of aircraft with position per day"
+      title="Position decode rate — ADS-B / MLAT / no position"
       controls={<DaySelect value={days} onChange={onDaysChange} options={[30, 90, 365]} />}
     >
-      {!data?.length ? <Empty loading={loading} /> : (
-        <ResponsiveContainer width="100%" height={200}>
-          <AreaChart data={data} margin={{ top: 8, right: 12, bottom: 8, left: 8 }}>
-            <CartesianGrid stroke="#21262d" />
-            <XAxis dataKey="date" tick={{ fill: '#484f58', fontSize: 10 }}
-              interval={Math.max(0, Math.floor(data.length / 6))} />
-            <YAxis domain={[0, 100]} tick={{ fill: '#484f58', fontSize: 11 }} width={44}
-              tickFormatter={v => `${v}%`} />
-            <Tooltip contentStyle={{ background: '#161b22', border: '1px solid #30363d', fontSize: 12 }}
-              formatter={v => [`${v}%`, 'with position']} />
-            <Area type="monotone" dataKey="pct" name="Decode rate" stroke="#bc8cff"
-              fill="#bc8cff20" strokeWidth={2} dot={false} isAnimationActive={false} />
-          </AreaChart>
-        </ResponsiveContainer>
+      {!chartData.length ? <Empty loading={loading} /> : (
+        <>
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={chartData} margin={{ top: 8, right: 12, bottom: 8, left: 8 }}
+              barCategoryGap="20%">
+              <CartesianGrid stroke="#21262d" vertical={false} />
+              <XAxis dataKey="date" tick={{ fill: '#484f58', fontSize: 10 }}
+                interval={Math.max(0, Math.floor(chartData.length / 6))} />
+              <YAxis domain={[0, 100]} tick={{ fill: '#484f58', fontSize: 11 }} width={44}
+                tickFormatter={v => `${v}%`} />
+              <Tooltip
+                contentStyle={{ background: '#161b22', border: '1px solid #30363d', fontSize: 12 }}
+                formatter={(v, name) => [`${v.toFixed(1)}%`, name]}
+              />
+              <Bar dataKey="adsb"   name="ADS-B"       stackId="s" fill="#388bfd" isAnimationActive={false} />
+              {hasMLAT && <Bar dataKey="mlat" name="MLAT" stackId="s" fill="#bc8cff" isAnimationActive={false} />}
+              <Bar dataKey="no_pos" name="No position"  stackId="s" fill="#21262d" isAnimationActive={false} />
+            </BarChart>
+          </ResponsiveContainer>
+          <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center', marginTop: '0.5rem', fontSize: '0.72rem', color: '#484f58' }}>
+            <span><span style={{ color: '#388bfd' }}>■</span> ADS-B positioned</span>
+            {hasMLAT && <span><span style={{ color: '#bc8cff' }}>■</span> MLAT positioned</span>}
+            <span><span style={{ color: '#30363d' }}>■</span> No position</span>
+          </div>
+        </>
       )}
     </Card>
   )
@@ -748,13 +783,13 @@ function PositionDecodeRate({ days, onDaysChange }) {
 // Page layout
 // ---------------------------------------------------------------------------
 export default function ReceiverPage({ snapshot }) {
-  const [scatterDays, setScatterDays]   = useState(7)
+  const [scatterDays, setScatterDays]   = useState(1)
   const [signalDays,  setSignalDays]    = useState(14)
   const [polarDays,   setPolarDays]     = useState(30)
   const [rangePctDays, setRangePctDays] = useState(30)
   const [uniqueDays,   setUniqueDays]   = useState(90)
   const [completeDays, setCompleteDays] = useState(90)
-  const [decodeDays,   setDecodeDays]   = useState(90)
+  const [decodeDays,   setDecodeDays]   = useState(30)
 
   const aircraft = snapshot?.aircraft || []
 

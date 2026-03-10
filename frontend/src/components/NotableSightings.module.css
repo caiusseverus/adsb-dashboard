@@ -120,6 +120,49 @@
 .num { font-variant-numeric: tabular-nums; font-weight: 600; }
 .typeCount { color: #484f58; font-size: 0.75rem; margin-left: 0.3em; }
 
+.typeSelect {
+  background: transparent;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  color: #484f58;
+  font-size: 0.75rem;
+  padding: 0.2rem 0.4rem;
+  cursor: pointer;
+}
+.typeSelect:hover { color: #8b949e; border-color: #8b949e; }
+.typeSelect option { background: #161b22; color: #c9d1d9; }
+
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  margin-top: 0.75rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid #21262d;
+}
+
+.pageBtn {
+  background: transparent;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  color: #484f58;
+  font-size: 0.8rem;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+  line-height: 1.4;
+}
+.pageBtn:hover:not(:disabled) { color: #c9d1d9; border-color: #8b949e; }
+.pageBtn:disabled { opacity: 0.3; cursor: default; }
+
+.pageInfo {
+  color: #484f58;
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  min-width: 120px;
+  text-align: center;
+}
+
 .empty {
   color: #484f58;
   font-size: 0.85rem;

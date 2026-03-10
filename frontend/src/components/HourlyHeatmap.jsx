@@ -255,7 +255,7 @@ export default function HourlyHeatmap() {
         </div>
       </div>
 
-      {loading ? (
+      {!data.length && loading ? (
         <div className={styles.empty}>Loading…</div>
       ) : data.length === 0 ? (
         <div className={styles.empty}>No data yet — check back after the app has been running for a while.</div>

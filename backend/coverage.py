@@ -18,8 +18,12 @@ async def coverage_polar(days: int = Query(default=30, ge=1, le=90)) -> list[dic
 
 
 @router.get("/polar_bins")
-async def coverage_polar_bins(days: int = Query(default=30, ge=1, le=90)) -> dict:
-    return await asyncio.to_thread(stats_db.query_polar_bins, days)
+async def coverage_polar_bins(
+    days: int = Query(default=30, ge=1, le=90),
+    sectors: int = Query(default=32, ge=8, le=360),
+) -> dict:
+    return await asyncio.to_thread(stats_db.query_polar_bins, days, sectors)
+
 
 
 @router.get("/max_range")
