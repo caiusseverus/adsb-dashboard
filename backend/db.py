@@ -1397,7 +1397,7 @@ class StatsDB:
         if sort_col and sort_col in self._NOTABLE_SORT_MAP:
             direction = "DESC" if sort_dir == "desc" else "ASC"
             expr = self._NOTABLE_SORT_MAP[sort_col]
-            return f"{expr} {direction}, ar.last_seen DESC"
+            return f"{expr} {direction} NULLS LAST, ar.last_seen DESC"
         # Default ordering
         if flag in ("all_aircraft", "unique_sighting"):
             return "ar.last_seen DESC"
