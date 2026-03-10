@@ -550,6 +550,10 @@ class AircraftState:
             ac.military = enrichment.db.is_military(icao)
             ac.country  = enrichment.db.get_country_by_icao(icao)
 
+            # For US military aircraft, derive year from the FY serial (e.g. '06-6160' → '2006')
+            if ac.military and not ac.year and ac.registration:
+                ac.year = enrichment.extract_us_mil_serial_year(ac.registration)
+
             # Apply any previously cached hexdb data immediately (no HTTP, no wait)
             hexdb_cached = enrichment.db.get_hexdb_cached(icao)
             if hexdb_cached:

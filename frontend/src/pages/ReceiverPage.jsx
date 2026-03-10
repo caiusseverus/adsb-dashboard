@@ -493,7 +493,7 @@ function PolarCoverage({ days, onDaysChange }) {
             }}>
               <div>{hover.bearing1}°–{hover.bearing2}°</div>
               <div>{hover.range1}–{hover.range2} nm</div>
-              <div style={{ color: '#8b949e' }}>{hover.count.toLocaleString()} samples</div>
+              <div style={{ color: '#8b949e' }}>{hover.count.toLocaleString()} positions received</div>
             </div>
           )}
           </div>
@@ -734,12 +734,12 @@ function PositionDecodeRate({ days, onDaysChange }) {
 
   const chartData = useMemo(() => {
     if (!data?.length) return []
-    return data.map(d => {
-      const mlat    = d.mlat_pct ?? 0
-      const adsb    = Math.max(0, (d.pos_pct ?? 0) - mlat)
-      const no_pos  = Math.max(0, 100 - (d.pos_pct ?? 0))
-      return { date: d.date, adsb, mlat, no_pos }
-    })
+    return data.map(d => ({
+      date:   d.date,
+      adsb:   d.adsb_pct   ?? 0,
+      mlat:   d.mlat_pct   ?? 0,
+      no_pos: d.no_pos_pct ?? 0,
+    }))
   }, [data])
 
   const hasMLAT = useMemo(() => chartData.some(d => d.mlat > 0), [chartData])
@@ -789,7 +789,7 @@ export default function ReceiverPage({ snapshot }) {
   const [rangePctDays, setRangePctDays] = useState(30)
   const [uniqueDays,   setUniqueDays]   = useState(90)
   const [completeDays, setCompleteDays] = useState(90)
-  const [decodeDays,   setDecodeDays]   = useState(90)
+  const [decodeDays,   setDecodeDays]   = useState(30)
 
   const aircraft = snapshot?.aircraft || []
 

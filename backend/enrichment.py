@@ -24,6 +24,7 @@ import gzip
 import io
 import json
 import logging
+import re
 import time
 import urllib.request
 from typing import Optional
@@ -612,6 +613,25 @@ class EnrichmentDB:
             )
         except Exception as exc:
             log.warning("Enrichment: could not save hexdb cache: %s", exc)
+
+
+_US_MIL_SERIAL_RE = re.compile(r'^\d{2}-\d+$')
+
+
+def extract_us_mil_serial_year(registration: str) -> Optional[str]:
+    """Extract manufacture year from a US military aircraft serial number.
+
+    US military serials use the format YY-NNNN where YY is the two-digit
+    fiscal year (e.g. '06-6160' → 2006, '99-0001' → 1999).
+    Year expansion: 00–50 → 2000–2050, 51–99 → 1951–1999.
+    Returns a 4-digit year string, or None if the registration doesn't match.
+    """
+    if not registration:
+        return None
+    if not _US_MIL_SERIAL_RE.match(registration.strip()):
+        return None
+    yy = int(registration.split('-')[0])
+    return str(2000 + yy if yy <= 50 else 1900 + yy)
 
 
 # Module-level singleton

@@ -31,6 +31,7 @@ const CustomTooltip = ({ active, payload, label }) => {
       <div><span style={{ color: '#388bfd' }}>●</span> Total {byKey.total}</div>
       <div><span style={{ color: '#3fb950' }}>●</span> Civil {byKey.civil}</div>
       <div><span style={{ color: '#bc8cff' }}>●</span> Military {byKey.military}</div>
+      {byKey.mlat > 0 && <div><span style={{ color: '#58a6ff' }}>●</span> MLAT {byKey.mlat}</div>}
     </div>
   )
 }
@@ -54,7 +55,7 @@ export default function TrendChart() {
   return (
     <div className={styles.container}>
       <div className={styles.header}>
-        <span className={styles.heading}>Aircraft Count Trend</span>
+        <span className={styles.heading}>Unique Airframes per Day</span>
         <div className={styles.controls}>
           {DAY_OPTIONS.map(d => (
             <button
@@ -76,6 +77,7 @@ export default function TrendChart() {
           <span className={styles.legendItem}><span className={styles.dot} style={{background:'#388bfd'}} /> Total</span>
           <span className={styles.legendItem}><span className={styles.dot} style={{background:'#3fb950'}} /> Civil</span>
           <span className={styles.legendItem}><span className={styles.dot} style={{background:'#bc8cff'}} /> Military</span>
+          {data.some(d => d.mlat > 0) && <span className={styles.legendItem}><span className={styles.dot} style={{background:'#58a6ff'}} /> MLAT</span>}
         </div>
         <ResponsiveContainer width="100%" height={180}>
           <ComposedChart data={data} margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
@@ -132,6 +134,17 @@ export default function TrendChart() {
               dot={false}
               isAnimationActive={false}
             />
+            {data.some(d => d.mlat > 0) && (
+              <Line
+                type="monotone"
+                dataKey="mlat"
+                stroke="#58a6ff"
+                strokeWidth={1.5}
+                strokeDasharray="4 2"
+                dot={false}
+                isAnimationActive={false}
+              />
+            )}
           </ComposedChart>
         </ResponsiveContainer>
         </>

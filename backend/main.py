@@ -216,6 +216,8 @@ async def lifespan(app: FastAPI):
     enrichment.db.load_or_download()
     await asyncio.to_thread(stats_db.rollup_missed_days)
     await asyncio.to_thread(stats_db.prune)
+    await asyncio.to_thread(stats_db.backfill_daily_coverage)
+    await asyncio.to_thread(stats_db.backfill_us_mil_years)
 
     # Seed today's unique-aircraft sets from DB so counts survive restarts
     today = date.today().isoformat()

@@ -26,8 +26,12 @@ _CALENDAR_METRICS = {
     "msg_max":           "msg_max",
     "unique_aircraft":   "unique_aircraft",
 }
-_VALID_FLAGS = {"all", "foreign_military", "home_military", "interesting", "rare", "first_seen_flag", "unique_sighting"}
+_VALID_FLAGS = {"all", "all_aircraft", "foreign_military", "home_military", "interesting", "rare", "first_seen_flag", "unique_sighting"}
 
+_NOTABLE_SORT_COLS = {
+    "icao", "registration", "type_code", "operator",
+    "year", "country", "flags", "first_seen", "last_seen", "sighting_count",
+}
 
 _VALID_BUCKETS = {15, 60}
 
@@ -192,22 +196,34 @@ async def receiver_completeness(days: int = Query(90, ge=7, le=365)) -> list[dic
 
 
 @router.get("/receiver/position_decode_rate")
-async def receiver_position_decode_rate(days: int = Query(90, ge=7, le=365)) -> list[dict]:
+async def receiver_position_decode_rate(days: int = Query(30, ge=7, le=365)) -> list[dict]:
     return await asyncio.to_thread(stats_db.query_position_decode_rate, days)
 
 
 @router.get("/notable")
 async def notable(
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     flag: str = Query("all"),
     days: Optional[int] = Query(None, ge=1, le=365),
-) -> list[dict]:
+    type_code: Optional[str] = Query(None),
+    sort_col: Optional[str] = Query(None),
+    sort_dir: str = Query("desc"),
+) -> dict:
     if flag not in _VALID_FLAGS:
         raise HTTPException(400, f"Unknown flag. Valid: {sorted(_VALID_FLAGS)}")
+    if sort_col and sort_col not in _NOTABLE_SORT_COLS:
+        raise HTTPException(400, f"Invalid sort column")
+    if sort_dir not in ("asc", "desc"):
+        sort_dir = "desc"
     if flag == "unique_sighting":
-        rows = await asyncio.to_thread(stats_db.query_unique_sightings, limit, days)
+        rows, total = await asyncio.to_thread(
+            stats_db.query_unique_sightings, limit, offset, days, type_code, sort_col, sort_dir
+        )
     else:
-        rows = await asyncio.to_thread(stats_db.query_notable, limit, flag, days)
+        rows, total = await asyncio.to_thread(
+            stats_db.query_notable, flag, limit, offset, days, type_code, sort_col, sort_dir
+        )
     # Overlay ADSBExchange + hexdb in-memory data; fall back to registry-stored fields
     for row in rows:
         icao = row["icao"]
@@ -224,4 +240,4 @@ async def notable(
         model = (adsbx and adsbx.get("model")) or (hexdb and hexdb.get("Type")) or ""
         type_desc = (f"{mfr} {model}".strip()) or None
         row["type_desc"] = type_desc or row.get("manufacturer") or None
-    return rows
+    return {"total": total, "items": rows}
