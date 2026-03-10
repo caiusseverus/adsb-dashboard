@@ -213,7 +213,7 @@ async def _push_updates() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    enrichment.db.load_or_download()
+    await asyncio.to_thread(enrichment.db.load_or_download)
     await asyncio.to_thread(stats_db.rollup_missed_days)
     await asyncio.to_thread(stats_db.prune)
     await asyncio.to_thread(stats_db.backfill_daily_coverage)
@@ -268,12 +268,14 @@ app.include_router(fleet_router)
 app.include_router(coverage_router)
 app.include_router(acas_router)
 app.include_router(status_router)
-app.include_router(debug_router)
+if config.DEBUG_ENRICHMENT:
+    app.include_router(debug_router)
+    log.info("Debug router mounted (DEBUG_ENRICHMENT=%s)", config.DEBUG_ENRICHMENT)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=config.CORS_ORIGINS,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 

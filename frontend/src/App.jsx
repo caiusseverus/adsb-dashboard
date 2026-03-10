@@ -11,7 +11,7 @@ import StatusPage from './pages/StatusPage'
 import styles from './App.module.css'
 
 const WS_URL = import.meta.env.PROD
-  ? `ws://${window.location.host}/ws`
+  ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`
   : 'ws://localhost:8000/ws'
 
 export default function App() {
@@ -32,7 +32,11 @@ export default function App() {
       clearTimeout(retryRef.current)
     }
     ws.onmessage = (e) => {
-      setSnapshot(JSON.parse(e.data))
+      try {
+        setSnapshot(JSON.parse(e.data))
+      } catch {
+        // ignore malformed frames
+      }
     }
     ws.onclose = () => {
       setConnected(false)
