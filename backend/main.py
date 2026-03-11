@@ -282,31 +282,33 @@ async def _push_updates() -> None:
         # doesn't prematurely prune an existing trail.
         active_icaos: set[str] = {ac["icao"] for ac in snapshot["aircraft"]}
         # Build notification tasks and track positions in a single pass.
-        # Notifications are gathered concurrently rather than awaited sequentially
-        # to avoid O(N × thread_dispatch_overhead) blocking on the event loop.
+        # Skip thread dispatch entirely when no notification channel is configured —
+        # avoids O(N × thread_overhead) per second even for no-op calls.
         notify_tasks = []
+        _notify_enabled = notifications.any_channel()
         t_loop_start = time.perf_counter()
         for ac in snapshot["aircraft"]:
             icao = ac["icao"]
-            if icao in _watchlist_cache:
-                notify_tasks.append(asyncio.to_thread(
-                    notifications.notify_watchlist,
-                    icao, ac.get("callsign"), ac.get("registration"),
-                    ac.get("operator"), ac.get("altitude"),
-                    ac.get("range_nm"), _watchlist_cache[icao],
-                ))
-            if ac.get("military"):
-                notify_tasks.append(asyncio.to_thread(
-                    notifications.notify_military,
-                    icao, ac.get("callsign"), ac.get("operator"),
-                    ac.get("country"), ac.get("altitude"), ac.get("range_nm"),
-                ))
-            if ac.get("interesting"):
-                notify_tasks.append(asyncio.to_thread(
-                    notifications.notify_interesting,
-                    icao, ac.get("callsign"), ac.get("type_code"),
-                    ac.get("operator"), ac.get("altitude"), ac.get("range_nm"),
-                ))
+            if _notify_enabled:
+                if icao in _watchlist_cache:
+                    notify_tasks.append(asyncio.to_thread(
+                        notifications.notify_watchlist,
+                        icao, ac.get("callsign"), ac.get("registration"),
+                        ac.get("operator"), ac.get("altitude"),
+                        ac.get("range_nm"), _watchlist_cache[icao],
+                    ))
+                if ac.get("military"):
+                    notify_tasks.append(asyncio.to_thread(
+                        notifications.notify_military,
+                        icao, ac.get("callsign"), ac.get("operator"),
+                        ac.get("country"), ac.get("altitude"), ac.get("range_nm"),
+                    ))
+                if ac.get("interesting"):
+                    notify_tasks.append(asyncio.to_thread(
+                        notifications.notify_interesting,
+                        icao, ac.get("callsign"), ac.get("type_code"),
+                        ac.get("operator"), ac.get("altitude"), ac.get("range_nm"),
+                    ))
 
             # Only record once the position is confirmed reliable:
             # - pos_global=True: a global CPR decode (even+odd pair) has succeeded,

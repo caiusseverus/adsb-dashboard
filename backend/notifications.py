@@ -8,6 +8,7 @@ Env vars (config.py) serve as fallback when DB has no override.
 import json
 import logging
 import smtplib
+import time
 import urllib.request
 from email.message import EmailMessage
 
@@ -17,23 +18,38 @@ log = logging.getLogger(__name__)
 
 _notified: set[str] = set()
 
+# Prefs cache — avoid a DB query on every per-aircraft call
+_prefs_cache: dict = {}
+_prefs_cache_ts: float = 0.0
+_PREFS_TTL = 10.0  # re-read DB at most every 10 seconds
+
 
 def reset_daily() -> None:
     _notified.clear()
     log.debug("Notification dedup set cleared for new day")
 
 
-def _any_channel() -> bool:
+def any_channel() -> bool:
     return bool(config.NTFY_URL or config.NOTIFY_EMAIL_TO)
 
 
+# Keep old name as alias so nothing else breaks
+_any_channel = any_channel
+
+
 def _get_prefs() -> dict:
-    """Load prefs from DB; fall back to env/config values."""
+    """Load prefs from DB, caching for _PREFS_TTL seconds."""
+    global _prefs_cache, _prefs_cache_ts
+    now = time.monotonic()
+    if now - _prefs_cache_ts < _PREFS_TTL:
+        return _prefs_cache
     try:
         from db import stats_db
-        return stats_db.get_notify_prefs()
+        _prefs_cache = stats_db.get_notify_prefs()
     except Exception:
-        return {}
+        _prefs_cache = {}
+    _prefs_cache_ts = now
+    return _prefs_cache
 
 
 def _pref_bool(prefs: dict, key: str, default: bool) -> bool:
@@ -173,14 +189,14 @@ def notify_acas(icao: str, description: str, corrective: bool,
                 altitude: int | None, range_nm: float | None = None) -> None:
     if not _any_channel():
         return
+    key = f"acas:{icao}"
+    if key in _notified:
+        return
     prefs = _get_prefs()
     if not _pref_bool(prefs, "notify_acas", config.NOTIFY_ACAS):
         return
     max_nm = _pref_range(prefs, "acas_max_range_nm")
     if not _in_range(max_nm, range_nm):
-        return
-    key = f"acas:{icao}"
-    if key in _notified:
         return
     _notified.add(key)
 
@@ -225,14 +241,14 @@ def notify_military(icao: str, callsign: str | None, operator: str | None,
                     range_nm: float | None = None) -> None:
     if not _any_channel():
         return
+    key = f"military:{icao}"
+    if key in _notified:
+        return
     prefs = _get_prefs()
     if not _pref_bool(prefs, "notify_military", config.NOTIFY_MILITARY):
         return
     max_nm = _pref_range(prefs, "military_max_range_nm")
     if not _in_range(max_nm, range_nm):
-        return
-    key = f"military:{icao}"
-    if key in _notified:
         return
     _notified.add(key)
 
@@ -255,14 +271,14 @@ def notify_interesting(icao: str, callsign: str | None, type_code: str | None,
                        range_nm: float | None = None) -> None:
     if not _any_channel():
         return
+    key = f"interesting:{icao}"
+    if key in _notified:
+        return
     prefs = _get_prefs()
     if not _pref_bool(prefs, "notify_interesting", config.NOTIFY_INTERESTING):
         return
     max_nm = _pref_range(prefs, "interesting_max_range_nm")
     if not _in_range(max_nm, range_nm):
-        return
-    key = f"interesting:{icao}"
-    if key in _notified:
         return
     _notified.add(key)
 
