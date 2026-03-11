@@ -1,0 +1,113 @@
+.section {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+}
+
+.titleRow {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 0.25rem;
+}
+
+.title {
+  margin: 0;
+  font-size: 0.95rem;
+  color: #c9d1d9;
+  font-weight: 600;
+}
+
+.subtitle {
+  margin: 0 0 1rem;
+  font-size: 0.75rem;
+  color: #484f58;
+}
+
+.controls {
+  display: flex;
+  gap: 3px;
+}
+
+.sep {
+  width: 1px;
+  background: #30363d;
+  margin: 0 4px;
+  align-self: stretch;
+}
+
+.btn, .btnActive {
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  border: 1px solid #30363d;
+  cursor: pointer;
+  background: transparent;
+  color: #484f58;
+}
+.btn:hover { color: #8b949e; }
+.btnActive  { background: #21262d; color: #e6edf3; border-color: #388bfd; }
+
+.status {
+  padding: 2rem;
+  text-align: center;
+  color: #484f58;
+  font-size: 0.85rem;
+}
+
+.chartWrap {
+  display: flex;
+  align-items: flex-start;
+  gap: 0;
+  /* prevent layout shift while loading */
+  min-height: 472px;
+}
+
+.yAxis {
+  flex-shrink: 0;
+  display: block;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+.scrollArea {
+  flex: 1;
+  overflow: hidden;
+}
+
+.heatmap {
+  display: block;
+  /* Always fill the available width regardless of internal pixel count.
+     Height is fixed so only the X axis stretches — intentional distortion
+     for short time windows gives more detail, not a shrunk plot. */
+  width: 100%;
+  /* height set via inline style so it adjusts with the ceiling */
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+.legend {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+  font-size: 0.72rem;
+  color: #484f58;
+}
+
+.legendGradient {
+  width: 160px;
+  height: 10px;
+  border-radius: 2px;
+  /* stops match heatColor() in component */
+  background: linear-gradient(to right,
+    #0b0c10,
+    #1e0a3c,
+    #142d8c,
+    #00b4dc,
+    #3cdc78,
+    #f0dc00,
+    #ffffff
+  );
+}
