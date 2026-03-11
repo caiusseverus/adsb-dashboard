@@ -430,8 +430,8 @@ app.include_router(acas_router)
 app.include_router(squawks_router)
 app.include_router(status_router)
 app.include_router(notify_settings_router)
+app.include_router(debug_router)
 if config.DEBUG_ENRICHMENT:
-    app.include_router(debug_router)
     log.info("Debug router mounted (DEBUG_ENRICHMENT=%s)", config.DEBUG_ENRICHMENT)
 
 app.add_middleware(
