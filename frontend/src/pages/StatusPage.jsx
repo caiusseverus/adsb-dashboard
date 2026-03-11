@@ -13,6 +13,7 @@ const TABLE_DESCRIPTIONS = {
   aircraft_registry:      { label: 'Aircraft registry',     desc: 'All aircraft ever seen; enrichment data, flags; kept permanently' },
   coverage_samples:       { label: 'Coverage samples',      desc: 'Per-minute range/bearing/altitude samples; used for polar plot and range charts' },
   acas_events:            { label: 'ACAS events',           desc: 'Decoded TCAS/ACAS Resolution Advisory events' },
+  squawk_events:          { label: 'Emergency squawks',     desc: 'Emergency squawk observations (7700/7600/7500); 90-day retention' },
 }
 
 function fmtBytes(n) {
@@ -27,11 +28,15 @@ function fmtRows(n) {
   return n?.toLocaleString() ?? '—'
 }
 
+const DATE_FMT = { day: 'numeric', month: 'short', year: 'numeric' }
+
 function fmtTs(ts) {
   if (!ts) return '—'
-  // Could be a Unix timestamp (integer) or a date string
-  if (typeof ts === 'string') return ts
-  return new Date(ts * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+  // date strings arrive as "YYYY-MM-DD"; append time so Date parses in local tz
+  const d = typeof ts === 'string'
+    ? new Date(ts + 'T00:00:00')
+    : new Date(ts * 1000)
+  return d.toLocaleDateString('en-GB', DATE_FMT)  // e.g. "5 Mar 2026"
 }
 
 function RetentionBadge({ expires, retainDays }) {
@@ -98,6 +103,7 @@ export default function StatusPage() {
               <th>Table</th>
               <th>Description</th>
               <th className={styles.num}>Rows</th>
+              <th className={styles.num}>Size</th>
               <th>Oldest record</th>
               <th>Newest record</th>
               <th>Retention</th>
@@ -111,6 +117,7 @@ export default function StatusPage() {
                   <td className={styles.tableName}>{meta.label}</td>
                   <td className={styles.desc}>{meta.desc}</td>
                   <td className={styles.num}>{fmtRows(t.rows)}</td>
+                  <td className={styles.num}>{fmtBytes(t.size_bytes)}</td>
                   <td className={styles.muted}>{fmtTs(t.oldest)}</td>
                   <td className={styles.muted}>{fmtTs(t.newest)}</td>
                   <td><RetentionBadge expires={t.expires} retainDays={t.retain_days} /></td>
@@ -119,10 +126,42 @@ export default function StatusPage() {
             })}
           </tbody>
         </table>
+        <div className={styles.tableNote}>
+          Table sizes include associated indexes. Remaining difference from total is SQLite free-page pool (space reclaimed from deleted rows, reused on next write).
+        </div>
       </div>
 
       {/* Aircraft debug lookup */}
       <AircraftDebug />
+
+      {/* Acknowledgements */}
+      <div className={styles.card}>
+        <div className={styles.cardHeader}>
+          <span className={styles.cardTitle}>Data sources &amp; acknowledgements</span>
+        </div>
+        <div className={styles.ackGrid}>
+          <AckItem
+            name="ADS-B Exchange"
+            url="https://www.adsbexchange.com"
+            desc="Aircraft enrichment data (registration, operator, type, military flag)"
+          />
+          <AckItem
+            name="hexdb.io"
+            url="https://hexdb.io"
+            desc="Aircraft registration and type lookup by ICAO hex address"
+          />
+          <AckItem
+            name="tar1090"
+            url="https://github.com/wiedehopf/tar1090"
+            desc="Aircraft database (tar1090-db) used for local registration lookup"
+          />
+          <AckItem
+            name="Planespotters.net"
+            url="https://www.planespotters.net"
+            desc="Aircraft photos displayed in the aircraft detail panel"
+          />
+        </div>
+      </div>
 
       {/* Config */}
       <div className={styles.card}>
@@ -138,6 +177,15 @@ export default function StatusPage() {
         </div>
       </div>
     </main>
+  )
+}
+
+function AckItem({ name, url, desc }) {
+  return (
+    <div className={styles.ackItem}>
+      <a href={url} target="_blank" rel="noopener noreferrer" className={styles.ackLink}>{name}</a>
+      <span className={styles.ackDesc}>{desc}</span>
+    </div>
   )
 }
 

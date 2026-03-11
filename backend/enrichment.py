@@ -13,6 +13,14 @@ Supplementary sources (bulk download, cached):
 Fallback source (on-demand API, results cached):
   - hexdb.io — registered owners for aircraft absent from ADSBExchange
 
+Memory strategy:
+  - ADSBExchange (~500K records) stored in a local SQLite DB (enrichment.db) rather
+    than a Python dict.  A bounded LRU cache (_adsbx_lru) holds the most-recently
+    looked-up entries so hot aircraft don't round-trip to SQLite every time.
+  - tar1090 per-aircraft shards are loaded from disk on demand, one ICAO is extracted,
+    then the shard dict is discarded.  The per-ICAO result is kept in _tar1090_lru.
+    Neither the raw shard dict nor the full adsbx dict is retained in RAM.
+
 Operator resolution order (each step overrides the previous):
   1. ADSBExchange ownop       — set at aircraft creation
   2. hexdb.io RegisteredOwners / OperatorFlagCode — set asynchronously (background task)
@@ -25,8 +33,10 @@ import io
 import json
 import logging
 import re
+import sqlite3
 import time
 import urllib.request
+from collections import OrderedDict
 from typing import Optional
 
 
@@ -239,8 +249,9 @@ _CR_NAME = [r[2] for r in _ICAO_COUNTRY_RANGES]
 
 # ADSBExchange (primary per-aircraft data)
 _ADSBX_URL   = "https://downloads.adsbexchange.com/downloads/basic-ac-db.json.gz"
-_ADSBX_RAW   = "adsbx_db.json.gz"    # raw downloaded file
-_ADSBX_CACHE = "adsbx_cache.json.gz" # processed compact cache
+_ADSBX_RAW   = "adsbx_db.json.gz"    # raw downloaded NDJSON file
+_ADSBX_CACHE = "adsbx_cache.json.gz" # legacy compact dict cache (migration only)
+_ADSBX_DB    = "enrichment.db"       # SQLite DB replacing in-memory dict
 _ADSBX_MAX_AGE = 7 * 86400           # re-download after 7 days
 
 # tar1090-db supplementary files (operators + type info + per-aircraft shards)
@@ -254,6 +265,9 @@ _TAR1090_SHARD_AGE  = 30 * 86400     # re-download shard files after 30 days
 # hexdb.io (on-demand fallback)
 _HEXDB_BASE       = "https://hexdb.io/api/v1/aircraft"
 _HEXDB_CACHE_FILE = "hexdb_cache.json.gz"
+
+# Per-ICAO LRU cache size — covers active aircraft with headroom
+_LRU_MAX = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +284,6 @@ def _decompress(raw: bytes) -> str:
     return gzip.decompress(raw).decode("utf-8")
 
 
-
 def _cache_age(filename: str) -> float:
     """Return seconds since a cache file was last modified, or infinity if absent."""
     path = config.DATA_DIR / filename
@@ -283,18 +296,36 @@ def _cache_age(filename: str) -> float:
 
 class EnrichmentDB:
     def __init__(self) -> None:
-        # ADSBExchange: ICAO_UPPER → {reg, icaotype, ownop, year, mil, manufacturer, model}
-        self._adsbx: dict[str, dict] = {}
-        # tar1090-db auxiliary
+        # ADSBExchange data lives in SQLite (enrichment.db); connection opened lazily
+        self._adsbx_conn: sqlite3.Connection | None = None
+        # Per-ICAO LRU caches — bounded so they can't grow unboundedly
+        self._adsbx_lru: OrderedDict[str, dict | None] = OrderedDict()
+        self._tar1090_lru: OrderedDict[str, dict | None] = OrderedDict()
+        # tar1090-db auxiliary (small, kept in RAM — ~1.5MB total)
         self._operators: dict[str, dict] = {}
         self._type_info: dict[str, dict] = {}
-        # tar1090-db per-aircraft shards: shard_key (e.g. "40") → {icao_suffix → entry}
-        # Loaded on demand; empty-dict sentinel means the shard was tried and had no data.
-        self._tar1090_shards: dict[str, dict] = {}
         # hexdb.io persistent cache: ICAO_UPPER → response dict (successes only)
         self._hexdb_cache: dict[str, dict] = {}
         # ICAOs that returned no data this session — not persisted, retried on restart
         self._hexdb_session_misses: set[str] = set()
+
+    # ------------------------------------------------------------------
+    # LRU helpers
+    # ------------------------------------------------------------------
+
+    def _lru_get(self, cache: OrderedDict, key: str) -> tuple[bool, object]:
+        """Return (found, value).  Moves the entry to most-recently-used position."""
+        if key in cache:
+            cache.move_to_end(key)
+            return True, cache[key]
+        return False, None
+
+    def _lru_put(self, cache: OrderedDict, key: str, value: object) -> None:
+        """Insert/update a cache entry, evicting the oldest if over capacity."""
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > _LRU_MAX:
+            cache.popitem(last=False)
 
     # ------------------------------------------------------------------
     # Public API
@@ -302,7 +333,7 @@ class EnrichmentDB:
 
     def load_or_download(self) -> None:
         """Load all enrichment data from cache, downloading anything missing."""
-        self._load_or_download_adsbx()
+        self._load_or_init_adsbx_db()
         for fname, url in [
             ("operators.js",            _OPERATORS_URL),
             ("icao_aircraft_types.js",  _TYPES_URL),
@@ -316,9 +347,9 @@ class EnrichmentDB:
 
     def check_for_updates(self) -> None:
         """Re-download stale files: ADSBExchange after 7 days, aux files after 30 days."""
-        if _cache_age(_ADSBX_CACHE) > _ADSBX_MAX_AGE:
-            log.info("Enrichment: ADSBExchange cache stale — re-downloading")
-            self._download_adsbx()
+        if _cache_age(_ADSBX_DB) > _ADSBX_MAX_AGE:
+            log.info("Enrichment: ADSBExchange DB stale — re-downloading")
+            self._download_and_reimport_adsbx()
         for fname, url in [
             ("operators.js",            _OPERATORS_URL),
             ("icao_aircraft_types.js",  _TYPES_URL),
@@ -330,7 +361,13 @@ class EnrichmentDB:
 
     def get_adsbx(self, icao: str) -> Optional[dict]:
         """Return ADSBExchange record for an ICAO, or None."""
-        return self._adsbx.get(icao.upper())
+        key = icao.upper()
+        found, val = self._lru_get(self._adsbx_lru, key)
+        if found:
+            return val  # type: ignore[return-value]
+        result = self._adsbx_db_lookup(key)
+        self._lru_put(self._adsbx_lru, key, result)
+        return result
 
     def get_operator(self, prefix: str) -> Optional[dict]:
         """Look up 3-letter ICAO airline designator; returns operator dict or None."""
@@ -342,8 +379,8 @@ class EnrichmentDB:
 
     def is_military(self, icao: str) -> bool:
         """Return True if ADSBExchange flags this aircraft military."""
-        adsbx = self._adsbx.get(icao.upper())
-        return bool(adsbx and adsbx.get("mil"))
+        rec = self.get_adsbx(icao)
+        return bool(rec and rec.get("mil"))
 
     def get_country_by_icao(self, icao: str) -> Optional[str]:
         """Return registration country from ICAO address block allocation, or None."""
@@ -361,29 +398,30 @@ class EnrichmentDB:
         return self._hexdb_cache.get(icao.upper())
 
     def get_tar1090_cached(self, icao: str) -> Optional[dict]:
-        """Return tar1090-db data if the relevant shard is already in memory, else None.
-        Never triggers a download — safe to call from hot paths."""
+        """Return tar1090-db data if the ICAO is already in the LRU cache, else None.
+        Never triggers disk I/O — safe to call from hot paths."""
         key = icao.upper()
-        shard = key[:2].lower()
-        shard_data = self._tar1090_shards.get(shard)
-        if shard_data is None:
-            return None
-        return self._tar1090_lookup(key, shard_data)
+        found, val = self._lru_get(self._tar1090_lru, key)
+        return val if found else None  # type: ignore[return-value]
 
     def get_tar1090(self, icao: str) -> Optional[dict]:
-        """Return tar1090-db data for an aircraft, downloading the shard if needed.
+        """Return tar1090-db data for an aircraft, loading the shard from disk if needed.
+        The shard dict is discarded immediately after the single-ICAO lookup; only the
+        result is cached in _tar1090_lru.
         Intended to be called via asyncio.to_thread (blocking I/O)."""
         key = icao.upper()
+        found, val = self._lru_get(self._tar1090_lru, key)
+        if found:
+            return val  # type: ignore[return-value]
         shard = key[:2].lower()
-        if shard not in self._tar1090_shards:
-            self._load_tar1090_shard(shard)
-        shard_data = self._tar1090_shards.get(shard)
-        if not shard_data:
-            return None
-        return self._tar1090_lookup(key, shard_data)
+        shard_data = self._load_tar1090_shard_data(shard)
+        result = self._tar1090_lookup(key, shard_data) if shard_data else None
+        # Cache the per-ICAO result; shard_data goes out of scope and is GC'd
+        self._lru_put(self._tar1090_lru, key, result)
+        return result
 
     def _tar1090_lookup(self, icao_upper: str, shard_data: dict) -> Optional[dict]:
-        """Extract aircraft entry from a loaded shard and normalise to hexdb field names."""
+        """Extract a single aircraft entry from shard data and normalise to hexdb field names."""
         suffix = icao_upper[2:]  # last 4 chars, e.g. "6DA1"
         entry = shard_data.get(suffix) or shard_data.get(suffix.lower())
         if not entry or not isinstance(entry, list):
@@ -399,34 +437,33 @@ class EnrichmentDB:
             "RegisteredOwners": owner or "",
         }
 
-    def _load_tar1090_shard(self, shard: str) -> None:
-        """Download (or load from cache) a tar1090-db shard file and store in memory."""
+    def _load_tar1090_shard_data(self, shard: str) -> Optional[dict]:
+        """Load a tar1090 shard from disk (downloading if absent/stale).
+        Returns the shard dict so the caller can extract what it needs and discard it."""
         cache_file = f"tar1090_shard_{shard}.json.gz"
-        if (config.DATA_DIR / cache_file).exists():
-            if _cache_age(cache_file) < _TAR1090_SHARD_AGE:
-                try:
-                    raw = gzip.decompress((config.DATA_DIR / cache_file).read_bytes())
-                    self._tar1090_shards[shard] = json.loads(raw.decode("utf-8"))
-                    log.debug("tar1090 shard %s loaded from cache (%d entries)", shard, len(self._tar1090_shards[shard]))
-                    return
-                except Exception as exc:
-                    log.warning("tar1090 shard cache %s unreadable: %s — re-downloading", shard, exc)
+        cache_path = config.DATA_DIR / cache_file
+        if cache_path.exists() and _cache_age(cache_file) < _TAR1090_SHARD_AGE:
+            try:
+                raw = gzip.decompress(cache_path.read_bytes())
+                data = json.loads(raw.decode("utf-8"))
+                log.debug("tar1090 shard %s loaded from disk", shard)
+                return data
+            except Exception as exc:
+                log.warning("tar1090 shard %s unreadable: %s — re-downloading", shard, exc)
         url = f"{_DB_BASE_URL}/{shard}.js"
         try:
             raw = _fetch(url, timeout=15)
             text = _decompress(raw)
             data = json.loads(text)
-            self._tar1090_shards[shard] = data
             log.debug("tar1090 shard %s downloaded (%d entries)", shard, len(data))
             try:
-                (config.DATA_DIR / cache_file).write_bytes(
-                    gzip.compress(json.dumps(data).encode("utf-8"))
-                )
+                cache_path.write_bytes(gzip.compress(json.dumps(data).encode("utf-8")))
             except Exception as exc:
                 log.warning("tar1090 shard %s cache write failed: %s", shard, exc)
+            return data
         except Exception as exc:
             log.debug("tar1090 shard %s not available: %s", shard, exc)
-            self._tar1090_shards[shard] = {}  # sentinel: tried, no data
+            return None
 
     def lookup_hexdb(self, icao: str) -> Optional[dict]:
         """
@@ -471,31 +508,110 @@ class EnrichmentDB:
         return data
 
     # ------------------------------------------------------------------
-    # ADSBExchange
+    # ADSBExchange — SQLite backend
     # ------------------------------------------------------------------
 
-    def _load_or_download_adsbx(self) -> None:
-        if (config.DATA_DIR / _ADSBX_CACHE).exists():
-            self._load_adsbx_cache()
-        elif (config.DATA_DIR / _ADSBX_RAW).exists():
-            log.info("Enrichment: parsing cached ADSBExchange raw file")
-            self._parse_adsbx_raw((config.DATA_DIR / _ADSBX_RAW).read_bytes())
-        else:
-            self._download_adsbx()
+    def _open_adsbx_db(self) -> None:
+        """Open (or reuse) the SQLite connection for ADSBExchange data."""
+        if self._adsbx_conn is None:
+            path = str(config.DATA_DIR / _ADSBX_DB)
+            conn = sqlite3.connect(path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=-4096")  # 4 MB page cache
+            self._adsbx_conn = conn
 
-    def _download_adsbx(self) -> None:
+    def _create_adsbx_db(self) -> None:
+        """Ensure the SQLite DB and adsbx table exist."""
+        self._open_adsbx_db()
+        assert self._adsbx_conn is not None
+        self._adsbx_conn.execute("""
+            CREATE TABLE IF NOT EXISTS adsbx (
+                icao         TEXT PRIMARY KEY,
+                reg          TEXT,
+                icaotype     TEXT,
+                ownop        TEXT,
+                year         TEXT,
+                mil          INTEGER,
+                manufacturer TEXT,
+                model        TEXT,
+                short_type   TEXT
+            )
+        """)
+        self._adsbx_conn.commit()
+
+    def _adsbx_db_lookup(self, icao_upper: str) -> Optional[dict]:
+        """Single-row SELECT from the adsbx table; returns dict or None."""
+        if self._adsbx_conn is None:
+            return None
+        try:
+            row = self._adsbx_conn.execute(
+                "SELECT reg, icaotype, ownop, year, mil, manufacturer, model, short_type "
+                "FROM adsbx WHERE icao = ?",
+                (icao_upper,),
+            ).fetchone()
+        except Exception as exc:
+            log.debug("adsbx DB lookup failed for %s: %s", icao_upper, exc)
+            return None
+        if row is None:
+            return None
+        return {
+            "reg":          row["reg"] or "",
+            "icaotype":     row["icaotype"] or "",
+            "ownop":        row["ownop"] or "",
+            "year":         row["year"] or "",
+            "mil":          bool(row["mil"]),
+            "manufacturer": row["manufacturer"] or "",
+            "model":        row["model"] or "",
+            "short_type":   row["short_type"] or "",
+        }
+
+    def _load_or_init_adsbx_db(self) -> None:
+        """Connect to an existing DB or create and populate a fresh one."""
+        db_path = config.DATA_DIR / _ADSBX_DB
+        if db_path.exists():
+            self._open_adsbx_db()
+            try:
+                count = self._adsbx_conn.execute("SELECT COUNT(*) FROM adsbx").fetchone()[0]  # type: ignore[union-attr]
+                if count > 0:
+                    log.info("Enrichment: ADSBExchange DB ready (%d records)", count)
+                    return
+            except Exception:
+                pass  # table may not exist yet — fall through to create/import
+        # DB absent or empty — create table then import data
+        self._create_adsbx_db()
+        if (config.DATA_DIR / _ADSBX_RAW).exists():
+            log.info("Enrichment: importing ADSBExchange from raw NDJSON file")
+            self._import_adsbx_ndjson((config.DATA_DIR / _ADSBX_RAW).read_bytes())
+        elif (config.DATA_DIR / _ADSBX_CACHE).exists():
+            log.info("Enrichment: migrating ADSBExchange from legacy cache (one-time)")
+            self._import_adsbx_legacy_cache()
+        else:
+            self._download_and_reimport_adsbx()
+
+    def _download_and_reimport_adsbx(self) -> None:
+        """Download the ADSBExchange file and import it into SQLite."""
         log.info("Enrichment: downloading ADSBExchange database…")
         try:
             raw = _fetch(_ADSBX_URL, timeout=120)
             (config.DATA_DIR / _ADSBX_RAW).write_bytes(raw)
             log.info("Enrichment: ADSBExchange downloaded (%d bytes)", len(raw))
-            self._parse_adsbx_raw(raw)
+            self._create_adsbx_db()
+            self._import_adsbx_ndjson(raw)
         except Exception as exc:
             log.error("Enrichment: failed to download ADSBExchange: %s", exc)
 
-    def _parse_adsbx_raw(self, raw_gz: bytes) -> None:
-        data: dict[str, dict] = {}
+    def _import_adsbx_ndjson(self, raw_gz: bytes) -> None:
+        """Stream-parse ADSBExchange NDJSON gzip into SQLite in batches.
+        Avoids building a full in-memory dict — only one batch is in RAM at a time."""
+        assert self._adsbx_conn is not None
+        BATCH = 10_000
+        count = 0
+        batch: list[tuple] = []
         try:
+            self._adsbx_conn.execute("DELETE FROM adsbx")
+            self._adsbx_conn.commit()
             with gzip.open(io.BytesIO(raw_gz)) as f:
                 for line in f:
                     line = line.strip()
@@ -508,37 +624,79 @@ class EnrichmentDB:
                     icao = (rec.get("icao") or "").upper()
                     if len(icao) != 6:
                         continue
-                    data[icao] = {
-                        "reg":          rec.get("reg") or "",
-                        "icaotype":     rec.get("icaotype") or "",
-                        "ownop":        rec.get("ownop") or "",
-                        "year":         rec.get("year") or "",
-                        "mil":          bool(rec.get("mil", False)),
-                        "manufacturer": rec.get("manufacturer") or "",
-                        "model":        rec.get("model") or "",
-                        "short_type":   rec.get("short_type") or "",
-                    }
+                    batch.append((
+                        icao,
+                        rec.get("reg") or "",
+                        rec.get("icaotype") or "",
+                        rec.get("ownop") or "",
+                        rec.get("year") or "",
+                        1 if rec.get("mil") else 0,
+                        rec.get("manufacturer") or "",
+                        rec.get("model") or "",
+                        rec.get("short_type") or "",
+                    ))
+                    if len(batch) >= BATCH:
+                        self._adsbx_conn.executemany(
+                            "INSERT OR REPLACE INTO adsbx VALUES (?,?,?,?,?,?,?,?,?)", batch
+                        )
+                        self._adsbx_conn.commit()
+                        count += len(batch)
+                        batch.clear()
+            if batch:
+                self._adsbx_conn.executemany(
+                    "INSERT OR REPLACE INTO adsbx VALUES (?,?,?,?,?,?,?,?,?)", batch
+                )
+                self._adsbx_conn.commit()
+                count += len(batch)
         except Exception as exc:
-            log.error("Enrichment: failed to parse ADSBExchange data: %s", exc)
+            log.error("Enrichment: ADSBExchange import failed: %s", exc)
             return
-        self._adsbx = data
-        log.info("Enrichment: loaded %d ADSBExchange records", len(data))
-        try:
-            (config.DATA_DIR / _ADSBX_CACHE).write_bytes(
-                gzip.compress(json.dumps(data).encode("utf-8"))
-            )
-            log.info("Enrichment: ADSBExchange cache written")
-        except Exception as exc:
-            log.warning("Enrichment: could not write ADSBExchange cache: %s", exc)
+        self._adsbx_lru.clear()
+        log.info("Enrichment: imported %d ADSBExchange records into SQLite", count)
 
-    def _load_adsbx_cache(self) -> None:
+    def _import_adsbx_legacy_cache(self) -> None:
+        """One-time migration: import old adsbx_cache.json.gz dict into SQLite.
+        After this runs, the cache file is no longer needed."""
+        assert self._adsbx_conn is not None
         try:
             raw = (config.DATA_DIR / _ADSBX_CACHE).read_bytes()
-            self._adsbx = json.loads(gzip.decompress(raw).decode("utf-8"))
-            log.info("Enrichment: loaded %d ADSBExchange records from cache", len(self._adsbx))
+            data: dict = json.loads(gzip.decompress(raw).decode("utf-8"))
         except Exception as exc:
-            log.warning("Enrichment: ADSBExchange cache load failed (%s) — re-downloading", exc)
-            self._download_adsbx()
+            log.warning("Enrichment: legacy cache read failed (%s) — downloading fresh", exc)
+            self._download_and_reimport_adsbx()
+            return
+        BATCH = 10_000
+        count = 0
+        batch: list[tuple] = []
+        self._adsbx_conn.execute("DELETE FROM adsbx")
+        self._adsbx_conn.commit()
+        for icao, rec in data.items():
+            batch.append((
+                icao.upper(),
+                rec.get("reg") or "",
+                rec.get("icaotype") or "",
+                rec.get("ownop") or "",
+                rec.get("year") or "",
+                1 if rec.get("mil") else 0,
+                rec.get("manufacturer") or "",
+                rec.get("model") or "",
+                rec.get("short_type") or "",
+            ))
+            if len(batch) >= BATCH:
+                self._adsbx_conn.executemany(
+                    "INSERT OR REPLACE INTO adsbx VALUES (?,?,?,?,?,?,?,?,?)", batch
+                )
+                self._adsbx_conn.commit()
+                count += len(batch)
+                batch.clear()
+        if batch:
+            self._adsbx_conn.executemany(
+                "INSERT OR REPLACE INTO adsbx VALUES (?,?,?,?,?,?,?,?,?)", batch
+            )
+            self._adsbx_conn.commit()
+            count += len(batch)
+        self._adsbx_lru.clear()
+        log.info("Enrichment: migrated %d records from legacy cache to SQLite", count)
 
     # ------------------------------------------------------------------
     # tar1090-db auxiliary files (operators + type info)

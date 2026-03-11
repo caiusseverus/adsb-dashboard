@@ -6,12 +6,18 @@ import AircraftDetailPanel from './components/AircraftDetailPanel'
 import HistoryPage from './pages/HistoryPage'
 import ReceiverPage from './pages/ReceiverPage'
 import FleetPage from './pages/FleetPage'
+import CoveragePage from './pages/CoveragePage'
+import MapPage from './pages/MapPage'
+import FlowMapPage from './pages/FlowMapPage'
 import EventsPage from './pages/EventsPage'
+import SightingsPage from './pages/SightingsPage'
 import StatusPage from './pages/StatusPage'
+import SettingsPage from './pages/SettingsPage'
+import SkyView from './pages/SkyView'
 import styles from './App.module.css'
 
 const WS_URL = import.meta.env.PROD
-  ? `ws://${window.location.host}/ws`
+  ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`
   : 'ws://localhost:8000/ws'
 
 export default function App() {
@@ -32,7 +38,11 @@ export default function App() {
       clearTimeout(retryRef.current)
     }
     ws.onmessage = (e) => {
-      setSnapshot(JSON.parse(e.data))
+      try {
+        setSnapshot(JSON.parse(e.data))
+      } catch {
+        // ignore malformed frames
+      }
     }
     ws.onclose = () => {
       setConnected(false)
@@ -62,6 +72,14 @@ export default function App() {
             onClick={() => setTab('live')}
           >Live</button>
           <button
+            className={tab === 'sky' ? styles.tabActive : styles.tab}
+            onClick={() => setTab('sky')}
+          >Sky</button>
+          <button
+            className={tab === 'map' ? styles.tabActive : styles.tab}
+            onClick={() => setTab('map')}
+          >Map</button>
+          <button
             className={tab === 'history' ? styles.tabActive : styles.tab}
             onClick={() => setTab('history')}
           >History</button>
@@ -70,9 +88,21 @@ export default function App() {
             onClick={() => setTab('receiver')}
           >Receiver</button>
           <button
+            className={tab === 'coverage' ? styles.tabActive : styles.tab}
+            onClick={() => setTab('coverage')}
+          >Coverage</button>
+          <button
+            className={tab === 'flow' ? styles.tabActive : styles.tab}
+            onClick={() => setTab('flow')}
+          >Flow</button>
+          <button
             className={tab === 'fleet' ? styles.tabActive : styles.tab}
             onClick={() => setTab('fleet')}
           >Fleet</button>
+          <button
+            className={tab === 'sightings' ? styles.tabActive : styles.tab}
+            onClick={() => setTab('sightings')}
+          >Sightings</button>
           <button
             className={tab === 'events' ? styles.tabActive : styles.tab}
             onClick={() => setTab('events')}
@@ -81,6 +111,10 @@ export default function App() {
             className={tab === 'status' ? styles.tabActive : styles.tab}
             onClick={() => setTab('status')}
           >Status</button>
+          <button
+            className={tab === 'settings' ? styles.tabActive : styles.tab}
+            onClick={() => setTab('settings')}
+          >Settings</button>
         </nav>
         <span className={connected ? styles.live : styles.offline}>
           {connected ? '● Live' : '○ Reconnecting…'}
@@ -103,15 +137,22 @@ export default function App() {
         </main>
       )}
 
-      {tab === 'history' && <HistoryPage onSelectIcao={setSelectedIcao} snapshot={snapshot} notableRefreshKey={notableRefreshKey} />}
+      {tab === 'map' && <MapPage snapshot={snapshot} onSelectIcao={setSelectedIcao} />}
+      {tab === 'history' && <HistoryPage snapshot={snapshot} />}
+      {tab === 'sightings' && <SightingsPage onSelectIcao={setSelectedIcao} notableRefreshKey={notableRefreshKey} />}
       {tab === 'receiver' && <ReceiverPage snapshot={snapshot} />}
+      {tab === 'coverage' && <CoveragePage />}
+      {tab === 'flow' && <FlowMapPage />}
       {tab === 'fleet' && <FleetPage onSelectIcao={setSelectedIcao} />}
       {tab === 'events' && <EventsPage onSelectIcao={setSelectedIcao} />}
+      {tab === 'sky' && <SkyView snapshot={snapshot} onSelectIcao={setSelectedIcao} />}
       {tab === 'status' && <StatusPage />}
+      {tab === 'settings' && <SettingsPage />}
 
       {selectedIcao && (
         <AircraftDetailPanel
           icao={selectedIcao}
+          snapshot={snapshot}
           onClose={() => setSelectedIcao(null)}
           onRefreshed={() => setNotableRefreshKey(k => k + 1)}
         />

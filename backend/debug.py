@@ -6,12 +6,14 @@ POST /api/debug/aircraft/{icao}/override — override a field in aircraft_regist
 """
 
 import asyncio
+import statistics
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from db import stats_db
 import enrichment as enrichment_module
+import aircraft_state as _state_module
 
 router = APIRouter(prefix="/api/debug")
 
@@ -19,6 +21,48 @@ OVERRIDEABLE_FIELDS = {
     "country", "registration", "type_code", "operator",
     "military", "manufacturer", "year",
 }
+
+
+@router.get("/perf")
+async def get_perf() -> dict:
+    """Return performance timing statistics for message decode and push-updates."""
+    from main import _msg_queue
+    msg_t = sorted(_state_module.msg_timings)  # copy of deque as sorted list
+    push_t = list(_state_module.push_timings)
+
+    def percentiles(data: list[float], scale: float = 1_000_000) -> dict:
+        n = len(data)
+        if not n:
+            return {"samples": 0, "p50": 0, "p95": 0, "p99": 0, "max": 0, "mean": 0}
+        return {
+            "samples": n,
+            "p50":  round(data[int(n * 0.50)] * scale, 1),
+            "p95":  round(data[int(n * 0.95)] * scale, 1),
+            "p99":  round(data[int(n * 0.99)] * scale, 1),
+            "max":  round(data[-1] * scale, 1),
+            "mean": round(statistics.mean(data) * scale, 1),
+        }
+
+    def push_avg(key: str) -> float:
+        if not push_t:
+            return 0.0
+        return round(sum(p[key] for p in push_t) / len(push_t), 2)
+
+    return {
+        # Per-message decode time in microseconds
+        "msg_decode_us": percentiles(msg_t, scale=1_000_000),
+        "msg_queue_depth": _msg_queue.qsize(),
+        # Per-_push_updates invocation in milliseconds
+        "push_updates_ms": {
+            "samples":        len(push_t),
+            "sync_avg":       push_avg("sync_ms"),       # sync loop: notify pre-check + track recording
+            "gather_avg":     push_avg("gather_ms"),     # await asyncio.gather(notify_tasks)
+            "notify_tasks_avg": push_avg("notify_tasks"),# threads dispatched per cycle
+            "broadcast_avg":  push_avg("broadcast_ms"),  # websocket send
+            "total_avg":      push_avg("total_ms"),
+            "ac_count_avg":   push_avg("ac_count"),
+        },
+    }
 
 
 @router.get("/aircraft/{icao}")

@@ -343,6 +343,39 @@ class StatsDB:
                     WHERE threat_icao IS NOT NULL;
             """)
 
+        # squawk_events table — emergency squawk occurrences
+        with self._connect() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS squawk_events (
+                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts       INTEGER NOT NULL,
+                    ts_last  INTEGER NOT NULL,
+                    icao     TEXT    NOT NULL,
+                    squawk   TEXT    NOT NULL,
+                    callsign TEXT,
+                    altitude INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS squawk_events_ts
+                    ON squawk_events(ts);
+                CREATE INDEX IF NOT EXISTS squawk_events_icao
+                    ON squawk_events(icao);
+            """)
+
+        # notify_watchlist + notify_prefs tables — notification settings
+        with self._connect() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS notify_watchlist (
+                    icao         TEXT    PRIMARY KEY,
+                    label        TEXT,
+                    max_range_nm REAL,
+                    added_ts     INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS notify_prefs (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+            """)
+
         # Migrate: add mlat/had_pos columns to daily_aircraft_seen
         with self._connect() as conn:
             for col in ("mlat INTEGER NOT NULL DEFAULT 0", "had_pos INTEGER NOT NULL DEFAULT 0"):
@@ -656,6 +689,7 @@ class StatsDB:
             conn.execute("DELETE FROM daily_aircraft_seen WHERE date < ?", (cutoff_date,))
             conn.execute("DELETE FROM coverage_samples WHERE ts < ?", (coverage_cutoff_ts,))
             conn.execute("DELETE FROM acas_events WHERE ts < ?", (coverage_cutoff_ts,))
+            conn.execute("DELETE FROM squawk_events WHERE ts < ?", (coverage_cutoff_ts,))
         log.info("DB: pruned data older than %s", cutoff_date)
 
     # ------------------------------------------------------------------
@@ -732,6 +766,41 @@ class StatsDB:
                      :threat_icao, :threat_alt, :threat_range_nm, :threat_bearing_deg,
                      :sensitivity_level, :altitude)
             """, events)
+
+    def write_squawk_event(self, icao: str, squawk: str, callsign: str | None,
+                            altitude: int | None, ts: int) -> int:
+        """Insert a new squawk event; returns the new row id."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO squawk_events (ts, ts_last, icao, squawk, callsign, altitude) "
+                "VALUES (?,?,?,?,?,?)",
+                (ts, ts, icao, squawk, callsign, altitude),
+            )
+            return cur.lastrowid
+
+    def update_squawk_event_last(self, row_id: int, ts_last: int,
+                                  altitude: int | None = None) -> None:
+        """Update ts_last (and latest altitude) for an ongoing squawk event."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE squawk_events SET ts_last=?, altitude=COALESCE(?,altitude) WHERE id=?",
+                (ts_last, altitude, row_id),
+            )
+
+    def query_squawk_events(self, days: int, limit: int = 500) -> list[dict]:
+        """Recent emergency squawk events joined with aircraft_registry."""
+        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT e.*,
+                       r.registration, r.type_code, r.operator, r.country
+                FROM squawk_events e
+                LEFT JOIN aircraft_registry r ON e.icao = r.icao
+                WHERE e.ts >= ?
+                ORDER BY e.ts DESC
+                LIMIT ?
+            """, (cutoff, limit)).fetchall()
+        return [dict(r) for r in rows]
 
     def query_acas_events(self, days: int, limit: int) -> list[sqlite3.Row]:
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
@@ -1804,9 +1873,9 @@ class StatsDB:
                 SELECT
                     date,
                     COUNT(*) AS total,
-                    SUM(CASE WHEN had_pos = 1 AND mlat = 0 THEN 1 ELSE 0 END) AS adsb_count,
-                    SUM(mlat)                                                   AS mlat_count,
-                    SUM(CASE WHEN had_pos = 0             THEN 1 ELSE 0 END) AS no_pos_count
+                    SUM(CASE WHEN mlat = 0 AND had_pos = 1 THEN 1 ELSE 0 END) AS adsb_count,
+                    SUM(CASE WHEN mlat = 1                THEN 1 ELSE 0 END) AS mlat_count,
+                    SUM(CASE WHEN mlat = 0 AND had_pos = 0 THEN 1 ELSE 0 END) AS no_pos_count
                 FROM daily_aircraft_seen
                 WHERE date >= ?
                 GROUP BY date
@@ -1993,6 +2062,238 @@ class StatsDB:
             })
         return result
 
+    # ------------------------------------------------------------------
+    # Type group lookup — mirrors src/utils/typeGroups.js for coverage points
+    # ------------------------------------------------------------------
+    _TYPE_GROUP_BY_CODE: dict[str, int] = {}
+    for _idx, _codes in [
+        (0, ['B744','B748','B763','B764','B772','B773','B77W','B77L','B788','B789','B78X',
+              'A332','A333','A342','A343','A359','A35K','A388']),                            # widebody
+        (1, ['A318','A319','A320','A321','A20N','A21N','B735','B736','B737','B738','B739',
+              'B38M','B39M','B752','B753','B757','E195','E290']),                            # narrowbody
+        (2, ['CRJ2','CRJ7','CRJ9','CRJX','E170','E175','E190','AT72','AT75','AT76',
+              'DH8A','DH8B','DH8C','DH8D','SF34','J328','E120']),                           # regional
+        (3, ['C25A','C25B','C25C','C510','C525','C550','C560','C56X','C650','C680','C68A',
+              'C700','C750','GL5T','GLEX','GLF4','GLF5','GLF6','E55P','PC24','F2TH','F900',
+              'FA7X','F7X','LJ35','LJ40','LJ45','LJ55','LJ60']),                            # bizjet
+        (4, ['C172','C152','C182','C206','C208','PA28','PA32','PA34','PA44','DA40','DA42',
+              'SR20','SR22','C150','BE36','BE58','M20P','M20T','M20J','C210','C421','C441',
+              'C340','PA31','PA46','BE99','BE20','P180','TBM7','TBM8','TBM9','PC12']),      # GA
+        # index 5 = rotary (matched by type_category prefix 'H')
+        (6, ['F16','FA18','F18','EF18','F15','F35','EUFI','RFAL','GRIF','HAWK','MB339',
+              'L39','PC21','PC9','T38','F86','TFAL','SU27','SU30','SU35','MIG2','MIG3',
+              'JAS3','A10','AV8B','HAR2','HUNT','TPHR']),                                    # fast jet
+        (7, ['C17','C5M','C130','C30J','C27J','CN35','C295','A400','AN12','AN22','AN26',
+              'AN72','AN32','IL76','IL78','L382','CL44','Y20','A124','A225',
+              'K35R','K35E','KC10','KC46','KDC1']),                                          # cargo
+    ]:
+        for _code in _codes:
+            _TYPE_GROUP_BY_CODE[_code] = _idx
+
+    @staticmethod
+    def _get_type_group_idx(type_code: str | None, type_category: str | None) -> int:
+        """Return type group index 0–7, or 8 for other/unknown. Matches typeGroups.js."""
+        if type_category and type_category.upper().startswith('H'):
+            return 5  # rotary
+        if type_code:
+            return StatsDB._TYPE_GROUP_BY_CODE.get(type_code.upper(), 8)
+        return 8
+
+    def query_coverage_points(self, days: int = 30, max_points: int = 40000) -> dict:
+        """Return downsampled coverage_samples joined with aircraft_registry flags.
+
+        Each point: [bearing_deg, range_nm, altitude_ft, military, interesting, op_idx, tg_idx]
+        op_idx 0–9 = top-10 operators by point count; 10 = other/unknown.
+        tg_idx 0–7 = TYPE_GROUPS index; 8 = other/unknown.
+        Returns 'operators': list of operator names; 'type_groups': list of group labels.
+        """
+        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        with self._connect() as conn:
+            total = conn.execute("""
+                SELECT COUNT(*) FROM coverage_samples
+                WHERE ts >= ? AND altitude IS NOT NULL AND range_nm > 0 AND altitude > 0
+            """, (cutoff,)).fetchone()[0]
+            stride = max(1, -(-total // max_points))
+            rows = conn.execute("""
+                SELECT cs.bearing_deg,
+                       cs.range_nm,
+                       cs.altitude,
+                       COALESCE(ar.military,     0) AS military,
+                       COALESCE(ar.interesting,  0) AS interesting,
+                       ar.operator,
+                       ar.type_code,
+                       ar.type_category
+                FROM coverage_samples cs
+                LEFT JOIN aircraft_registry ar ON cs.icao = ar.icao
+                WHERE cs.ts >= ?
+                  AND cs.altitude  IS NOT NULL
+                  AND cs.range_nm  > 0
+                  AND cs.altitude  > 0
+                  AND (cs.rowid % ?) = 0
+            """, (cutoff, stride)).fetchall()
+
+        # Top-10 operators by point count for compact colour index
+        op_counts: dict[str, int] = {}
+        for r in rows:
+            if r["operator"]:
+                op_counts[r["operator"]] = op_counts.get(r["operator"], 0) + 1
+        top_ops = [op for op, _ in sorted(op_counts.items(), key=lambda x: -x[1])[:10]]
+        op_idx_map = {op: i for i, op in enumerate(top_ops)}
+
+        TYPE_GROUP_LABELS = [
+            'Widebody', 'Narrowbody', 'Regional', 'Biz Jet',
+            'GA', 'Rotary', 'Fast Jet', 'Cargo',
+        ]
+
+        return {
+            "count":       len(rows),
+            "operators":   top_ops,
+            "type_groups": TYPE_GROUP_LABELS,
+            "points": [
+                [round(r["bearing_deg"], 1), round(r["range_nm"], 1),
+                 int(r["altitude"]), int(r["military"]), int(r["interesting"]),
+                 op_idx_map.get(r["operator"], 10),
+                 self._get_type_group_idx(r["type_code"], r["type_category"])]
+                for r in rows
+            ],
+        }
+
+    def query_coverage_range_trend(self, days: int = 90) -> list[dict]:
+        """Daily max and median range from coverage_samples, for trend charts."""
+        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT date(ts, 'unixepoch') AS day,
+                       ROUND(MAX(range_nm), 1) AS max_nm,
+                       ROUND(AVG(range_nm), 1) AS avg_nm
+                FROM coverage_samples
+                WHERE date(ts, 'unixepoch') >= ?
+                  AND range_nm > 0
+                GROUP BY day
+                ORDER BY day
+            """, (cutoff,)).fetchall()
+        return [{"date": r["day"], "max_nm": r["max_nm"], "avg_nm": r["avg_nm"]} for r in rows]
+
+    def query_coverage_flow(self, days: int = 7, grid_deg: float = 0.05) -> dict:
+        """Reconstruct lat/lon from bearing+range, bin to a grid, return cell counts.
+
+        Returns {cells: [[lat, lon, count], ...], max_count, grid_deg,
+                 receiver_lat, receiver_lon}
+        Requires RECEIVER_LAT / RECEIVER_LON to be configured.
+        """
+        if config.RECEIVER_LAT is None or config.RECEIVER_LON is None:
+            return {"error": "receiver_location_not_configured", "cells": [],
+                    "max_count": 0, "grid_deg": grid_deg,
+                    "receiver_lat": None, "receiver_lon": None}
+
+        cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT bearing_deg, range_nm
+                FROM coverage_samples
+                WHERE ts >= ? AND range_nm > 0
+            """, (cutoff,)).fetchall()
+
+        if not rows:
+            return {"cells": [], "max_count": 0, "grid_deg": grid_deg,
+                    "receiver_lat": config.RECEIVER_LAT, "receiver_lon": config.RECEIVER_LON}
+
+        rlat = config.RECEIVER_LAT
+        rlon = config.RECEIVER_LON
+        cos_rlat = math.cos(math.radians(rlat))
+
+        cell_counts: dict[tuple[float, float], int] = defaultdict(int)
+        for row in rows:
+            b_rad = math.radians(row["bearing_deg"])
+            r_nm  = row["range_nm"]
+            lat = rlat + r_nm * math.cos(b_rad) / 60.0
+            lon = rlon + r_nm * math.sin(b_rad) / (60.0 * cos_rlat)
+            lat_cell = math.floor(lat / grid_deg) * grid_deg
+            lon_cell = math.floor(lon / grid_deg) * grid_deg
+            cell_counts[(lat_cell, lon_cell)] += 1
+
+        max_count = max(cell_counts.values())
+        cells = [
+            [round(lat, 5), round(lon, 5), count]
+            for (lat, lon), count in cell_counts.items()
+        ]
+        return {
+            "cells": cells,
+            "max_count": max_count,
+            "grid_deg": grid_deg,
+            "receiver_lat": rlat,
+            "receiver_lon": rlon,
+        }
+
+    def query_alt_heatmap(self, hours: int = 24) -> dict:
+        """Return altitude-time heatmap data from coverage_samples.
+
+        Each cell: [minute_index, alt_ft_bucket, distinct_aircraft_count].
+        Altitude is bucketed to 100ft (matching ADS-B Mode C resolution).
+        minute_index is relative to min_ts so the frontend needs no timestamp arithmetic.
+        """
+        cutoff = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp())
+        # Align cutoff to the nearest minute boundary
+        min_ts = (cutoff // 60) * 60
+
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT
+                    (ts / 60) * 60                 AS minute_ts,
+                    (altitude / 100) * 100         AS alt_ft,
+                    COUNT(DISTINCT icao)            AS cnt
+                FROM coverage_samples
+                WHERE ts >= ?
+                  AND altitude IS NOT NULL
+                  AND altitude >= 0
+                  AND altitude <= 60000
+                GROUP BY minute_ts, alt_ft
+                ORDER BY minute_ts
+            """, (min_ts,)).fetchall()
+
+        if not rows:
+            return {"min_ts": min_ts, "minutes": hours * 60, "cells": [], "max_alt_observed": 0}
+
+        max_ts = int(rows[-1]["minute_ts"])
+        minutes = (max_ts - min_ts) // 60 + 1
+        max_alt_observed = max(int(r["alt_ft"]) for r in rows)
+
+        cells = [
+            [(int(r["minute_ts"]) - min_ts) // 60, int(r["alt_ft"]), int(r["cnt"])]
+            for r in rows
+        ]
+        return {"min_ts": min_ts, "minutes": minutes, "cells": cells, "max_alt_observed": max_alt_observed}
+
+    def backup(self, dest_dir: "Path") -> "Path":
+        """Hot-backup the database to dest_dir/adsb_backup_YYYY-MM-DD.db.
+
+        Uses SQLite's native backup API — safe while the DB is live.
+        Returns the path of the written file.
+        Prunes old backups beyond config.BACKUP_RETAIN.
+        """
+        import sqlite3 as _sqlite3
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / f"adsb_backup_{date.today().isoformat()}.db"
+
+        src  = _sqlite3.connect(str(config.DB_PATH))
+        dest = _sqlite3.connect(str(dest_path))
+        try:
+            src.backup(dest)
+        finally:
+            dest.close()
+            src.close()
+
+        # Prune: keep only the N most-recent backup files
+        backups = sorted(dest_dir.glob("adsb_backup_*.db"))
+        for old in backups[: -config.BACKUP_RETAIN]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+        log.info("DB backup written to %s", dest_path)
+        return dest_path
+
     def query_needs_enrichment(self, limit: int = 500) -> list[str]:
         """ICAOs with missing operator/registration/type, ordered by most recently seen."""
         with self._connect() as conn:
@@ -2039,6 +2340,7 @@ class StatsDB:
             ("aircraft_registry",     None,        False, None),
             ("coverage_samples",      "ts",        True,  90),
             ("acas_events",           "ts",        True,  90),
+            ("squawk_events",         "ts",        True,  90),
         ]
 
         result = []
@@ -2051,26 +2353,150 @@ class StatsDB:
                         f"SELECT MIN({ts_col}), MAX({ts_col}) FROM {tbl}"
                     ).fetchone()
                     oldest, newest = bounds[0], bounds[1]
+                # Table size via dbstat — include the table itself and all its indexes.
+                # Index pages carry their own name in dbstat, so we look up associated
+                # index names from sqlite_master and sum all of them.
+                try:
+                    size_bytes = conn.execute("""
+                        SELECT SUM(d.pgsize)
+                        FROM dbstat d
+                        WHERE d.name = ?
+                           OR d.name IN (
+                               SELECT name FROM sqlite_master
+                               WHERE tbl_name = ? AND type = 'index'
+                           )
+                    """, (tbl, tbl)).fetchone()[0] or 0
+                except Exception:
+                    size_bytes = None
                 result.append({
                     "table":       tbl,
                     "rows":        row_count,
+                    "size_bytes":  size_bytes,
                     "oldest":      oldest,
                     "newest":      newest,
                     "expires":     expires,
                     "retain_days": ret_days,
                 })
 
+        # Backup status — use effective config (DB overrides env var)
+        backup_path, backup_retain = self.get_effective_backup_config()
+        backup_info: dict = {"enabled": False, "path": None, "files": []}
+        if backup_path:
+            backup_info["enabled"] = True
+            backup_info["path"]    = str(backup_path)
+            backup_info["retain"]  = backup_retain
+            if backup_path.exists():
+                files = sorted(backup_path.glob("adsb_backup_*.db"), reverse=True)
+                backup_info["files"] = [
+                    {
+                        "name":  f.name,
+                        "size_bytes": f.stat().st_size,
+                        "date":  f.name[12:22],   # YYYY-MM-DD from filename
+                    }
+                    for f in files
+                ]
+
+        with self._connect() as conn:
+            wl_count = conn.execute("SELECT COUNT(*) FROM notify_watchlist").fetchone()[0]
+
         return {
             "db_size_bytes": db_size,
             "tables": result,
+            "backup": backup_info,
             "config": {
                 "minute_stats_retention_days": config.MINUTE_STATS_RETENTION_DAYS,
                 "coverage_retention_days":     90,
                 "acas_retention_days":         90,
                 "ghost_filter_msgs":           config.GHOST_FILTER_MSGS,
                 "rare_threshold":              config.RARE_THRESHOLD,
+                "receiver_lat":               config.RECEIVER_LAT,
+                "receiver_lon":               config.RECEIVER_LON,
+            },
+            "notifications": {
+                "ntfy_enabled":    bool(config.NTFY_URL),
+                "ntfy_url":        config.NTFY_URL or None,
+                "email_enabled":   bool(config.NOTIFY_EMAIL_TO),
+                "email_to":        config.NOTIFY_EMAIL_TO or None,
+                "prefs":           self.get_notify_prefs(),
+                "watchlist_count": wl_count,
             },
         }
+
+    # ------------------------------------------------------------------
+    # Notification prefs and watchlist
+    # ------------------------------------------------------------------
+
+    def get_notify_prefs(self) -> dict:
+        """Return all notification preferences as a dict. Missing keys get defaults."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT key, value FROM notify_prefs").fetchall()
+        prefs = {r["key"]: r["value"] for r in rows}
+        return {
+            "notify_emergency":   prefs.get("notify_emergency",   "true"),
+            "notify_acas":        prefs.get("notify_acas",        "false"),
+            "notify_military":    prefs.get("notify_military",    "false"),
+            "notify_interesting": prefs.get("notify_interesting", "false"),
+            "military_max_range_nm":    prefs.get("military_max_range_nm",    ""),
+            "interesting_max_range_nm": prefs.get("interesting_max_range_nm", ""),
+            "acas_max_range_nm":        prefs.get("acas_max_range_nm",        ""),
+            # Backup config — DB value overrides env var
+            "backup_path":   prefs.get("backup_path",   str(config.BACKUP_PATH) if config.BACKUP_PATH else ""),
+            "backup_retain": prefs.get("backup_retain", str(config.BACKUP_RETAIN)),
+        }
+
+    def get_effective_backup_config(self) -> "tuple[Path | None, int]":
+        """Return (backup_path, retain_days) preferring DB prefs over env vars."""
+        from pathlib import Path as _Path
+        prefs = self.get_notify_prefs()
+        path_str = prefs.get("backup_path", "").strip()
+        retain_str = prefs.get("backup_retain", "").strip()
+        path = _Path(path_str) if path_str else config.BACKUP_PATH
+        try:
+            retain = int(retain_str) if retain_str else config.BACKUP_RETAIN
+        except ValueError:
+            retain = config.BACKUP_RETAIN
+        return path, retain
+
+    def set_notify_pref(self, key: str, value: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO notify_prefs (key, value) VALUES (?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+
+    def get_notify_watchlist(self) -> list[dict]:
+        """Return watchlist joined with aircraft_registry for display."""
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT w.icao, w.label, w.max_range_nm, w.added_ts,
+                       r.registration, r.type_code, r.operator, r.country
+                FROM notify_watchlist w
+                LEFT JOIN aircraft_registry r ON w.icao = r.icao
+                ORDER BY w.added_ts DESC
+            """).fetchall()
+        return [dict(r) for r in rows]
+
+    def is_watched(self, icao: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM notify_watchlist WHERE icao=?", (icao,)
+            ).fetchone()
+        return row is not None
+
+    def add_to_watchlist(self, icao: str, label: str | None,
+                         max_range_nm: float | None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO notify_watchlist (icao, label, max_range_nm, added_ts) "
+                "VALUES (?,?,?,?) ON CONFLICT(icao) DO UPDATE SET "
+                "label=excluded.label, max_range_nm=excluded.max_range_nm",
+                (icao, label, max_range_nm, int(__import__('time').time())),
+            )
+
+    def remove_from_watchlist(self, icao: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM notify_watchlist WHERE icao=?", (icao,))
 
 
 # Module-level singleton

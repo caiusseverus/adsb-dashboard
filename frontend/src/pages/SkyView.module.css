@@ -1,0 +1,84 @@
+.container {
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+}
+
+.header {
+  text-align: center;
+}
+
+.title {
+  margin: 0 0 0.25rem;
+  font-size: 1.1rem;
+  color: #c9d1d9;
+}
+
+.subtitle {
+  margin: 0;
+  font-size: 0.78rem;
+  color: #484f58;
+}
+
+.canvasWrap {
+  position: relative;
+  display: inline-block;
+}
+
+.canvas {
+  display: block;
+  max-width: 100%;
+  cursor: crosshair;
+  border-radius: 50%;
+}
+
+.canvas:active {
+  cursor: pointer;
+}
+
+.tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 0.4rem 0.65rem;
+  font-size: 0.78rem;
+  color: #c9d1d9;
+  white-space: nowrap;
+  z-index: 10;
+  line-height: 1.6;
+}
+
+.tooltipIcao {
+  font-weight: 600;
+  color: #388bfd;
+  font-family: monospace;
+}
+
+.tooltipMeta {
+  color: #8b949e;
+  font-size: 0.74rem;
+}
+
+.tooltipHint {
+  color: #484f58;
+  font-size: 0.72rem;
+  margin-top: 2px;
+}
+
+.legend {
+  display: flex;
+  gap: 1.25rem;
+  flex-wrap: wrap;
+  justify-content: center;
+  font-size: 0.78rem;
+}
+
+.legendItem {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}

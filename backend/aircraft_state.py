@@ -13,6 +13,7 @@ from datetime import date
 from typing import Optional
 
 import pyModeS as pms
+from pyModeS.decoder.bds import bds40 as _bds40, bds50 as _bds50, bds60 as _bds60
 
 import acas as acas_decoder
 import config
@@ -21,6 +22,15 @@ from db import INTERESTING_TYPE_CODES
 from utils import country_from_registration
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Performance timing stores — written by process_message and _push_updates,
+# read by /api/debug/perf.  deques are thread-safe for single-writer appends.
+# ---------------------------------------------------------------------------
+# Per-message total processing time in seconds (includes lock acquisition + decode)
+msg_timings: deque[float] = deque(maxlen=2000)
+# Per-_push_updates invocation breakdown: {loop_ms, broadcast_ms, total_ms, ac_count}
+push_timings: deque[dict] = deque(maxlen=120)
 
 _R_NM = 3440.065  # Earth radius in nautical miles
 # Beast timestamp value used by mlat-client for all synthesized positions.
@@ -139,6 +149,7 @@ class Aircraft:
     bearing_deg: Optional[float] = None   # bearing from receiver (degrees true)
     cpr_even: Optional[tuple] = field(default=None, repr=False)   # (raw_msg, timestamp)
     cpr_odd:  Optional[tuple] = field(default=None, repr=False)
+    pos_global: bool = False  # True once a global CPR decode (even+odd pair) has succeeded
     sighting_count: int = 1               # from aircraft_registry; 1 = unique (never seen before)
     # MLAT
     has_adsb: bool = False               # True once a DF17 WITHOUT the MLAT timestamp is seen
@@ -236,12 +247,14 @@ class AircraftState:
 
         mlat = mlat_source is not None
 
+        t0 = time.perf_counter()
         with self._lock:
             self._total += 1
             if mlat:
                 self._mlat_total += 1
             self._tick(now, mlat=mlat)
             self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
+        msg_timings.append(time.perf_counter() - t0)
 
     def expire_aircraft(self) -> None:
         now = time.time()
@@ -417,6 +430,7 @@ class AircraftState:
                     "acas_ra_corrective": ac.acas_ra_corrective,
                     "acas_threat_icao":   ac.acas_threat_icao,
                     "acas_sensitivity":   ac.acas_sensitivity,
+                    "pos_global":         ac.pos_global,
                 }
                 for ac in self._aircraft.values()
             ]
@@ -670,12 +684,15 @@ class AircraftState:
                     # longitude zone when the receiver is more than ~5° west of the
                     # aircraft (e.g. western UK receiver + aircraft over the North Sea).
                     pos = None
+                    pos_from_global = False
                     if (ac.cpr_even and ac.cpr_odd
                             and abs(ac.cpr_even[1] - ac.cpr_odd[1]) < 10):
                         pos = pms.adsb.position(
                             ac.cpr_even[0], ac.cpr_odd[0],
                             ac.cpr_even[1], ac.cpr_odd[1],
                         )
+                        if pos is not None:
+                            pos_from_global = True
 
                     # Local decode fallback: only when no pair is available yet.
                     # Use the aircraft's own last position as reference (safer than
@@ -701,6 +718,8 @@ class AircraftState:
                             else:
                                 ac.lat = round(lat, 5)
                                 ac.lon = round(lon, 5)
+                                if pos_from_global:
+                                    ac.pos_global = True
                                 if config.RECEIVER_LAT is not None and config.RECEIVER_LON is not None:
                                     ac.range_nm = round(_haversine_nm(
                                         config.RECEIVER_LAT, config.RECEIVER_LON,
@@ -733,13 +752,9 @@ class AircraftState:
                 except Exception:
                     pass
 
-            # EHS decode: infer BDS register and extract data
-            try:
-                bds = pms.bds.infer(raw)
-            except Exception:
-                bds = None
-
-            if bds == "BDS40":
+            # EHS decode: direct is40/is50/is60 checks — ~5x faster than pms.bds.infer()
+            # which speculatively tries ~20 registers. Checks are mutually exclusive in practice.
+            if _bds40.is40(raw):
                 # Selected altitude (autopilot target)
                 try:
                     sel = pms.commb.selalt40mcp(raw)
@@ -748,7 +763,7 @@ class AircraftState:
                 except Exception:
                     pass
 
-            elif bds == "BDS50":
+            elif _bds50.is50(raw):
                 # TAS + track angle + roll
                 try:
                     tas = pms.commb.tas50(raw)
@@ -764,7 +779,7 @@ class AircraftState:
                 except Exception:
                     pass
 
-            elif bds == "BDS60":
+            elif _bds60.is60(raw):
                 # IAS + Mach + magnetic heading + baro vertical rate
                 try:
                     ias = pms.commb.ias60(raw)

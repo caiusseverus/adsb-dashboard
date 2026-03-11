@@ -36,7 +36,10 @@ def _parse_mlat_servers(val: str, default_host: str) -> list[tuple[str, str, int
                 host = default_host
             servers.append((name.strip(), host.strip(), int(port_str.strip())))
         except (ValueError, AttributeError):
-            pass  # malformed entry; skip silently
+            import logging
+            logging.getLogger(__name__).warning(
+                "MLAT_SERVERS: skipping malformed entry %d %r", i, entry
+            )
     return servers
 
 
@@ -79,3 +82,36 @@ DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 DB_PATH: Path = Path(os.getenv("DB_PATH", str(DATA_DIR / "adsb.db")))
+
+_backup_raw = os.getenv("BACKUP_PATH", "")
+BACKUP_PATH: Optional[Path] = Path(_backup_raw) if _backup_raw else None
+BACKUP_RETAIN: int = int(os.getenv("BACKUP_RETAIN", "7"))
+
+# Allowed CORS origins. Defaults to the Vite dev server only; not needed in
+# production because the frontend is served from the same origin as the backend.
+_cors_raw = os.getenv("CORS_ORIGINS", "http://localhost:5173")
+CORS_ORIGINS: list[str] = [o.strip() for o in _cors_raw.split(",") if o.strip()]
+
+# ---------------------------------------------------------------------------
+# Notifications (ntfy.sh and/or SMTP email)
+# ---------------------------------------------------------------------------
+NTFY_URL: str = os.getenv("NTFY_URL", "")          # e.g. https://ntfy.sh/my-topic
+
+NOTIFY_EMAIL_TO:   str = os.getenv("NOTIFY_EMAIL_TO",   "")
+NOTIFY_EMAIL_FROM: str = os.getenv("NOTIFY_EMAIL_FROM", "")
+NOTIFY_SMTP_HOST:  str = os.getenv("NOTIFY_SMTP_HOST",  "localhost")
+NOTIFY_SMTP_PORT:  int = int(os.getenv("NOTIFY_SMTP_PORT", "587"))
+NOTIFY_SMTP_USER:  str = os.getenv("NOTIFY_SMTP_USER",  "")
+NOTIFY_SMTP_PASS:  str = os.getenv("NOTIFY_SMTP_PASS",  "")
+
+# Trigger switches — defaults: emergency on, everything else off
+def _bool(key: str, default: bool) -> bool:
+    v = os.getenv(key, "")
+    if not v:
+        return default
+    return v.lower() not in ("0", "false", "no")
+
+NOTIFY_EMERGENCY:    bool = _bool("NOTIFY_EMERGENCY",    True)
+NOTIFY_ACAS:         bool = _bool("NOTIFY_ACAS",         False)
+NOTIFY_MILITARY:     bool = _bool("NOTIFY_MILITARY",     False)
+NOTIFY_INTERESTING:  bool = _bool("NOTIFY_INTERESTING",  False)

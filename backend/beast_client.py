@@ -57,6 +57,10 @@ class BeastClient:
                 if not chunk:
                     raise ConnectionError("Remote closed the connection")
                 self._buf.extend(chunk)
+                if len(self._buf) > 65536:
+                    # Buffer overflow — likely connected to a non-Beast endpoint or
+                    # a pathological stream. Reconnect rather than exhaust memory.
+                    raise ConnectionError("Beast buffer exceeded 64 KB — reconnecting")
                 self._parse_frames()
         finally:
             writer.close()

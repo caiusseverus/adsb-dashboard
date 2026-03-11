@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
 import styles from './CalendarHeatmap.module.css'
+import { TYPE_GROUPS } from '../utils/typeGroups'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 
@@ -15,15 +16,7 @@ const METRICS = [
   { value: 'msg_max',           label: 'Peak msg/s',       url: null },
 ]
 
-const GROUPS = [
-  { value: 'widebody',   label: 'Widebody',    types: ['B744','B748','B763','B764','B772','B773','B77W','B77L','B788','B789','B78X','A332','A333','A342','A343','A359','A35K','A388'] },
-  { value: 'narrowbody', label: 'Narrowbody',  types: ['A318','A319','A320','A321','A20N','A21N','B735','B736','B737','B738','B739','B38M','B39M','B752','B753','B757','E195','E290'] },
-  { value: 'regional',   label: 'Regional',    types: ['CRJ2','CRJ7','CRJ9','CRJX','E170','E175','E190','AT72','AT75','AT76','DH8A','DH8B','DH8C','DH8D','SF34','J328','E120'] },
-  { value: 'bizjet',     label: 'Biz jet',     types: ['C25A','C25B','C25C','C510','C525','C550','C560','C56X','C650','C680','C68A','C700','C750','GL5T','GLEX','GLF4','GLF5','GLF6','E55P','PC24','F2TH','F900','FA7X','F7X','LJ35','LJ40','LJ45','LJ55','LJ60'] },
-  { value: 'pistonGA',   label: 'Piston GA',   types: ['C172','C152','C182','C206','C208','PA28','PA32','PA34','PA44','DA40','DA42','SR20','SR22','C150','BE36','BE58','M20P','M20T','C210'] },
-  { value: 'rotary',     label: 'Rotary',      category: 'H' },
-  { value: 'milfast',    label: 'Mil jets',    types: ['F16','FA18','F15','F35','EUFI','RFAL','GRIF','HAWK','MB339','L39','PC21','PC9','T38','F86'] },
-]
+const GROUPS = TYPE_GROUPS
 
 const MONTH_OPTIONS = [3, 6, 12, 18, 24]
 const DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
