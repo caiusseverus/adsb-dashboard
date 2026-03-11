@@ -335,18 +335,20 @@ async def _push_updates() -> None:
                 )
         # Prune tracks for aircraft that have left the live set
         track_store.expire(active_icaos)
+        t_sync_end = time.perf_counter()
 
         if notify_tasks:
             await asyncio.gather(*notify_tasks)
-
-        t_loop_end = time.perf_counter()
+        t_gather_end = time.perf_counter()
 
         if not _clients:
             _push_timings_store.append({
-                "loop_ms": round((t_loop_end - t_loop_start) * 1000, 2),
+                "sync_ms":     round((t_sync_end - t_loop_start) * 1000, 2),
+                "gather_ms":   round((t_gather_end - t_sync_end) * 1000, 2),
+                "notify_tasks": len(notify_tasks),
                 "broadcast_ms": 0.0,
-                "total_ms": round((t_loop_end - t_loop_start) * 1000, 2),
-                "ac_count": len(snapshot["aircraft"]),
+                "total_ms":    round((t_gather_end - t_loop_start) * 1000, 2),
+                "ac_count":    len(snapshot["aircraft"]),
             })
             continue
 
@@ -367,10 +369,12 @@ async def _push_updates() -> None:
 
         t_done = time.perf_counter()
         _push_timings_store.append({
-            "loop_ms": round((t_loop_end - t_loop_start) * 1000, 2),
-            "broadcast_ms": round((t_done - t_loop_end) * 1000, 2),
-            "total_ms": round((t_done - t_loop_start) * 1000, 2),
-            "ac_count": len(snapshot["aircraft"]),
+            "sync_ms":      round((t_sync_end - t_loop_start) * 1000, 2),
+            "gather_ms":    round((t_gather_end - t_sync_end) * 1000, 2),
+            "notify_tasks": len(notify_tasks),
+            "broadcast_ms": round((t_done - t_gather_end) * 1000, 2),
+            "total_ms":     round((t_done - t_loop_start) * 1000, 2),
+            "ac_count":     len(snapshot["aircraft"]),
         })
 
 

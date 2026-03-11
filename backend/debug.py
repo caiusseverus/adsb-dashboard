@@ -52,11 +52,13 @@ async def get_perf() -> dict:
         "msg_decode_us": percentiles(msg_t, scale=1_000_000),
         # Per-_push_updates invocation in milliseconds
         "push_updates_ms": {
-            "samples":       len(push_t),
-            "loop_avg":      push_avg("loop_ms"),       # notify + track recording
-            "broadcast_avg": push_avg("broadcast_ms"),  # websocket send
-            "total_avg":     push_avg("total_ms"),
-            "ac_count_avg":  push_avg("ac_count"),
+            "samples":        len(push_t),
+            "sync_avg":       push_avg("sync_ms"),       # sync loop: notify pre-check + track recording
+            "gather_avg":     push_avg("gather_ms"),     # await asyncio.gather(notify_tasks)
+            "notify_tasks_avg": push_avg("notify_tasks"),# threads dispatched per cycle
+            "broadcast_avg":  push_avg("broadcast_ms"),  # websocket send
+            "total_avg":      push_avg("total_ms"),
+            "ac_count_avg":   push_avg("ac_count"),
         },
     }
 
