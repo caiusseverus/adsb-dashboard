@@ -290,20 +290,22 @@ async def _push_updates() -> None:
         for ac in snapshot["aircraft"]:
             icao = ac["icao"]
             if _notify_enabled:
-                if icao in _watchlist_cache:
+                # Pre-check _notified before dispatching any thread — already-seen
+                # aircraft (the vast majority) are skipped with a cheap set lookup.
+                if icao in _watchlist_cache and not notifications.already_notified(f"watchlist:{icao}"):
                     notify_tasks.append(asyncio.to_thread(
                         notifications.notify_watchlist,
                         icao, ac.get("callsign"), ac.get("registration"),
                         ac.get("operator"), ac.get("altitude"),
                         ac.get("range_nm"), _watchlist_cache[icao],
                     ))
-                if ac.get("military"):
+                if ac.get("military") and not notifications.already_notified(f"military:{icao}"):
                     notify_tasks.append(asyncio.to_thread(
                         notifications.notify_military,
                         icao, ac.get("callsign"), ac.get("operator"),
                         ac.get("country"), ac.get("altitude"), ac.get("range_nm"),
                     ))
-                if ac.get("interesting"):
+                if ac.get("interesting") and not notifications.already_notified(f"interesting:{icao}"):
                     notify_tasks.append(asyncio.to_thread(
                         notifications.notify_interesting,
                         icao, ac.get("callsign"), ac.get("type_code"),

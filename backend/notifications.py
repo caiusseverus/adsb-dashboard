@@ -29,6 +29,11 @@ def reset_daily() -> None:
     log.debug("Notification dedup set cleared for new day")
 
 
+def already_notified(key: str) -> bool:
+    """Fast in-process check — call before dispatching asyncio.to_thread."""
+    return key in _notified
+
+
 def any_channel() -> bool:
     return bool(config.NTFY_URL or config.NOTIFY_EMAIL_TO)
 
