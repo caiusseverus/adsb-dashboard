@@ -281,29 +281,32 @@ async def _push_updates() -> None:
         # Kept separate from the recording condition so a temporary loss of position
         # doesn't prematurely prune an existing trail.
         active_icaos: set[str] = {ac["icao"] for ac in snapshot["aircraft"]}
+        # Build notification tasks and track positions in a single pass.
+        # Notifications are gathered concurrently rather than awaited sequentially
+        # to avoid O(N × thread_dispatch_overhead) blocking on the event loop.
+        notify_tasks = []
         t_loop_start = time.perf_counter()
         for ac in snapshot["aircraft"]:
-            # Watchlist / military / interesting notifications (dedup inside notifications module)
             icao = ac["icao"]
             if icao in _watchlist_cache:
-                await asyncio.to_thread(
+                notify_tasks.append(asyncio.to_thread(
                     notifications.notify_watchlist,
                     icao, ac.get("callsign"), ac.get("registration"),
                     ac.get("operator"), ac.get("altitude"),
                     ac.get("range_nm"), _watchlist_cache[icao],
-                )
+                ))
             if ac.get("military"):
-                await asyncio.to_thread(
+                notify_tasks.append(asyncio.to_thread(
                     notifications.notify_military,
                     icao, ac.get("callsign"), ac.get("operator"),
                     ac.get("country"), ac.get("altitude"), ac.get("range_nm"),
-                )
+                ))
             if ac.get("interesting"):
-                await asyncio.to_thread(
+                notify_tasks.append(asyncio.to_thread(
                     notifications.notify_interesting,
                     icao, ac.get("callsign"), ac.get("type_code"),
                     ac.get("operator"), ac.get("altitude"), ac.get("range_nm"),
-                )
+                ))
 
             # Only record once the position is confirmed reliable:
             # - pos_global=True: a global CPR decode (even+odd pair) has succeeded,
@@ -328,6 +331,9 @@ async def _push_updates() -> None:
                 )
         # Prune tracks for aircraft that have left the live set
         track_store.expire(active_icaos)
+
+        if notify_tasks:
+            await asyncio.gather(*notify_tasks)
 
         t_loop_end = time.perf_counter()
 
