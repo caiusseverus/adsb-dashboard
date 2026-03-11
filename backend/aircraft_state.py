@@ -13,6 +13,7 @@ from datetime import date
 from typing import Optional
 
 import pyModeS as pms
+from pyModeS.decoder.bds import bds40 as _bds40, bds50 as _bds50, bds60 as _bds60
 
 import acas as acas_decoder
 import config
@@ -751,13 +752,9 @@ class AircraftState:
                 except Exception:
                     pass
 
-            # EHS decode: infer BDS register and extract data
-            try:
-                bds = pms.bds.infer(raw)
-            except Exception:
-                bds = None
-
-            if bds == "BDS40":
+            # EHS decode: direct is40/is50/is60 checks — ~5x faster than pms.bds.infer()
+            # which speculatively tries ~20 registers. Checks are mutually exclusive in practice.
+            if _bds40.is40(raw):
                 # Selected altitude (autopilot target)
                 try:
                     sel = pms.commb.selalt40mcp(raw)
@@ -766,7 +763,7 @@ class AircraftState:
                 except Exception:
                     pass
 
-            elif bds == "BDS50":
+            elif _bds50.is50(raw):
                 # TAS + track angle + roll
                 try:
                     tas = pms.commb.tas50(raw)
@@ -782,7 +779,7 @@ class AircraftState:
                 except Exception:
                     pass
 
-            elif bds == "BDS60":
+            elif _bds60.is60(raw):
                 # IAS + Mach + magnetic heading + baro vertical rate
                 try:
                     ias = pms.commb.ias60(raw)

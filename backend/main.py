@@ -59,7 +59,10 @@ _watchlist_cache_ts: float = 0.0
 # background thread drains the queue calling state.process_message().  This
 # keeps all pyModeS decode work off the asyncio event loop so TCP reads and
 # WebSocket broadcasts are never starved.
-_msg_queue: queue.SimpleQueue = queue.SimpleQueue()
+# Bounded at 5000: if the decoder falls behind, drop new arrivals rather than
+# accumulating stale messages that would be decoded minutes late.
+_MSG_QUEUE_MAX = 5000
+_msg_queue: queue.Queue = queue.Queue(maxsize=_MSG_QUEUE_MAX)
 
 
 def _start_msg_processor() -> None:
@@ -78,7 +81,10 @@ def _start_msg_processor() -> None:
 
 async def _beast_runner() -> None:
     def on_message(msg: dict) -> None:
-        _msg_queue.put((msg, None))
+        try:
+            _msg_queue.put_nowait((msg, None))
+        except queue.Full:
+            pass  # drop oldest-equivalent: decoder is behind, discard this arrival
 
     client = BeastClient(config.BEAST_HOST, config.BEAST_PORT, on_message)
     await client.run()
@@ -86,7 +92,10 @@ async def _beast_runner() -> None:
 
 async def _mlat_runner(name: str, host: str, port: int) -> None:
     def on_mlat_message(msg: dict) -> None:
-        _msg_queue.put((msg, name))
+        try:
+            _msg_queue.put_nowait((msg, name))
+        except queue.Full:
+            pass
 
     client = BeastClient(host, port, on_mlat_message)
     log.info("MLAT runner starting: %s (%s:%s)", name, host, port)
