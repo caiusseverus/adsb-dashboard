@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 import config
 import enrichment
 from beast_client import BeastClient
-from aircraft_state import AircraftState
+from aircraft_state import AircraftState, push_timings as _push_timings_store
 from db import stats_db
 from track_store import TrackStore
 from history import router as history_router
@@ -281,6 +281,7 @@ async def _push_updates() -> None:
         # Kept separate from the recording condition so a temporary loss of position
         # doesn't prematurely prune an existing trail.
         active_icaos: set[str] = {ac["icao"] for ac in snapshot["aircraft"]}
+        t_loop_start = time.perf_counter()
         for ac in snapshot["aircraft"]:
             # Watchlist / military / interesting notifications (dedup inside notifications module)
             icao = ac["icao"]
@@ -328,7 +329,15 @@ async def _push_updates() -> None:
         # Prune tracks for aircraft that have left the live set
         track_store.expire(active_icaos)
 
+        t_loop_end = time.perf_counter()
+
         if not _clients:
+            _push_timings_store.append({
+                "loop_ms": round((t_loop_end - t_loop_start) * 1000, 2),
+                "broadcast_ms": 0.0,
+                "total_ms": round((t_loop_end - t_loop_start) * 1000, 2),
+                "ac_count": len(snapshot["aircraft"]),
+            })
             continue
 
         payload = json.dumps(snapshot)
@@ -345,6 +354,14 @@ async def _push_updates() -> None:
                 _clients.remove(ws)
             except ValueError:
                 pass
+
+        t_done = time.perf_counter()
+        _push_timings_store.append({
+            "loop_ms": round((t_loop_end - t_loop_start) * 1000, 2),
+            "broadcast_ms": round((t_done - t_loop_end) * 1000, 2),
+            "total_ms": round((t_done - t_loop_start) * 1000, 2),
+            "ac_count": len(snapshot["aircraft"]),
+        })
 
 
 # ---------------------------------------------------------------------------

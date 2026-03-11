@@ -22,6 +22,15 @@ from utils import country_from_registration
 
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Performance timing stores — written by process_message and _push_updates,
+# read by /api/debug/perf.  deques are thread-safe for single-writer appends.
+# ---------------------------------------------------------------------------
+# Per-message total processing time in seconds (includes lock acquisition + decode)
+msg_timings: deque[float] = deque(maxlen=2000)
+# Per-_push_updates invocation breakdown: {loop_ms, broadcast_ms, total_ms, ac_count}
+push_timings: deque[dict] = deque(maxlen=120)
+
 _R_NM = 3440.065  # Earth radius in nautical miles
 # Beast timestamp value used by mlat-client for all synthesized positions.
 # Bytes: FF 00 4D 4C 41 54  ("FF00" + "MLAT" in ASCII).
@@ -237,12 +246,14 @@ class AircraftState:
 
         mlat = mlat_source is not None
 
+        t0 = time.perf_counter()
         with self._lock:
             self._total += 1
             if mlat:
                 self._mlat_total += 1
             self._tick(now, mlat=mlat)
             self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
+        msg_timings.append(time.perf_counter() - t0)
 
     def expire_aircraft(self) -> None:
         now = time.time()

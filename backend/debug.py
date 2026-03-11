@@ -6,12 +6,14 @@ POST /api/debug/aircraft/{icao}/override — override a field in aircraft_regist
 """
 
 import asyncio
+import statistics
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from db import stats_db
 import enrichment as enrichment_module
+import aircraft_state as _state_module
 
 router = APIRouter(prefix="/api/debug")
 
@@ -19,6 +21,44 @@ OVERRIDEABLE_FIELDS = {
     "country", "registration", "type_code", "operator",
     "military", "manufacturer", "year",
 }
+
+
+@router.get("/perf")
+async def get_perf() -> dict:
+    """Return performance timing statistics for message decode and push-updates."""
+    msg_t = sorted(_state_module.msg_timings)  # copy of deque as sorted list
+    push_t = list(_state_module.push_timings)
+
+    def percentiles(data: list[float], scale: float = 1_000_000) -> dict:
+        n = len(data)
+        if not n:
+            return {"samples": 0, "p50": 0, "p95": 0, "p99": 0, "max": 0, "mean": 0}
+        return {
+            "samples": n,
+            "p50":  round(data[int(n * 0.50)] * scale, 1),
+            "p95":  round(data[int(n * 0.95)] * scale, 1),
+            "p99":  round(data[int(n * 0.99)] * scale, 1),
+            "max":  round(data[-1] * scale, 1),
+            "mean": round(statistics.mean(data) * scale, 1),
+        }
+
+    def push_avg(key: str) -> float:
+        if not push_t:
+            return 0.0
+        return round(sum(p[key] for p in push_t) / len(push_t), 2)
+
+    return {
+        # Per-message decode time in microseconds
+        "msg_decode_us": percentiles(msg_t, scale=1_000_000),
+        # Per-_push_updates invocation in milliseconds
+        "push_updates_ms": {
+            "samples":       len(push_t),
+            "loop_avg":      push_avg("loop_ms"),       # notify + track recording
+            "broadcast_avg": push_avg("broadcast_ms"),  # websocket send
+            "total_avg":     push_avg("total_ms"),
+            "ac_count_avg":  push_avg("ac_count"),
+        },
+    }
 
 
 @router.get("/aircraft/{icao}")
