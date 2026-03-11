@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, Fragment } from 'react'
 import {
-  BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid,
-  LineChart, Line, ReferenceLine, ResponsiveContainer, Legend,
+  LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid,
+  ReferenceLine, ResponsiveContainer,
 } from 'recharts'
 import styles from './EventsPage.module.css'
 import { formatOperator } from '../utils/formatOperator'
@@ -141,85 +141,148 @@ function ContextRow({ event, onClose }) {
   )
 }
 
+function StatPill({ label, value, color }) {
+  return (
+    <div className={styles.statPill}>
+      <span className={styles.statPillValue} style={color ? { color } : undefined}>{value ?? '—'}</span>
+      <span className={styles.statPillLabel}>{label}</span>
+    </div>
+  )
+}
+
 function StatsPanel({ days }) {
-  const [timeline, setTimeline] = useState([])
-  const [stats, setStats]       = useState(null)
+  const [acas,    setAcas]    = useState(null)
+  const [squawks, setSquawks] = useState([])
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/acas/timeline?days=${days}`)
-      .then(r => r.ok ? r.json() : [])
-      .then(setTimeline)
-      .catch(() => {})
-
     fetch(`${API_BASE}/api/acas/stats?days=${days}`)
-      .then(r => r.ok ? r.json() : null)
-      .then(setStats)
-      .catch(() => {})
+      .then(r => r.ok ? r.json() : null).then(setAcas).catch(() => {})
+    fetch(`${API_BASE}/api/squawks/events?days=${days}`)
+      .then(r => r.ok ? r.json() : []).then(setSquawks).catch(() => {})
+  }, [days])
+
+  const sq7700 = squawks.filter(e => e.squawk === '7700').length
+  const sq7600 = squawks.filter(e => e.squawk === '7600').length
+  const sq7500 = squawks.filter(e => e.squawk === '7500').length
+
+  return (
+    <div className={styles.pillRow}>
+      <StatPill label="ACAS total"   value={acas?.total}      />
+      <StatPill label="Corrective"   value={acas?.corrective} color="#f85149" />
+      <StatPill label="Preventive"   value={acas?.preventive} color="#bc8cff" />
+      <div className={styles.pillSep} />
+      <StatPill label="7700 Emergency" value={sq7700} color="#f85149" />
+      <StatPill label="7600 Radio fail" value={sq7600} color="#d29922" />
+      <StatPill label="7500 Hijack"    value={sq7500} color="#bc8cff" />
+    </div>
+  )
+}
+
+const SQUAWK_LABELS = {
+  '7700': { label: 'General emergency', color: '#f85149' },
+  '7600': { label: 'Radio failure',     color: '#d29922' },
+  '7500': { label: 'Hijack',            color: '#bc8cff' },
+}
+
+const SQ_TIMEFRAMES = [
+  { value: 7,  label: '7d' },
+  { value: 30, label: '30d' },
+  { value: 90, label: '90d' },
+]
+
+function SquawkBadge({ code }) {
+  const info = SQUAWK_LABELS[code] ?? { label: code, color: '#8b949e' }
+  return (
+    <span style={{
+      background: info.color + '22', color: info.color,
+      border: `1px solid ${info.color}55`,
+      borderRadius: 4, padding: '0 6px', fontSize: '0.75rem', fontWeight: 600,
+    }}>{code} — {info.label}</span>
+  )
+}
+
+function fmtDuration(ts, ts_last) {
+  const secs = ts_last - ts
+  if (secs < 60)  return `${secs}s`
+  if (secs < 3600) return `${Math.round(secs / 60)}m`
+  return `${(secs / 3600).toFixed(1)}h`
+}
+
+function EmergencySquawksSection({ onSelectIcao }) {
+  const [days, setDays]       = useState(30)
+  const [events, setEvents]   = useState([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    setLoading(true)
+    fetch(`${API_BASE}/api/squawks/events?days=${days}`)
+      .then(r => r.ok ? r.json() : [])
+      .then(d => { setEvents(d); setLoading(false) })
+      .catch(() => setLoading(false))
   }, [days])
 
   return (
-    <div className={styles.statsGrid}>
-      {/* Timeline bar chart */}
-      <div className={styles.statsCard}>
-        <div className={styles.statsTitle}>Events per day</div>
-        {timeline.length === 0 ? (
-          <div className={styles.statsEmpty}>No events recorded yet.</div>
-        ) : (
-          <ResponsiveContainer width="100%" height={140}>
-            <BarChart data={timeline} margin={{ top: 4, right: 8, bottom: 4, left: 0 }}>
-              <CartesianGrid stroke="#21262d" strokeDasharray="3 3" />
-              <XAxis dataKey="day" tick={{ fill: '#484f58', fontSize: 9 }}
-                     tickFormatter={d => d?.slice(5)} />
-              <YAxis tick={{ fill: '#484f58', fontSize: 9 }} allowDecimals={false} />
-              <Tooltip contentStyle={{ background: '#161b22', border: '1px solid #30363d', fontSize: 11 }} />
-              <Bar dataKey="corrective" stackId="s" fill="#f85149" name="Corrective" />
-              <Bar dataKey="preventive" stackId="s" fill="#bc8cff" name="Preventive" />
-            </BarChart>
-          </ResponsiveContainer>
-        )}
+    <div className={styles.tableCard}>
+      <div className={styles.tableHeader}>
+        <span className={styles.tableTitle}>Emergency Squawks</span>
+        <span className={styles.count}>{events.length}</span>
+        <div className={styles.controls}>
+          {SQ_TIMEFRAMES.map(t => (
+            <button key={t.value}
+              className={days === t.value ? styles.btnActive : styles.btn}
+              onClick={() => setDays(t.value)}>{t.label}</button>
+          ))}
+        </div>
       </div>
 
-      {/* Stats breakdowns */}
-      <div className={styles.statsCard}>
-        <div className={styles.statsTitle}>
-          {stats ? `${stats.total} events — ${stats.corrective} corrective, ${stats.preventive} preventive` : 'Loading…'}
+      {loading ? (
+        <div className={styles.empty}>Loading…</div>
+      ) : events.length === 0 ? (
+        <div className={styles.empty}>
+          No emergency squawks recorded. 7700 (emergency), 7600 (radio failure) and 7500 (hijack)
+          are captured as soon as the squawk field is decoded from a Mode-S message.
         </div>
-        {stats && (
-          <div className={styles.statsSub}>
-            {/* By country */}
-            {stats.by_country.length > 0 && (
-              <div className={styles.miniChart}>
-                <div className={styles.miniChartTitle}>By country</div>
-                <ResponsiveContainer width="100%" height={80}>
-                  <BarChart data={stats.by_country} layout="vertical"
-                            margin={{ top: 2, right: 8, bottom: 2, left: 55 }}>
-                    <XAxis type="number" tick={{ fill: '#484f58', fontSize: 9 }} allowDecimals={false} />
-                    <YAxis type="category" dataKey="country" tick={{ fill: '#8b949e', fontSize: 9 }} width={55} />
-                    <Tooltip contentStyle={{ background: '#161b22', border: '1px solid #30363d', fontSize: 11 }} />
-                    <Bar dataKey="count" fill="#388bfd" />
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            )}
-            {/* By operator */}
-            {stats.by_operator.length > 0 && (
-              <div className={styles.miniChart}>
-                <div className={styles.miniChartTitle}>By operator (top 10)</div>
-                <ResponsiveContainer width="100%" height={80}>
-                  <BarChart data={stats.by_operator} layout="vertical"
-                            margin={{ top: 2, right: 8, bottom: 2, left: 80 }}>
-                    <XAxis type="number" tick={{ fill: '#484f58', fontSize: 9 }} allowDecimals={false} />
-                    <YAxis type="category" dataKey="operator" tick={{ fill: '#8b949e', fontSize: 9 }} width={80}
-                           tickFormatter={op => formatOperator(op)?.slice(0, 14) ?? op} />
-                    <Tooltip contentStyle={{ background: '#161b22', border: '1px solid #30363d', fontSize: 11 }} />
-                    <Bar dataKey="count" fill="#3fb950" />
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            )}
-          </div>
-        )}
-      </div>
+      ) : (
+        <div className={styles.scrollWrap}>
+          <table className={styles.table}>
+            <thead>
+              <tr>
+                <th>First seen</th>
+                <th>Duration</th>
+                <th>ICAO</th>
+                <th>Callsign</th>
+                <th>Reg</th>
+                <th>Type</th>
+                <th>Operator</th>
+                <th>Country</th>
+                <th>Squawk</th>
+                <th>Altitude</th>
+              </tr>
+            </thead>
+            <tbody>
+              {events.map(ev => (
+                <tr key={ev.id} className={styles.eventRow}
+                  style={{ borderLeft: `3px solid ${(SQUAWK_LABELS[ev.squawk] ?? {}).color ?? '#8b949e'}` }}>
+                  <td className={styles.muted}>{fmtTs(ev.ts)}</td>
+                  <td className={styles.muted}>{fmtDuration(ev.ts, ev.ts_last)}</td>
+                  <td className={styles.icao}
+                    style={{ cursor: 'pointer' }}
+                    onClick={() => onSelectIcao?.(ev.icao)}>{ev.icao}</td>
+                  <td>{ev.callsign ?? '—'}</td>
+                  <td>{ev.registration ?? '—'}</td>
+                  <td>{ev.type_code ?? '—'}</td>
+                  <td className={styles.operator} title={formatOperator(ev.operator) ?? undefined}>
+                    {formatOperator(ev.operator) ?? '—'}
+                  </td>
+                  <td>{ev.country ?? '—'}</td>
+                  <td><SquawkBadge code={ev.squawk} /></td>
+                  <td>{fmtAlt(ev.altitude)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   )
 }
@@ -274,7 +337,10 @@ export default function EventsPage({ onSelectIcao }) {
 
       <StatsPanel days={days} />
 
-      {/* Events table */}
+      {/* Emergency squawks */}
+      <EmergencySquawksSection onSelectIcao={onSelectIcao} />
+
+      {/* ACAS events table */}
       <div className={styles.tableCard}>
         <div className={styles.tableHeader}>
           <span className={styles.tableTitle}>ACAS Events</span>

@@ -264,3 +264,45 @@
 .debugMissing {
   color: #30363d;
 }
+
+.tableNote {
+  font-size: 0.72rem;
+  color: #484f58;
+  padding: 0.6rem 0 0;
+}
+
+/* Acknowledgements */
+.ackGrid {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.ackItem {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #21262d;
+  font-size: 0.85rem;
+}
+
+.ackItem:last-child {
+  border-bottom: none;
+}
+
+.ackLink {
+  color: #388bfd;
+  text-decoration: none;
+  font-weight: 500;
+  white-space: nowrap;
+  min-width: 140px;
+}
+
+.ackLink:hover {
+  text-decoration: underline;
+}
+
+.ackDesc {
+  color: #8b949e;
+}

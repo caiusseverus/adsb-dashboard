@@ -139,6 +139,7 @@ class Aircraft:
     bearing_deg: Optional[float] = None   # bearing from receiver (degrees true)
     cpr_even: Optional[tuple] = field(default=None, repr=False)   # (raw_msg, timestamp)
     cpr_odd:  Optional[tuple] = field(default=None, repr=False)
+    pos_global: bool = False  # True once a global CPR decode (even+odd pair) has succeeded
     sighting_count: int = 1               # from aircraft_registry; 1 = unique (never seen before)
     # MLAT
     has_adsb: bool = False               # True once a DF17 WITHOUT the MLAT timestamp is seen
@@ -417,6 +418,7 @@ class AircraftState:
                     "acas_ra_corrective": ac.acas_ra_corrective,
                     "acas_threat_icao":   ac.acas_threat_icao,
                     "acas_sensitivity":   ac.acas_sensitivity,
+                    "pos_global":         ac.pos_global,
                 }
                 for ac in self._aircraft.values()
             ]
@@ -670,12 +672,15 @@ class AircraftState:
                     # longitude zone when the receiver is more than ~5° west of the
                     # aircraft (e.g. western UK receiver + aircraft over the North Sea).
                     pos = None
+                    pos_from_global = False
                     if (ac.cpr_even and ac.cpr_odd
                             and abs(ac.cpr_even[1] - ac.cpr_odd[1]) < 10):
                         pos = pms.adsb.position(
                             ac.cpr_even[0], ac.cpr_odd[0],
                             ac.cpr_even[1], ac.cpr_odd[1],
                         )
+                        if pos is not None:
+                            pos_from_global = True
 
                     # Local decode fallback: only when no pair is available yet.
                     # Use the aircraft's own last position as reference (safer than
@@ -701,6 +706,8 @@ class AircraftState:
                             else:
                                 ac.lat = round(lat, 5)
                                 ac.lon = round(lon, 5)
+                                if pos_from_global:
+                                    ac.pos_global = True
                                 if config.RECEIVER_LAT is not None and config.RECEIVER_LON is not None:
                                     ac.range_nm = round(_haversine_nm(
                                         config.RECEIVER_LAT, config.RECEIVER_LON,

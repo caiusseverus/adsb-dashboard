@@ -1,0 +1,91 @@
+.page {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 52px);
+  padding: 1rem 1.5rem;
+  gap: 0.75rem;
+  box-sizing: border-box;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #c9d1d9;
+}
+
+.controls {
+  display: flex;
+  gap: 3px;
+}
+
+.btn, .btnActive {
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  border: 1px solid #30363d;
+  cursor: pointer;
+  background: transparent;
+  color: #484f58;
+}
+.btn:hover  { color: #8b949e; }
+.btnActive  { background: #21262d; color: #e6edf3; border-color: #388bfd; }
+
+.meta {
+  font-size: 0.72rem;
+  color: #484f58;
+}
+
+.metaError {
+  font-size: 0.72rem;
+  color: #f85149;
+}
+
+.mapWrap {
+  flex: 1;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid #21262d;
+  /* Leaflet needs a non-zero height to initialise */
+  min-height: 0;
+}
+
+/* Force Leaflet map to fill its container */
+.mapWrap :global(.leaflet-container) {
+  width: 100%;
+  height: 100%;
+  background: #0b0c10;
+}
+
+.legend {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+  font-size: 0.72rem;
+  color: #484f58;
+}
+
+.legendLabel {
+  color: #8b949e;
+}
+
+.gradBar {
+  width: 120px;
+  height: 10px;
+  border-radius: 3px;
+  background: linear-gradient(to right, rgb(8,40,100), rgb(30,100,220), rgb(30,200,200), rgb(230,210,30), rgb(220,30,30));
+}
+
+.legendNote {
+  margin-left: 0.5rem;
+  color: #30363d;
+}

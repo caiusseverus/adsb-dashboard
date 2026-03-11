@@ -200,6 +200,11 @@ async def receiver_position_decode_rate(days: int = Query(30, ge=7, le=365)) -> 
     return await asyncio.to_thread(stats_db.query_position_decode_rate, days)
 
 
+@router.get("/alt_heatmap")
+async def alt_heatmap(hours: int = Query(24, ge=1, le=168)) -> dict:
+    return await asyncio.to_thread(stats_db.query_alt_heatmap, hours)
+
+
 @router.get("/notable")
 async def notable(
     limit: int = Query(100, ge=1, le=500),

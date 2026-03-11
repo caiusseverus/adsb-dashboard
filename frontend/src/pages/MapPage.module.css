@@ -1,0 +1,90 @@
+.page {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background: #0b0c10;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.6rem 1rem;
+  background: #161b22;
+  border-bottom: 1px solid #21262d;
+  flex-shrink: 0;
+}
+
+.count {
+  font-size: 0.78rem;
+  color: #484f58;
+  min-width: 80px;
+}
+
+.modeGroup {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.btn {
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 5px;
+  color: #8b949e;
+  font-size: 0.78rem;
+  padding: 0.25rem 0.65rem;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+.btn:hover { border-color: #388bfd; color: #c9d1d9; }
+
+.btnActive {
+  composes: btn;
+  background: #388bfd1a;
+  border-color: #388bfd;
+  color: #388bfd;
+}
+
+.mapWrap {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Override Leaflet's default font/attribution colour for dark theme */
+.mapWrap :global(.leaflet-control-attribution) {
+  background: rgba(11, 12, 16, 0.75);
+  color: #484f58;
+  font-size: 0.65rem;
+}
+.mapWrap :global(.leaflet-control-attribution a) {
+  color: #388bfd;
+}
+
+.legend {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.45rem 1rem;
+  background: #161b22;
+  border-top: 1px solid #21262d;
+  flex-shrink: 0;
+  overflow-x: auto;
+  flex-wrap: wrap;
+}
+
+.legendItem {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  color: #8b949e;
+  white-space: nowrap;
+}
+
+.legendSep {
+  margin-left: auto;
+  font-size: 0.72rem;
+  color: #30363d;
+  white-space: nowrap;
+}

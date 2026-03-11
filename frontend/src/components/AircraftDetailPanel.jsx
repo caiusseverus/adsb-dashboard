@@ -119,12 +119,13 @@ function RouteSection({ icao, callsign }) {
   )
 }
 
-export default function AircraftDetailPanel({ icao, onClose, onRefreshed }) {
+export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefreshed }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [acasEvents, setAcasEvents] = useState([])
+  const [watched, setWatched] = useState(false)
 
   const load = useCallback(() => {
     if (!icao) return
@@ -147,6 +148,10 @@ export default function AircraftDetailPanel({ icao, onClose, onRefreshed }) {
 
   useEffect(() => { load() }, [load])
 
+  // Live section: prefer real-time snapshot over the one-shot API response.
+  // Snapshot aircraft fields match the data.live schema directly.
+  const liveData = snapshot?.aircraft?.find(a => a.icao === icao) ?? data?.live
+
   useEffect(() => {
     if (!icao) return
     fetch(`${API_BASE}/api/acas/aircraft/${icao}?limit=10`)
@@ -154,6 +159,23 @@ export default function AircraftDetailPanel({ icao, onClose, onRefreshed }) {
       .then(setAcasEvents)
       .catch(() => setAcasEvents([]))
   }, [icao])
+
+  useEffect(() => {
+    fetch(`${API_BASE}/api/notify/watchlist/${icao}`)
+      .then(r => r.ok ? r.json() : { watched: false })
+      .then(d => setWatched(d.watched))
+      .catch(() => {})
+  }, [icao])
+
+  const toggleWatch = async () => {
+    const method = watched ? 'DELETE' : 'POST'
+    const r = await fetch(`${API_BASE}/api/notify/watchlist/${icao}`, {
+      method,
+      headers: method === 'POST' ? { 'Content-Type': 'application/json' } : {},
+      body: method === 'POST' ? JSON.stringify({ max_range_nm: null }) : undefined,
+    })
+    if (r.ok) setWatched(w => !w)
+  }
 
   // Close on Escape
   useEffect(() => {
@@ -170,6 +192,20 @@ export default function AircraftDetailPanel({ icao, onClose, onRefreshed }) {
             {data?.military && <span className={styles.milBadge}>MIL</span>}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <button
+              onClick={toggleWatch}
+              style={{
+                background: watched ? '#388bfd22' : 'transparent',
+                border: `1px solid ${watched ? '#388bfd' : '#30363d'}`,
+                color: watched ? '#388bfd' : '#484f58',
+                borderRadius: 4,
+                padding: '0.15rem 0.6rem',
+                fontSize: '0.75rem',
+                cursor: 'pointer',
+              }}
+            >
+              {watched ? '★ Watching' : '☆ Watch'}
+            </button>
             <button
               className={styles.refreshBtn}
               onClick={refresh}
@@ -204,52 +240,52 @@ export default function AircraftDetailPanel({ icao, onClose, onRefreshed }) {
               <Field label="Year"         value={data.year} />
             </Section>
 
-            {data.live && (
+            {liveData && (
               <Section title="Live">
-                <Field label="Callsign"  value={data.live.callsign} />
-                <Field label="Altitude"  value={fmtAlt(data.live.altitude)} />
-                <Field label="Sel. alt"  value={data.live.selected_alt != null ? fmtAlt(data.live.selected_alt) : null} />
+                <Field label="Callsign"  value={liveData.callsign} />
+                <Field label="Altitude"  value={fmtAlt(liveData.altitude)} />
+                <Field label="Sel. alt"  value={liveData.selected_alt != null ? fmtAlt(liveData.selected_alt) : null} />
                 <Field label="Speed"     value={
-                  data.live.airspeed_kts != null
-                    ? `${data.live.airspeed_kts} kt${data.live.airspeed_type ? ` (${data.live.airspeed_type})` : ''}`
+                  liveData.airspeed_kts != null
+                    ? `${liveData.airspeed_kts} kt${liveData.airspeed_type ? ` (${liveData.airspeed_type})` : ''}`
                     : null
                 } />
-                {data.live.mach != null && (
-                  <Field label="Mach" value={`M${data.live.mach.toFixed(3)}`} />
+                {liveData.mach != null && (
+                  <Field label="Mach" value={`M${liveData.mach.toFixed(3)}`} />
                 )}
-                <Field label="Heading"   value={data.live.heading_deg != null ? `${data.live.heading_deg}°` : null} />
+                <Field label="Heading"   value={liveData.heading_deg != null ? `${liveData.heading_deg}°` : null} />
                 <Field label="Vert. rate" value={
-                  data.live.vertical_rate_fpm != null
-                    ? `${data.live.vertical_rate_fpm > 0 ? '+' : ''}${data.live.vertical_rate_fpm} fpm`
+                  liveData.vertical_rate_fpm != null
+                    ? `${liveData.vertical_rate_fpm > 0 ? '+' : ''}${liveData.vertical_rate_fpm} fpm`
                     : null
                 } />
-                <Field label="Range"     value={data.live.range_nm != null ? `${data.live.range_nm} nm` : null} />
-                {data.live.lat != null && data.live.lon != null && (
+                <Field label="Range"     value={liveData.range_nm != null ? `${liveData.range_nm} nm` : null} />
+                {liveData.lat != null && liveData.lon != null && (
                   <div className={styles.field}>
                     <span className={styles.fieldLabel}>Position</span>
                     <a
                       className={styles.fieldValue}
-                      href={`https://www.openstreetmap.org/?mlat=${data.live.lat}&mlon=${data.live.lon}&zoom=10`}
+                      href={`https://www.openstreetmap.org/?mlat=${liveData.lat}&mlon=${liveData.lon}&zoom=10`}
                       target="_blank"
                       rel="noopener noreferrer"
                     >
-                      {data.live.lat.toFixed(4)}, {data.live.lon.toFixed(4)}
+                      {liveData.lat.toFixed(4)}, {liveData.lon.toFixed(4)}
                     </a>
                   </div>
                 )}
                 <Field label="Squawk"    value={
-                  data.live.squawk
-                    ? `${data.live.squawk}${EMERGENCY_SQUAWKS[data.live.squawk] ? ` — ${EMERGENCY_SQUAWKS[data.live.squawk]}` : ''}`
+                  liveData.squawk
+                    ? `${liveData.squawk}${EMERGENCY_SQUAWKS[liveData.squawk] ? ` — ${EMERGENCY_SQUAWKS[liveData.squawk]}` : ''}`
                     : null
                 } />
-                <Field label="Signal"    value={data.live.signal != null ? `${Math.round((255 - data.live.signal) / 2.55)}%` : null} />
-                <Field label="Messages"  value={data.live.msg_count} />
-                <Field label="Last seen" value={data.live.age != null ? `${data.live.age}s ago` : null} />
+                <Field label="Signal"    value={liveData.signal != null ? `${Math.round((255 - liveData.signal) / 2.55)}%` : null} />
+                <Field label="Messages"  value={liveData.msg_count} />
+                <Field label="Last seen" value={liveData.age != null ? `${liveData.age}s ago` : null} />
               </Section>
             )}
 
-            {data.live?.callsign && (
-              <RouteSection icao={icao} callsign={data.live.callsign} />
+            {liveData?.callsign && (
+              <RouteSection icao={icao} callsign={liveData.callsign} />
             )}
 
             {data.history && (

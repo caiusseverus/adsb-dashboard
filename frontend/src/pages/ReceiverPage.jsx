@@ -124,26 +124,19 @@ function ScatterPlot({ days, onDaysChange }) {
 // ---------------------------------------------------------------------------
 // 2. Signal strength percentile bands (dBFS) — coverage edge is the key line
 // ---------------------------------------------------------------------------
-function SignalPercentiles({ days, onDaysChange }) {
-  const { data, loading } = useFetch(`${API_BASE}/api/history/receiver/signal?days=${days}`)
+function RangeTrend({ days, onDaysChange }) {
+  const { data, loading } = useFetch(`${API_BASE}/api/coverage/range_trend?days=${days}`)
 
-  // Backend now returns dBFS values directly (negative numbers, 0=strongest)
   const points = useMemo(() => (data || []).map(d => ({
-    label:  new Date(d.ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
-    strong: d.strong,
-    median: d.median,
-    weak:   d.weak,
+    label:  d.date,
+    max_nm: d.max_nm,
+    avg_nm: d.avg_nm,
   })), [data])
-
-  // Domain: find actual range, pad slightly
-  const allVals = points.flatMap(p => [p.strong, p.median, p.weak]).filter(v => v != null)
-  const yMin = allVals.length ? Math.floor(Math.min(...allVals) / 5) * 5 - 5 : -100
-  const yMax = allVals.length ? Math.ceil(Math.max(...allVals) / 5) * 5 + 5 : 0
 
   return (
     <Card
-      title="Signal strength percentiles — dBFS (weak line = coverage edge)"
-      controls={<DaySelect value={days} onChange={onDaysChange} options={[7, 14, 30, 60, 90]} />}
+      title="Daily max range (nm)"
+      controls={<DaySelect value={days} onChange={onDaysChange} options={[30, 90, 180, 365]} />}
     >
       {!points.length ? <Empty loading={loading} /> : (
         <ResponsiveContainer width="100%" height={220}>
@@ -151,18 +144,16 @@ function SignalPercentiles({ days, onDaysChange }) {
             <CartesianGrid stroke="#21262d" />
             <XAxis dataKey="label" tick={{ fill: '#484f58', fontSize: 10 }}
               interval={Math.max(0, Math.floor(points.length / 8))} />
-            <YAxis domain={[yMin, yMax]} tick={{ fill: '#484f58', fontSize: 11 }} width={52}
-              tickFormatter={v => `${v} dB`} />
+            <YAxis tick={{ fill: '#484f58', fontSize: 11 }} width={44}
+              tickFormatter={v => `${v}`} unit=" nm" />
             <Tooltip
               contentStyle={{ background: '#161b22', border: '1px solid #30363d', fontSize: 12 }}
-              formatter={(v, name) => [`${v} dBFS`, name]}
+              formatter={(v, name) => [`${v} nm`, name]}
             />
-            <Area type="monotone" dataKey="strong" name="Strong (p90)" stroke="#3fb950"
-              fill="#3fb95018" strokeWidth={1} dot={false} isAnimationActive={false} />
-            <Area type="monotone" dataKey="median" name="Median (p50)" stroke="#388bfd"
+            <Area type="monotone" dataKey="max_nm" name="Max range" stroke="#388bfd"
               fill="#388bfd18" strokeWidth={2} dot={false} isAnimationActive={false} />
-            <Area type="monotone" dataKey="weak" name="Weak / edge (p10)" stroke="#f85149"
-              fill="#f8514918" strokeWidth={1.5} dot={false} isAnimationActive={false}
+            <Area type="monotone" dataKey="avg_nm" name="Mean range" stroke="#3fb950"
+              fill="#3fb95010" strokeWidth={1.5} dot={false} isAnimationActive={false}
               strokeDasharray="4 2" />
             <Legend wrapperStyle={{ fontSize: 11, color: '#8b949e' }} />
           </AreaChart>
@@ -669,33 +660,6 @@ function BaselineComparison({ snapshot }) {
   )
 }
 
-// ---------------------------------------------------------------------------
-// 9. Unique aircraft per day
-// ---------------------------------------------------------------------------
-function UniqueAircraftPerDay({ days, onDaysChange }) {
-  const { data, loading } = useFetch(`${API_BASE}/api/history/receiver/unique_aircraft?days=${days}`)
-  return (
-    <Card
-      title="Unique aircraft per day"
-      controls={<DaySelect value={days} onChange={onDaysChange} options={[30, 90, 365]} />}
-    >
-      {!data?.length ? <Empty loading={loading} /> : (
-        <ResponsiveContainer width="100%" height={200}>
-          <AreaChart data={data} margin={{ top: 8, right: 12, bottom: 8, left: 8 }}>
-            <CartesianGrid stroke="#21262d" />
-            <XAxis dataKey="date" tick={{ fill: '#484f58', fontSize: 10 }}
-              interval={Math.max(0, Math.floor(data.length / 6))} />
-            <YAxis tick={{ fill: '#484f58', fontSize: 11 }} width={44} allowDecimals={false} />
-            <Tooltip contentStyle={{ background: '#161b22', border: '1px solid #30363d', fontSize: 12 }}
-              formatter={v => [v, 'aircraft']} />
-            <Area type="monotone" dataKey="count" name="Aircraft" stroke="#3fb950"
-              fill="#3fb95020" strokeWidth={2} dot={false} isAnimationActive={false} />
-          </AreaChart>
-        </ResponsiveContainer>
-      )}
-    </Card>
-  )
-}
 
 // ---------------------------------------------------------------------------
 // 10. Reception completeness
@@ -784,10 +748,9 @@ function PositionDecodeRate({ days, onDaysChange }) {
 // ---------------------------------------------------------------------------
 export default function ReceiverPage({ snapshot }) {
   const [scatterDays, setScatterDays]   = useState(1)
-  const [signalDays,  setSignalDays]    = useState(14)
+  const [rangeTrendDays, setRangeTrendDays] = useState(90)
   const [polarDays,   setPolarDays]     = useState(30)
   const [rangePctDays, setRangePctDays] = useState(30)
-  const [uniqueDays,   setUniqueDays]   = useState(90)
   const [completeDays, setCompleteDays] = useState(90)
   const [decodeDays,   setDecodeDays]   = useState(30)
 
@@ -805,14 +768,13 @@ export default function ReceiverPage({ snapshot }) {
       </div>
       <div className={styles.row}>
         <RangePercentiles days={rangePctDays} onDaysChange={setRangePctDays} />
-        <SignalPercentiles days={signalDays} onDaysChange={setSignalDays} />
+        <RangeTrend days={rangeTrendDays} onDaysChange={setRangeTrendDays} />
       </div>
       <div className={styles.row}>
         <PolarCoverage days={polarDays} onDaysChange={setPolarDays} />
         <DistributionStats />
       </div>
-      <div className={styles.row3}>
-        <UniqueAircraftPerDay  days={uniqueDays}   onDaysChange={setUniqueDays} />
+      <div className={styles.row}>
         <ReceptionCompleteness days={completeDays} onDaysChange={setCompleteDays} />
         <PositionDecodeRate    days={decodeDays}   onDaysChange={setDecodeDays} />
       </div>
