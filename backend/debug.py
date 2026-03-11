@@ -26,6 +26,7 @@ OVERRIDEABLE_FIELDS = {
 @router.get("/perf")
 async def get_perf() -> dict:
     """Return performance timing statistics for message decode and push-updates."""
+    from main import _msg_queue
     msg_t = sorted(_state_module.msg_timings)  # copy of deque as sorted list
     push_t = list(_state_module.push_timings)
 
@@ -50,6 +51,7 @@ async def get_perf() -> dict:
     return {
         # Per-message decode time in microseconds
         "msg_decode_us": percentiles(msg_t, scale=1_000_000),
+        "msg_queue_depth": _msg_queue.qsize(),
         # Per-_push_updates invocation in milliseconds
         "push_updates_ms": {
             "samples":        len(push_t),

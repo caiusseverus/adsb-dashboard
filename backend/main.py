@@ -1,6 +1,8 @@
 import asyncio
 import json
 import logging
+import queue
+import threading
 import warnings
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
@@ -53,6 +55,22 @@ _active_squawks: dict[str, dict] = {}
 _watchlist_cache: dict[str, float | None] = {}   # icao → max_range_nm
 _watchlist_cache_ts: float = 0.0
 
+# Message decode queue — Beast/MLAT runners push raw messages here; a single
+# background thread drains the queue calling state.process_message().  This
+# keeps all pyModeS decode work off the asyncio event loop so TCP reads and
+# WebSocket broadcasts are never starved.
+_msg_queue: queue.SimpleQueue = queue.SimpleQueue()
+
+
+def _start_msg_processor() -> None:
+    """Start the daemon thread that decodes Beast messages from _msg_queue."""
+    def _run() -> None:
+        while True:
+            msg, mlat_source = _msg_queue.get()
+            state.process_message(msg, mlat_source)
+    t = threading.Thread(target=_run, daemon=True, name="beast-decoder")
+    t.start()
+
 
 # ---------------------------------------------------------------------------
 # Background tasks
@@ -60,7 +78,7 @@ _watchlist_cache_ts: float = 0.0
 
 async def _beast_runner() -> None:
     def on_message(msg: dict) -> None:
-        state.process_message(msg)
+        _msg_queue.put((msg, None))
 
     client = BeastClient(config.BEAST_HOST, config.BEAST_PORT, on_message)
     await client.run()
@@ -68,7 +86,7 @@ async def _beast_runner() -> None:
 
 async def _mlat_runner(name: str, host: str, port: int) -> None:
     def on_mlat_message(msg: dict) -> None:
-        state.process_message(msg, mlat_source=name)
+        _msg_queue.put((msg, name))
 
     client = BeastClient(host, port, on_mlat_message)
     log.info("MLAT runner starting: %s (%s:%s)", name, host, port)
@@ -423,6 +441,7 @@ async def lifespan(app: FastAPI):
     }
     await asyncio.to_thread(stats_db.fix_military_countries, corrections, config.HOME_COUNTRY)
 
+    _start_msg_processor()
     asyncio.create_task(_beast_runner())
     for name, host, port in config.MLAT_SERVERS:
         asyncio.create_task(_mlat_runner(name, host, port))
