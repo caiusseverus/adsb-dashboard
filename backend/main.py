@@ -224,7 +224,7 @@ async def _db_writer() -> None:
                 )
 
         # Detect emergency squawk start/continuation/end
-        now_ts = int(now)
+        now_ts = int(time.time())
         squawking_icaos: set[str] = set()
         for ac in snapshot["aircraft"]:
             sq = ac.get("squawk") or ""
