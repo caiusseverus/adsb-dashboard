@@ -34,6 +34,19 @@ def already_notified(key: str) -> bool:
     return key in _notified
 
 
+def trigger_enabled(trigger: str, default: bool = False) -> bool:
+    """Return whether a named trigger is enabled, using cached prefs.
+    Call once per _push_updates cycle to gate entire trigger types."""
+    prefs = _get_prefs()
+    defaults: dict[str, bool] = {
+        "notify_military":    config.NOTIFY_MILITARY,
+        "notify_interesting": config.NOTIFY_INTERESTING,
+        "notify_acas":        config.NOTIFY_ACAS,
+        "notify_emergency":   config.NOTIFY_EMERGENCY,
+    }
+    return _pref_bool(prefs, trigger, defaults.get(trigger, default))
+
+
 def any_channel() -> bool:
     return bool(config.NTFY_URL or config.NOTIFY_EMAIL_TO)
 

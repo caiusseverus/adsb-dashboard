@@ -286,6 +286,10 @@ async def _push_updates() -> None:
         # avoids O(N × thread_overhead) per second even for no-op calls.
         notify_tasks = []
         _notify_enabled = notifications.any_channel()
+        # Check per-trigger prefs once per cycle (uses cached prefs, <1µs each).
+        # Avoids dispatching any threads for triggers the user has turned off.
+        _mil_on  = _notify_enabled and notifications.trigger_enabled("notify_military")
+        _int_on  = _notify_enabled and notifications.trigger_enabled("notify_interesting")
         t_loop_start = time.perf_counter()
         for ac in snapshot["aircraft"]:
             icao = ac["icao"]
@@ -299,13 +303,13 @@ async def _push_updates() -> None:
                         ac.get("operator"), ac.get("altitude"),
                         ac.get("range_nm"), _watchlist_cache[icao],
                     ))
-                if ac.get("military") and not notifications.already_notified(f"military:{icao}"):
+                if _mil_on and ac.get("military") and not notifications.already_notified(f"military:{icao}"):
                     notify_tasks.append(asyncio.to_thread(
                         notifications.notify_military,
                         icao, ac.get("callsign"), ac.get("operator"),
                         ac.get("country"), ac.get("altitude"), ac.get("range_nm"),
                     ))
-                if ac.get("interesting") and not notifications.already_notified(f"interesting:{icao}"):
+                if _int_on and ac.get("interesting") and not notifications.already_notified(f"interesting:{icao}"):
                     notify_tasks.append(asyncio.to_thread(
                         notifications.notify_interesting,
                         icao, ac.get("callsign"), ac.get("type_code"),
