@@ -43,6 +43,42 @@ _ICAO_HEX_RE = re.compile(r"^[0-9A-F]{6}$")
 _ACAS_CONFIRM_WINDOW_S = 12
 _ACAS_MIN_CONFIRM_FRAMES = 2
 
+# Altitude filtering constants
+_ALT_MIN_FT = -1_000          # below this is a bad decode (subterranean)
+_ALT_MAX_FT = 60_000          # above this is a bad decode (service ceiling)
+_ALT_MAX_RATE_FPM = 8_000     # max realistic climb/descent rate — rejects spikes
+_ALT_SOURCE_STALE_S = 15.0    # after this many seconds, lower-priority source may overwrite
+
+
+def _accept_altitude(ac: "Aircraft", alt: int, source: str, now: float) -> bool:
+    """Return True and update ac.altitude if alt passes range + rate-of-change + priority checks.
+
+    source: "ADS-B" (DF17/18, CRC-verified) or "SURV" (DF4/20, parity-masked).
+    ADS-B is preferred; SURV is only accepted when ADS-B is stale or absent.
+    """
+    # Range gate — reject physically impossible values
+    if not (_ALT_MIN_FT <= alt <= _ALT_MAX_FT):
+        return False
+
+    # Source priority: don't let SURV overwrite a recent ADS-B altitude
+    if source == "SURV" and ac._alt_source == "ADS-B":
+        age = now - ac._alt_source_ts
+        if age < _ALT_SOURCE_STALE_S:
+            return False
+
+    # Rate-of-change gate — reject spikes that exceed realistic climb/descent
+    if ac.altitude is not None and ac._alt_source_ts > 0:
+        dt_min = (now - ac._alt_source_ts) / 60.0
+        if dt_min > 0:
+            rate = abs(alt - ac.altitude) / dt_min
+            if rate > _ALT_MAX_RATE_FPM:
+                return False
+
+    ac.altitude = alt
+    ac._alt_source = source
+    ac._alt_source_ts = now
+    return True
+
 def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """True bearing from (lat1,lon1) to (lat2,lon2) in degrees (0=N, 90=E)."""
     dlon = math.radians(lon2 - lon1)
@@ -157,6 +193,9 @@ class Aircraft:
     mlat: bool = False                    # True if position is MLAT-derived (timestamp-confirmed)
     mlat_source: Optional[str] = None    # name of the MLAT server that established the position
     mlat_msg_count: int = 0              # Beast frames with the MLAT timestamp marker
+    # Altitude source tracking — for priority and rate-of-change filtering
+    _alt_source: Optional[str]  = field(default=None, repr=False)  # "ADS-B" | "SURV"
+    _alt_source_ts: float       = field(default=0.0,  repr=False)  # monotonic time of last alt update
     # ACAS/TCAS fields
     acas_ra_active:     bool           = False
     acas_ra_desc:       Optional[str]  = None
@@ -638,8 +677,10 @@ class AircraftState:
             self._cur_min_signals.append(signal)
         self._cur_min_df_counts[df] = self._cur_min_df_counts.get(df, 0) + 1
 
-        # --- Decode ADS-B (DF 17) ---
-        if df == 17 and len(raw) == 28:
+        # --- Decode ADS-B (DF 17 and DF 18) ---
+        # DF17: Extended Squitter with true 24-bit CRC — highest integrity source.
+        # DF18: TIS-B / ADS-R rebroadcast — same message structure, same altitude quality.
+        if df in (17, 18) and len(raw) == 28:
             try:
                 tc = pms.adsb.typecode(raw)
             except Exception:
@@ -668,7 +709,7 @@ class AircraftState:
                 try:
                     alt = pms.adsb.altitude(raw)
                     if alt is not None:
-                        ac.altitude = alt
+                        _accept_altitude(ac, int(alt), "ADS-B", now)
                 except Exception:
                     pass
                 try:
@@ -733,22 +774,23 @@ class AircraftState:
                     pass
 
         # --- Altitude from surveillance altitude reply (DF 4) ---
+        # Lower integrity than ADS-B: parity is XOR-masked with aircraft address.
         elif df == 4 and len(raw) == 14:
             try:
                 alt = pms.altcode(raw)
                 if alt is not None:
-                    ac.altitude = alt
+                    _accept_altitude(ac, int(alt), "SURV", now)
             except Exception:
                 pass
 
         # --- DF 20/21: Comm-B replies (28 hex chars / 112 bits) ---
         elif df in (20, 21) and len(raw) == 28:
-            # Altitude from DF20
+            # Altitude from DF20 — same parity integrity as DF4
             if df == 20:
                 try:
                     alt = pms.altcode(raw)
                     if alt is not None:
-                        ac.altitude = alt
+                        _accept_altitude(ac, int(alt), "SURV", now)
                 except Exception:
                     pass
 
@@ -808,13 +850,9 @@ class AircraftState:
                     pass
 
         # --- DF16: Long Air-Air Surveillance (ACAS RA in MV field) ---
+        # Altitude from DF16 is intentionally not used — DF16 is an ACAS air-to-air
+        # message and its parity is unreliable for altitude extraction.
         elif df == 16 and len(raw) == 28:
-            try:
-                alt = pms.altcode(raw)
-                if alt is not None:
-                    ac.altitude = alt
-            except Exception:
-                pass
             try:
                 result = acas_decoder.decode_df16_mv(raw)
                 if result and result.get("ara_active"):
