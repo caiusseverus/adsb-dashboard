@@ -42,6 +42,10 @@ from notify_settings import router as notify_settings_router
 import tracks as tracks_module
 from tracks import router as tracks_router
 
+from benchmark import make_pause_aware_decoder
+
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
@@ -77,15 +81,8 @@ _decoder_thread: threading.Thread | None = None
 
 def _start_msg_processor() -> threading.Thread:
     """Start the daemon thread that decodes Beast messages from _msg_queue.
-    Returns the thread so lifespan teardown can send the sentinel and join it."""
-    def _run() -> None:
-        while True:
-            item = _msg_queue.get()
-            if item is _DECODE_SENTINEL:
-                log.debug("beast-decoder: shutdown sentinel received")
-                return
-            msg, mlat_source = item
-            state.process_message(msg, mlat_source)
+    Uses make_pause_aware_decoder so the benchmark can pause it cleanly."""
+    _run = make_pause_aware_decoder(_msg_queue, state, _DECODE_SENTINEL)
     t = threading.Thread(target=_run, daemon=True, name="beast-decoder")
     t.start()
     return t

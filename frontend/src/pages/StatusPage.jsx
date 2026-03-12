@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import styles from './StatusPage.module.css'
+import BenchmarkPanel from './BenchmarkPanel'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 
@@ -133,6 +134,8 @@ export default function StatusPage() {
 
       {/* Aircraft debug lookup */}
       <AircraftDebug />
+
+      <BenchmarkPanel />
 
       {/* Acknowledgements */}
       <div className={styles.card}>
