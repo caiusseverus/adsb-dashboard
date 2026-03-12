@@ -8,10 +8,22 @@ const VERT_EXAG     = 8
 const FEET_PER_NM   = 6076.115
 const ALT_SCALE_FT  = 45000   // fixed colour scale ceiling — not data-driven
 
+// Maximum trail points kept per aircraft (~10 min at 1 Hz)
+const MAX_TRAIL_PTS = 600
+
 // Tag colours — same palette as AircraftTable badges
 const C_MILITARY    = new THREE.Color(0xbc8cff)
 const C_INTERESTING = new THREE.Color(0xd29922)
 const C_STANDARD    = new THREE.Color(0x3fb950)
+
+// Trail colours — match SkyView / badge conventions
+const C_TRAIL = {
+  acas:        new THREE.Color(0xf85149),
+  military:    new THREE.Color(0xbc8cff),
+  mlat:        new THREE.Color(0x388bfd),
+  interesting: new THREE.Color(0xd29922),
+  standard:    new THREE.Color(0x3fb950),
+}
 
 // Operator palette — 10 distinct colours + dim grey for "other"
 const C_OP_PALETTE   = NAMED_PALETTE.map(h => new THREE.Color(h))
@@ -22,7 +34,6 @@ const C_TG_PALETTE   = TYPE_GROUPS.map(g => new THREE.Color(g.color))
 const C_TG_OTHER     = new THREE.Color(TYPE_GROUP_OTHER_COLOR)
 
 // Altitude gradient stops: green → yellow → blue → purple
-// Scale is fixed 0–ALT_SCALE_FT so colours are consistent across datasets.
 const ALT_STOPS = [
   [0.00, new THREE.Color(0x3fb950)],
   [0.33, new THREE.Color(0xd29922)],
@@ -71,7 +82,6 @@ function buildPoints(points, colorMode) {
     } else if (colorMode === 'type_group') {
       col = (tg_idx != null && tg_idx < 8) ? C_TG_PALETTE[tg_idx] : C_TG_OTHER
     } else {
-      // tag mode: military / interesting / standard
       col = military    ? C_MILITARY
           : interesting ? C_INTERESTING
           : C_STANDARD
@@ -89,13 +99,90 @@ function buildPoints(points, colorMode) {
   return new THREE.Points(geo, new THREE.PointsMaterial({
     size:            1.5,
     vertexColors:    true,
-    sizeAttenuation: false,   // fixed screen-space size — stays sharp when zooming in
+    sizeAttenuation: false,
     transparent:     true,
     opacity:         0.8,
   }))
 }
 
-// Ground-plane range ring
+// Build merged LineSegments for all live aircraft trails
+function buildTrails(trails) {
+  let totalSegs = 0
+  for (const pts of Object.values(trails)) {
+    if (pts.length >= 2) totalSegs += pts.length - 1
+  }
+  if (totalSegs === 0) return null
+
+  const positions = new Float32Array(totalSegs * 6)   // 2 verts × 3 coords
+  const colors    = new Float32Array(totalSegs * 6)   // 2 verts × 3 colours
+
+  let idx = 0
+  for (const pts of Object.values(trails)) {
+    if (pts.length < 2) continue
+    const last = pts[pts.length - 1]
+    const col = last.acas        ? C_TRAIL.acas
+              : last.military    ? C_TRAIL.military
+              : last.mlat        ? C_TRAIL.mlat
+              : last.interesting ? C_TRAIL.interesting
+              : C_TRAIL.standard
+
+    for (let i = 0; i < pts.length - 1; i++) {
+      const [x0, y0, z0] = toWorld(pts[i].bearing,     pts[i].range,     pts[i].alt ?? 0)
+      const [x1, y1, z1] = toWorld(pts[i + 1].bearing, pts[i + 1].range, pts[i + 1].alt ?? 0)
+      positions[idx * 6]     = x0; positions[idx * 6 + 1] = y0; positions[idx * 6 + 2] = z0
+      positions[idx * 6 + 3] = x1; positions[idx * 6 + 4] = y1; positions[idx * 6 + 5] = z1
+      colors[idx * 6]     = col.r; colors[idx * 6 + 1] = col.g; colors[idx * 6 + 2] = col.b
+      colors[idx * 6 + 3] = col.r; colors[idx * 6 + 4] = col.g; colors[idx * 6 + 5] = col.b
+      idx++
+    }
+  }
+
+  const geo = new THREE.BufferGeometry()
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geo.setAttribute('color',    new THREE.BufferAttribute(colors,    3))
+  return new THREE.LineSegments(geo, new THREE.LineBasicMaterial({
+    vertexColors: true,
+    transparent:  true,
+    opacity:      0.75,
+  }))
+}
+
+// Build a Points object with one bright dot at each aircraft's current position
+function buildLiveDots(trails) {
+  const entries = Object.values(trails).filter(pts => pts.length > 0)
+  if (entries.length === 0) return null
+
+  const n = entries.length
+  const positions = new Float32Array(n * 3)
+  const colors    = new Float32Array(n * 3)
+
+  entries.forEach((pts, i) => {
+    const last = pts[pts.length - 1]
+    const [x, y, z] = toWorld(last.bearing, last.range, last.alt ?? 0)
+    positions[i * 3]     = x
+    positions[i * 3 + 1] = y
+    positions[i * 3 + 2] = z
+    const col = last.acas        ? C_TRAIL.acas
+              : last.military    ? C_TRAIL.military
+              : last.mlat        ? C_TRAIL.mlat
+              : last.interesting ? C_TRAIL.interesting
+              : C_TRAIL.standard
+    colors[i * 3]     = col.r
+    colors[i * 3 + 1] = col.g
+    colors[i * 3 + 2] = col.b
+  })
+
+  const geo = new THREE.BufferGeometry()
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geo.setAttribute('color',    new THREE.BufferAttribute(colors,    3))
+  return new THREE.Points(geo, new THREE.PointsMaterial({
+    size:            5,
+    vertexColors:    true,
+    sizeAttenuation: false,
+  }))
+}
+
+// Ground-plane range ring — brighter than before
 function makeRing(radius) {
   const pts = []
   for (let i = 0; i <= 128; i++) {
@@ -104,7 +191,7 @@ function makeRing(radius) {
   }
   return new THREE.Line(
     new THREE.BufferGeometry().setFromPoints(pts),
-    new THREE.LineBasicMaterial({ color: 0x21262d }),
+    new THREE.LineBasicMaterial({ color: 0x30363d }),
   )
 }
 
@@ -116,46 +203,50 @@ function makeSpoke(bearing_deg, length) {
       new THREE.Vector3(0, 0, 0),
       new THREE.Vector3(Math.sin(rad) * length, 0, Math.cos(rad) * length),
     ]),
-    new THREE.LineBasicMaterial({ color: 0x21262d }),
+    new THREE.LineBasicMaterial({ color: 0x30363d }),
   )
 }
 
 // Canvas-texture sprite for compass labels
 function makeLabel(text, x, z) {
   const c = document.createElement('canvas')
-  c.width = 64; c.height = 32
+  c.width = 128; c.height = 64
   const ctx = c.getContext('2d')
-  ctx.font = 'bold 18px monospace'
-  ctx.fillStyle = '#484f58'
+  ctx.font = 'bold 48px sans-serif'
+  ctx.fillStyle = '#c9d1d9'
   ctx.textAlign = 'center'
   ctx.textBaseline = 'middle'
-  ctx.fillText(text, 32, 16)
+  ctx.fillText(text, 64, 32)
   const sprite = new THREE.Sprite(
     new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), transparent: true }),
   )
   sprite.position.set(x, 1, z)
-  sprite.scale.set(14, 7, 1)
+  sprite.scale.set(30, 15, 1)
   return sprite
 }
 
+const DAY_OPTIONS      = [{ label: '24h', value: 1 }, { label: '7d', value: 7 }, { label: '30d', value: 30 }, { label: '90d', value: 90 }]
 const MAX_POINT_OPTIONS = [50000, 100000, 200000, 500000]
 const DEFAULT_MAX_POINTS = 100000
 
-export default function CoveragePage() {
-  const mountRef  = useRef(null)
-  const sceneRef  = useRef(null)   // { scene, camera, renderer, controls, pointsObj }
-  const dataRef   = useRef([])     // raw fetched points (unfiltered)
+export default function CoveragePage({ aircraft = [] }) {
+  const mountRef    = useRef(null)
+  const sceneRef    = useRef(null)   // { scene, camera, renderer, controls, pointsObj, trailsObj, liveDotsObj }
+  const dataRef     = useRef([])     // raw fetched points (unfiltered)
+  const pendingRef  = useRef(null)   // points waiting to render after 'rendering' phase
+  const trailsRef   = useRef({})     // live trail buffer: { icao: [{bearing,range,alt,...}] }
+  const compassRef  = useRef(null)   // ref to inner compass ring div (rotated via JS, not React state)
 
-  const [days,       setDays]       = useState(30)
-  const [maxPoints,  setMaxPoints]  = useState(DEFAULT_MAX_POINTS)
-  const [colorMode,  setColorMode]  = useState('type_group')
-  const [typeFilter, setTypeFilter] = useState('all')  // 'all' | 'military' | 'interesting'
-  const [loading,    setLoading]    = useState(true)
-  const [error,      setError]      = useState(null)
-  const [fetchedN,   setFetchedN]   = useState(0)
-  const [shownN,     setShownN]     = useState(0)
-  const [operators,  setOperators]  = useState([])   // top-10 operator names for legend
-  const [typeGroups, setTypeGroups] = useState([])   // type group labels from API
+  const [days,         setDays]         = useState(30)
+  const [maxPoints,    setMaxPoints]    = useState(DEFAULT_MAX_POINTS)
+  const [colorMode,    setColorMode]    = useState('type_group')
+  const [typeFilter,   setTypeFilter]   = useState('all')
+  const [loadingPhase, setLoadingPhase] = useState(null)  // null | 'fetching' | 'rendering'
+  const [error,        setError]        = useState(null)
+  const [fetchedN,     setFetchedN]     = useState(0)
+  const [shownN,       setShownN]       = useState(0)
+  const [operators,    setOperators]    = useState([])
+  const [typeGroups,   setTypeGroups]   = useState([])
 
   // ── Initialise Three.js (once) ──────────────────────────────────────
   useEffect(() => {
@@ -197,8 +288,18 @@ export default function CoveragePage() {
         new THREE.Vector3(0, 0, 0),
         new THREE.Vector3(0, altTopY + 5, 0),
       ]),
-      new THREE.LineBasicMaterial({ color: 0x30363d }),
+      new THREE.LineBasicMaterial({ color: 0x484f58 }),
     ))
+
+    // Update the 2D compass rose to match the camera's horizontal azimuth.
+    // Direct DOM manipulation (not React state) to avoid a re-render every frame.
+    const updateCompass = () => {
+      if (!compassRef.current) return
+      const angle = Math.atan2(camera.position.x, camera.position.z) * (180 / Math.PI)
+      compassRef.current.style.transform = `rotate(${angle}deg)`
+    }
+    controls.addEventListener('change', updateCompass)
+    updateCompass()  // set correct initial rotation
 
     let rafId
     const animate = () => { rafId = requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera) }
@@ -212,11 +313,12 @@ export default function CoveragePage() {
     }
     window.addEventListener('resize', onResize)
 
-    sceneRef.current = { scene, camera, renderer, controls, pointsObj: null }
+    sceneRef.current = { scene, camera, renderer, controls, pointsObj: null, trailsObj: null, liveDotsObj: null }
 
     return () => {
       cancelAnimationFrame(rafId)
       window.removeEventListener('resize', onResize)
+      controls.removeEventListener('change', updateCompass)
       renderer.dispose()
       if (container.contains(renderer.domElement)) container.removeChild(renderer.domElement)
       sceneRef.current = null
@@ -228,7 +330,6 @@ export default function CoveragePage() {
     const ref = sceneRef.current
     if (!ref) return
 
-    // Apply type filter
     const filtered = filter === 'military'    ? points.filter(p => p[3])
                    : filter === 'interesting' ? points.filter(p => p[4])
                    : points
@@ -249,30 +350,102 @@ export default function CoveragePage() {
   // ── Fetch when days or maxPoints changes ────────────────────────────
   useEffect(() => {
     let cancelled = false
-    setLoading(true)
+    setLoadingPhase('fetching')
     setError(null)
 
     fetch(`/api/coverage/points?days=${days}&max_points=${maxPoints}`)
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() })
       .then(({ points, operators: ops, type_groups: tgs }) => {
         if (cancelled) return
-        dataRef.current = points
+        pendingRef.current = { points, ops, tgs }
+        setFetchedN(points.length)
         setOperators(ops ?? [])
         setTypeGroups(tgs ?? TYPE_GROUPS.map(g => g.label))
-        setFetchedN(points.length)
-        setLoading(false)
-        redraw(points, colorMode, typeFilter)
+        // Transition to 'rendering' so React can paint the "Building scene…" message
+        // before the synchronous buffer-build blocks the main thread.
+        setLoadingPhase('rendering')
       })
-      .catch(e => { if (!cancelled) { setLoading(false); setError(e.message) } })
+      .catch(e => { if (!cancelled) { setLoadingPhase(null); setError(e.message) } })
 
     return () => { cancelled = true }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [days, maxPoints])
 
+  // ── After 'rendering' phase is painted, do the expensive buffer build ──
+  useEffect(() => {
+    if (loadingPhase !== 'rendering') return
+    const pending = pendingRef.current
+    if (!pending) return
+
+    const id = setTimeout(() => {
+      dataRef.current = pending.points
+      redraw(pending.points, colorMode, typeFilter)
+      setLoadingPhase(null)
+    }, 30)   // 30 ms gives React time to paint the "Building scene…" message
+
+    return () => clearTimeout(id)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadingPhase])
+
   // ── Re-colour / re-filter from stored data (no fetch) ───────────────
   useEffect(() => {
     if (dataRef.current.length) redraw(dataRef.current, colorMode, typeFilter)
   }, [colorMode, typeFilter, redraw])
+
+  // ── Accumulate live aircraft trails ─────────────────────────────────
+  useEffect(() => {
+    const ref = sceneRef.current
+    if (!ref || !aircraft.length) return
+
+    const trails = trailsRef.current
+
+    // Remove departed aircraft
+    const activeSet = new Set(aircraft.map(ac => ac.icao))
+    for (const icao of Object.keys(trails)) {
+      if (!activeSet.has(icao)) delete trails[icao]
+    }
+
+    // Append new positions
+    for (const ac of aircraft) {
+      if (ac.bearing_deg == null || ac.range_nm == null || ac.altitude == null) continue
+      if (!trails[ac.icao]) trails[ac.icao] = []
+      const trail = trails[ac.icao]
+      const last  = trail[trail.length - 1]
+      // Skip if position hasn't moved meaningfully (avoids duplicate points for stationary aircraft)
+      if (last &&
+          Math.abs(last.bearing - ac.bearing_deg) < 0.05 &&
+          Math.abs(last.range   - ac.range_nm)    < 0.05) continue
+      trail.push({
+        bearing:     ac.bearing_deg,
+        range:       ac.range_nm,
+        alt:         ac.altitude,
+        military:    ac.military,
+        mlat:        ac.mlat,
+        interesting: ac.interesting,
+        acas:        ac.acas_ra_active,
+      })
+      if (trail.length > MAX_TRAIL_PTS) trail.splice(0, trail.length - MAX_TRAIL_PTS)
+    }
+
+    // Rebuild trail lines and current-position dots
+    const { scene } = ref
+    if (ref.trailsObj) {
+      scene.remove(ref.trailsObj)
+      ref.trailsObj.geometry.dispose()
+      ref.trailsObj.material.dispose()
+      ref.trailsObj = null
+    }
+    if (ref.liveDotsObj) {
+      scene.remove(ref.liveDotsObj)
+      ref.liveDotsObj.geometry.dispose()
+      ref.liveDotsObj.material.dispose()
+      ref.liveDotsObj = null
+    }
+    const mesh = buildTrails(trails)
+    if (mesh) { scene.add(mesh); ref.trailsObj = mesh }
+    const dots = buildLiveDots(trails)
+    if (dots) { scene.add(dots); ref.liveDotsObj = dots }
+  }, [aircraft])
 
   const resetCamera = useCallback(() => {
     const ref = sceneRef.current
@@ -286,6 +459,10 @@ export default function CoveragePage() {
   const isOpMode  = colorMode === 'operator'
   const isTgMode  = colorMode === 'type_group'
 
+  const loadingMsg = loadingPhase === 'fetching'   ? 'Fetching points from database…'
+                   : loadingPhase === 'rendering'  ? 'Building 3D scene…'
+                   : null
+
   return (
     <div className={styles.page}>
       <div className={styles.toolbar}>
@@ -293,8 +470,8 @@ export default function CoveragePage() {
 
         {/* Days */}
         <div className={styles.controls}>
-          {[7, 30, 90].map(d => (
-            <button key={d} className={days === d ? styles.btnActive : styles.btn} onClick={() => setDays(d)}>{d}d</button>
+          {DAY_OPTIONS.map(({ label, value }) => (
+            <button key={value} className={days === value ? styles.btnActive : styles.btn} onClick={() => setDays(value)}>{label}</button>
           ))}
         </div>
 
@@ -333,7 +510,7 @@ export default function CoveragePage() {
         <button className={styles.resetBtn} onClick={resetCamera}>Reset view</button>
       </div>
 
-      {!loading && !error && (
+      {!loadingPhase && !error && (
         <div className={styles.meta}>
           {shownN.toLocaleString()} points shown
           {shownN !== fetchedN && ` (${fetchedN.toLocaleString()} fetched)`}
@@ -342,17 +519,34 @@ export default function CoveragePage() {
       )}
 
       <div className={styles.canvasWrap} ref={mountRef}>
-        {(loading || error) && (
+        {(loadingMsg || error) && (
           <div className={styles.overlay}>
-            {error ? `Error: ${error}` : 'Loading…'}
+            {error ? `Error: ${error}` : (
+              <div className={styles.loadingBox}>
+                <div className={styles.spinner} />
+                <span>{loadingMsg}</span>
+              </div>
+            )}
           </div>
         )}
+
+        {/* 2D compass rose — top-right. The inner ring rotates with camera azimuth
+            via compassRef (direct DOM, not React state). N stays aligned with scene North. */}
+        <div className={styles.compass} aria-hidden="true">
+          <div className={styles.compassInner} ref={compassRef}>
+            <span className={styles.compassN}>N</span>
+            <span className={styles.compassE}>E</span>
+            <span className={styles.compassS}>S</span>
+            <span className={styles.compassW}>W</span>
+            <div className={styles.compassNeedle} />
+          </div>
+        </div>
       </div>
 
       <div className={styles.legend}>
         {isTgMode ? (
           <>
-            {TYPE_GROUPS.map((g, i) => (
+            {TYPE_GROUPS.map((g) => (
               <span key={g.value} className={styles.legendItem}>
                 <span className={styles.dot} style={{ background: g.color }} />{g.label}
               </span>
@@ -384,8 +578,8 @@ export default function CoveragePage() {
             <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#bc8cff' }} />{`>${Math.round(ALT_SCALE_FT * 0.67 / 1000)}k ft`}</span>
           </>
         )}
-        <span className={styles.legendItem} style={{ marginLeft: 'auto', color: '#30363d' }}>
-          N = top of scene · rings = 50 nm · vertical ×{VERT_EXAG}
+        <span className={styles.legendItem} style={{ marginLeft: 'auto', color: '#484f58' }}>
+          rings = 50 nm · vertical ×{VERT_EXAG} · trails = live aircraft
         </span>
       </div>
     </div>
