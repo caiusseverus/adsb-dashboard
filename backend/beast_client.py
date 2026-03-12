@@ -101,6 +101,11 @@ class BeastClient:
 
             # Success
             del buf[:end]
+            # Mode-AC frames (0x31) carry no ICAO address and are discarded by
+            # process_message anyway — skip dispatch to avoid the dict allocation
+            # and queue overhead (~10-20% of frames at a typical receiver).
+            if msg_type == 0x31:
+                continue
             self._dispatch(msg_type, data)
 
     def _unescape(self, buf: bytearray, start: int, needed: int) -> Tuple[Union[bytes, bool, None], Optional[int]]:

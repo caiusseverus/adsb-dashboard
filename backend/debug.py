@@ -1,11 +1,14 @@
 """
-Debug API router — aircraft data source comparison and field override.
+Debug API router — aircraft data source comparison, field override, and benchmark.
 
+GET  /api/debug/perf                     — live runtime timing stats
+GET  /api/debug/benchmark                — run (or return cached) pipeline benchmark
 GET  /api/debug/aircraft/{icao}          — query all enrichment sources
 POST /api/debug/aircraft/{icao}/override — override a field in aircraft_registry
 """
 
 import asyncio
+import logging
 import statistics
 
 from fastapi import APIRouter, HTTPException
@@ -14,7 +17,10 @@ from pydantic import BaseModel
 from db import stats_db
 import enrichment as enrichment_module
 import aircraft_state as _state_module
+import benchmark as _benchmark_module
+from benchmark import DecoderPaused
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/debug")
 
 OVERRIDEABLE_FIELDS = {
@@ -23,11 +29,15 @@ OVERRIDEABLE_FIELDS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Perf stats (live runtime)
+# ---------------------------------------------------------------------------
+
 @router.get("/perf")
 async def get_perf() -> dict:
     """Return performance timing statistics for message decode and push-updates."""
     from main import _msg_queue
-    msg_t = sorted(_state_module.msg_timings)  # copy of deque as sorted list
+    msg_t  = sorted(_state_module.msg_timings)
     push_t = list(_state_module.push_timings)
 
     def percentiles(data: list[float], scale: float = 1_000_000) -> dict:
@@ -49,68 +59,147 @@ async def get_perf() -> dict:
         return round(sum(p[key] for p in push_t) / len(push_t), 2)
 
     return {
-        # Per-message decode time in microseconds
-        "msg_decode_us": percentiles(msg_t, scale=1_000_000),
+        "msg_decode_us":  percentiles(msg_t, scale=1_000_000),
         "msg_queue_depth": _msg_queue.qsize(),
-        # Per-_push_updates invocation in milliseconds
         "push_updates_ms": {
-            "samples":        len(push_t),
-            "sync_avg":       push_avg("sync_ms"),       # sync loop: notify pre-check + track recording
-            "gather_avg":     push_avg("gather_ms"),     # await asyncio.gather(notify_tasks)
-            "notify_tasks_avg": push_avg("notify_tasks"),# threads dispatched per cycle
-            "broadcast_avg":  push_avg("broadcast_ms"),  # websocket send
-            "total_avg":      push_avg("total_ms"),
-            "ac_count_avg":   push_avg("ac_count"),
+            "samples":          len(push_t),
+            "sync_avg":         push_avg("sync_ms"),
+            "gather_avg":       push_avg("gather_ms"),
+            "notify_tasks_avg": push_avg("notify_tasks"),
+            "broadcast_avg":    push_avg("broadcast_ms"),
+            "total_avg":        push_avg("total_ms"),
+            "ac_count_avg":     push_avg("ac_count"),
         },
     }
 
+
+# ---------------------------------------------------------------------------
+# Benchmark endpoint
+# ---------------------------------------------------------------------------
+
+_bench_running = False   # guard against concurrent runs
+
+
+def _run_with_pause(n_msgs: int) -> dict:
+    """
+    Blocking function executed in a thread (via asyncio.to_thread).
+
+    Pauses the live decoder for the full duration of the benchmark so that
+    GIL contention from real message decoding cannot inflate timings.
+    """
+    with DecoderPaused(drain_timeout=2.0):
+        return _benchmark_module.run_benchmark(n_msgs=n_msgs, paused=True)
+
+
+@router.get("/benchmark")
+async def run_benchmark(fresh: bool = False, n: int = 5000) -> dict:
+    """
+    Run the pipeline micro-benchmark and return results.
+
+    The live Beast decoder is paused for the duration of the run so that
+    GIL contention does not inflate the timings.  The Beast TCP connection
+    remains open; buffered frames are processed once the decoder resumes.
+
+    Query params
+    ------------
+    fresh : bool  — force a new run even if a cached result exists
+    n     : int   — iterations per stage (default 5000; clamped 100–20000)
+    """
+    global _bench_running
+
+    if not fresh:
+        cached = _benchmark_module.get_last_result()
+        if cached:
+            return cached
+
+    if _bench_running:
+        raise HTTPException(
+            status_code=409,
+            detail="Benchmark already running — try again in a few seconds",
+        )
+
+    n = max(100, min(n, 20_000))
+
+    _bench_running = True
+    try:
+        log.info("benchmark: starting (%d iterations, decoder will be paused)", n)
+        result = await asyncio.to_thread(_run_with_pause, n)
+        log.info("benchmark: complete in %.1fs — %s", result["total_bench_time_s"], result["verdict"])
+    finally:
+        _bench_running = False
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Benchmark status (polled by UI to show running state)
+# ---------------------------------------------------------------------------
+
+@router.get("/benchmark/status")
+async def benchmark_status() -> dict:
+    """Returns whether a benchmark run is currently in progress."""
+    cached = _benchmark_module.get_last_result()
+    return {
+        "running":    _bench_running,
+        "has_result": bool(cached),
+        "timestamp":  cached.get("timestamp") if cached else None,
+        "verdict":    cached.get("verdict")   if cached else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Aircraft debug / override
+# ---------------------------------------------------------------------------
 
 @router.get("/aircraft/{icao}")
 async def debug_aircraft(icao: str) -> dict:
-    """Return data from every enrichment source for a given ICAO address."""
-    icao_upper = icao.upper().strip()
-    if len(icao_upper) != 6 or not all(c in "0123456789ABCDEF" for c in icao_upper):
-        raise HTTPException(400, "ICAO must be a 6-character hex address")
-
-    db = enrichment_module.db
-
-    # Run blocking I/O in threads
-    hexdb_data, tar1090_data, registry = await asyncio.gather(
-        asyncio.to_thread(db.force_lookup_hexdb, icao_upper),
-        asyncio.to_thread(db.get_tar1090, icao_upper),
-        asyncio.to_thread(stats_db.get_aircraft_registry_entry, icao_upper),
-    )
-
-    adsbx = db.get_adsbx(icao_upper)
-    country_from_icao = db.get_country_by_icao(icao_upper)
-
+    icao = icao.upper()
+    adsbx    = enrichment_module.db.get_adsbx(icao)
+    hexdb    = enrichment_module.db.get_hexdb_cached(icao)
+    tar1090  = enrichment_module.db.get_tar1090_cached(icao)
+    country  = enrichment_module.db.get_country_by_icao(icao)
+    military = enrichment_module.db.is_military(icao)
+    registry = await asyncio.to_thread(stats_db.get_aircraft, icao)
     return {
-        "icao": icao_upper,
-        "icao_block": {
-            "country": country_from_icao,
-        },
-        "adsbexchange": adsbx or {},
-        "hexdb": hexdb_data or {},
-        "tar1090": tar1090_data or {},
-        "registry": registry or {},
+        "icao":        icao,
+        "icao_block":  {"country": country, "military": military},
+        "adsbexchange": adsbx,
+        "hexdb":       hexdb,
+        "tar1090":     tar1090,
+        "registry":    dict(registry) if registry else None,
     }
 
 
-class OverrideBody(BaseModel):
+class OverrideRequest(BaseModel):
     field: str
-    value: str | int | None
+    value: str | bool | None
 
 
 @router.post("/aircraft/{icao}/override")
-async def override_aircraft_field(icao: str, body: OverrideBody) -> dict:
-    """Write a manual override for one field into aircraft_registry."""
-    icao_upper = icao.upper().strip()
-    if body.field not in OVERRIDEABLE_FIELDS:
-        raise HTTPException(400, f"Field '{body.field}' cannot be overridden. "
-                            f"Allowed: {sorted(OVERRIDEABLE_FIELDS)}")
-    # Coerce military to int (0/1)
-    value = body.value
-    if body.field == "military":
-        value = 1 if value else 0
-    await asyncio.to_thread(stats_db.update_aircraft_field, icao_upper, body.field, value)
-    return {"ok": True, "icao": icao_upper, "field": body.field, "value": value}
+async def override_aircraft_field(icao: str, req: OverrideRequest) -> dict:
+    icao = icao.upper()
+    if req.field not in OVERRIDEABLE_FIELDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Field '{req.field}' is not overrideable. Allowed: {sorted(OVERRIDEABLE_FIELDS)}",
+        )
+    row = await asyncio.to_thread(stats_db.get_aircraft, icao)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Aircraft {icao} not in registry")
+
+    await asyncio.to_thread(
+        stats_db.force_update_aircraft_enrichment,
+        icao,
+        req.value if req.field == "registration" else None,
+        req.value if req.field == "type_code"     else None,
+        None,
+        req.value if req.field == "operator"      else None,
+        req.value if req.field == "manufacturer"  else None,
+        req.value if req.field == "year"          else None,
+        req.value if req.field == "country"       else None,
+    )
+
+    if req.field == "military" and req.value is not None:
+        await asyncio.to_thread(stats_db.set_military_flag, icao, bool(req.value))
+
+    return {"status": "ok", "icao": icao, "field": req.field, "value": req.value}

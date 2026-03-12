@@ -42,6 +42,10 @@ from notify_settings import router as notify_settings_router
 import tracks as tracks_module
 from tracks import router as tracks_router
 
+from benchmark import make_pause_aware_decoder
+
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
@@ -77,15 +81,8 @@ _decoder_thread: threading.Thread | None = None
 
 def _start_msg_processor() -> threading.Thread:
     """Start the daemon thread that decodes Beast messages from _msg_queue.
-    Returns the thread so lifespan teardown can send the sentinel and join it."""
-    def _run() -> None:
-        while True:
-            item = _msg_queue.get()
-            if item is _DECODE_SENTINEL:
-                log.debug("beast-decoder: shutdown sentinel received")
-                return
-            msg, mlat_source = item
-            state.process_message(msg, mlat_source)
+    Uses make_pause_aware_decoder so the benchmark can pause it cleanly."""
+    _run = make_pause_aware_decoder(_msg_queue, state, _DECODE_SENTINEL)
     t = threading.Thread(target=_run, daemon=True, name="beast-decoder")
     t.start()
     return t
@@ -145,6 +142,25 @@ async def _backup_runner() -> None:
                 await asyncio.to_thread(stats_db.backup, backup_path)
         except Exception:
             log.exception("Nightly backup failed")
+
+
+async def _adsbx_task() -> None:
+    """Drain the ADSBx enrichment queue for newly-seen aircraft.
+
+    Runs every 0.5s, up to 20 ICAOs per cycle. All SQLite lookups for the batch
+    run in a single asyncio.to_thread call — one thread per cycle instead of N —
+    to minimise GIL contention with the decoder thread.
+    """
+    await asyncio.sleep(2)  # brief startup delay — let the decoder warm up first
+    while True:
+        batch = state.pop_adsbx_queue(max_n=20)
+        if batch:
+            def _lookup_batch(icaos: set) -> dict:
+                return {icao: enrichment.db.get_adsbx(icao) for icao in icaos}
+            results = await asyncio.to_thread(_lookup_batch, batch)
+            for icao, adsbx in results.items():
+                state.apply_adsbx(icao, adsbx)
+        await asyncio.sleep(0.5)
 
 
 async def _hexdb_task() -> None:
@@ -483,6 +499,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_db_writer())
     asyncio.create_task(_db_update_checker())
     asyncio.create_task(_hexdb_cache_flusher())
+    asyncio.create_task(_adsbx_task())
     asyncio.create_task(_hexdb_task())
     asyncio.create_task(_backup_runner())  # runs nightly; path resolved from DB/env at runtime
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",

@@ -235,6 +235,7 @@ class AircraftState:
         self._cur_min_mlat_count: int = 0
         self._min_mlat_counts: deque[tuple[int, int]] = deque(maxlen=60)  # (minute, count)
 
+        self._adsbx_queue: set[str] = set()  # ICAOs awaiting ADSBx enrichment (off decode thread)
         self._hexdb_queue: set[str] = set()  # ICAOs awaiting hexdb.io operator lookup
 
         # ACAS event queue: drained by main._db_writer() every minute
@@ -389,6 +390,71 @@ class AircraftState:
                 "acas_sensitivity":   ac.acas_sensitivity,
             }
 
+    def pop_adsbx_queue(self, max_n: int = 20) -> set[str]:
+        """Return up to max_n ICAOs awaiting ADSBx enrichment; removes them from the queue."""
+        with self._lock:
+            batch = set(list(self._adsbx_queue)[:max_n])
+            self._adsbx_queue -= batch
+            return batch
+
+    def apply_adsbx(self, icao: str, adsbx: dict | None) -> None:
+        """Apply ADSBx enrichment to a newly-seen aircraft (called from background task).
+
+        Only uses in-memory lookups (get_type_info = dict, country_from_registration =
+        in-memory), so it is safe to call from the asyncio event loop thread.
+        """
+        with self._lock:
+            ac = self._aircraft.get(icao)
+            if ac is None:
+                return  # aircraft expired while queued
+
+            if adsbx:
+                if not ac.registration:
+                    ac.registration = (adsbx.get("reg") or "").strip() or None
+                if not ac.type_code:
+                    ac.type_code = (adsbx.get("icaotype") or "").strip() or None
+                if ac.type_code and not ac.type_full_name:
+                    ti = enrichment.db.get_type_info(ac.type_code)
+                    if ti:
+                        ac.type_full_name = ti.get("name") or None
+                        ac.type_category  = ti.get("desc") or None
+                        ac.wtc            = ti.get("wtc")  or None
+                if not ac.type_desc:
+                    mfr   = (adsbx.get("manufacturer") or "").strip()
+                    model = (adsbx.get("model") or "").strip()
+                    ac.type_desc = (f"{mfr} {model}".strip()) or None
+                if not ac.manufacturer:
+                    mfr = (adsbx.get("manufacturer") or "").strip()
+                    ac.manufacturer = mfr or None
+                if not ac.year:
+                    ac.year = (adsbx.get("year") or "").strip() or None
+                if not ac.operator and adsbx.get("ownop"):
+                    ac.operator = adsbx["ownop"]
+
+                # ADSBx is authoritative for the military flag
+                ac.military = bool(adsbx.get("mil"))
+                if ac.military:
+                    self._today_mil_icaos.add(icao)
+                    if not ac.year and ac.registration:
+                        ac.year = enrichment.extract_us_mil_serial_year(ac.registration)
+
+                # Registration-prefix country overrides ICAO block for civil aircraft
+                if ac.registration and not ac.military:
+                    reg_country = country_from_registration(ac.registration)
+                    if reg_country:
+                        ac.country = reg_country
+
+            # Queue hexdb HTTP lookup if any key field is still missing
+            if not ac.operator or not ac.registration or not ac.type_code:
+                self._hexdb_queue.add(icao)
+
+            if config.DEBUG_ENRICHMENT == 1:
+                op_source = (
+                    "adsbx" if adsbx and adsbx.get("ownop") and ac.operator == adsbx.get("ownop")
+                    else "queued"
+                )
+                _log_enrichment(icao, ac, adsbx, op_source)
+
     def apply_hexdb(self, icao: str, data: dict) -> None:
         """Apply a hexdb.io response to a live aircraft (fills any still-missing fields)."""
         with self._lock:
@@ -487,6 +553,7 @@ class AircraftState:
             "mlat_aircraft_count": mlat_aircraft_count,
             "unique_today": len(self._today_icaos),
             "unique_today_military": len(self._today_mil_icaos),
+            "adsbx_queue_size": len(self._adsbx_queue),
             "hexdb_queue_size": len(self._hexdb_queue),
             "aircraft": sorted(aircraft_list, key=lambda x: x["msg_count"], reverse=True),
             "rate_history": [
@@ -579,63 +646,16 @@ class AircraftState:
         if icao not in self._aircraft:
             ac = Aircraft(icao=icao, sighting_count=self._sighting_counts.get(icao, 1))
 
-            # Primary enrichment: ADSBExchange
-            adsbx = enrichment.db.get_adsbx(icao)
-            if adsbx:
-                ac.registration = adsbx.get("reg") or None
-                ac.type_code    = adsbx.get("icaotype") or None
-                ac.year         = adsbx.get("year") or None
-                mfr   = adsbx.get("manufacturer") or ""
-                model = adsbx.get("model") or ""
-                ac.manufacturer = mfr or None
-                ac.type_desc = (f"{mfr} {model}".strip()) or None
-                if adsbx.get("ownop"):
-                    ac.operator = adsbx["ownop"]
-
-            # Type details: WTC + full name from tar1090-db type files
-            if ac.type_code:
-                ti = enrichment.db.get_type_info(ac.type_code)
-                if ti:
-                    ac.type_full_name = ti.get("name") or None
-                    ac.type_category  = ti.get("desc") or None
-                    ac.wtc            = ti.get("wtc")  or None
-
-            ac.military = enrichment.db.is_military(icao)
-            ac.country  = enrichment.db.get_country_by_icao(icao)
-
-            # For US military aircraft, derive year from the FY serial (e.g. '06-6160' → '2006')
-            if ac.military and not ac.year and ac.registration:
-                ac.year = enrichment.extract_us_mil_serial_year(ac.registration)
-
-            # Apply any previously cached hexdb data immediately (no HTTP, no wait)
+            # Fast in-memory lookups only — no SQLite I/O on the decode thread.
+            # get_country_by_icao: binary search; get_hexdb_cached: LRU lookup.
+            ac.country = enrichment.db.get_country_by_icao(icao)
             hexdb_cached = enrichment.db.get_hexdb_cached(icao)
             if hexdb_cached:
                 _apply_hexdb_data(ac, hexdb_cached)
 
-            # Determine operator source for debug logging
-            if adsbx and adsbx.get("ownop") and ac.operator == adsbx["ownop"]:
-                op_source = "adsbx"
-            elif hexdb_cached and ac.operator:
-                op_source = "hexdb-cache"
-            elif ac.operator:
-                op_source = "unknown"
-            else:
-                op_source = "queued"
-
-            # Registration prefix overrides ICAO-block country (more accurate for GA).
-            # Skip for military aircraft — their serials don't follow civil prefix
-            # conventions (e.g. RAF ZK341 starts with 'ZK' but is NOT New Zealand).
-            if ac.registration and not ac.military:
-                reg_country = country_from_registration(ac.registration)
-                if reg_country:
-                    ac.country = reg_country
-
-            # Queue hexdb HTTP lookup if any key field is still missing
-            if not ac.operator or not ac.registration or not ac.type_code:
-                self._hexdb_queue.add(icao)
-
-            if config.DEBUG_ENRICHMENT == 1:
-                _log_enrichment(icao, ac, adsbx, op_source)
+            # ADSBx enrichment (SQLite) is deferred to _adsbx_task so the decode
+            # thread is never blocked on I/O.
+            self._adsbx_queue.add(icao)
 
             self._aircraft[icao] = ac
 
