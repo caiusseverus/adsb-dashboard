@@ -497,7 +497,7 @@ class AircraftState:
                 for m, mn, mx, me, t, c, mil, sa, sn, sx, wp, ml in rate_history[-60:]
             ],
             "df_history": [
-                {"minute": m, "counts": counts}
+                {"minute": m, "counts": {str(k): v for k, v in counts.items()}}
                 for m, counts in df_history[-60:]
             ],
             "mlat_history": [
