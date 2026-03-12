@@ -42,6 +42,7 @@ _MLAT_TS_MARKER: int = int.from_bytes(b'\xff\x00MLAT', 'big')  # 0xFF004D4C4154
 _ICAO_HEX_RE = re.compile(r"^[0-9A-F]{6}$")
 _ACAS_CONFIRM_WINDOW_S = 12
 _ACAS_MIN_CONFIRM_FRAMES = 2
+_HEXDB_QUEUE_MAX = 600  # hard ceiling: startup batch + live overflow
 
 # Altitude filtering constants
 _ALT_MIN_FT = -1_000          # below this is a bad decode (subterranean)
@@ -318,7 +319,10 @@ class AircraftState:
     def seed_hexdb_queue(self, icaos: list[str]) -> None:
         """Add a batch of ICAOs to the hexdb re-enrichment queue."""
         with self._lock:
-            self._hexdb_queue.update(icaos)
+            for icao in icaos:
+                if len(self._hexdb_queue) >= _HEXDB_QUEUE_MAX:
+                    break
+                self._hexdb_queue.add(icao)
 
     def update_sighting_counts(self, counts: dict[str, int]) -> None:
         """Refresh in-memory sighting_count for live aircraft after a DB write."""
@@ -446,7 +450,8 @@ class AircraftState:
 
             # Queue hexdb HTTP lookup if any key field is still missing
             if not ac.operator or not ac.registration or not ac.type_code:
-                self._hexdb_queue.add(icao)
+                if len(self._hexdb_queue) < _HEXDB_QUEUE_MAX:
+                    self._hexdb_queue.add(icao)
 
             if config.DEBUG_ENRICHMENT == 1:
                 op_source = (

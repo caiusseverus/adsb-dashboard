@@ -9,7 +9,6 @@ POST /api/debug/aircraft/{icao}/override — override a field in aircraft_regist
 
 import asyncio
 import logging
-import statistics
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -50,7 +49,7 @@ async def get_perf() -> dict:
             "p95":  round(data[int(n * 0.95)] * scale, 1),
             "p99":  round(data[int(n * 0.99)] * scale, 1),
             "max":  round(data[-1] * scale, 1),
-            "mean": round(statistics.mean(data) * scale, 1),
+            "mean": round((sum(data) / n) * scale, 1),
         }
 
     def push_avg(key: str) -> float:

@@ -17,6 +17,15 @@ import config
 log = logging.getLogger(__name__)
 
 _notified: set[str] = set()
+_NOTIFIED_MAX = 5_000  # ~300 KB worst case; prevents unbounded growth on busy sites
+
+
+def _mark_notified(key: str) -> None:
+    """Add key to _notified, evicting one arbitrary entry if at capacity."""
+    if len(_notified) >= _NOTIFIED_MAX:
+        _notified.pop()
+    _notified.add(key)
+
 
 # Prefs cache — avoid a DB query on every per-aircraft call
 _prefs_cache: dict = {}
@@ -185,7 +194,7 @@ def notify_emergency_squawk(icao: str, squawk: str, callsign: str | None,
     key = f"emergency:{icao}:{squawk}"
     if key in _notified:
         return
-    _notified.add(key)
+    _mark_notified(key)
 
     labels = {"7700": "General emergency", "7600": "Radio failure", "7500": "Hijack"}
     label = labels.get(squawk, squawk)
@@ -216,7 +225,7 @@ def notify_acas(icao: str, description: str, corrective: bool,
     max_nm = _pref_range(prefs, "acas_max_range_nm")
     if not _in_range(max_nm, range_nm):
         return
-    _notified.add(key)
+    _mark_notified(key)
 
     ident = registration or icao
     kind  = "Corrective" if corrective else "Preventive"
@@ -240,7 +249,7 @@ def notify_watchlist(icao: str, callsign: str | None, registration: str | None,
     key = f"watchlist:{icao}"
     if key in _notified:
         return
-    _notified.add(key)
+    _mark_notified(key)
 
     ident = callsign or registration or icao
     lines = [f"Watchlist aircraft spotted: {ident}"]
@@ -268,7 +277,7 @@ def notify_military(icao: str, callsign: str | None, operator: str | None,
     max_nm = _pref_range(prefs, "military_max_range_nm")
     if not _in_range(max_nm, range_nm):
         return
-    _notified.add(key)
+    _mark_notified(key)
 
     ident = callsign or icao
     lines = [f"Military aircraft spotted: {ident}"]
@@ -298,7 +307,7 @@ def notify_interesting(icao: str, callsign: str | None, type_code: str | None,
     max_nm = _pref_range(prefs, "interesting_max_range_nm")
     if not _in_range(max_nm, range_nm):
         return
-    _notified.add(key)
+    _mark_notified(key)
 
     ident = callsign or icao
     lines = [f"Interesting aircraft spotted: {ident}"]
