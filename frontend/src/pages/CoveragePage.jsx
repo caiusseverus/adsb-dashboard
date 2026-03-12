@@ -250,6 +250,7 @@ export default function CoveragePage({ aircraft = [] }) {
   const [maxPoints,    setMaxPoints]    = useState(DEFAULT_MAX_POINTS)
   const [colorMode,    setColorMode]    = useState('type_group')
   const [typeFilter,   setTypeFilter]   = useState('all')
+  const [showMode,     setShowMode]     = useState('both')  // 'both' | 'live' | 'history'
   const [loadingPhase, setLoadingPhase] = useState(null)  // null | 'fetching' | 'rendering'
   const [error,        setError]        = useState(null)
   const [fetchedN,     setFetchedN]     = useState(0)
@@ -335,9 +336,21 @@ export default function CoveragePage({ aircraft = [] }) {
   }, [])
 
   // ── Replace the point cloud in the scene ────────────────────────────
-  const redraw = useCallback((points, mode, filter) => {
+  const redraw = useCallback((points, mode, filter, show) => {
     const ref = sceneRef.current
     if (!ref) return
+
+    // Live-only: remove historical points and bail out
+    if (show === 'live') {
+      if (ref.pointsObj) {
+        ref.scene.remove(ref.pointsObj)
+        ref.pointsObj.geometry.dispose()
+        ref.pointsObj.material.dispose()
+        ref.pointsObj = null
+      }
+      setShownN(0)
+      return
+    }
 
     const filtered = filter === 'military'    ? points.filter(p => p[3])
                    : filter === 'interesting' ? points.filter(p => p[4])
@@ -388,7 +401,7 @@ export default function CoveragePage({ aircraft = [] }) {
 
     const id = setTimeout(() => {
       dataRef.current = pending.points
-      redraw(pending.points, colorMode, typeFilter)
+      redraw(pending.points, colorMode, typeFilter, showMode)
       setLoadingPhase(null)
     }, 30)   // 30 ms gives React time to paint the "Building scene…" message
 
@@ -398,13 +411,22 @@ export default function CoveragePage({ aircraft = [] }) {
 
   // ── Re-colour / re-filter from stored data (no fetch) ───────────────
   useEffect(() => {
-    if (dataRef.current.length) redraw(dataRef.current, colorMode, typeFilter)
-  }, [colorMode, typeFilter, redraw])
+    if (dataRef.current.length) redraw(dataRef.current, colorMode, typeFilter, showMode)
+  }, [colorMode, typeFilter, showMode, redraw])
 
   // ── Accumulate live aircraft trails ─────────────────────────────────
   useEffect(() => {
     const ref = sceneRef.current
-    if (!ref || !aircraft.length) return
+    if (!ref) return
+
+    // History-only: remove live layers and bail out
+    if (showMode === 'history') {
+      if (ref.trailsObj)   { ref.scene.remove(ref.trailsObj);   ref.trailsObj.geometry.dispose();   ref.trailsObj.material.dispose();   ref.trailsObj = null }
+      if (ref.liveDotsObj) { ref.scene.remove(ref.liveDotsObj); ref.liveDotsObj.geometry.dispose(); ref.liveDotsObj.material.dispose(); ref.liveDotsObj = null }
+      return
+    }
+
+    if (!aircraft.length) return
 
     const trails = trailsRef.current
 
@@ -455,7 +477,7 @@ export default function CoveragePage({ aircraft = [] }) {
     if (mesh) { scene.add(mesh); ref.trailsObj = mesh }
     const dots = buildLiveDots(trails)
     if (dots) { scene.add(dots); ref.liveDotsObj = dots }
-  }, [aircraft])
+  }, [aircraft, showMode])
 
   const resetCamera = useCallback(() => {
     const ref = sceneRef.current
@@ -515,6 +537,15 @@ export default function CoveragePage({ aircraft = [] }) {
           <button className={colorMode === 'altitude'   ? styles.btnActive : styles.btn} onClick={() => setColorMode('altitude')}>By altitude</button>
           <button className={colorMode === 'operator'   ? styles.btnActive : styles.btn} onClick={() => setColorMode('operator')}>By operator</button>
           <button className={colorMode === 'tag'        ? styles.btnActive : styles.btn} onClick={() => setColorMode('tag')}>By tag</button>
+        </div>
+
+        <div className={styles.sep} />
+
+        {/* Show mode */}
+        <div className={styles.controls}>
+          <button className={showMode === 'both'    ? styles.btnActive : styles.btn} onClick={() => setShowMode('both')}>Both</button>
+          <button className={showMode === 'history' ? styles.btnActive : styles.btn} onClick={() => setShowMode('history')}>History</button>
+          <button className={showMode === 'live'    ? styles.btnActive : styles.btn} onClick={() => setShowMode('live')}>Live</button>
         </div>
 
         <button className={styles.resetBtn} onClick={resetCamera}>Reset view</button>
