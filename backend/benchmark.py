@@ -398,12 +398,12 @@ def run_benchmark(n_msgs: int = 5000, paused: bool = False) -> dict:
 
     full_p95 = results["stage_full_pipeline"]["p95_us"]
     max_rate  = results["stage_full_pipeline"]["max_sustained_rate"]
-    if max_rate >= 2500:
+    if max_rate >= 3500:
         verdict        = "PASS"
-        verdict_detail = f"Pipeline can sustain ≥2,500 msgs/s at p95 ({full_p95} µs/msg)"
-    elif max_rate >= 1500:
+        verdict_detail = f"Pipeline can sustain ≥3,500 msgs/s at p95 ({full_p95} µs/msg)"
+    elif max_rate >= 2000:
         verdict        = "MARGINAL"
-        verdict_detail = f"Pipeline sustains ~{max_rate} msgs/s; below 2,500 target ({full_p95} µs/msg at p95)"
+        verdict_detail = f"Pipeline sustains ~{max_rate} msgs/s; below 3,500 target ({full_p95} µs/msg at p95)"
     else:
         verdict        = "FAIL"
         verdict_detail = f"Pipeline bottleneck: only {max_rate} msgs/s possible ({full_p95} µs/msg at p95)"

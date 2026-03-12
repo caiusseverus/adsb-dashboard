@@ -37,8 +37,8 @@ def _bar(value, max_val, width=30, colour=CYAN):
     return _c("█" * filled, colour) + _c("░" * (width - filled), DIM)
 
 def _fmt_rate(r):
-    if r >= 2500: return _c(f"{r:,} msg/s", GREEN, BOLD)
-    if r >= 1500: return _c(f"{r:,} msg/s", YELLOW)
+    if r >= 3500: return _c(f"{r:,} msg/s", GREEN, BOLD)
+    if r >= 2000: return _c(f"{r:,} msg/s", YELLOW)
     return _c(f"{r:,} msg/s", RED)
 
 def _fmt_us(us, target):

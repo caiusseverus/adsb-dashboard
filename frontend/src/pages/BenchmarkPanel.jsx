@@ -61,7 +61,7 @@ function LatencyBar({ p50, p95, p99, target }) {
 function StageRow({ stage, data }) {
   if (!data) return null
   const pass      = data.p95_us <= stage.target
-  const rateColor = data.max_sustained_rate >= 2500 ? '#3fb950' : data.max_sustained_rate >= 1500 ? '#d29922' : '#f85149'
+  const rateColor = data.max_sustained_rate >= 3500 ? '#3fb950' : data.max_sustained_rate >= 2000 ? '#d29922' : '#f85149'
 
   return (
     <div style={{ padding: '0.7rem 0', borderBottom: '1px solid #21262d' }}>
@@ -309,7 +309,7 @@ export default function BenchmarkPanel() {
 
           {/* Stages */}
           <div style={{ color: '#484f58', fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.06em', padding: '0.9rem 0 0' }}>
-            Stage breakdown — target: sustain ≥2,500 msgs/s (≤400µs p95 end-to-end)
+            Stage breakdown — target: sustain ≥3,500 msgs/s (≤286µs p95 end-to-end)
           </div>
           {STAGES.map(s => <StageRow key={s.key} stage={s} data={result[s.key]} />)}
 
