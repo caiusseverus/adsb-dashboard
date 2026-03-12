@@ -1,7 +1,7 @@
 .page {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 52px); /* fill below header */
+  height: calc(100vh - 52px);
   padding: 1rem 1.5rem;
   gap: 0.75rem;
   box-sizing: border-box;
@@ -73,16 +73,83 @@
   border: 1px solid #21262d;
 }
 
+/* Loading overlay */
 .overlay {
   position: absolute;
   inset: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 0.85rem;
-  color: #484f58;
+  background: rgba(11, 12, 16, 0.75);
   pointer-events: none;
+  z-index: 10;
 }
+
+.loadingBox {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  color: #8b949e;
+  font-size: 0.85rem;
+}
+
+.spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid #30363d;
+  border-top-color: #388bfd;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 2-D compass rose — top-right corner of the canvas */
+.compass {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 62px;
+  height: 62px;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Inner ring rotates via JS (compassRef) to track camera azimuth */
+.compassInner {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  border: 1px solid #484f58;
+  border-radius: 50%;
+}
+
+/* North needle — blue above centre, grey below */
+.compassNeedle {
+  position: absolute;
+  left: 50%;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  background: linear-gradient(to bottom, #388bfd 50%, #484f58 50%);
+  transform: translateX(-50%);
+  border-radius: 1px;
+}
+
+.compassN, .compassE, .compassS, .compassW {
+  position: absolute;
+  font-size: 0.6rem;
+  font-weight: 700;
+  color: #8b949e;
+  line-height: 1;
+}
+.compassN { top: 2px;    left: 50%; transform: translateX(-50%); color: #388bfd; }
+.compassS { bottom: 2px; left: 50%; transform: translateX(-50%); }
+.compassE { right: 2px;  top: 50%;  transform: translateY(-50%); }
+.compassW { left: 2px;   top: 50%;  transform: translateY(-50%); }
 
 .legend {
   display: flex;

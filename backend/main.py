@@ -1,5 +1,13 @@
 import asyncio
 import json
+try:
+    import orjson as _orjson
+    def _json_dumps(obj: dict) -> str:
+        return _orjson.dumps(obj).decode("utf-8")
+except ImportError:
+    _orjson = None  # type: ignore[assignment]
+    def _json_dumps(obj: dict) -> str:  # type: ignore[misc]
+        return json.dumps(obj)
 import logging
 import queue
 import threading
@@ -63,16 +71,24 @@ _watchlist_cache_ts: float = 0.0
 # accumulating stale messages that would be decoded minutes late.
 _MSG_QUEUE_MAX = 5000
 _msg_queue: queue.Queue = queue.Queue(maxsize=_MSG_QUEUE_MAX)
+_DECODE_SENTINEL = object()   # placed on queue to signal the decoder thread to exit
+_decoder_thread: threading.Thread | None = None
 
 
-def _start_msg_processor() -> None:
-    """Start the daemon thread that decodes Beast messages from _msg_queue."""
+def _start_msg_processor() -> threading.Thread:
+    """Start the daemon thread that decodes Beast messages from _msg_queue.
+    Returns the thread so lifespan teardown can send the sentinel and join it."""
     def _run() -> None:
         while True:
-            msg, mlat_source = _msg_queue.get()
+            item = _msg_queue.get()
+            if item is _DECODE_SENTINEL:
+                log.debug("beast-decoder: shutdown sentinel received")
+                return
+            msg, mlat_source = item
             state.process_message(msg, mlat_source)
     t = threading.Thread(target=_run, daemon=True, name="beast-decoder")
     t.start()
+    return t
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +122,14 @@ async def _db_update_checker() -> None:
     while True:
         await asyncio.sleep(86400)
         await asyncio.to_thread(enrichment.db.check_for_updates)
+
+
+async def _hexdb_cache_flusher() -> None:
+    """Flush the hexdb cache to SD at most every 5 minutes, only when dirty.
+    Batches all lookups since the last flush into a single gzip write."""
+    while True:
+        await asyncio.sleep(300)
+        await asyncio.to_thread(enrichment.db.flush_hexdb_cache_if_dirty)
 
 
 async def _backup_runner() -> None:
@@ -383,7 +407,7 @@ async def _push_updates() -> None:
             })
             continue
 
-        payload = json.dumps(snapshot)
+        payload = _json_dumps(snapshot)
         dead: list[WebSocket] = []
 
         for ws in list(_clients):
@@ -450,18 +474,49 @@ async def lifespan(app: FastAPI):
     }
     await asyncio.to_thread(stats_db.fix_military_countries, corrections, config.HOME_COUNTRY)
 
-    _start_msg_processor()
+    global _decoder_thread
+    _decoder_thread = _start_msg_processor()
     asyncio.create_task(_beast_runner())
     for name, host, port in config.MLAT_SERVERS:
         asyncio.create_task(_mlat_runner(name, host, port))
     asyncio.create_task(_push_updates())
     asyncio.create_task(_db_writer())
     asyncio.create_task(_db_update_checker())
+    asyncio.create_task(_hexdb_cache_flusher())
     asyncio.create_task(_hexdb_task())
     asyncio.create_task(_backup_runner())  # runs nightly; path resolved from DB/env at runtime
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",
              config.BEAST_HOST, config.BEAST_PORT)
+
     yield
+
+    # --- Graceful shutdown ---
+    # Stop the decoder thread before the final DB write so it can't be
+    # holding _lock when we call get_snapshot() below.
+    log.info("Shutdown: stopping decoder thread…")
+    _msg_queue.put(_DECODE_SENTINEL)
+    if _decoder_thread is not None:
+        _decoder_thread.join(timeout=2.0)
+
+    log.info("Shutdown: flushing state to disk…")
+    try:
+        final_snapshot = state.get_snapshot()
+        await asyncio.to_thread(stats_db.write_minute, final_snapshot)
+    except Exception:
+        log.exception("Shutdown: final DB write failed")
+
+    try:
+        enrichment.db.flush_hexdb_cache_if_dirty()
+    except Exception:
+        log.exception("Shutdown: hexdb cache flush failed")
+
+    # Checkpoint the WAL so next startup opens a clean DB without recovery.
+    try:
+        with stats_db._connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        log.info("Shutdown: WAL checkpoint complete")
+    except Exception:
+        log.exception("Shutdown: WAL checkpoint failed")
 
 
 app = FastAPI(title="ADS-B Dashboard", lifespan=lifespan)
@@ -500,7 +555,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
 
     try:
         # Send the current snapshot immediately on connect
-        await ws.send_text(json.dumps(state.get_snapshot()))
+        await ws.send_text(_json_dumps(state.get_snapshot()))
         # Keep the connection open; the push loop handles subsequent updates
         while True:
             await ws.receive_text()

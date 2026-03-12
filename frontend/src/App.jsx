@@ -141,7 +141,7 @@ export default function App() {
       {tab === 'history' && <HistoryPage snapshot={snapshot} />}
       {tab === 'sightings' && <SightingsPage onSelectIcao={setSelectedIcao} notableRefreshKey={notableRefreshKey} />}
       {tab === 'receiver' && <ReceiverPage snapshot={snapshot} />}
-      {tab === 'coverage' && <CoveragePage />}
+      {tab === 'coverage' && <CoveragePage aircraft={snapshot.aircraft ?? []} />}
       {tab === 'flow' && <FlowMapPage />}
       {tab === 'fleet' && <FleetPage onSelectIcao={setSelectedIcao} />}
       {tab === 'events' && <EventsPage onSelectIcao={setSelectedIcao} />}

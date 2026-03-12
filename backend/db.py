@@ -431,32 +431,32 @@ class StatsDB:
                 type_counts = Counter(
                     a["type_code"] for a in aircraft if a.get("type_code")
                 )
-                for type_code, count in type_counts.items():
-                    conn.execute(
-                        "INSERT OR REPLACE INTO minute_type_counts VALUES (?,?,?)",
-                        (cur_ts, type_code, count),
-                    )
+                conn.executemany(
+                    "INSERT OR REPLACE INTO minute_type_counts VALUES (?,?,?)",
+                    ((cur_ts, tc, cnt) for tc, cnt in type_counts.items()),
+                )
                 operator_counts = Counter(
                     a["operator"] for a in aircraft if a.get("operator")
                 )
-                for operator, count in operator_counts.items():
-                    conn.execute(
-                        "INSERT OR REPLACE INTO minute_operator_counts VALUES (?,?,?)",
-                        (cur_ts, operator, count),
-                    )
+                conn.executemany(
+                    "INSERT OR REPLACE INTO minute_operator_counts VALUES (?,?,?)",
+                    ((cur_ts, op, cnt) for op, cnt in operator_counts.items()),
+                )
 
             # Daily aircraft seen (deduped by date + icao)
             # mlat=1 if ever seen via MLAT; had_pos=1 if ever had a decoded position
-            for ac in aircraft:
-                conn.execute(
-                    """INSERT INTO daily_aircraft_seen (date, icao, mlat, had_pos) VALUES (?,?,?,?)
-                       ON CONFLICT(date, icao) DO UPDATE SET
-                           mlat    = MAX(mlat,    excluded.mlat),
-                           had_pos = MAX(had_pos, excluded.had_pos)""",
+            conn.executemany(
+                """INSERT INTO daily_aircraft_seen (date, icao, mlat, had_pos) VALUES (?,?,?,?)
+                   ON CONFLICT(date, icao) DO UPDATE SET
+                       mlat    = MAX(mlat,    excluded.mlat),
+                       had_pos = MAX(had_pos, excluded.had_pos)""",
+                (
                     (today, ac["icao"],
                      1 if ac.get("mlat") else 0,
-                     1 if ac.get("lat") is not None else 0),
-                )
+                     1 if ac.get("lat") is not None else 0)
+                    for ac in aircraft
+                ),
+            )
 
             # Aircraft registry upserts
             for ac in aircraft:
