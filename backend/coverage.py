@@ -61,7 +61,7 @@ async def coverage_flow(
 
 @router.get("/points")
 async def coverage_points(
-    days:       int = Query(default=30,     ge=1,    le=90),
+    days:       int = Query(default=30,     ge=1,    le=365),
     max_points: int = Query(default=100000, ge=10000, le=500000),
 ) -> dict:
     """Downsampled coverage points for the 3-D coverage view.
