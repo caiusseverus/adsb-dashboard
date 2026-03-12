@@ -147,15 +147,19 @@ async def _backup_runner() -> None:
 async def _adsbx_task() -> None:
     """Drain the ADSBx enrichment queue for newly-seen aircraft.
 
-    Runs every 0.5s, up to 20 ICAOs per cycle. No rate limit — this is a local
-    SQLite lookup, not an HTTP call. The decode thread is never blocked on this I/O.
+    Runs every 0.5s, up to 20 ICAOs per cycle. All SQLite lookups for the batch
+    run in a single asyncio.to_thread call — one thread per cycle instead of N —
+    to minimise GIL contention with the decoder thread.
     """
     await asyncio.sleep(2)  # brief startup delay — let the decoder warm up first
     while True:
         batch = state.pop_adsbx_queue(max_n=20)
-        for icao in batch:
-            adsbx = await asyncio.to_thread(enrichment.db.get_adsbx, icao)
-            state.apply_adsbx(icao, adsbx)
+        if batch:
+            def _lookup_batch(icaos: set) -> dict:
+                return {icao: enrichment.db.get_adsbx(icao) for icao in icaos}
+            results = await asyncio.to_thread(_lookup_batch, batch)
+            for icao, adsbx in results.items():
+                state.apply_adsbx(icao, adsbx)
         await asyncio.sleep(0.5)
 
 
