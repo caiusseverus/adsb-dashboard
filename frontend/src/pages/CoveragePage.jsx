@@ -15,6 +15,18 @@ const MAX_TRAIL_GAP_S   = 20
 const MAX_BEARING_JUMP  = 45   // degrees — impossible in 1 s for any real aircraft
 const MAX_RANGE_JUMP_NM = 50   // nm — likewise
 
+function bearingDeltaDeg(a, b) {
+  const d = Math.abs((a ?? 0) - (b ?? 0)) % 360
+  return d > 180 ? 360 - d : d
+}
+
+function isTrailSegmentValid(a, b) {
+  if (b.ts - a.ts > MAX_TRAIL_GAP_S) return false
+  if (bearingDeltaDeg(a.bearing, b.bearing) > MAX_BEARING_JUMP) return false
+  if (Math.abs((b.range ?? 0) - (a.range ?? 0)) > MAX_RANGE_JUMP_NM) return false
+  return true
+}
+
 // Tag colours — same palette as AircraftTable badges
 const C_MILITARY    = new THREE.Color(0xbc8cff)
 const C_INTERESTING = new THREE.Color(0xd29922)
@@ -132,7 +144,10 @@ function liveAcColor(pt, colorMode, operators) {
 function buildTrails(trails, colorMode, operators) {
   let totalSegs = 0
   for (const pts of Object.values(trails)) {
-    if (pts.length >= 2) totalSegs += pts.length - 1
+    if (pts.length < 2) continue
+    for (let i = 0; i < pts.length - 1; i++) {
+      if (isTrailSegmentValid(pts[i], pts[i + 1])) totalSegs++
+    }
   }
   if (totalSegs === 0) return null
 
@@ -148,9 +163,7 @@ function buildTrails(trails, colorMode, operators) {
     for (let i = 0; i < pts.length - 1; i++) {
       const a = pts[i], b = pts[i + 1]
       // Skip segment on time gap or impossible position jump (CPR glitch guard)
-      if (b.ts - a.ts > MAX_TRAIL_GAP_S) continue
-      if (Math.abs(b.bearing - a.bearing) > MAX_BEARING_JUMP) continue
-      if (Math.abs(b.range   - a.range)   > MAX_RANGE_JUMP_NM) continue
+      if (!isTrailSegmentValid(a, b)) continue
       const [x0, y0, z0] = toWorld(a.bearing, a.range, a.alt ?? 0)
       const [x1, y1, z1] = toWorld(b.bearing, b.range, b.alt ?? 0)
       // Altitude mode: colour each vertex by its own altitude (gradient along trail)
