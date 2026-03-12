@@ -154,9 +154,9 @@ class TestParseFrames:
         assert self.messages[0]["raw"].startswith("1A")
 
     def test_mode_ac_frame(self):
-        # Mode-AC: type 0x31, 2-byte payload
+        # Mode-AC (0x31) frames are silently dropped before dispatch — no ICAO address,
+        # useless to process_message, and ~10-20% of traffic at a typical receiver.
         ts = b"\x00\x00\x00\x00\x00\x01"
         frame = _build_frame(0x31, ts, 0x20, bytes(2))
         self._feed(frame)
-        assert len(self.messages) == 1
-        assert self.messages[0]["type"] == 0x31
+        assert len(self.messages) == 0
