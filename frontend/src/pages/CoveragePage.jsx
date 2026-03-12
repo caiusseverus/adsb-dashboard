@@ -277,8 +277,8 @@ export default function CoveragePage({ aircraft = [] }) {
     for (const b of [0, 90, 180, 270]) scene.add(makeSpoke(b, 270))
 
     const LR = 278
-    scene.add(makeLabel('N',    0, -LR))
-    scene.add(makeLabel('S',    0,  LR))
+    scene.add(makeLabel('N',    0,  LR))
+    scene.add(makeLabel('S',    0, -LR))
     scene.add(makeLabel('E',  LR,    0))
     scene.add(makeLabel('W', -LR,    0))
 
