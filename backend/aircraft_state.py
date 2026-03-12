@@ -7,7 +7,7 @@ import time
 import threading
 import logging
 import re
-from collections import deque
+from collections import deque, OrderedDict
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Optional
@@ -42,7 +42,8 @@ _MLAT_TS_MARKER: int = int.from_bytes(b'\xff\x00MLAT', 'big')  # 0xFF004D4C4154
 _ICAO_HEX_RE = re.compile(r"^[0-9A-F]{6}$")
 _ACAS_CONFIRM_WINDOW_S = 12
 _ACAS_MIN_CONFIRM_FRAMES = 2
-_HEXDB_QUEUE_MAX = 600  # hard ceiling: startup batch + live overflow
+_HEXDB_QUEUE_MAX = 600      # hard ceiling: startup batch + live overflow
+_SIGHTING_LRU_MAX = 10_000  # ~800 KB worst case; evicts oldest on busy long-running sites
 
 # Altitude filtering constants
 _ALT_MIN_FT = -1_000          # below this is a bad decode (subterranean)
@@ -251,8 +252,9 @@ class AircraftState:
         self._today_icaos: set[str] = set()
         self._today_mil_icaos: set[str] = set()
 
-        # sighting_count seed from DB (icao -> count); used when creating new Aircraft objects
-        self._sighting_counts: dict[str, int] = {}
+        # sighting_count seed from DB (icao -> count); bounded LRU so long-tail
+        # historical ICAOs are evicted rather than accumulating indefinitely
+        self._sighting_counts: OrderedDict[str, int] = OrderedDict()
 
     # ------------------------------------------------------------------
     # Public API
@@ -332,6 +334,9 @@ class AircraftState:
                 if ac:
                     ac.sighting_count = count
                 self._sighting_counts[icao] = count
+                self._sighting_counts.move_to_end(icao)
+                while len(self._sighting_counts) > _SIGHTING_LRU_MAX:
+                    self._sighting_counts.popitem(last=False)
 
     def pop_hexdb_queue(self, max_n: int = 10) -> set[str]:
         """Return up to max_n ICAOs awaiting hexdb lookup; removes them from the queue."""

@@ -492,10 +492,12 @@ async def lifespan(app: FastAPI):
     today_data = await asyncio.to_thread(stats_db.query_today_icaos, today)
     state.init_today(today_data["all"], today_data["military"])
 
-    # Seed sighting counts so live aircraft correctly reflect DB state
-    sighting_counts = await asyncio.to_thread(stats_db.query_all_sighting_counts)
+    # Seed sighting counts so live aircraft correctly reflect DB state.
+    # Only load aircraft seen in the last 90 days — avoids pulling the full
+    # registry into RAM on mature installs with years of history.
+    sighting_counts = await asyncio.to_thread(stats_db.query_sighting_counts_recent, 90)
     state.seed_sighting_counts(sighting_counts)
-    log.info("Seeded sighting counts for %d aircraft", len(sighting_counts))
+    log.info("Seeded sighting counts for %d aircraft (last 90 days)", len(sighting_counts))
 
     # Queue aircraft with missing enrichment fields for hexdb re-lookup
     needs_enrichment = await asyncio.to_thread(stats_db.query_needs_enrichment, 500)

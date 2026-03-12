@@ -8,6 +8,7 @@ All public methods are synchronous and safe to call via asyncio.to_thread().
 import logging
 import math
 import sqlite3
+import threading
 import time
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
@@ -157,6 +158,7 @@ INTERESTING_TYPE_CODES: frozenset[str] = frozenset({
 class StatsDB:
     def __init__(self) -> None:
         self._last_written_ts: int = 0
+        self._local = threading.local()  # thread-local connection storage
         self._init_schema()
 
     # ------------------------------------------------------------------
@@ -164,10 +166,19 @@ class StatsDB:
     # ------------------------------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(config.DB_PATH), timeout=10)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.row_factory = sqlite3.Row
+        """Return a per-thread persistent SQLite connection.
+        Each asyncio.to_thread worker gets its own connection on first call, then
+        reuses it. check_same_thread=False is safe here because no connection is
+        ever shared between threads — threading.local() enforces that."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(config.DB_PATH), timeout=10, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=-8000")   # 8 MB page cache per thread
+            conn.execute("PRAGMA temp_store=MEMORY")  # temp tables in RAM, not SD card
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
         return conn
 
     # ------------------------------------------------------------------
@@ -2322,6 +2333,17 @@ class StatsDB:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT icao, sighting_count FROM aircraft_registry"
+            ).fetchall()
+        return {r["icao"]: r["sighting_count"] for r in rows}
+
+    def query_sighting_counts_recent(self, days: int = 90) -> dict[str, int]:
+        """Return {icao: sighting_count} for aircraft seen in the last N days.
+        Much smaller result set than query_all_sighting_counts on mature installs."""
+        cutoff = int(time.time()) - days * 86400
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT icao, sighting_count FROM aircraft_registry WHERE last_seen >= ?",
+                (cutoff,),
             ).fetchall()
         return {r["icao"]: r["sighting_count"] for r in rows}
 
