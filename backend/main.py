@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections import deque
 try:
     import orjson as _orjson
     def _json_dumps(obj: dict) -> str:
@@ -67,6 +68,9 @@ _active_squawks: dict[str, dict] = {}
 
 # Watchlist cache — refreshed from DB every 30s to avoid per-aircraft DB reads
 _watchlist_cache: dict[str, float | None] = {}   # icao → max_range_nm
+
+# Route lookup queue: (visit_id, callsign) pairs awaiting adsbdb.com resolution
+_route_queue: deque[tuple[int, str]] = deque(maxlen=2000)
 _watchlist_cache_ts: float = 0.0
 
 # Message decode queue — Beast/MLAT runners push raw messages here; a single
@@ -232,6 +236,23 @@ def _wal_checkpoint_passive() -> None:
         log.warning("Periodic WAL checkpoint failed", exc_info=True)
 
 
+def _credible_aircraft(ac) -> bool:
+    """Ghost filter for Aircraft dataclass objects (used at visit close time)."""
+    if config.GHOST_FILTER_MSGS <= 0:
+        return True
+    if ac.msg_count >= config.GHOST_FILTER_MSGS:
+        return True
+    if ac.mlat:
+        return True
+    if enrichment.db.get_adsbx(ac.icao):
+        return True
+    if enrichment.db.get_hexdb_cached(ac.icao):
+        return True
+    if enrichment.db.get_tar1090_cached(ac.icao):
+        return True
+    return False
+
+
 def _ghost_credible(ac: dict) -> bool:
     """Return True if this aircraft is likely real and should be persisted."""
     if config.GHOST_FILTER_MSGS <= 0:
@@ -343,13 +364,55 @@ async def _db_writer() -> None:
                 del _active_squawks[icao]
 
 
+async def _route_enricher() -> None:
+    """Resolve origin/destination airports for completed visits via adsbdb.com."""
+    import urllib.request
+    import urllib.error
+    while True:
+        if not _route_queue:
+            await asyncio.sleep(10)
+            continue
+        visit_id, callsign = _route_queue.popleft()
+
+        def _lookup(cs: str) -> tuple[str | None, str | None]:
+            url = f"https://api.adsbdb.com/v0/callsign/{cs}"
+            try:
+                with urllib.request.urlopen(url, timeout=15) as resp:
+                    data = json.loads(resp.read())
+                route = data.get("response", {}).get("flightroute") or {}
+                origin = (route.get("origin") or {}).get("icao_code") or None
+                dest   = (route.get("destination") or {}).get("icao_code") or None
+                return origin, dest
+            except Exception:
+                return None, None
+
+        origin, dest = await asyncio.to_thread(_lookup, callsign)
+        if origin or dest:
+            await asyncio.to_thread(stats_db.update_visit_route, visit_id, origin, dest)
+        await asyncio.sleep(0.5)  # max 2 req/s — adsbdb is a free service
+
+
 async def _push_updates() -> None:
     """Broadcast a state snapshot to every connected WebSocket client every second."""
     import time
     global _watchlist_cache, _watchlist_cache_ts
     while True:
         await asyncio.sleep(1)
-        state.expire_aircraft()
+        expired = state.expire_aircraft()
+
+        # Close visit records for aircraft that just timed out
+        if expired:
+            credible = [ac for ac in expired if _credible_aircraft(ac)]
+            if credible:
+                tuples = [
+                    (ac.icao, int(ac.first_seen), int(ac.last_seen),
+                     ac.callsign, ac.squawk, ac.max_altitude, ac.msg_count)
+                    for ac in credible
+                ]
+                visit_ids = await asyncio.to_thread(stats_db.write_visits, tuples)
+                for ac, vid in zip(credible, visit_ids):
+                    if ac.callsign:
+                        _route_queue.append((vid, ac.callsign))
 
         snapshot = state.get_snapshot()
 
@@ -557,6 +620,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_hexdb_task())
     asyncio.create_task(_backup_runner())  # runs nightly; path resolved from DB/env at runtime
     asyncio.create_task(_hires_writer())
+    asyncio.create_task(_route_enricher())
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",
              config.BEAST_HOST, config.BEAST_PORT)
 

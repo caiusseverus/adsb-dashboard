@@ -79,6 +79,8 @@ def _accept_altitude(ac: "Aircraft", alt: int, source: str, now: float) -> bool:
     ac.altitude = alt
     ac._alt_source = source
     ac._alt_source_ts = now
+    if ac.max_altitude is None or alt > ac.max_altitude:
+        ac.max_altitude = alt
     return True
 
 def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -189,6 +191,7 @@ class Aircraft:
     cpr_odd:  Optional[tuple] = field(default=None, repr=False)
     pos_global: bool = False  # True once a global CPR decode (even+odd pair) has succeeded
     sighting_count: int = 1               # from aircraft_registry; 1 = unique (never seen before)
+    max_altitude: Optional[int] = None    # highest altitude seen this visit
     # MLAT
     has_adsb: bool = False               # True once a DF17 WITHOUT the MLAT timestamp is seen
                                          # (guarantees a real ADS-B transponder; blocks MLAT tag)
@@ -299,13 +302,16 @@ class AircraftState:
             self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
         msg_timings.append(time.perf_counter() - t0)
 
-    def expire_aircraft(self) -> None:
+    def expire_aircraft(self) -> list["Aircraft"]:
+        """Remove stale aircraft and return them for visit logging."""
         now = time.time()
+        expired = []
         with self._lock:
             stale = [icao for icao, ac in self._aircraft.items()
                      if now - ac.last_seen > self._timeout]
             for icao in stale:
-                del self._aircraft[icao]
+                expired.append(self._aircraft.pop(icao))
+        return expired
 
     def init_today(self, icaos: set[str], mil_icaos: set[str]) -> None:
         """Seed today's unique-aircraft sets from DB on startup (persistence across restarts)."""

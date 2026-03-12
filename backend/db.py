@@ -275,6 +275,21 @@ class StatsDB:
                 CREATE INDEX IF NOT EXISTS coverage_samples_ts
                     ON coverage_samples(ts);
 
+                CREATE TABLE IF NOT EXISTS visits (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    icao         TEXT    NOT NULL,
+                    start_ts     INTEGER NOT NULL,
+                    end_ts       INTEGER NOT NULL,
+                    callsign     TEXT,
+                    squawk       TEXT,
+                    max_altitude INTEGER,
+                    msg_count    INTEGER NOT NULL DEFAULT 0,
+                    origin_icao  TEXT,
+                    dest_icao    TEXT
+                );
+                CREATE INDEX IF NOT EXISTS visits_icao  ON visits(icao);
+                CREATE INDEX IF NOT EXISTS visits_start ON visits(start_ts);
+
                 CREATE TABLE IF NOT EXISTS aircraft_registry (
                     icao             TEXT    PRIMARY KEY,
                     first_seen       INTEGER NOT NULL,
@@ -2583,6 +2598,33 @@ class StatsDB:
     def remove_from_watchlist(self, icao: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM notify_watchlist WHERE icao=?", (icao,))
+
+    # ------------------------------------------------------------------
+    # Visit log
+    # ------------------------------------------------------------------
+
+    def write_visits(self, visits: list[tuple]) -> list[int]:
+        """Insert completed visit records. Each tuple: (icao, start_ts, end_ts,
+        callsign, squawk, max_altitude, msg_count). Returns inserted row IDs."""
+        ids = []
+        with self._connect() as conn:
+            for v in visits:
+                cur = conn.execute(
+                    "INSERT INTO visits "
+                    "(icao, start_ts, end_ts, callsign, squawk, max_altitude, msg_count) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    v,
+                )
+                ids.append(cur.lastrowid)
+        return ids
+
+    def update_visit_route(self, visit_id: int, origin_icao: str | None,
+                           dest_icao: str | None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE visits SET origin_icao=?, dest_icao=? WHERE id=?",
+                (origin_icao, dest_icao, visit_id),
+            )
 
 
 # Module-level singleton
