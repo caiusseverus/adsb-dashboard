@@ -2181,6 +2181,58 @@ class StatsDB:
             ],
         }
 
+    def query_timelapse_tracks(self, start_ts: int, end_ts: int) -> dict:
+        """Per-aircraft position tracks for the timelapse player.
+
+        Returns {start_ts, end_ts, tracks: [{icao, military, interesting, tg_idx,
+                 points: [[dt_s, bearing, range, alt], ...]}, ...]}
+        dt_s is seconds since start_ts.  Only tracks with >= 2 points are included.
+        """
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT cs.ts,
+                       cs.icao,
+                       cs.bearing_deg,
+                       cs.range_nm,
+                       cs.altitude,
+                       COALESCE(ar.military,    0) AS military,
+                       COALESCE(ar.interesting, 0) AS interesting,
+                       ar.type_code,
+                       ar.type_category
+                FROM coverage_samples cs
+                LEFT JOIN aircraft_registry ar ON cs.icao = ar.icao
+                WHERE cs.ts >= ? AND cs.ts <= ?
+                  AND cs.altitude  IS NOT NULL
+                  AND cs.range_nm  > 0
+                  AND cs.altitude  > 0
+                ORDER BY cs.icao, cs.ts
+            """, (start_ts, end_ts)).fetchall()
+
+        from collections import defaultdict
+        raw: dict[str, list] = defaultdict(list)
+        meta: dict[str, dict] = {}
+        for r in rows:
+            icao = r["icao"]
+            raw[icao].append([
+                r["ts"] - start_ts,           # dt seconds
+                round(r["bearing_deg"], 1),
+                round(r["range_nm"],   1),
+                int(r["altitude"]),
+            ])
+            if icao not in meta:
+                meta[icao] = {
+                    "military":    bool(r["military"]),
+                    "interesting": bool(r["interesting"]),
+                    "tg_idx":      self._get_type_group_idx(r["type_code"], r["type_category"]),
+                }
+
+        tracks = [
+            {"icao": icao, **meta[icao], "points": pts}
+            for icao, pts in raw.items()
+            if len(pts) >= 2
+        ]
+        return {"start_ts": start_ts, "end_ts": end_ts, "tracks": tracks}
+
     def query_coverage_range_trend(self, days: int = 90) -> list[dict]:
         """Daily max and median range from coverage_samples, for trend charts."""
         cutoff = (date.today() - timedelta(days=days)).isoformat()

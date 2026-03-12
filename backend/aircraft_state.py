@@ -316,7 +316,7 @@ class AircraftState:
     def seed_sighting_counts(self, counts: dict[str, int]) -> None:
         """Seed sighting_count from DB so new Aircraft objects get correct values."""
         with self._lock:
-            self._sighting_counts = counts
+            self._sighting_counts = OrderedDict(counts)
 
     def seed_hexdb_queue(self, icaos: list[str]) -> None:
         """Add a batch of ICAOs to the hexdb re-enrichment queue."""

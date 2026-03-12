@@ -21,3 +21,5 @@ backend/.venv/
 # Backend data (DB, caches)
 backend/data/
 adsb_dashboard_engineering_review.md
+performance_analysis.md
+rpi4_audit_report.md

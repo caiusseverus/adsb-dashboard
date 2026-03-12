@@ -36,6 +36,7 @@ from coverage import router as coverage_router
 from acas import router as acas_router
 from squawks import router as squawks_router
 import notifications
+import hires_buffer
 from status import router as status_router
 from debug import router as debug_router
 from notify_settings import router as notify_settings_router
@@ -475,6 +476,31 @@ async def _push_updates() -> None:
         })
 
 
+async def _hires_writer() -> None:
+    """Record aircraft positions to the in-memory hires buffer every 10 seconds.
+    Applies the same ghost filter and value guards as the DB coverage writer."""
+    import time as _time
+    while True:
+        await asyncio.sleep(hires_buffer.HIRES_INTERVAL_S)
+        if config.RECEIVER_LAT is None or config.RECEIVER_LON is None:
+            continue
+        snapshot = state.get_snapshot()
+        now_ts = int(_time.time())
+        samples = [
+            (now_ts, ac["icao"],
+             ac["bearing_deg"], ac["range_nm"], ac.get("altitude"),
+             ac.get("military", False), ac.get("interesting", False),
+             ac.get("type_code"), ac.get("type_category"))
+            for ac in snapshot.get("aircraft", [])
+            if (ac.get("bearing_deg") is not None
+                and ac.get("range_nm") is not None
+                and (ac.get("range_nm") or 0) > 0
+                and (ac.get("altitude") or 0) > 0
+                and _ghost_credible(ac))
+        ]
+        hires_buffer.record(samples)
+
+
 # ---------------------------------------------------------------------------
 # App lifespan
 # ---------------------------------------------------------------------------
@@ -530,6 +556,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_adsbx_task())
     asyncio.create_task(_hexdb_task())
     asyncio.create_task(_backup_runner())  # runs nightly; path resolved from DB/env at runtime
+    asyncio.create_task(_hires_writer())
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",
              config.BEAST_HOST, config.BEAST_PORT)
 
