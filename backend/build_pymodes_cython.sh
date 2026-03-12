@@ -20,18 +20,16 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
   exit 1
 fi
 
-echo "Installing Cython into venv…"
-uv pip install --quiet cython
+echo "Installing Cython and setuptools into venv…"
+uv pip install --quiet cython setuptools
 
 echo "Downloading pyModeS 2.9 source…"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
-pip download "pymodes==2.9" --no-deps --no-binary pymodes -d "$TMPDIR" -q
+uv pip download "pymodes==2.9" --no-deps --no-binary pymodes -d "$TMPDIR" -q
 tar -xzf "$TMPDIR"/pyModeS-2.9.tar.gz -C "$TMPDIR"
 
 echo "Building c_common extension…"
-"$VENV_PYTHON" -m ensurepip -q 2>/dev/null || true
-"$VENV_PYTHON" -m pip install setuptools -q
 cd "$TMPDIR/pyModeS-2.9"
 "$VENV_PYTHON" setup.py build_ext --inplace -q
 
