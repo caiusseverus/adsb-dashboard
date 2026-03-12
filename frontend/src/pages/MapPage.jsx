@@ -203,7 +203,7 @@ export default function MapPage({ snapshot, onSelectIcao }) {
       const hist = posHistRef.current.get(ac.icao)
       const last = hist[hist.length - 1]
       // Only push if position actually changed (avoids cluttering history when stationary)
-      if (!last || last[0] !== ac.lat || last[1] !== ac.lon) {
+      if ((ac.pos_global || ac.mlat) && (!last || last[0] !== ac.lat || last[1] !== ac.lon)) {
         hist.push([ac.lat, ac.lon])
         if (hist.length > MAX_TRAIL) hist.shift()
       }
