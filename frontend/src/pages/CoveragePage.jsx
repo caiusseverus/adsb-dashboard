@@ -10,6 +10,10 @@ const ALT_SCALE_FT  = 45000   // fixed colour scale ceiling — not data-driven
 
 // Maximum trail points kept per aircraft (~10 min at 1 Hz)
 const MAX_TRAIL_PTS = 600
+// Break a trail segment on time gap (seconds) or position jump thresholds
+const MAX_TRAIL_GAP_S   = 20
+const MAX_BEARING_JUMP  = 45   // degrees — impossible in 1 s for any real aircraft
+const MAX_RANGE_JUMP_NM = 50   // nm — likewise
 
 // Tag colours — same palette as AircraftTable badges
 const C_MILITARY    = new THREE.Color(0xbc8cff)
@@ -127,8 +131,13 @@ function buildTrails(trails) {
               : C_TRAIL.standard
 
     for (let i = 0; i < pts.length - 1; i++) {
-      const [x0, y0, z0] = toWorld(pts[i].bearing,     pts[i].range,     pts[i].alt ?? 0)
-      const [x1, y1, z1] = toWorld(pts[i + 1].bearing, pts[i + 1].range, pts[i + 1].alt ?? 0)
+      const a = pts[i], b = pts[i + 1]
+      // Skip segment on time gap or impossible position jump (CPR glitch guard)
+      if (b.ts - a.ts > MAX_TRAIL_GAP_S) continue
+      if (Math.abs(b.bearing - a.bearing) > MAX_BEARING_JUMP) continue
+      if (Math.abs(b.range   - a.range)   > MAX_RANGE_JUMP_NM) continue
+      const [x0, y0, z0] = toWorld(a.bearing, a.range, a.alt ?? 0)
+      const [x1, y1, z1] = toWorld(b.bearing, b.range, b.alt ?? 0)
       positions[idx * 6]     = x0; positions[idx * 6 + 1] = y0; positions[idx * 6 + 2] = z0
       positions[idx * 6 + 3] = x1; positions[idx * 6 + 4] = y1; positions[idx * 6 + 5] = z1
       colors[idx * 6]     = col.r; colors[idx * 6 + 1] = col.g; colors[idx * 6 + 2] = col.b
@@ -419,6 +428,7 @@ export default function CoveragePage({ aircraft = [] }) {
         bearing:     ac.bearing_deg,
         range:       ac.range_nm,
         alt:         ac.altitude,
+        ts:          Date.now() / 1000,
         military:    ac.military,
         mlat:        ac.mlat,
         interesting: ac.interesting,
