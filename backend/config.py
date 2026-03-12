@@ -115,3 +115,5 @@ NOTIFY_EMERGENCY:    bool = _bool("NOTIFY_EMERGENCY",    True)
 NOTIFY_ACAS:         bool = _bool("NOTIFY_ACAS",         False)
 NOTIFY_MILITARY:     bool = _bool("NOTIFY_MILITARY",     False)
 NOTIFY_INTERESTING:  bool = _bool("NOTIFY_INTERESTING",  False)
+
+DEBUG_LOG: bool = _bool("DEBUG_LOG", False)  # set true to enable verbose logging

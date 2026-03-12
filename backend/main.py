@@ -47,10 +47,11 @@ from benchmark import make_pause_aware_decoder
 
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if config.DEBUG_LOG else logging.WARNING,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
 )
 log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)  # main module always logs at INFO regardless of DEBUG_LOG
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -216,6 +217,20 @@ async def _hexdb_task() -> None:
         await asyncio.sleep(5)
 
 
+_last_wal_checkpoint: float = 0.0
+_WAL_CHECKPOINT_INTERVAL = 3600.0  # 1 hour
+
+
+def _wal_checkpoint_passive() -> None:
+    """Run a PASSIVE WAL checkpoint — returns immediately, doesn't block readers."""
+    try:
+        with stats_db._connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        log.debug("Periodic WAL checkpoint complete")
+    except Exception:
+        log.warning("Periodic WAL checkpoint failed", exc_info=True)
+
+
 def _ghost_credible(ac: dict) -> bool:
     """Return True if this aircraft is likely real and should be persisted."""
     if config.GHOST_FILTER_MSGS <= 0:
@@ -253,6 +268,14 @@ async def _db_writer() -> None:
             credible = [ac for ac in snapshot.get("aircraft", []) if _ghost_credible(ac)]
             snapshot = {**snapshot, "aircraft": credible}
         await asyncio.to_thread(stats_db.write_minute, snapshot)
+
+        # Periodic WAL checkpoint — keeps the WAL file small between restarts.
+        # PASSIVE mode doesn't block readers or writers.
+        import time as _time
+        global _last_wal_checkpoint
+        if _time.monotonic() - _last_wal_checkpoint >= _WAL_CHECKPOINT_INTERVAL:
+            await asyncio.to_thread(_wal_checkpoint_passive)
+            _last_wal_checkpoint = _time.monotonic()
 
         # Refresh in-memory sighting counts from DB so NEW badge stays accurate
         current_icaos = [ac["icao"] for ac in snapshot.get("aircraft", [])]

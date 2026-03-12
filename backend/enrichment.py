@@ -276,10 +276,21 @@ _HEXDB_LRU_MAX = 5000
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _fetch(url: str, timeout: int = 30) -> bytes:
+def _fetch(url: str, timeout: int = 15, _attempts: int = 3) -> bytes:
+    """Fetch URL with retries and exponential backoff (1 s, 2 s).
+    Default timeout reduced to 15 s — 30 s stalled startup enrichment too long on slow links."""
     req = urllib.request.Request(url, headers={"User-Agent": "adsb-dashboard"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    last_exc: Exception = RuntimeError("no attempts made")
+    for attempt in range(_attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _attempts - 1:
+                time.sleep(2 ** attempt)  # 1 s, then 2 s
+            log.debug("_fetch attempt %d/%d failed for %s: %s", attempt + 1, _attempts, url, exc)
+    raise last_exc
 
 
 def _decompress(raw: bytes) -> str:
