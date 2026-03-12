@@ -289,18 +289,12 @@ async def _db_writer() -> None:
         if config.RECEIVER_LAT is not None and config.RECEIVER_LON is not None:
             now_ts = int(time.time())
             samples = [
-                {
-                    "ts":          now_ts,
-                    "icao":        ac["icao"],
-                    "bearing_deg": ac["bearing_deg"],
-                    "range_nm":    ac["range_nm"],
-                    "altitude":    ac.get("altitude"),
-                    "signal":      ac.get("signal"),
-                }
+                (now_ts, ac["icao"], ac["bearing_deg"], ac["range_nm"],
+                 ac.get("altitude"), ac.get("signal"))
                 for ac in snapshot.get("aircraft", [])
                 if ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
             ]
-            await asyncio.to_thread(stats_db.write_coverage, samples)
+            await asyncio.to_thread(stats_db.write_coverage_tuples, samples)
 
         # Drain pending ACAS events to DB and fire notifications
         acas_evts = state.pop_acas_events()
@@ -380,31 +374,40 @@ async def _push_updates() -> None:
         # Avoids dispatching any threads for triggers the user has turned off.
         _mil_on  = _notify_enabled and notifications.trigger_enabled("notify_military")
         _int_on  = _notify_enabled and notifications.trigger_enabled("notify_interesting")
+        # Collect matching aircraft first; dispatch at most 3 threads per cycle
+        # regardless of how many aircraft match, replacing the previous O(N) dispatch.
+        _mil_batch: list[dict] = []
+        _int_batch: list[dict] = []
+        _wl_batch:  list[dict] = []
         t_loop_start = time.perf_counter()
         for ac in snapshot["aircraft"]:
             icao = ac["icao"]
             if _notify_enabled:
-                # Pre-check _notified before dispatching any thread — already-seen
-                # aircraft (the vast majority) are skipped with a cheap set lookup.
                 if icao in _watchlist_cache and not notifications.already_notified(f"watchlist:{icao}"):
-                    notify_tasks.append(asyncio.to_thread(
-                        notifications.notify_watchlist,
-                        icao, ac.get("callsign"), ac.get("registration"),
-                        ac.get("operator"), ac.get("altitude"),
-                        ac.get("range_nm"), _watchlist_cache[icao],
-                    ))
+                    _wl_batch.append({
+                        "icao": icao, "callsign": ac.get("callsign"),
+                        "registration": ac.get("registration"), "operator": ac.get("operator"),
+                        "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
+                        "max_range_nm": _watchlist_cache[icao],
+                    })
                 if _mil_on and ac.get("military") and not notifications.already_notified(f"military:{icao}"):
-                    notify_tasks.append(asyncio.to_thread(
-                        notifications.notify_military,
-                        icao, ac.get("callsign"), ac.get("operator"),
-                        ac.get("country"), ac.get("altitude"), ac.get("range_nm"),
-                    ))
+                    _mil_batch.append({
+                        "icao": icao, "callsign": ac.get("callsign"),
+                        "operator": ac.get("operator"), "country": ac.get("country"),
+                        "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
+                    })
                 if _int_on and ac.get("interesting") and not notifications.already_notified(f"interesting:{icao}"):
-                    notify_tasks.append(asyncio.to_thread(
-                        notifications.notify_interesting,
-                        icao, ac.get("callsign"), ac.get("type_code"),
-                        ac.get("operator"), ac.get("altitude"), ac.get("range_nm"),
-                    ))
+                    _int_batch.append({
+                        "icao": icao, "callsign": ac.get("callsign"),
+                        "type_code": ac.get("type_code"), "operator": ac.get("operator"),
+                        "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
+                    })
+        if _mil_batch:
+            notify_tasks.append(asyncio.to_thread(notifications.notify_military_batch, _mil_batch))
+        if _int_batch:
+            notify_tasks.append(asyncio.to_thread(notifications.notify_interesting_batch, _int_batch))
+        if _wl_batch:
+            notify_tasks.append(asyncio.to_thread(notifications.notify_watchlist_batch, _wl_batch))
 
             # Only record once the position is confirmed reliable:
             # - pos_global=True: a global CPR decode (even+odd pair) has succeeded,

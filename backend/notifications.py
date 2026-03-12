@@ -321,3 +321,23 @@ def notify_interesting(icao: str, callsign: str | None, type_code: str | None,
         lines.append(f"Operator: {operator}")
     lines.append(f"ICAO: {icao}")
     _send(f"Interesting: {ident}", "\n".join(lines), tags="eyes", icao=icao)
+
+
+# ---------------------------------------------------------------------------
+# Batch wrappers — called with a list of aircraft dicts, at most once per
+# trigger type per _push_updates cycle, replacing the old per-aircraft dispatch.
+# ---------------------------------------------------------------------------
+
+def notify_military_batch(aircraft: list[dict]) -> None:
+    for ac in aircraft:
+        notify_military(**ac)
+
+
+def notify_interesting_batch(aircraft: list[dict]) -> None:
+    for ac in aircraft:
+        notify_interesting(**ac)
+
+
+def notify_watchlist_batch(aircraft: list[dict]) -> None:
+    for ac in aircraft:
+        notify_watchlist(**ac)

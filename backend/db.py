@@ -710,6 +710,18 @@ class StatsDB:
                 samples,
             )
 
+    def write_coverage_tuples(self, samples: list[tuple]) -> None:
+        """Like write_coverage but accepts pre-built (ts, icao, bearing_deg, range_nm,
+        altitude, signal) tuples — avoids per-row dict construction in the caller."""
+        if not samples:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO coverage_samples "
+                "(ts, icao, bearing_deg, range_nm, altitude, signal) VALUES (?,?,?,?,?,?)",
+                samples,
+            )
+
     def query_polar(self, days: int, max_points: int = 8000) -> list[dict]:
         """Coverage samples for the last N days, downsampled to max_points for polar scatter plot."""
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
