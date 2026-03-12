@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import styles from './CoveragePage.module.css'
-import { NAMED_PALETTE, TYPE_GROUPS, TYPE_GROUP_OTHER_COLOR } from '../utils/typeGroups'
+import { NAMED_PALETTE, TYPE_GROUPS, TYPE_GROUP_OTHER_COLOR, getTypeGroup } from '../utils/typeGroups'
 
 const VERT_EXAG     = 8
 const FEET_PER_NM   = 6076.115
@@ -109,8 +109,27 @@ function buildPoints(points, colorMode) {
   }))
 }
 
+// Colour for a live trail/dot based on colorMode.
+// Altitude mode is handled per-vertex in buildTrails; this covers the rest.
+function liveAcColor(pt, colorMode, operators) {
+  if (colorMode === 'type_group') {
+    const g = getTypeGroup(pt.type_code, pt.type_category)
+    return g ? new THREE.Color(g.color) : C_TG_OTHER
+  }
+  if (colorMode === 'operator') {
+    const idx = operators ? operators.indexOf(pt.operator) : -1
+    return idx >= 0 ? C_OP_PALETTE[idx] : C_OP_OTHER
+  }
+  // tag / default (also used as fallback for altitude mode at the dot level)
+  return pt.acas        ? C_TRAIL.acas
+       : pt.military    ? C_TRAIL.military
+       : pt.mlat        ? C_TRAIL.mlat
+       : pt.interesting ? C_TRAIL.interesting
+       : C_TRAIL.standard
+}
+
 // Build merged LineSegments for all live aircraft trails
-function buildTrails(trails) {
+function buildTrails(trails, colorMode, operators) {
   let totalSegs = 0
   for (const pts of Object.values(trails)) {
     if (pts.length >= 2) totalSegs += pts.length - 1
@@ -123,12 +142,8 @@ function buildTrails(trails) {
   let idx = 0
   for (const pts of Object.values(trails)) {
     if (pts.length < 2) continue
-    const last = pts[pts.length - 1]
-    const col = last.acas        ? C_TRAIL.acas
-              : last.military    ? C_TRAIL.military
-              : last.mlat        ? C_TRAIL.mlat
-              : last.interesting ? C_TRAIL.interesting
-              : C_TRAIL.standard
+    // For non-altitude modes, one colour per aircraft (from last point)
+    const acCol = colorMode !== 'altitude' ? liveAcColor(pts[pts.length - 1], colorMode, operators) : null
 
     for (let i = 0; i < pts.length - 1; i++) {
       const a = pts[i], b = pts[i + 1]
@@ -138,10 +153,13 @@ function buildTrails(trails) {
       if (Math.abs(b.range   - a.range)   > MAX_RANGE_JUMP_NM) continue
       const [x0, y0, z0] = toWorld(a.bearing, a.range, a.alt ?? 0)
       const [x1, y1, z1] = toWorld(b.bearing, b.range, b.alt ?? 0)
+      // Altitude mode: colour each vertex by its own altitude (gradient along trail)
+      const colA = colorMode === 'altitude' ? altColor(a.alt ?? 0) : acCol
+      const colB = colorMode === 'altitude' ? altColor(b.alt ?? 0) : acCol
       positions[idx * 6]     = x0; positions[idx * 6 + 1] = y0; positions[idx * 6 + 2] = z0
       positions[idx * 6 + 3] = x1; positions[idx * 6 + 4] = y1; positions[idx * 6 + 5] = z1
-      colors[idx * 6]     = col.r; colors[idx * 6 + 1] = col.g; colors[idx * 6 + 2] = col.b
-      colors[idx * 6 + 3] = col.r; colors[idx * 6 + 4] = col.g; colors[idx * 6 + 5] = col.b
+      colors[idx * 6]     = colA.r; colors[idx * 6 + 1] = colA.g; colors[idx * 6 + 2] = colA.b
+      colors[idx * 6 + 3] = colB.r; colors[idx * 6 + 4] = colB.g; colors[idx * 6 + 5] = colB.b
       idx++
     }
   }
@@ -157,7 +175,7 @@ function buildTrails(trails) {
 }
 
 // Build a Points object with one bright dot at each aircraft's current position
-function buildLiveDots(trails) {
+function buildLiveDots(trails, colorMode, operators) {
   const entries = Object.values(trails).filter(pts => pts.length > 0)
   if (entries.length === 0) return null
 
@@ -171,11 +189,8 @@ function buildLiveDots(trails) {
     positions[i * 3]     = x
     positions[i * 3 + 1] = y
     positions[i * 3 + 2] = z
-    const col = last.acas        ? C_TRAIL.acas
-              : last.military    ? C_TRAIL.military
-              : last.mlat        ? C_TRAIL.mlat
-              : last.interesting ? C_TRAIL.interesting
-              : C_TRAIL.standard
+    const col = colorMode === 'altitude' ? altColor(last.alt ?? 0)
+              : liveAcColor(last, colorMode, operators)
     colors[i * 3]     = col.r
     colors[i * 3 + 1] = col.g
     colors[i * 3 + 2] = col.b
@@ -447,14 +462,17 @@ export default function CoveragePage({ aircraft = [] }) {
           Math.abs(last.bearing - ac.bearing_deg) < 0.05 &&
           Math.abs(last.range   - ac.range_nm)    < 0.05) continue
       trail.push({
-        bearing:     ac.bearing_deg,
-        range:       ac.range_nm,
-        alt:         ac.altitude,
-        ts:          Date.now() / 1000,
-        military:    ac.military,
-        mlat:        ac.mlat,
-        interesting: ac.interesting,
-        acas:        ac.acas_ra_active,
+        bearing:       ac.bearing_deg,
+        range:         ac.range_nm,
+        alt:           ac.altitude,
+        ts:            Date.now() / 1000,
+        military:      ac.military,
+        mlat:          ac.mlat,
+        interesting:   ac.interesting,
+        acas:          ac.acas_ra_active,
+        type_code:     ac.type_code,
+        type_category: ac.type_category,
+        operator:      ac.operator,
       })
       if (trail.length > MAX_TRAIL_PTS) trail.splice(0, trail.length - MAX_TRAIL_PTS)
     }
@@ -473,11 +491,11 @@ export default function CoveragePage({ aircraft = [] }) {
       ref.liveDotsObj.material.dispose()
       ref.liveDotsObj = null
     }
-    const mesh = buildTrails(trails)
+    const mesh = buildTrails(trails, colorMode, operators)
     if (mesh) { scene.add(mesh); ref.trailsObj = mesh }
-    const dots = buildLiveDots(trails)
+    const dots = buildLiveDots(trails, colorMode, operators)
     if (dots) { scene.add(dots); ref.liveDotsObj = dots }
-  }, [aircraft, showMode])
+  }, [aircraft, showMode, colorMode, operators])
 
   const resetCamera = useCallback(() => {
     const ref = sceneRef.current
