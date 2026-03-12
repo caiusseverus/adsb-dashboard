@@ -57,7 +57,7 @@ function toWorld(bearing_deg, range_nm, alt_ft) {
   return [
     range_nm * Math.sin(rad),
     (alt_ft / FEET_PER_NM) * VERT_EXAG,
-    range_nm * Math.cos(rad),
+    -range_nm * Math.cos(rad),   // negate: North (0°) → −Z, into scene
   ]
 }
 
@@ -201,7 +201,7 @@ function makeSpoke(bearing_deg, length) {
   return new THREE.Line(
     new THREE.BufferGeometry().setFromPoints([
       new THREE.Vector3(0, 0, 0),
-      new THREE.Vector3(Math.sin(rad) * length, 0, Math.cos(rad) * length),
+      new THREE.Vector3(Math.sin(rad) * length, 0, -Math.cos(rad) * length),
     ]),
     new THREE.LineBasicMaterial({ color: 0x30363d }),
   )
@@ -277,8 +277,8 @@ export default function CoveragePage({ aircraft = [] }) {
     for (const b of [0, 90, 180, 270]) scene.add(makeSpoke(b, 270))
 
     const LR = 278
-    scene.add(makeLabel('N',    0,  LR))
-    scene.add(makeLabel('S',    0, -LR))
+    scene.add(makeLabel('N',    0, -LR))
+    scene.add(makeLabel('S',    0,  LR))
     scene.add(makeLabel('E',  LR,    0))
     scene.add(makeLabel('W', -LR,    0))
 
