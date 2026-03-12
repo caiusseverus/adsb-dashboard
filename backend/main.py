@@ -1,5 +1,13 @@
 import asyncio
 import json
+try:
+    import orjson as _orjson
+    def _json_dumps(obj: dict) -> str:
+        return _orjson.dumps(obj).decode("utf-8")
+except ImportError:
+    _orjson = None  # type: ignore[assignment]
+    def _json_dumps(obj: dict) -> str:  # type: ignore[misc]
+        return json.dumps(obj)
 import logging
 import queue
 import threading
@@ -399,7 +407,7 @@ async def _push_updates() -> None:
             })
             continue
 
-        payload = json.dumps(snapshot)
+        payload = _json_dumps(snapshot)
         dead: list[WebSocket] = []
 
         for ws in list(_clients):
@@ -547,7 +555,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
 
     try:
         # Send the current snapshot immediately on connect
-        await ws.send_text(json.dumps(state.get_snapshot()))
+        await ws.send_text(_json_dumps(state.get_snapshot()))
         # Keep the connection open; the push loop handles subsequent updates
         while True:
             await ws.receive_text()
