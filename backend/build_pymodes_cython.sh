@@ -24,16 +24,22 @@ echo "Installing Cython and setuptools into venv…"
 uv pip install --quiet cython setuptools
 
 echo "Downloading pyModeS 2.9 source…"
-TMPDIR="$(mktemp -d)"
+export TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
-uv pip download "pymodes==2.9" --no-deps --no-binary pymodes -d "$TMPDIR" -q
+"$VENV_PYTHON" - << 'PYEOF'
+import json, urllib.request, sys, os
+tmpdir = os.environ["TMPDIR"]
+meta = json.loads(urllib.request.urlopen("https://pypi.org/pypi/pymodes/2.9/json").read())
+url = next(u["url"] for u in meta["urls"] if u["packagetype"] == "sdist")
+urllib.request.urlretrieve(url, os.path.join(tmpdir, "pyModeS-2.9.tar.gz"))
+PYEOF
 tar -xzf "$TMPDIR"/pyModeS-2.9.tar.gz -C "$TMPDIR"
+
+SITE="$("$VENV_PYTHON" -c "import pyModeS, os; print(os.path.dirname(pyModeS.__file__))")"
 
 echo "Building c_common extension…"
 cd "$TMPDIR/pyModeS-2.9"
 "$VENV_PYTHON" setup.py build_ext --inplace -q
-
-SITE="$("$VENV_PYTHON" -c "import pyModeS, os; print(os.path.dirname(pyModeS.__file__))")"
 cp pyModeS/c_common.cpython-*.so "$SITE/"
 echo "Installed c_common extension to $SITE"
 
