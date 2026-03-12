@@ -108,6 +108,14 @@ async def _db_update_checker() -> None:
         await asyncio.to_thread(enrichment.db.check_for_updates)
 
 
+async def _hexdb_cache_flusher() -> None:
+    """Flush the hexdb cache to SD at most every 5 minutes, only when dirty.
+    Batches all lookups since the last flush into a single gzip write."""
+    while True:
+        await asyncio.sleep(300)
+        await asyncio.to_thread(enrichment.db.flush_hexdb_cache_if_dirty)
+
+
 async def _backup_runner() -> None:
     """Nightly backup at local midnight. Uses DB-configured path (falls back to env var)."""
     while True:
@@ -457,6 +465,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_push_updates())
     asyncio.create_task(_db_writer())
     asyncio.create_task(_db_update_checker())
+    asyncio.create_task(_hexdb_cache_flusher())
     asyncio.create_task(_hexdb_task())
     asyncio.create_task(_backup_runner())  # runs nightly; path resolved from DB/env at runtime
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",

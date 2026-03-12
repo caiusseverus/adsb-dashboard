@@ -268,6 +268,8 @@ _HEXDB_CACHE_FILE = "hexdb_cache.json.gz"
 
 # Per-ICAO LRU cache size — covers active aircraft with headroom
 _LRU_MAX = 2000
+# hexdb persistent cache cap — ~400 bytes/entry; 5000 ≈ 2 MB
+_HEXDB_LRU_MAX = 5000
 
 
 # ---------------------------------------------------------------------------
@@ -304,8 +306,10 @@ class EnrichmentDB:
         # tar1090-db auxiliary (small, kept in RAM — ~1.5MB total)
         self._operators: dict[str, dict] = {}
         self._type_info: dict[str, dict] = {}
-        # hexdb.io persistent cache: ICAO_UPPER → response dict (successes only)
-        self._hexdb_cache: dict[str, dict] = {}
+        # hexdb.io persistent cache: ICAO_UPPER → response dict (successes only).
+        # Bounded LRU — prevents unbounded growth on high-traffic receivers.
+        self._hexdb_cache: OrderedDict[str, dict] = OrderedDict()
+        self._hexdb_dirty: bool = False   # True when cache has unsaved entries
         # ICAOs that returned no data this session — not persisted, retried on restart
         self._hexdb_session_misses: set[str] = set()
 
@@ -326,6 +330,13 @@ class EnrichmentDB:
         cache.move_to_end(key)
         while len(cache) > _LRU_MAX:
             cache.popitem(last=False)
+
+    def _lru_put_hexdb(self, key: str, value: object) -> None:
+        """Like _lru_put but uses the larger _HEXDB_LRU_MAX cap."""
+        self._hexdb_cache[key] = value
+        self._hexdb_cache.move_to_end(key)
+        while len(self._hexdb_cache) > _HEXDB_LRU_MAX:
+            self._hexdb_cache.popitem(last=False)
 
     # ------------------------------------------------------------------
     # Public API
@@ -395,7 +406,8 @@ class EnrichmentDB:
 
     def get_hexdb_cached(self, icao: str) -> Optional[dict]:
         """Return a previously cached successful hexdb lookup, or None (no HTTP call)."""
-        return self._hexdb_cache.get(icao.upper())
+        found, val = self._lru_get(self._hexdb_cache, icao.upper())
+        return val if found else None  # type: ignore[return-value]
 
     def get_tar1090_cached(self, icao: str) -> Optional[dict]:
         """Return tar1090-db data if the ICAO is already in the LRU cache, else None.
@@ -471,10 +483,12 @@ class EnrichmentDB:
         Intended to be called via asyncio.to_thread.
         Only successful lookups are persisted; failures are tracked in-memory
         only and retried on the next app restart.
+        Does NOT write to disk immediately — sets _hexdb_dirty for the periodic flusher.
         """
         key = icao.upper()
-        if key in self._hexdb_cache:
-            return self._hexdb_cache[key]
+        found, val = self._lru_get(self._hexdb_cache, key)
+        if found:
+            return val  # type: ignore[return-value]
         if key in self._hexdb_session_misses:
             return None
         try:
@@ -486,8 +500,9 @@ class EnrichmentDB:
         if not data:
             self._hexdb_session_misses.add(key)
             return None
-        self._hexdb_cache[key] = data
-        self._save_hexdb_cache()
+        # Use _lru_put so the cache stays bounded at _HEXDB_LRU_MAX entries
+        self._lru_put_hexdb(key, data)
+        self._hexdb_dirty = True   # flush deferred to _hexdb_cache_flusher in main.py
         return data
 
     def force_lookup_hexdb(self, icao: str) -> Optional[dict]:
@@ -502,10 +517,19 @@ class EnrichmentDB:
             return None
         if not data:
             return None
-        self._hexdb_cache[key] = data
+        self._lru_put_hexdb(key, data)
         self._hexdb_session_misses.discard(key)
-        self._save_hexdb_cache()
+        self._hexdb_dirty = True
         return data
+
+    def flush_hexdb_cache_if_dirty(self) -> None:
+        """Write the hexdb cache to disk if it has unsaved entries.
+        Called periodically from a background task — not on every lookup."""
+        if not self._hexdb_dirty:
+            return
+        self._save_hexdb_cache()
+        self._hexdb_dirty = False
+        log.debug("Enrichment: hexdb cache flushed to disk (%d entries)", len(self._hexdb_cache))
 
     # ------------------------------------------------------------------
     # ADSBExchange — SQLite backend
@@ -758,8 +782,11 @@ class EnrichmentDB:
             return
         try:
             raw = json.loads(gzip.decompress(path.read_bytes()).decode("utf-8"))
-            # Strip any empty-dict failure entries written by older versions
-            self._hexdb_cache = {k: v for k, v in raw.items() if v}
+            # Strip empty-dict failure entries written by older versions, then cap to LRU limit.
+            # Oldest entries (lowest insertion order) are dropped first if the file is oversized.
+            self._hexdb_cache = OrderedDict((k, v) for k, v in raw.items() if v)
+            while len(self._hexdb_cache) > _HEXDB_LRU_MAX:
+                self._hexdb_cache.popitem(last=False)
             log.info("Enrichment: loaded %d hexdb cache entries", len(self._hexdb_cache))
         except Exception as exc:
             log.warning("Enrichment: hexdb cache load failed: %s", exc)
