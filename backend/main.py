@@ -144,6 +144,21 @@ async def _backup_runner() -> None:
             log.exception("Nightly backup failed")
 
 
+async def _adsbx_task() -> None:
+    """Drain the ADSBx enrichment queue for newly-seen aircraft.
+
+    Runs every 0.5s, up to 20 ICAOs per cycle. No rate limit — this is a local
+    SQLite lookup, not an HTTP call. The decode thread is never blocked on this I/O.
+    """
+    await asyncio.sleep(2)  # brief startup delay — let the decoder warm up first
+    while True:
+        batch = state.pop_adsbx_queue(max_n=20)
+        for icao in batch:
+            adsbx = await asyncio.to_thread(enrichment.db.get_adsbx, icao)
+            state.apply_adsbx(icao, adsbx)
+        await asyncio.sleep(0.5)
+
+
 async def _hexdb_task() -> None:
     """Process hexdb.io fallback lookups at a polite rate (1 req/sec).
     Checks the queue every 5 seconds; new aircraft are enriched within ~5s of first contact."""
@@ -480,6 +495,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_db_writer())
     asyncio.create_task(_db_update_checker())
     asyncio.create_task(_hexdb_cache_flusher())
+    asyncio.create_task(_adsbx_task())
     asyncio.create_task(_hexdb_task())
     asyncio.create_task(_backup_runner())  # runs nightly; path resolved from DB/env at runtime
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",
