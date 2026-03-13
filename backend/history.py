@@ -246,3 +246,13 @@ async def notable(
         type_desc = (f"{mfr} {model}".strip()) or None
         row["type_desc"] = type_desc or row.get("manufacturer") or None
     return {"total": total, "items": rows}
+
+
+@router.post("/visits/cleanup")
+async def visits_cleanup(max_gap_mins: int = 10) -> dict:
+    """Merge adjacent visit records for the same aircraft that were split by a
+    backend restart or brief signal loss.  max_gap_mins: maximum gap (minutes)
+    between end of one visit and start of the next to consider them the same flight."""
+    max_gap_secs = max(1, min(max_gap_mins, 60)) * 60  # clamp 1–60 minutes
+    merged = await asyncio.to_thread(stats_db.merge_short_visits, max_gap_secs)
+    return {"merged": merged, "max_gap_mins": max_gap_mins}

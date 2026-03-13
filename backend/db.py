@@ -2663,6 +2663,88 @@ class StatsDB:
                 (origin_icao, dest_icao, visit_id),
             )
 
+    def merge_short_visits(self, max_gap_secs: int = 600) -> int:
+        """Merge adjacent visits for the same ICAO that were likely split by a backend
+        restart or brief signal loss.
+
+        Two visits are merged when:
+        - Same ICAO
+        - Gap between end_ts and next start_ts < max_gap_secs
+        - Callsigns are compatible: same value, or at least one is null/empty
+
+        Merged record keeps: earliest start_ts, latest end_ts, non-null callsign,
+        summed msg_count, highest max_altitude, origin_icao from the earlier visit,
+        dest_icao from the later visit.
+
+        Returns the number of rows deleted (absorbed into their predecessor).
+        """
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT id, icao, start_ts, end_ts, callsign, squawk,
+                       max_altitude, msg_count, origin_icao, dest_icao
+                FROM visits
+                ORDER BY icao, start_ts
+            """).fetchall()
+
+        # Group by ICAO — preserve insertion order (Python 3.7+)
+        by_icao: dict[str, list[dict]] = {}
+        for row in rows:
+            by_icao.setdefault(row["icao"], []).append(dict(row))
+
+        updates: list[tuple] = []  # (end_ts, callsign, squawk, max_alt, msg_count, orig, dest, id)
+        deletes: list[int] = []
+
+        for visits in by_icao.values():
+            i = 0
+            while i < len(visits) - 1:
+                a, b = visits[i], visits[i + 1]
+                gap = b["start_ts"] - a["end_ts"]
+
+                cs_a = (a["callsign"] or "").strip().rstrip("_")
+                cs_b = (b["callsign"] or "").strip().rstrip("_")
+                compatible = (not cs_a) or (not cs_b) or (cs_a == cs_b)
+
+                if gap < max_gap_secs and compatible:
+                    alts = [x for x in (a["max_altitude"], b["max_altitude"]) if x is not None]
+                    merged: dict = {
+                        "id":          a["id"],
+                        "end_ts":      b["end_ts"],
+                        "callsign":    cs_a or cs_b or None,
+                        "squawk":      a["squawk"] or b["squawk"],
+                        "max_altitude": max(alts) if alts else None,
+                        "msg_count":   (a["msg_count"] or 0) + (b["msg_count"] or 0),
+                        "origin_icao": a["origin_icao"] or b["origin_icao"],
+                        "dest_icao":   b["dest_icao"] or a["dest_icao"],
+                    }
+                    updates.append((
+                        merged["end_ts"], merged["callsign"], merged["squawk"],
+                        merged["max_altitude"], merged["msg_count"],
+                        merged["origin_icao"], merged["dest_icao"], merged["id"],
+                    ))
+                    deletes.append(b["id"])
+                    # Replace a in-place so it can absorb further neighbours
+                    visits[i] = {**a, **{k: v for k, v in merged.items() if k != "id"}}
+                    visits.pop(i + 1)
+                else:
+                    i += 1
+
+        if updates or deletes:
+            with self._connect() as conn:
+                for u in updates:
+                    conn.execute("""
+                        UPDATE visits
+                        SET end_ts=?, callsign=?, squawk=?, max_altitude=?,
+                            msg_count=?, origin_icao=?, dest_icao=?
+                        WHERE id=?
+                    """, u)
+                if deletes:
+                    conn.execute(
+                        f"DELETE FROM visits WHERE id IN ({','.join('?' * len(deletes))})",
+                        deletes,
+                    )
+
+        return len(deletes)
+
     def query_visits(self, icao: str, limit: int = 20) -> list[dict]:
         """Return visit records for an aircraft, newest first."""
         with self._connect() as conn:
