@@ -309,6 +309,13 @@ a.fieldValue:hover { text-decoration: underline; }
   background: #1c2128;
 }
 
+.visitTime {
+  font-variant-numeric: tabular-nums;
+  color: #8b949e;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
 .visitCallsign {
   font-family: monospace;
   font-weight: 600;

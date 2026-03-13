@@ -11,9 +11,23 @@ const EMERGENCY_SQUAWKS = {
   '7500': 'Hijack',
 }
 
-function fmtDate(unix) {
+function fmtDateTime(unix) {
   if (!unix) return '—'
-  return new Date(unix * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+  const d = new Date(unix * 1000)
+  return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short' })
+    + ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false })
+}
+
+function fmtTime(unix) {
+  if (!unix) return '—'
+  return new Date(unix * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false })
+}
+
+// Same calendar day in local time?
+function sameDay(startTs, endTs) {
+  if (!startTs || !endTs) return false
+  const a = new Date(startTs * 1000), b = new Date(endTs * 1000)
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
 }
 
 function fmtAlt(alt) {
@@ -349,7 +363,8 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
                 <table className={styles.visitsTable}>
                   <thead>
                     <tr>
-                      <th>Date</th>
+                      <th>Start</th>
+                      <th>End</th>
                       <th>Callsign</th>
                       <th>Route</th>
                       <th>Max alt</th>
@@ -364,7 +379,8 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
                           onClick={() => handleVisitRowClick(v.id)}
                           title="Click to show track"
                         >
-                          <td>{fmtDate(v.start_ts)}</td>
+                          <td className={styles.visitTime}>{fmtDateTime(v.start_ts)}</td>
+                          <td className={styles.visitTime}>{sameDay(v.start_ts, v.end_ts) ? fmtTime(v.end_ts) : fmtDateTime(v.end_ts)}</td>
                           <td><span className={styles.visitCallsign}>{v.callsign || '—'}</span></td>
                           <td>
                             {(v.origin_icao || v.dest_icao)
@@ -377,7 +393,7 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
                         </tr>
                         {activeVisitId === v.id && (
                           <tr>
-                            <td colSpan={5} style={{ padding: '0 0.5rem 0.5rem' }}>
+                            <td colSpan={6} style={{ padding: '0 0.5rem 0.5rem' }}>
                               <MiniMap icao={icao} visitId={v.id} />
                             </td>
                           </tr>
