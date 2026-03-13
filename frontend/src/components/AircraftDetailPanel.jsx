@@ -283,7 +283,7 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
                 {data.history && (
                   <>
                     <Field label="First seen"
-                      value={fmtDate(data.history.first_seen)} />
+                      value={fmtDateTime(data.history.first_seen)} />
                     <Field label="Sessions"
                       value={data.history.sighting_count} />
                   </>
