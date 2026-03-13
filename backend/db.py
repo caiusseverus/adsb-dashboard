@@ -2663,6 +2663,54 @@ class StatsDB:
                 (origin_icao, dest_icao, visit_id),
             )
 
+    def query_visits(self, icao: str, limit: int = 20) -> list[dict]:
+        """Return visit records for an aircraft, newest first."""
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT id, icao, start_ts, end_ts, callsign, squawk,
+                       max_altitude, msg_count, origin_icao, dest_icao
+                FROM visits
+                WHERE icao = ?
+                ORDER BY start_ts DESC
+                LIMIT ?
+            """, (icao.upper(), limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def query_visit_track(self, icao: str, start_ts: int, end_ts: int,
+                          receiver_lat: float, receiver_lon: float) -> list[dict]:
+        """Return lat/lon track points reconstructed from coverage_samples bearing/range."""
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT ts, bearing_deg, range_nm, altitude
+                FROM coverage_samples
+                WHERE icao = ? AND ts BETWEEN ? AND ?
+                  AND bearing_deg IS NOT NULL AND range_nm IS NOT NULL AND range_nm > 0
+                ORDER BY ts
+            """, (icao.upper(), start_ts, end_ts)).fetchall()
+
+        R = 6371.0  # km
+        lat1 = math.radians(receiver_lat)
+        lon1 = math.radians(receiver_lon)
+        points = []
+        for row in rows:
+            bearing = math.radians(row["bearing_deg"])
+            d = row["range_nm"] * 1.852 / R  # nm → km → radians
+            lat2 = math.asin(
+                math.sin(lat1) * math.cos(d)
+                + math.cos(lat1) * math.sin(d) * math.cos(bearing)
+            )
+            lon2 = lon1 + math.atan2(
+                math.sin(bearing) * math.sin(d) * math.cos(lat1),
+                math.cos(d) - math.sin(lat1) * math.sin(lat2),
+            )
+            points.append({
+                "ts":       row["ts"],
+                "lat":      round(math.degrees(lat2), 5),
+                "lon":      round(math.degrees(lon2), 5),
+                "altitude": row["altitude"],
+            })
+        return points
+
 
 # Module-level singleton
 stats_db = StatsDB()

@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from 'react'
+import { Fragment, useState, useEffect, useCallback, useRef } from 'react'
+import L from 'leaflet'
 import styles from './AircraftDetailPanel.module.css'
 import { formatOperator } from '../utils/formatOperator'
 
@@ -10,112 +11,104 @@ const EMERGENCY_SQUAWKS = {
   '7500': 'Hijack',
 }
 
-function fmtTs(unix) {
+function fmtDate(unix) {
   if (!unix) return '—'
-  return new Date(unix * 1000).toLocaleString()
+  return new Date(unix * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
 }
 
 function fmtAlt(alt) {
-  if (alt == null) return '—'
+  if (alt == null) return null
   return alt.toLocaleString() + ' ft'
 }
 
-function Field({ label, value, className }) {
+function fmtDuration(startTs, endTs) {
+  if (!startTs || !endTs) return null
+  const secs = endTs - startTs
+  if (secs < 60) return `${secs}s`
+  const mins = Math.floor(secs / 60)
+  if (mins < 60) return `${mins}m`
+  return `${Math.floor(mins / 60)}h ${mins % 60}m`
+}
+
+function Field({ label, value, href }) {
   if (value == null || value === '') return null
   return (
     <div className={styles.field}>
       <span className={styles.fieldLabel}>{label}</span>
-      <span className={`${styles.fieldValue} ${className ?? ''}`}>{value}</span>
+      {href
+        ? <a className={styles.fieldValue} href={href} target="_blank" rel="noopener noreferrer">{value}</a>
+        : <span className={styles.fieldValue}>{value}</span>
+      }
     </div>
   )
 }
 
-function Section({ title, children }) {
-  return (
-    <div className={styles.section}>
-      <div className={styles.sectionTitle}>{title}</div>
-      {children}
-    </div>
-  )
-}
+// Reconstruct lat/lon track from visit on a Leaflet mini-map
+function MiniMap({ icao, visitId }) {
+  const containerRef = useRef(null)
+  const mapRef = useRef(null)
 
-function PhotoSection({ icao }) {
-  const [photo, setPhoto] = useState(undefined) // undefined=loading, null=none, obj=data
   useEffect(() => {
-    fetch(`https://api.planespotters.net/pub/photos/hex/${icao}`)
-      .then(r => r.ok ? r.json() : null)
-      .then(d => {
-        const p = d?.photos?.[0]
-        setPhoto(p ? { src: p.thumbnail_large?.src || p.thumbnail?.src, link: p.link, photographer: p.photographer } : null)
+    if (!containerRef.current) return
+
+    // Init map once
+    if (!mapRef.current) {
+      mapRef.current = L.map(containerRef.current, {
+        zoomControl: true,
+        attributionControl: false,
+        scrollWheelZoom: false,
       })
-      .catch(() => setPhoto(null))
-  }, [icao])
+      L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        maxZoom: 18,
+      }).addTo(mapRef.current)
+    }
 
-  if (photo === undefined) return (
-    <Section title="Photo"><div className={styles.loading}>Loading…</div></Section>
-  )
-  if (!photo) return null
+    const map = mapRef.current
+    // Clear previous layers
+    map.eachLayer(l => { if (l instanceof L.Polyline || l instanceof L.CircleMarker) map.removeLayer(l) })
 
-  return (
-    <Section title="Photo">
-      <a href={photo.link} target="_blank" rel="noopener noreferrer" className={styles.photoLink}>
-        <img src={photo.src} alt={`Aircraft ${icao}`} className={styles.photo} />
-      </a>
-      {photo.photographer && (
-        <div className={styles.photoCredit}>Photo: {photo.photographer}</div>
-      )}
-    </Section>
-  )
+    fetch(`${API_BASE}/api/aircraft/${icao}/visits/${visitId}/track`)
+      .then(r => r.ok ? r.json() : [])
+      .then(pts => {
+        if (!pts.length) return
+        const latlngs = pts.map(p => [p.lat, p.lon])
+        L.polyline(latlngs, { color: '#388bfd', weight: 2, opacity: 0.8 }).addTo(map)
+        // Start/end markers
+        L.circleMarker(latlngs[0], { radius: 5, color: '#3fb950', fillColor: '#3fb950', fillOpacity: 1, weight: 0 }).addTo(map)
+        L.circleMarker(latlngs[latlngs.length - 1], { radius: 5, color: '#f85149', fillColor: '#f85149', fillOpacity: 1, weight: 0 }).addTo(map)
+        map.fitBounds(L.polyline(latlngs).getBounds(), { padding: [16, 16] })
+      })
+      .catch(() => {})
+
+    return () => {
+      // Keep map instance alive across visitId changes — don't destroy
+    }
+  }, [icao, visitId])
+
+  // Destroy on unmount
+  useEffect(() => {
+    return () => {
+      if (mapRef.current) {
+        mapRef.current.remove()
+        mapRef.current = null
+      }
+    }
+  }, [])
+
+  return <div ref={containerRef} className={styles.miniMap} />
 }
 
-function RouteSection({ icao, callsign }) {
-  const [route, setRoute] = useState(undefined) // undefined=loading, null=none, obj=data
-  const [error, setError] = useState(false)
-
-  useEffect(() => {
-    if (!callsign) { setRoute(null); return }
-    setRoute(undefined)
-    setError(false)
-    fetch(`${API_BASE}/api/aircraft/${icao}/route?callsign=${encodeURIComponent(callsign)}`)
-      .then(r => r.ok ? r.json() : null)
-      .then(data => setRoute(data))
-      .catch(() => { setError(true); setRoute(null) })
-  }, [icao, callsign])
-
-  if (!callsign) return null
-
+function RouteDisplay({ visits, visitId }) {
+  if (!visits?.length) return null
+  const v = visitId ? visits.find(x => x.id === visitId) : null
+  const visit = v || visits[0]
+  if (!visit?.origin_icao && !visit?.dest_icao) return null
   return (
-    <Section title="Route">
-      {route === undefined && <div className={styles.loading}>Loading route…</div>}
-      {error && <div className={styles.noData}>Route lookup failed</div>}
-      {route === null && !error && <div className={styles.noData}>No route data</div>}
-      {route && (
-        <div className={styles.route}>
-          <div className={styles.routeRow}>
-            <div className={styles.routeAirport}>
-              <span className={styles.routeIcao}>{route.origin?.icao ?? '?'}</span>
-              {route.origin?.info?.airport && (
-                <span className={styles.routeName}>{route.origin.info.airport}</span>
-              )}
-              {route.origin?.info?.country_code && (
-                <span className={styles.routeCountry}>{route.origin.info.country_code}</span>
-              )}
-            </div>
-            <span className={styles.routeArrow}>→</span>
-            <div className={styles.routeAirport}>
-              <span className={styles.routeIcao}>{route.destination?.icao ?? '?'}</span>
-              {route.destination?.info?.airport && (
-                <span className={styles.routeName}>{route.destination.info.airport}</span>
-              )}
-              {route.destination?.info?.country_code && (
-                <span className={styles.routeCountry}>{route.destination.info.country_code}</span>
-              )}
-            </div>
-          </div>
-          {route.flight && <Field label="Flight" value={route.flight} />}
-        </div>
-      )}
-    </Section>
+    <div className={styles.routeInline}>
+      <span className={styles.routeCode}>{visit.origin_icao ?? '?'}</span>
+      <span className={styles.routeArrow}>→</span>
+      <span className={styles.routeCode}>{visit.dest_icao ?? '?'}</span>
+    </div>
   )
 }
 
@@ -126,6 +119,9 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
   const [refreshing, setRefreshing] = useState(false)
   const [acasEvents, setAcasEvents] = useState([])
   const [watched, setWatched] = useState(false)
+  const [visits, setVisits] = useState([])
+  const [activeVisitId, setActiveVisitId] = useState(null)
+  const [photo, setPhoto] = useState(undefined) // undefined=loading, null=none, obj=loaded
 
   const load = useCallback(() => {
     if (!icao) return
@@ -148,9 +144,13 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
 
   useEffect(() => { load() }, [load])
 
-  // Live section: prefer real-time snapshot over the one-shot API response.
-  // Snapshot aircraft fields match the data.live schema directly.
-  const liveData = snapshot?.aircraft?.find(a => a.icao === icao) ?? data?.live
+  useEffect(() => {
+    if (!icao) return
+    fetch(`${API_BASE}/api/aircraft/${icao}/visits`)
+      .then(r => r.ok ? r.json() : [])
+      .then(setVisits)
+      .catch(() => setVisits([]))
+  }, [icao])
 
   useEffect(() => {
     if (!icao) return
@@ -161,10 +161,23 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
   }, [icao])
 
   useEffect(() => {
+    if (!icao) return
     fetch(`${API_BASE}/api/notify/watchlist/${icao}`)
       .then(r => r.ok ? r.json() : { watched: false })
       .then(d => setWatched(d.watched))
       .catch(() => {})
+  }, [icao])
+
+  useEffect(() => {
+    if (!icao) return
+    setPhoto(undefined)
+    fetch(`https://api.planespotters.net/pub/photos/hex/${icao}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        const p = d?.photos?.[0]
+        setPhoto(p ? { src: p.thumbnail_large?.src || p.thumbnail?.src, link: p.link, photographer: p.photographer } : null)
+      })
+      .catch(() => setPhoto(null))
   }, [icao])
 
   const toggleWatch = async () => {
@@ -177,41 +190,45 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
     if (r.ok) setWatched(w => !w)
   }
 
-  // Close on Escape
+  // Close on Escape or backdrop click
   useEffect(() => {
     function onKey(e) { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
 
+  // Live data: prefer real-time snapshot
+  const liveData = snapshot?.aircraft?.find(a => a.icao === icao) ?? data?.live
+
+  const regStr = data?.registration || ''
+  const typeStr = data?.type_code
+    ? [data.type_code, data.type_full_name].filter(Boolean).join(' · ')
+    : data?.type_desc || ''
+  const opStr = formatOperator(data?.operator) || ''
+
+  const handleVisitRowClick = (visitId) => {
+    setActiveVisitId(prev => prev === visitId ? null : visitId)
+  }
+
   return (
-    <aside className={styles.panel}>
-        <div className={styles.panelHeader}>
-          <div className={styles.panelTitle}>
-            {icao}
-            {data?.military && <span className={styles.milBadge}>MIL</span>}
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+    <div className={styles.overlay} onMouseDown={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className={styles.modal}>
+
+        {/* Header */}
+        <div className={styles.header}>
+          <span className={styles.headerIcao}>{icao}</span>
+          {data?.military && <span className={styles.milBadge}>MIL</span>}
+          {regStr && <><span className={styles.headerSep}>·</span><span className={styles.headerReg}>{regStr}</span></>}
+          {typeStr && <><span className={styles.headerSep}>·</span><span className={styles.headerType}>{typeStr}</span></>}
+          {opStr && <><span className={styles.headerSep}>·</span><span className={styles.headerOperator}>{opStr}</span></>}
+          <div className={styles.headerActions}>
             <button
+              className={`${styles.watchBtn}${watched ? ' ' + styles.watching : ''}`}
               onClick={toggleWatch}
-              style={{
-                background: watched ? '#388bfd22' : 'transparent',
-                border: `1px solid ${watched ? '#388bfd' : '#30363d'}`,
-                color: watched ? '#388bfd' : '#484f58',
-                borderRadius: 4,
-                padding: '0.15rem 0.6rem',
-                fontSize: '0.75rem',
-                cursor: 'pointer',
-              }}
-            >
-              {watched ? '★ Watching' : '☆ Watch'}
+            >{watched ? '★ Watching' : '☆ Watch'}</button>
+            <button className={styles.iconBtn} onClick={refresh} disabled={refreshing} title="Re-apply enrichment">
+              {refreshing ? '…' : '↻'}
             </button>
-            <button
-              className={styles.refreshBtn}
-              onClick={refresh}
-              disabled={refreshing}
-              title="Re-apply enrichment from ADSBex and hexdb"
-            >{refreshing ? '…' : '↻'}</button>
             <button className={styles.closeBtn} onClick={onClose} aria-label="Close">✕</button>
           </div>
         </div>
@@ -221,90 +238,164 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
 
         {data && !loading && (
           <div className={styles.body}>
-            <PhotoSection icao={icao} />
 
-            <Section title="Identity">
-              <Field label="ICAO"         value={data.icao} />
-              <Field label="Registration" value={data.registration} />
-              <Field label="Operator"     value={formatOperator(data.operator)} />
-              <Field label="Country"      value={data.country} />
-              {data.military && <Field label="Military" value="Yes" />}
-            </Section>
-
-            <Section title="Type">
-              <Field label="Type code"    value={data.type_code} />
-              <Field label="Full name"    value={data.type_full_name} />
-              <Field label="Category"     value={data.type_category} />
-              <Field label="WTC"          value={data.wtc} />
-              <Field label="Details"      value={data.type_desc} />
-              <Field label="Year"         value={data.year} />
-            </Section>
-
-            {liveData && (
-              <Section title="Live">
-                <Field label="Callsign"  value={liveData.callsign} />
-                <Field label="Altitude"  value={fmtAlt(liveData.altitude)} />
-                <Field label="Sel. alt"  value={liveData.selected_alt != null ? fmtAlt(liveData.selected_alt) : null} />
-                <Field label="Speed"     value={
-                  liveData.airspeed_kts != null
-                    ? `${liveData.airspeed_kts} kt${liveData.airspeed_type ? ` (${liveData.airspeed_type})` : ''}`
-                    : null
-                } />
-                {liveData.mach != null && (
-                  <Field label="Mach" value={`M${liveData.mach.toFixed(3)}`} />
+            {/* Photo */}
+            {photo?.src && (
+              <>
+                <a href={photo.link} target="_blank" rel="noopener noreferrer">
+                  <img src={photo.src} alt={`Aircraft ${icao}`} className={styles.photo} />
+                </a>
+                {photo.photographer && (
+                  <div className={styles.photoCredit}>Photo: {photo.photographer}</div>
                 )}
-                <Field label="Heading"   value={liveData.heading_deg != null ? `${liveData.heading_deg}°` : null} />
-                <Field label="Vert. rate" value={
-                  liveData.vertical_rate_fpm != null
-                    ? `${liveData.vertical_rate_fpm > 0 ? '+' : ''}${liveData.vertical_rate_fpm} fpm`
-                    : null
-                } />
-                <Field label="Range"     value={liveData.range_nm != null ? `${liveData.range_nm} nm` : null} />
-                {liveData.lat != null && liveData.lon != null && (
-                  <div className={styles.field}>
-                    <span className={styles.fieldLabel}>Position</span>
-                    <a
-                      className={styles.fieldValue}
-                      href={`https://www.openstreetmap.org/?mlat=${liveData.lat}&mlon=${liveData.lon}&zoom=10`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                    >
-                      {liveData.lat.toFixed(4)}, {liveData.lon.toFixed(4)}
-                    </a>
+              </>
+            )}
+
+            {/* Two-column: Airframe | Live */}
+            <div className={styles.twoCol}>
+              {/* Left: airframe details */}
+              <div className={styles.col}>
+                <div className={styles.sectionTitle}>Airframe</div>
+                <Field label="ICAO"        value={icao} />
+                <Field label="Registration" value={data.registration} />
+                <Field label="Operator"    value={opStr} />
+                <Field label="Country"     value={data.country} />
+                <Field label="Type code"   value={data.type_code} />
+                <Field label="Full name"   value={data.type_full_name} />
+                <Field label="Category"    value={data.type_category} />
+                <Field label="WTC"         value={data.wtc} />
+                <Field label="Details"     value={data.type_desc} />
+                <Field label="Year"        value={data.year} />
+                {data.history && (
+                  <>
+                    <Field label="First seen"
+                      value={fmtDate(data.history.first_seen)} />
+                    <Field label="Sessions"
+                      value={data.history.sighting_count} />
+                  </>
+                )}
+                {data.history && (
+                  <div className={styles.flagsRow}>
+                    {data.military             && <span className={`${styles.flag} ${styles.flagMil}`}>Military</span>}
+                    {data.history.rare         && <span className={`${styles.flag} ${styles.flagRare}`}>Rare type</span>}
+                    {data.history.first_seen_flag && <span className={`${styles.flag} ${styles.flagNew}`}>First sighting</span>}
+                    {data.history.interesting  && <span className={`${styles.flag} ${styles.flagInt}`}>Interesting</span>}
+                    {data.history.foreign_military && <span className={`${styles.flag} ${styles.flagMil}`}>Foreign mil</span>}
                   </div>
                 )}
-                <Field label="Squawk"    value={
-                  liveData.squawk
-                    ? `${liveData.squawk}${EMERGENCY_SQUAWKS[liveData.squawk] ? ` — ${EMERGENCY_SQUAWKS[liveData.squawk]}` : ''}`
-                    : null
-                } />
-                <Field label="Signal"    value={liveData.signal != null ? `${Math.round((255 - liveData.signal) / 2.55)}%` : null} />
-                <Field label="Messages"  value={liveData.msg_count} />
-                <Field label="Last seen" value={liveData.age != null ? `${liveData.age}s ago` : null} />
-              </Section>
+              </div>
+
+              {/* Right: live state (if active) */}
+              <div className={styles.col}>
+                <div className={styles.sectionTitle}>Now {!liveData && <span style={{ color: '#484f58', fontWeight: 400 }}>· not in range</span>}</div>
+                {liveData ? (
+                  <>
+                    <Field label="Callsign"   value={liveData.callsign} />
+                    <Field label="Altitude"   value={fmtAlt(liveData.altitude)} />
+                    <Field label="Sel. alt"   value={fmtAlt(liveData.selected_alt)} />
+                    <Field label="Speed"      value={
+                      liveData.airspeed_kts != null
+                        ? `${liveData.airspeed_kts} kt${liveData.airspeed_type ? ` (${liveData.airspeed_type})` : ''}`
+                        : null
+                    } />
+                    {liveData.mach != null && (
+                      <Field label="Mach" value={`M${liveData.mach.toFixed(3)}`} />
+                    )}
+                    <Field label="Heading"    value={liveData.heading_deg != null ? `${liveData.heading_deg}°` : null} />
+                    <Field label="Vert. rate" value={
+                      liveData.vertical_rate_fpm != null
+                        ? `${liveData.vertical_rate_fpm > 0 ? '+' : ''}${liveData.vertical_rate_fpm} fpm`
+                        : null
+                    } />
+                    <Field label="Range"      value={liveData.range_nm != null ? `${liveData.range_nm} nm` : null} />
+                    {liveData.lat != null && liveData.lon != null && (
+                      <Field
+                        label="Position"
+                        value={`${liveData.lat.toFixed(4)}, ${liveData.lon.toFixed(4)}`}
+                        href={`https://www.openstreetmap.org/?mlat=${liveData.lat}&mlon=${liveData.lon}&zoom=10`}
+                      />
+                    )}
+                    <Field label="Squawk"     value={
+                      liveData.squawk
+                        ? `${liveData.squawk}${EMERGENCY_SQUAWKS[liveData.squawk] ? ` — ${EMERGENCY_SQUAWKS[liveData.squawk]}` : ''}`
+                        : null
+                    } />
+                    <Field label="Signal"     value={liveData.signal != null ? `${Math.round((255 - liveData.signal) / 2.55)}%` : null} />
+                    <Field label="Messages"   value={liveData.msg_count} />
+                    <Field label="Last seen"  value={liveData.age != null ? `${liveData.age}s ago` : null} />
+
+                    {/* Route from most-recent visit */}
+                    {visits.length > 0 && (visits[0].origin_icao || visits[0].dest_icao) && (
+                      <div style={{ marginTop: '0.5rem' }}>
+                        <div className={styles.sectionTitle} style={{ marginBottom: '0.3rem' }}>Route</div>
+                        <div className={styles.routeInline}>
+                          <span className={styles.routeCode}>{visits[0].origin_icao ?? '?'}</span>
+                          <span className={styles.routeArrow}>→</span>
+                          <span className={styles.routeCode}>{visits[0].dest_icao ?? '?'}</span>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className={styles.noData} style={{ paddingTop: '0.5rem' }}>No live data</div>
+                )}
+              </div>
+            </div>
+
+            {/* Visits table */}
+            {visits.length > 0 && (
+              <div className={styles.visitsSection}>
+                <div className={styles.sectionTitle}>Visit History ({visits.length})</div>
+                <table className={styles.visitsTable}>
+                  <thead>
+                    <tr>
+                      <th>Date</th>
+                      <th>Callsign</th>
+                      <th>Route</th>
+                      <th>Max alt</th>
+                      <th style={{ textAlign: 'right' }}>Duration</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {visits.map(v => (
+                      <Fragment key={v.id}>
+                        <tr
+                          className={`${styles.visitRow}${activeVisitId === v.id ? ' ' + styles.active : ''}`}
+                          onClick={() => handleVisitRowClick(v.id)}
+                          title="Click to show track"
+                        >
+                          <td>{fmtDate(v.start_ts)}</td>
+                          <td><span className={styles.visitCallsign}>{v.callsign || '—'}</span></td>
+                          <td>
+                            {(v.origin_icao || v.dest_icao)
+                              ? <span className={styles.visitRoute}>{v.origin_icao ?? '?'} → {v.dest_icao ?? '?'}</span>
+                              : <span className={styles.noData}>—</span>
+                            }
+                          </td>
+                          <td className={styles.visitAlt}>{v.max_altitude ? (v.max_altitude.toLocaleString() + ' ft') : '—'}</td>
+                          <td className={styles.visitDur}>{fmtDuration(v.start_ts, v.end_ts) ?? '—'}</td>
+                        </tr>
+                        {activeVisitId === v.id && (
+                          <tr>
+                            <td colSpan={5} style={{ padding: '0 0.5rem 0.5rem' }}>
+                              <MiniMap icao={icao} visitId={v.id} />
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
 
-            {liveData?.callsign && (
-              <RouteSection icao={icao} callsign={liveData.callsign} />
-            )}
-
-            {data.history && (
-              <Section title="History">
-                <Field label="First seen"     value={fmtTs(data.history.first_seen)} />
-                <Field label="Last seen"      value={fmtTs(data.history.last_seen)} />
-                <Field label="Sessions"       value={data.history.sighting_count} />
-                {data.history.foreign_military && <Field label="Flag" value="Foreign military" />}
-                {data.history.interesting     && <Field label="Flag" value="Interesting" />}
-                {data.history.rare            && <Field label="Flag" value="Rare" />}
-                {data.history.first_seen_flag && <Field label="Flag" value="First sighting" />}
-              </Section>
-            )}
-
+            {/* ACAS events */}
             {acasEvents.length > 0 && (
-              <Section title="ACAS Events">
+              <div className={styles.acasSection}>
+                <div className={styles.sectionTitle}>ACAS Events</div>
                 {acasEvents.map(ev => (
                   <div key={ev.ts + ev.icao} className={styles.acasEvent}>
-                    <span className={styles.acasEvTime}>{fmtTs(ev.ts)}</span>
+                    <span className={styles.acasEvTime}>{new Date(ev.ts * 1000).toLocaleString()}</span>
                     <span className={ev.ra_corrective ? styles.correctiveBadge : styles.preventiveBadge}>
                       {ev.ra_description}
                     </span>
@@ -315,16 +406,18 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
                       </span>
                     )}
                     {ev.altitude != null && (
-                      <span className={styles.acasAlt}>{fmtAlt(ev.altitude)}</span>
+                      <span className={styles.acasAlt}>{ev.altitude.toLocaleString()} ft</span>
                     )}
                     {ev.mte ? <span className={styles.mteBadge}>MTE</span> : null}
                   </div>
                 ))}
-              </Section>
+              </div>
             )}
 
           </div>
         )}
-      </aside>
+
+      </div>
+    </div>
   )
 }
