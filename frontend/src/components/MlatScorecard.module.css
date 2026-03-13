@@ -1,0 +1,93 @@
+.card {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-top: 3px solid #388bfd;
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+}
+
+.heading {
+  font-size: 0.7rem;
+  font-weight: 500;
+  color: #484f58;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 0.75rem;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+  color: #c9d1d9;
+}
+
+.table th {
+  color: #484f58;
+  font-size: 0.68rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0 0.5rem 0.5rem;
+  border-bottom: 1px solid #21262d;
+  white-space: nowrap;
+}
+
+.table td {
+  padding: 0.45rem 0.5rem;
+  border-bottom: 1px solid #161b22;
+  vertical-align: middle;
+}
+
+.table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.name {
+  font-weight: 600;
+  color: #e6edf3;
+  white-space: nowrap;
+}
+
+.right {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.quality {
+  width: 140px;
+  min-width: 120px;
+}
+
+.spikeCount {
+  color: #6e7681;
+}
+
+.barTrack {
+  position: relative;
+  background: #0d1117;
+  border-radius: 3px;
+  height: 18px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+}
+
+.barFill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  border-radius: 3px;
+  opacity: 0.25;
+  transition: width 0.4s ease;
+}
+
+.barLabel {
+  position: relative;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding-left: 0.4rem;
+  font-variant-numeric: tabular-nums;
+}

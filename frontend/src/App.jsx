@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import StatsBar from './components/StatsBar'
+import MlatScorecard from './components/MlatScorecard'
 import MessageRateChart from './components/MessageRateChart'
 import AircraftTable from './components/AircraftTable'
 import AircraftDetailPanel from './components/AircraftDetailPanel'
@@ -126,6 +127,9 @@ export default function App() {
           {snapshot ? (
             <>
               <StatsBar snapshot={snapshot} />
+              {(snapshot.mlat_total ?? 0) > 0 && (
+                <MlatScorecard aircraft={snapshot.aircraft} />
+              )}
               <MessageRateChart data={snapshot.rate_history} />
               <AircraftTable aircraft={snapshot.aircraft} onSelectIcao={setSelectedIcao} queueSize={snapshot.hexdb_queue_size ?? 0} />
             </>

@@ -1,6 +1,7 @@
 """FastAPI router exposing the in-memory track store."""
 
 from fastapi import APIRouter
+from track_store import TRACK_SCHEMA_VERSION
 
 router = APIRouter()
 
@@ -15,5 +16,8 @@ def get_tracks() -> dict:
     Polled by the SkyView and 3-D view components every 5 seconds.
     """
     if _track_store is None:
-        return {}
-    return _track_store.get_tracks()
+        return {"schema_version": TRACK_SCHEMA_VERSION, "tracks": {}}
+    return {
+        "schema_version": TRACK_SCHEMA_VERSION,
+        "tracks": _track_store.get_tracks(),
+    }

@@ -130,6 +130,12 @@ SQLITE_SYNCHRONOUS: str = os.getenv("SQLITE_SYNCHRONOUS", "NORMAL")
 # Default: 6 hours (21600 s). Set to 3600 for hourly, 86400 for daily.
 RARITY_RECALC_SECONDS: float = float(os.getenv("RARITY_RECALC_SECONDS", "21600"))
 
+# MLAT position quality and fusion mode.
+# none         — Phase A: last-write-wins, no position change (default, safe)
+# spike_filter — reject fixes whose implied groundspeed exceeds threshold
+# weighted     — ECEF weighted centroid of recent fixes from all active sources
+MLAT_FUSION: str = os.getenv("MLAT_FUSION", "none").lower()
+
 # How often to flush buffered aircraft_registry upserts to disk (seconds).
 # Buffers write_minute()'s per-aircraft upserts so SD writes happen at most
 # once per interval rather than once per minute per aircraft.

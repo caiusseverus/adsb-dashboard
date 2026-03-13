@@ -494,6 +494,7 @@ async def _push_updates() -> None:
                     mlat=bool(ac.get("mlat")),
                     interesting=bool(ac.get("interesting")),
                     acas_ra_active=bool(ac.get("acas_ra_active")),
+                    mlat_source=ac.get("mlat_source"),
                     now=now,
                 )
         # Prune tracks for aircraft that have left the live set
