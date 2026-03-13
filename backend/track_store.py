@@ -8,8 +8,14 @@ currently-visible aircraft.
 
 Each track point is a plain tuple for minimal memory overhead:
   (ts, bearing_deg, range_nm, altitude_ft, lat, lon,
-   military, mlat, interesting, acas_ra_active)
+   military, mlat, interesting, acas_ra_active, mlat_source)
+
+Schema version 2 added mlat_source (index 10) as a trailing field.
+Consumers reading only indices 0–9 are unaffected.
 """
+
+# Increment when tuple schema changes (trailing fields only — safe for existing consumers).
+TRACK_SCHEMA_VERSION = 2
 
 import threading
 import time
@@ -31,6 +37,7 @@ _MIL         = 6
 _MLAT        = 7
 _INTERESTING = 8
 _ACAS        = 9
+_MLAT_SRC    = 10  # added in schema v2 — str | None
 
 
 class TrackStore:
@@ -57,6 +64,7 @@ class TrackStore:
         mlat: bool,
         interesting: bool,
         acas_ra_active: bool,
+        mlat_source: Optional[str] = None,
         now: Optional[float] = None,
     ) -> None:
         """Append a track point if the per-aircraft rate limit allows it."""
@@ -70,7 +78,7 @@ class TrackStore:
                 self._tracks[icao] = deque(maxlen=_MAX_POINTS)
             self._tracks[icao].append((
                 now, bearing_deg, range_nm, altitude_ft, lat, lon,
-                military, mlat, interesting, acas_ra_active,
+                military, mlat, interesting, acas_ra_active, mlat_source,
             ))
 
     def expire(self, active_icaos: set[str]) -> None:
@@ -114,6 +122,7 @@ class TrackStore:
                         "mlat":          p[_MLAT],
                         "interesting":   p[_INTERESTING],
                         "acas_ra_active": p[_ACAS],
+                        "mlat_source":   p[_MLAT_SRC] if len(p) > _MLAT_SRC else None,
                     }
                     for p in track
                     if p[_TS] >= cutoff

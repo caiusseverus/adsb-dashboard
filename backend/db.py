@@ -8,6 +8,7 @@ All public methods are synchronous and safe to call via asyncio.to_thread().
 import logging
 import math
 import sqlite3
+import threading
 import time
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
@@ -157,6 +158,17 @@ INTERESTING_TYPE_CODES: frozenset[str] = frozenset({
 class StatsDB:
     def __init__(self) -> None:
         self._last_written_ts: int = 0
+        self._local = threading.local()  # thread-local connection storage
+        # Rarity is time-gated — the rare flag changes only when a new type
+        # appears, so a full-table UPDATE every minute is wasteful on Pi SD.
+        self._last_rarity_recalc: float = 0.0
+        self._rarity_recalc_interval: float = config.RARITY_RECALC_SECONDS
+        # Registry write buffer — collects per-aircraft upserts from write_minute()
+        # and flushes them as a batch every REGISTRY_FLUSH_SECONDS.  This reduces
+        # aircraft_registry SD writes from ~100/minute to ~100 every 5 minutes.
+        self._registry_dirty: dict[str, dict] = {}
+        self._last_registry_flush: float = 0.0
+        self._registry_flush_interval: float = config.REGISTRY_FLUSH_SECONDS
         self._init_schema()
 
     # ------------------------------------------------------------------
@@ -164,10 +176,19 @@ class StatsDB:
     # ------------------------------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(config.DB_PATH), timeout=10)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.row_factory = sqlite3.Row
+        """Return a per-thread persistent SQLite connection.
+        Each asyncio.to_thread worker gets its own connection on first call, then
+        reuses it. check_same_thread=False is safe here because no connection is
+        ever shared between threads — threading.local() enforces that."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(config.DB_PATH), timeout=10, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(f"PRAGMA synchronous={config.SQLITE_SYNCHRONOUS}")
+            conn.execute("PRAGMA cache_size=-8000")   # 8 MB page cache per thread
+            conn.execute("PRAGMA temp_store=MEMORY")  # temp tables in RAM, not SD card
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
         return conn
 
     # ------------------------------------------------------------------
@@ -263,6 +284,21 @@ class StatsDB:
                 );
                 CREATE INDEX IF NOT EXISTS coverage_samples_ts
                     ON coverage_samples(ts);
+
+                CREATE TABLE IF NOT EXISTS visits (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    icao         TEXT    NOT NULL,
+                    start_ts     INTEGER NOT NULL,
+                    end_ts       INTEGER NOT NULL,
+                    callsign     TEXT,
+                    squawk       TEXT,
+                    max_altitude INTEGER,
+                    msg_count    INTEGER NOT NULL DEFAULT 0,
+                    origin_icao  TEXT,
+                    dest_icao    TEXT
+                );
+                CREATE INDEX IF NOT EXISTS visits_icao  ON visits(icao);
+                CREATE INDEX IF NOT EXISTS visits_start ON visits(start_ts);
 
                 CREATE TABLE IF NOT EXISTS aircraft_registry (
                     icao             TEXT    PRIMARY KEY,
@@ -458,12 +494,39 @@ class StatsDB:
                 ),
             )
 
-            # Aircraft registry upserts
+            # Buffer registry upserts — the latest snapshot value for each ICAO
+            # overwrites any earlier buffered entry, so only one upsert per aircraft
+            # reaches the DB per flush interval.
             for ac in aircraft:
-                self._upsert_aircraft(conn, ac, now_ts)
+                self._registry_dirty[ac["icao"]] = ac
 
-        # Recalculate type-based rarity flags outside the main write transaction
-        self.recalculate_type_rarity()
+        # Flush buffered registry upserts when the interval has elapsed.
+        now = time.time()
+        if self._registry_dirty and now - self._last_registry_flush >= self._registry_flush_interval:
+            self._flush_registry(now_ts)
+
+        # Recalculate type-based rarity flags outside the main write transaction,
+        # but only when the interval has elapsed — the rare flag changes at most
+        # a handful of times per day, so every-minute UPDATEs are unnecessary.
+        if now - self._last_rarity_recalc >= self._rarity_recalc_interval:
+            self.recalculate_type_rarity()
+            self._last_rarity_recalc = now
+
+    def _flush_registry(self, now_ts: int) -> None:
+        """Write all buffered dirty aircraft to the registry in a single transaction."""
+        if not self._registry_dirty:
+            return
+        count = len(self._registry_dirty)
+        with self._connect() as conn:
+            for ac in self._registry_dirty.values():
+                self._upsert_aircraft(conn, ac, now_ts)
+        self._registry_dirty.clear()
+        self._last_registry_flush = time.time()
+        log.debug("DB: flushed %d registry entries", count)
+
+    def flush_registry_now(self) -> None:
+        """Force an immediate registry flush regardless of the interval — call on shutdown."""
+        self._flush_registry(int(time.time()))
 
     def _upsert_aircraft(self, conn: sqlite3.Connection, ac: dict, now_ts: int) -> None:
         home = (config.HOME_COUNTRY or "").lower()
@@ -707,6 +770,18 @@ class StatsDB:
                 "INSERT OR REPLACE INTO coverage_samples "
                 "(ts, icao, bearing_deg, range_nm, altitude, signal) "
                 "VALUES (:ts, :icao, :bearing_deg, :range_nm, :altitude, :signal)",
+                samples,
+            )
+
+    def write_coverage_tuples(self, samples: list[tuple]) -> None:
+        """Like write_coverage but accepts pre-built (ts, icao, bearing_deg, range_nm,
+        altitude, signal) tuples — avoids per-row dict construction in the caller."""
+        if not samples:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO coverage_samples "
+                "(ts, icao, bearing_deg, range_nm, altitude, signal) VALUES (?,?,?,?,?,?)",
                 samples,
             )
 
@@ -2158,6 +2233,58 @@ class StatsDB:
             ],
         }
 
+    def query_timelapse_tracks(self, start_ts: int, end_ts: int) -> dict:
+        """Per-aircraft position tracks for the timelapse player.
+
+        Returns {start_ts, end_ts, tracks: [{icao, military, interesting, tg_idx,
+                 points: [[dt_s, bearing, range, alt], ...]}, ...]}
+        dt_s is seconds since start_ts.  Only tracks with >= 2 points are included.
+        """
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT cs.ts,
+                       cs.icao,
+                       cs.bearing_deg,
+                       cs.range_nm,
+                       cs.altitude,
+                       COALESCE(ar.military,    0) AS military,
+                       COALESCE(ar.interesting, 0) AS interesting,
+                       ar.type_code,
+                       ar.type_category
+                FROM coverage_samples cs
+                LEFT JOIN aircraft_registry ar ON cs.icao = ar.icao
+                WHERE cs.ts >= ? AND cs.ts <= ?
+                  AND cs.altitude  IS NOT NULL
+                  AND cs.range_nm  > 0
+                  AND cs.altitude  > 0
+                ORDER BY cs.icao, cs.ts
+            """, (start_ts, end_ts)).fetchall()
+
+        from collections import defaultdict
+        raw: dict[str, list] = defaultdict(list)
+        meta: dict[str, dict] = {}
+        for r in rows:
+            icao = r["icao"]
+            raw[icao].append([
+                r["ts"] - start_ts,           # dt seconds
+                round(r["bearing_deg"], 1),
+                round(r["range_nm"],   1),
+                int(r["altitude"]),
+            ])
+            if icao not in meta:
+                meta[icao] = {
+                    "military":    bool(r["military"]),
+                    "interesting": bool(r["interesting"]),
+                    "tg_idx":      self._get_type_group_idx(r["type_code"], r["type_category"]),
+                }
+
+        tracks = [
+            {"icao": icao, **meta[icao], "points": pts}
+            for icao, pts in raw.items()
+            if len(pts) >= 2
+        ]
+        return {"start_ts": start_ts, "end_ts": end_ts, "tracks": tracks}
+
     def query_coverage_range_trend(self, days: int = 90) -> list[dict]:
         """Daily max and median range from coverage_samples, for trend charts."""
         cutoff = (date.today() - timedelta(days=days)).isoformat()
@@ -2310,6 +2437,17 @@ class StatsDB:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT icao, sighting_count FROM aircraft_registry"
+            ).fetchall()
+        return {r["icao"]: r["sighting_count"] for r in rows}
+
+    def query_sighting_counts_recent(self, days: int = 90) -> dict[str, int]:
+        """Return {icao: sighting_count} for aircraft seen in the last N days.
+        Much smaller result set than query_all_sighting_counts on mature installs."""
+        cutoff = int(time.time()) - days * 86400
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT icao, sighting_count FROM aircraft_registry WHERE last_seen >= ?",
+                (cutoff,),
             ).fetchall()
         return {r["icao"]: r["sighting_count"] for r in rows}
 
@@ -2497,6 +2635,163 @@ class StatsDB:
     def remove_from_watchlist(self, icao: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM notify_watchlist WHERE icao=?", (icao,))
+
+    # ------------------------------------------------------------------
+    # Visit log
+    # ------------------------------------------------------------------
+
+    def write_visits(self, visits: list[tuple]) -> list[int]:
+        """Insert completed visit records. Each tuple: (icao, start_ts, end_ts,
+        callsign, squawk, max_altitude, msg_count). Returns inserted row IDs."""
+        ids = []
+        with self._connect() as conn:
+            for v in visits:
+                cur = conn.execute(
+                    "INSERT INTO visits "
+                    "(icao, start_ts, end_ts, callsign, squawk, max_altitude, msg_count) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    v,
+                )
+                ids.append(cur.lastrowid)
+        return ids
+
+    def update_visit_route(self, visit_id: int, origin_icao: str | None,
+                           dest_icao: str | None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE visits SET origin_icao=?, dest_icao=? WHERE id=?",
+                (origin_icao, dest_icao, visit_id),
+            )
+
+    def merge_short_visits(self, max_gap_secs: int = 600) -> int:
+        """Merge adjacent visits for the same ICAO that were likely split by a backend
+        restart or brief signal loss.
+
+        Two visits are merged when:
+        - Same ICAO
+        - Gap between end_ts and next start_ts < max_gap_secs
+        - Callsigns are compatible: same value, or at least one is null/empty
+
+        Merged record keeps: earliest start_ts, latest end_ts, non-null callsign,
+        summed msg_count, highest max_altitude, origin_icao from the earlier visit,
+        dest_icao from the later visit.
+
+        Returns the number of rows deleted (absorbed into their predecessor).
+        """
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT id, icao, start_ts, end_ts, callsign, squawk,
+                       max_altitude, msg_count, origin_icao, dest_icao
+                FROM visits
+                ORDER BY icao, start_ts
+            """).fetchall()
+
+        # Group by ICAO — preserve insertion order (Python 3.7+)
+        by_icao: dict[str, list[dict]] = {}
+        for row in rows:
+            by_icao.setdefault(row["icao"], []).append(dict(row))
+
+        updates: list[tuple] = []  # (end_ts, callsign, squawk, max_alt, msg_count, orig, dest, id)
+        deletes: list[int] = []
+
+        for visits in by_icao.values():
+            i = 0
+            while i < len(visits) - 1:
+                a, b = visits[i], visits[i + 1]
+                gap = b["start_ts"] - a["end_ts"]
+
+                cs_a = (a["callsign"] or "").strip().rstrip("_")
+                cs_b = (b["callsign"] or "").strip().rstrip("_")
+                compatible = (not cs_a) or (not cs_b) or (cs_a == cs_b)
+
+                if gap < max_gap_secs and compatible:
+                    alts = [x for x in (a["max_altitude"], b["max_altitude"]) if x is not None]
+                    merged: dict = {
+                        "id":          a["id"],
+                        "end_ts":      b["end_ts"],
+                        "callsign":    cs_a or cs_b or None,
+                        "squawk":      a["squawk"] or b["squawk"],
+                        "max_altitude": max(alts) if alts else None,
+                        "msg_count":   (a["msg_count"] or 0) + (b["msg_count"] or 0),
+                        "origin_icao": a["origin_icao"] or b["origin_icao"],
+                        "dest_icao":   b["dest_icao"] or a["dest_icao"],
+                    }
+                    updates.append((
+                        merged["end_ts"], merged["callsign"], merged["squawk"],
+                        merged["max_altitude"], merged["msg_count"],
+                        merged["origin_icao"], merged["dest_icao"], merged["id"],
+                    ))
+                    deletes.append(b["id"])
+                    # Replace a in-place so it can absorb further neighbours
+                    visits[i] = {**a, **{k: v for k, v in merged.items() if k != "id"}}
+                    visits.pop(i + 1)
+                else:
+                    i += 1
+
+        if updates or deletes:
+            with self._connect() as conn:
+                for u in updates:
+                    conn.execute("""
+                        UPDATE visits
+                        SET end_ts=?, callsign=?, squawk=?, max_altitude=?,
+                            msg_count=?, origin_icao=?, dest_icao=?
+                        WHERE id=?
+                    """, u)
+                if deletes:
+                    conn.execute(
+                        f"DELETE FROM visits WHERE id IN ({','.join('?' * len(deletes))})",
+                        deletes,
+                    )
+
+        return len(deletes)
+
+    def query_visits(self, icao: str, limit: int = 20) -> list[dict]:
+        """Return visit records for an aircraft, newest first."""
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT id, icao, start_ts, end_ts, callsign, squawk,
+                       max_altitude, msg_count, origin_icao, dest_icao
+                FROM visits
+                WHERE icao = ?
+                ORDER BY start_ts DESC
+                LIMIT ?
+            """, (icao.upper(), limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def query_visit_track(self, icao: str, start_ts: int, end_ts: int,
+                          receiver_lat: float, receiver_lon: float) -> list[dict]:
+        """Return lat/lon track points reconstructed from coverage_samples bearing/range."""
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT ts, bearing_deg, range_nm, altitude
+                FROM coverage_samples
+                WHERE icao = ? AND ts BETWEEN ? AND ?
+                  AND bearing_deg IS NOT NULL AND range_nm IS NOT NULL AND range_nm > 0
+                ORDER BY ts
+            """, (icao.upper(), start_ts, end_ts)).fetchall()
+
+        R = 6371.0  # km
+        lat1 = math.radians(receiver_lat)
+        lon1 = math.radians(receiver_lon)
+        points = []
+        for row in rows:
+            bearing = math.radians(row["bearing_deg"])
+            d = row["range_nm"] * 1.852 / R  # nm → km → radians
+            lat2 = math.asin(
+                math.sin(lat1) * math.cos(d)
+                + math.cos(lat1) * math.sin(d) * math.cos(bearing)
+            )
+            lon2 = lon1 + math.atan2(
+                math.sin(bearing) * math.sin(d) * math.cos(lat1),
+                math.cos(d) - math.sin(lat1) * math.sin(lat2),
+            )
+            points.append({
+                "ts":       row["ts"],
+                "lat":      round(math.degrees(lat2), 5),
+                "lon":      round(math.degrees(lon2), 5),
+                "altitude": row["altitude"],
+            })
+        return points
 
 
 # Module-level singleton

@@ -14,6 +14,7 @@ import urllib.error
 
 from fastapi import APIRouter, HTTPException, Query
 
+import config
 import enrichment
 from db import stats_db
 from utils import country_from_registration
@@ -269,6 +270,29 @@ async def aircraft_refresh(icao: str) -> dict:
         )
 
     return await aircraft_detail(icao)
+
+
+@router.get("/{icao}/visits")
+async def aircraft_visits(icao: str, limit: int = 30) -> list:
+    icao = icao.upper()
+    return await asyncio.to_thread(stats_db.query_visits, icao, limit)
+
+
+@router.get("/{icao}/visits/{visit_id}/track")
+async def aircraft_visit_track(icao: str, visit_id: int) -> list:
+    icao = icao.upper()
+    if config.RECEIVER_LAT is None or config.RECEIVER_LON is None:
+        return []
+    # Look up the visit's timestamps
+    visits = await asyncio.to_thread(stats_db.query_visits, icao, 200)
+    visit = next((v for v in visits if v["id"] == visit_id), None)
+    if not visit:
+        return []
+    return await asyncio.to_thread(
+        stats_db.query_visit_track,
+        icao, visit["start_ts"], visit["end_ts"],
+        config.RECEIVER_LAT, config.RECEIVER_LON,
+    )
 
 
 @router.get("/{icao}/route")

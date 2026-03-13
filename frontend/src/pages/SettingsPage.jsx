@@ -415,6 +415,61 @@ function BackupSection() {
 }
 
 // ---------------------------------------------------------------------------
+// Maintenance
+// ---------------------------------------------------------------------------
+function MaintenanceSection() {
+  const [gapMins, setGapMins] = useState(10)
+  const [running, setRunning] = useState(false)
+  const [result, setResult] = useState(null)  // null | { merged, max_gap_mins } | 'error'
+
+  const run = async () => {
+    setRunning(true)
+    setResult(null)
+    try {
+      const r = await fetch(`${API_BASE}/api/history/visits/cleanup?max_gap_mins=${gapMins}`, { method: 'POST' })
+      if (!r.ok) throw new Error()
+      setResult(await r.json())
+    } catch {
+      setResult('error')
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  return (
+    <section className={styles.card}>
+      <h2 className={styles.cardTitle}>Maintenance</h2>
+      <p className={styles.hint}>
+        Merge visit records that were split by a backend restart or brief signal loss.
+        Visits for the same aircraft with a gap smaller than the threshold and matching
+        (or absent) callsigns are joined into a single record.
+      </p>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap', marginTop: '0.75rem' }}>
+        <label className={styles.rangeLabel} style={{ minWidth: 'unset' }}>Max gap</label>
+        <input
+          type="number"
+          className={styles.rangeInput}
+          value={gapMins}
+          min={1} max={60}
+          onChange={e => setGapMins(Number(e.target.value))}
+          style={{ width: '4rem' }}
+        />
+        <span className={styles.rangeLabel}>minutes</span>
+        <button className={styles.saveBtn} onClick={run} disabled={running}>
+          {running ? 'Running…' : 'Merge short visits'}
+        </button>
+        {result === 'error' && <span style={{ color: '#f85149', fontSize: '0.82rem' }}>Failed</span>}
+        {result && result !== 'error' && (
+          <span style={{ color: result.merged > 0 ? '#3fb950' : '#8b949e', fontSize: '0.82rem' }}>
+            {result.merged > 0 ? `${result.merged} visit${result.merged !== 1 ? 's' : ''} merged` : 'Nothing to merge'}
+          </span>
+        )}
+      </div>
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Page root
 // ---------------------------------------------------------------------------
 export default function SettingsPage() {
@@ -423,6 +478,7 @@ export default function SettingsPage() {
       <TriggersSection />
       <WatchlistSection />
       <BackupSection />
+      <MaintenanceSection />
     </main>
   )
 }

@@ -115,3 +115,28 @@ NOTIFY_EMERGENCY:    bool = _bool("NOTIFY_EMERGENCY",    True)
 NOTIFY_ACAS:         bool = _bool("NOTIFY_ACAS",         False)
 NOTIFY_MILITARY:     bool = _bool("NOTIFY_MILITARY",     False)
 NOTIFY_INTERESTING:  bool = _bool("NOTIFY_INTERESTING",  False)
+
+DEBUG_LOG: bool = _bool("DEBUG_LOG", False)  # set true to enable verbose logging
+
+# ---------------------------------------------------------------------------
+# SQLite / Pi tuning
+# ---------------------------------------------------------------------------
+# synchronous=NORMAL is safe with WAL and eliminates most fsync() calls.
+# Use FULL only if the Pi's power supply is unreliable.
+SQLITE_SYNCHRONOUS: str = os.getenv("SQLITE_SYNCHRONOUS", "NORMAL")
+
+# How often to run the full-table rarity recalculation (seconds).
+# The rare flag changes only when a new type appears; daily is more than enough.
+# Default: 6 hours (21600 s). Set to 3600 for hourly, 86400 for daily.
+RARITY_RECALC_SECONDS: float = float(os.getenv("RARITY_RECALC_SECONDS", "21600"))
+
+# MLAT position quality and fusion mode.
+# none         — Phase A: last-write-wins, no position change (default, safe)
+# spike_filter — reject fixes whose implied groundspeed exceeds threshold
+# weighted     — ECEF weighted centroid of recent fixes from all active sources
+MLAT_FUSION: str = os.getenv("MLAT_FUSION", "none").lower()
+
+# How often to flush buffered aircraft_registry upserts to disk (seconds).
+# Buffers write_minute()'s per-aircraft upserts so SD writes happen at most
+# once per interval rather than once per minute per aircraft.
+REGISTRY_FLUSH_SECONDS: float = float(os.getenv("REGISTRY_FLUSH_SECONDS", "300"))

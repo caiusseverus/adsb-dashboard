@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections import deque
 try:
     import orjson as _orjson
     def _json_dumps(obj: dict) -> str:
@@ -36,21 +37,27 @@ from coverage import router as coverage_router
 from acas import router as acas_router
 from squawks import router as squawks_router
 import notifications
+import hires_buffer
 from status import router as status_router
 from debug import router as debug_router
 from notify_settings import router as notify_settings_router
+import health as health_module
+from health import router as health_router
 import tracks as tracks_module
 from tracks import router as tracks_router
+import mlat as mlat_module
+from mlat import router as mlat_router
 
 from benchmark import make_pause_aware_decoder
 
 
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if config.DEBUG_LOG else logging.WARNING,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
 )
 log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)  # main module always logs at INFO regardless of DEBUG_LOG
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -65,6 +72,9 @@ _active_squawks: dict[str, dict] = {}
 
 # Watchlist cache — refreshed from DB every 30s to avoid per-aircraft DB reads
 _watchlist_cache: dict[str, float | None] = {}   # icao → max_range_nm
+
+# Route lookup queue: (visit_id, callsign) pairs awaiting adsbdb.com resolution
+_route_queue: deque[tuple[int, str]] = deque(maxlen=2000)
 _watchlist_cache_ts: float = 0.0
 
 # Message decode queue — Beast/MLAT runners push raw messages here; a single
@@ -216,6 +226,37 @@ async def _hexdb_task() -> None:
         await asyncio.sleep(5)
 
 
+_last_wal_checkpoint: float = 0.0
+_WAL_CHECKPOINT_INTERVAL = 3600.0  # 1 hour
+
+
+def _wal_checkpoint_passive() -> None:
+    """Run a PASSIVE WAL checkpoint — returns immediately, doesn't block readers."""
+    try:
+        with stats_db._connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        log.debug("Periodic WAL checkpoint complete")
+    except Exception:
+        log.warning("Periodic WAL checkpoint failed", exc_info=True)
+
+
+def _credible_aircraft(ac) -> bool:
+    """Ghost filter for Aircraft dataclass objects (used at visit close time)."""
+    if config.GHOST_FILTER_MSGS <= 0:
+        return True
+    if ac.msg_count >= config.GHOST_FILTER_MSGS:
+        return True
+    if ac.mlat:
+        return True
+    if enrichment.db.get_adsbx(ac.icao):
+        return True
+    if enrichment.db.get_hexdb_cached(ac.icao):
+        return True
+    if enrichment.db.get_tar1090_cached(ac.icao):
+        return True
+    return False
+
+
 def _ghost_credible(ac: dict) -> bool:
     """Return True if this aircraft is likely real and should be persisted."""
     if config.GHOST_FILTER_MSGS <= 0:
@@ -254,6 +295,14 @@ async def _db_writer() -> None:
             snapshot = {**snapshot, "aircraft": credible}
         await asyncio.to_thread(stats_db.write_minute, snapshot)
 
+        # Periodic WAL checkpoint — keeps the WAL file small between restarts.
+        # PASSIVE mode doesn't block readers or writers.
+        import time as _time
+        global _last_wal_checkpoint
+        if _time.monotonic() - _last_wal_checkpoint >= _WAL_CHECKPOINT_INTERVAL:
+            await asyncio.to_thread(_wal_checkpoint_passive)
+            _last_wal_checkpoint = _time.monotonic()
+
         # Refresh in-memory sighting counts from DB so NEW badge stays accurate
         current_icaos = [ac["icao"] for ac in snapshot.get("aircraft", [])]
         if current_icaos:
@@ -265,19 +314,13 @@ async def _db_writer() -> None:
         # Write coverage samples for aircraft that have a position
         if config.RECEIVER_LAT is not None and config.RECEIVER_LON is not None:
             now_ts = int(time.time())
-            samples = [
-                {
-                    "ts":          now_ts,
-                    "icao":        ac["icao"],
-                    "bearing_deg": ac["bearing_deg"],
-                    "range_nm":    ac["range_nm"],
-                    "altitude":    ac.get("altitude"),
-                    "signal":      ac.get("signal"),
-                }
+            samples = (
+                (now_ts, ac["icao"], ac["bearing_deg"], ac["range_nm"],
+                 ac.get("altitude"), ac.get("signal"))
                 for ac in snapshot.get("aircraft", [])
                 if ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
-            ]
-            await asyncio.to_thread(stats_db.write_coverage, samples)
+            )
+            await asyncio.to_thread(stats_db.write_coverage_tuples, samples)
 
         # Drain pending ACAS events to DB and fire notifications
         acas_evts = state.pop_acas_events()
@@ -325,13 +368,55 @@ async def _db_writer() -> None:
                 del _active_squawks[icao]
 
 
+async def _route_enricher() -> None:
+    """Resolve origin/destination airports for completed visits via adsbdb.com."""
+    import urllib.request
+    import urllib.error
+    while True:
+        if not _route_queue:
+            await asyncio.sleep(10)
+            continue
+        visit_id, callsign = _route_queue.popleft()
+
+        def _lookup(cs: str) -> tuple[str | None, str | None]:
+            url = f"https://api.adsbdb.com/v0/callsign/{cs}"
+            try:
+                with urllib.request.urlopen(url, timeout=15) as resp:
+                    data = json.loads(resp.read())
+                route = data.get("response", {}).get("flightroute") or {}
+                origin = (route.get("origin") or {}).get("icao_code") or None
+                dest   = (route.get("destination") or {}).get("icao_code") or None
+                return origin, dest
+            except Exception:
+                return None, None
+
+        origin, dest = await asyncio.to_thread(_lookup, callsign)
+        if origin or dest:
+            await asyncio.to_thread(stats_db.update_visit_route, visit_id, origin, dest)
+        await asyncio.sleep(0.5)  # max 2 req/s — adsbdb is a free service
+
+
 async def _push_updates() -> None:
     """Broadcast a state snapshot to every connected WebSocket client every second."""
     import time
     global _watchlist_cache, _watchlist_cache_ts
     while True:
         await asyncio.sleep(1)
-        state.expire_aircraft()
+        expired = state.expire_aircraft()
+
+        # Close visit records for aircraft that just timed out
+        if expired:
+            credible = [ac for ac in expired if _credible_aircraft(ac)]
+            if credible:
+                tuples = [
+                    (ac.icao, int(ac.first_seen), int(ac.last_seen),
+                     ac.callsign, ac.squawk, ac.max_altitude, ac.msg_count)
+                    for ac in credible
+                ]
+                visit_ids = await asyncio.to_thread(stats_db.write_visits, tuples)
+                for ac, vid in zip(credible, visit_ids):
+                    if ac.callsign:
+                        _route_queue.append((vid, ac.callsign))
 
         snapshot = state.get_snapshot()
 
@@ -357,32 +442,34 @@ async def _push_updates() -> None:
         # Avoids dispatching any threads for triggers the user has turned off.
         _mil_on  = _notify_enabled and notifications.trigger_enabled("notify_military")
         _int_on  = _notify_enabled and notifications.trigger_enabled("notify_interesting")
+        # Collect matching aircraft first; dispatch at most 3 threads per cycle
+        # regardless of how many aircraft match, replacing the previous O(N) dispatch.
+        _mil_batch: list[dict] = []
+        _int_batch: list[dict] = []
+        _wl_batch:  list[dict] = []
         t_loop_start = time.perf_counter()
         for ac in snapshot["aircraft"]:
             icao = ac["icao"]
             if _notify_enabled:
-                # Pre-check _notified before dispatching any thread — already-seen
-                # aircraft (the vast majority) are skipped with a cheap set lookup.
                 if icao in _watchlist_cache and not notifications.already_notified(f"watchlist:{icao}"):
-                    notify_tasks.append(asyncio.to_thread(
-                        notifications.notify_watchlist,
-                        icao, ac.get("callsign"), ac.get("registration"),
-                        ac.get("operator"), ac.get("altitude"),
-                        ac.get("range_nm"), _watchlist_cache[icao],
-                    ))
+                    _wl_batch.append({
+                        "icao": icao, "callsign": ac.get("callsign"),
+                        "registration": ac.get("registration"), "operator": ac.get("operator"),
+                        "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
+                        "max_range_nm": _watchlist_cache[icao],
+                    })
                 if _mil_on and ac.get("military") and not notifications.already_notified(f"military:{icao}"):
-                    notify_tasks.append(asyncio.to_thread(
-                        notifications.notify_military,
-                        icao, ac.get("callsign"), ac.get("operator"),
-                        ac.get("country"), ac.get("altitude"), ac.get("range_nm"),
-                    ))
+                    _mil_batch.append({
+                        "icao": icao, "callsign": ac.get("callsign"),
+                        "operator": ac.get("operator"), "country": ac.get("country"),
+                        "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
+                    })
                 if _int_on and ac.get("interesting") and not notifications.already_notified(f"interesting:{icao}"):
-                    notify_tasks.append(asyncio.to_thread(
-                        notifications.notify_interesting,
-                        icao, ac.get("callsign"), ac.get("type_code"),
-                        ac.get("operator"), ac.get("altitude"), ac.get("range_nm"),
-                    ))
-
+                    _int_batch.append({
+                        "icao": icao, "callsign": ac.get("callsign"),
+                        "type_code": ac.get("type_code"), "operator": ac.get("operator"),
+                        "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
+                    })
             # Only record once the position is confirmed reliable:
             # - pos_global=True: a global CPR decode (even+odd pair) has succeeded,
             #   guaranteeing the position is not from the potentially-wrong local
@@ -402,8 +489,15 @@ async def _push_updates() -> None:
                     mlat=bool(ac.get("mlat")),
                     interesting=bool(ac.get("interesting")),
                     acas_ra_active=bool(ac.get("acas_ra_active")),
+                    mlat_source=ac.get("mlat_source"),
                     now=now,
                 )
+        if _mil_batch:
+            notify_tasks.append(asyncio.to_thread(notifications.notify_military_batch, _mil_batch))
+        if _int_batch:
+            notify_tasks.append(asyncio.to_thread(notifications.notify_interesting_batch, _int_batch))
+        if _wl_batch:
+            notify_tasks.append(asyncio.to_thread(notifications.notify_watchlist_batch, _wl_batch))
         # Prune tracks for aircraft that have left the live set
         track_store.expire(active_icaos)
         t_sync_end = time.perf_counter()
@@ -449,6 +543,31 @@ async def _push_updates() -> None:
         })
 
 
+async def _hires_writer() -> None:
+    """Record aircraft positions to the in-memory hires buffer every 10 seconds.
+    Applies the same ghost filter and value guards as the DB coverage writer."""
+    import time as _time
+    while True:
+        await asyncio.sleep(hires_buffer.HIRES_INTERVAL_S)
+        if config.RECEIVER_LAT is None or config.RECEIVER_LON is None:
+            continue
+        snapshot = state.get_snapshot()
+        now_ts = int(_time.time())
+        samples = [
+            (now_ts, ac["icao"],
+             ac["bearing_deg"], ac["range_nm"], ac.get("altitude"),
+             ac.get("military", False), ac.get("interesting", False),
+             ac.get("type_code"), ac.get("type_category"))
+            for ac in snapshot.get("aircraft", [])
+            if (ac.get("bearing_deg") is not None
+                and ac.get("range_nm") is not None
+                and (ac.get("range_nm") or 0) > 0
+                and (ac.get("altitude") or 0) > 0
+                and _ghost_credible(ac))
+        ]
+        hires_buffer.record(samples)
+
+
 # ---------------------------------------------------------------------------
 # App lifespan
 # ---------------------------------------------------------------------------
@@ -466,10 +585,12 @@ async def lifespan(app: FastAPI):
     today_data = await asyncio.to_thread(stats_db.query_today_icaos, today)
     state.init_today(today_data["all"], today_data["military"])
 
-    # Seed sighting counts so live aircraft correctly reflect DB state
-    sighting_counts = await asyncio.to_thread(stats_db.query_all_sighting_counts)
+    # Seed sighting counts so live aircraft correctly reflect DB state.
+    # Only load aircraft seen in the last 90 days — avoids pulling the full
+    # registry into RAM on mature installs with years of history.
+    sighting_counts = await asyncio.to_thread(stats_db.query_sighting_counts_recent, 90)
     state.seed_sighting_counts(sighting_counts)
-    log.info("Seeded sighting counts for %d aircraft", len(sighting_counts))
+    log.info("Seeded sighting counts for %d aircraft (last 90 days)", len(sighting_counts))
 
     # Queue aircraft with missing enrichment fields for hexdb re-lookup
     needs_enrichment = await asyncio.to_thread(stats_db.query_needs_enrichment, 500)
@@ -492,22 +613,39 @@ async def lifespan(app: FastAPI):
 
     global _decoder_thread
     _decoder_thread = _start_msg_processor()
-    asyncio.create_task(_beast_runner())
+    _bg_tasks: list[asyncio.Task] = []
+    def _bg(coro):
+        t = asyncio.create_task(coro)
+        _bg_tasks.append(t)
+        return t
+    _bg(_beast_runner())
     for name, host, port in config.MLAT_SERVERS:
-        asyncio.create_task(_mlat_runner(name, host, port))
-    asyncio.create_task(_push_updates())
-    asyncio.create_task(_db_writer())
-    asyncio.create_task(_db_update_checker())
-    asyncio.create_task(_hexdb_cache_flusher())
-    asyncio.create_task(_adsbx_task())
-    asyncio.create_task(_hexdb_task())
-    asyncio.create_task(_backup_runner())  # runs nightly; path resolved from DB/env at runtime
+        _bg(_mlat_runner(name, host, port))
+    _bg(_push_updates())
+    _bg(_db_writer())
+    _bg(_db_update_checker())
+    _bg(_hexdb_cache_flusher())
+    _bg(_adsbx_task())
+    _bg(_hexdb_task())
+    _bg(_backup_runner())  # runs nightly; path resolved from DB/env at runtime
+    _bg(_hires_writer())
+    _bg(_route_enricher())
+    _bg(health_module.loop_lag_sampler())
+    health_module.register_context(_msg_queue, _clients)
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",
              config.BEAST_HOST, config.BEAST_PORT)
 
     yield
 
     # --- Graceful shutdown ---
+    # Cancel background tasks first; the explicit final DB write below
+    # handles persistence — we don't need _push_updates or _db_writer to
+    # finish their current cycle.
+    log.info("Shutdown: cancelling background tasks…")
+    for t in _bg_tasks:
+        t.cancel()
+    await asyncio.gather(*_bg_tasks, return_exceptions=True)
+
     # Stop the decoder thread before the final DB write so it can't be
     # holding _lock when we call get_snapshot() below.
     log.info("Shutdown: stopping decoder thread…")
@@ -519,6 +657,9 @@ async def lifespan(app: FastAPI):
     try:
         final_snapshot = state.get_snapshot()
         await asyncio.to_thread(stats_db.write_minute, final_snapshot)
+        # write_minute() may not flush the registry buffer if the interval hasn't
+        # elapsed — force a final flush so no aircraft data is lost on clean shutdown.
+        await asyncio.to_thread(stats_db.flush_registry_now)
     except Exception:
         log.exception("Shutdown: final DB write failed")
 
@@ -542,6 +683,8 @@ app.include_router(tracks_router)
 app.include_router(history_router)
 aircraft_router._state = state  # type: ignore[attr-defined]
 app.include_router(aircraft_router)
+mlat_module._state = state
+app.include_router(mlat_router)
 app.include_router(fleet_router)
 app.include_router(coverage_router)
 app.include_router(acas_router)
@@ -549,6 +692,7 @@ app.include_router(squawks_router)
 app.include_router(status_router)
 app.include_router(notify_settings_router)
 app.include_router(debug_router)
+app.include_router(health_router)
 if config.DEBUG_ENRICHMENT:
     log.info("Debug router mounted (DEBUG_ENRICHMENT=%s)", config.DEBUG_ENRICHMENT)
 

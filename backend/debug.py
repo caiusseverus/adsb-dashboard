@@ -9,10 +9,15 @@ POST /api/debug/aircraft/{icao}/override — override a field in aircraft_regist
 
 import asyncio
 import logging
-import statistics
+import os
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
+# On Pi hardware 20k iterations pins all cores for ~20s and can push junction
+# temperature above the 80°C soft-throttle threshold, corrupting the results.
+_IS_PI    = os.path.exists("/sys/firmware/devicetree/base/model")
+_BENCH_MAX = 2_000 if _IS_PI else 20_000
 
 from db import stats_db
 import enrichment as enrichment_module
@@ -50,7 +55,7 @@ async def get_perf() -> dict:
             "p95":  round(data[int(n * 0.95)] * scale, 1),
             "p99":  round(data[int(n * 0.99)] * scale, 1),
             "max":  round(data[-1] * scale, 1),
-            "mean": round(statistics.mean(data) * scale, 1),
+            "mean": round((sum(data) / n) * scale, 1),
         }
 
     def push_avg(key: str) -> float:
@@ -118,7 +123,7 @@ async def run_benchmark(fresh: bool = False, n: int = 5000) -> dict:
             detail="Benchmark already running — try again in a few seconds",
         )
 
-    n = max(100, min(n, 20_000))
+    n = max(100, min(n, _BENCH_MAX))
 
     _bench_running = True
     try:

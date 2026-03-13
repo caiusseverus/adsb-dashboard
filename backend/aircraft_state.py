@@ -7,10 +7,10 @@ import time
 import threading
 import logging
 import re
-from collections import deque
+from collections import deque, OrderedDict
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import pyModeS as pms
 from pyModeS.decoder.bds import bds40 as _bds40, bds50 as _bds50, bds60 as _bds60
@@ -42,12 +42,178 @@ _MLAT_TS_MARKER: int = int.from_bytes(b'\xff\x00MLAT', 'big')  # 0xFF004D4C4154
 _ICAO_HEX_RE = re.compile(r"^[0-9A-F]{6}$")
 _ACAS_CONFIRM_WINDOW_S = 12
 _ACAS_MIN_CONFIRM_FRAMES = 2
+_HEXDB_QUEUE_MAX = 600      # hard ceiling: startup batch + live overflow
+_SIGHTING_LRU_MAX = 10_000  # ~800 KB worst case; evicts oldest on busy long-running sites
 
 # Altitude filtering constants
 _ALT_MIN_FT = -1_000          # below this is a bad decode (subterranean)
 _ALT_MAX_FT = 60_000          # above this is a bad decode (service ceiling)
 _ALT_MAX_RATE_FPM = 8_000     # max realistic climb/descent rate — rejects spikes
 _ALT_SOURCE_STALE_S = 15.0    # after this many seconds, lower-priority source may overwrite
+
+# MLAT quality constants
+_MLAT_MIN_DT_S        = 0.5   # minimum fix interval for speed-based spike detection
+_MLAT_MAX_SPEED_KT    = 750   # implied groundspeed ceiling (kt) — above this = spike
+_MLAT_FIX_MAXLEN      = 20    # rolling fix-buffer depth per source (~10–20 s at 1–2 Hz)
+_MLAT_STALE_EVICT_S   = 120   # evict a source's per-aircraft state after this silence (s)
+_MLAT_ALIGN_WINDOW    = 2.0   # max age difference (s) for cross-source residual pairing
+_MLAT_RESIDUAL_MAXLEN = 30    # rolling residual buffer depth per source
+_MLAT_FUSION_WINDOW   = 4.0   # max fix age (s) for inclusion in weighted fusion
+
+# ── Kalman filter constants ────────────────────────────────────────────────
+# 2-D constant-velocity filter; state = [east_m, north_m, ve_m/s, vn_m/s]
+_KF_SIGMA_A  = 5.0       # m/s² process noise (typical aircraft manoeuvring accel)
+_KF_SIGMA_M0 = 50.0      # m    base MLAT measurement noise (quality=1.0 source)
+_KF_GATE_D2  = 13.816    # chi² innovations gate, 99.9 % threshold, 2 DOF
+_KF_R_EARTH  = 6_371_000.0
+
+
+# ── Kalman helper functions ────────────────────────────────────────────────
+
+def _enu(lat: float, lon: float, ref_lat: float, ref_lon: float) -> tuple[float, float]:
+    """Lat/lon → approximate ENU metres relative to reference point.
+    Accurate to <0.1 % for offsets up to ~50 km — sufficient for MLAT.
+    """
+    north = math.radians(lat - ref_lat) * _KF_R_EARTH
+    east  = math.radians(lon - ref_lon) * math.cos(math.radians(ref_lat)) * _KF_R_EARTH
+    return east, north
+
+
+def _latlon_from_enu(east: float, north: float,
+                     ref_lat: float, ref_lon: float) -> tuple[float, float]:
+    lat = ref_lat + math.degrees(north / _KF_R_EARTH)
+    lon = ref_lon + math.degrees(east / (_KF_R_EARTH * math.cos(math.radians(ref_lat))))
+    return lat, lon
+
+
+def _kf_init(e: float, n: float) -> tuple[list, list]:
+    """Initialise state and covariance at a known ENU position, zero velocity."""
+    x = [e, n, 0.0, 0.0]
+    P0p = 500.0 ** 2   # 500 m initial position uncertainty (1-sigma)
+    P0v = 150.0 ** 2   # 150 m/s (~300 kt) initial velocity uncertainty
+    P = [P0p, 0.0, 0.0, 0.0,
+         0.0, P0p, 0.0, 0.0,
+         0.0, 0.0, P0v, 0.0,
+         0.0, 0.0, 0.0, P0v]
+    return x, P
+
+
+def _kf_predict(x: list, P: list, dt: float) -> tuple[list, list]:
+    """Constant-velocity predict step.  P is 4×4 stored row-major (16 floats)."""
+    dt2 = dt * dt
+    dt3 = dt2 * dt
+    dt4 = dt2 * dt2
+    # x_pred = F * x
+    x_p = [x[0] + x[2]*dt, x[1] + x[3]*dt, x[2], x[3]]
+    # F*P*F' — expanded analytically, exploiting F sparsity
+    FPFt = [
+        P[0]  + dt*(P[8]+P[2])  + dt2*P[10],   # (0,0) e,e
+        P[1]  + dt*(P[9]+P[3])  + dt2*P[11],   # (0,1) e,n
+        P[2]  + dt*P[10],                        # (0,2) e,ve
+        P[3]  + dt*P[11],                        # (0,3) e,vn
+        P[4]  + dt*(P[12]+P[6]) + dt2*P[14],   # (1,0) n,e
+        P[5]  + dt*(P[13]+P[7]) + dt2*P[15],   # (1,1) n,n
+        P[6]  + dt*P[14],                        # (1,2) n,ve
+        P[7]  + dt*P[15],                        # (1,3) n,vn
+        P[8]  + dt*P[10],                        # (2,0) ve,e
+        P[9]  + dt*P[11],                        # (2,1) ve,n
+        P[10],                                    # (2,2) ve,ve
+        P[11],                                    # (2,3) ve,vn
+        P[12] + dt*P[14],                        # (3,0) vn,e
+        P[13] + dt*P[15],                        # (3,1) vn,n
+        P[14],                                    # (3,2) vn,ve
+        P[15],                                    # (3,3) vn,vn
+    ]
+    # Add process noise Q (constant-velocity model, σ_a²)
+    sa2 = _KF_SIGMA_A * _KF_SIGMA_A
+    FPFt[0]  += sa2 * dt4 / 4   # e,e
+    FPFt[5]  += sa2 * dt4 / 4   # n,n
+    FPFt[10] += sa2 * dt2        # ve,ve
+    FPFt[15] += sa2 * dt2        # vn,vn
+    FPFt[2]  += sa2 * dt3 / 2   # e,ve
+    FPFt[8]  += sa2 * dt3 / 2   # ve,e
+    FPFt[7]  += sa2 * dt3 / 2   # n,vn
+    FPFt[13] += sa2 * dt3 / 2   # vn,n
+    return x_p, FPFt
+
+
+def _kf_update(x_p: list, P_p: list,
+               e_meas: float, n_meas: float,
+               quality: float) -> tuple[list, list, bool]:
+    """Kalman measurement update with chi-squared innovations gate.
+
+    Measurement noise R = (σ_m0 / quality)² — poor-geometry sources get
+    larger noise and therefore contribute less to the fused estimate.
+    Returns (x_new, P_new, accepted).
+    """
+    sigma_m = _KF_SIGMA_M0 / max(quality, 0.1)
+    R = sigma_m * sigma_m
+
+    # Innovation y = z − H·x_pred  (H extracts position rows)
+    y0 = e_meas - x_p[0]
+    y1 = n_meas - x_p[1]
+
+    # S = H·P·H' + R  (top-left 2×2 of P, plus R on diagonal)
+    S00 = P_p[0] + R;  S01 = P_p[1]
+    S10 = P_p[4];      S11 = P_p[5] + R
+
+    det_S = S00*S11 - S01*S10
+    if abs(det_S) < 1.0:          # degenerate — skip update
+        return x_p, P_p, False
+
+    Si00 =  S11 / det_S;  Si01 = -S01 / det_S
+    Si10 = -S10 / det_S;  Si11 =  S00 / det_S
+
+    # Chi-squared innovations gate: d² = y' S⁻¹ y
+    d2 = Si00*y0*y0 + (Si01+Si10)*y0*y1 + Si11*y1*y1
+    if d2 > _KF_GATE_D2:
+        return x_p, P_p, False     # outlier — reject measurement
+
+    # Kalman gain K = P·H'·S⁻¹  (4×2, stored as two column vectors K0, K1)
+    K0 = [P_p[i*4]*Si00 + P_p[i*4+1]*Si10 for i in range(4)]
+    K1 = [P_p[i*4]*Si01 + P_p[i*4+1]*Si11 for i in range(4)]
+
+    x_new = [x_p[i] + K0[i]*y0 + K1[i]*y1 for i in range(4)]
+    # P_new = (I − K·H)·P  →  P[i,j] − K0[i]·P[0,j] − K1[i]·P[1,j]
+    P_new = [P_p[i*4+j] - K0[i]*P_p[j] - K1[i]*P_p[4+j]
+             for i in range(4) for j in range(4)]
+    return x_new, P_new, True
+
+
+def _kalman_init(ac: "Aircraft", lat: float, lon: float, now: float) -> None:
+    """Initialise (or re-initialise) the per-aircraft Kalman state."""
+    x, P = _kf_init(0.0, 0.0)   # ENU origin = current position
+    ac.kalman_state = {"x": x, "P": P, "ref_lat": lat, "ref_lon": lon, "ts": now}
+
+
+def _kalman_update_position(ac: "Aircraft", lat: float, lon: float,
+                             now: float, quality: float) -> tuple[float, float]:
+    """Sequential predict+update cycle for one incoming MLAT fix.
+
+    Each source fix is treated as an independent measurement; quality score
+    controls measurement noise so weaker sources contribute proportionally less.
+    Always returns the current Kalman position estimate.
+    """
+    ks = ac.kalman_state
+    dt = now - ks["ts"]
+
+    x_p, P_p = _kf_predict(ks["x"], ks["P"], dt)
+
+    e_meas, n_meas = _enu(lat, lon, ks["ref_lat"], ks["ref_lon"])
+    x_new, P_new, _ = _kf_update(x_p, P_p, e_meas, n_meas, quality)
+
+    ks["x"] = x_new
+    ks["P"] = P_new
+    ks["ts"] = now
+
+    return _latlon_from_enu(x_new[0], x_new[1], ks["ref_lat"], ks["ref_lon"])
+
+
+class MlatFix(NamedTuple):
+    """A single MLAT position fix from one network."""
+    ts:  float   # time.time() when received
+    lat: float
+    lon: float
 
 
 def _accept_altitude(ac: "Aircraft", alt: int, source: str, now: float) -> bool:
@@ -77,6 +243,8 @@ def _accept_altitude(ac: "Aircraft", alt: int, source: str, now: float) -> bool:
     ac.altitude = alt
     ac._alt_source = source
     ac._alt_source_ts = now
+    if ac.max_altitude is None or alt > ac.max_altitude:
+        ac.max_altitude = alt
     return True
 
 def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -93,6 +261,210 @@ def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a = (math.sin(dlat / 2) ** 2
          + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2)
     return _R_NM * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _update_range_bearing(ac: "Aircraft") -> None:
+    """Recompute range_nm and bearing_deg from ac.lat/lon and receiver coords."""
+    if config.RECEIVER_LAT is not None and config.RECEIVER_LON is not None:
+        ac.range_nm   = round(_haversine_nm(config.RECEIVER_LAT, config.RECEIVER_LON, ac.lat, ac.lon), 1)
+        ac.bearing_deg = round(_bearing_deg(config.RECEIVER_LAT, config.RECEIVER_LON, ac.lat, ac.lon), 1)
+
+
+def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
+                          pos_from_global: bool, now: float) -> None:  # noqa: ARG001
+    """Write a validated ADS-B CPR position to the aircraft record."""
+    ac.lat = round(lat, 5)
+    ac.lon = round(lon, 5)
+    if pos_from_global:
+        ac.pos_global = True
+    _update_range_bearing(ac)
+
+
+def _fuse_ecef(candidates: list[tuple[float, float, float]]) -> tuple[float, float]:
+    """ECEF weighted centroid of (lat_deg, lon_deg, weight) candidates.
+
+    Correct for any lat/lon separation; at MLAT disagreement distances (< 10 nm)
+    the result is nearly identical to a simple weighted average of lat/lon, but
+    the ECEF approach is correct by construction and costs negligible extra compute.
+    """
+    total_w = sum(w for _, _, w in candidates)
+    fx = fy = fz = 0.0
+    for lat, lon, w in candidates:
+        rlat, rlon = math.radians(lat), math.radians(lon)
+        fx += math.cos(rlat) * math.cos(rlon) * w / total_w
+        fy += math.cos(rlat) * math.sin(rlon) * w / total_w
+        fz += math.sin(rlat)                  * w / total_w
+    r = math.sqrt(fx * fx + fy * fy + fz * fz)
+    return math.degrees(math.asin(fz / r)), math.degrees(math.atan2(fy, fx))
+
+
+def _compute_cross_source_residuals(ac: "Aircraft", source: str, lat: float, lon: float, now: float) -> None:
+    """Record inter-network position residuals against all other sources with recent fixes.
+
+    Called only for non-spiked fixes so residual distributions reflect real quality,
+    not position noise from bad fixes.  Both the new source and each counterpart
+    share the residual symmetrically.
+    """
+    for src, buf in ac.mlat_fixes.items():
+        if src == source or not buf:
+            continue
+        other = buf[-1]
+        if now - other.ts > _MLAT_ALIGN_WINDOW:
+            continue   # too stale for a meaningful comparison
+        residual_nm = _haversine_nm(lat, lon, other.lat, other.lon)
+        for s in (source, src):
+            if s not in ac.mlat_residuals:
+                ac.mlat_residuals[s] = deque(maxlen=_MLAT_RESIDUAL_MAXLEN)
+            ac.mlat_residuals[s].append(residual_nm)
+
+
+def _update_quality_score(ac: "Aircraft", source: str) -> None:
+    """Recompute quality score combining spike rate (60%) and median inter-source residual (40%).
+
+    When fewer than 3 residual samples are available the score is spike-rate-only,
+    giving each source a fair chance before cross-source data accumulates.
+    """
+    total = ac.mlat_fix_counts[source] + sum(ac.mlat_spike_counts[source].values())
+    spike_score = ac.mlat_fix_counts[source] / total if total > 0 else 1.0
+
+    residuals = ac.mlat_residuals.get(source)
+    if residuals and len(residuals) >= 3:
+        median_nm = sorted(residuals)[len(residuals) // 2]
+        # 0 nm → 1.0, 0.5 nm → 0.67, 1 nm → 0.50, 2 nm → 0.33
+        residual_score = 1.0 / (1.0 + median_nm)
+        quality = 0.6 * spike_score + 0.4 * residual_score
+    else:
+        quality = spike_score
+
+    ac.mlat_quality_scores[source] = round(quality, 3)
+
+
+def _select_output_position(
+    ac: "Aircraft", cur_lat: float, cur_lon: float, is_spike: bool, now: float
+) -> tuple[float, float] | None:
+    """Choose the output position under the active MLAT_FUSION mode.
+
+    Returns (lat, lon) to write to ac.lat/ac.lon, or None to skip the write.
+
+    spike_filter — reject spiked fixes; clean fixes written as-is.
+    weighted     — ECEF weighted centroid of all sources with recent buffered fixes;
+                   falls back to current fix if no other source has a recent fix.
+    """
+    fusion = config.MLAT_FUSION
+
+    if fusion == "spike_filter":
+        return None if is_spike else (cur_lat, cur_lon)
+
+    if fusion == "weighted":
+        candidates: list[tuple[float, float, float]] = []
+        for src, buf in ac.mlat_fixes.items():
+            if not buf:
+                continue
+            fix = buf[-1]
+            if now - fix.ts > _MLAT_FUSION_WINDOW:
+                continue
+            w = ac.mlat_quality_scores.get(src, 1.0)
+            if w > 0:
+                candidates.append((fix.lat, fix.lon, w))
+        if len(candidates) >= 2:
+            return _fuse_ecef(candidates)
+        if candidates:
+            return candidates[0][0], candidates[0][1]
+        # No buffered fixes yet — use current fix if it is not a spike
+        return None if is_spike else (cur_lat, cur_lon)
+
+    return None
+
+
+def _record_mlat_fix(ac: "Aircraft", source: str, lat: float, lon: float, now: float) -> None:
+    """Buffer an MLAT fix, run spike detection, and write position.
+
+    Phase A (MLAT_FUSION=none): last-write-wins, no behaviour change.
+    Phase B (spike_filter / weighted): position write is gated on quality.
+    """
+    # Initialise per-source state on first fix from this source
+    if source not in ac.mlat_fixes:
+        ac.mlat_fixes[source]          = deque(maxlen=_MLAT_FIX_MAXLEN)
+        ac.mlat_spike_counts[source]   = {}
+        ac.mlat_fix_counts[source]     = 0
+        ac.mlat_quality_scores[source] = 1.0
+
+    buf      = ac.mlat_fixes[source]
+    prev_ts  = ac.mlat_last_fix_ts.get(source)
+    is_spike = False
+
+    if prev_ts is not None and buf:
+        if now <= prev_ts:
+            # Non-monotonic timestamp
+            ac.mlat_spike_counts[source]["nonmonotonic"] = (
+                ac.mlat_spike_counts[source].get("nonmonotonic", 0) + 1
+            )
+            is_spike = True
+        else:
+            dt = now - prev_ts
+            if dt < _MLAT_MIN_DT_S:
+                # Gap too small for a reliable speed estimate — skip check, don't count as spike
+                pass
+            else:
+                prev = buf[-1]
+                speed_kt = (_haversine_nm(prev.lat, prev.lon, lat, lon) / dt) * 3600
+                if speed_kt > _MLAT_MAX_SPEED_KT:
+                    ac.mlat_spike_counts[source]["speed"] = (
+                        ac.mlat_spike_counts[source].get("speed", 0) + 1
+                    )
+                    is_spike = True
+
+    if not is_spike:
+        buf.append(MlatFix(ts=now, lat=lat, lon=lon))
+        ac.mlat_fix_counts[source] += 1
+
+    # Update rolling quality score: fraction of non-spiked attempted fixes
+    total_attempts = ac.mlat_fix_counts[source] + sum(ac.mlat_spike_counts[source].values())
+    if total_attempts > 0:
+        ac.mlat_quality_scores[source] = round(ac.mlat_fix_counts[source] / total_attempts, 3)
+
+    ac.mlat_last_fix_ts[source] = now
+
+    # Cross-source residuals feed the scorecard regardless of fusion mode.
+    if not is_spike:
+        _compute_cross_source_residuals(ac, source, lat, lon, now)
+    _update_quality_score(ac, source)
+
+    # Evict sources that have been silent for too long to prevent dict growth
+    stale = [s for s, ts in ac.mlat_last_fix_ts.items()
+             if now - ts > _MLAT_STALE_EVICT_S and s != source]
+    for s in stale:
+        ac.mlat_fixes.pop(s, None)
+        ac.mlat_spike_counts.pop(s, None)
+        ac.mlat_fix_counts.pop(s, None)
+        ac.mlat_quality_scores.pop(s, None)
+        ac.mlat_last_fix_ts.pop(s, None)
+        ac.mlat_residuals.pop(s, None)
+
+    # Position write — gated by MLAT_FUSION mode
+    if config.MLAT_FUSION == "none":
+        # Phase A behaviour: always write, last-write-wins
+        ac.lat = round(lat, 5)
+        ac.lon = round(lon, 5)
+        _update_range_bearing(ac)
+    elif config.MLAT_FUSION == "kalman":
+        if not is_spike:
+            quality = ac.mlat_quality_scores.get(source, 1.0)
+            ks = ac.kalman_state
+            if ks is None or (now - ks["ts"]) > 60.0:
+                # First fix or aircraft was silent > 60 s — (re-)initialise
+                _kalman_init(ac, lat, lon, now)
+                ac.lat, ac.lon = round(lat, 5), round(lon, 5)
+            else:
+                lat_k, lon_k = _kalman_update_position(ac, lat, lon, now, quality)
+                ac.lat, ac.lon = round(lat_k, 5), round(lon_k, 5)
+            _update_range_bearing(ac)
+    else:
+        pos = _select_output_position(ac, lat, lon, is_spike, now)
+        if pos is not None:
+            ac.lat = round(pos[0], 5)
+            ac.lon = round(pos[1], 5)
+            _update_range_bearing(ac)
 
 
 def _log_enrichment(icao: str, ac, adsbx: dict | None, op_source: str) -> None:
@@ -151,7 +523,7 @@ def _apply_hexdb_data(ac, data: dict) -> None:
             ac.operator = owners
 
 
-@dataclass
+@dataclass(slots=True)
 class Aircraft:
     icao: str
     first_seen: float = field(default_factory=time.time)
@@ -187,6 +559,7 @@ class Aircraft:
     cpr_odd:  Optional[tuple] = field(default=None, repr=False)
     pos_global: bool = False  # True once a global CPR decode (even+odd pair) has succeeded
     sighting_count: int = 1               # from aircraft_registry; 1 = unique (never seen before)
+    max_altitude: Optional[int] = None    # highest altitude seen this visit
     # MLAT
     has_adsb: bool = False               # True once a DF17 WITHOUT the MLAT timestamp is seen
                                          # (guarantees a real ADS-B transponder; blocks MLAT tag)
@@ -203,6 +576,22 @@ class Aircraft:
     acas_sensitivity:   Optional[int]  = None
     acas_threat_icao:   Optional[str]  = None
     acas_ra_ts:         Optional[float]= None
+    # MLAT per-source quality tracking — populated by _record_mlat_fix()
+    # source → deque[MlatFix] (rolling fix buffer per network)
+    mlat_fixes:          dict = field(default_factory=dict)
+    # source → {reason: count} — nonmonotonic / speed spike counters
+    mlat_spike_counts:   dict = field(default_factory=dict)
+    # source → int — count of non-spiked (accepted) fixes
+    mlat_fix_counts:     dict = field(default_factory=dict)
+    # source → float [0.0–1.0] — rolling quality score (good fixes / total)
+    mlat_quality_scores: dict = field(default_factory=dict)
+    # source → float — timestamp of most recent fix (for stale eviction)
+    mlat_last_fix_ts:    dict = field(default_factory=dict)
+    # source → deque[float] — rolling inter-network position residuals in nm (Phase B)
+    mlat_residuals:      dict = field(default_factory=dict)
+    # Kalman filter state — populated on first MLAT fix when MLAT_FUSION=kalman
+    # dict: {x, P, ref_lat, ref_lon, ts}  or None before first fix
+    kalman_state:        Optional[dict] = None
 
 
 class AircraftState:
@@ -250,8 +639,15 @@ class AircraftState:
         self._today_icaos: set[str] = set()
         self._today_mil_icaos: set[str] = set()
 
-        # sighting_count seed from DB (icao -> count); used when creating new Aircraft objects
-        self._sighting_counts: dict[str, int] = {}
+        # sighting_count seed from DB (icao -> count); bounded LRU so long-tail
+        # historical ICAOs are evicted rather than accumulating indefinitely
+        self._sighting_counts: OrderedDict[str, int] = OrderedDict()
+
+        # History deque cache for get_snapshot() — the completed-minute deques only
+        # change once per minute, so we rebuild the list copies at most 1×/min instead
+        # of 60×/min (once per second).
+        self._snapshot_history_minute: int = -1
+        self._snapshot_history_cache: tuple | None = None  # (rate_list, df_list, mlat_list)
 
     # ------------------------------------------------------------------
     # Public API
@@ -296,13 +692,16 @@ class AircraftState:
             self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
         msg_timings.append(time.perf_counter() - t0)
 
-    def expire_aircraft(self) -> None:
+    def expire_aircraft(self) -> list["Aircraft"]:
+        """Remove stale aircraft and return them for visit logging."""
         now = time.time()
+        expired = []
         with self._lock:
             stale = [icao for icao, ac in self._aircraft.items()
                      if now - ac.last_seen > self._timeout]
             for icao in stale:
-                del self._aircraft[icao]
+                expired.append(self._aircraft.pop(icao))
+        return expired
 
     def init_today(self, icaos: set[str], mil_icaos: set[str]) -> None:
         """Seed today's unique-aircraft sets from DB on startup (persistence across restarts)."""
@@ -313,12 +712,15 @@ class AircraftState:
     def seed_sighting_counts(self, counts: dict[str, int]) -> None:
         """Seed sighting_count from DB so new Aircraft objects get correct values."""
         with self._lock:
-            self._sighting_counts = counts
+            self._sighting_counts = OrderedDict(counts)
 
     def seed_hexdb_queue(self, icaos: list[str]) -> None:
         """Add a batch of ICAOs to the hexdb re-enrichment queue."""
         with self._lock:
-            self._hexdb_queue.update(icaos)
+            for icao in icaos:
+                if len(self._hexdb_queue) >= _HEXDB_QUEUE_MAX:
+                    break
+                self._hexdb_queue.add(icao)
 
     def update_sighting_counts(self, counts: dict[str, int]) -> None:
         """Refresh in-memory sighting_count for live aircraft after a DB write."""
@@ -328,6 +730,9 @@ class AircraftState:
                 if ac:
                     ac.sighting_count = count
                 self._sighting_counts[icao] = count
+                self._sighting_counts.move_to_end(icao)
+                while len(self._sighting_counts) > _SIGHTING_LRU_MAX:
+                    self._sighting_counts.popitem(last=False)
 
     def pop_hexdb_queue(self, max_n: int = 10) -> set[str]:
         """Return up to max_n ICAOs awaiting hexdb lookup; removes them from the queue."""
@@ -446,7 +851,8 @@ class AircraftState:
 
             # Queue hexdb HTTP lookup if any key field is still missing
             if not ac.operator or not ac.registration or not ac.type_code:
-                self._hexdb_queue.add(icao)
+                if len(self._hexdb_queue) < _HEXDB_QUEUE_MAX:
+                    self._hexdb_queue.add(icao)
 
             if config.DEBUG_ENRICHMENT == 1:
                 op_source = (
@@ -481,9 +887,20 @@ class AircraftState:
             else:
                 cur_mn = cur_mx = cur_me = 0.0
             cur_total = len(self._aircraft)
-            cur_mil = sum(1 for ac in self._aircraft.values() if ac.military)
-            cur_with_pos = sum(1 for ac in self._aircraft.values() if ac.lat is not None)
-            cur_mlat_pos = sum(1 for ac in self._aircraft.values() if ac.mlat and ac.lat is not None)
+            # Single pass: collect all per-aircraft counters and the aircraft list.
+            # Replaces four separate O(N) scans that previously ran inside the lock.
+            cur_mil = cur_with_pos = cur_mlat_pos = mlat_aircraft_count = 0
+            for ac in self._aircraft.values():
+                if ac.military:
+                    cur_mil += 1
+                if ac.lat is not None:
+                    cur_with_pos += 1
+                if ac.mlat:
+                    mlat_aircraft_count += 1
+                    if ac.lat is not None:
+                        cur_mlat_pos += 1
+            live_military = cur_mil
+
             cur_sigs = self._cur_min_signals
             cur_sig_avg = round(sum(cur_sigs) / len(cur_sigs), 1) if cur_sigs else None
             cur_stats = (self._cur_min, cur_mn, cur_mx, cur_me,
@@ -491,9 +908,20 @@ class AircraftState:
                          cur_sig_avg, min(cur_sigs) if cur_sigs else None,
                          max(cur_sigs) if cur_sigs else None,
                          cur_with_pos, cur_mlat_pos)
-            rate_history = list(self._min_stats) + [cur_stats]
-            df_history = list(self._min_df_stats) + [(self._cur_min, dict(self._cur_min_df_counts))]
-            mlat_history = list(self._min_mlat_counts) + [(self._cur_min, self._cur_min_mlat_count)]
+
+            # Rebuild history list copies only when the minute rolls over.
+            # At 1 Hz this avoids 3 deque→list copies per second (59 of 60 are free).
+            if self._snapshot_history_minute != self._cur_min or self._snapshot_history_cache is None:
+                self._snapshot_history_cache = (
+                    list(self._min_stats),
+                    list(self._min_df_stats),
+                    list(self._min_mlat_counts),
+                )
+                self._snapshot_history_minute = self._cur_min
+            hist_min_stats, hist_df_stats, hist_mlat_counts = self._snapshot_history_cache
+            rate_history = hist_min_stats + [cur_stats]
+            df_history = hist_df_stats + [(self._cur_min, dict(self._cur_min_df_counts))]
+            mlat_history = hist_mlat_counts + [(self._cur_min, self._cur_min_mlat_count)]
 
             aircraft_list = [
                 {
@@ -530,6 +958,20 @@ class AircraftState:
                     "mlat":              ac.mlat,
                     "mlat_source":       ac.mlat_source,
                     "mlat_msg_count":    ac.mlat_msg_count,
+                    "mlat_quality":      dict(ac.mlat_quality_scores),
+                    "mlat_sources": {
+                        src: {
+                            "fixes":           len(buf),
+                            "spikes":          sum(ac.mlat_spike_counts.get(src, {}).values()),
+                            "spike_detail":    dict(ac.mlat_spike_counts.get(src, {})),
+                            "median_residual": (
+                                round(sorted(ac.mlat_residuals[src])[len(ac.mlat_residuals[src]) // 2], 3)
+                                if src in ac.mlat_residuals and len(ac.mlat_residuals[src]) >= 3
+                                else None
+                            ),
+                        }
+                        for src, buf in ac.mlat_fixes.items()
+                    },
                     "acas_ra_active":     ac.acas_ra_ts is not None and (now - ac.acas_ra_ts) < 60,
                     "acas_ra_desc":       ac.acas_ra_desc,
                     "acas_ra_corrective": ac.acas_ra_corrective,
@@ -539,9 +981,6 @@ class AircraftState:
                 }
                 for ac in self._aircraft.values()
             ]
-
-        live_military = sum(1 for ac in self._aircraft.values() if ac.military)
-        mlat_aircraft_count = sum(1 for ac in self._aircraft.values() if ac.mlat)
 
         return {
             "aircraft_count": len(aircraft_list),
@@ -776,20 +1215,15 @@ class AircraftState:
                                         config.RECEIVER_LAT, config.RECEIVER_LON,
                                         lat, lon) > 500):
                                 pass  # discard — beyond ADS-B range
-                            else:
-                                ac.lat = round(lat, 5)
-                                ac.lon = round(lon, 5)
-                                if pos_from_global:
-                                    ac.pos_global = True
-                                if config.RECEIVER_LAT is not None and config.RECEIVER_LON is not None:
-                                    ac.range_nm = round(_haversine_nm(
-                                        config.RECEIVER_LAT, config.RECEIVER_LON,
-                                        ac.lat, ac.lon,
-                                    ), 1)
-                                    ac.bearing_deg = round(_bearing_deg(
-                                        config.RECEIVER_LAT, config.RECEIVER_LON,
-                                        ac.lat, ac.lon,
-                                    ), 1)
+                            elif mlat and not ac.has_adsb:
+                                # Genuine MLAT position: buffer, spike-detect, fuse
+                                # Skip if aircraft has confirmed ADS-B transponder —
+                                # the MLAT stream is just forwarding its GPS broadcast;
+                                # the ADS-B position from the main stream is authoritative.
+                                _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
+                            elif not mlat:
+                                # ADS-B position: write directly
+                                _accept_adsb_position(ac, lat, lon, pos_from_global, now)
                 except Exception:
                     pass
 

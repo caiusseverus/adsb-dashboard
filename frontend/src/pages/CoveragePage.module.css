@@ -172,3 +172,59 @@
   border-radius: 50%;
   flex-shrink: 0;
 }
+
+/* ── Timelapse control bar ─────────────────────────────────────────── */
+.tlBar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  padding: 0.3rem 0.5rem;
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 6px;
+}
+
+.tlDate {
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  border: 1px solid #30363d;
+  background: #0b0c10;
+  color: #c9d1d9;
+  cursor: pointer;
+}
+.tlDate::-webkit-calendar-picker-indicator { filter: invert(0.5); }
+
+.tlBtn {
+  padding: 0.15rem 0.55rem;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  border: 1px solid #30363d;
+  cursor: pointer;
+  background: transparent;
+  color: #8b949e;
+}
+.tlBtn:hover:not(:disabled) { color: #c9d1d9; }
+.tlBtn:disabled { opacity: 0.35; cursor: default; }
+
+.tlScrubber {
+  flex: 1;
+  min-width: 120px;
+  max-width: 340px;
+  accent-color: #388bfd;
+  cursor: pointer;
+}
+
+.tlTime {
+  font-size: 0.78rem;
+  color: #8b949e;
+  font-variant-numeric: tabular-nums;
+  min-width: 7ch;
+}
+
+.tlError {
+  font-size: 0.72rem;
+  color: #f85149;
+}
