@@ -425,9 +425,8 @@ def _record_mlat_fix(ac: "Aircraft", source: str, lat: float, lon: float, now: f
 
     ac.mlat_last_fix_ts[source] = now
 
-    # Update quality score — always use the richer Phase B formula even in none mode
-    # so the scorecard data is useful regardless of which fusion mode is active.
-    if config.MLAT_FUSION != "none" and not is_spike:
+    # Cross-source residuals feed the scorecard regardless of fusion mode.
+    if not is_spike:
         _compute_cross_source_residuals(ac, source, lat, lon, now)
     _update_quality_score(ac, source)
 
