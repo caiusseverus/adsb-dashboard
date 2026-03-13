@@ -64,6 +64,12 @@
   color: #6e7681;
 }
 
+.residualRange {
+  font-size: 0.68rem;
+  color: #484f58;
+  margin-top: 1px;
+}
+
 .barTrack {
   position: relative;
   background: #0d1117;

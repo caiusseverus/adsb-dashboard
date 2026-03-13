@@ -6,16 +6,17 @@ import styles from './MlatScorecard.module.css'
  * sorted by quality descending.
  */
 function aggregateSources(aircraft) {
-  const totals = {}   // source → { fixes, spikes, residuals[], qualities[] }
+  const totals = {}   // source → { fixes, spikes, residuals[], qualities[], aircraft_count }
 
   for (const ac of aircraft) {
     const srcs = ac.mlat_sources
     const quals = ac.mlat_quality
     if (!srcs) continue
     for (const [src, stats] of Object.entries(srcs)) {
-      if (!totals[src]) totals[src] = { fixes: 0, spikes: 0, residuals: [], qualities: [] }
+      if (!totals[src]) totals[src] = { fixes: 0, spikes: 0, residuals: [], qualities: [], aircraft_count: 0 }
       totals[src].fixes  += stats.fixes  ?? 0
       totals[src].spikes += stats.spikes ?? 0
+      totals[src].aircraft_count += 1
       if (stats.median_residual != null) totals[src].residuals.push(stats.median_residual)
       if (quals?.[src] != null)          totals[src].qualities.push(quals[src])
     }
@@ -26,11 +27,15 @@ function aggregateSources(aircraft) {
       const attempted = d.fixes + d.spikes
       const spikeRate = attempted > 0 ? d.spikes / attempted : 0
       const sorted    = [...d.residuals].sort((a, b) => a - b)
-      const medianRes = sorted.length > 0 ? sorted[Math.floor(sorted.length / 2)] : null
+      const n         = sorted.length
+      const medianRes = n > 0 ? sorted[Math.floor(n / 2)] : null
+      // p10/p90 only meaningful with enough samples
+      const p10Res    = n >= 5 ? sorted[Math.floor(n * 0.10)] : null
+      const p90Res    = n >= 5 ? sorted[Math.floor(n * 0.90)] : null
       const quality   = d.qualities.length > 0
         ? d.qualities.reduce((s, v) => s + v, 0) / d.qualities.length
         : null
-      return { source, fixes: d.fixes, spikes: d.spikes, spikeRate, medianRes, quality }
+      return { source, fixes: d.fixes, spikes: d.spikes, spikeRate, medianRes, p10Res, p90Res, quality, aircraft_count: d.aircraft_count }
     })
     .filter(d => d.fixes + d.spikes > 0)
     .sort((a, b) => (b.quality ?? 0) - (a.quality ?? 0))
@@ -67,9 +72,10 @@ export default function MlatScorecard({ aircraft }) {
         <thead>
           <tr>
             <th>Network</th>
+            <th className={styles.right}>Aircraft</th>
             <th className={styles.right}>Fixes</th>
             <th className={styles.right}>Spike&nbsp;rate</th>
-            <th className={styles.right}>Median&nbsp;residual</th>
+            <th className={styles.right}>Residual&nbsp;(p10–p90)</th>
             <th className={styles.quality}>Quality</th>
           </tr>
         </thead>
@@ -77,13 +83,21 @@ export default function MlatScorecard({ aircraft }) {
           {rows.map(row => (
             <tr key={row.source}>
               <td className={styles.name}>{row.source}</td>
+              <td className={styles.right}>{row.aircraft_count}</td>
               <td className={styles.right}>{row.fixes.toLocaleString()}</td>
               <td className={styles.right} style={{ color: row.spikeRate > 0.05 ? '#f85149' : '#8b949e' }}>
                 {(row.spikeRate * 100).toFixed(1)}%
                 {row.spikes > 0 && <span className={styles.spikeCount}> ({row.spikes})</span>}
               </td>
-              <td className={styles.right} style={{ color: row.medianRes == null ? '#8b949e' : row.medianRes > 1 ? '#e3b341' : '#3fb950' }}>
-                {row.medianRes != null ? `${row.medianRes.toFixed(2)} nm` : '—'}
+              <td className={styles.right}>
+                <span style={{ color: row.medianRes == null ? '#8b949e' : row.medianRes > 1 ? '#e3b341' : '#3fb950' }}>
+                  {row.medianRes != null ? `${row.medianRes.toFixed(2)} nm` : '—'}
+                </span>
+                {row.p10Res != null && (
+                  <div className={styles.residualRange}>
+                    {row.p10Res.toFixed(2)}–{row.p90Res.toFixed(2)}
+                  </div>
+                )}
               </td>
               <td className={styles.quality}>{qualityBar(row.quality)}</td>
             </tr>

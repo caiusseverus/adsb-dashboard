@@ -45,6 +45,8 @@ import health as health_module
 from health import router as health_router
 import tracks as tracks_module
 from tracks import router as tracks_router
+import mlat as mlat_module
+from mlat import router as mlat_router
 
 from benchmark import make_pause_aware_decoder
 
@@ -682,6 +684,8 @@ app.include_router(tracks_router)
 app.include_router(history_router)
 aircraft_router._state = state  # type: ignore[attr-defined]
 app.include_router(aircraft_router)
+mlat_module._state = state
+app.include_router(mlat_router)
 app.include_router(fleet_router)
 app.include_router(coverage_router)
 app.include_router(acas_router)

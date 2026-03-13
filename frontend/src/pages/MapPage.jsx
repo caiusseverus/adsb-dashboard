@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useMemo, useCallback } from 'react'
+import { useEffect, useRef, useState, useMemo } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { TYPE_GROUPS, TYPE_GROUP_OTHER_COLOR, typeGroupColor, buildNameColorMap, NAMED_PALETTE } from '../utils/typeGroups'
@@ -82,30 +82,51 @@ const COLOR_MODES = [
   { value: 'tags',     label: 'Tags' },
 ]
 
-const MAX_TRAIL = 90   // seconds of position history per aircraft
+// Distinct colours for per-source MLAT dots — consistent by source name hash
+const MLAT_SRC_PALETTE = ['#ff7b00', '#00d4ff', '#ff00cc', '#aaff00', '#ff3366', '#00ffaa', '#ffcc00', '#cc99ff']
+function mlatSrcColor(src) {
+  let h = 0
+  for (const c of src) h = (h * 31 + c.charCodeAt(0)) & 0xffff
+  return MLAT_SRC_PALETTE[h % MLAT_SRC_PALETTE.length]
+}
 
-// 14 segments with a power-curve opacity ramp: tail is near-invisible,
-// head approaches full opacity. Steps are small enough to look continuous.
-const N_TRAIL_SEGS = 14
-const TRAIL_SEGS = Array.from({ length: N_TRAIL_SEGS }, (_, i) => {
-  const s = i / N_TRAIL_SEGS
-  const e = (i + 1) / N_TRAIL_SEGS
-  // Power curve: opacity = ((centre of segment) ^ 1.3) * 0.72
-  const opacity = ((i + 0.5) / N_TRAIL_SEGS) ** 1.3 * 0.72
-  return [s, e, opacity]
-})
+// Residual thresholds → colour
+function residualColor(nm) {
+  if (nm < 0.3) return '#3fb950'   // good
+  if (nm < 1.0) return '#e3b341'   // marginal
+  return '#f85149'                  // poor
+}
+
+const MAX_TRAIL = 300  // position history depth (~5 min at 1 Hz)
+
+// Three fixed-depth segments sliced from the newest position backward.
+// Fixed lengths mean the trail grows naturally without the "sliding" effect
+// of proportional segmentation.
+const TRAIL_SEGS = [
+  { len: 30,  opacity: 0.75 },  // most recent  ~30 s
+  { len: 60,  opacity: 0.40 },  // 30 – 90 s ago
+  { len: 210, opacity: 0.15 },  // 90 – 300 s ago
+]
 
 export default function MapPage({ snapshot, onSelectIcao }) {
-  const mapRef     = useRef(null)
-  const mountRef   = useRef(null)
-  const markersRef = useRef(new Map())   // icao → L.Marker
-  const trailsRef  = useRef(new Map())   // icao → { lines: L.Polyline[], color }
-  const posHistRef = useRef(new Map())   // icao → [lat, lon][]
-  const fittedRef  = useRef(false)
+  const mapRef            = useRef(null)
+  const mountRef          = useRef(null)
+  const markersRef        = useRef(new Map())   // icao → L.Marker
+  const trailsRef         = useRef(new Map())   // icao → { lines: L.Polyline[], color }
+  const posHistRef        = useRef(new Map())   // icao → [lat, lon][]
+  const fittedRef         = useRef(false)
   const receiverMarkerRef = useRef(null)
+  const residualLayerRef  = useRef([])          // L.CircleMarker[] for residual overlay
+  const residualTimerRef  = useRef(null)
+  // MLAT source dots: accumulated per aircraft until it leaves sight
+  const mlatDotsRef       = useRef(new Map())   // icao → Map<source, L.CircleMarker[]>
+  const mlatSeenRef       = useRef(new Map())   // icao → Map<source, Set<"lat,lon">>
+  const mlatPollRef       = useRef(null)
 
-  const [colorMode, setColorMode] = useState('altitude')
-  const [acCount,   setAcCount]   = useState(0)
+  const [colorMode,       setColorMode]       = useState('altitude')
+  const [acCount,         setAcCount]         = useState(0)
+  const [showResiduals,   setShowResiduals]   = useState(false)
+  const [showMlatSources, setShowMlatSources] = useState(false)
 
   // ── Init Leaflet (once on mount) ────────────────────────────────────────
   useEffect(() => {
@@ -127,6 +148,11 @@ export default function MapPage({ snapshot, onSelectIcao }) {
       trailsRef.current.clear()
       posHistRef.current.clear()
       fittedRef.current = false
+      residualLayerRef.current = []
+      clearInterval(residualTimerRef.current)
+      mlatDotsRef.current.clear()
+      mlatSeenRef.current.clear()
+      clearInterval(mlatPollRef.current)
     }
   }, [])
 
@@ -148,6 +174,106 @@ export default function MapPage({ snapshot, onSelectIcao }) {
       })
       .catch(() => {})
   }, [])
+
+  // ── MLAT source dots: poll bulk fixes endpoint, accumulate dots ───────────
+  useEffect(() => {
+    const clearAllDots = () => {
+      mlatDotsRef.current.forEach(srcMap =>
+        srcMap.forEach(dots => dots.forEach(d => d.remove()))
+      )
+      mlatDotsRef.current.clear()
+      mlatSeenRef.current.clear()
+    }
+
+    if (!showMlatSources) {
+      clearAllDots()
+      clearInterval(mlatPollRef.current)
+      return
+    }
+
+    const poll = () => {
+      fetch(`${API_BASE}/api/mlat/fixes`)
+        .then(r => r.ok ? r.json() : {})
+        .then(data => {
+          const map = mapRef.current
+          if (!map) return
+          for (const [icao, sources] of Object.entries(data)) {
+            for (const [src, pts] of Object.entries(sources)) {
+              if (!Array.isArray(pts)) continue
+              if (!mlatDotsRef.current.has(icao)) mlatDotsRef.current.set(icao, new Map())
+              if (!mlatSeenRef.current.has(icao))  mlatSeenRef.current.set(icao, new Map())
+              const dotsMap = mlatDotsRef.current.get(icao)
+              const seenMap = mlatSeenRef.current.get(icao)
+              if (!dotsMap.has(src)) dotsMap.set(src, [])
+              if (!seenMap.has(src)) seenMap.set(src, new Set())
+              const dots = dotsMap.get(src)
+              const seen = seenMap.get(src)
+              const color = mlatSrcColor(src)
+              for (const [lat, lon] of pts) {
+                const key = `${lat},${lon}`
+                if (!seen.has(key)) {
+                  seen.add(key)
+                  dots.push(
+                    L.circleMarker([lat, lon], {
+                      radius: 3, color, fillColor: color, fillOpacity: 0.85,
+                      weight: 0,
+                    })
+                      .bindTooltip(src, { direction: 'top' })
+                      .addTo(map)
+                  )
+                }
+              }
+            }
+          }
+        })
+        .catch(() => {})
+    }
+
+    poll()
+    mlatPollRef.current = setInterval(poll, 2000)
+    return () => clearInterval(mlatPollRef.current)
+  }, [showMlatSources])
+
+  // ── Residual overlay: poll /api/mlat/residuals when enabled ──────────────
+  useEffect(() => {
+    const clear = () => {
+      residualLayerRef.current.forEach(m => m.remove())
+      residualLayerRef.current = []
+    }
+
+    if (!showResiduals) {
+      clear()
+      clearInterval(residualTimerRef.current)
+      return
+    }
+
+    const refresh = () => {
+      fetch(`${API_BASE}/api/mlat/residuals`)
+        .then(r => r.ok ? r.json() : [])
+        .then(data => {
+          if (!mapRef.current) return
+          clear()
+          data.forEach(pt => {
+            const color = residualColor(pt.avg_residual_nm)
+            const m = L.circleMarker([pt.lat, pt.lon], {
+              radius: 6, color, fillColor: color, fillOpacity: 0.55,
+              weight: 1, opacity: 0.8,
+            })
+              .bindTooltip(
+                `${pt.icao.toUpperCase()}<br>${pt.avg_residual_nm.toFixed(2)} nm<br>${pt.sources.join(', ')}`,
+                { direction: 'top' }
+              )
+              .addTo(mapRef.current)
+            residualLayerRef.current.push(m)
+          })
+        })
+        .catch(() => {})
+    }
+
+    refresh()
+    residualTimerRef.current = setInterval(refresh, 5000)
+    return () => clearInterval(residualTimerRef.current)
+  }, [showResiduals])
 
   // ── Compute colour function and legend from current mode + snapshot ───
   const { colorFn, legendItems } = useMemo(() => {
@@ -194,8 +320,11 @@ export default function MapPage({ snapshot, onSelectIcao }) {
   useEffect(() => {
     const map = mapRef.current
     if (!map) return
-    const aircraft = (snapshot?.aircraft ?? []).filter(ac => ac.lat != null && ac.lon != null)
-    const icaoSet  = new Set(aircraft.map(ac => ac.icao))
+
+    // When MLAT-sources mode is active, only show MLAT aircraft
+    const allAircraft = (snapshot?.aircraft ?? []).filter(ac => ac.lat != null && ac.lon != null)
+    const aircraft    = showMlatSources ? allAircraft.filter(ac => ac.mlat) : allAircraft
+    const icaoSet     = new Set(aircraft.map(ac => ac.icao))
 
     // ── Update position histories ──────────────────────────────────────
     for (const ac of aircraft) {
@@ -209,11 +338,17 @@ export default function MapPage({ snapshot, onSelectIcao }) {
       }
     }
 
-    // ── Remove stale markers and trails ───────────────────────────────
+    // ── Remove stale markers, trails, and MLAT dots ───────────────────
     for (const [icao, marker] of markersRef.current) {
       if (!icaoSet.has(icao)) {
         marker.remove()
         markersRef.current.delete(icao)
+        // Clear accumulated MLAT dots when aircraft leaves sight
+        if (mlatDotsRef.current.has(icao)) {
+          mlatDotsRef.current.get(icao).forEach(dots => dots.forEach(d => d.remove()))
+          mlatDotsRef.current.delete(icao)
+          mlatSeenRef.current.delete(icao)
+        }
       }
     }
     for (const [icao, trail] of trailsRef.current) {
@@ -246,24 +381,25 @@ export default function MapPage({ snapshot, onSelectIcao }) {
     for (const ac of aircraft) {
       const hist  = posHistRef.current.get(ac.icao) ?? []
       const color = colorFn(ac)
-      const n     = hist.length
       const existing = trailsRef.current.get(ac.icao)
 
       if (existing && existing.color === color) {
-        // Reuse existing polylines — just update latlngs
-        TRAIL_SEGS.forEach(([s, e], i) => {
-          const from = Math.floor(s * n)
-          const to   = Math.ceil(e * n)
-          existing.lines[i].setLatLngs(to - from >= 2 ? hist.slice(from, to) : [])
-        })
+        // Reuse existing polylines — update latlngs from fixed-depth windows
+        let end = hist.length
+        for (let i = 0; i < TRAIL_SEGS.length; i++) {
+          const start = Math.max(0, end - TRAIL_SEGS[i].len)
+          existing.lines[i].setLatLngs(end - start >= 2 ? hist.slice(start, end) : [])
+          end = start
+        }
       } else {
-        // Remove old trail and create fresh
         existing?.lines.forEach(l => l.remove())
-        const lines = TRAIL_SEGS.map(([s, e, opacity]) => {
-          const from = Math.floor(s * n)
-          const to   = Math.ceil(e * n)
-          return L.polyline(to - from >= 2 ? hist.slice(from, to) : [], {
-            color, weight: 2, opacity, smoothFactor: 1,
+        let end = hist.length
+        const lines = TRAIL_SEGS.map(({ len, opacity }) => {
+          const start = Math.max(0, end - len)
+          const pts   = end - start >= 2 ? hist.slice(start, end) : []
+          end = start
+          return L.polyline(pts, {
+            color, weight: 1.5, opacity, smoothFactor: 1,
             lineCap: 'round', lineJoin: 'round',
           }).addTo(map)
         })
@@ -279,7 +415,7 @@ export default function MapPage({ snapshot, onSelectIcao }) {
       map.fitBounds(bounds.pad(0.1))
       fittedRef.current = true
     }
-  }, [snapshot?.aircraft, colorFn, onSelectIcao])
+  }, [snapshot?.aircraft, colorFn, onSelectIcao, showMlatSources])
 
   return (
     <div className={styles.page}>
@@ -294,6 +430,16 @@ export default function MapPage({ snapshot, onSelectIcao }) {
             >{m.label}</button>
           ))}
         </div>
+        <button
+          className={showMlatSources ? styles.btnActive : styles.btn}
+          onClick={() => setShowMlatSources(v => !v)}
+          title="Show only MLAT aircraft with per-source position dots"
+        >MLAT sources</button>
+        <button
+          className={showResiduals ? styles.btnActive : styles.btn}
+          onClick={() => setShowResiduals(v => !v)}
+          title="Show MLAT cross-source residual quality overlay"
+        >MLAT residuals</button>
       </div>
 
       <div className={styles.mapWrap} ref={mountRef} />

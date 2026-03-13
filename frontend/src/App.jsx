@@ -141,7 +141,7 @@ export default function App() {
         </main>
       )}
 
-      {tab === 'map' && <MapPage snapshot={snapshot} onSelectIcao={setSelectedIcao} />}
+      {tab === 'map' && <MapPage snapshot={snapshot} onSelectIcao={setSelectedIcao} selectedIcao={selectedIcao} />}
       {tab === 'history' && <HistoryPage snapshot={snapshot} />}
       {tab === 'sightings' && <SightingsPage onSelectIcao={setSelectedIcao} notableRefreshKey={notableRefreshKey} />}
       {tab === 'receiver' && <ReceiverPage snapshot={snapshot} />}

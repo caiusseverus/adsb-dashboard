@@ -60,6 +60,154 @@ _MLAT_ALIGN_WINDOW    = 2.0   # max age difference (s) for cross-source residual
 _MLAT_RESIDUAL_MAXLEN = 30    # rolling residual buffer depth per source
 _MLAT_FUSION_WINDOW   = 4.0   # max fix age (s) for inclusion in weighted fusion
 
+# ── Kalman filter constants ────────────────────────────────────────────────
+# 2-D constant-velocity filter; state = [east_m, north_m, ve_m/s, vn_m/s]
+_KF_SIGMA_A  = 5.0       # m/s² process noise (typical aircraft manoeuvring accel)
+_KF_SIGMA_M0 = 50.0      # m    base MLAT measurement noise (quality=1.0 source)
+_KF_GATE_D2  = 13.816    # chi² innovations gate, 99.9 % threshold, 2 DOF
+_KF_R_EARTH  = 6_371_000.0
+
+
+# ── Kalman helper functions ────────────────────────────────────────────────
+
+def _enu(lat: float, lon: float, ref_lat: float, ref_lon: float) -> tuple[float, float]:
+    """Lat/lon → approximate ENU metres relative to reference point.
+    Accurate to <0.1 % for offsets up to ~50 km — sufficient for MLAT.
+    """
+    north = math.radians(lat - ref_lat) * _KF_R_EARTH
+    east  = math.radians(lon - ref_lon) * math.cos(math.radians(ref_lat)) * _KF_R_EARTH
+    return east, north
+
+
+def _latlon_from_enu(east: float, north: float,
+                     ref_lat: float, ref_lon: float) -> tuple[float, float]:
+    lat = ref_lat + math.degrees(north / _KF_R_EARTH)
+    lon = ref_lon + math.degrees(east / (_KF_R_EARTH * math.cos(math.radians(ref_lat))))
+    return lat, lon
+
+
+def _kf_init(e: float, n: float) -> tuple[list, list]:
+    """Initialise state and covariance at a known ENU position, zero velocity."""
+    x = [e, n, 0.0, 0.0]
+    P0p = 500.0 ** 2   # 500 m initial position uncertainty (1-sigma)
+    P0v = 150.0 ** 2   # 150 m/s (~300 kt) initial velocity uncertainty
+    P = [P0p, 0.0, 0.0, 0.0,
+         0.0, P0p, 0.0, 0.0,
+         0.0, 0.0, P0v, 0.0,
+         0.0, 0.0, 0.0, P0v]
+    return x, P
+
+
+def _kf_predict(x: list, P: list, dt: float) -> tuple[list, list]:
+    """Constant-velocity predict step.  P is 4×4 stored row-major (16 floats)."""
+    dt2 = dt * dt
+    dt3 = dt2 * dt
+    dt4 = dt2 * dt2
+    # x_pred = F * x
+    x_p = [x[0] + x[2]*dt, x[1] + x[3]*dt, x[2], x[3]]
+    # F*P*F' — expanded analytically, exploiting F sparsity
+    FPFt = [
+        P[0]  + dt*(P[8]+P[2])  + dt2*P[10],   # (0,0) e,e
+        P[1]  + dt*(P[9]+P[3])  + dt2*P[11],   # (0,1) e,n
+        P[2]  + dt*P[10],                        # (0,2) e,ve
+        P[3]  + dt*P[11],                        # (0,3) e,vn
+        P[4]  + dt*(P[12]+P[6]) + dt2*P[14],   # (1,0) n,e
+        P[5]  + dt*(P[13]+P[7]) + dt2*P[15],   # (1,1) n,n
+        P[6]  + dt*P[14],                        # (1,2) n,ve
+        P[7]  + dt*P[15],                        # (1,3) n,vn
+        P[8]  + dt*P[10],                        # (2,0) ve,e
+        P[9]  + dt*P[11],                        # (2,1) ve,n
+        P[10],                                    # (2,2) ve,ve
+        P[11],                                    # (2,3) ve,vn
+        P[12] + dt*P[14],                        # (3,0) vn,e
+        P[13] + dt*P[15],                        # (3,1) vn,n
+        P[14],                                    # (3,2) vn,ve
+        P[15],                                    # (3,3) vn,vn
+    ]
+    # Add process noise Q (constant-velocity model, σ_a²)
+    sa2 = _KF_SIGMA_A * _KF_SIGMA_A
+    FPFt[0]  += sa2 * dt4 / 4   # e,e
+    FPFt[5]  += sa2 * dt4 / 4   # n,n
+    FPFt[10] += sa2 * dt2        # ve,ve
+    FPFt[15] += sa2 * dt2        # vn,vn
+    FPFt[2]  += sa2 * dt3 / 2   # e,ve
+    FPFt[8]  += sa2 * dt3 / 2   # ve,e
+    FPFt[7]  += sa2 * dt3 / 2   # n,vn
+    FPFt[13] += sa2 * dt3 / 2   # vn,n
+    return x_p, FPFt
+
+
+def _kf_update(x_p: list, P_p: list,
+               e_meas: float, n_meas: float,
+               quality: float) -> tuple[list, list, bool]:
+    """Kalman measurement update with chi-squared innovations gate.
+
+    Measurement noise R = (σ_m0 / quality)² — poor-geometry sources get
+    larger noise and therefore contribute less to the fused estimate.
+    Returns (x_new, P_new, accepted).
+    """
+    sigma_m = _KF_SIGMA_M0 / max(quality, 0.1)
+    R = sigma_m * sigma_m
+
+    # Innovation y = z − H·x_pred  (H extracts position rows)
+    y0 = e_meas - x_p[0]
+    y1 = n_meas - x_p[1]
+
+    # S = H·P·H' + R  (top-left 2×2 of P, plus R on diagonal)
+    S00 = P_p[0] + R;  S01 = P_p[1]
+    S10 = P_p[4];      S11 = P_p[5] + R
+
+    det_S = S00*S11 - S01*S10
+    if abs(det_S) < 1.0:          # degenerate — skip update
+        return x_p, P_p, False
+
+    Si00 =  S11 / det_S;  Si01 = -S01 / det_S
+    Si10 = -S10 / det_S;  Si11 =  S00 / det_S
+
+    # Chi-squared innovations gate: d² = y' S⁻¹ y
+    d2 = Si00*y0*y0 + (Si01+Si10)*y0*y1 + Si11*y1*y1
+    if d2 > _KF_GATE_D2:
+        return x_p, P_p, False     # outlier — reject measurement
+
+    # Kalman gain K = P·H'·S⁻¹  (4×2, stored as two column vectors K0, K1)
+    K0 = [P_p[i*4]*Si00 + P_p[i*4+1]*Si10 for i in range(4)]
+    K1 = [P_p[i*4]*Si01 + P_p[i*4+1]*Si11 for i in range(4)]
+
+    x_new = [x_p[i] + K0[i]*y0 + K1[i]*y1 for i in range(4)]
+    # P_new = (I − K·H)·P  →  P[i,j] − K0[i]·P[0,j] − K1[i]·P[1,j]
+    P_new = [P_p[i*4+j] - K0[i]*P_p[j] - K1[i]*P_p[4+j]
+             for i in range(4) for j in range(4)]
+    return x_new, P_new, True
+
+
+def _kalman_init(ac: "Aircraft", lat: float, lon: float, now: float) -> None:
+    """Initialise (or re-initialise) the per-aircraft Kalman state."""
+    x, P = _kf_init(0.0, 0.0)   # ENU origin = current position
+    ac.kalman_state = {"x": x, "P": P, "ref_lat": lat, "ref_lon": lon, "ts": now}
+
+
+def _kalman_update_position(ac: "Aircraft", lat: float, lon: float,
+                             now: float, quality: float) -> tuple[float, float]:
+    """Sequential predict+update cycle for one incoming MLAT fix.
+
+    Each source fix is treated as an independent measurement; quality score
+    controls measurement noise so weaker sources contribute proportionally less.
+    Always returns the current Kalman position estimate.
+    """
+    ks = ac.kalman_state
+    dt = now - ks["ts"]
+
+    x_p, P_p = _kf_predict(ks["x"], ks["P"], dt)
+
+    e_meas, n_meas = _enu(lat, lon, ks["ref_lat"], ks["ref_lon"])
+    x_new, P_new, _ = _kf_update(x_p, P_p, e_meas, n_meas, quality)
+
+    ks["x"] = x_new
+    ks["P"] = P_new
+    ks["ts"] = now
+
+    return _latlon_from_enu(x_new[0], x_new[1], ks["ref_lat"], ks["ref_lon"])
+
 
 class MlatFix(NamedTuple):
     """A single MLAT position fix from one network."""
@@ -300,6 +448,18 @@ def _record_mlat_fix(ac: "Aircraft", source: str, lat: float, lon: float, now: f
         ac.lat = round(lat, 5)
         ac.lon = round(lon, 5)
         _update_range_bearing(ac)
+    elif config.MLAT_FUSION == "kalman":
+        if not is_spike:
+            quality = ac.mlat_quality_scores.get(source, 1.0)
+            ks = ac.kalman_state
+            if ks is None or (now - ks["ts"]) > 60.0:
+                # First fix or aircraft was silent > 60 s — (re-)initialise
+                _kalman_init(ac, lat, lon, now)
+                ac.lat, ac.lon = round(lat, 5), round(lon, 5)
+            else:
+                lat_k, lon_k = _kalman_update_position(ac, lat, lon, now, quality)
+                ac.lat, ac.lon = round(lat_k, 5), round(lon_k, 5)
+            _update_range_bearing(ac)
     else:
         pos = _select_output_position(ac, lat, lon, is_spike, now)
         if pos is not None:
@@ -430,6 +590,9 @@ class Aircraft:
     mlat_last_fix_ts:    dict = field(default_factory=dict)
     # source → deque[float] — rolling inter-network position residuals in nm (Phase B)
     mlat_residuals:      dict = field(default_factory=dict)
+    # Kalman filter state — populated on first MLAT fix when MLAT_FUSION=kalman
+    # dict: {x, P, ref_lat, ref_lon, ts}  or None before first fix
+    kalman_state:        Optional[dict] = None
 
 
 class AircraftState:
@@ -1053,10 +1216,13 @@ class AircraftState:
                                         config.RECEIVER_LAT, config.RECEIVER_LON,
                                         lat, lon) > 500):
                                 pass  # discard — beyond ADS-B range
-                            elif mlat:
-                                # MLAT position: buffer, spike-detect, write (Phase A)
+                            elif mlat and not ac.has_adsb:
+                                # Genuine MLAT position: buffer, spike-detect, fuse
+                                # Skip if aircraft has confirmed ADS-B transponder —
+                                # the MLAT stream is just forwarding its GPS broadcast;
+                                # the ADS-B position from the main stream is authoritative.
                                 _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
-                            else:
+                            elif not mlat:
                                 # ADS-B position: write directly
                                 _accept_adsb_position(ac, lat, lon, pos_from_global, now)
                 except Exception:
