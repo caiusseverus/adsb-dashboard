@@ -32,8 +32,10 @@ import gzip
 import io
 import json
 import logging
+import os
 import re
 import sqlite3
+import tempfile
 import time
 import urllib.request
 from collections import OrderedDict
@@ -321,8 +323,9 @@ class EnrichmentDB:
         # Bounded LRU — prevents unbounded growth on high-traffic receivers.
         self._hexdb_cache: OrderedDict[str, dict] = OrderedDict()
         self._hexdb_dirty: bool = False   # True when cache has unsaved entries
-        # ICAOs that returned no data this session — not persisted, retried on restart
-        self._hexdb_session_misses: set[str] = set()
+        # ICAOs that returned no data this session — not persisted, retried on restart.
+        # Bounded LRU (10k) so ghost ICAOs from CRC errors don't accumulate indefinitely.
+        self._hexdb_session_misses: OrderedDict[str, None] = OrderedDict()
 
     # ------------------------------------------------------------------
     # LRU helpers
@@ -348,6 +351,15 @@ class EnrichmentDB:
         self._hexdb_cache.move_to_end(key)
         while len(self._hexdb_cache) > _HEXDB_LRU_MAX:
             self._hexdb_cache.popitem(last=False)
+
+    _SESSION_MISS_MAX = 10_000
+
+    def _record_hexdb_miss(self, key: str) -> None:
+        """Add key to the session-miss LRU, evicting the oldest entry if at capacity."""
+        self._hexdb_session_misses[key] = None
+        self._hexdb_session_misses.move_to_end(key)
+        if len(self._hexdb_session_misses) > self._SESSION_MISS_MAX:
+            self._hexdb_session_misses.popitem(last=False)
 
     # ------------------------------------------------------------------
     # Public API
@@ -506,10 +518,10 @@ class EnrichmentDB:
             data = json.loads(_fetch(f"{_HEXDB_BASE}/{icao.lower()}"))
         except Exception as exc:
             log.debug("hexdb lookup failed for %s: %s", icao, exc)
-            self._hexdb_session_misses.add(key)
+            self._record_hexdb_miss(key)
             return None
         if not data:
-            self._hexdb_session_misses.add(key)
+            self._record_hexdb_miss(key)
             return None
         # Use _lru_put so the cache stays bounded at _HEXDB_LRU_MAX entries
         self._lru_put_hexdb(key, data)
@@ -529,7 +541,7 @@ class EnrichmentDB:
         if not data:
             return None
         self._lru_put_hexdb(key, data)
-        self._hexdb_session_misses.discard(key)
+        self._hexdb_session_misses.pop(key, None)
         self._hexdb_dirty = True
         return data
 
@@ -803,11 +815,20 @@ class EnrichmentDB:
             log.warning("Enrichment: hexdb cache load failed: %s", exc)
 
     def _save_hexdb_cache(self) -> None:
+        # compresslevel=1 is ~3× faster than the default (9) with only ~15% size penalty.
+        # Atomic write via temp file + rename prevents a half-written cache on crash/SIGTERM.
+        path = config.DATA_DIR / _HEXDB_CACHE_FILE
+        payload = gzip.compress(json.dumps(self._hexdb_cache).encode("utf-8"), compresslevel=1)
+        fd, tmp = tempfile.mkstemp(dir=config.DATA_DIR, suffix=".tmp")
         try:
-            (config.DATA_DIR / _HEXDB_CACHE_FILE).write_bytes(
-                gzip.compress(json.dumps(self._hexdb_cache).encode("utf-8"))
-            )
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(payload)
+            os.replace(tmp, path)
         except Exception as exc:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
             log.warning("Enrichment: could not save hexdb cache: %s", exc)
 
 

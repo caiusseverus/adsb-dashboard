@@ -41,6 +41,8 @@ import hires_buffer
 from status import router as status_router
 from debug import router as debug_router
 from notify_settings import router as notify_settings_router
+import health as health_module
+from health import router as health_router
 import tracks as tracks_module
 from tracks import router as tracks_router
 
@@ -310,12 +312,12 @@ async def _db_writer() -> None:
         # Write coverage samples for aircraft that have a position
         if config.RECEIVER_LAT is not None and config.RECEIVER_LON is not None:
             now_ts = int(time.time())
-            samples = [
+            samples = (
                 (now_ts, ac["icao"], ac["bearing_deg"], ac["range_nm"],
                  ac.get("altitude"), ac.get("signal"))
                 for ac in snapshot.get("aircraft", [])
                 if ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
-            ]
+            )
             await asyncio.to_thread(stats_db.write_coverage_tuples, samples)
 
         # Drain pending ACAS events to DB and fire notifications
@@ -609,24 +611,39 @@ async def lifespan(app: FastAPI):
 
     global _decoder_thread
     _decoder_thread = _start_msg_processor()
-    asyncio.create_task(_beast_runner())
+    _bg_tasks: list[asyncio.Task] = []
+    def _bg(coro):
+        t = asyncio.create_task(coro)
+        _bg_tasks.append(t)
+        return t
+    _bg(_beast_runner())
     for name, host, port in config.MLAT_SERVERS:
-        asyncio.create_task(_mlat_runner(name, host, port))
-    asyncio.create_task(_push_updates())
-    asyncio.create_task(_db_writer())
-    asyncio.create_task(_db_update_checker())
-    asyncio.create_task(_hexdb_cache_flusher())
-    asyncio.create_task(_adsbx_task())
-    asyncio.create_task(_hexdb_task())
-    asyncio.create_task(_backup_runner())  # runs nightly; path resolved from DB/env at runtime
-    asyncio.create_task(_hires_writer())
-    asyncio.create_task(_route_enricher())
+        _bg(_mlat_runner(name, host, port))
+    _bg(_push_updates())
+    _bg(_db_writer())
+    _bg(_db_update_checker())
+    _bg(_hexdb_cache_flusher())
+    _bg(_adsbx_task())
+    _bg(_hexdb_task())
+    _bg(_backup_runner())  # runs nightly; path resolved from DB/env at runtime
+    _bg(_hires_writer())
+    _bg(_route_enricher())
+    _bg(health_module.loop_lag_sampler())
+    health_module.register_context(_msg_queue, _clients)
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",
              config.BEAST_HOST, config.BEAST_PORT)
 
     yield
 
     # --- Graceful shutdown ---
+    # Cancel background tasks first; the explicit final DB write below
+    # handles persistence — we don't need _push_updates or _db_writer to
+    # finish their current cycle.
+    log.info("Shutdown: cancelling background tasks…")
+    for t in _bg_tasks:
+        t.cancel()
+    await asyncio.gather(*_bg_tasks, return_exceptions=True)
+
     # Stop the decoder thread before the final DB write so it can't be
     # holding _lock when we call get_snapshot() below.
     log.info("Shutdown: stopping decoder thread…")
@@ -638,6 +655,9 @@ async def lifespan(app: FastAPI):
     try:
         final_snapshot = state.get_snapshot()
         await asyncio.to_thread(stats_db.write_minute, final_snapshot)
+        # write_minute() may not flush the registry buffer if the interval hasn't
+        # elapsed — force a final flush so no aircraft data is lost on clean shutdown.
+        await asyncio.to_thread(stats_db.flush_registry_now)
     except Exception:
         log.exception("Shutdown: final DB write failed")
 
@@ -668,6 +688,7 @@ app.include_router(squawks_router)
 app.include_router(status_router)
 app.include_router(notify_settings_router)
 app.include_router(debug_router)
+app.include_router(health_router)
 if config.DEBUG_ENRICHMENT:
     log.info("Debug router mounted (DEBUG_ENRICHMENT=%s)", config.DEBUG_ENRICHMENT)
 

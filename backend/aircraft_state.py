@@ -155,7 +155,7 @@ def _apply_hexdb_data(ac, data: dict) -> None:
             ac.operator = owners
 
 
-@dataclass
+@dataclass(slots=True)
 class Aircraft:
     icao: str
     first_seen: float = field(default_factory=time.time)
@@ -258,6 +258,12 @@ class AircraftState:
         # sighting_count seed from DB (icao -> count); bounded LRU so long-tail
         # historical ICAOs are evicted rather than accumulating indefinitely
         self._sighting_counts: OrderedDict[str, int] = OrderedDict()
+
+        # History deque cache for get_snapshot() — the completed-minute deques only
+        # change once per minute, so we rebuild the list copies at most 1×/min instead
+        # of 60×/min (once per second).
+        self._snapshot_history_minute: int = -1
+        self._snapshot_history_cache: tuple | None = None  # (rate_list, df_list, mlat_list)
 
     # ------------------------------------------------------------------
     # Public API
@@ -497,9 +503,20 @@ class AircraftState:
             else:
                 cur_mn = cur_mx = cur_me = 0.0
             cur_total = len(self._aircraft)
-            cur_mil = sum(1 for ac in self._aircraft.values() if ac.military)
-            cur_with_pos = sum(1 for ac in self._aircraft.values() if ac.lat is not None)
-            cur_mlat_pos = sum(1 for ac in self._aircraft.values() if ac.mlat and ac.lat is not None)
+            # Single pass: collect all per-aircraft counters and the aircraft list.
+            # Replaces four separate O(N) scans that previously ran inside the lock.
+            cur_mil = cur_with_pos = cur_mlat_pos = mlat_aircraft_count = 0
+            for ac in self._aircraft.values():
+                if ac.military:
+                    cur_mil += 1
+                if ac.lat is not None:
+                    cur_with_pos += 1
+                if ac.mlat:
+                    mlat_aircraft_count += 1
+                    if ac.lat is not None:
+                        cur_mlat_pos += 1
+            live_military = cur_mil
+
             cur_sigs = self._cur_min_signals
             cur_sig_avg = round(sum(cur_sigs) / len(cur_sigs), 1) if cur_sigs else None
             cur_stats = (self._cur_min, cur_mn, cur_mx, cur_me,
@@ -507,9 +524,20 @@ class AircraftState:
                          cur_sig_avg, min(cur_sigs) if cur_sigs else None,
                          max(cur_sigs) if cur_sigs else None,
                          cur_with_pos, cur_mlat_pos)
-            rate_history = list(self._min_stats) + [cur_stats]
-            df_history = list(self._min_df_stats) + [(self._cur_min, dict(self._cur_min_df_counts))]
-            mlat_history = list(self._min_mlat_counts) + [(self._cur_min, self._cur_min_mlat_count)]
+
+            # Rebuild history list copies only when the minute rolls over.
+            # At 1 Hz this avoids 3 deque→list copies per second (59 of 60 are free).
+            if self._snapshot_history_minute != self._cur_min or self._snapshot_history_cache is None:
+                self._snapshot_history_cache = (
+                    list(self._min_stats),
+                    list(self._min_df_stats),
+                    list(self._min_mlat_counts),
+                )
+                self._snapshot_history_minute = self._cur_min
+            hist_min_stats, hist_df_stats, hist_mlat_counts = self._snapshot_history_cache
+            rate_history = hist_min_stats + [cur_stats]
+            df_history = hist_df_stats + [(self._cur_min, dict(self._cur_min_df_counts))]
+            mlat_history = hist_mlat_counts + [(self._cur_min, self._cur_min_mlat_count)]
 
             aircraft_list = [
                 {
@@ -555,9 +583,6 @@ class AircraftState:
                 }
                 for ac in self._aircraft.values()
             ]
-
-        live_military = sum(1 for ac in self._aircraft.values() if ac.military)
-        mlat_aircraft_count = sum(1 for ac in self._aircraft.values() if ac.mlat)
 
         return {
             "aircraft_count": len(aircraft_list),

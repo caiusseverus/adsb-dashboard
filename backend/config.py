@@ -117,3 +117,20 @@ NOTIFY_MILITARY:     bool = _bool("NOTIFY_MILITARY",     False)
 NOTIFY_INTERESTING:  bool = _bool("NOTIFY_INTERESTING",  False)
 
 DEBUG_LOG: bool = _bool("DEBUG_LOG", False)  # set true to enable verbose logging
+
+# ---------------------------------------------------------------------------
+# SQLite / Pi tuning
+# ---------------------------------------------------------------------------
+# synchronous=NORMAL is safe with WAL and eliminates most fsync() calls.
+# Use FULL only if the Pi's power supply is unreliable.
+SQLITE_SYNCHRONOUS: str = os.getenv("SQLITE_SYNCHRONOUS", "NORMAL")
+
+# How often to run the full-table rarity recalculation (seconds).
+# The rare flag changes only when a new type appears; daily is more than enough.
+# Default: 6 hours (21600 s). Set to 3600 for hourly, 86400 for daily.
+RARITY_RECALC_SECONDS: float = float(os.getenv("RARITY_RECALC_SECONDS", "21600"))
+
+# How often to flush buffered aircraft_registry upserts to disk (seconds).
+# Buffers write_minute()'s per-aircraft upserts so SD writes happen at most
+# once per interval rather than once per minute per aircraft.
+REGISTRY_FLUSH_SECONDS: float = float(os.getenv("REGISTRY_FLUSH_SECONDS", "300"))

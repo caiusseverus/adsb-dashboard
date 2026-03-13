@@ -159,6 +159,16 @@ class StatsDB:
     def __init__(self) -> None:
         self._last_written_ts: int = 0
         self._local = threading.local()  # thread-local connection storage
+        # Rarity is time-gated — the rare flag changes only when a new type
+        # appears, so a full-table UPDATE every minute is wasteful on Pi SD.
+        self._last_rarity_recalc: float = 0.0
+        self._rarity_recalc_interval: float = config.RARITY_RECALC_SECONDS
+        # Registry write buffer — collects per-aircraft upserts from write_minute()
+        # and flushes them as a batch every REGISTRY_FLUSH_SECONDS.  This reduces
+        # aircraft_registry SD writes from ~100/minute to ~100 every 5 minutes.
+        self._registry_dirty: dict[str, dict] = {}
+        self._last_registry_flush: float = 0.0
+        self._registry_flush_interval: float = config.REGISTRY_FLUSH_SECONDS
         self._init_schema()
 
     # ------------------------------------------------------------------
@@ -174,7 +184,7 @@ class StatsDB:
         if conn is None:
             conn = sqlite3.connect(str(config.DB_PATH), timeout=10, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute(f"PRAGMA synchronous={config.SQLITE_SYNCHRONOUS}")
             conn.execute("PRAGMA cache_size=-8000")   # 8 MB page cache per thread
             conn.execute("PRAGMA temp_store=MEMORY")  # temp tables in RAM, not SD card
             conn.row_factory = sqlite3.Row
@@ -484,12 +494,39 @@ class StatsDB:
                 ),
             )
 
-            # Aircraft registry upserts
+            # Buffer registry upserts — the latest snapshot value for each ICAO
+            # overwrites any earlier buffered entry, so only one upsert per aircraft
+            # reaches the DB per flush interval.
             for ac in aircraft:
-                self._upsert_aircraft(conn, ac, now_ts)
+                self._registry_dirty[ac["icao"]] = ac
 
-        # Recalculate type-based rarity flags outside the main write transaction
-        self.recalculate_type_rarity()
+        # Flush buffered registry upserts when the interval has elapsed.
+        now = time.time()
+        if self._registry_dirty and now - self._last_registry_flush >= self._registry_flush_interval:
+            self._flush_registry(now_ts)
+
+        # Recalculate type-based rarity flags outside the main write transaction,
+        # but only when the interval has elapsed — the rare flag changes at most
+        # a handful of times per day, so every-minute UPDATEs are unnecessary.
+        if now - self._last_rarity_recalc >= self._rarity_recalc_interval:
+            self.recalculate_type_rarity()
+            self._last_rarity_recalc = now
+
+    def _flush_registry(self, now_ts: int) -> None:
+        """Write all buffered dirty aircraft to the registry in a single transaction."""
+        if not self._registry_dirty:
+            return
+        count = len(self._registry_dirty)
+        with self._connect() as conn:
+            for ac in self._registry_dirty.values():
+                self._upsert_aircraft(conn, ac, now_ts)
+        self._registry_dirty.clear()
+        self._last_registry_flush = time.time()
+        log.debug("DB: flushed %d registry entries", count)
+
+    def flush_registry_now(self) -> None:
+        """Force an immediate registry flush regardless of the interval — call on shutdown."""
+        self._flush_registry(int(time.time()))
 
     def _upsert_aircraft(self, conn: sqlite3.Connection, ac: dict, now_ts: int) -> None:
         home = (config.HOME_COUNTRY or "").lower()
