@@ -470,13 +470,6 @@ async def _push_updates() -> None:
                         "type_code": ac.get("type_code"), "operator": ac.get("operator"),
                         "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
                     })
-        if _mil_batch:
-            notify_tasks.append(asyncio.to_thread(notifications.notify_military_batch, _mil_batch))
-        if _int_batch:
-            notify_tasks.append(asyncio.to_thread(notifications.notify_interesting_batch, _int_batch))
-        if _wl_batch:
-            notify_tasks.append(asyncio.to_thread(notifications.notify_watchlist_batch, _wl_batch))
-
             # Only record once the position is confirmed reliable:
             # - pos_global=True: a global CPR decode (even+odd pair) has succeeded,
             #   guaranteeing the position is not from the potentially-wrong local
@@ -499,6 +492,12 @@ async def _push_updates() -> None:
                     mlat_source=ac.get("mlat_source"),
                     now=now,
                 )
+        if _mil_batch:
+            notify_tasks.append(asyncio.to_thread(notifications.notify_military_batch, _mil_batch))
+        if _int_batch:
+            notify_tasks.append(asyncio.to_thread(notifications.notify_interesting_batch, _int_batch))
+        if _wl_batch:
+            notify_tasks.append(asyncio.to_thread(notifications.notify_watchlist_batch, _wl_batch))
         # Prune tracks for aircraft that have left the live set
         track_store.expire(active_icaos)
         t_sync_end = time.perf_counter()
