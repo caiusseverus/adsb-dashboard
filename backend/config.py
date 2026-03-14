@@ -149,3 +149,7 @@ ALT_FRESH_S: float = float(os.getenv("ALT_FRESH_S", "20"))
 # Buffers write_minute()'s per-aircraft upserts so SD writes happen at most
 # once per interval rather than once per minute per aircraft.
 REGISTRY_FLUSH_SECONDS: float = float(os.getenv("REGISTRY_FLUSH_SECONDS", "300"))
+
+# readsb aircraft JSON source for position QA checker.
+READSB_AIRCRAFT_JSON_PATH: str = os.getenv("READSB_AIRCRAFT_JSON_PATH", "/run/readsb/aircraft.json")
+READSB_AIRCRAFT_JSON_URL: str = os.getenv("READSB_AIRCRAFT_JSON_URL", "http://adsbpi.local/tar1090/data/aircraft.json")

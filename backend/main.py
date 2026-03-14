@@ -47,6 +47,8 @@ import tracks as tracks_module
 from tracks import router as tracks_router
 import mlat as mlat_module
 from mlat import router as mlat_router
+import position_quality as position_quality_module
+from position_quality import router as position_quality_router, PositionQualityChecker, run_position_quality_checker
 
 from benchmark import make_pause_aware_decoder
 
@@ -634,6 +636,7 @@ async def lifespan(app: FastAPI):
     _bg(_backup_runner())  # runs nightly; path resolved from DB/env at runtime
     _bg(_hires_writer())
     _bg(_route_enricher())
+    _bg(run_position_quality_checker(position_quality_module._checker))
     _bg(health_module.loop_lag_sampler())
     health_module.register_context(_msg_queue, _clients)
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",
@@ -696,6 +699,9 @@ app.include_router(squawks_router)
 app.include_router(status_router)
 app.include_router(notify_settings_router)
 app.include_router(debug_router)
+position_quality_module._state = state
+position_quality_module._checker = PositionQualityChecker(state)
+app.include_router(position_quality_router)
 app.include_router(health_router)
 if config.DEBUG_ENRICHMENT:
     log.info("Debug router mounted (DEBUG_ENRICHMENT=%s)", config.DEBUG_ENRICHMENT)
