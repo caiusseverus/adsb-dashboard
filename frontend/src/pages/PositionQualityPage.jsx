@@ -4,6 +4,7 @@ import {
   Legend,
   Line,
   LineChart,
+  ReferenceLine,
   ResponsiveContainer,
   Scatter,
   ScatterChart,
@@ -78,26 +79,29 @@ export default function PositionQualityPage() {
     [detail]
   )
 
-  const scatterData = useMemo(() => {
+  const offsetHistory = useMemo(() => {
     return (detail?.history ?? [])
       .map((point) => {
-        const baseLat = point.internal_lat
-        const baseLon = point.internal_lon
-        const otherLat = point.readsb_lat
-        const otherLon = point.readsb_lon
-        if ([baseLat, baseLon, otherLat, otherLon].some((v) => v === null || v === undefined)) {
+        const internalLat = point.internal_lat
+        const internalLon = point.internal_lon
+        const readsbLat = point.readsb_lat
+        const readsbLon = point.readsb_lon
+        if ([internalLat, internalLon, readsbLat, readsbLon].some((v) => v === null || v === undefined)) {
           return null
         }
-        const dy = (otherLat - baseLat) * 111_320
-        const dx = (otherLon - baseLon) * 111_320 * Math.cos((baseLat * Math.PI) / 180)
         return {
-          dx,
-          dy,
-          error: point.horizontal_error_m,
+          dx: (internalLon - readsbLon) * 111_320 * Math.cos((readsbLat * Math.PI) / 180),
+          dy: (internalLat - readsbLat) * 111_320,
+          t: new Date(point.ts * 1000).toLocaleTimeString(),
         }
       })
       .filter(Boolean)
   }, [detail])
+
+  const currentOffset = useMemo(() => {
+    if (!offsetHistory.length) return []
+    return [offsetHistory[offsetHistory.length - 1]]
+  }, [offsetHistory])
 
   return (
     <main className={styles.main}>
@@ -135,14 +139,26 @@ export default function PositionQualityPage() {
               </ResponsiveContainer>
             </div>
             <div className={styles.chartCard}>
-              <h4>Relative position offset (readsb vs internal)</h4>
+              <h4>Relative internal offset from readsb (0,0 = match)</h4>
               <ResponsiveContainer width="100%" height={240}>
                 <ScatterChart>
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis type="number" dataKey="dx" name="East/West" unit="m" />
                   <YAxis type="number" dataKey="dy" name="North/South" unit="m" />
-                  <Tooltip cursor={{ strokeDasharray: '3 3' }} />
-                  <Scatter data={scatterData} fill="#f97316" />
+                  <ReferenceLine x={0} stroke="#64748b" strokeDasharray="3 3" />
+                  <ReferenceLine y={0} stroke="#64748b" strokeDasharray="3 3" />
+                  <Tooltip
+                    cursor={{ strokeDasharray: '3 3' }}
+                    formatter={(value, name) => [fmt(value, 1), name === 'dx' ? 'East/West' : 'North/South']}
+                    labelFormatter={(_, payload) => payload?.[0]?.payload?.t || ''}
+                  />
+                  <Scatter
+                    data={offsetHistory}
+                    fill="#f97316"
+                    line={{ stroke: '#f97316', strokeWidth: 2 }}
+                    name="Offset history"
+                  />
+                  <Scatter data={currentOffset} fill="#ef4444" name="Current" />
                 </ScatterChart>
               </ResponsiveContainer>
             </div>
