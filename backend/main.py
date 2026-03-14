@@ -316,7 +316,11 @@ async def _db_writer() -> None:
             now_ts = int(time.time())
             samples = (
                 (now_ts, ac["icao"], ac["bearing_deg"], ac["range_nm"],
-                 ac.get("altitude"), ac.get("signal"))
+                 (ac.get("altitude")
+                  if ((ac.get("last_pos_age") is not None and ac.get("last_pos_age") <= config.POS_FRESH_S)
+                      and (ac.get("last_alt_age") is not None and ac.get("last_alt_age") <= config.ALT_FRESH_S))
+                  else None),
+                 ac.get("signal"))
                 for ac in snapshot.get("aircraft", [])
                 if ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
             )
@@ -477,7 +481,7 @@ async def _push_updates() -> None:
             # - mlat=True: position established by multilateration, also reliable.
             if (ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
                     and ac.get("lat") is not None
-                    and (ac.get("pos_global") or ac.get("mlat"))):
+                    and (ac.get("pos_global") or ac.get("mlat") or ac.get("pos_confident"))):
                 track_store.record(
                     icao=ac["icao"],
                     bearing_deg=ac["bearing_deg"],

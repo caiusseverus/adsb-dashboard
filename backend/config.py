@@ -136,6 +136,15 @@ RARITY_RECALC_SECONDS: float = float(os.getenv("RARITY_RECALC_SECONDS", "21600")
 # weighted     — ECEF weighted centroid of recent fixes from all active sources
 MLAT_FUSION: str = os.getenv("MLAT_FUSION", "none").lower()
 
+# ADS-B / coverage quality gates
+# Additional range cap for first local-CPR positions (before global pairing).
+ADSB_LOCAL_ENTRY_MAX_RANGE_NM: float = float(os.getenv("ADSB_LOCAL_ENTRY_MAX_RANGE_NM", "300"))
+# Maximum implied groundspeed for position-to-position plausibility checks.
+ADSB_MAX_IMPLIED_SPEED_KT: float = float(os.getenv("ADSB_MAX_IMPLIED_SPEED_KT", "750"))
+# Freshness gates used when persisting coverage altitude values.
+POS_FRESH_S: float = float(os.getenv("POS_FRESH_S", "15"))
+ALT_FRESH_S: float = float(os.getenv("ALT_FRESH_S", "20"))
+
 # How often to flush buffered aircraft_registry upserts to disk (seconds).
 # Buffers write_minute()'s per-aircraft upserts so SD writes happen at most
 # once per interval rather than once per minute per aircraft.
