@@ -232,6 +232,11 @@ def _accept_altitude(ac: "Aircraft", alt: int, source: str, now: float) -> bool:
         if age < _ALT_SOURCE_STALE_S:
             return False
 
+    # If position is stale, suppress large SURV-only altitude moves.
+    if source == "SURV" and ac.last_pos_ts > 0 and (now - ac.last_pos_ts) > config.POS_FRESH_S:
+        if ac.altitude is not None and abs(alt - ac.altitude) > 1500:
+            return False
+
     # Rate-of-change gate — reject spikes that exceed realistic climb/descent
     if ac.altitude is not None and ac._alt_source_ts > 0:
         dt_min = (now - ac._alt_source_ts) / 60.0
@@ -241,6 +246,7 @@ def _accept_altitude(ac: "Aircraft", alt: int, source: str, now: float) -> bool:
                 return False
 
     ac.altitude = alt
+    ac.last_alt_ts = now
     ac._alt_source = source
     ac._alt_source_ts = now
     if ac.max_altitude is None or alt > ac.max_altitude:
@@ -271,13 +277,28 @@ def _update_range_bearing(ac: "Aircraft") -> None:
 
 
 def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
-                          pos_from_global: bool, now: float) -> None:  # noqa: ARG001
-    """Write a validated ADS-B CPR position to the aircraft record."""
+                          pos_from_global: bool, now: float) -> bool:
+    """Write a validated ADS-B CPR position to the aircraft record.
+
+    Returns True when the position is accepted and written; False when rejected
+    by plausibility checks.
+    """
+    # Implied-speed gate against the last accepted position.
+    if ac.lat is not None and ac.lon is not None and ac.last_pos_ts > 0:
+        dt = now - ac.last_pos_ts
+        if dt > 0:
+            speed_kt = (_haversine_nm(ac.lat, ac.lon, lat, lon) / dt) * 3600
+            if speed_kt > config.ADSB_MAX_IMPLIED_SPEED_KT:
+                return False
+
     ac.lat = round(lat, 5)
     ac.lon = round(lon, 5)
+    ac.last_pos_ts = now
     if pos_from_global:
         ac.pos_global = True
+        ac.pos_confident = True
     _update_range_bearing(ac)
+    return True
 
 
 def _fuse_ecef(candidates: list[tuple[float, float, float]]) -> tuple[float, float]:
@@ -446,6 +467,8 @@ def _record_mlat_fix(ac: "Aircraft", source: str, lat: float, lon: float, now: f
         # Phase A behaviour: always write, last-write-wins
         ac.lat = round(lat, 5)
         ac.lon = round(lon, 5)
+        ac.last_pos_ts = now
+        ac.pos_confident = True
         _update_range_bearing(ac)
     elif config.MLAT_FUSION == "kalman":
         if not is_spike:
@@ -458,12 +481,16 @@ def _record_mlat_fix(ac: "Aircraft", source: str, lat: float, lon: float, now: f
             else:
                 lat_k, lon_k = _kalman_update_position(ac, lat, lon, now, quality)
                 ac.lat, ac.lon = round(lat_k, 5), round(lon_k, 5)
+            ac.last_pos_ts = now
+            ac.pos_confident = True
             _update_range_bearing(ac)
     else:
         pos = _select_output_position(ac, lat, lon, is_spike, now)
         if pos is not None:
             ac.lat = round(pos[0], 5)
             ac.lon = round(pos[1], 5)
+            ac.last_pos_ts = now
+            ac.pos_confident = True
             _update_range_bearing(ac)
 
 
@@ -558,6 +585,7 @@ class Aircraft:
     cpr_even: Optional[tuple] = field(default=None, repr=False)   # (raw_msg, timestamp)
     cpr_odd:  Optional[tuple] = field(default=None, repr=False)
     pos_global: bool = False  # True once a global CPR decode (even+odd pair) has succeeded
+    pos_confident: bool = False  # True when initial position has passed bootstrap confidence checks
     sighting_count: int = 1               # from aircraft_registry; 1 = unique (never seen before)
     max_altitude: Optional[int] = None    # highest altitude seen this visit
     # MLAT
@@ -566,6 +594,9 @@ class Aircraft:
     mlat: bool = False                    # True if position is MLAT-derived (timestamp-confirmed)
     mlat_source: Optional[str] = None    # name of the MLAT server that established the position
     mlat_msg_count: int = 0              # Beast frames with the MLAT timestamp marker
+    last_pos_ts: float = 0.0             # unix ts of last accepted position update
+    last_alt_ts: float = 0.0             # unix ts of last accepted altitude update
+    _local_bootstrap_pos: Optional[tuple] = field(default=None, repr=False)  # (lat, lon, ts)
     # Altitude source tracking — for priority and rate-of-change filtering
     _alt_source: Optional[str]  = field(default=None, repr=False)  # "ADS-B" | "SURV"
     _alt_source_ts: float       = field(default=0.0,  repr=False)  # monotonic time of last alt update
@@ -788,6 +819,10 @@ class AircraftState:
                 "mlat":            ac.mlat,
                 "mlat_source":       ac.mlat_source,
                 "mlat_msg_count":    ac.mlat_msg_count,
+                "pos_global":      ac.pos_global,
+                "pos_confident":   ac.pos_confident,
+                "last_pos_age":    round(now - ac.last_pos_ts, 1) if ac.last_pos_ts > 0 else None,
+                "last_alt_age":    round(now - ac.last_alt_ts, 1) if ac.last_alt_ts > 0 else None,
                 "acas_ra_active":     ac.acas_ra_ts is not None and (now - ac.acas_ra_ts) < 60,
                 "acas_ra_desc":       ac.acas_ra_desc,
                 "acas_ra_corrective": ac.acas_ra_corrective,
@@ -958,6 +993,8 @@ class AircraftState:
                     "mlat":              ac.mlat,
                     "mlat_source":       ac.mlat_source,
                     "mlat_msg_count":    ac.mlat_msg_count,
+                    "last_pos_age":      round(now - ac.last_pos_ts, 1) if ac.last_pos_ts > 0 else None,
+                    "last_alt_age":      round(now - ac.last_alt_ts, 1) if ac.last_alt_ts > 0 else None,
                     "mlat_quality":      dict(ac.mlat_quality_scores),
                     "mlat_sources": {
                         src: {
@@ -978,6 +1015,7 @@ class AircraftState:
                     "acas_threat_icao":   ac.acas_threat_icao,
                     "acas_sensitivity":   ac.acas_sensitivity,
                     "pos_global":         ac.pos_global,
+                    "pos_confident":      ac.pos_confident,
                 }
                 for ac in self._aircraft.values()
             ]
@@ -1215,6 +1253,14 @@ class AircraftState:
                                         config.RECEIVER_LAT, config.RECEIVER_LON,
                                         lat, lon) > 500):
                                 pass  # discard — beyond ADS-B range
+                            elif (not pos_from_global
+                                  and not ac.pos_confident
+                                  and config.RECEIVER_LAT is not None
+                                  and config.RECEIVER_LON is not None
+                                  and _haversine_nm(
+                                      config.RECEIVER_LAT, config.RECEIVER_LON,
+                                      lat, lon) > config.ADSB_LOCAL_ENTRY_MAX_RANGE_NM):
+                                pass  # discard — stricter cap for unconfirmed local decode
                             elif mlat and not ac.has_adsb:
                                 # Genuine MLAT position: buffer, spike-detect, fuse
                                 # Skip if aircraft has confirmed ADS-B transponder —
@@ -1223,7 +1269,22 @@ class AircraftState:
                                 _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
                             elif not mlat:
                                 # ADS-B position: write directly
-                                _accept_adsb_position(ac, lat, lon, pos_from_global, now)
+                                # Bootstrap confidence for local-only startup positions.
+                                if not pos_from_global and not ac.pos_confident:
+                                    prev = ac._local_bootstrap_pos
+                                    if prev is None:
+                                        ac._local_bootstrap_pos = (lat, lon, now)
+                                    else:
+                                        plat, plon, pts = prev
+                                        dt = now - pts
+                                        if dt > 0:
+                                            speed_kt = (_haversine_nm(plat, plon, lat, lon) / dt) * 3600
+                                            if speed_kt <= config.ADSB_MAX_IMPLIED_SPEED_KT:
+                                                ac.pos_confident = True
+                                        ac._local_bootstrap_pos = (lat, lon, now)
+
+                                if pos_from_global or ac.pos_confident:
+                                    _accept_adsb_position(ac, lat, lon, pos_from_global, now)
                 except Exception:
                     pass
 
