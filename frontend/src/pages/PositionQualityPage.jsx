@@ -107,42 +107,6 @@ export default function PositionQualityPage() {
           Last update: {updatedAt ? new Date(updatedAt * 1000).toLocaleTimeString() : '—'}
         </span>
       </div>
-      <div className={styles.tableWrap}>
-        <table className={styles.table}>
-          <thead>
-            <tr>
-              <th>ICAO</th>
-              <th>Callsign</th>
-              <th>Internal Lat/Lon</th>
-              <th>readsb Lat/Lon</th>
-              <th>Δ Alt (ft)</th>
-              <th>Δ Pos (m)</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row) => (
-              <tr
-                key={row.icao}
-                className={selectedIcao === row.icao ? styles.selected : ''}
-                onClick={() => setSelectedIcao(row.icao)}
-              >
-                <td>{row.icao}</td>
-                <td>{row.callsign || '—'}</td>
-                <td>{fmt(row.internal.lat, 4)}, {fmt(row.internal.lon, 4)}</td>
-                <td>{fmt(row.readsb.lat, 4)}, {fmt(row.readsb.lon, 4)}</td>
-                <td>{row.altitude_delta_ft ?? '—'}</td>
-                <td>{fmt(row.horizontal_error_m, 1)}</td>
-              </tr>
-            ))}
-            {!rows.length && (
-              <tr>
-                <td colSpan={6} className={styles.empty}>No matched aircraft between internal state and readsb.</td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
-
       {selectedIcao && detail && (
         <section className={styles.detailBox}>
           <div className={styles.detailHeader}>
@@ -185,6 +149,42 @@ export default function PositionQualityPage() {
           </div>
         </section>
       )}
+
+      <div className={styles.tableWrap}>
+        <table className={styles.table}>
+          <thead>
+            <tr>
+              <th>ICAO</th>
+              <th>Callsign</th>
+              <th>Internal Lat/Lon</th>
+              <th>readsb Lat/Lon</th>
+              <th>Δ Alt (ft)</th>
+              <th>Δ Pos (m)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr
+                key={row.icao}
+                className={selectedIcao === row.icao ? styles.selected : ''}
+                onClick={() => setSelectedIcao(row.icao)}
+              >
+                <td>{row.icao}</td>
+                <td>{row.callsign || '—'}</td>
+                <td>{fmt(row.internal.lat, 4)}, {fmt(row.internal.lon, 4)}</td>
+                <td>{fmt(row.readsb.lat, 4)}, {fmt(row.readsb.lon, 4)}</td>
+                <td>{row.altitude_delta_ft ?? '—'}</td>
+                <td>{fmt(row.horizontal_error_m, 1)}</td>
+              </tr>
+            ))}
+            {!rows.length && (
+              <tr>
+                <td colSpan={6} className={styles.empty}>No matched aircraft between internal state and readsb.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
     </main>
   )
 }

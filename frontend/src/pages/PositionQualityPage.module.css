@@ -19,6 +19,7 @@
   border: 1px solid #27272a;
   border-radius: 10px;
   overflow: auto;
+  max-height: 52vh;
 }
 
 .table {
