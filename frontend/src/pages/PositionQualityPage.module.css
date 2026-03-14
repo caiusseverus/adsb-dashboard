@@ -1,0 +1,97 @@
+.main {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.headerRow {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.timestamp {
+  color: #a1a1aa;
+  font-size: 0.9rem;
+}
+
+.tableWrap {
+  border: 1px solid #27272a;
+  border-radius: 10px;
+  overflow: auto;
+  max-height: 52vh;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+
+.table th,
+.table td {
+  padding: 0.55rem 0.6rem;
+  border-bottom: 1px solid #27272a;
+  white-space: nowrap;
+}
+
+.table tbody tr {
+  cursor: pointer;
+}
+
+.table tbody tr:hover,
+.selected {
+  background: rgba(56, 189, 248, 0.12);
+}
+
+.empty {
+  text-align: center;
+  color: #a1a1aa;
+}
+
+.detailBox {
+  border: 1px solid #27272a;
+  border-radius: 10px;
+  padding: 0.75rem;
+  background: #111827;
+}
+
+.detailHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.detailHeader button {
+  background: #1f2937;
+  border: 1px solid #374151;
+  color: #e5e7eb;
+  border-radius: 6px;
+  padding: 0.3rem 0.65rem;
+  cursor: pointer;
+}
+
+.statsGrid {
+  margin: 0.5rem 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.45rem;
+}
+
+.chartGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 0.85rem;
+}
+
+.chartCard {
+  border: 1px solid #374151;
+  border-radius: 8px;
+  padding: 0.4rem;
+  background: #0b1220;
+}
+
+.chartCard h4 {
+  margin: 0.2rem 0 0.4rem;
+  font-size: 0.92rem;
+}
