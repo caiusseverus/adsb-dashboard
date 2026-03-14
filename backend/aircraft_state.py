@@ -10,6 +10,7 @@ import re
 from collections import deque, OrderedDict
 from dataclasses import dataclass, field
 from datetime import date
+from enum import IntEnum
 from typing import NamedTuple, Optional
 
 import pyModeS as pms
@@ -44,6 +45,27 @@ _ACAS_CONFIRM_WINDOW_S = 12
 _ACAS_MIN_CONFIRM_FRAMES = 2
 _HEXDB_QUEUE_MAX = 600      # hard ceiling: startup batch + live overflow
 _SIGHTING_LRU_MAX = 10_000  # ~800 KB worst case; evicts oldest on busy long-running sites
+
+# ---------------------------------------------------------------------------
+# Message source classification (mirrors readsb SOURCE_* in track.h)
+# Higher value = higher integrity.  Used by altitude and position filters
+# to decide whether a new reading can override the current one.
+# ---------------------------------------------------------------------------
+class MsgSource(IntEnum):
+    INVALID        = 0
+    MODE_AC        = 1
+    MLAT           = 2
+    MODE_S         = 3   # DF0/4/5/16/20/21 Address/Parity, ICAO filter hit
+    MODE_S_CHECKED = 4   # DF11, clean or single-bit-corrected CRC
+    ADSR           = 5   # DF18
+    ADSB           = 6   # DF17 (clean or corrected — good_crc differentiates)
+
+# ICAO filter — confirmed addresses from DF17/18 clean CRC.
+# Address/Parity DFs (0/4/5/16/20/21) are only decoded if the ICAO
+# appears here — prevents ghost aircraft from CRC-syndrome collisions.
+_CONFIRMED_ICAO_MAX    = 20_000   # LRU cap (readsb: icaoFilterAdd)
+_ICAO_FILTER_EXPIRY_S  = 60.0     # evict if not refreshed within 60 s (readsb: icaoFilterExpire)
+_AP_DFS = frozenset({0, 4, 5, 16, 20, 21})
 
 # Altitude filtering constants
 _ALT_MIN_FT = -1_000          # below this is a bad decode (subterranean)
@@ -674,6 +696,13 @@ class AircraftState:
         # historical ICAOs are evicted rather than accumulating indefinitely
         self._sighting_counts: OrderedDict[str, int] = OrderedDict()
 
+        # Confirmed-ICAO filter (equivalent to readsb icao_filter.c).
+        # Populated from DF17/18 (clean CRC, authoritative ICAO).
+        # Address/Parity DFs (0/4/5/16/20/21) are only decoded if the ICAO
+        # appears here — prevents ghost aircraft from CRC-syndrome collisions.
+        # Value is the last-seen timestamp for expiry pruning.
+        self._confirmed_icaos: OrderedDict[str, float] = OrderedDict()
+
         # History deque cache for get_snapshot() — the completed-minute deques only
         # change once per minute, so we rebuild the list copies at most 1×/min instead
         # of 60×/min (once per second).
@@ -732,6 +761,14 @@ class AircraftState:
                      if now - ac.last_seen > self._timeout]
             for icao in stale:
                 expired.append(self._aircraft.pop(icao))
+
+            # Prune ICAO filter: evict entries not refreshed within expiry window.
+            # Mirrors readsb icaoFilterExpire() which runs every ~60 s.
+            icao_cutoff = now - _ICAO_FILTER_EXPIRY_S
+            stale_icaos = [k for k, ts in self._confirmed_icaos.items()
+                           if ts < icao_cutoff]
+            for k in stale_icaos:
+                del self._confirmed_icaos[k]
         return expired
 
     def init_today(self, icaos: set[str], mil_icaos: set[str]) -> None:
@@ -1105,19 +1142,51 @@ class AircraftState:
         except Exception:
             return
 
-        # --- Extract ICAO ---
+        # --- CRC check + ICAO extraction + source classification ---
         icao: Optional[str] = None
+        crc_clean = False
+        source = MsgSource.INVALID
         try:
-            if df in (17, 18, 11):
+            if df in (17, 18):
+                # DF17/18: true CRC covers entire message; residual 0 = clean.
+                # pyModeS crc() returns the 24-bit remainder on the original bytes.
+                crc_residual = pms.crc(raw)
+                crc_clean = (crc_residual == 0)
                 icao = pms.icao(raw)
-            elif df in (0, 4, 5, 16, 20, 21):
-                icao = pms.icao(raw)   # pyModeS recovers it from CRC
+                if icao:
+                    icao_up = icao.upper()
+                    # Register as confirmed ICAO (readsb: icaoFilterAdd)
+                    self._confirmed_icaos[icao_up] = now
+                    self._confirmed_icaos.move_to_end(icao_up)
+                    if len(self._confirmed_icaos) > _CONFIRMED_ICAO_MAX:
+                        self._confirmed_icaos.popitem(last=False)
+                    source = MsgSource.ADSR if df == 18 else MsgSource.ADSB
+            elif df == 11:
+                icao = pms.icao(raw)
+                # DF11 CRC includes Interrogator ID in lower 7 bits — less
+                # reliable for ICAO confirmation; do NOT add to confirmed set.
+                source = MsgSource.MODE_S_CHECKED
+            elif df in _AP_DFS:
+                # Address/Parity: CRC syndrome IS the ICAO address.
+                # Only accept if previously confirmed by a DF17/18.
+                icao = pms.icao(raw)
+                if not icao or icao.upper() not in self._confirmed_icaos:
+                    return
+                # Refresh LRU timestamp
+                icao_up = icao.upper()
+                self._confirmed_icaos[icao_up] = now
+                self._confirmed_icaos.move_to_end(icao_up)
+                source = MsgSource.MODE_S
         except Exception:
             pass
 
         if not icao:
             return
         icao = icao.upper()
+
+        # MLAT-timestamp frame overrides source classification
+        if mlat:
+            source = MsgSource.MLAT
 
         # --- Update or create aircraft record ---
         if icao not in self._aircraft:
@@ -1290,18 +1359,22 @@ class AircraftState:
 
         # --- Altitude from surveillance altitude reply (DF 4) ---
         # Lower integrity than ADS-B: parity is XOR-masked with aircraft address.
+        # Suppressed for MLAT frames: mlat-client copies baro alt from a secondary
+        # reply on a different receiver — unreliable and potentially from a
+        # different aircraft (readsb track.c: "terrible altitude source, ignore").
         elif df == 4 and len(raw) == 14:
-            try:
-                alt = pms.altcode(raw)
-                if alt is not None:
-                    _accept_altitude(ac, int(alt), "SURV", now)
-            except Exception:
-                pass
+            if not mlat:
+                try:
+                    alt = pms.altcode(raw)
+                    if alt is not None:
+                        _accept_altitude(ac, int(alt), "SURV", now)
+                except Exception:
+                    pass
 
         # --- DF 20/21: Comm-B replies (28 hex chars / 112 bits) ---
         elif df in (20, 21) and len(raw) == 28:
-            # Altitude from DF20 — same parity integrity as DF4
-            if df == 20:
+            # Altitude from DF20 — same parity integrity as DF4; same MLAT suppression.
+            if df == 20 and not mlat:
                 try:
                     alt = pms.altcode(raw)
                     if alt is not None:
@@ -1312,13 +1385,14 @@ class AircraftState:
             # EHS decode: direct is40/is50/is60 checks — ~5x faster than pms.bds.infer()
             # which speculatively tries ~20 registers. Checks are mutually exclusive in practice.
             if _bds40.is40(raw):
-                # Selected altitude (autopilot target)
-                try:
-                    sel = pms.commb.selalt40mcp(raw)
-                    if sel is not None:
-                        ac.selected_alt = int(sel)
-                except Exception:
-                    pass
+                # Selected altitude (autopilot target) — altitude field; suppress for MLAT.
+                if not mlat:
+                    try:
+                        sel = pms.commb.selalt40mcp(raw)
+                        if sel is not None:
+                            ac.selected_alt = int(sel)
+                    except Exception:
+                        pass
 
             elif _bds50.is50(raw):
                 # TAS + track angle + roll
@@ -1357,12 +1431,13 @@ class AircraftState:
                         ac.heading_deg = round(float(hdg), 1)
                 except Exception:
                     pass
-                try:
-                    vr = pms.commb.vr60baro(raw)
-                    if vr is not None:
-                        ac.vertical_rate_fpm = int(round(vr))
-                except Exception:
-                    pass
+                if not mlat:  # baro vertical rate is altitude-derived; suppress for MLAT
+                    try:
+                        vr = pms.commb.vr60baro(raw)
+                        if vr is not None:
+                            ac.vertical_rate_fpm = int(round(vr))
+                    except Exception:
+                        pass
 
         # --- DF16: Long Air-Air Surveillance (ACAS RA in MV field) ---
         # Altitude from DF16 is intentionally not used — DF16 is an ACAS air-to-air

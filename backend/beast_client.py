@@ -22,6 +22,11 @@ log = logging.getLogger(__name__)
 
 _MSG_LEN = {0x31: 2, 0x32: 7, 0x33: 14}
 
+# Cumulative count of non-0x1A bytes discarded while re-synchronising the frame
+# stream (readsb: stats_current.remote_malformed_beast).  Exposed via /api/debug/perf.
+# All BeastClient instances (main + MLAT) aggregate into this single counter.
+malformed_bytes: int = 0
+
 class BeastClient:
     def __init__(self, host: str, port: int, on_message: Callable[[dict], None]):
         self._host = host
@@ -70,20 +75,24 @@ class BeastClient:
                 pass
 
     def _parse_frames(self) -> None:
+        global malformed_bytes
         buf = self._buf
         while len(buf) >= 2:
             # Synchronize on 0x1a
             if buf[0] != 0x1A:
                 idx = buf.find(0x1A)
                 if idx == -1:
+                    malformed_bytes += len(buf)
                     buf.clear()
                     return
+                malformed_bytes += idx
                 del buf[:idx]
                 continue
 
             msg_type = buf[1]
             if msg_type not in _MSG_LEN:
                 # If we see 0x1a 0x1a, it's an escaped byte in a lost frame; skip 1 byte
+                malformed_bytes += 1
                 del buf[:1]
                 continue
 
@@ -96,6 +105,7 @@ class BeastClient:
             
             if data is False:
                 # Framing error: found unescaped 0x1a. Discard current sync byte.
+                malformed_bytes += 1
                 del buf[:1]
                 continue
 

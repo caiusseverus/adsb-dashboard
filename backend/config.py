@@ -73,9 +73,10 @@ DEBUG_ENRICHMENT: int = _parse_debug_level(os.getenv("DEBUG_ENRICHMENT", "0"))
 HOME_COUNTRY: str = os.getenv("HOME_COUNTRY", "")
 RARE_THRESHOLD: int = int(os.getenv("RARE_THRESHOLD", "5"))
 # Minimum messages before an aircraft is written to the registry.
-# Helps filter bogus ICAO addresses from CRC decoding errors.
+# With the ICAO filter enabled, this is a secondary persistence gate —
+# mainly guards against very brief sightings (e.g. a single reflected DF17).
 # Set to 0 to disable filtering. ADSBex/hexdb hit bypasses this check.
-GHOST_FILTER_MSGS: int = int(os.getenv("GHOST_FILTER_MSGS", "5"))
+GHOST_FILTER_MSGS: int = int(os.getenv("GHOST_FILTER_MSGS", "2"))
 MINUTE_STATS_RETENTION_DAYS: int = int(os.getenv("MINUTE_STATS_RETENTION_DAYS", "30"))
 
 DATA_DIR = Path(__file__).parent / "data"
