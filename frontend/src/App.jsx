@@ -15,6 +15,7 @@ import SightingsPage from './pages/SightingsPage'
 import StatusPage from './pages/StatusPage'
 import SettingsPage from './pages/SettingsPage'
 import SkyView from './pages/SkyView'
+import PositionQualityPage from './pages/PositionQualityPage'
 import styles from './App.module.css'
 
 const WS_URL = import.meta.env.PROD
@@ -109,6 +110,10 @@ export default function App() {
             onClick={() => setTab('events')}
           >Events</button>
           <button
+            className={tab === 'positionqa' ? styles.tabActive : styles.tab}
+            onClick={() => setTab('positionqa')}
+          >Position QA</button>
+          <button
             className={tab === 'status' ? styles.tabActive : styles.tab}
             onClick={() => setTab('status')}
           >Status</button>
@@ -150,6 +155,7 @@ export default function App() {
       {tab === 'fleet' && <FleetPage onSelectIcao={setSelectedIcao} />}
       {tab === 'events' && <EventsPage onSelectIcao={setSelectedIcao} />}
       {tab === 'sky' && <SkyView snapshot={snapshot} onSelectIcao={setSelectedIcao} />}
+      {tab === 'positionqa' && <PositionQualityPage />}
       {tab === 'status' && <StatusPage />}
       {tab === 'settings' && <SettingsPage />}
 
