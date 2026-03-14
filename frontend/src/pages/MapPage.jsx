@@ -98,6 +98,9 @@ function residualColor(nm) {
 }
 
 const MAX_TRAIL = 300  // position history depth (~5 min at 1 Hz)
+const MAX_TRAIL_GAP_S = 20
+const MAX_TRAIL_IMPLIED_SPEED_KT = 900
+const MAX_SOURCE_SWITCH_JUMP_NM = 3
 
 // Three fixed-depth segments sliced from the newest position backward.
 // Fixed lengths mean the trail grows naturally without the "sliding" effect
@@ -107,6 +110,15 @@ const TRAIL_SEGS = [
   { len: 60,  opacity: 0.40 },  // 30 – 90 s ago
   { len: 210, opacity: 0.15 },  // 90 – 300 s ago
 ]
+
+function haversineNm(lat1, lon1, lat2, lon2) {
+  const R_NM = 3440.065
+  const dLat = (lat2 - lat1) * Math.PI / 180
+  const dLon = (lon2 - lon1) * Math.PI / 180
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2
+  return R_NM * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
 
 export default function MapPage({ snapshot, onSelectIcao }) {
   const mapRef            = useRef(null)
@@ -327,13 +339,24 @@ export default function MapPage({ snapshot, onSelectIcao }) {
     const icaoSet     = new Set(aircraft.map(ac => ac.icao))
 
     // ── Update position histories ──────────────────────────────────────
+    const nowS = Date.now() / 1000
     for (const ac of aircraft) {
       if (!posHistRef.current.has(ac.icao)) posHistRef.current.set(ac.icao, [])
       const hist = posHistRef.current.get(ac.icao)
       const last = hist[hist.length - 1]
       // Only push if position actually changed (avoids cluttering history when stationary)
-      if ((ac.pos_global || ac.mlat) && (!last || last[0] !== ac.lat || last[1] !== ac.lon)) {
-        hist.push([ac.lat, ac.lon])
+      if ((ac.pos_global || ac.mlat) && (!last || last.lat !== ac.lat || last.lon !== ac.lon)) {
+        if (last) {
+          const dt = nowS - last.ts
+          const distNm = haversineNm(last.lat, last.lon, ac.lat, ac.lon)
+          const impliedSpeedKt = dt > 0 ? (distNm / dt) * 3600 : Infinity
+          const sourceSwitched = !!ac.mlat !== !!last.mlat
+          const shouldBreak = dt > MAX_TRAIL_GAP_S
+            || impliedSpeedKt > MAX_TRAIL_IMPLIED_SPEED_KT
+            || (sourceSwitched && distNm > MAX_SOURCE_SWITCH_JUMP_NM)
+          if (shouldBreak) hist.length = 0
+        }
+        hist.push({ lat: ac.lat, lon: ac.lon, ts: nowS, mlat: !!ac.mlat })
         if (hist.length > MAX_TRAIL) hist.shift()
       }
     }
@@ -388,7 +411,10 @@ export default function MapPage({ snapshot, onSelectIcao }) {
         let end = hist.length
         for (let i = 0; i < TRAIL_SEGS.length; i++) {
           const start = Math.max(0, end - TRAIL_SEGS[i].len)
-          existing.lines[i].setLatLngs(end - start >= 2 ? hist.slice(start, end) : [])
+          const pts = end - start >= 2
+            ? hist.slice(start, end).map(p => [p.lat, p.lon])
+            : []
+          existing.lines[i].setLatLngs(pts)
           end = start
         }
       } else {
@@ -396,7 +422,9 @@ export default function MapPage({ snapshot, onSelectIcao }) {
         let end = hist.length
         const lines = TRAIL_SEGS.map(({ len, opacity }) => {
           const start = Math.max(0, end - len)
-          const pts   = end - start >= 2 ? hist.slice(start, end) : []
+          const pts = end - start >= 2
+            ? hist.slice(start, end).map(p => [p.lat, p.lon])
+            : []
           end = start
           return L.polyline(pts, {
             color, weight: 1.5, opacity, smoothFactor: 1,

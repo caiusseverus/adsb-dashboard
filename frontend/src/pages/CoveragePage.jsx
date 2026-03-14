@@ -17,26 +17,46 @@ const MAX_RANGE_JUMP_NM = 50   // nm — likewise
 const MAX_ALT_RATE_FPM  = 6000
 const MAX_ALT_JUMP_FT_WHEN_STATIC_XY = 2000
 const MIN_XY_MOVE_FOR_ALT_JUMP_NM = 0.05
+const MAX_TRAIL_IMPLIED_SPEED_KT = 900
+const MAX_SOURCE_SWITCH_JUMP_NM = 3
 
 function bearingDeltaDeg(a, b) {
   const d = Math.abs((a ?? 0) - (b ?? 0)) % 360
   return d > 180 ? 360 - d : d
 }
 
+function haversineNm(lat1, lon1, lat2, lon2) {
+  if ([lat1, lon1, lat2, lon2].some(v => v == null)) return null
+  const R_NM = 3440.065
+  const dLat = (lat2 - lat1) * Math.PI / 180
+  const dLon = (lon2 - lon1) * Math.PI / 180
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2
+  return R_NM * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
 function isTrailSegmentValid(a, b) {
   const dt = b.ts - a.ts
-  if (dt > MAX_TRAIL_GAP_S) return false
+  if (dt <= 0 || dt > MAX_TRAIL_GAP_S) return false
   if (bearingDeltaDeg(a.bearing, b.bearing) > MAX_BEARING_JUMP) return false
   const dRange = Math.abs((b.range ?? 0) - (a.range ?? 0))
   if (dRange > MAX_RANGE_JUMP_NM) return false
+
+  const distNm = haversineNm(a.lat, a.lon, b.lat, b.lon)
+  if (distNm != null) {
+    const impliedSpeedKt = (distNm / dt) * 3600
+    if (impliedSpeedKt > MAX_TRAIL_IMPLIED_SPEED_KT) return false
+    if (!!a.mlat !== !!b.mlat && distNm > MAX_SOURCE_SWITCH_JUMP_NM) return false
+  }
+
   const altA = a.alt ?? 0
   const altB = b.alt ?? 0
   const dAlt = Math.abs(altB - altA)
-  if (dt > 0) {
-    const rateFpm = (dAlt / dt) * 60
-    if (rateFpm > MAX_ALT_RATE_FPM) return false
-  }
-  if (dRange < MIN_XY_MOVE_FOR_ALT_JUMP_NM && dAlt > MAX_ALT_JUMP_FT_WHEN_STATIC_XY) return false
+  const rateFpm = (dAlt / dt) * 60
+  if (rateFpm > MAX_ALT_RATE_FPM) return false
+
+  const xyMoveNm = distNm ?? dRange
+  if (xyMoveNm < MIN_XY_MOVE_FOR_ALT_JUMP_NM && dAlt > MAX_ALT_JUMP_FT_WHEN_STATIC_XY) return false
   return true
 }
 
@@ -958,21 +978,43 @@ export default function CoveragePage({ aircraft = [] }) {
     }
 
     // Append new positions
+    const nowS = Date.now() / 1000
     for (const ac of aircraft) {
       if (ac.bearing_deg == null || ac.range_nm == null || ac.altitude == null) continue
       if (!(ac.pos_global || ac.mlat || ac.pos_confident)) continue
       if (!trails[ac.icao]) trails[ac.icao] = []
       const trail = trails[ac.icao]
-      const last  = trail[trail.length - 1]
+
+      // If this aircraft has been without position for a while, start a new trail segment.
+      if (ac.last_pos_age != null && ac.last_pos_age > MAX_TRAIL_GAP_S) trail.length = 0
+
+      let last = trail[trail.length - 1]
       // Skip if position hasn't moved meaningfully (avoids duplicate points for stationary aircraft)
       if (last &&
           Math.abs(last.bearing - ac.bearing_deg) < 0.05 &&
           Math.abs(last.range   - ac.range_nm)    < 0.05) continue
+
+      // Hard break on reacquisition jumps so we never stitch unrealistic lines.
+      if (last) {
+        const dt = nowS - last.ts
+        const distNm = haversineNm(last.lat, last.lon, ac.lat, ac.lon)
+        const impliedSpeedKt = dt > 0 && distNm != null ? (distNm / dt) * 3600 : Infinity
+        const sourceSwitched = !!last.mlat !== !!ac.mlat
+        if (dt <= 0
+            || dt > MAX_TRAIL_GAP_S
+            || impliedSpeedKt > MAX_TRAIL_IMPLIED_SPEED_KT
+            || (sourceSwitched && distNm != null && distNm > MAX_SOURCE_SWITCH_JUMP_NM)) {
+          trail.length = 0
+        }
+      }
+
       trail.push({
         bearing:       ac.bearing_deg,
         range:         ac.range_nm,
         alt:           ac.altitude,
-        ts:            Date.now() / 1000,
+        lat:           ac.lat,
+        lon:           ac.lon,
+        ts:            nowS,
         military:      ac.military,
         mlat:          ac.mlat,
         interesting:   ac.interesting,
