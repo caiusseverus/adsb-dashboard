@@ -483,7 +483,7 @@ async def _push_updates() -> None:
             # - mlat=True: position established by multilateration, also reliable.
             if (ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
                     and ac.get("lat") is not None
-                    and (ac.get("pos_global") or ac.get("mlat") or ac.get("pos_confident"))):
+                    and ac.get("pos_confident")):  # pos_confident = _pos_reliable() in snapshot
                 track_store.record(
                     icao=ac["icao"],
                     bearing_deg=ac["bearing_deg"],

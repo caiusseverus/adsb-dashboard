@@ -154,3 +154,7 @@ REGISTRY_FLUSH_SECONDS: float = float(os.getenv("REGISTRY_FLUSH_SECONDS", "300")
 # readsb aircraft JSON source for position QA checker.
 READSB_AIRCRAFT_JSON_PATH: str = os.getenv("READSB_AIRCRAFT_JSON_PATH", "/run/readsb/aircraft.json")
 READSB_AIRCRAFT_JSON_URL: str = os.getenv("READSB_AIRCRAFT_JSON_URL", "http://adsbpi.local/tar1090/data/aircraft.json")
+
+# Maximum range (nm) from the receiver for accepted ADS-B positions.
+# Mirrors readsb's receiver_range config; 300 nm is a typical ADS-B horizon.
+MAX_RANGE_NM: float = float(os.getenv("MAX_RANGE_NM", "300"))
