@@ -67,6 +67,11 @@ _CONFIRMED_ICAO_MAX    = 20_000   # LRU cap (readsb: icaoFilterAdd)
 _ICAO_FILTER_EXPIRY_S  = 60.0     # evict if not refreshed within 60 s (readsb: icaoFilterExpire)
 _AP_DFS = frozenset({0, 4, 5, 16, 20, 21})
 
+# DF values that can arise from a single-bit error corrupting a DF17 type field.
+# readsb: fixDF17msgtype() in mode_s.c — flips the DF field back to 17 and
+# verifies CRC.  Only 112-bit (14-byte) messages are eligible.
+_DF17_BIT_ERROR_CANDIDATES = frozenset({1, 16, 19, 21, 25})
+
 # Altitude filtering constants (mirrors readsb track.h / updateAltitude())
 _ALT_MIN_FT             = -1_000  # below this is a bad decode (subterranean)
 _ALT_MAX_FT             = 60_000  # above this is a bad decode (service ceiling)
@@ -435,6 +440,26 @@ def _pos_reliable(ac: "Aircraft") -> bool:
         return True
     return (ac.pos_reliable_odd  >= _POS_RELIABLE_PUBLISH and
             ac.pos_reliable_even >= _POS_RELIABLE_PUBLISH)
+
+
+def _try_fix_df17(raw_bytes: bytes) -> Optional[bytes]:
+    """Attempt single-bit DF field correction to DF17.
+
+    If a 112-bit frame arrives with a DF value that is exactly one bit flip
+    away from 17, force the DF to 17 and accept if the CRC passes.
+    Mirrors readsb fixDF17msgtype() in mode_s.c.
+    Returns corrected bytes on success, None otherwise.
+    """
+    if len(raw_bytes) < 14:
+        return None
+    df = (raw_bytes[0] >> 3) & 0x1F
+    if df not in _DF17_BIT_ERROR_CANDIDATES:
+        return None
+    corrected = bytearray(raw_bytes)
+    corrected[0] = (corrected[0] & 0x07) | (17 << 3)
+    if pms.crc(corrected.hex().upper()) == 0:
+        return bytes(corrected)
+    return None
 
 
 def _in_discard_cache(ac: "Aircraft", lat: float, lon: float, now: float) -> bool:
@@ -1340,6 +1365,17 @@ class AircraftState:
         except Exception:
             return
 
+        # DF17 type fixup: recover frames where a single-bit error corrupted the
+        # DF field.  Only for 112-bit (28 hex char) messages.  Sets df17_corrected
+        # so that crc_clean is forced False — lower good_crc in the altitude filter.
+        df17_corrected = False
+        if len(raw) == 28 and df != 17:
+            fixed = _try_fix_df17(bytes.fromhex(raw))
+            if fixed is not None:
+                raw = fixed.hex().upper()
+                df = 17
+                df17_corrected = True
+
         # --- CRC check + ICAO extraction + source classification ---
         icao: Optional[str] = None
         crc_clean = False
@@ -1349,7 +1385,8 @@ class AircraftState:
                 # DF17/18: true CRC covers entire message; residual 0 = clean.
                 # pyModeS crc() returns the 24-bit remainder on the original bytes.
                 crc_residual = pms.crc(raw)
-                crc_clean = (crc_residual == 0)
+                # Corrected frames have CRC=0 after fixup but are lower confidence.
+                crc_clean = (crc_residual == 0) and not df17_corrected
                 icao = pms.icao(raw)
                 if icao:
                     icao_up = icao.upper()
