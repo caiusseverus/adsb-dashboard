@@ -561,14 +561,18 @@ async def _hires_writer() -> None:
         now_ts = int(_time.time())
         samples = [
             (now_ts, ac["icao"],
-             ac["bearing_deg"], ac["range_nm"], ac.get("altitude"),
+             ac["bearing_deg"], ac["range_nm"],
+             # Same freshness gate as _db_writer — suppress stale altitude
+             (ac.get("altitude")
+              if ((ac.get("last_pos_age") is not None and ac.get("last_pos_age") <= config.POS_FRESH_S)
+                  and (ac.get("last_alt_age") is not None and ac.get("last_alt_age") <= config.ALT_FRESH_S))
+              else None),
              ac.get("military", False), ac.get("interesting", False),
              ac.get("type_code"), ac.get("type_category"))
             for ac in snapshot.get("aircraft", [])
             if (ac.get("bearing_deg") is not None
                 and ac.get("range_nm") is not None
                 and (ac.get("range_nm") or 0) > 0
-                and (ac.get("altitude") or 0) > 0
                 and _ghost_credible(ac))
         ]
         hires_buffer.record(samples)
