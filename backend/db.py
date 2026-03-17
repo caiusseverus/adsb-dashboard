@@ -628,14 +628,22 @@ class StatsDB:
             SELECT
                 ?,
                 CAST(SUM(msg_mean * 60) AS INTEGER),
-                MAX(msg_max),
+                -- p95 of per-minute mean rates instead of MAX(msg_max); avoids
+                -- reconnection bursts or single-second spikes inflating the heatmap
+                (SELECT MAX(msg_mean) FROM (
+                    SELECT msg_mean,
+                           ROW_NUMBER() OVER (ORDER BY msg_mean) AS rn,
+                           COUNT(*) OVER () AS n
+                    FROM minute_stats
+                    WHERE date(ts, 'unixepoch') = ?
+                ) WHERE rn * 100 <= n * 95),
                 MAX(ac_total),
                 MAX(ac_civil),
                 MAX(ac_military),
                 (SELECT COUNT(*) FROM daily_aircraft_seen WHERE date = ?)
             FROM minute_stats
             WHERE date(ts, 'unixepoch') = ?
-        """, (date_str, date_str, date_str))
+        """, (date_str, date_str, date_str, date_str))
 
         conn.execute("""
             INSERT OR REPLACE INTO day_type_counts (date, type_code, count)
@@ -2330,16 +2338,32 @@ class StatsDB:
         return {"start_ts": start_ts, "end_ts": end_ts, "tracks": tracks}
 
     def query_coverage_range_trend(self, days: int = 90) -> list[dict]:
-        """Daily max and median range from coverage_samples, for trend charts."""
+        """Daily p95 and median range from coverage_samples, for trend charts.
+
+        Uses p95 instead of MAX to exclude outlier positions (bad CPR decodes
+        that produce unrealistically large range values).
+        """
         cutoff = (date.today() - timedelta(days=days)).isoformat()
         with self._connect() as conn:
             rows = conn.execute("""
-                SELECT date(ts, 'unixepoch') AS day,
-                       ROUND(MAX(range_nm), 1) AS max_nm,
+                WITH ranked AS (
+                    SELECT date(ts, 'unixepoch') AS day,
+                           range_nm,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY date(ts, 'unixepoch')
+                               ORDER BY range_nm
+                           ) AS rn,
+                           COUNT(*) OVER (
+                               PARTITION BY date(ts, 'unixepoch')
+                           ) AS n
+                    FROM coverage_samples
+                    WHERE date(ts, 'unixepoch') >= ?
+                      AND range_nm > 0
+                )
+                SELECT day,
+                       ROUND(MAX(CASE WHEN rn * 100 <= n * 95 THEN range_nm ELSE 0 END), 1) AS max_nm,
                        ROUND(AVG(range_nm), 1) AS avg_nm
-                FROM coverage_samples
-                WHERE date(ts, 'unixepoch') >= ?
-                  AND range_nm > 0
+                FROM ranked
                 GROUP BY day
                 ORDER BY day
             """, (cutoff,)).fetchall()

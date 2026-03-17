@@ -522,7 +522,15 @@ function BoxPlotSVG({ data, formatVal, minZero = true }) {
   const pad = (hi - lo) * 0.15 || 1
   const yLo = (minZero ? Math.max(0, lo - pad) : lo - pad), yHi = hi + pad
   const sy = v => MT + plotH - ((v - yLo) / (yHi - yLo)) * plotH
-  const ticks = [0, 1, 2, 3].map(i => yLo + (i / 3) * (yHi - yLo))
+
+  // Compute nice rounded tick intervals (1/2/5 × power-of-10 steps)
+  const rawStep = (yHi - yLo) / 4
+  const mag = Math.pow(10, Math.floor(Math.log10(rawStep || 1)))
+  const norm = rawStep / mag
+  const niceStep = norm <= 1.5 ? mag : norm <= 3.5 ? 2 * mag : norm <= 7.5 ? 5 * mag : 10 * mag
+  const tickStart = Math.ceil(yLo / niceStep) * niceStep
+  const ticks = []
+  for (let t = tickStart; t <= yHi + niceStep * 0.01; t += niceStep) ticks.push(t)
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: H }}>
