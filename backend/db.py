@@ -1522,6 +1522,50 @@ class StatsDB:
             """, params).fetchall()
         return [{"year": r["year"], "count": r["count"]} for r in rows]
 
+    def query_fleet_top_routes(self, limit: int = 20,
+                               since_ts: int | None = None) -> list[dict]:
+        params: list = []
+        since_clause = ""
+        if since_ts is not None:
+            since_clause = "AND start_ts >= ?"
+            params.append(since_ts)
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(f"""
+                SELECT origin_icao, dest_icao, COUNT(*) AS count
+                FROM visits
+                WHERE origin_icao IS NOT NULL AND origin_icao != ''
+                  AND dest_icao IS NOT NULL AND dest_icao != ''
+                  {since_clause}
+                GROUP BY origin_icao, dest_icao
+                ORDER BY count DESC
+                LIMIT ?
+            """, params).fetchall()
+        return [{"origin": r["origin_icao"], "dest": r["dest_icao"],
+                 "count": r["count"]} for r in rows]
+
+    def query_fleet_top_airports(self, limit: int = 20,
+                                  since_ts: int | None = None,
+                                  direction: str = "origin") -> list[dict]:
+        col = "origin_icao" if direction == "origin" else "dest_icao"
+        params: list = []
+        since_clause = ""
+        if since_ts is not None:
+            since_clause = "AND start_ts >= ?"
+            params.append(since_ts)
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(f"""
+                SELECT {col} AS airport, COUNT(*) AS count
+                FROM visits
+                WHERE {col} IS NOT NULL AND {col} != ''
+                  {since_clause}
+                GROUP BY {col}
+                ORDER BY count DESC
+                LIMIT ?
+            """, params).fetchall()
+        return [{"airport": r["airport"], "count": r["count"]} for r in rows]
+
     # Maps frontend sort key → SQL expression (no user data, all literals)
     _NOTABLE_SORT_MAP = {
         "icao":           "ar.icao",

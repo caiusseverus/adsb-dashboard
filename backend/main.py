@@ -12,13 +12,8 @@ except ImportError:
 import logging
 import queue
 import threading
-import warnings
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
-
-# websockets ≥ 12 deprecates the two-argument ws_handler signature used
-# internally by starlette/uvicorn — suppress until uvicorn catches up.
-warnings.filterwarnings('ignore', category=DeprecationWarning, module='websockets')
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware

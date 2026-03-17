@@ -435,6 +435,102 @@ function TopMilitaryAircraft({ since, onSelectIcao }) {
 }
 
 // ---------------------------------------------------------------------------
+// Top routes
+// ---------------------------------------------------------------------------
+function TopRoutes({ since }) {
+  const { data, loading } = useFetch(appendSince(`${API_BASE}/api/fleet/top_routes?limit=20`, since))
+
+  const chartData = useMemo(() =>
+    (data || []).map(d => ({
+      label: `${d.origin} → ${d.dest}`,
+      count: d.count,
+      origin: d.origin,
+      dest: d.dest,
+      origin_name: d.origin_name,
+      dest_name: d.dest_name,
+    })),
+  [data])
+
+  return (
+    <Card title="Top routes">
+      {!chartData.length ? <Empty loading={loading} /> : (
+        <HBarChart
+          data={chartData}
+          labelKey="label"
+          valueKey="count"
+          height={Math.max(200, chartData.length * 22 + 30)}
+          colorFn={() => '#3fb950'}
+          tooltipContent={({ payload }) => {
+            if (!payload?.length) return null
+            const d = payload[0].payload
+            return (
+              <div className={styles.tooltip}>
+                <div><strong>{d.origin}</strong>{d.origin_name ? ` · ${d.origin_name}` : ''}</div>
+                <div><strong>{d.dest}</strong>{d.dest_name ? ` · ${d.dest_name}` : ''}</div>
+                <div>{d.count.toLocaleString()} visits</div>
+              </div>
+            )
+          }}
+        />
+      )}
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Top airports
+// ---------------------------------------------------------------------------
+function TopAirports({ since }) {
+  const [direction, setDirection] = useState('origin')
+  const { data, loading } = useFetch(
+    appendSince(`${API_BASE}/api/fleet/top_airports?limit=20&direction=${direction}`, since)
+  )
+
+  const chartData = useMemo(() =>
+    (data || []).map(d => ({
+      label: d.airport,
+      count: d.count,
+      name: d.name,
+    })),
+  [data])
+
+  const controls = (
+    <>
+      {['origin', 'dest'].map(d => (
+        <button key={d} className={direction === d ? styles.btnActive : styles.btn}
+          onClick={() => setDirection(d)}>
+          {d === 'origin' ? 'Origins' : 'Destinations'}
+        </button>
+      ))}
+    </>
+  )
+
+  return (
+    <Card title="Top airports" controls={controls}>
+      {!chartData.length ? <Empty loading={loading} /> : (
+        <HBarChart
+          data={chartData}
+          labelKey="label"
+          valueKey="count"
+          height={Math.max(200, chartData.length * 22 + 30)}
+          colorFn={() => '#bc8cff'}
+          tooltipContent={({ payload }) => {
+            if (!payload?.length) return null
+            const d = payload[0].payload
+            return (
+              <div className={styles.tooltip}>
+                <div><strong>{d.label}</strong>{d.name ? ` · ${d.name}` : ''}</div>
+                <div>{d.count.toLocaleString()} visits</div>
+              </div>
+            )
+          }}
+        />
+      )}
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Page layout
 // ---------------------------------------------------------------------------
 export default function FleetPage({ onSelectIcao }) {
@@ -462,6 +558,10 @@ export default function FleetPage({ onSelectIcao }) {
         <TypeCategories since={since} />
       </div>
       <ManufactureYears since={since} />
+      <div className={styles.row}>
+        <TopRoutes since={since} />
+        <TopAirports since={since} />
+      </div>
       <div className={styles.row}>
         <TopAircraft since={since} onSelectIcao={onSelectIcao} />
         <TopMilitaryAircraft since={since} onSelectIcao={onSelectIcao} />
