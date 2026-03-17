@@ -10,6 +10,7 @@ import re
 from collections import deque, OrderedDict
 from dataclasses import dataclass, field
 from datetime import date
+from enum import IntEnum
 from typing import NamedTuple, Optional
 
 import pyModeS as pms
@@ -45,11 +46,45 @@ _ACAS_MIN_CONFIRM_FRAMES = 2
 _HEXDB_QUEUE_MAX = 600      # hard ceiling: startup batch + live overflow
 _SIGHTING_LRU_MAX = 10_000  # ~800 KB worst case; evicts oldest on busy long-running sites
 
-# Altitude filtering constants
-_ALT_MIN_FT = -1_000          # below this is a bad decode (subterranean)
-_ALT_MAX_FT = 60_000          # above this is a bad decode (service ceiling)
-_ALT_MAX_RATE_FPM = 8_000     # max realistic climb/descent rate — rejects spikes
-_ALT_SOURCE_STALE_S = 15.0    # after this many seconds, lower-priority source may overwrite
+# ---------------------------------------------------------------------------
+# Message source classification (mirrors readsb SOURCE_* in track.h)
+# Higher value = higher integrity.  Used by altitude and position filters
+# to decide whether a new reading can override the current one.
+# ---------------------------------------------------------------------------
+class MsgSource(IntEnum):
+    INVALID        = 0
+    MODE_AC        = 1
+    MLAT           = 2
+    MODE_S         = 3   # DF0/4/5/16/20/21 Address/Parity, ICAO filter hit
+    MODE_S_CHECKED = 4   # DF11, clean or single-bit-corrected CRC
+    ADSR           = 5   # DF18
+    ADSB           = 6   # DF17 (clean or corrected — good_crc differentiates)
+
+# ICAO filter — confirmed addresses from DF17/18 clean CRC.
+# Address/Parity DFs (0/4/5/16/20/21) are only decoded if the ICAO
+# appears here — prevents ghost aircraft from CRC-syndrome collisions.
+_CONFIRMED_ICAO_MAX    = 20_000   # LRU cap (readsb: icaoFilterAdd)
+_ICAO_FILTER_EXPIRY_S  = 60.0     # evict if not refreshed within 60 s (readsb: icaoFilterExpire)
+_AP_DFS = frozenset({0, 4, 5, 16, 20, 21})
+
+# DF values that can arise from a single-bit error corrupting a DF17 type field.
+# readsb: fixDF17msgtype() in mode_s.c — flips the DF field back to 17 and
+# verifies CRC.  Only 112-bit (14-byte) messages are eligible.
+_DF17_BIT_ERROR_CANDIDATES = frozenset({1, 16, 19, 21, 25})
+
+# Altitude filtering constants (mirrors readsb track.h / updateAltitude())
+_ALT_MIN_FT             = -1_000  # below this is a bad decode (subterranean)
+_ALT_MAX_FT             = 60_000  # above this is a bad decode (service ceiling)
+_ALT_RELIABLE_MAX       = 20      # ALTITUDE_BARO_RELIABLE_MAX
+_ALT_RELIABLE_PUBLISH   = 2       # minimum alt_reliable to include altitude in snapshot output
+_ALT_LOW_DELTA_FT       = 300     # below this delta, accept unconditionally
+_ALT_DEFAULT_MAX_FPM    = 12500   # default rate ceiling when no vertical rate known
+_ALT_DEFAULT_MIN_FPM    = -12500
+_ALT_RATE_TOLERANCE_FPM = 1500    # ± window around reported vertical rate
+_ALT_RATE_AGE_SLOP_MAX  = 11000   # max extra fpm slop added for stale rate data
+_ALT_QBIT_CEILING_FT    = 50175   # above this, Q-bit encoding becomes unreliable
+_ALT_STALE_WINDOW_S     = 30.0    # beyond this, alt_reliable is capped to 0
+_ALT_FAST_UPDATE_S      = 2.0     # CRC=0 + age < this → good_crc = MAX
 
 # MLAT quality constants
 _MLAT_MIN_DT_S        = 0.5   # minimum fix interval for speed-based spike detection
@@ -59,6 +94,24 @@ _MLAT_STALE_EVICT_S   = 120   # evict a source's per-aircraft state after this s
 _MLAT_ALIGN_WINDOW    = 2.0   # max age difference (s) for cross-source residual pairing
 _MLAT_RESIDUAL_MAXLEN = 30    # rolling residual buffer depth per source
 _MLAT_FUSION_WINDOW   = 4.0   # max fix age (s) for inclusion in weighted fusion
+
+# ADS-B position reliability constants (mirrors readsb track.c pos_reliable)
+_POS_RELIABLE_MAX              = 4.0    # ceiling for the reliability score
+_POS_RELIABLE_DECAY            = 0.26   # per-failure penalty
+_POS_RELIABLE_PUBLISH          = 1.0    # minimum score to include lat/lon in snapshot output
+_POS_RELIABLE_RESET_TIMEOUT_S  = 3600.0 # 60-min silence → reset scores
+_ADSB_MAX_SPEED_KT             = 1500   # hard ceiling for ADS-B speed check
+_SPEED_UNCERTAINTY_KT_PER_S    = 3.0    # ceiling widens +3 kt per second elapsed
+_MLAT_FORCE_INTERVAL_S         = 30.0   # mlatForce: min interval between force-accepts
+_MLAT_FORCE_DISTANCE_NM        = 13.5   # mlatForce: min distance from ADS-B pos (25 km)
+
+# CPR duplicate detection constants
+_CPR_DUP_WINDOW_S   = 2.0    # window for considering identical frames as duplicates
+_CPR_DUP_CACHE_LEN  = 6      # max recent CPR frames cached per aircraft
+
+# Position discard cache constants (prevents double-penalising the same bad position)
+_DISCARD_CACHE_LEN  = 4
+_DISCARD_CACHE_TTL  = 4.0    # seconds
 
 # ── Kalman filter constants ────────────────────────────────────────────────
 # 2-D constant-velocity filter; state = [east_m, north_m, ve_m/s, vn_m/s]
@@ -216,36 +269,120 @@ class MlatFix(NamedTuple):
     lon: float
 
 
-def _accept_altitude(ac: "Aircraft", alt: int, source: str, now: float) -> bool:
-    """Return True and update ac.altitude if alt passes range + rate-of-change + priority checks.
+def _alt_baro_reliable(ac: "Aircraft") -> bool:
+    """Mirror of readsb altBaroReliable(): alt_reliable >= ALT_RELIABLE_PUBLISH."""
+    return ac.alt_reliable >= _ALT_RELIABLE_PUBLISH
 
-    source: "ADS-B" (DF17/18, CRC-verified) or "SURV" (DF4/20, parity-masked).
-    ADS-B is preferred; SURV is only accepted when ADS-B is stale or absent.
+
+def _penalise_alt_reliable(ac: "Aircraft", good_crc: int = 0) -> None:
+    """Decrement alt_reliable and invalidate source on floor breach."""
+    ac.alt_reliable -= (good_crc + 1)
+    if ac.alt_reliable <= 0:
+        ac.alt_reliable = 0
+        ac._alt_source = None
+
+
+def _accept_altitude(ac: "Aircraft", alt: int, source: "MsgSource",
+                     crc_clean: bool, now: float) -> bool:
+    """Update ac.altitude if alt passes the readsb-equivalent 8-layer filter.
+
+    Maintains alt_reliable score (0..ALT_RELIABLE_MAX).  Altitude is only
+    published in snapshots when alt_reliable >= ALT_RELIABLE_PUBLISH (2).
+    Mirrors readsb updateAltitude() in track.c.
     """
-    # Range gate — reject physically impossible values
+    # Layer 0: range gate
     if not (_ALT_MIN_FT <= alt <= _ALT_MAX_FT):
         return False
 
-    # Source priority: don't let SURV overwrite a recent ADS-B altitude
-    if source == "SURV" and ac._alt_source == "ADS-B":
-        age = now - ac._alt_source_ts
-        if age < _ALT_SOURCE_STALE_S:
-            return False
+    # Layer 1: MLAT veto
+    # mlat-client copies baro alt from a secondary reply on another receiver —
+    # not from the MLAT geometry. readsb: "terrible altitude source, ignore".
+    if source == MsgSource.MLAT:
+        return False
 
-    # Rate-of-change gate — reject spikes that exceed realistic climb/descent
-    if ac.altitude is not None and ac._alt_source_ts > 0:
-        dt_min = (now - ac._alt_source_ts) / 60.0
-        if dt_min > 0:
-            rate = abs(alt - ac.altitude) / dt_min
-            if rate > _ALT_MAX_RATE_FPM:
-                return False
+    # Layer 2: Q-bit anomaly above 50,175 ft
+    # Gillham/Q-bit encoding produces invalid values above this ceiling.
+    # Apply to MODE_S only (ADS-B TC9-22 uses its own encoding).
+    if source == MsgSource.MODE_S and alt > _ALT_QBIT_CEILING_FT:
+        _penalise_alt_reliable(ac)
+        return False
 
-    ac.altitude = alt
-    ac._alt_source = source
-    ac._alt_source_ts = now
-    if ac.max_altitude is None or alt > ac.max_altitude:
-        ac.max_altitude = alt
-    return True
+    # Layer 3: compute good_crc — message confidence score
+    # Mirrors readsb: mm->crc == 0 gates the high-confidence path.
+    baro_age_s = (now - ac._alt_ts) if ac._alt_ts > 0 else _ALT_STALE_WINDOW_S
+    good_crc = 0
+    if crc_clean and source > MsgSource.MODE_S_CHECKED:
+        # CRC residual zero + ADSB/ADSR source — highest confidence
+        if baro_age_s < _ALT_FAST_UPDATE_S:
+            good_crc = _ALT_RELIABLE_MAX       # 20: rapid clean ADS-B update
+        else:
+            good_crc = _ALT_RELIABLE_MAX // 3  # 7: clean but infrequent
+
+    # Layer 4: cap alt_reliable by data staleness when delta is large
+    delta = (alt - ac.altitude) if ac.altitude is not None else 0
+    fpm = 0
+    if abs(delta) >= _ALT_LOW_DELTA_FT:
+        # Implied rate (readsb formula: delta*600 / (baroAge_100ms + 10))
+        baro_age_units = baro_age_s * 10 + 10  # prevent div/0
+        fpm = delta * 600.0 / baro_age_units
+        if baro_age_s < _ALT_STALE_WINDOW_S:
+            stale_cap = int(_ALT_RELIABLE_MAX * (1.0 - baro_age_s / _ALT_STALE_WINDOW_S))
+            ac.alt_reliable = min(ac.alt_reliable, stale_cap)
+        else:
+            ac.alt_reliable = 0
+
+    # Layer 5: dynamic vertical rate window
+    min_fpm = _ALT_DEFAULT_MIN_FPM
+    max_fpm = _ALT_DEFAULT_MAX_FPM
+    if abs(delta) >= _ALT_LOW_DELTA_FT:
+        geom_age_ms = (now - ac._vrate_geom_ts) * 1000 if ac._vrate_geom_fpm is not None else float('inf')
+        baro_age_ms = (now - ac._vrate_baro_ts) * 1000 if ac._vrate_baro_fpm is not None else float('inf')
+        vrate = None
+        if ac._vrate_geom_fpm is not None and geom_age_ms < baro_age_ms:
+            vrate = ac._vrate_geom_fpm
+            slop = min(_ALT_RATE_AGE_SLOP_MAX, int(geom_age_ms / 2))
+        elif ac._vrate_baro_fpm is not None:
+            vrate = ac._vrate_baro_fpm
+            slop = min(_ALT_RATE_AGE_SLOP_MAX, int(baro_age_ms / 2))
+        if vrate is not None:
+            min_fpm = vrate - _ALT_RATE_TOLERANCE_FPM - slop
+            max_fpm = vrate + _ALT_RATE_TOLERANCE_FPM + slop
+
+    # Layer 6: accept/reject decision (four paths)
+    accept = False
+    reset_reliable = False
+    if abs(delta) < _ALT_LOW_DELTA_FT:
+        accept = True                    # tiny delta: unconditional
+    elif fpm != 0 and min_fpm <= fpm <= max_fpm:
+        accept = True                    # rate consistent with reported vrate
+    elif good_crc >= ac.alt_reliable:
+        accept = True                    # high-confidence source overrides history
+        reset_reliable = True
+    elif source > (ac._alt_source or MsgSource.INVALID):
+        accept = True                    # better source than current
+        reset_reliable = True
+
+    # Layer 7: accept path — score increment
+    if accept:
+        if reset_reliable:
+            ac.alt_reliable = 0
+        # MODE_S anti-inflate: infrequent alt on MLAT target should not build confidence
+        if source == MsgSource.MODE_S and ac.mlat and baro_age_s > 5.0:
+            score_add = -1
+        else:
+            score_add = good_crc + 1
+        ac.alt_reliable = max(0, min(_ALT_RELIABLE_MAX, ac.alt_reliable + score_add))
+        ac.altitude = alt
+        ac._alt_source = source
+        ac._alt_ts = now
+        ac.last_alt_ts = now  # kept for snapshot last_alt_age / coverage gate
+        if ac.max_altitude is None or alt > ac.max_altitude:
+            ac.max_altitude = alt
+        return True
+
+    # Layer 8: discard path — cumulative penalty
+    _penalise_alt_reliable(ac, good_crc)
+    return False
 
 def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """True bearing from (lat1,lon1) to (lat2,lon2) in degrees (0=N, 90=E)."""
@@ -270,11 +407,114 @@ def _update_range_bearing(ac: "Aircraft") -> None:
         ac.bearing_deg = round(_bearing_deg(config.RECEIVER_LAT, config.RECEIVER_LON, ac.lat, ac.lon), 1)
 
 
+def _is_cpr_duplicate(ac: "Aircraft", raw: str, oe: int, now: float) -> bool:
+    """Return True if an identical CPR frame has been seen within _CPR_DUP_WINDOW_S.
+
+    Same raw bytes means the same transponder encoding was received more than once
+    (e.g. reflected signal or two nearby feeders forwarding the same frame).
+    Duplicate frames should not update CPR pairing or pos_reliable (readsb:
+    cpr_duplicate_check in track.c).
+    """
+    cutoff = now - _CPR_DUP_WINDOW_S
+    fresh = [(r, o, ts) for r, o, ts in ac._cpr_recent if ts >= cutoff]
+    for r, o, _ in fresh:
+        if r == raw and o == oe:
+            ac._cpr_recent = fresh
+            return True
+    fresh.append((raw, oe, now))
+    if len(fresh) > _CPR_DUP_CACHE_LEN:
+        fresh.pop(0)
+    ac._cpr_recent = fresh
+    return False
+
+
+def _pos_reliable(ac: "Aircraft") -> bool:
+    """Mirror of readsb posReliable() in track.h.
+
+    MLAT positions bypass the CPR reliability threshold — they are validated
+    by the MLAT network geometry, not by CPR pair confirmation.
+    """
+    if ac.lat is None:
+        return False
+    if ac.mlat:
+        return True
+    return (ac.pos_reliable_odd  >= _POS_RELIABLE_PUBLISH and
+            ac.pos_reliable_even >= _POS_RELIABLE_PUBLISH)
+
+
+def _try_fix_df17(raw_bytes: bytes) -> Optional[bytes]:
+    """Attempt single-bit DF field correction to DF17.
+
+    If a 112-bit frame arrives with a DF value that is exactly one bit flip
+    away from 17, force the DF to 17 and accept if the CRC passes.
+    Mirrors readsb fixDF17msgtype() in mode_s.c.
+    Returns corrected bytes on success, None otherwise.
+    """
+    if len(raw_bytes) < 14:
+        return None
+    df = (raw_bytes[0] >> 3) & 0x1F
+    if df not in _DF17_BIT_ERROR_CANDIDATES:
+        return None
+    corrected = bytearray(raw_bytes)
+    corrected[0] = (corrected[0] & 0x07) | (17 << 3)
+    if pms.crc(corrected.hex().upper()) == 0:
+        return bytes(corrected)
+    return None
+
+
+def _in_discard_cache(ac: "Aircraft", lat: float, lon: float, now: float) -> bool:
+    return any(
+        lt == lat and ln == lon and now - ts < _DISCARD_CACHE_TTL
+        for lt, ln, ts in ac._discard_cache
+    )
+
+
+def _add_to_discard_cache(ac: "Aircraft", lat: float, lon: float, now: float) -> None:
+    ac._discard_cache.append((lat, lon, now))
+    if len(ac._discard_cache) > _DISCARD_CACHE_LEN:
+        ac._discard_cache.pop(0)
+
+
 def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
-                          pos_from_global: bool, now: float) -> None:  # noqa: ARG001
-    """Write a validated ADS-B CPR position to the aircraft record."""
+                          pos_from_global: bool, cpr_odd: bool, now: float) -> None:
+    """Write a validated ADS-B CPR position to the aircraft record.
+
+    Applies a speed-check gate (readsb track.c speed_check) and maintains a
+    soft reliability score (pos_reliable_odd/even).  A failed check penalises
+    the score; when score reaches zero the CPR state is reset so the aircraft
+    must re-establish position from a fresh even+odd pair.  lat/lon are still
+    stored (needed as reference for local CPR decode) but suppressed in snapshot
+    output until pos_reliable reaches _POS_RELIABLE_PUBLISH.
+    """
+    if ac.lat is not None and ac.lon is not None and ac.last_pos_ts > 0:
+        elapsed_s = now - ac.last_pos_ts
+        if elapsed_s > 0:
+            dist_nm = _haversine_nm(ac.lat, ac.lon, lat, lon)
+            # Ceiling widens with time to account for position uncertainty (+3 kt/s)
+            ceiling_kt = _ADSB_MAX_SPEED_KT + _SPEED_UNCERTAINTY_KT_PER_S * elapsed_s
+            implied_kt = (dist_nm / elapsed_s) * 3600
+            if implied_kt > ceiling_kt:
+                if not _in_discard_cache(ac, lat, lon, now):
+                    ac.pos_reliable_odd  = max(0.0, ac.pos_reliable_odd  - _POS_RELIABLE_DECAY)
+                    ac.pos_reliable_even = max(0.0, ac.pos_reliable_even - _POS_RELIABLE_DECAY)
+                    if ac.pos_reliable_odd < _POS_RELIABLE_DECAY or ac.pos_reliable_even < _POS_RELIABLE_DECAY:
+                        # Sustained failures: reset CPR state
+                        ac.pos_reliable_odd  = 0.0
+                        ac.pos_reliable_even = 0.0
+                        ac.cpr_even  = None
+                        ac.cpr_odd   = None
+                        ac.pos_global = False
+                    _add_to_discard_cache(ac, lat, lon, now)
+                return  # discard this position
+
+    # Position accepted — increment reliability score for the frame that triggered decode
+    if cpr_odd:
+        ac.pos_reliable_odd  = min(ac.pos_reliable_odd  + 1.0, _POS_RELIABLE_MAX)
+    else:
+        ac.pos_reliable_even = min(ac.pos_reliable_even + 1.0, _POS_RELIABLE_MAX)
     ac.lat = round(lat, 5)
     ac.lon = round(lon, 5)
+    ac.last_pos_ts = now
     if pos_from_global:
         ac.pos_global = True
     _update_range_bearing(ac)
@@ -446,6 +686,7 @@ def _record_mlat_fix(ac: "Aircraft", source: str, lat: float, lon: float, now: f
         # Phase A behaviour: always write, last-write-wins
         ac.lat = round(lat, 5)
         ac.lon = round(lon, 5)
+        ac.last_pos_ts = now
         _update_range_bearing(ac)
     elif config.MLAT_FUSION == "kalman":
         if not is_spike:
@@ -458,12 +699,14 @@ def _record_mlat_fix(ac: "Aircraft", source: str, lat: float, lon: float, now: f
             else:
                 lat_k, lon_k = _kalman_update_position(ac, lat, lon, now, quality)
                 ac.lat, ac.lon = round(lat_k, 5), round(lon_k, 5)
+            ac.last_pos_ts = now
             _update_range_bearing(ac)
     else:
         pos = _select_output_position(ac, lat, lon, is_spike, now)
         if pos is not None:
             ac.lat = round(pos[0], 5)
             ac.lon = round(pos[1], 5)
+            ac.last_pos_ts = now
             _update_range_bearing(ac)
 
 
@@ -558,6 +801,19 @@ class Aircraft:
     cpr_even: Optional[tuple] = field(default=None, repr=False)   # (raw_msg, timestamp)
     cpr_odd:  Optional[tuple] = field(default=None, repr=False)
     pos_global: bool = False  # True once a global CPR decode (even+odd pair) has succeeded
+    # Soft position reliability score (readsb: pos_reliable_odd/even in track.c).
+    # Incremented by +1.0 on each accepted position; penalised by -0.26 on speed-check
+    # failure; CPR state reset when either falls to zero.  lat/lon suppressed in snapshot
+    # output until score reaches _POS_RELIABLE_PUBLISH (avoids wrong-zone first-position errors).
+    pos_reliable_odd:    float = 0.0
+    pos_reliable_even:   float = 0.0
+    # Discard cache: prevents double-penalising the same bad position on retransmit
+    _discard_cache:      list  = field(default_factory=list, repr=False)
+    # Rolling cache of recent CPR raw frames for duplicate detection.
+    # Entries: (raw_hex, oe_flag, timestamp).  Bounded by _CPR_DUP_CACHE_LEN.
+    _cpr_recent:         list  = field(default_factory=list, repr=False)
+    # mlatForce: timestamp of last forced MLAT position accept (ADS-B→MLAT transition)
+    _last_mlat_force_ts: float = field(default=0.0, repr=False)
     sighting_count: int = 1               # from aircraft_registry; 1 = unique (never seen before)
     max_altitude: Optional[int] = None    # highest altitude seen this visit
     # MLAT
@@ -566,9 +822,17 @@ class Aircraft:
     mlat: bool = False                    # True if position is MLAT-derived (timestamp-confirmed)
     mlat_source: Optional[str] = None    # name of the MLAT server that established the position
     mlat_msg_count: int = 0              # Beast frames with the MLAT timestamp marker
-    # Altitude source tracking — for priority and rate-of-change filtering
-    _alt_source: Optional[str]  = field(default=None, repr=False)  # "ADS-B" | "SURV"
-    _alt_source_ts: float       = field(default=0.0,  repr=False)  # monotonic time of last alt update
+    last_pos_ts: float = 0.0             # unix ts of last accepted position update (snapshot)
+    last_alt_ts: float = 0.0             # unix ts of last accepted altitude update (snapshot)
+    # Altitude reliability score (readsb: alt_reliable / updateAltitude())
+    alt_reliable:    int   = field(default=0,   repr=False)  # 0..ALT_RELIABLE_MAX
+    _alt_ts:         float = field(default=0.0, repr=False)  # time of last baro_alt write
+    _alt_source:     Optional["MsgSource"] = field(default=None, repr=False)
+    # Vertical rate fields for the dynamic rate window (Layer 5 of altitude filter)
+    _vrate_baro_fpm: Optional[int]   = field(default=None, repr=False)
+    _vrate_geom_fpm: Optional[int]   = field(default=None, repr=False)
+    _vrate_baro_ts:  float           = field(default=0.0,  repr=False)
+    _vrate_geom_ts:  float           = field(default=0.0,  repr=False)
     # ACAS/TCAS fields
     acas_ra_active:     bool           = False
     acas_ra_desc:       Optional[str]  = None
@@ -643,6 +907,13 @@ class AircraftState:
         # historical ICAOs are evicted rather than accumulating indefinitely
         self._sighting_counts: OrderedDict[str, int] = OrderedDict()
 
+        # Confirmed-ICAO filter (equivalent to readsb icao_filter.c).
+        # Populated from DF17/18 (clean CRC, authoritative ICAO).
+        # Address/Parity DFs (0/4/5/16/20/21) are only decoded if the ICAO
+        # appears here — prevents ghost aircraft from CRC-syndrome collisions.
+        # Value is the last-seen timestamp for expiry pruning.
+        self._confirmed_icaos: OrderedDict[str, float] = OrderedDict()
+
         # History deque cache for get_snapshot() — the completed-minute deques only
         # change once per minute, so we rebuild the list copies at most 1×/min instead
         # of 60×/min (once per second).
@@ -701,6 +972,22 @@ class AircraftState:
                      if now - ac.last_seen > self._timeout]
             for icao in stale:
                 expired.append(self._aircraft.pop(icao))
+
+            # Prune ICAO filter: evict entries not refreshed within expiry window.
+            # Mirrors readsb icaoFilterExpire() which runs every ~60 s.
+            icao_cutoff = now - _ICAO_FILTER_EXPIRY_S
+            stale_icaos = [k for k, ts in self._confirmed_icaos.items()
+                           if ts < icao_cutoff]
+            for k in stale_icaos:
+                del self._confirmed_icaos[k]
+
+            # 60-minute pos_reliable timeout: aircraft silent for an hour gets
+            # reliability reset so the next position must re-establish trust.
+            for ac in self._aircraft.values():
+                if (ac.pos_reliable_odd != 0.0 or ac.pos_reliable_even != 0.0):
+                    if ac.last_pos_ts > 0 and (now - ac.last_pos_ts) > _POS_RELIABLE_RESET_TIMEOUT_S:
+                        ac.pos_reliable_odd  = 0.0
+                        ac.pos_reliable_even = 0.0
         return expired
 
     def init_today(self, icaos: set[str], mil_icaos: set[str]) -> None:
@@ -758,7 +1045,7 @@ class AircraftState:
             return {
                 "icao":          ac.icao,
                 "callsign":      ac.callsign,
-                "altitude":      ac.altitude,
+                "altitude":      ac.altitude if _alt_baro_reliable(ac) else None,
                 "squawk":        ac.squawk,
                 "signal":        ac.signal,
                 "msg_count":     ac.msg_count,
@@ -788,6 +1075,12 @@ class AircraftState:
                 "mlat":            ac.mlat,
                 "mlat_source":       ac.mlat_source,
                 "mlat_msg_count":    ac.mlat_msg_count,
+                "pos_global":        ac.pos_global,
+                "pos_reliable_odd":  ac.pos_reliable_odd,
+                "pos_reliable_even": ac.pos_reliable_even,
+                "pos_confident":     _pos_reliable(ac),
+                "last_pos_age":    round(now - ac.last_pos_ts, 1) if ac.last_pos_ts > 0 else None,
+                "last_alt_age":    round(now - ac.last_alt_ts, 1) if ac.last_alt_ts > 0 else None,
                 "acas_ra_active":     ac.acas_ra_ts is not None and (now - ac.acas_ra_ts) < 60,
                 "acas_ra_desc":       ac.acas_ra_desc,
                 "acas_ra_corrective": ac.acas_ra_corrective,
@@ -927,7 +1220,7 @@ class AircraftState:
                 {
                     "icao": ac.icao,
                     "callsign": ac.callsign,
-                    "altitude": ac.altitude,
+                    "altitude": ac.altitude if _alt_baro_reliable(ac) else None,
                     "squawk": ac.squawk,
                     "signal": ac.signal,
                     "msg_count": ac.msg_count,
@@ -958,6 +1251,8 @@ class AircraftState:
                     "mlat":              ac.mlat,
                     "mlat_source":       ac.mlat_source,
                     "mlat_msg_count":    ac.mlat_msg_count,
+                    "last_pos_age":      round(now - ac.last_pos_ts, 1) if ac.last_pos_ts > 0 else None,
+                    "last_alt_age":      round(now - ac.last_alt_ts, 1) if ac.last_alt_ts > 0 else None,
                     "mlat_quality":      dict(ac.mlat_quality_scores),
                     "mlat_sources": {
                         src: {
@@ -978,6 +1273,9 @@ class AircraftState:
                     "acas_threat_icao":   ac.acas_threat_icao,
                     "acas_sensitivity":   ac.acas_sensitivity,
                     "pos_global":         ac.pos_global,
+                    "pos_reliable_odd":   ac.pos_reliable_odd,
+                    "pos_reliable_even":  ac.pos_reliable_even,
+                    "pos_confident":      _pos_reliable(ac),
                 }
                 for ac in self._aircraft.values()
             ]
@@ -1067,19 +1365,63 @@ class AircraftState:
         except Exception:
             return
 
-        # --- Extract ICAO ---
+        # DF17 type fixup: recover frames where a single-bit error corrupted the
+        # DF field.  Only for 112-bit (28 hex char) messages.  Sets df17_corrected
+        # so that crc_clean is forced False — lower good_crc in the altitude filter.
+        df17_corrected = False
+        if len(raw) == 28 and df != 17:
+            fixed = _try_fix_df17(bytes.fromhex(raw))
+            if fixed is not None:
+                raw = fixed.hex().upper()
+                df = 17
+                df17_corrected = True
+
+        # --- CRC check + ICAO extraction + source classification ---
         icao: Optional[str] = None
+        crc_clean = False
+        source = MsgSource.INVALID
         try:
-            if df in (17, 18, 11):
+            if df in (17, 18):
+                # DF17/18: true CRC covers entire message; residual 0 = clean.
+                # pyModeS crc() returns the 24-bit remainder on the original bytes.
+                crc_residual = pms.crc(raw)
+                # Corrected frames have CRC=0 after fixup but are lower confidence.
+                crc_clean = (crc_residual == 0) and not df17_corrected
                 icao = pms.icao(raw)
-            elif df in (0, 4, 5, 16, 20, 21):
-                icao = pms.icao(raw)   # pyModeS recovers it from CRC
+                if icao:
+                    icao_up = icao.upper()
+                    # Register as confirmed ICAO (readsb: icaoFilterAdd)
+                    self._confirmed_icaos[icao_up] = now
+                    self._confirmed_icaos.move_to_end(icao_up)
+                    if len(self._confirmed_icaos) > _CONFIRMED_ICAO_MAX:
+                        self._confirmed_icaos.popitem(last=False)
+                    source = MsgSource.ADSR if df == 18 else MsgSource.ADSB
+            elif df == 11:
+                icao = pms.icao(raw)
+                # DF11 CRC includes Interrogator ID in lower 7 bits — less
+                # reliable for ICAO confirmation; do NOT add to confirmed set.
+                source = MsgSource.MODE_S_CHECKED
+            elif df in _AP_DFS:
+                # Address/Parity: CRC syndrome IS the ICAO address.
+                # Only accept if previously confirmed by a DF17/18.
+                icao = pms.icao(raw)
+                if not icao or icao.upper() not in self._confirmed_icaos:
+                    return
+                # Refresh LRU timestamp
+                icao_up = icao.upper()
+                self._confirmed_icaos[icao_up] = now
+                self._confirmed_icaos.move_to_end(icao_up)
+                source = MsgSource.MODE_S
         except Exception:
             pass
 
         if not icao:
             return
         icao = icao.upper()
+
+        # MLAT-timestamp frame overrides source classification
+        if mlat:
+            source = MsgSource.MLAT
 
         # --- Update or create aircraft record ---
         if icao not in self._aircraft:
@@ -1168,96 +1510,115 @@ class AircraftState:
                 try:
                     alt = pms.adsb.altitude(raw)
                     if alt is not None:
-                        _accept_altitude(ac, int(alt), "ADS-B", now)
+                        _accept_altitude(ac, int(alt), source, crc_clean, now)
                 except Exception:
                     pass
                 try:
                     oe = pms.adsb.oe_flag(raw)
-                    if oe == 0:
-                        ac.cpr_even = (raw, now)
-                    else:
-                        ac.cpr_odd = (raw, now)
 
-                    # Global decode is always preferred: uses even+odd pair and is
-                    # geometrically unambiguous — no zone-selection dependency on
-                    # reference longitude.  Local decode can pick the wrong CPR
-                    # longitude zone when the receiver is more than ~5° west of the
-                    # aircraft (e.g. western UK receiver + aircraft over the North Sea).
-                    pos = None
-                    pos_from_global = False
-                    if (ac.cpr_even and ac.cpr_odd
-                            and abs(ac.cpr_even[1] - ac.cpr_odd[1]) < 10):
-                        pos = pms.adsb.position(
-                            ac.cpr_even[0], ac.cpr_odd[0],
-                            ac.cpr_even[1], ac.cpr_odd[1],
-                        )
-                        if pos is not None:
-                            pos_from_global = True
+                    # Duplicate check: same raw frame within _CPR_DUP_WINDOW_S means
+                    # multiple receivers forwarded the same transponder transmission.
+                    # Skip CPR pairing and pos_reliable update to avoid inflating
+                    # confidence at multi-feeder/reflection sites (readsb:
+                    # cpr_duplicate_check in track.c).
+                    if not _is_cpr_duplicate(ac, raw, oe, now):
+                        if oe == 0:
+                            ac.cpr_even = (raw, now)
+                        else:
+                            ac.cpr_odd = (raw, now)
 
-                    # Local decode fallback: only when no pair is available yet.
-                    # Use the aircraft's own last position as reference (safer than
-                    # receiver coords — same zone guaranteed once ac.lat is trusted).
-                    # Receiver coords used only for the very first frame of a new aircraft.
-                    if pos is None:
-                        ref_lat = ac.lat if ac.lat is not None else config.RECEIVER_LAT
-                        ref_lon = ac.lon if ac.lon is not None else config.RECEIVER_LON
-                        if ref_lat is not None and ref_lon is not None:
-                            pos = pms.adsb.position_with_ref(raw, ref_lat, ref_lon)
+                        # Global decode is always preferred: geometrically unambiguous.
+                        # Local decode can pick the wrong CPR longitude zone when the
+                        # receiver is west of the aircraft (e.g. UK receiver + aircraft
+                        # over the North Sea).
+                        pos = None
+                        pos_from_global = False
+                        global_bad = False
+                        if (ac.cpr_even and ac.cpr_odd
+                                and abs(ac.cpr_even[1] - ac.cpr_odd[1]) < 10):
+                            pos = pms.adsb.position(
+                                ac.cpr_even[0], ac.cpr_odd[0],
+                                ac.cpr_even[1], ac.cpr_odd[1],
+                            )
+                            if pos is not None:
+                                pos_from_global = True
+                            elif ac.pos_global:
+                                # Established aircraft + None from global most likely
+                                # means bad data (-2), not zone mismatch (-1).
+                                # Block local fallback to avoid wrong-zone write.
+                                global_bad = True
 
-                    if pos:
-                        lat, lon = pos
-                        if -90 <= lat <= 90 and -180 <= lon <= 180:
-                            # Plausibility check: reject positions impossibly far from
-                            # receiver (catches wrong-zone decodes on first local decode)
-                            if (config.RECEIVER_LAT is not None
-                                    and config.RECEIVER_LON is not None
-                                    and _haversine_nm(
-                                        config.RECEIVER_LAT, config.RECEIVER_LON,
-                                        lat, lon) > 500):
-                                pass  # discard — beyond ADS-B range
-                            elif mlat and not ac.has_adsb:
-                                # Genuine MLAT position: buffer, spike-detect, fuse
-                                # Skip if aircraft has confirmed ADS-B transponder —
-                                # the MLAT stream is just forwarding its GPS broadcast;
-                                # the ADS-B position from the main stream is authoritative.
-                                _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
-                            elif not mlat:
-                                # ADS-B position: write directly
-                                _accept_adsb_position(ac, lat, lon, pos_from_global, now)
+                        # Local decode fallback: only when global was not attempted
+                        # or failed with a likely zone mismatch (not bad data).
+                        if not pos_from_global and not global_bad:
+                            ref_lat = ac.lat if ac.lat is not None else config.RECEIVER_LAT
+                            ref_lon = ac.lon if ac.lon is not None else config.RECEIVER_LON
+                            if ref_lat is not None and ref_lon is not None:
+                                pos = pms.adsb.position_with_ref(raw, ref_lat, ref_lon)
+
+                        if pos:
+                            lat, lon = pos
+                            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                                # Range gate: reject positions beyond receiver range
+                                if (config.RECEIVER_LAT is not None
+                                        and config.RECEIVER_LON is not None
+                                        and _haversine_nm(
+                                            config.RECEIVER_LAT, config.RECEIVER_LON,
+                                            lat, lon) > config.MAX_RANGE_NM):
+                                    pass  # discard — beyond ADS-B range
+                                elif mlat and not ac.has_adsb:
+                                    # Genuine MLAT position: buffer, spike-detect, fuse.
+                                    # MLAT force: if ADS-B position is stale and MLAT
+                                    # fix is far away, force-accept to transition.
+                                    if (ac.has_adsb
+                                            and ac.lat is not None
+                                            and now - ac._last_mlat_force_ts > _MLAT_FORCE_INTERVAL_S
+                                            and _haversine_nm(ac.lat, ac.lon, lat, lon) > _MLAT_FORCE_DISTANCE_NM):
+                                        ac._last_mlat_force_ts = now
+                                        ac.pos_reliable_odd  = _POS_RELIABLE_PUBLISH
+                                        ac.pos_reliable_even = _POS_RELIABLE_PUBLISH
+                                    _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
+                                elif not mlat:
+                                    _accept_adsb_position(ac, lat, lon, pos_from_global, oe == 1, now)
                 except Exception:
                     pass
 
         # --- Altitude from surveillance altitude reply (DF 4) ---
         # Lower integrity than ADS-B: parity is XOR-masked with aircraft address.
+        # Suppressed for MLAT frames: mlat-client copies baro alt from a secondary
+        # reply on a different receiver — unreliable and potentially from a
+        # different aircraft (readsb track.c: "terrible altitude source, ignore").
         elif df == 4 and len(raw) == 14:
-            try:
-                alt = pms.altcode(raw)
-                if alt is not None:
-                    _accept_altitude(ac, int(alt), "SURV", now)
-            except Exception:
-                pass
-
-        # --- DF 20/21: Comm-B replies (28 hex chars / 112 bits) ---
-        elif df in (20, 21) and len(raw) == 28:
-            # Altitude from DF20 — same parity integrity as DF4
-            if df == 20:
+            if not mlat:
                 try:
                     alt = pms.altcode(raw)
                     if alt is not None:
-                        _accept_altitude(ac, int(alt), "SURV", now)
+                        _accept_altitude(ac, int(alt), MsgSource.MODE_S, False, now)
+                except Exception:
+                    pass
+
+        # --- DF 20/21: Comm-B replies (28 hex chars / 112 bits) ---
+        elif df in (20, 21) and len(raw) == 28:
+            # Altitude from DF20 — same parity integrity as DF4; same MLAT suppression.
+            if df == 20 and not mlat:
+                try:
+                    alt = pms.altcode(raw)
+                    if alt is not None:
+                        _accept_altitude(ac, int(alt), MsgSource.MODE_S, False, now)
                 except Exception:
                     pass
 
             # EHS decode: direct is40/is50/is60 checks — ~5x faster than pms.bds.infer()
             # which speculatively tries ~20 registers. Checks are mutually exclusive in practice.
             if _bds40.is40(raw):
-                # Selected altitude (autopilot target)
-                try:
-                    sel = pms.commb.selalt40mcp(raw)
-                    if sel is not None:
-                        ac.selected_alt = int(sel)
-                except Exception:
-                    pass
+                # Selected altitude (autopilot target) — altitude field; suppress for MLAT.
+                if not mlat:
+                    try:
+                        sel = pms.commb.selalt40mcp(raw)
+                        if sel is not None:
+                            ac.selected_alt = int(sel)
+                    except Exception:
+                        pass
 
             elif _bds50.is50(raw):
                 # TAS + track angle + roll
@@ -1296,12 +1657,16 @@ class AircraftState:
                         ac.heading_deg = round(float(hdg), 1)
                 except Exception:
                     pass
-                try:
-                    vr = pms.commb.vr60baro(raw)
-                    if vr is not None:
-                        ac.vertical_rate_fpm = int(round(vr))
-                except Exception:
-                    pass
+                if not mlat:  # baro vertical rate is altitude-derived; suppress for MLAT
+                    try:
+                        vr = pms.commb.vr60baro(raw)
+                        if vr is not None:
+                            ac.vertical_rate_fpm = int(round(vr))
+                            # Feed altitude filter dynamic rate window
+                            ac._vrate_baro_fpm = int(round(vr))
+                            ac._vrate_baro_ts  = now
+                    except Exception:
+                        pass
 
         # --- DF16: Long Air-Air Surveillance (ACAS RA in MV field) ---
         # Altitude from DF16 is intentionally not used — DF16 is an ACAS air-to-air

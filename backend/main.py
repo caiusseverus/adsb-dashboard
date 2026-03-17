@@ -47,6 +47,8 @@ import tracks as tracks_module
 from tracks import router as tracks_router
 import mlat as mlat_module
 from mlat import router as mlat_router
+import position_quality as position_quality_module
+from position_quality import router as position_quality_router, PositionQualityChecker, run_position_quality_checker
 
 from benchmark import make_pause_aware_decoder
 
@@ -316,7 +318,11 @@ async def _db_writer() -> None:
             now_ts = int(time.time())
             samples = (
                 (now_ts, ac["icao"], ac["bearing_deg"], ac["range_nm"],
-                 ac.get("altitude"), ac.get("signal"))
+                 (ac.get("altitude")
+                  if ((ac.get("last_pos_age") is not None and ac.get("last_pos_age") <= config.POS_FRESH_S)
+                      and (ac.get("last_alt_age") is not None and ac.get("last_alt_age") <= config.ALT_FRESH_S))
+                  else None),
+                 ac.get("signal"))
                 for ac in snapshot.get("aircraft", [])
                 if ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
             )
@@ -477,7 +483,7 @@ async def _push_updates() -> None:
             # - mlat=True: position established by multilateration, also reliable.
             if (ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
                     and ac.get("lat") is not None
-                    and (ac.get("pos_global") or ac.get("mlat"))):
+                    and ac.get("pos_confident")):  # pos_confident = _pos_reliable() in snapshot
                 track_store.record(
                     icao=ac["icao"],
                     bearing_deg=ac["bearing_deg"],
@@ -630,6 +636,7 @@ async def lifespan(app: FastAPI):
     _bg(_backup_runner())  # runs nightly; path resolved from DB/env at runtime
     _bg(_hires_writer())
     _bg(_route_enricher())
+    _bg(run_position_quality_checker(position_quality_module._checker))
     _bg(health_module.loop_lag_sampler())
     health_module.register_context(_msg_queue, _clients)
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",
@@ -692,6 +699,9 @@ app.include_router(squawks_router)
 app.include_router(status_router)
 app.include_router(notify_settings_router)
 app.include_router(debug_router)
+position_quality_module._state = state
+position_quality_module._checker = PositionQualityChecker(state)
+app.include_router(position_quality_router)
 app.include_router(health_router)
 if config.DEBUG_ENRICHMENT:
     log.info("Debug router mounted (DEBUG_ENRICHMENT=%s)", config.DEBUG_ENRICHMENT)

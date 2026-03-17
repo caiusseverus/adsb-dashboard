@@ -73,9 +73,10 @@ DEBUG_ENRICHMENT: int = _parse_debug_level(os.getenv("DEBUG_ENRICHMENT", "0"))
 HOME_COUNTRY: str = os.getenv("HOME_COUNTRY", "")
 RARE_THRESHOLD: int = int(os.getenv("RARE_THRESHOLD", "5"))
 # Minimum messages before an aircraft is written to the registry.
-# Helps filter bogus ICAO addresses from CRC decoding errors.
+# With the ICAO filter enabled, this is a secondary persistence gate —
+# mainly guards against very brief sightings (e.g. a single reflected DF17).
 # Set to 0 to disable filtering. ADSBex/hexdb hit bypasses this check.
-GHOST_FILTER_MSGS: int = int(os.getenv("GHOST_FILTER_MSGS", "5"))
+GHOST_FILTER_MSGS: int = int(os.getenv("GHOST_FILTER_MSGS", "2"))
 MINUTE_STATS_RETENTION_DAYS: int = int(os.getenv("MINUTE_STATS_RETENTION_DAYS", "30"))
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -136,7 +137,24 @@ RARITY_RECALC_SECONDS: float = float(os.getenv("RARITY_RECALC_SECONDS", "21600")
 # weighted     — ECEF weighted centroid of recent fixes from all active sources
 MLAT_FUSION: str = os.getenv("MLAT_FUSION", "none").lower()
 
+# ADS-B / coverage quality gates
+# Additional range cap for first local-CPR positions (before global pairing).
+ADSB_LOCAL_ENTRY_MAX_RANGE_NM: float = float(os.getenv("ADSB_LOCAL_ENTRY_MAX_RANGE_NM", "300"))
+# Maximum implied groundspeed for position-to-position plausibility checks.
+ADSB_MAX_IMPLIED_SPEED_KT: float = float(os.getenv("ADSB_MAX_IMPLIED_SPEED_KT", "750"))
+# Freshness gates used when persisting coverage altitude values.
+POS_FRESH_S: float = float(os.getenv("POS_FRESH_S", "15"))
+ALT_FRESH_S: float = float(os.getenv("ALT_FRESH_S", "20"))
+
 # How often to flush buffered aircraft_registry upserts to disk (seconds).
 # Buffers write_minute()'s per-aircraft upserts so SD writes happen at most
 # once per interval rather than once per minute per aircraft.
 REGISTRY_FLUSH_SECONDS: float = float(os.getenv("REGISTRY_FLUSH_SECONDS", "300"))
+
+# readsb aircraft JSON source for position QA checker.
+READSB_AIRCRAFT_JSON_PATH: str = os.getenv("READSB_AIRCRAFT_JSON_PATH", "/run/readsb/aircraft.json")
+READSB_AIRCRAFT_JSON_URL: str = os.getenv("READSB_AIRCRAFT_JSON_URL", "http://adsbpi.local/tar1090/data/aircraft.json")
+
+# Maximum range (nm) from the receiver for accepted ADS-B positions.
+# Mirrors readsb's receiver_range config; 300 nm is a typical ADS-B horizon.
+MAX_RANGE_NM: float = float(os.getenv("MAX_RANGE_NM", "300"))
