@@ -31,6 +31,7 @@ export default function App() {
   const [selectedIcao, setSelectedIcao] = useState(null)
   const [notableRefreshKey, setNotableRefreshKey] = useState(0)
   const [receiverPos, setReceiverPos] = useState(null)
+  const [debugMode, setDebugMode] = useState(false)
   const wsRef = useRef(null)
   const retryRef = useRef(null)
 
@@ -73,6 +74,7 @@ export default function App() {
         const lat = d?.config?.receiver_lat
         const lon = d?.config?.receiver_lon
         if (lat != null && lon != null) setReceiverPos([lat, lon])
+        if (d?.config?.debug) setDebugMode(true)
       })
       .catch(() => {})
   }, [])
@@ -125,10 +127,12 @@ export default function App() {
             className={tab === 'events' ? styles.tabActive : styles.tab}
             onClick={() => setTab('events')}
           >Events</button>
-          <button
-            className={tab === 'positionqa' ? styles.tabActive : styles.tab}
-            onClick={() => setTab('positionqa')}
-          >Position QA</button>
+          {debugMode && (
+            <button
+              className={tab === 'positionqa' ? styles.tabActive : styles.tab}
+              onClick={() => setTab('positionqa')}
+            >Position QA</button>
+          )}
           <button
             className={tab === 'status' ? styles.tabActive : styles.tab}
             onClick={() => setTab('status')}
@@ -171,7 +175,7 @@ export default function App() {
       {tab === 'fleet' && <FleetPage onSelectIcao={setSelectedIcao} />}
       {tab === 'events' && <EventsPage onSelectIcao={setSelectedIcao} />}
       {tab === 'sky' && <SkyView snapshot={snapshot} onSelectIcao={setSelectedIcao} />}
-      {tab === 'positionqa' && <PositionQualityPage />}
+      {tab === 'positionqa' && debugMode && <PositionQualityPage />}
       {tab === 'status' && <StatusPage />}
       {tab === 'settings' && <SettingsPage />}
 
