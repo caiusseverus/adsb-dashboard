@@ -425,7 +425,7 @@ function tlDefaultDate() {
 
 const DAY_OPTIONS      = [{ label: '24h', value: 1 }, { label: '7d', value: 7 }, { label: '30d', value: 30 }, { label: '90d', value: 90 }]
 const MAX_POINT_OPTIONS = [50000, 100000, 200000, 500000]
-const DEFAULT_MAX_POINTS = 100000
+const DEFAULT_MAX_POINTS = 50000
 
 export default function CoveragePage({ aircraft = [] }) {
   const mountRef    = useRef(null)
@@ -435,7 +435,7 @@ export default function CoveragePage({ aircraft = [] }) {
   const trailsRef   = useRef({})     // live trail buffer: { icao: [{bearing,range,alt,...}] }
   const compassRef  = useRef(null)   // ref to inner compass ring div (rotated via JS, not React state)
 
-  const [days,         setDays]         = useState(30)
+  const [days,         setDays]         = useState(1)
   const [maxPoints,    setMaxPoints]    = useState(DEFAULT_MAX_POINTS)
   const [colorMode,    setColorMode]    = useState('type_group')
   const [typeFilter,   setTypeFilter]   = useState('all')

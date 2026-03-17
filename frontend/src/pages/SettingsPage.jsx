@@ -288,7 +288,7 @@ function BackupSection() {
   }, [])
 
   const loadFiles = useCallback(() => {
-    fetch(`${API_BASE}/api/status`)
+    fetch(`${API_BASE}/api/status/tables`)
       .then(r => r.ok ? r.json() : null)
       .then(d => setFiles(d?.backup?.files ?? []))
       .catch(() => setFiles([]))

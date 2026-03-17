@@ -120,7 +120,7 @@ function haversineNm(lat1, lon1, lat2, lon2) {
   return R_NM * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
 }
 
-export default function MapPage({ snapshot, onSelectIcao }) {
+export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
   const mapRef            = useRef(null)
   const mountRef          = useRef(null)
   const markersRef        = useRef(new Map())   // icao → L.Marker
@@ -143,7 +143,11 @@ export default function MapPage({ snapshot, onSelectIcao }) {
   // ── Init Leaflet (once on mount) ────────────────────────────────────────
   useEffect(() => {
     if (mapRef.current) return
-    const map = L.map(mountRef.current, { center: [51.5, -0.1], zoom: 8, zoomControl: true })
+    // Use receiver position if already known (from App-level status fetch) so the
+    // map opens centred correctly without a later re-zoom
+    const initCenter = receiverPos ?? [51.5, -0.1]
+    const initZoom   = receiverPos ? 9 : 8
+    const map = L.map(mountRef.current, { center: initCenter, zoom: initZoom, zoomControl: true })
     // CartoDB Dark Matter — free, no API key, attribution required
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
       attribution:
@@ -168,24 +172,33 @@ export default function MapPage({ snapshot, onSelectIcao }) {
     }
   }, [])
 
-  // ── Fetch receiver position from status endpoint ─────────────────────
+  // ── Place receiver marker (uses prop if available, else fetches status) ──
   useEffect(() => {
-    fetch(`${API_BASE}/api/status`)
-      .then(r => r.ok ? r.json() : null)
-      .then(d => {
-        const lat = d?.config?.receiver_lat
-        const lon = d?.config?.receiver_lon
-        const map = mapRef.current
-        if (!lat || !lon || !map) return
-        if (receiverMarkerRef.current) receiverMarkerRef.current.remove()
-        receiverMarkerRef.current = L.marker([lat, lon], { icon: RECEIVER_ICON, zIndexOffset: 2000 })
-          .bindTooltip('Receiver', { direction: 'top' })
-          .addTo(map)
-        map.setView([lat, lon], 9)
-        fittedRef.current = true  // don't auto-fit to aircraft if receiver is known
-      })
-      .catch(() => {})
-  }, [])
+    const placeMarker = (lat, lon) => {
+      const map = mapRef.current
+      if (!map) return
+      if (receiverMarkerRef.current) receiverMarkerRef.current.remove()
+      receiverMarkerRef.current = L.marker([lat, lon], { icon: RECEIVER_ICON, zIndexOffset: 2000 })
+        .bindTooltip('Receiver', { direction: 'top' })
+        .addTo(map)
+      fittedRef.current = true  // don't auto-fit to aircraft if receiver is known
+      // Only re-zoom if the map wasn't already initialised at receiver pos
+      if (!receiverPos) map.setView([lat, lon], 9)
+    }
+
+    if (receiverPos) {
+      placeMarker(receiverPos[0], receiverPos[1])
+    } else {
+      fetch(`${API_BASE}/api/status`)
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+          const lat = d?.config?.receiver_lat
+          const lon = d?.config?.receiver_lon
+          if (lat && lon) placeMarker(lat, lon)
+        })
+        .catch(() => {})
+    }
+  }, [receiverPos])
 
   // ── MLAT source dots: poll bulk fixes endpoint, accumulate dots ───────────
   useEffect(() => {

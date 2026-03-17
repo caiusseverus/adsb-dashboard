@@ -18,6 +18,8 @@ import SkyView from './pages/SkyView'
 import PositionQualityPage from './pages/PositionQualityPage'
 import styles from './App.module.css'
 
+const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
+
 const WS_URL = import.meta.env.PROD
   ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`
   : 'ws://localhost:8000/ws'
@@ -28,6 +30,7 @@ export default function App() {
   const [tab, setTab] = useState('live')
   const [selectedIcao, setSelectedIcao] = useState(null)
   const [notableRefreshKey, setNotableRefreshKey] = useState(0)
+  const [receiverPos, setReceiverPos] = useState(null)
   const wsRef = useRef(null)
   const retryRef = useRef(null)
 
@@ -60,6 +63,19 @@ export default function App() {
       clearTimeout(retryRef.current)
     }
   }, [connect])
+
+  // Fetch receiver position once at app start so MapPage can set its initial
+  // view synchronously rather than re-zooming after an async status fetch
+  useEffect(() => {
+    fetch(`${API_BASE}/api/status`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        const lat = d?.config?.receiver_lat
+        const lon = d?.config?.receiver_lon
+        if (lat != null && lon != null) setReceiverPos([lat, lon])
+      })
+      .catch(() => {})
+  }, [])
 
   return (
     <div className={styles.layout}>
@@ -146,7 +162,7 @@ export default function App() {
         </main>
       )}
 
-      {tab === 'map' && <MapPage snapshot={snapshot} onSelectIcao={setSelectedIcao} selectedIcao={selectedIcao} />}
+      {tab === 'map' && <MapPage snapshot={snapshot} onSelectIcao={setSelectedIcao} selectedIcao={selectedIcao} receiverPos={receiverPos} />}
       {tab === 'history' && <HistoryPage snapshot={snapshot} />}
       {tab === 'sightings' && <SightingsPage onSelectIcao={setSelectedIcao} notableRefreshKey={notableRefreshKey} />}
       {tab === 'receiver' && <ReceiverPage snapshot={snapshot} />}

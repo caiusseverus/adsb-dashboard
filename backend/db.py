@@ -2531,8 +2531,22 @@ class StatsDB:
             ).fetchall()
         return {r["icao"]: r["sighting_count"] for r in rows}
 
-    def query_status(self) -> dict:
-        """DB size, per-table row counts, date ranges, and retention policy summary."""
+    def query_status_notifications(self) -> dict:
+        """Notification prefs and watchlist count — fast, no table scans."""
+        with self._connect() as conn:
+            wl_count = conn.execute("SELECT COUNT(*) FROM notify_watchlist").fetchone()[0]
+        return {
+            "ntfy_enabled":    bool(config.NTFY_URL),
+            "ntfy_url":        config.NTFY_URL or None,
+            "email_enabled":   bool(config.NOTIFY_EMAIL_TO),
+            "email_to":        config.NOTIFY_EMAIL_TO or None,
+            "prefs":           self.get_notify_prefs(),
+            "watchlist_count": wl_count,
+        }
+
+    def query_status_tables(self) -> dict:
+        """DB size, per-table row counts, date ranges, and backup info.
+        This is the slow part — runs dbstat and COUNT(*) per table."""
         import os
         db_size = os.path.getsize(str(config.DB_PATH)) if config.DB_PATH.exists() else 0
 
@@ -2602,30 +2616,10 @@ class StatsDB:
                     for f in files
                 ]
 
-        with self._connect() as conn:
-            wl_count = conn.execute("SELECT COUNT(*) FROM notify_watchlist").fetchone()[0]
-
         return {
             "db_size_bytes": db_size,
             "tables": result,
             "backup": backup_info,
-            "config": {
-                "minute_stats_retention_days": config.MINUTE_STATS_RETENTION_DAYS,
-                "coverage_retention_days":     90,
-                "acas_retention_days":         90,
-                "ghost_filter_msgs":           config.GHOST_FILTER_MSGS,
-                "rare_threshold":              config.RARE_THRESHOLD,
-                "receiver_lat":               config.RECEIVER_LAT,
-                "receiver_lon":               config.RECEIVER_LON,
-            },
-            "notifications": {
-                "ntfy_enabled":    bool(config.NTFY_URL),
-                "ntfy_url":        config.NTFY_URL or None,
-                "email_enabled":   bool(config.NOTIFY_EMAIL_TO),
-                "email_to":        config.NOTIFY_EMAIL_TO or None,
-                "prefs":           self.get_notify_prefs(),
-                "watchlist_count": wl_count,
-            },
         }
 
     # ------------------------------------------------------------------

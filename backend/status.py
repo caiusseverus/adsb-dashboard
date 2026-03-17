@@ -1,11 +1,16 @@
 """
 Status API — database size, table row counts, retention info, Pi health.
+
+Two endpoints:
+  GET /api/status        — fast: config, Pi health, notification prefs (no table scans)
+  GET /api/status/tables — slow: per-table row counts, sizes, backup info
 """
 
 import asyncio
 import pathlib
 from fastapi import APIRouter
 
+import config as _config
 from db import stats_db
 
 router = APIRouter(prefix="/api/status")
@@ -54,6 +59,27 @@ def _pi_health() -> dict:
 
 @router.get("")
 async def get_status() -> dict:
-    status = await asyncio.to_thread(stats_db.query_status)
-    status["pi_health"] = await asyncio.to_thread(_pi_health)
-    return status
+    """Fast — config, Pi health, notification prefs. No table scans."""
+    pi_health, notifications = await asyncio.gather(
+        asyncio.to_thread(_pi_health),
+        asyncio.to_thread(stats_db.query_status_notifications),
+    )
+    return {
+        "config": {
+            "minute_stats_retention_days": _config.MINUTE_STATS_RETENTION_DAYS,
+            "coverage_retention_days":     90,
+            "acas_retention_days":         90,
+            "ghost_filter_msgs":           _config.GHOST_FILTER_MSGS,
+            "rare_threshold":              _config.RARE_THRESHOLD,
+            "receiver_lat":                _config.RECEIVER_LAT,
+            "receiver_lon":                _config.RECEIVER_LON,
+        },
+        "pi_health":     pi_health,
+        "notifications": notifications,
+    }
+
+
+@router.get("/tables")
+async def get_status_tables() -> dict:
+    """Slow — per-table row counts, sizes, backup info. Runs dbstat scans."""
+    return await asyncio.to_thread(stats_db.query_status_tables)
