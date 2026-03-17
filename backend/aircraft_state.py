@@ -786,7 +786,9 @@ def _apply_hexdb_data(ac, data: dict) -> None:
                         ac.country = op.get("c")
                     return
         owners = (data.get("RegisteredOwners") or "").strip()
-        if owners:
+        # Reject short or purely-numeric strings (e.g. "00", "0") that indicate
+        # missing data rather than a real operator name
+        if owners and len(owners) >= 3 and not owners.isdigit():
             ac.operator = owners
 
 

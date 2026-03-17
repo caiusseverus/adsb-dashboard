@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, Fragment } from 'react'
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid,
-  ReferenceLine, ResponsiveContainer,
+  ReferenceLine, ResponsiveContainer, Legend,
 } from 'recharts'
 import styles from './EventsPage.module.css'
 import { formatOperator } from '../utils/formatOperator'
