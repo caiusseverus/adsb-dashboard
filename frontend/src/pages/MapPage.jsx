@@ -102,14 +102,6 @@ const MAX_TRAIL_GAP_S = 20
 const MAX_TRAIL_IMPLIED_SPEED_KT = 900
 const MAX_SOURCE_SWITCH_JUMP_NM = 3
 
-// Three fixed-depth segments sliced from the newest position backward.
-// Fixed lengths mean the trail grows naturally without the "sliding" effect
-// of proportional segmentation.
-const TRAIL_SEGS = [
-  { len: 30,  opacity: 0.75 },  // most recent  ~30 s
-  { len: 60,  opacity: 0.40 },  // 30 – 90 s ago
-  { len: 210, opacity: 0.15 },  // 90 – 300 s ago
-]
 
 function haversineNm(lat1, lon1, lat2, lon2) {
   const R_NM = 3440.065
@@ -124,7 +116,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
   const mapRef            = useRef(null)
   const mountRef          = useRef(null)
   const markersRef        = useRef(new Map())   // icao → L.Marker
-  const trailsRef         = useRef(new Map())   // icao → { lines: L.Polyline[], color }
+  const trailsRef         = useRef(new Map())   // icao → { line: L.Polyline, color }
   const posHistRef        = useRef(new Map())   // icao → [lat, lon][]
   const fittedRef         = useRef(false)
   const receiverMarkerRef = useRef(null)
@@ -389,7 +381,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
     }
     for (const [icao, trail] of trailsRef.current) {
       if (!icaoSet.has(icao)) {
-        trail.lines.forEach(l => l.remove())
+        trail.line.remove()
         trailsRef.current.delete(icao)
         posHistRef.current.delete(icao)
       }
@@ -420,31 +412,17 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
       const existing = trailsRef.current.get(ac.icao)
 
       if (existing && existing.color === color) {
-        // Reuse existing polylines — update latlngs from fixed-depth windows
-        let end = hist.length
-        for (let i = 0; i < TRAIL_SEGS.length; i++) {
-          const start = Math.max(0, end - TRAIL_SEGS[i].len)
-          const pts = end - start >= 2
-            ? hist.slice(start, end).map(p => [p.lat, p.lon])
-            : []
-          existing.lines[i].setLatLngs(pts)
-          end = start
-        }
+        // Reuse existing polyline — update latlngs
+        const pts = hist.length >= 2 ? hist.map(p => [p.lat, p.lon]) : []
+        existing.line.setLatLngs(pts)
       } else {
-        existing?.lines.forEach(l => l.remove())
-        let end = hist.length
-        const lines = TRAIL_SEGS.map(({ len, opacity }) => {
-          const start = Math.max(0, end - len)
-          const pts = end - start >= 2
-            ? hist.slice(start, end).map(p => [p.lat, p.lon])
-            : []
-          end = start
-          return L.polyline(pts, {
-            color, weight: 1.5, opacity, smoothFactor: 1,
-            lineCap: 'round', lineJoin: 'round',
-          }).addTo(map)
-        })
-        trailsRef.current.set(ac.icao, { lines, color })
+        existing?.line.remove()
+        const pts = hist.length >= 2 ? hist.map(p => [p.lat, p.lon]) : []
+        const line = L.polyline(pts, {
+          color, weight: 1.5, opacity: 0.6, smoothFactor: 1,
+          lineCap: 'round', lineJoin: 'round',
+        }).addTo(map)
+        trailsRef.current.set(ac.icao, { line, color })
       }
     }
 

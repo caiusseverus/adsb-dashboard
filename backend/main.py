@@ -573,7 +573,7 @@ async def _hires_writer() -> None:
                   and (ac.get("last_alt_age") is not None and ac.get("last_alt_age") <= config.ALT_FRESH_S))
               else None),
              ac.get("military", False), ac.get("interesting", False),
-             ac.get("type_code"), ac.get("type_category"))
+             ac.get("type_code"), ac.get("type_category"), ac.get("operator"))
             for ac in snapshot.get("aircraft", [])
             if (ac.get("bearing_deg") is not None
                 and ac.get("range_nm") is not None

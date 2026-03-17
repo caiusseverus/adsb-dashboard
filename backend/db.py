@@ -2302,7 +2302,8 @@ class StatsDB:
                        COALESCE(ar.military,    0) AS military,
                        COALESCE(ar.interesting, 0) AS interesting,
                        ar.type_code,
-                       ar.type_category
+                       ar.type_category,
+                       ar.operator
                 FROM coverage_samples cs
                 LEFT JOIN aircraft_registry ar ON cs.icao = ar.icao
                 WHERE cs.ts >= ? AND cs.ts <= ?
@@ -2328,6 +2329,7 @@ class StatsDB:
                     "military":    bool(r["military"]),
                     "interesting": bool(r["interesting"]),
                     "tg_idx":      self._get_type_group_idx(r["type_code"], r["type_category"]),
+                    "operator":    r["operator"],
                 }
 
         tracks = [

@@ -156,20 +156,26 @@ function buildPoints(points, colorMode) {
 
 // Colour for a live trail/dot based on colorMode.
 // Altitude mode is handled per-vertex in buildTrails; this covers the rest.
-function liveAcColor(pt, colorMode, operators) {
+// Shared colour function for live aircraft dots/trails and timelapse tracks.
+// obj may be a live aircraft snapshot or a timelapse track — both shapes supported.
+function pointColor(obj, colorMode, operators = []) {
   if (colorMode === 'type_group') {
-    const g = getTypeGroup(pt.type_code, pt.type_category)
+    // Timelapse tracks carry pre-computed tg_idx; live aircraft have type_code/category
+    if (obj.tg_idx != null) return obj.tg_idx < 8 ? C_TG_PALETTE[obj.tg_idx] : C_TG_OTHER
+    const g = getTypeGroup(obj.type_code, obj.type_category)
     return g ? new THREE.Color(g.color) : C_TG_OTHER
   }
   if (colorMode === 'operator') {
-    const idx = operators ? operators.indexOf(pt.operator) : -1
-    return idx >= 0 ? C_OP_PALETTE[idx] : C_OP_OTHER
+    // History points carry pre-computed op_idx; live aircraft carry operator string
+    const idx = obj.op_idx != null ? obj.op_idx
+              : obj.operator ? operators.indexOf(obj.operator) : -1
+    return (idx >= 0 && idx < 10) ? C_OP_PALETTE[idx] : C_OP_OTHER
   }
-  // tag / default (also used as fallback for altitude mode at the dot level)
-  return pt.acas        ? C_TRAIL.acas
-       : pt.military    ? C_TRAIL.military
-       : pt.mlat        ? C_TRAIL.mlat
-       : pt.interesting ? C_TRAIL.interesting
+  // tag / default
+  return obj.acas        ? C_TRAIL.acas
+       : obj.military    ? C_TRAIL.military
+       : obj.mlat        ? C_TRAIL.mlat
+       : obj.interesting ? C_TRAIL.interesting
        : C_TRAIL.standard
 }
 
@@ -191,7 +197,7 @@ function buildTrails(trails, colorMode, operators) {
   for (const pts of Object.values(trails)) {
     if (pts.length < 2) continue
     // For non-altitude modes, one colour per aircraft (from last point)
-    const acCol = colorMode !== 'altitude' ? liveAcColor(pts[pts.length - 1], colorMode, operators) : null
+    const acCol = colorMode !== 'altitude' ? pointColor(pts[pts.length - 1], colorMode, operators) : null
 
     for (let i = 0; i < pts.length - 1; i++) {
       const a = pts[i], b = pts[i + 1]
@@ -236,7 +242,7 @@ function buildLiveDots(trails, colorMode, operators) {
     positions[i * 3 + 1] = y
     positions[i * 3 + 2] = z
     const col = colorMode === 'altitude' ? altColor(last.alt ?? 0)
-              : liveAcColor(last, colorMode, operators)
+              : pointColor(last, colorMode, operators)
     colors[i * 3]     = col.r
     colors[i * 3 + 1] = col.g
     colors[i * 3 + 2] = col.b
@@ -401,14 +407,6 @@ function findSegIdx(points, dt) {
   return lo
 }
 
-function tlTrackColor(track, colorMode) {
-  if (colorMode === 'type_group') {
-    return (track.tg_idx != null && track.tg_idx < 8) ? C_TG_PALETTE[track.tg_idx] : C_TG_OTHER
-  }
-  return track.military    ? C_TRAIL.military
-       : track.interesting ? C_TRAIL.interesting
-       : C_TRAIL.standard
-}
 
 function tlFormatTime(startTs, dt) {
   const d = new Date((startTs + dt) * 1000)
@@ -438,7 +436,6 @@ export default function CoveragePage({ aircraft = [] }) {
   const [days,         setDays]         = useState(1)
   const [maxPoints,    setMaxPoints]    = useState(DEFAULT_MAX_POINTS)
   const [colorMode,    setColorMode]    = useState('type_group')
-  const [typeFilter,   setTypeFilter]   = useState('all')
   const [showMode,     setShowMode]     = useState('both')  // 'both' | 'live' | 'history'
   const [loadingPhase, setLoadingPhase] = useState(null)  // null | 'fetching' | 'rendering'
   const [error,        setError]        = useState(null)
@@ -475,6 +472,7 @@ export default function CoveragePage({ aircraft = [] }) {
   const tlIsLiveRef    = useRef(true)   // mirrors tlIsLive for use in RAF/timeout closures
   const colorModeRef   = useRef('type_group')
   const tlActiveRef    = useRef(false)  // mirrors tlActive for use in non-reactive closures
+  const tlOperatorsRef = useRef([])     // top-10 operators from loaded timelapse data
 
   // ── Initialise Three.js (once) ──────────────────────────────────────
   useEffect(() => {
@@ -626,7 +624,7 @@ export default function CoveragePage({ aircraft = [] }) {
       if (di >= TL_MAX_AC) break
       const [x, y, z] = toWorld(bearing, range, alt)
       dp[di * 3] = x; dp[di * 3 + 1] = y; dp[di * 3 + 2] = z
-      const col = mode === 'altitude' ? altColor(alt) : tlTrackColor(track, mode)
+      const col = mode === 'altitude' ? altColor(alt) : pointColor(track, mode, tlOperatorsRef.current)
       dc[di * 3] = col.r; dc[di * 3 + 1] = col.g; dc[di * 3 + 2] = col.b
       di++
 
@@ -635,7 +633,7 @@ export default function CoveragePage({ aircraft = [] }) {
       // seamlessly. Each step emits one segment [prev, current]; interior points
       // are not duplicated in memory — they're computed and forwarded as "prev".
       const anchor = Math.floor(dt / TRAIL_INTERVAL_S) * TRAIL_INTERVAL_S
-      const acCol  = mode === 'altitude' ? null : tlTrackColor(track, mode)
+      const acCol  = mode === 'altitude' ? null : pointColor(track, mode, tlOperatorsRef.current)
       let sd = si
       let prevX = x, prevY = y, prevZ = z
       let prevFR = col.r, prevFG = col.g, prevFB = col.b   // lead is full brightness
@@ -828,6 +826,11 @@ export default function CoveragePage({ aircraft = [] }) {
         const minDt = data.tracks.length > 0
           ? Math.min(...data.tracks.map(t => t.points[0]?.[0] ?? 0))
           : 0
+        // Compute top-10 operators from this timelapse window for operator colour mode
+        const tlOpCounts = {}
+        for (const t of data.tracks) if (t.operator) tlOpCounts[t.operator] = (tlOpCounts[t.operator] || 0) + 1
+        tlOperatorsRef.current = Object.entries(tlOpCounts).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([op]) => op)
+
         tlDataRef.current        = data
         tlStartDtRef.current     = minDt
         tlCurrentDtRef.current   = minDt
@@ -877,7 +880,7 @@ export default function CoveragePage({ aircraft = [] }) {
   }, [renderTlFrame])
 
   // ── Replace the point cloud in the scene ────────────────────────────
-  const redraw = useCallback((points, mode, filter, show) => {
+  const redraw = useCallback((points, mode, show) => {
     const ref = sceneRef.current
     if (!ref) return
 
@@ -893,19 +896,15 @@ export default function CoveragePage({ aircraft = [] }) {
       return
     }
 
-    const filtered = filter === 'military'    ? points.filter(p => p[3])
-                   : filter === 'interesting' ? points.filter(p => p[4])
-                   : points
-
-    setShownN(filtered.length)
+    setShownN(points.length)
 
     if (ref.pointsObj) {
       ref.scene.remove(ref.pointsObj)
       ref.pointsObj.geometry.dispose()
       ref.pointsObj.material.dispose()
     }
-    if (filtered.length === 0) { ref.pointsObj = null; return }
-    const obj = buildPoints(filtered, mode)
+    if (points.length === 0) { ref.pointsObj = null; return }
+    const obj = buildPoints(points, mode)
     ref.scene.add(obj)
     ref.pointsObj = obj
     if (tlActiveRef.current) obj.visible = false   // keep hidden if timelapse is active
@@ -942,7 +941,7 @@ export default function CoveragePage({ aircraft = [] }) {
 
     const id = setTimeout(() => {
       dataRef.current = pending.points
-      redraw(pending.points, colorMode, typeFilter, showMode)
+      redraw(pending.points, colorMode, showMode)
       setLoadingPhase(null)
     }, 30)   // 30 ms gives React time to paint the "Building scene…" message
 
@@ -952,8 +951,8 @@ export default function CoveragePage({ aircraft = [] }) {
 
   // ── Re-colour / re-filter from stored data (no fetch) ───────────────
   useEffect(() => {
-    if (dataRef.current.length) redraw(dataRef.current, colorMode, typeFilter, showMode)
-  }, [colorMode, typeFilter, showMode, redraw])
+    if (dataRef.current.length) redraw(dataRef.current, colorMode, showMode)
+  }, [colorMode, showMode, redraw])
 
   // ── Accumulate live aircraft trails ─────────────────────────────────
   useEffect(() => {
@@ -1026,6 +1025,13 @@ export default function CoveragePage({ aircraft = [] }) {
       if (trail.length > MAX_TRAIL_PTS) trail.splice(0, trail.length - MAX_TRAIL_PTS)
     }
 
+    // Compute top-10 operators from currently live aircraft for trail colouring.
+    // Using live aircraft rather than the history-derived `operators` state ensures
+    // operator mode works even before coverage history is loaded.
+    const opCounts = {}
+    for (const ac of aircraft) if (ac.operator) opCounts[ac.operator] = (opCounts[ac.operator] || 0) + 1
+    const liveOps = Object.entries(opCounts).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([op]) => op)
+
     // Rebuild trail lines and current-position dots
     const { scene } = ref
     if (ref.trailsObj) {
@@ -1040,11 +1046,11 @@ export default function CoveragePage({ aircraft = [] }) {
       ref.liveDotsObj.material.dispose()
       ref.liveDotsObj = null
     }
-    const mesh = buildTrails(trails, colorMode, operators)
+    const mesh = buildTrails(trails, colorMode, liveOps)
     if (mesh) { scene.add(mesh); ref.trailsObj = mesh; if (tlActiveRef.current) mesh.visible = false }
-    const dots = buildLiveDots(trails, colorMode, operators)
+    const dots = buildLiveDots(trails, colorMode, liveOps)
     if (dots) { scene.add(dots); ref.liveDotsObj = dots; if (tlActiveRef.current) dots.visible = false }
-  }, [aircraft, showMode, colorMode, operators])
+  }, [aircraft, showMode, colorMode])
 
   const toggleCoastline = useCallback(() => {
     const v = !showCoastlineRef.current
@@ -1110,17 +1116,6 @@ export default function CoveragePage({ aircraft = [] }) {
           {MAX_POINT_OPTIONS.map(n => (
             <button key={n} className={maxPoints === n ? styles.btnActive : styles.btn} onClick={() => setMaxPoints(n)}>
               {n >= 1000 ? `${n / 1000}k` : n}
-            </button>
-          ))}
-        </div>
-
-        <div className={styles.sep} />
-
-        {/* Type filter */}
-        <div className={styles.controls}>
-          {['all', 'military', 'interesting'].map(f => (
-            <button key={f} className={typeFilter === f ? styles.btnActive : styles.btn} onClick={() => setTypeFilter(f)}>
-              {f.charAt(0).toUpperCase() + f.slice(1)}
             </button>
           ))}
         </div>
