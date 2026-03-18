@@ -441,7 +441,8 @@ def _pos_reliable(ac: "Aircraft") -> bool:
     if ac.mlat:
         return True
     return (ac.pos_reliable_odd  >= _POS_RELIABLE_PUBLISH and
-            ac.pos_reliable_even >= _POS_RELIABLE_PUBLISH)
+            ac.pos_reliable_even >= _POS_RELIABLE_PUBLISH and
+            ac.pos_global)
 
 
 def _try_fix_df17(raw_bytes: bytes) -> Optional[bytes]:
@@ -500,7 +501,7 @@ def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
         ac.cpr_odd   = None
         ac.pos_global = False
         # Fall through — no speed check; accept position and begin fresh
-    elif ac.lat is not None and ac.lon is not None and ac.last_pos_ts > 0:
+    elif ac.lat is not None and ac.lon is not None and ac.last_pos_ts > 0 and ac.pos_global:
         elapsed_s = now - ac.last_pos_ts
         if elapsed_s > 0:
             dist_nm = _haversine_nm(ac.lat, ac.lon, lat, lon)
@@ -523,7 +524,7 @@ def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
 
     # Fast-track: if within ~27 nm (50 km) of last known position, promote
     # directly to publish threshold (mirrors readsb incrementReliable fast-path)
-    if ac.lat is not None and ac.lon is not None:
+    if ac.lat is not None and ac.lon is not None and ac.pos_global:
         dist_nm = _haversine_nm(ac.lat, ac.lon, lat, lon)
         if dist_nm < 27.0:
             if cpr_odd:
