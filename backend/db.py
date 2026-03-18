@@ -628,14 +628,22 @@ class StatsDB:
             SELECT
                 ?,
                 CAST(SUM(msg_mean * 60) AS INTEGER),
-                MAX(msg_max),
+                -- p95 of per-minute mean rates instead of MAX(msg_max); avoids
+                -- reconnection bursts or single-second spikes inflating the heatmap
+                (SELECT MAX(msg_mean) FROM (
+                    SELECT msg_mean,
+                           ROW_NUMBER() OVER (ORDER BY msg_mean) AS rn,
+                           COUNT(*) OVER () AS n
+                    FROM minute_stats
+                    WHERE date(ts, 'unixepoch') = ?
+                ) WHERE rn * 100 <= n * 95),
                 MAX(ac_total),
                 MAX(ac_civil),
                 MAX(ac_military),
                 (SELECT COUNT(*) FROM daily_aircraft_seen WHERE date = ?)
             FROM minute_stats
             WHERE date(ts, 'unixepoch') = ?
-        """, (date_str, date_str, date_str))
+        """, (date_str, date_str, date_str, date_str))
 
         conn.execute("""
             INSERT OR REPLACE INTO day_type_counts (date, type_code, count)
@@ -1522,6 +1530,50 @@ class StatsDB:
             """, params).fetchall()
         return [{"year": r["year"], "count": r["count"]} for r in rows]
 
+    def query_fleet_top_routes(self, limit: int = 20,
+                               since_ts: int | None = None) -> list[dict]:
+        params: list = []
+        since_clause = ""
+        if since_ts is not None:
+            since_clause = "AND start_ts >= ?"
+            params.append(since_ts)
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(f"""
+                SELECT origin_icao, dest_icao, COUNT(*) AS count
+                FROM visits
+                WHERE origin_icao IS NOT NULL AND origin_icao != ''
+                  AND dest_icao IS NOT NULL AND dest_icao != ''
+                  {since_clause}
+                GROUP BY origin_icao, dest_icao
+                ORDER BY count DESC
+                LIMIT ?
+            """, params).fetchall()
+        return [{"origin": r["origin_icao"], "dest": r["dest_icao"],
+                 "count": r["count"]} for r in rows]
+
+    def query_fleet_top_airports(self, limit: int = 20,
+                                  since_ts: int | None = None,
+                                  direction: str = "origin") -> list[dict]:
+        col = "origin_icao" if direction == "origin" else "dest_icao"
+        params: list = []
+        since_clause = ""
+        if since_ts is not None:
+            since_clause = "AND start_ts >= ?"
+            params.append(since_ts)
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(f"""
+                SELECT {col} AS airport, COUNT(*) AS count
+                FROM visits
+                WHERE {col} IS NOT NULL AND {col} != ''
+                  {since_clause}
+                GROUP BY {col}
+                ORDER BY count DESC
+                LIMIT ?
+            """, params).fetchall()
+        return [{"airport": r["airport"], "count": r["count"]} for r in rows]
+
     # Maps frontend sort key → SQL expression (no user data, all literals)
     _NOTABLE_SORT_MAP = {
         "icao":           "ar.icao",
@@ -2250,7 +2302,8 @@ class StatsDB:
                        COALESCE(ar.military,    0) AS military,
                        COALESCE(ar.interesting, 0) AS interesting,
                        ar.type_code,
-                       ar.type_category
+                       ar.type_category,
+                       ar.operator
                 FROM coverage_samples cs
                 LEFT JOIN aircraft_registry ar ON cs.icao = ar.icao
                 WHERE cs.ts >= ? AND cs.ts <= ?
@@ -2276,6 +2329,7 @@ class StatsDB:
                     "military":    bool(r["military"]),
                     "interesting": bool(r["interesting"]),
                     "tg_idx":      self._get_type_group_idx(r["type_code"], r["type_category"]),
+                    "operator":    r["operator"],
                 }
 
         tracks = [
@@ -2286,16 +2340,32 @@ class StatsDB:
         return {"start_ts": start_ts, "end_ts": end_ts, "tracks": tracks}
 
     def query_coverage_range_trend(self, days: int = 90) -> list[dict]:
-        """Daily max and median range from coverage_samples, for trend charts."""
+        """Daily p95 and median range from coverage_samples, for trend charts.
+
+        Uses p95 instead of MAX to exclude outlier positions (bad CPR decodes
+        that produce unrealistically large range values).
+        """
         cutoff = (date.today() - timedelta(days=days)).isoformat()
         with self._connect() as conn:
             rows = conn.execute("""
-                SELECT date(ts, 'unixepoch') AS day,
-                       ROUND(MAX(range_nm), 1) AS max_nm,
+                WITH ranked AS (
+                    SELECT date(ts, 'unixepoch') AS day,
+                           range_nm,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY date(ts, 'unixepoch')
+                               ORDER BY range_nm
+                           ) AS rn,
+                           COUNT(*) OVER (
+                               PARTITION BY date(ts, 'unixepoch')
+                           ) AS n
+                    FROM coverage_samples
+                    WHERE date(ts, 'unixepoch') >= ?
+                      AND range_nm > 0
+                )
+                SELECT day,
+                       ROUND(MAX(CASE WHEN rn * 100 <= n * 95 THEN range_nm ELSE 0 END), 1) AS max_nm,
                        ROUND(AVG(range_nm), 1) AS avg_nm
-                FROM coverage_samples
-                WHERE date(ts, 'unixepoch') >= ?
-                  AND range_nm > 0
+                FROM ranked
                 GROUP BY day
                 ORDER BY day
             """, (cutoff,)).fetchall()
@@ -2463,8 +2533,22 @@ class StatsDB:
             ).fetchall()
         return {r["icao"]: r["sighting_count"] for r in rows}
 
-    def query_status(self) -> dict:
-        """DB size, per-table row counts, date ranges, and retention policy summary."""
+    def query_status_notifications(self) -> dict:
+        """Notification prefs and watchlist count — fast, no table scans."""
+        with self._connect() as conn:
+            wl_count = conn.execute("SELECT COUNT(*) FROM notify_watchlist").fetchone()[0]
+        return {
+            "ntfy_enabled":    bool(config.NTFY_URL),
+            "ntfy_url":        config.NTFY_URL or None,
+            "email_enabled":   bool(config.NOTIFY_EMAIL_TO),
+            "email_to":        config.NOTIFY_EMAIL_TO or None,
+            "prefs":           self.get_notify_prefs(),
+            "watchlist_count": wl_count,
+        }
+
+    def query_status_tables(self) -> dict:
+        """DB size, per-table row counts, date ranges, and backup info.
+        This is the slow part — runs dbstat and COUNT(*) per table."""
         import os
         db_size = os.path.getsize(str(config.DB_PATH)) if config.DB_PATH.exists() else 0
 
@@ -2534,30 +2618,10 @@ class StatsDB:
                     for f in files
                 ]
 
-        with self._connect() as conn:
-            wl_count = conn.execute("SELECT COUNT(*) FROM notify_watchlist").fetchone()[0]
-
         return {
             "db_size_bytes": db_size,
             "tables": result,
             "backup": backup_info,
-            "config": {
-                "minute_stats_retention_days": config.MINUTE_STATS_RETENTION_DAYS,
-                "coverage_retention_days":     90,
-                "acas_retention_days":         90,
-                "ghost_filter_msgs":           config.GHOST_FILTER_MSGS,
-                "rare_threshold":              config.RARE_THRESHOLD,
-                "receiver_lat":               config.RECEIVER_LAT,
-                "receiver_lon":               config.RECEIVER_LON,
-            },
-            "notifications": {
-                "ntfy_enabled":    bool(config.NTFY_URL),
-                "ntfy_url":        config.NTFY_URL or None,
-                "email_enabled":   bool(config.NOTIFY_EMAIL_TO),
-                "email_to":        config.NOTIFY_EMAIL_TO or None,
-                "prefs":           self.get_notify_prefs(),
-                "watchlist_count": wl_count,
-            },
         }
 
     # ------------------------------------------------------------------

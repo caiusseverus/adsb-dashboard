@@ -102,14 +102,6 @@ const MAX_TRAIL_GAP_S = 20
 const MAX_TRAIL_IMPLIED_SPEED_KT = 900
 const MAX_SOURCE_SWITCH_JUMP_NM = 3
 
-// Three fixed-depth segments sliced from the newest position backward.
-// Fixed lengths mean the trail grows naturally without the "sliding" effect
-// of proportional segmentation.
-const TRAIL_SEGS = [
-  { len: 30,  opacity: 0.75 },  // most recent  ~30 s
-  { len: 60,  opacity: 0.40 },  // 30 – 90 s ago
-  { len: 210, opacity: 0.15 },  // 90 – 300 s ago
-]
 
 function haversineNm(lat1, lon1, lat2, lon2) {
   const R_NM = 3440.065
@@ -120,11 +112,11 @@ function haversineNm(lat1, lon1, lat2, lon2) {
   return R_NM * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
 }
 
-export default function MapPage({ snapshot, onSelectIcao }) {
+export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
   const mapRef            = useRef(null)
   const mountRef          = useRef(null)
   const markersRef        = useRef(new Map())   // icao → L.Marker
-  const trailsRef         = useRef(new Map())   // icao → { lines: L.Polyline[], color }
+  const trailsRef         = useRef(new Map())   // icao → { line: L.Polyline, color }
   const posHistRef        = useRef(new Map())   // icao → [lat, lon][]
   const fittedRef         = useRef(false)
   const receiverMarkerRef = useRef(null)
@@ -143,7 +135,11 @@ export default function MapPage({ snapshot, onSelectIcao }) {
   // ── Init Leaflet (once on mount) ────────────────────────────────────────
   useEffect(() => {
     if (mapRef.current) return
-    const map = L.map(mountRef.current, { center: [51.5, -0.1], zoom: 8, zoomControl: true })
+    // Use receiver position if already known (from App-level status fetch) so the
+    // map opens centred correctly without a later re-zoom
+    const initCenter = receiverPos ?? [51.5, -0.1]
+    const initZoom   = receiverPos ? 9 : 8
+    const map = L.map(mountRef.current, { center: initCenter, zoom: initZoom, zoomControl: true })
     // CartoDB Dark Matter — free, no API key, attribution required
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
       attribution:
@@ -168,24 +164,33 @@ export default function MapPage({ snapshot, onSelectIcao }) {
     }
   }, [])
 
-  // ── Fetch receiver position from status endpoint ─────────────────────
+  // ── Place receiver marker (uses prop if available, else fetches status) ──
   useEffect(() => {
-    fetch(`${API_BASE}/api/status`)
-      .then(r => r.ok ? r.json() : null)
-      .then(d => {
-        const lat = d?.config?.receiver_lat
-        const lon = d?.config?.receiver_lon
-        const map = mapRef.current
-        if (!lat || !lon || !map) return
-        if (receiverMarkerRef.current) receiverMarkerRef.current.remove()
-        receiverMarkerRef.current = L.marker([lat, lon], { icon: RECEIVER_ICON, zIndexOffset: 2000 })
-          .bindTooltip('Receiver', { direction: 'top' })
-          .addTo(map)
-        map.setView([lat, lon], 9)
-        fittedRef.current = true  // don't auto-fit to aircraft if receiver is known
-      })
-      .catch(() => {})
-  }, [])
+    const placeMarker = (lat, lon) => {
+      const map = mapRef.current
+      if (!map) return
+      if (receiverMarkerRef.current) receiverMarkerRef.current.remove()
+      receiverMarkerRef.current = L.marker([lat, lon], { icon: RECEIVER_ICON, zIndexOffset: 2000 })
+        .bindTooltip('Receiver', { direction: 'top' })
+        .addTo(map)
+      fittedRef.current = true  // don't auto-fit to aircraft if receiver is known
+      // Only re-zoom if the map wasn't already initialised at receiver pos
+      if (!receiverPos) map.setView([lat, lon], 9)
+    }
+
+    if (receiverPos) {
+      placeMarker(receiverPos[0], receiverPos[1])
+    } else {
+      fetch(`${API_BASE}/api/status`)
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+          const lat = d?.config?.receiver_lat
+          const lon = d?.config?.receiver_lon
+          if (lat && lon) placeMarker(lat, lon)
+        })
+        .catch(() => {})
+    }
+  }, [receiverPos])
 
   // ── MLAT source dots: poll bulk fixes endpoint, accumulate dots ───────────
   useEffect(() => {
@@ -376,7 +381,7 @@ export default function MapPage({ snapshot, onSelectIcao }) {
     }
     for (const [icao, trail] of trailsRef.current) {
       if (!icaoSet.has(icao)) {
-        trail.lines.forEach(l => l.remove())
+        trail.line.remove()
         trailsRef.current.delete(icao)
         posHistRef.current.delete(icao)
       }
@@ -407,31 +412,17 @@ export default function MapPage({ snapshot, onSelectIcao }) {
       const existing = trailsRef.current.get(ac.icao)
 
       if (existing && existing.color === color) {
-        // Reuse existing polylines — update latlngs from fixed-depth windows
-        let end = hist.length
-        for (let i = 0; i < TRAIL_SEGS.length; i++) {
-          const start = Math.max(0, end - TRAIL_SEGS[i].len)
-          const pts = end - start >= 2
-            ? hist.slice(start, end).map(p => [p.lat, p.lon])
-            : []
-          existing.lines[i].setLatLngs(pts)
-          end = start
-        }
+        // Reuse existing polyline — update latlngs
+        const pts = hist.length >= 2 ? hist.map(p => [p.lat, p.lon]) : []
+        existing.line.setLatLngs(pts)
       } else {
-        existing?.lines.forEach(l => l.remove())
-        let end = hist.length
-        const lines = TRAIL_SEGS.map(({ len, opacity }) => {
-          const start = Math.max(0, end - len)
-          const pts = end - start >= 2
-            ? hist.slice(start, end).map(p => [p.lat, p.lon])
-            : []
-          end = start
-          return L.polyline(pts, {
-            color, weight: 1.5, opacity, smoothFactor: 1,
-            lineCap: 'round', lineJoin: 'round',
-          }).addTo(map)
-        })
-        trailsRef.current.set(ac.icao, { lines, color })
+        existing?.line.remove()
+        const pts = hist.length >= 2 ? hist.map(p => [p.lat, p.lon]) : []
+        const line = L.polyline(pts, {
+          color, weight: 1.5, opacity: 0.6, smoothFactor: 1,
+          lineCap: 'round', lineJoin: 'round',
+        }).addTo(map)
+        trailsRef.current.set(ac.icao, { line, color })
       }
     }
 

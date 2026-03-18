@@ -48,22 +48,32 @@ function RetentionBadge({ expires, retainDays }) {
 }
 
 export default function StatusPage() {
-  const [status, setStatus] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
+  // Fast fetch — config, pi_health, notifications (renders immediately)
+  const [status, setStatus]         = useState(null)
+  // Slow fetch — table row counts, sizes, backup (fills in lazily)
+  const [tableData, setTableData]   = useState(null)
+  const [tablesLoading, setTablesLoading] = useState(true)
 
   useEffect(() => {
     fetch(`${API_BASE}/api/status`)
-      .then(r => r.ok ? r.json() : Promise.reject(r.status))
-      .then(d => { setStatus(d); setLoading(false) })
-      .catch(e => { setError(String(e)); setLoading(false) })
+      .then(r => r.ok ? r.json() : null)
+      .then(d => setStatus(d))
+      .catch(() => {})
   }, [])
 
-  if (loading) return <main className={styles.main}><div className={styles.empty}>Loading…</div></main>
-  if (error)   return <main className={styles.main}><div className={styles.empty}>Error: {error}</div></main>
-  if (!status) return null
+  useEffect(() => {
+    fetch(`${API_BASE}/api/status/tables`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { setTableData(d); setTablesLoading(false) })
+      .catch(() => setTablesLoading(false))
+  }, [])
 
-  const { db_size_bytes, tables, config: cfg } = status
+  // Render the shell immediately once config arrives; tables fill in behind it
+  if (!status) return <main className={styles.main}><div className={styles.empty}>Loading…</div></main>
+
+  const cfg    = status.config ?? {}
+  const tables = tableData?.tables ?? []
+  const db_size_bytes = tableData?.db_size_bytes ?? null
 
   return (
     <main className={styles.main}>
@@ -71,24 +81,24 @@ export default function StatusPage() {
       <div className={styles.summaryRow}>
         <div className={styles.summaryCard}>
           <div className={styles.summaryLabel}>Database size</div>
-          <div className={styles.summaryValue}>{fmtBytes(db_size_bytes)}</div>
+          <div className={styles.summaryValue}>{tablesLoading ? '…' : fmtBytes(db_size_bytes)}</div>
         </div>
         <div className={styles.summaryCard}>
           <div className={styles.summaryLabel}>Total aircraft</div>
           <div className={styles.summaryValue}>
-            {fmtRows(tables.find(t => t.table === 'aircraft_registry')?.rows)}
+            {tablesLoading ? '…' : fmtRows(tables.find(t => t.table === 'aircraft_registry')?.rows)}
           </div>
         </div>
         <div className={styles.summaryCard}>
           <div className={styles.summaryLabel}>ACAS events</div>
           <div className={styles.summaryValue}>
-            {fmtRows(tables.find(t => t.table === 'acas_events')?.rows)}
+            {tablesLoading ? '…' : fmtRows(tables.find(t => t.table === 'acas_events')?.rows)}
           </div>
         </div>
         <div className={styles.summaryCard}>
           <div className={styles.summaryLabel}>Coverage samples</div>
           <div className={styles.summaryValue}>
-            {fmtRows(tables.find(t => t.table === 'coverage_samples')?.rows)}
+            {tablesLoading ? '…' : fmtRows(tables.find(t => t.table === 'coverage_samples')?.rows)}
           </div>
         </div>
       </div>
@@ -98,38 +108,44 @@ export default function StatusPage() {
         <div className={styles.cardHeader}>
           <span className={styles.cardTitle}>Storage breakdown by table</span>
         </div>
-        <table className={styles.table}>
-          <thead>
-            <tr>
-              <th>Table</th>
-              <th>Description</th>
-              <th className={styles.num}>Rows</th>
-              <th className={styles.num}>Size</th>
-              <th>Oldest record</th>
-              <th>Newest record</th>
-              <th>Retention</th>
-            </tr>
-          </thead>
-          <tbody>
-            {tables.map(t => {
-              const meta = TABLE_DESCRIPTIONS[t.table] ?? { label: t.table, desc: '' }
-              return (
-                <tr key={t.table}>
-                  <td className={styles.tableName}>{meta.label}</td>
-                  <td className={styles.desc}>{meta.desc}</td>
-                  <td className={styles.num}>{fmtRows(t.rows)}</td>
-                  <td className={styles.num}>{fmtBytes(t.size_bytes)}</td>
-                  <td className={styles.muted}>{fmtTs(t.oldest)}</td>
-                  <td className={styles.muted}>{fmtTs(t.newest)}</td>
-                  <td><RetentionBadge expires={t.expires} retainDays={t.retain_days} /></td>
+        {tablesLoading ? (
+          <div className={styles.empty}>Loading table stats…</div>
+        ) : (
+          <>
+            <table className={styles.table}>
+              <thead>
+                <tr>
+                  <th>Table</th>
+                  <th>Description</th>
+                  <th className={styles.num}>Rows</th>
+                  <th className={styles.num}>Size</th>
+                  <th>Oldest record</th>
+                  <th>Newest record</th>
+                  <th>Retention</th>
                 </tr>
-              )
-            })}
-          </tbody>
-        </table>
-        <div className={styles.tableNote}>
-          Table sizes include associated indexes. Remaining difference from total is SQLite free-page pool (space reclaimed from deleted rows, reused on next write).
-        </div>
+              </thead>
+              <tbody>
+                {tables.map(t => {
+                  const meta = TABLE_DESCRIPTIONS[t.table] ?? { label: t.table, desc: '' }
+                  return (
+                    <tr key={t.table}>
+                      <td className={styles.tableName}>{meta.label}</td>
+                      <td className={styles.desc}>{meta.desc}</td>
+                      <td className={styles.num}>{fmtRows(t.rows)}</td>
+                      <td className={styles.num}>{fmtBytes(t.size_bytes)}</td>
+                      <td className={styles.muted}>{fmtTs(t.oldest)}</td>
+                      <td className={styles.muted}>{fmtTs(t.newest)}</td>
+                      <td><RetentionBadge expires={t.expires} retainDays={t.retain_days} /></td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+            <div className={styles.tableNote}>
+              Table sizes include associated indexes. Remaining difference from total is SQLite free-page pool (space reclaimed from deleted rows, reused on next write).
+            </div>
+          </>
+        )}
       </div>
 
       {/* Aircraft debug lookup */}

@@ -12,13 +12,8 @@ except ImportError:
 import logging
 import queue
 import threading
-import warnings
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
-
-# websockets ≥ 12 deprecates the two-argument ws_handler signature used
-# internally by starlette/uvicorn — suppress until uvicorn catches up.
-warnings.filterwarnings('ignore', category=DeprecationWarning, module='websockets')
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -349,25 +344,35 @@ async def _db_writer() -> None:
             icao = ac["icao"]
             squawking_icaos.add(icao)
             if icao in _active_squawks and _active_squawks[icao]["squawk"] == sq:
-                # Ongoing — update ts_last every 30s to avoid hammering DB every second
-                if now_ts - _active_squawks[icao]["last_update"] >= 30:
-                    await asyncio.to_thread(
-                        stats_db.update_squawk_event_last,
-                        _active_squawks[icao]["db_id"], now_ts, ac.get("altitude"),
-                    )
-                    _active_squawks[icao]["last_update"] = now_ts
+                entry = _active_squawks[icao]
+                if entry["db_id"] is None:
+                    # Pending confirmation — write to DB only after 10s sustained squawk
+                    if now_ts - entry["first_seen"] >= 10:
+                        db_id = await asyncio.to_thread(
+                            stats_db.write_squawk_event,
+                            icao, sq, ac.get("callsign"), ac.get("altitude"), entry["first_seen"],
+                        )
+                        entry["db_id"] = db_id
+                        entry["last_update"] = now_ts
+                        log.info("Emergency squawk %s from %s confirmed", sq, icao)
+                        await asyncio.to_thread(
+                            notifications.notify_emergency_squawk,
+                            icao, sq, ac.get("callsign"), ac.get("altitude"), ac.get("operator"),
+                        )
+                else:
+                    # Ongoing confirmed event — update ts_last every 30s
+                    if now_ts - entry["last_update"] >= 30:
+                        await asyncio.to_thread(
+                            stats_db.update_squawk_event_last,
+                            entry["db_id"], now_ts, ac.get("altitude"),
+                        )
+                        entry["last_update"] = now_ts
             else:
-                # New event (or squawk code changed)
-                db_id = await asyncio.to_thread(
-                    stats_db.write_squawk_event,
-                    icao, sq, ac.get("callsign"), ac.get("altitude"), now_ts,
-                )
-                _active_squawks[icao] = {"squawk": sq, "db_id": db_id, "last_update": now_ts}
-                log.info("Emergency squawk %s from %s", sq, icao)
-                await asyncio.to_thread(
-                    notifications.notify_emergency_squawk,
-                    icao, sq, ac.get("callsign"), ac.get("altitude"), ac.get("operator"),
-                )
+                # New event (or squawk code changed) — pending, not yet written to DB
+                _active_squawks[icao] = {
+                    "squawk": sq, "db_id": None,
+                    "first_seen": now_ts, "last_update": now_ts,
+                }
         # Close out events for aircraft no longer squawking emergency
         for icao in list(_active_squawks.keys()):
             if icao not in squawking_icaos:
@@ -561,14 +566,18 @@ async def _hires_writer() -> None:
         now_ts = int(_time.time())
         samples = [
             (now_ts, ac["icao"],
-             ac["bearing_deg"], ac["range_nm"], ac.get("altitude"),
+             ac["bearing_deg"], ac["range_nm"],
+             # Same freshness gate as _db_writer — suppress stale altitude
+             (ac.get("altitude")
+              if ((ac.get("last_pos_age") is not None and ac.get("last_pos_age") <= config.POS_FRESH_S)
+                  and (ac.get("last_alt_age") is not None and ac.get("last_alt_age") <= config.ALT_FRESH_S))
+              else None),
              ac.get("military", False), ac.get("interesting", False),
-             ac.get("type_code"), ac.get("type_category"))
+             ac.get("type_code"), ac.get("type_category"), ac.get("operator"))
             for ac in snapshot.get("aircraft", [])
             if (ac.get("bearing_deg") is not None
                 and ac.get("range_nm") is not None
                 and (ac.get("range_nm") or 0) > 0
-                and (ac.get("altitude") or 0) > 0
                 and _ghost_credible(ac))
         ]
         hires_buffer.record(samples)

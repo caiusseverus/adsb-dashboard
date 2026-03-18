@@ -12,7 +12,7 @@ L.Icon.Default.mergeOptions({
 })
 
 const DAY_OPTIONS = [1, 3, 7, 14, 30]
-const DEFAULT_DAYS = 7
+const DEFAULT_DAYS = 1
 
 // Map a normalised value 0–1 onto a traffic colour (dark blue → cyan → yellow → red)
 function trafficColor(t) {

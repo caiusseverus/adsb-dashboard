@@ -20,7 +20,7 @@ HIRES_MAX_AGE_S  = 86_400  # 24 hours
 
 _lock      = threading.Lock()
 _tracks:    dict[str, deque]  = {}   # icao → deque of (ts, bearing, range, alt)
-_meta:      dict[str, dict]   = {}   # icao → {military, interesting, type_code, type_category}
+_meta:      dict[str, dict]   = {}   # icao → {military, interesting, type_code, type_category, operator}
 _last_ts:   dict[str, int]    = {}   # icao → last recorded ts (rate-limiter)
 
 
@@ -29,7 +29,7 @@ def record(samples: list[tuple]) -> None:
 
     Each element of `samples`:
         (ts, icao, bearing_deg, range_nm, alt_ft,
-         military, interesting, type_code, type_category)
+         military, interesting, type_code, type_category, operator)
 
     Silently ignores samples where the same ICAO was recorded fewer than
     HIRES_INTERVAL_S seconds ago.  Prunes entries older than HIRES_MAX_AGE_S
@@ -39,7 +39,7 @@ def record(samples: list[tuple]) -> None:
         return
     cutoff = int(time.time()) - HIRES_MAX_AGE_S
     with _lock:
-        for ts, icao, bearing, range_nm, alt, military, interesting, tc, tcat in samples:
+        for ts, icao, bearing, range_nm, alt, military, interesting, tc, tcat, operator in samples:
             if ts - _last_ts.get(icao, 0) < HIRES_INTERVAL_S:
                 continue
             _last_ts[icao] = ts
@@ -50,10 +50,11 @@ def record(samples: list[tuple]) -> None:
                 _tracks[icao] = dq
             dq.append((ts, bearing, range_nm, alt))
             _meta[icao] = {
-                "military":    bool(military),
-                "interesting": bool(interesting),
-                "type_code":   tc,
+                "military":      bool(military),
+                "interesting":   bool(interesting),
+                "type_code":     tc,
                 "type_category": tcat,
+                "operator":      operator,
             }
             # Prune the tail of this deque (oldest entries first)
             while dq and dq[0][0] < cutoff:
@@ -72,7 +73,7 @@ def query_tracks(start_ts: int, end_ts: int) -> dict:
 
     Response format is identical to db.StatsDB.query_timelapse_tracks so the
     frontend needs no changes:
-        {start_ts, end_ts, tracks: [{icao, military, interesting, tg_idx,
+        {start_ts, end_ts, tracks: [{icao, military, interesting, tg_idx, operator,
                                       points: [[dt_s, bearing, range, alt], ...]}, ...]}
     Only tracks with >= 2 points in the window are included.
     """
@@ -97,6 +98,7 @@ def query_tracks(start_ts: int, end_ts: int) -> dict:
             "military":    m.get("military",    False),
             "interesting": m.get("interesting", False),
             "tg_idx":      tg_idx,
+            "operator":    m.get("operator"),
             "points":      window,
         })
 

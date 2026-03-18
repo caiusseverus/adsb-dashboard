@@ -98,7 +98,7 @@ _MLAT_FUSION_WINDOW   = 4.0   # max fix age (s) for inclusion in weighted fusion
 # ADS-B position reliability constants (mirrors readsb track.c pos_reliable)
 _POS_RELIABLE_MAX              = 4.0    # ceiling for the reliability score
 _POS_RELIABLE_DECAY            = 0.26   # per-failure penalty
-_POS_RELIABLE_PUBLISH          = 1.0    # minimum score to include lat/lon in snapshot output
+_POS_RELIABLE_PUBLISH          = 2.0    # minimum score to include lat/lon in snapshot output (2 odd + 2 even)
 _POS_RELIABLE_RESET_TIMEOUT_S  = 3600.0 # 60-min silence → reset scores
 _ADSB_MAX_SPEED_KT             = 1500   # hard ceiling for ADS-B speed check
 _SPEED_UNCERTAINTY_KT_PER_S    = 3.0    # ceiling widens +3 kt per second elapsed
@@ -318,7 +318,7 @@ def _accept_altitude(ac: "Aircraft", alt: int, source: "MsgSource",
         else:
             good_crc = _ALT_RELIABLE_MAX // 3  # 7: clean but infrequent
 
-    # Layer 4: cap alt_reliable by data staleness when delta is large
+    # Layer 4: cap alt_reliable by data staleness — only when altitude actually changed
     delta = (alt - ac.altitude) if ac.altitude is not None else 0
     fpm = 0
     if abs(delta) >= _ALT_LOW_DELTA_FT:
@@ -329,7 +329,9 @@ def _accept_altitude(ac: "Aircraft", alt: int, source: "MsgSource",
             stale_cap = int(_ALT_RELIABLE_MAX * (1.0 - baro_age_s / _ALT_STALE_WINDOW_S))
             ac.alt_reliable = min(ac.alt_reliable, stale_cap)
         else:
-            ac.alt_reliable = 0
+            # Stale + large delta: cap at publish threshold, not zero —
+            # prevents oscillation on slow-beacon Mode-S aircraft
+            ac.alt_reliable = min(ac.alt_reliable, _ALT_RELIABLE_PUBLISH)
 
     # Layer 5: dynamic vertical rate window
     min_fpm = _ALT_DEFAULT_MIN_FPM
@@ -463,14 +465,17 @@ def _try_fix_df17(raw_bytes: bytes) -> Optional[bytes]:
 
 
 def _in_discard_cache(ac: "Aircraft", lat: float, lon: float, now: float) -> bool:
+    # Round to 5dp (~1 m) so near-identical decodes from different reference
+    # positions match reliably (raw floats may differ in low-order bits)
+    rlat, rlon = round(lat, 5), round(lon, 5)
     return any(
-        lt == lat and ln == lon and now - ts < _DISCARD_CACHE_TTL
+        lt == rlat and ln == rlon and now - ts < _DISCARD_CACHE_TTL
         for lt, ln, ts in ac._discard_cache
     )
 
 
 def _add_to_discard_cache(ac: "Aircraft", lat: float, lon: float, now: float) -> None:
-    ac._discard_cache.append((lat, lon, now))
+    ac._discard_cache.append((round(lat, 5), round(lon, 5), now))
     if len(ac._discard_cache) > _DISCARD_CACHE_LEN:
         ac._discard_cache.pop(0)
 
@@ -486,7 +491,16 @@ def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
     stored (needed as reference for local CPR decode) but suppressed in snapshot
     output until pos_reliable reaches _POS_RELIABLE_PUBLISH.
     """
-    if ac.lat is not None and ac.lon is not None and ac.last_pos_ts > 0:
+    # Timeout override: if position is very stale, bypass speed check entirely
+    # (mirrors readsb POS_RELIABLE_TIMEOUT — aircraft must re-establish from scratch)
+    if ac.last_pos_ts > 0 and (now - ac.last_pos_ts) > _POS_RELIABLE_RESET_TIMEOUT_S:
+        ac.pos_reliable_odd  = 0.0
+        ac.pos_reliable_even = 0.0
+        ac.cpr_even  = None
+        ac.cpr_odd   = None
+        ac.pos_global = False
+        # Fall through — no speed check; accept position and begin fresh
+    elif ac.lat is not None and ac.lon is not None and ac.last_pos_ts > 0:
         elapsed_s = now - ac.last_pos_ts
         if elapsed_s > 0:
             dist_nm = _haversine_nm(ac.lat, ac.lon, lat, lon)
@@ -506,6 +520,16 @@ def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
                         ac.pos_global = False
                     _add_to_discard_cache(ac, lat, lon, now)
                 return  # discard this position
+
+    # Fast-track: if within ~27 nm (50 km) of last known position, promote
+    # directly to publish threshold (mirrors readsb incrementReliable fast-path)
+    if ac.lat is not None and ac.lon is not None:
+        dist_nm = _haversine_nm(ac.lat, ac.lon, lat, lon)
+        if dist_nm < 27.0:
+            if cpr_odd:
+                ac.pos_reliable_odd  = max(ac.pos_reliable_odd,  _POS_RELIABLE_PUBLISH)
+            else:
+                ac.pos_reliable_even = max(ac.pos_reliable_even, _POS_RELIABLE_PUBLISH)
 
     # Position accepted — increment reliability score for the frame that triggered decode
     if cpr_odd:
@@ -762,7 +786,9 @@ def _apply_hexdb_data(ac, data: dict) -> None:
                         ac.country = op.get("c")
                     return
         owners = (data.get("RegisteredOwners") or "").strip()
-        if owners:
+        # Reject short or purely-numeric strings (e.g. "00", "0") that indicate
+        # missing data rather than a real operator name
+        if owners and len(owners) >= 3 and not owners.isdigit():
             ac.operator = owners
 
 

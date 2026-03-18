@@ -10,9 +10,20 @@ from fastapi import APIRouter, Query
 
 from db import stats_db
 import enrichment
+from coverage import _load_airports
 from utils import format_operator
 
 router = APIRouter(prefix="/api/fleet")
+
+# Lazy ICAO → airport name lookup built from the shared airports.json
+_icao_name_map: dict[str, str] | None = None
+
+
+def _airport_name(icao: str) -> str | None:
+    global _icao_name_map
+    if _icao_name_map is None:
+        _icao_name_map = {ap["icao"]: ap["name"] for ap in _load_airports() if ap.get("icao")}
+    return _icao_name_map.get(icao)
 
 
 def _since_ts(since_days: int | None) -> int | None:
@@ -85,4 +96,30 @@ async def fleet_top_aircraft(
     rows = await asyncio.to_thread(stats_db.query_top_aircraft, limit, _since_ts(since), military)
     for row in rows:
         row["operator_display"] = format_operator(row["operator"])
+    return rows
+
+
+@router.get("/top_routes")
+async def fleet_top_routes(
+    limit: int = Query(20, ge=1, le=100),
+    since: Optional[int] = Query(None, ge=1),
+) -> list[dict]:
+    rows = await asyncio.to_thread(stats_db.query_fleet_top_routes, limit, _since_ts(since))
+    for row in rows:
+        row["origin_name"] = _airport_name(row["origin"])
+        row["dest_name"]   = _airport_name(row["dest"])
+    return rows
+
+
+@router.get("/top_airports")
+async def fleet_top_airports(
+    limit: int = Query(20, ge=1, le=100),
+    since: Optional[int] = Query(None, ge=1),
+    direction: str = Query("origin"),
+) -> list[dict]:
+    if direction not in ("origin", "dest"):
+        direction = "origin"
+    rows = await asyncio.to_thread(stats_db.query_fleet_top_airports, limit, _since_ts(since), direction)
+    for row in rows:
+        row["name"] = _airport_name(row["airport"])
     return rows
