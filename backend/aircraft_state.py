@@ -78,8 +78,9 @@ _ALT_MAX_FT             = 60_000  # above this is a bad decode (service ceiling)
 _ALT_RELIABLE_MAX       = 20      # ALTITUDE_BARO_RELIABLE_MAX
 _ALT_RELIABLE_PUBLISH   = 2       # minimum alt_reliable to include altitude in snapshot output
 _ALT_LOW_DELTA_FT       = 300     # below this delta, accept unconditionally
-_ALT_DEFAULT_MAX_FPM    = 12500   # default rate ceiling when no vertical rate known
-_ALT_DEFAULT_MIN_FPM    = -12500
+_ALT_DEFAULT_MAX_FPM    = 3_000   # default rate ceiling when no vertical rate known (was 12500)
+_ALT_DEFAULT_MIN_FPM    = -3_000  # (was -12500)
+_ALT_HARD_MAX_FPM       = 6_000   # physical ceiling for Layer 6 override paths only
 _ALT_RATE_TOLERANCE_FPM = 1500    # ± window around reported vertical rate
 _ALT_RATE_AGE_SLOP_MAX  = 11000   # max extra fpm slop added for stale rate data
 _ALT_QBIT_CEILING_FT    = 50175   # above this, Q-bit encoding becomes unreliable
@@ -357,10 +358,10 @@ def _accept_altitude(ac: "Aircraft", alt: int, source: "MsgSource",
         accept = True                    # tiny delta: unconditional
     elif fpm != 0 and min_fpm <= fpm <= max_fpm:
         accept = True                    # rate consistent with reported vrate
-    elif good_crc >= ac.alt_reliable:
+    elif good_crc >= ac.alt_reliable and (fpm == 0 or abs(fpm) <= _ALT_HARD_MAX_FPM):
         accept = True                    # high-confidence source overrides history
         reset_reliable = True
-    elif source > (ac._alt_source or MsgSource.INVALID):
+    elif source > (ac._alt_source or MsgSource.INVALID) and (fpm == 0 or abs(fpm) <= _ALT_HARD_MAX_FPM):
         accept = True                    # better source than current
         reset_reliable = True
 
