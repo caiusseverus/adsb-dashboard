@@ -446,6 +446,13 @@ def _pos_reliable(ac: "Aircraft") -> bool:
             ac.pos_global)
 
 
+def _published_position(ac: "Aircraft") -> tuple[float | None, float | None, float | None, float | None]:
+    """Return lat/lon/range/bearing only when the position is publishable."""
+    if not _pos_reliable(ac):
+        return None, None, None, None
+    return ac.lat, ac.lon, ac.range_nm, ac.bearing_deg
+
+
 def _try_fix_df17(raw_bytes: bytes) -> Optional[bytes]:
     """Attempt single-bit DF field correction to DF17.
 
@@ -1070,6 +1077,7 @@ class AircraftState:
             ac = self._aircraft.get(icao)
             if ac is None:
                 return None
+            pub_lat, pub_lon, pub_range_nm, pub_bearing_deg = _published_position(ac)
             return {
                 "icao":          ac.icao,
                 "callsign":      ac.callsign,
@@ -1089,10 +1097,10 @@ class AircraftState:
                 "country":       ac.country,
                 "year":          ac.year,
                 "manufacturer":  ac.manufacturer,
-                "lat":              ac.lat,
-                "lon":              ac.lon,
-                "range_nm":         ac.range_nm,
-                "bearing_deg":      ac.bearing_deg,
+                "lat":              pub_lat,
+                "lon":              pub_lon,
+                "range_nm":         pub_range_nm,
+                "bearing_deg":      pub_bearing_deg,
                 "airspeed_kts":     ac.airspeed_kts,
                 "airspeed_type":    ac.airspeed_type,
                 "heading_deg":      ac.heading_deg,
@@ -1212,13 +1220,14 @@ class AircraftState:
             # Replaces four separate O(N) scans that previously ran inside the lock.
             cur_mil = cur_with_pos = cur_mlat_pos = mlat_aircraft_count = 0
             for ac in self._aircraft.values():
+                has_published_pos = _pos_reliable(ac)
                 if ac.military:
                     cur_mil += 1
-                if ac.lat is not None:
+                if has_published_pos:
                     cur_with_pos += 1
                 if ac.mlat:
                     mlat_aircraft_count += 1
-                    if ac.lat is not None:
+                    if has_published_pos:
                         cur_mlat_pos += 1
             live_military = cur_mil
 
@@ -1244,8 +1253,10 @@ class AircraftState:
             df_history = hist_df_stats + [(self._cur_min, dict(self._cur_min_df_counts))]
             mlat_history = hist_mlat_counts + [(self._cur_min, self._cur_min_mlat_count)]
 
-            aircraft_list = [
-                {
+            aircraft_list = []
+            for ac in self._aircraft.values():
+                pub_lat, pub_lon, pub_range_nm, pub_bearing_deg = _published_position(ac)
+                aircraft_list.append({
                     "icao": ac.icao,
                     "callsign": ac.callsign,
                     "altitude": ac.altitude if _alt_baro_reliable(ac) else None,
@@ -1264,10 +1275,10 @@ class AircraftState:
                     "country": ac.country,
                     "year": ac.year,
                     "manufacturer": ac.manufacturer,
-                    "lat":              ac.lat,
-                    "lon":              ac.lon,
-                    "range_nm":         ac.range_nm,
-                    "bearing_deg":      ac.bearing_deg,
+                    "lat":              pub_lat,
+                    "lon":              pub_lon,
+                    "range_nm":         pub_range_nm,
+                    "bearing_deg":      pub_bearing_deg,
                     "airspeed_kts":     ac.airspeed_kts,
                     "airspeed_type":    ac.airspeed_type,
                     "heading_deg":      ac.heading_deg,
@@ -1304,9 +1315,7 @@ class AircraftState:
                     "pos_reliable_odd":   ac.pos_reliable_odd,
                     "pos_reliable_even":  ac.pos_reliable_even,
                     "pos_confident":      _pos_reliable(ac),
-                }
-                for ac in self._aircraft.values()
-            ]
+                })
 
         return {
             "aircraft_count": len(aircraft_list),
@@ -1364,8 +1373,8 @@ class AircraftState:
                 mn = mx = me = 0.0
             total = len(self._aircraft)
             mil = sum(1 for ac in self._aircraft.values() if ac.military)
-            with_pos = sum(1 for ac in self._aircraft.values() if ac.lat is not None)
-            mlat_pos = sum(1 for ac in self._aircraft.values() if ac.mlat and ac.lat is not None)
+            with_pos = sum(1 for ac in self._aircraft.values() if _pos_reliable(ac))
+            mlat_pos = sum(1 for ac in self._aircraft.values() if ac.mlat and _pos_reliable(ac))
             sigs = self._cur_min_signals
             sig_avg = round(sum(sigs) / len(sigs), 1) if sigs else None
             sig_min = min(sigs) if sigs else None

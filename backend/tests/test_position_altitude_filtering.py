@@ -6,7 +6,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-from aircraft_state import Aircraft, MsgSource, _pos_reliable, _accept_adsb_position, _accept_altitude
+from aircraft_state import Aircraft, AircraftState, MsgSource, _pos_reliable, _accept_adsb_position, _accept_altitude
 
 
 # ---------------------------------------------------------------------------
@@ -156,3 +156,40 @@ class TestAcceptAdsbPositionFastTrack:
                                cpr_odd=True, now=1000.0)
         # Fast-track must have promoted odd score to at least 2.0
         assert ac.pos_reliable_odd >= 2.0
+
+
+class TestSnapshotPublication:
+
+    def test_snapshot_hides_local_only_adsb_position_until_global_decode(self):
+        state = AircraftState()
+        ac = make_ac(
+            lat=51.5, lon=-0.1,
+            range_nm=12.3, bearing_deg=180.0,
+            pos_reliable_odd=4.0, pos_reliable_even=4.0,
+            pos_global=False,
+        )
+        state._aircraft[ac.icao] = ac
+
+        snapshot = state.get_snapshot()
+        live = state.get_aircraft_live(ac.icao)
+
+        assert snapshot["aircraft"][0]["lat"] is None
+        assert snapshot["aircraft"][0]["lon"] is None
+        assert snapshot["aircraft"][0]["range_nm"] is None
+        assert snapshot["aircraft"][0]["bearing_deg"] is None
+        assert live["lat"] is None
+        assert live["lon"] is None
+
+    def test_snapshot_keeps_mlat_positions_visible(self):
+        state = AircraftState()
+        ac = make_ac(
+            lat=51.5, lon=-0.1,
+            range_nm=12.3, bearing_deg=180.0,
+            mlat=True,
+        )
+        state._aircraft[ac.icao] = ac
+
+        snapshot = state.get_snapshot()
+
+        assert snapshot["aircraft"][0]["lat"] == pytest.approx(51.5, abs=0.001)
+        assert snapshot["aircraft"][0]["lon"] == pytest.approx(-0.1, abs=0.001)
