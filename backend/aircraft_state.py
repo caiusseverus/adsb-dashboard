@@ -78,8 +78,9 @@ _ALT_MAX_FT             = 60_000  # above this is a bad decode (service ceiling)
 _ALT_RELIABLE_MAX       = 20      # ALTITUDE_BARO_RELIABLE_MAX
 _ALT_RELIABLE_PUBLISH   = 2       # minimum alt_reliable to include altitude in snapshot output
 _ALT_LOW_DELTA_FT       = 300     # below this delta, accept unconditionally
-_ALT_DEFAULT_MAX_FPM    = 12500   # default rate ceiling when no vertical rate known
-_ALT_DEFAULT_MIN_FPM    = -12500
+_ALT_DEFAULT_MAX_FPM    = 3_000   # default rate ceiling when no vertical rate known (was 12500)
+_ALT_DEFAULT_MIN_FPM    = -3_000  # (was -12500)
+_ALT_HARD_MAX_FPM       = 6_000   # physical ceiling for Layer 6 override paths only
 _ALT_RATE_TOLERANCE_FPM = 1500    # ± window around reported vertical rate
 _ALT_RATE_AGE_SLOP_MAX  = 11000   # max extra fpm slop added for stale rate data
 _ALT_QBIT_CEILING_FT    = 50175   # above this, Q-bit encoding becomes unreliable
@@ -357,10 +358,10 @@ def _accept_altitude(ac: "Aircraft", alt: int, source: "MsgSource",
         accept = True                    # tiny delta: unconditional
     elif fpm != 0 and min_fpm <= fpm <= max_fpm:
         accept = True                    # rate consistent with reported vrate
-    elif good_crc >= ac.alt_reliable:
+    elif good_crc >= ac.alt_reliable and (fpm == 0 or abs(fpm) <= _ALT_HARD_MAX_FPM):
         accept = True                    # high-confidence source overrides history
         reset_reliable = True
-    elif source > (ac._alt_source or MsgSource.INVALID):
+    elif source > (ac._alt_source or MsgSource.INVALID) and (fpm == 0 or abs(fpm) <= _ALT_HARD_MAX_FPM):
         accept = True                    # better source than current
         reset_reliable = True
 
@@ -441,7 +442,15 @@ def _pos_reliable(ac: "Aircraft") -> bool:
     if ac.mlat:
         return True
     return (ac.pos_reliable_odd  >= _POS_RELIABLE_PUBLISH and
-            ac.pos_reliable_even >= _POS_RELIABLE_PUBLISH)
+            ac.pos_reliable_even >= _POS_RELIABLE_PUBLISH and
+            ac.pos_global)
+
+
+def _published_position(ac: "Aircraft") -> tuple[float | None, float | None, float | None, float | None]:
+    """Return lat/lon/range/bearing only when the position is publishable."""
+    if not _pos_reliable(ac):
+        return None, None, None, None
+    return ac.lat, ac.lon, ac.range_nm, ac.bearing_deg
 
 
 def _try_fix_df17(raw_bytes: bytes) -> Optional[bytes]:
@@ -500,7 +509,7 @@ def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
         ac.cpr_odd   = None
         ac.pos_global = False
         # Fall through — no speed check; accept position and begin fresh
-    elif ac.lat is not None and ac.lon is not None and ac.last_pos_ts > 0:
+    elif ac.lat is not None and ac.lon is not None and ac.last_pos_ts > 0 and ac.pos_global:
         elapsed_s = now - ac.last_pos_ts
         if elapsed_s > 0:
             dist_nm = _haversine_nm(ac.lat, ac.lon, lat, lon)
@@ -523,7 +532,7 @@ def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
 
     # Fast-track: if within ~27 nm (50 km) of last known position, promote
     # directly to publish threshold (mirrors readsb incrementReliable fast-path)
-    if ac.lat is not None and ac.lon is not None:
+    if ac.lat is not None and ac.lon is not None and ac.pos_global:
         dist_nm = _haversine_nm(ac.lat, ac.lon, lat, lon)
         if dist_nm < 27.0:
             if cpr_odd:
@@ -1068,6 +1077,7 @@ class AircraftState:
             ac = self._aircraft.get(icao)
             if ac is None:
                 return None
+            pub_lat, pub_lon, pub_range_nm, pub_bearing_deg = _published_position(ac)
             return {
                 "icao":          ac.icao,
                 "callsign":      ac.callsign,
@@ -1087,10 +1097,10 @@ class AircraftState:
                 "country":       ac.country,
                 "year":          ac.year,
                 "manufacturer":  ac.manufacturer,
-                "lat":              ac.lat,
-                "lon":              ac.lon,
-                "range_nm":         ac.range_nm,
-                "bearing_deg":      ac.bearing_deg,
+                "lat":              pub_lat,
+                "lon":              pub_lon,
+                "range_nm":         pub_range_nm,
+                "bearing_deg":      pub_bearing_deg,
                 "airspeed_kts":     ac.airspeed_kts,
                 "airspeed_type":    ac.airspeed_type,
                 "heading_deg":      ac.heading_deg,
@@ -1210,13 +1220,14 @@ class AircraftState:
             # Replaces four separate O(N) scans that previously ran inside the lock.
             cur_mil = cur_with_pos = cur_mlat_pos = mlat_aircraft_count = 0
             for ac in self._aircraft.values():
+                has_published_pos = _pos_reliable(ac)
                 if ac.military:
                     cur_mil += 1
-                if ac.lat is not None:
+                if has_published_pos:
                     cur_with_pos += 1
                 if ac.mlat:
                     mlat_aircraft_count += 1
-                    if ac.lat is not None:
+                    if has_published_pos:
                         cur_mlat_pos += 1
             live_military = cur_mil
 
@@ -1242,8 +1253,10 @@ class AircraftState:
             df_history = hist_df_stats + [(self._cur_min, dict(self._cur_min_df_counts))]
             mlat_history = hist_mlat_counts + [(self._cur_min, self._cur_min_mlat_count)]
 
-            aircraft_list = [
-                {
+            aircraft_list = []
+            for ac in self._aircraft.values():
+                pub_lat, pub_lon, pub_range_nm, pub_bearing_deg = _published_position(ac)
+                aircraft_list.append({
                     "icao": ac.icao,
                     "callsign": ac.callsign,
                     "altitude": ac.altitude if _alt_baro_reliable(ac) else None,
@@ -1262,10 +1275,10 @@ class AircraftState:
                     "country": ac.country,
                     "year": ac.year,
                     "manufacturer": ac.manufacturer,
-                    "lat":              ac.lat,
-                    "lon":              ac.lon,
-                    "range_nm":         ac.range_nm,
-                    "bearing_deg":      ac.bearing_deg,
+                    "lat":              pub_lat,
+                    "lon":              pub_lon,
+                    "range_nm":         pub_range_nm,
+                    "bearing_deg":      pub_bearing_deg,
                     "airspeed_kts":     ac.airspeed_kts,
                     "airspeed_type":    ac.airspeed_type,
                     "heading_deg":      ac.heading_deg,
@@ -1302,9 +1315,7 @@ class AircraftState:
                     "pos_reliable_odd":   ac.pos_reliable_odd,
                     "pos_reliable_even":  ac.pos_reliable_even,
                     "pos_confident":      _pos_reliable(ac),
-                }
-                for ac in self._aircraft.values()
-            ]
+                })
 
         return {
             "aircraft_count": len(aircraft_list),
@@ -1362,8 +1373,8 @@ class AircraftState:
                 mn = mx = me = 0.0
             total = len(self._aircraft)
             mil = sum(1 for ac in self._aircraft.values() if ac.military)
-            with_pos = sum(1 for ac in self._aircraft.values() if ac.lat is not None)
-            mlat_pos = sum(1 for ac in self._aircraft.values() if ac.mlat and ac.lat is not None)
+            with_pos = sum(1 for ac in self._aircraft.values() if _pos_reliable(ac))
+            mlat_pos = sum(1 for ac in self._aircraft.values() if ac.mlat and _pos_reliable(ac))
             sigs = self._cur_min_signals
             sig_avg = round(sum(sigs) / len(sigs), 1) if sigs else None
             sig_min = min(sigs) if sigs else None
