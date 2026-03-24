@@ -578,10 +578,11 @@ export default function CoveragePage({ aircraft = [] }) {
   const receiverCamRef = useRef(null)
 
   // ── Terrain / coordinate-mode state ─────────────────────────────────
-  const [showTerrain,  setShowTerrain]  = useState(false)
-  const [terrainWire,  setTerrainWire]  = useState(false)
-  const terrainWireRef = useRef(false)   // ref so async terrain fetch reads current value
-  const [terrainHiRes, setTerrainHiRes] = useState(false)
+  const [showTerrain,   setShowTerrain]   = useState(false)
+  const [terrainWire,   setTerrainWire]   = useState(false)
+  const terrainWireRef  = useRef(false)   // ref so async terrain fetch reads current value
+  const [terrainHiRes,  setTerrainHiRes]  = useState(false)
+  const [terrainLoading, setTerrainLoading] = useState(false)
   const [curveMode,    setCurveMode]    = useState(false)
   const [altScale,     setAltScale]     = useState(8)
   // sceneVersion bumps to force a full redraw when coordinate params change
@@ -824,14 +825,20 @@ export default function CoveragePage({ aircraft = [] }) {
     let cancelled = false
     const localMeshes = []   // meshes added by this effect run, for cleanup on cancel
     ;(async () => {
+      setTerrainLoading(true)
       try {
         const gridN = terrainHiRes ? 2048 : 512
         const resp = await fetch(`/api/terrain/grid?radius_nm=400&grid_n=${gridN}&min_radius_nm=0`)
         if (!resp.ok || cancelled) return
-        const data = await resp.json()
+        const buf = await resp.arrayBuffer()
         if (cancelled) return
         const r2 = sceneRef.current
         if (!r2) return
+        const data = {
+          grid_n:    parseInt(resp.headers.get('X-Grid-N')),
+          step_nm:   parseFloat(resp.headers.get('X-Step-Nm')),
+          elevations: new Int16Array(buf),
+        }
         // Store center-cell elevation for receiver-view camera floor
         const ci = Math.floor(data.grid_n / 2) * data.grid_n + Math.floor(data.grid_n / 2)
         terrainCenterElevMRef.current = Math.max(0, data.elevations[ci] ?? 0)
@@ -842,6 +849,8 @@ export default function CoveragePage({ aircraft = [] }) {
         localMeshes.push(mesh)
       } catch {
         // terrain is optional — degrade silently on download failure
+      } finally {
+        if (!cancelled) setTerrainLoading(false)
       }
     })()
     return () => {
@@ -1707,6 +1716,13 @@ export default function CoveragePage({ aircraft = [] }) {
                 <span>{loadingMsg}</span>
               </div>
             )}
+          </div>
+        )}
+
+        {terrainLoading && (
+          <div className={styles.terrainBadge}>
+            <div className={styles.terrainSpinner} />
+            <span>Loading terrain…</span>
           </div>
         )}
 

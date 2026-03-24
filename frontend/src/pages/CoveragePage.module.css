@@ -107,6 +107,34 @@
   to { transform: rotate(360deg); }
 }
 
+/* Non-blocking terrain loading badge — bottom-left of canvas */
+.terrainBadge {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: rgba(22, 27, 34, 0.88);
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 0.3rem 0.6rem;
+  color: #8b949e;
+  font-size: 0.72rem;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.terrainSpinner {
+  width: 10px;
+  height: 10px;
+  border: 2px solid #30363d;
+  border-top-color: #388bfd;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
 /* 2-D compass rose — top-right corner of the canvas */
 .compass {
   position: absolute;
