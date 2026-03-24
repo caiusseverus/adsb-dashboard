@@ -674,10 +674,6 @@ async def lifespan(app: FastAPI):
     }
     await asyncio.to_thread(stats_db.fix_military_countries, corrections, config.HOME_COUNTRY)
 
-    # Pre-warm terrain grid so first client request is instant
-    if config.RECEIVER_LAT is not None and config.RECEIVER_LON is not None:
-        await asyncio.to_thread(terrain_prewarm, config.RECEIVER_LAT, config.RECEIVER_LON)
-
     global _decoder_thread
     _decoder_thread = _start_msg_processor()
     _bg_tasks: list[asyncio.Task] = []
@@ -699,6 +695,10 @@ async def lifespan(app: FastAPI):
     if config.MEMORY_POLICY_ENABLED:
         _bg(_memory_guard())
     _bg(_route_enricher())
+    if config.RECEIVER_LAT is not None and config.RECEIVER_LON is not None:
+        async def _terrain_prewarm():
+            await asyncio.to_thread(terrain_prewarm, config.RECEIVER_LAT, config.RECEIVER_LON)
+        _bg(_terrain_prewarm())
     _bg(run_position_quality_checker(position_quality_module._checker))
     _bg(health_module.loop_lag_sampler())
     health_module.register_context(_msg_queue, _clients)
