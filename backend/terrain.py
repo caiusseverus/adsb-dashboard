@@ -57,11 +57,23 @@ def _tile_name(lat: int, lon: int) -> str:
 
 
 def _download_tile(lat: int, lon: int) -> Optional[Path]:
-    """Download SRTM1 tile .hgt.gz, decompress and cache as .hgt. Returns path or None."""
+    """Download SRTM1 tile and cache as .hgt.gz (compressed). Returns path or None."""
     name = _tile_name(lat, lon)
+    gz_path = _TERRAIN_DIR / f"{name}.hgt.gz"
+    if gz_path.exists():
+        return gz_path
+
+    # Migrate legacy uncompressed .hgt → .hgt.gz
     hgt_path = _TERRAIN_DIR / f"{name}.hgt"
     if hgt_path.exists():
-        return hgt_path
+        log.info("Compressing SRTM tile %s", name)
+        compressed = gzip.compress(hgt_path.read_bytes())
+        tmp = gz_path.with_suffix('.tmp')
+        tmp.write_bytes(compressed)
+        os.replace(tmp, gz_path)
+        hgt_path.unlink()
+        log.info("Compressed SRTM tile %s (%.0f KB on disk)", name, len(compressed) / 1024)
+        return gz_path
 
     ns_dir = f"{'N' if lat >= 0 else 'S'}{abs(lat):02d}"
     url = f"{_SRTM_BASE}/{ns_dir}/{name}.hgt.gz"
@@ -70,12 +82,11 @@ def _download_tile(lat: int, lon: int) -> Optional[Path]:
         req = urllib.request.Request(url, headers={"User-Agent": "adsb-dashboard/1.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             gz_bytes = resp.read()
-        hgt_data = gzip.decompress(gz_bytes)
-        tmp_path = hgt_path.with_suffix('.tmp')
-        tmp_path.write_bytes(hgt_data)
-        os.replace(tmp_path, hgt_path)  # atomic rename — safe for concurrent threads
-        log.info("Cached SRTM tile %s (%d KB)", name, len(hgt_data) // 1024)
-        return hgt_path
+        tmp = gz_path.with_suffix('.tmp')
+        tmp.write_bytes(gz_bytes)
+        os.replace(tmp, gz_path)  # atomic rename — safe for concurrent threads
+        log.info("Cached SRTM tile %s (%.0f KB compressed)", name, len(gz_bytes) / 1024)
+        return gz_path
     except Exception as exc:
         log.warning("SRTM tile %s download failed: %s", name, exc)
         return None
@@ -86,8 +97,11 @@ def _read_hgt(path: Path) -> tuple[array.array, int]:
 
     Uses array.array('h') — 2 bytes/element vs ~28 bytes/element for Python tuple.
     HGT files are big-endian; byteswap on little-endian hosts.
+    Accepts both .hgt and .hgt.gz paths.
     """
     data = path.read_bytes()
+    if path.suffix == '.gz':
+        data = gzip.decompress(data)
     n_sq = len(data) // 2
     n = int(math.isqrt(n_sq))
     arr = array.array('h', data[:n * n * 2])
@@ -251,7 +265,7 @@ def _fmt_coord(v: float) -> str:
 
 def _cache_path(lat: float, lon: float, radius_nm: float, grid_n: int, min_radius_nm: float) -> Path:
     mr = f"mr{int(min_radius_nm)}" if min_radius_nm else "mr0"
-    return _TERRAIN_DIR / f"grid_{grid_n}_{int(radius_nm)}_{mr}_{_fmt_coord(lat)}_{_fmt_coord(lon)}.bin"
+    return _TERRAIN_DIR / f"grid_{grid_n}_{int(radius_nm)}_{mr}_{_fmt_coord(lat)}_{_fmt_coord(lon)}.bin.gz"
 
 
 _cleanup_done: set[tuple] = set()
@@ -259,10 +273,18 @@ _cleanup_lock = threading.Lock()
 
 
 def _cleanup_stale_cache(lat: float, lon: float) -> None:
-    """Delete .bin cache files that don't match the current receiver coordinates."""
-    current_suffix = f"_{_fmt_coord(lat)}_{_fmt_coord(lon)}.bin"
+    """Delete grid cache files that don't match the current receiver coordinates."""
+    coord_suffix = f"_{_fmt_coord(lat)}_{_fmt_coord(lon)}"
+    for f in _TERRAIN_DIR.glob("grid_*.bin.gz"):
+        if not f.name.endswith(coord_suffix + ".bin.gz"):
+            try:
+                f.unlink()
+                log.info("Removed stale terrain cache: %s", f.name)
+            except OSError as exc:
+                log.warning("Could not remove stale terrain cache %s: %s", f.name, exc)
+    # Remove legacy uncompressed .bin files with wrong coordinates
     for f in _TERRAIN_DIR.glob("grid_*.bin"):
-        if not f.name.endswith(current_suffix):
+        if not f.name.endswith(coord_suffix + ".bin"):
             try:
                 f.unlink()
                 log.info("Removed stale terrain cache: %s", f.name)
@@ -298,7 +320,19 @@ def _build(receiver_lat: float, receiver_lon: float, radius_nm: float,
     cache = _cache_path(receiver_lat, receiver_lon, radius_nm, grid_n, min_radius_nm)
     if cache.exists():
         log.debug("Terrain cache hit: %s", cache.name)
-        return cache.read_bytes(), metadata
+        return gzip.decompress(cache.read_bytes()), metadata
+
+    # Migrate legacy uncompressed .bin → .bin.gz (cache.stem strips the .gz suffix)
+    legacy = cache.with_name(cache.stem)
+    if legacy.exists():
+        log.info("Compressing terrain cache %s", legacy.name)
+        raw = legacy.read_bytes()
+        tmp = cache.with_suffix('.tmp')
+        tmp.write_bytes(gzip.compress(raw))
+        os.replace(tmp, cache)
+        legacy.unlink()
+        log.info("Compressed terrain cache: %s (%.0f KB on disk)", cache.name, cache.stat().st_size / 1024)
+        return raw, metadata
 
     log.info("Building terrain grid %dx%d r=%.0fnm — result will be cached", grid_n, grid_n, radius_nm)
 
@@ -315,9 +349,9 @@ def _build(receiver_lat: float, receiver_lon: float, radius_nm: float,
 
     tmp = cache.with_suffix('.tmp')
     try:
-        tmp.write_bytes(elev_bytes)
+        tmp.write_bytes(gzip.compress(elev_bytes))
         os.replace(tmp, cache)
-        log.info("Terrain cache saved: %s (%.0f KB)", cache.name, len(elev_bytes) / 1024)
+        log.info("Terrain cache saved: %s (%.0f KB on disk)", cache.name, cache.stat().st_size / 1024)
     except OSError as exc:
         log.warning("Could not write terrain cache %s: %s", cache.name, exc)
 
