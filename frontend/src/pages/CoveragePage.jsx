@@ -514,6 +514,14 @@ export default function CoveragePage({ aircraft = [] }) {
   const dataRef     = useRef([])     // raw fetched points (unfiltered)
   const pendingRef  = useRef(null)   // points waiting to render after 'rendering' phase
   const trailsRef   = useRef({})     // live trail buffer: { icao: [{bearing,range,alt,...}] }
+
+  const [terrainEnabled, setTerrainEnabled] = useState(true)
+  useEffect(() => {
+    fetch('/api/status')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d?.config?.terrain_enabled === false) setTerrainEnabled(false) })
+      .catch(() => {})
+  }, [])
   const compassRef  = useRef(null)   // ref to inner compass ring div (rotated via JS, not React state)
 
   const [days,         setDays]         = useState(1)
@@ -1650,14 +1658,16 @@ export default function CoveragePage({ aircraft = [] }) {
         <button className={showAirportsMedium ? styles.btnActive : styles.btn} onClick={toggleAirportsMedium}>Med</button>
         <div className={styles.sep} />
 
-        {/* Terrain */}
-        <button className={showTerrain ? styles.btnActive : styles.btn}
-          onClick={() => setShowTerrain(v => !v)}>Terrain</button>
-        {showTerrain && (<>
-          <button className={terrainWire ? styles.btnActive : styles.btn}
-            onClick={() => setTerrainWire(v => !v)}>Wire</button>
-          <button className={terrainHiRes ? styles.btnActive : styles.btn}
-            onClick={() => setTerrainHiRes(v => !v)}>Hi</button>
+        {/* Terrain — hidden when TERRAIN_ENABLED=false on the server */}
+        {terrainEnabled && (<>
+          <button className={showTerrain ? styles.btnActive : styles.btn}
+            onClick={() => setShowTerrain(v => !v)}>Terrain</button>
+          {showTerrain && (<>
+            <button className={terrainWire ? styles.btnActive : styles.btn}
+              onClick={() => setTerrainWire(v => !v)}>Wire</button>
+            <button className={terrainHiRes ? styles.btnActive : styles.btn}
+              onClick={() => setTerrainHiRes(v => !v)}>Hi-res</button>
+          </>)}
         </>)}
         <div className={styles.sep} />
 
@@ -1750,7 +1760,10 @@ export default function CoveragePage({ aircraft = [] }) {
         {terrainLoading && (
           <div className={styles.terrainBadge}>
             <div className={styles.terrainSpinner} />
-            <span>Loading terrain…</span>
+            <span>{terrainHiRes
+              ? 'Building hi-res terrain — first run may take several minutes…'
+              : 'Loading terrain…'}
+            </span>
           </div>
         )}
 

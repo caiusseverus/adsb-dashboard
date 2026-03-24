@@ -90,6 +90,7 @@ async def get_status() -> dict:
             "receiver_lat":                _config.RECEIVER_LAT,
             "receiver_lon":                _config.RECEIVER_LON,
             "debug":                       _config.DEBUG_LOG,
+            "terrain_enabled":             _config.TERRAIN_ENABLED,
         },
         "pi_health":       pi_health,
         "notifications":   notifications,

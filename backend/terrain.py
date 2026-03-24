@@ -332,6 +332,8 @@ async def terrain_grid(
 ):
     """SRTM elevation grid centred on RECEIVER_LAT/LON.
     Returns raw little-endian int16 bytes. Grid metadata is in response headers."""
+    if not config.TERRAIN_ENABLED:
+        raise HTTPException(status_code=503, detail="Terrain disabled (TERRAIN_ENABLED=false)")
     if config.RECEIVER_LAT is None or config.RECEIVER_LON is None:
         raise HTTPException(status_code=400, detail="RECEIVER_LAT/LON not configured")
 
@@ -360,7 +362,9 @@ async def terrain_grid(
 def prewarm_cache(receiver_lat: float, receiver_lon: float,
                   radius_nm: float = 400, grid_n: int = 512) -> None:
     """Build and cache the standard-resolution terrain grid at startup.
-    No-op if the cache file already exists.  Called from main.py lifespan."""
+    No-op if the cache file already exists or TERRAIN_ENABLED is false."""
+    if not config.TERRAIN_ENABLED:
+        return
     cache = _cache_path(receiver_lat, receiver_lon, radius_nm, grid_n, 0)
     if cache.exists():
         log.info("Terrain cache already present: %s", cache.name)

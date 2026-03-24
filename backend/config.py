@@ -189,3 +189,9 @@ WS_SEND_TIMEOUT_S: float = float(os.getenv("WS_SEND_TIMEOUT_S", "2.0"))
 # Set to "false" to lock the system to normal/full-retention mode regardless
 # of available RAM.  Has no effect on non-Linux hosts.
 MEMORY_POLICY_ENABLED: bool = os.getenv("MEMORY_POLICY_ENABLED", "true").lower() not in ("false", "0", "no")
+
+# Enable SRTM terrain downloads and the terrain overlay in the 3D coverage view.
+# Set to "false" on systems with limited storage (SRTM tiles are ~25 MB each;
+# a full 400 nm radius requires up to ~350 tiles).  When disabled, the terrain
+# button is hidden in the UI and no tile downloads or grid processing occur.
+TERRAIN_ENABLED: bool = os.getenv("TERRAIN_ENABLED", "true").lower() not in ("false", "0", "no")
