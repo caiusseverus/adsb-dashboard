@@ -811,7 +811,8 @@ export default function CoveragePage({ aircraft = [] }) {
     for (const obj of ref.terrainObjs) {
       ref.scene.remove(obj)
       obj.geometry.dispose()
-      obj.material.dispose()
+      // traverse disposes child materials too (e.g. depthMesh's MeshBasicMaterial)
+      obj.traverse(child => { if (child.material) child.material.dispose() })
     }
     ref.terrainObjs = []
     if (!showTerrain) {
@@ -850,7 +851,7 @@ export default function CoveragePage({ aircraft = [] }) {
       for (const obj of localMeshes) {
         if (r2) r2.scene.remove(obj)
         obj.geometry.dispose()
-        obj.material.dispose()
+        obj.traverse(child => { if (child.material) child.material.dispose() })
       }
       if (r2) r2.terrainObjs = r2.terrainObjs.filter(o => !localMeshes.includes(o))
     }

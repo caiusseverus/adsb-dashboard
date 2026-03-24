@@ -23,6 +23,7 @@ import os
 import sys
 import threading
 import urllib.request
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
@@ -106,24 +107,30 @@ def _sample_elev(shorts: tuple, n: int, tile_lat: int, tile_lon: int,
     return -1 if v == -32768 else v  # -1 = ocean/void; 0 = actual sea-level land
 
 
-# In-memory cache: {(lat, lon): (shorts_tuple, n) | (None, None)}
-_tile_cache: dict = {}
+# LRU tile cache — capped at 12 tiles (~300 MB) to prevent unbounded growth.
+# Each SRTM1 tile is ~25 MB (3601×3601 int16); a 400nm request loads ~20 tiles,
+# but tiles overlap between requests so 12 covers typical single-site usage.
+_TILE_CACHE_MAX = 12
+_tile_cache: OrderedDict = OrderedDict()
 
 
 def _get_tile(lat: int, lon: int) -> tuple[tuple | None, int | None]:
     key = (lat, lon)
-    if key in _tile_cache:          # fast path — no lock needed (GIL + read-only)
-        return _tile_cache[key]
     with _cache_lock:
-        if key in _tile_cache:      # double-check: another thread may have populated it
+        if key in _tile_cache:
+            # Move to end to mark as most-recently used
+            _tile_cache.move_to_end(key)
             return _tile_cache[key]
         path = _download_tile(lat, lon)
-        if path is None:
-            _tile_cache[key] = (None, None)
-        else:
-            shorts, n = _read_hgt(path)
-            _tile_cache[key] = (shorts, n)
-    return _tile_cache[key]
+        value = (None, None) if path is None else _read_hgt(path)
+        _tile_cache[key] = value
+        _tile_cache.move_to_end(key)
+        # Evict least-recently-used tile when over capacity
+        while len(_tile_cache) > _TILE_CACHE_MAX:
+            evicted = next(iter(_tile_cache))
+            del _tile_cache[evicted]
+            log.debug("Evicted SRTM tile %s from LRU cache", evicted)
+    return value
 
 
 def _build_grid_np(
