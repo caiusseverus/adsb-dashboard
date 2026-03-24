@@ -75,9 +75,9 @@ def _read_meminfo() -> dict[str, int]:
 
 
 def _level_idx_for_pct(pct: float) -> int:
-    """Return the index of the most-severe level whose min_pct_free <= pct."""
-    # Walk from most severe (last) to least severe (first); first match wins
-    for i in range(len(_LEVELS) - 1, -1, -1):
+    """Return the index of the least-severe level whose min_pct_free threshold pct meets."""
+    # Walk from least severe (normal) to most severe (critical); first match wins
+    for i in range(len(_LEVELS)):
         if pct >= _LEVELS[i][1]:
             return i
     return len(_LEVELS) - 1  # critical — shouldn't be reached

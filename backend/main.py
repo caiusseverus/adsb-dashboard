@@ -597,6 +597,20 @@ async def _hires_writer() -> None:
         hires_buffer.record(samples)
 
 
+def _apply_memory_policy(level: str) -> None:
+    policy = memory_policy.get_policy()
+    hires_buffer.set_policy(policy["hires_max_age_s"], policy["hires_interval_s"])
+    hires_buffer.prune_now()
+    new_timeout = config.AIRCRAFT_TIMEOUT // 2 if policy["halve_timeout"] else config.AIRCRAFT_TIMEOUT
+    state.set_timeout(new_timeout)
+    log.info(
+        "memory_policy applied: level=%s hires_age=%ds hires_interval=%ds "
+        "snapshot=%s aircraft_timeout=%ds",
+        level, policy["hires_max_age_s"], policy["hires_interval_s"],
+        policy["snapshot_mode"], new_timeout,
+    )
+
+
 async def _memory_guard() -> None:
     """Poll memory pressure every 10 s and apply policy to consumers.
 
@@ -605,30 +619,15 @@ async def _memory_guard() -> None:
     On de-escalation (improving): restores defaults after sustained readings
     (handled inside memory_policy.check() via hysteresis counter).
     """
-    prev_level = memory_policy.get_level()
+    prev_level = memory_policy.check()
+    _apply_memory_policy(prev_level)
     while True:
         await asyncio.sleep(10)
         new_level = memory_policy.check()
         if new_level == prev_level:
             continue
         prev_level = new_level
-
-        policy = memory_policy.get_policy()
-
-        # Apply hires buffer policy and force an immediate prune on escalation
-        hires_buffer.set_policy(policy["hires_max_age_s"], policy["hires_interval_s"])
-        hires_buffer.prune_now()
-
-        # Apply aircraft timeout policy
-        new_timeout = config.AIRCRAFT_TIMEOUT // 2 if policy["halve_timeout"] else config.AIRCRAFT_TIMEOUT
-        state.set_timeout(new_timeout)
-
-        log.info(
-            "memory_policy applied: level=%s hires_age=%ds hires_interval=%ds "
-            "snapshot=%s aircraft_timeout=%ds",
-            new_level, policy["hires_max_age_s"], policy["hires_interval_s"],
-            policy["snapshot_mode"], new_timeout,
-        )
+        _apply_memory_policy(new_level)
 
 
 # ---------------------------------------------------------------------------
