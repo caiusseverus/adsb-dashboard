@@ -73,6 +73,7 @@ _watchlist_cache: dict[str, float | None] = {}   # icao → max_range_nm
 
 # Route lookup queue: (visit_id, callsign) pairs awaiting adsbdb.com resolution
 _route_queue: deque[tuple[int, str]] = deque(maxlen=2000)
+_route_queue_drops: int = 0   # count of visits evicted before enrichment
 _watchlist_cache_ts: float = 0.0
 
 # Message decode queue — Beast/MLAT runners push raw messages here; a single
@@ -105,7 +106,7 @@ async def _beast_runner() -> None:
         try:
             _msg_queue.put_nowait((msg, None))
         except queue.Full:
-            pass  # drop oldest-equivalent: decoder is behind, discard this arrival
+            pass  # drop new: decoder is behind, discard this arrival
 
     client = BeastClient(config.BEAST_HOST, config.BEAST_PORT, on_message)
     await client.run()
@@ -429,6 +430,11 @@ async def _push_updates() -> None:
                 visit_ids = await asyncio.to_thread(stats_db.write_visits, tuples)
                 for ac, vid in zip(credible, visit_ids):
                     if ac.callsign:
+                        global _route_queue_drops
+                        if len(_route_queue) == _route_queue.maxlen:
+                            _route_queue_drops += 1
+                            log.warning("route enrichment queue full — drop #%d (visit %d %s)",
+                                        _route_queue_drops, vid, ac.callsign)
                         _route_queue.append((vid, ac.callsign))
 
         snapshot = state.get_snapshot()

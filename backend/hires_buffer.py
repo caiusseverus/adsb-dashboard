@@ -2,26 +2,37 @@
 High-resolution in-memory coverage track buffer.
 
 Stores aircraft position samples at HIRES_INTERVAL_S resolution for up to
-HIRES_MAX_AGE_S (24 hours).  Not persistent — data exists only while the
-process is running.  Intended to replace the 1-minute coverage_samples DB
-query for the timelapse player when data is available.
+HIRES_MAX_AGE_S.  Not persistent — data exists only while the process is
+running.  Intended to replace the 1-minute coverage_samples DB query for the
+timelapse player when data is available.
 
-Thread-safe: a single RLock guards all state.
+Thread-safe: a single Lock guards all state.
+
+Memory controls (both configurable via .env):
+  HIRES_MAX_AGE_S   — retention window (default 12 h)
+  HIRES_MAX_POINTS  — global hard cap on total stored points (default 500 k)
 """
 
+import logging
 import time
 import threading
 from collections import deque
 
+import config
 from db import StatsDB   # for _get_type_group_idx (staticmethod, no DB I/O)
 
-HIRES_INTERVAL_S = 10    # minimum seconds between samples for the same ICAO
-HIRES_MAX_AGE_S  = 86_400  # 24 hours
+log = logging.getLogger(__name__)
 
-_lock      = threading.Lock()
-_tracks:    dict[str, deque]  = {}   # icao → deque of (ts, bearing, range, alt)
-_meta:      dict[str, dict]   = {}   # icao → {military, interesting, type_code, type_category, operator, mlat}
-_last_ts:   dict[str, int]    = {}   # icao → last recorded ts (rate-limiter)
+HIRES_INTERVAL_S = 10                        # minimum seconds between samples for the same ICAO
+HIRES_MAX_AGE_S  = config.HIRES_MAX_AGE_S   # retention window
+HIRES_MAX_POINTS = config.HIRES_MAX_POINTS  # global point cap
+
+_lock         = threading.Lock()
+_tracks:      dict[str, deque] = {}   # icao → deque of (ts, bearing, range, alt)
+_meta:        dict[str, dict]  = {}   # icao → {military, interesting, type_code, type_category, operator, mlat}
+_last_ts:     dict[str, int]   = {}   # icao → last recorded ts (rate-limiter)
+_total_points: int = 0                # running total across all deques
+_cap_logged:   bool = False           # warn only once per cap episode
 
 
 def record(samples: list[tuple]) -> None:
@@ -33,8 +44,11 @@ def record(samples: list[tuple]) -> None:
 
     Silently ignores samples where the same ICAO was recorded fewer than
     HIRES_INTERVAL_S seconds ago.  Prunes entries older than HIRES_MAX_AGE_S
-    from each affected deque.
+    from each affected deque.  Drops new samples when the global point cap
+    is reached (oldest retained data stays until it ages out naturally).
     """
+    global _total_points, _cap_logged
+
     if not samples:
         return
     cutoff = int(time.time()) - HIRES_MAX_AGE_S
@@ -48,7 +62,26 @@ def record(samples: list[tuple]) -> None:
             if dq is None:
                 dq = deque()
                 _tracks[icao] = dq
+
+            # Prune aged-out entries first so the cap check sees the true count
+            while dq and dq[0][0] < cutoff:
+                dq.popleft()
+                _total_points -= 1
+
+            # Hard cap: drop this sample rather than growing without bound
+            if _total_points >= HIRES_MAX_POINTS:
+                if not _cap_logged:
+                    log.warning(
+                        "hires_buffer: global cap of %d points reached — "
+                        "new samples dropped until old data ages out",
+                        HIRES_MAX_POINTS,
+                    )
+                    _cap_logged = True
+                continue
+
+            _cap_logged = False  # reset warning once we're below the cap again
             dq.append((ts, bearing, range_nm, alt))
+            _total_points += 1
             _meta[icao] = {
                 "military":      bool(military),
                 "interesting":   bool(interesting),
@@ -57,9 +90,6 @@ def record(samples: list[tuple]) -> None:
                 "operator":      operator,
                 "mlat":          bool(mlat),
             }
-            # Prune the tail of this deque (oldest entries first)
-            while dq and dq[0][0] < cutoff:
-                dq.popleft()
 
         # Remove ICAOs whose deques have been fully pruned
         empty = [icao for icao, dq in _tracks.items() if not dq]
@@ -67,6 +97,17 @@ def record(samples: list[tuple]) -> None:
             del _tracks[icao]
             _meta.pop(icao, None)
             _last_ts.pop(icao, None)
+
+
+def stats() -> dict:
+    """Return current buffer statistics for observability."""
+    with _lock:
+        return {
+            "icao_count":   len(_tracks),
+            "total_points": _total_points,
+            "max_points":   HIRES_MAX_POINTS,
+            "max_age_s":    HIRES_MAX_AGE_S,
+        }
 
 
 def query_tracks(start_ts: int, end_ts: int) -> dict:

@@ -1,22 +1,25 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, lazy, Suspense } from 'react'
 import StatsBar from './components/StatsBar'
 import MlatScorecard from './components/MlatScorecard'
 import MessageRateChart from './components/MessageRateChart'
 import AircraftTable from './components/AircraftTable'
 import AircraftDetailPanel from './components/AircraftDetailPanel'
-import HistoryPage from './pages/HistoryPage'
-import ReceiverPage from './pages/ReceiverPage'
-import FleetPage from './pages/FleetPage'
-import CoveragePage from './pages/CoveragePage'
-import MapPage from './pages/MapPage'
-import FlowMapPage from './pages/FlowMapPage'
-import EventsPage from './pages/EventsPage'
-import SightingsPage from './pages/SightingsPage'
-import StatusPage from './pages/StatusPage'
-import SettingsPage from './pages/SettingsPage'
-import SkyView from './pages/SkyView'
-import PositionQualityPage from './pages/PositionQualityPage'
 import styles from './App.module.css'
+
+// Page modules are lazy-loaded so heavy dependencies (Leaflet, Three.js,
+// Recharts) are only fetched when the user first visits that tab.
+const HistoryPage        = lazy(() => import('./pages/HistoryPage'))
+const ReceiverPage       = lazy(() => import('./pages/ReceiverPage'))
+const FleetPage          = lazy(() => import('./pages/FleetPage'))
+const CoveragePage       = lazy(() => import('./pages/CoveragePage'))
+const MapPage            = lazy(() => import('./pages/MapPage'))
+const FlowMapPage        = lazy(() => import('./pages/FlowMapPage'))
+const EventsPage         = lazy(() => import('./pages/EventsPage'))
+const SightingsPage      = lazy(() => import('./pages/SightingsPage'))
+const StatusPage         = lazy(() => import('./pages/StatusPage'))
+const SettingsPage       = lazy(() => import('./pages/SettingsPage'))
+const SkyView            = lazy(() => import('./pages/SkyView'))
+const PositionQualityPage = lazy(() => import('./pages/PositionQualityPage'))
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 
@@ -166,18 +169,20 @@ export default function App() {
         </main>
       )}
 
-      {tab === 'map' && <MapPage snapshot={snapshot} onSelectIcao={setSelectedIcao} selectedIcao={selectedIcao} receiverPos={receiverPos} />}
-      {tab === 'history' && <HistoryPage snapshot={snapshot} />}
-      {tab === 'sightings' && <SightingsPage onSelectIcao={setSelectedIcao} notableRefreshKey={notableRefreshKey} />}
-      {tab === 'receiver' && <ReceiverPage snapshot={snapshot} />}
-      {tab === 'coverage' && <CoveragePage aircraft={snapshot.aircraft ?? []} />}
-      {tab === 'flow' && <FlowMapPage />}
-      {tab === 'fleet' && <FleetPage onSelectIcao={setSelectedIcao} />}
-      {tab === 'events' && <EventsPage onSelectIcao={setSelectedIcao} />}
-      {tab === 'sky' && <SkyView snapshot={snapshot} onSelectIcao={setSelectedIcao} />}
-      {tab === 'positionqa' && debugMode && <PositionQualityPage />}
-      {tab === 'status' && <StatusPage />}
-      {tab === 'settings' && <SettingsPage />}
+      <Suspense fallback={null}>
+        {tab === 'map' && <MapPage snapshot={snapshot} onSelectIcao={setSelectedIcao} selectedIcao={selectedIcao} receiverPos={receiverPos} />}
+        {tab === 'history' && <HistoryPage snapshot={snapshot} />}
+        {tab === 'sightings' && <SightingsPage onSelectIcao={setSelectedIcao} notableRefreshKey={notableRefreshKey} />}
+        {tab === 'receiver' && <ReceiverPage snapshot={snapshot} />}
+        {tab === 'coverage' && <CoveragePage aircraft={snapshot?.aircraft ?? []} />}
+        {tab === 'flow' && <FlowMapPage />}
+        {tab === 'fleet' && <FleetPage onSelectIcao={setSelectedIcao} />}
+        {tab === 'events' && <EventsPage onSelectIcao={setSelectedIcao} />}
+        {tab === 'sky' && <SkyView snapshot={snapshot} onSelectIcao={setSelectedIcao} />}
+        {tab === 'positionqa' && debugMode && <PositionQualityPage />}
+        {tab === 'status' && <StatusPage />}
+        {tab === 'settings' && <SettingsPage />}
+      </Suspense>
 
       {selectedIcao && (
         <AircraftDetailPanel

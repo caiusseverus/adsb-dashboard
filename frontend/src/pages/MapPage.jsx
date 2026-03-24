@@ -226,9 +226,15 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
               const dots = dotsMap.get(src)
               const seen = seenMap.get(src)
               const color = mlatSrcColor(src)
+              const MLAT_DOT_CAP = 200  // max markers per source per aircraft
               for (const [lat, lon] of pts) {
                 const key = `${lat},${lon}`
                 if (!seen.has(key)) {
+                  // Ring-buffer: evict oldest marker when cap reached
+                  if (dots.length >= MLAT_DOT_CAP) {
+                    const evicted = dots.shift()
+                    evicted.remove()
+                  }
                   seen.add(key)
                   dots.push(
                     L.circleMarker([lat, lon], {

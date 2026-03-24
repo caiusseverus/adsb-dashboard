@@ -168,3 +168,14 @@ READSB_AIRCRAFT_JSON_URL: str = os.getenv("READSB_AIRCRAFT_JSON_URL", "http://ad
 # Maximum range (nm) from the receiver for accepted ADS-B positions.
 # Mirrors readsb's receiver_range config; 300 nm is a typical ADS-B horizon.
 MAX_RANGE_NM: float = float(os.getenv("MAX_RANGE_NM", "300"))
+
+# ---------------------------------------------------------------------------
+# Hi-res timelapse buffer
+# ---------------------------------------------------------------------------
+# How long to retain in-memory position samples.  12 h is the default
+# (down from the original 24 h) to halve worst-case RAM usage.
+HIRES_MAX_AGE_S: int = int(os.getenv("HIRES_MAX_AGE_S", "43200"))
+# Hard cap on total points across all ICAOs.  When hit, new samples are
+# dropped until old data ages out.  500 k points ≈ 100–200 MB Python RSS
+# depending on GC pressure; reduce if running on a constrained device.
+HIRES_MAX_POINTS: int = int(os.getenv("HIRES_MAX_POINTS", "500000"))
