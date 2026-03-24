@@ -313,7 +313,7 @@ function buildEarthSphere() {
   const R_eff = R_NM / _altScale
   const geo = new THREE.SphereGeometry(R_eff, 72, 54)
   const mat = new THREE.MeshBasicMaterial({
-    color: 0x0c1a10,
+    color: 0x0b0c10,   // match scene background — curved/flat modes look identical
     polygonOffset: true,
     polygonOffsetFactor: 2,
     polygonOffsetUnits: 1,
