@@ -1203,7 +1203,23 @@ class AircraftState:
                 return
             _apply_hexdb_data(ac, data)
 
-    def get_snapshot(self) -> dict:
+    # Fields stripped in 'reduced' mode (elevated/high pressure).
+    # Diagnostic data not needed for core live display.
+    _REDUCED_DROP = frozenset({
+        "mlat_sources", "mlat_quality",
+        "pos_global", "pos_reliable_odd", "pos_reliable_even",
+        "acas_ra_desc", "acas_ra_corrective", "acas_threat_icao", "acas_sensitivity",
+    })
+
+    # Allowlist for 'thin' mode (critical pressure).
+    # Only fields required to render the live table and map.
+    _THIN_KEEP = frozenset({
+        "icao", "callsign", "lat", "lon", "altitude", "bearing_deg", "range_nm",
+        "signal", "msg_count", "military", "interesting", "mlat", "mlat_source",
+        "type_code", "operator", "age", "acas_ra_active", "squawk", "pos_confident",
+    })
+
+    def get_snapshot(self, mode: str = "full") -> dict:
         now = time.time()
         with self._lock:
             # Average msg/sec over the last 10 completed seconds
@@ -1321,6 +1337,18 @@ class AircraftState:
                     "pos_reliable_even":  ac.pos_reliable_even,
                     "pos_confident":      _pos_reliable(ac),
                 })
+
+            # Apply snapshot mode stripping outside the per-aircraft loop
+            # to keep the hot path clean.
+            if mode == "reduced":
+                for entry in aircraft_list:
+                    for key in self._REDUCED_DROP:
+                        entry.pop(key, None)
+            elif mode == "thin":
+                aircraft_list = [
+                    {k: v for k, v in entry.items() if k in self._THIN_KEEP}
+                    for entry in aircraft_list
+                ]
 
         return {
             "aircraft_count": len(aircraft_list),

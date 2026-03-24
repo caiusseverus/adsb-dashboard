@@ -35,7 +35,7 @@ from squawks import router as squawks_router
 import notifications
 import hires_buffer
 import memory_policy
-from status import router as status_router
+from status import router as status_router, register_runtime_stats
 from debug import router as debug_router
 from notify_settings import router as notify_settings_router
 import health as health_module
@@ -438,7 +438,8 @@ async def _push_updates() -> None:
                                         _route_queue_drops, vid, ac.callsign)
                         _route_queue.append((vid, ac.callsign))
 
-        snapshot = state.get_snapshot()
+        _snap_mode = memory_policy.get_policy()["snapshot_mode"] if config.MEMORY_POLICY_ENABLED else "full"
+        snapshot = state.get_snapshot(mode=_snap_mode)
 
         # Record track points (rate-limited to 1/5s per aircraft inside TrackStore)
         now = time.time()
@@ -697,6 +698,11 @@ async def lifespan(app: FastAPI):
     _bg(run_position_quality_checker(position_quality_module._checker))
     _bg(health_module.loop_lag_sampler())
     health_module.register_context(_msg_queue, _clients)
+    register_runtime_stats(lambda: {
+        "ws_clients":       len(_clients),
+        "route_queue_size": len(_route_queue),
+        "route_queue_drops": _route_queue_drops,
+    })
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",
              config.BEAST_HOST, config.BEAST_PORT)
 
