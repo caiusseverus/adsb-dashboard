@@ -34,6 +34,7 @@ from acas import router as acas_router
 from squawks import router as squawks_router
 import notifications
 import hires_buffer
+import memory_policy
 from status import router as status_router
 from debug import router as debug_router
 from notify_settings import router as notify_settings_router
@@ -595,6 +596,40 @@ async def _hires_writer() -> None:
         hires_buffer.record(samples)
 
 
+async def _memory_guard() -> None:
+    """Poll memory pressure every 10 s and apply policy to consumers.
+
+    On level escalation (worsening): immediately shrinks hires_buffer
+    retention and forces a prune, halves aircraft timeout if High/Critical.
+    On de-escalation (improving): restores defaults after sustained readings
+    (handled inside memory_policy.check() via hysteresis counter).
+    """
+    prev_level = memory_policy.get_level()
+    while True:
+        await asyncio.sleep(10)
+        new_level = memory_policy.check()
+        if new_level == prev_level:
+            continue
+        prev_level = new_level
+
+        policy = memory_policy.get_policy()
+
+        # Apply hires buffer policy and force an immediate prune on escalation
+        hires_buffer.set_policy(policy["hires_max_age_s"], policy["hires_interval_s"])
+        hires_buffer.prune_now()
+
+        # Apply aircraft timeout policy
+        new_timeout = config.AIRCRAFT_TIMEOUT // 2 if policy["halve_timeout"] else config.AIRCRAFT_TIMEOUT
+        state.set_timeout(new_timeout)
+
+        log.info(
+            "memory_policy applied: level=%s hires_age=%ds hires_interval=%ds "
+            "snapshot=%s aircraft_timeout=%ds",
+            new_level, policy["hires_max_age_s"], policy["hires_interval_s"],
+            policy["snapshot_mode"], new_timeout,
+        )
+
+
 # ---------------------------------------------------------------------------
 # App lifespan
 # ---------------------------------------------------------------------------
@@ -656,6 +691,8 @@ async def lifespan(app: FastAPI):
     _bg(_hexdb_task())
     _bg(_backup_runner())  # runs nightly; path resolved from DB/env at runtime
     _bg(_hires_writer())
+    if config.MEMORY_POLICY_ENABLED:
+        _bg(_memory_guard())
     _bg(_route_enricher())
     _bg(run_position_quality_checker(position_quality_module._checker))
     _bg(health_module.loop_lag_sampler())

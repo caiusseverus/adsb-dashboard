@@ -184,3 +184,8 @@ HIRES_MAX_POINTS: int = int(os.getenv("HIRES_MAX_POINTS", "500000"))
 # within this window are disconnected — prevents one stalled browser from
 # blocking the broadcast to all other clients.
 WS_SEND_TIMEOUT_S: float = float(os.getenv("WS_SEND_TIMEOUT_S", "2.0"))
+
+# Enable adaptive memory pressure policy (reads /proc/meminfo every 10 s).
+# Set to "false" to lock the system to normal/full-retention mode regardless
+# of available RAM.  Has no effect on non-Linux hosts.
+MEMORY_POLICY_ENABLED: bool = os.getenv("MEMORY_POLICY_ENABLED", "true").lower() not in ("false", "0", "no")

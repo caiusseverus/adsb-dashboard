@@ -1025,6 +1025,11 @@ class AircraftState:
                         ac.pos_reliable_even = 0.0
         return expired
 
+    def set_timeout(self, seconds: int) -> None:
+        """Update the aircraft expiry timeout (called by memory_guard on pressure changes)."""
+        with self._lock:
+            self._timeout = seconds
+
     def init_today(self, icaos: set[str], mil_icaos: set[str]) -> None:
         """Seed today's unique-aircraft sets from DB on startup (persistence across restarts)."""
         with self._lock:

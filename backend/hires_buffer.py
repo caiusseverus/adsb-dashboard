@@ -99,6 +99,44 @@ def record(samples: list[tuple]) -> None:
             _last_ts.pop(icao, None)
 
 
+def set_policy(max_age_s: int, interval_s: int) -> None:
+    """Update retention window and sampling interval (called by memory_guard).
+
+    Takes effect on the next record() call.  Call prune_now() immediately
+    after to free memory without waiting for the next recording cycle.
+    """
+    global HIRES_MAX_AGE_S, HIRES_INTERVAL_S
+    with _lock:
+        HIRES_MAX_AGE_S = max_age_s
+        HIRES_INTERVAL_S = interval_s
+
+
+def prune_now() -> int:
+    """Force an immediate age-based prune using the current HIRES_MAX_AGE_S.
+
+    Returns the number of points removed.  Called by memory_guard on
+    escalation so memory is freed without waiting for the next record() cycle.
+    """
+    global _total_points, _cap_logged
+    removed = 0
+    cutoff = int(time.time()) - HIRES_MAX_AGE_S
+    with _lock:
+        for dq in _tracks.values():
+            while dq and dq[0][0] < cutoff:
+                dq.popleft()
+                _total_points -= 1
+                removed += 1
+        # Clean up fully-emptied deques
+        empty = [icao for icao, dq in _tracks.items() if not dq]
+        for icao in empty:
+            del _tracks[icao]
+            _meta.pop(icao, None)
+            _last_ts.pop(icao, None)
+        if removed:
+            _cap_logged = False  # allow cap warning to fire again if needed
+    return removed
+
+
 def stats() -> dict:
     """Return current buffer statistics for observability."""
     with _lock:
@@ -107,6 +145,7 @@ def stats() -> dict:
             "total_points": _total_points,
             "max_points":   HIRES_MAX_POINTS,
             "max_age_s":    HIRES_MAX_AGE_S,
+            "interval_s":   HIRES_INTERVAL_S,
         }
 
 
