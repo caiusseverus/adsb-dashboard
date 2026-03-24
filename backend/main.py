@@ -29,7 +29,7 @@ from history import router as history_router
 from aircraft import router as aircraft_router
 from fleet import router as fleet_router
 from coverage import router as coverage_router
-from terrain import router as terrain_router
+from terrain import router as terrain_router, prewarm_cache as terrain_prewarm
 from acas import router as acas_router
 from squawks import router as squawks_router
 import notifications
@@ -673,6 +673,10 @@ async def lifespan(app: FastAPI):
         if enrichment.db.get_country_by_icao(icao)
     }
     await asyncio.to_thread(stats_db.fix_military_countries, corrections, config.HOME_COUNTRY)
+
+    # Pre-warm terrain grid so first client request is instant
+    if config.RECEIVER_LAT is not None and config.RECEIVER_LON is not None:
+        await asyncio.to_thread(terrain_prewarm, config.RECEIVER_LAT, config.RECEIVER_LON)
 
     global _decoder_thread
     _decoder_thread = _start_msg_processor()

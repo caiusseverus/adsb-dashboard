@@ -172,8 +172,10 @@ def _build_grid_np(
     pairs        = np.column_stack([tile_lat.ravel(), tile_lon.ravel()])
     unique_tiles = np.unique(pairs, axis=0)
 
-    for tlat_i, tlon_i in unique_tiles:
+    n_tiles = len(unique_tiles)
+    for ti, (tlat_i, tlon_i) in enumerate(unique_tiles, 1):
         tlat, tlon = int(tlat_i), int(tlon_i)
+        log.info("Terrain: tile %d/%d (%s)", ti, n_tiles, _tile_name(tlat, tlon))
         shorts, n = _get_tile(tlat, tlon)
         if shorts is None or n == 0:
             continue
@@ -352,3 +354,16 @@ async def terrain_grid(
             "X-Receiver-Lon":  str(meta["receiver_lon"]),
         },
     )
+
+
+def prewarm_cache(receiver_lat: float, receiver_lon: float,
+                  radius_nm: float = 400, grid_n: int = 512) -> None:
+    """Build and cache the standard-resolution terrain grid at startup.
+    No-op if the cache file already exists.  Called from main.py lifespan."""
+    cache = _cache_path(receiver_lat, receiver_lon, radius_nm, grid_n, 0)
+    if cache.exists():
+        log.info("Terrain cache already present: %s", cache.name)
+        return
+    log.info("Pre-warming terrain grid %dx%d r=%.0fnm — this may take a while on first run",
+             grid_n, grid_n, radius_nm)
+    _build(receiver_lat, receiver_lon, radius_nm, grid_n, 0)

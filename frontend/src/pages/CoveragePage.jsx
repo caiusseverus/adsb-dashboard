@@ -306,6 +306,23 @@ function buildLiveDots(trails, colorMode, operators, typeCodes) {
   }))
 }
 
+// Opaque earth sphere for curved mode — occludes aircraft/coastline behind the horizon.
+// R_eff matches the coordinate system: receiver at y=0, earth centre at y=-R_eff.
+// polygonOffset pushes it fractionally behind terrain/grid at the same depth.
+function buildEarthSphere() {
+  const R_eff = R_NM / _altScale
+  const geo = new THREE.SphereGeometry(R_eff, 72, 54)
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0x0c1a10,
+    polygonOffset: true,
+    polygonOffsetFactor: 2,
+    polygonOffsetUnits: 1,
+  })
+  const mesh = new THREE.Mesh(geo, mat)
+  mesh.position.set(0, -R_eff, 0)
+  return mesh
+}
+
 // Range ring — uses toWorld so it curves correctly in curved mode
 function makeRing(radius) {
   const pts = []
@@ -674,7 +691,7 @@ export default function CoveragePage({ aircraft = [] }) {
     }
     window.addEventListener('resize', onResize)
 
-    sceneRef.current = { scene, camera, renderer, controls, pointsObj: null, trailsObj: null, liveDotsObj: null, coastlineObj: null, airportsLargeObj: null, airportsMediumObj: null, terrainObjs: [], altAxisObj: altAxis, gridObjs: initialGridObjs }
+    sceneRef.current = { scene, camera, renderer, controls, pointsObj: null, trailsObj: null, liveDotsObj: null, coastlineObj: null, airportsLargeObj: null, airportsMediumObj: null, terrainObjs: [], earthObj: null, altAxisObj: altAxis, gridObjs: initialGridObjs }
 
     return () => {
       cancelAnimationFrame(rafId)
@@ -769,6 +786,17 @@ export default function CoveragePage({ aircraft = [] }) {
     if (!ref) return
     // Rings + spokes
     ref.gridObjs = rebuildGridObjects(ref.scene, ref.gridObjs ?? [])
+    // Earth sphere — opaque globe in curved mode so objects behind the horizon are occluded
+    if (ref.earthObj) {
+      ref.scene.remove(ref.earthObj)
+      ref.earthObj.geometry.dispose()
+      ref.earthObj.material.dispose()
+      ref.earthObj = null
+    }
+    if (_curveMode) {
+      ref.earthObj = buildEarthSphere()
+      ref.scene.add(ref.earthObj)
+    }
     // Coastline — rebuild from stored segments so no re-fetch needed
     const segs = coastlineDataRef.current
     if (segs?.length) {
