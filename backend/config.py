@@ -179,3 +179,8 @@ HIRES_MAX_AGE_S: int = int(os.getenv("HIRES_MAX_AGE_S", "43200"))
 # dropped until old data ages out.  500 k points ≈ 100–200 MB Python RSS
 # depending on GC pressure; reduce if running on a constrained device.
 HIRES_MAX_POINTS: int = int(os.getenv("HIRES_MAX_POINTS", "500000"))
+
+# Per-client WebSocket send timeout.  Clients that can't accept a payload
+# within this window are disconnected — prevents one stalled browser from
+# blocking the broadcast to all other clients.
+WS_SEND_TIMEOUT_S: float = float(os.getenv("WS_SEND_TIMEOUT_S", "2.0"))

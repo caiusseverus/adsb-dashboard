@@ -537,19 +537,21 @@ async def _push_updates() -> None:
             continue
 
         payload = _json_dumps(snapshot)
-        dead: list[WebSocket] = []
 
-        for ws in list(_clients):
+        async def _send_one(ws: WebSocket) -> WebSocket | None:
             try:
-                await ws.send_text(payload)
+                await asyncio.wait_for(ws.send_text(payload), timeout=config.WS_SEND_TIMEOUT_S)
+                return None
             except Exception:
-                dead.append(ws)
+                return ws
 
-        for ws in dead:
-            try:
-                _clients.remove(ws)
-            except ValueError:
-                pass
+        results = await asyncio.gather(*[_send_one(ws) for ws in list(_clients)])
+        for ws in results:
+            if ws is not None:
+                try:
+                    _clients.remove(ws)
+                except ValueError:
+                    pass
 
         t_done = time.perf_counter()
         _push_timings_store.append({
@@ -559,6 +561,7 @@ async def _push_updates() -> None:
             "broadcast_ms": round((t_done - t_gather_end) * 1000, 2),
             "total_ms":     round((t_done - t_loop_start) * 1000, 2),
             "ac_count":     len(snapshot["aircraft"]),
+            "payload_bytes": len(payload),
         })
 
 
