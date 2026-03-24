@@ -292,12 +292,32 @@ def _cleanup_stale_cache(lat: float, lon: float) -> None:
                 log.warning("Could not remove stale terrain cache %s: %s", f.name, exc)
 
 
+def _migrate_hgt_files() -> None:
+    """Compress any uncompressed .hgt tiles left over from before this change."""
+    for hgt in _TERRAIN_DIR.glob("*.hgt"):
+        gz_path = hgt.with_name(hgt.name + '.gz')
+        if gz_path.exists():
+            hgt.unlink()
+            continue
+        try:
+            log.info("Compressing SRTM tile %s", hgt.stem)
+            compressed = gzip.compress(hgt.read_bytes())
+            tmp = gz_path.with_name(gz_path.name + '.tmp')
+            tmp.write_bytes(compressed)
+            os.replace(tmp, gz_path)
+            hgt.unlink()
+            log.info("Compressed %s → %s (%.0f KB)", hgt.name, gz_path.name, len(compressed) / 1024)
+        except OSError as exc:
+            log.warning("Could not compress %s: %s", hgt.name, exc)
+
+
 def _ensure_cleanup(lat: float, lon: float) -> None:
     key = (round(lat, 5), round(lon, 5))
     with _cleanup_lock:
         if key in _cleanup_done:
             return
         _cleanup_stale_cache(lat, lon)
+        _migrate_hgt_files()
         _cleanup_done.add(key)
 
 
