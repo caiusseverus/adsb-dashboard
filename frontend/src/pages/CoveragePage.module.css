@@ -228,3 +228,51 @@
   font-size: 0.72rem;
   color: #f85149;
 }
+
+/* Operator / type filter (input + datalist autocomplete) */
+.searchGroup { display: flex; align-items: center; }
+
+.searchInput {
+  background: #0b0c10;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  color: #c9d1d9;
+  font-size: 0.72rem;
+  padding: 0.15rem 0.5rem;
+  width: 130px;
+}
+.searchInput:focus { outline: none; border-color: #388bfd; }
+.searchInput::placeholder { color: #484f58; }
+
+.filterLabel {
+  font-size: 0.72rem;
+  color: #388bfd;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.clearBtn {
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  border: 1px solid #f85149;
+  background: transparent;
+  color: #f85149;
+  cursor: pointer;
+}
+.clearBtn:hover { background: rgba(248, 81, 73, 0.1); }
+
+/* Scene parameter sliders (altitude scale, curvature) */
+.sliderLabel {
+  font-size: 0.72rem;
+  color: #484f58;
+  white-space: nowrap;
+  min-width: 4ch;
+}
+
+.sceneSlider {
+  width: 72px;
+  accent-color: #388bfd;
+  cursor: pointer;
+  vertical-align: middle;
+}

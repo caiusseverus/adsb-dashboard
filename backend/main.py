@@ -29,6 +29,7 @@ from history import router as history_router
 from aircraft import router as aircraft_router
 from fleet import router as fleet_router
 from coverage import router as coverage_router
+from terrain import router as terrain_router
 from acas import router as acas_router
 from squawks import router as squawks_router
 import notifications
@@ -703,6 +704,7 @@ mlat_module._state = state
 app.include_router(mlat_router)
 app.include_router(fleet_router)
 app.include_router(coverage_router)
+app.include_router(terrain_router)
 app.include_router(acas_router)
 app.include_router(squawks_router)
 app.include_router(status_router)

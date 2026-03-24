@@ -2226,22 +2226,54 @@ class StatsDB:
             return StatsDB._TYPE_GROUP_BY_CODE.get(type_code.upper(), 8)
         return 8
 
-    def query_coverage_points(self, days: int = 30, max_points: int = 40000) -> dict:
+    def query_coverage_points(
+        self, days: int = 30, max_points: int = 40000,
+        military: bool | None = None,
+        operator: str | None = None,
+        type_codes: list[str] | None = None,
+        type_category_prefix: str | None = None,
+    ) -> dict:
         """Return downsampled coverage_samples joined with aircraft_registry flags.
 
-        Each point: [bearing_deg, range_nm, altitude_ft, military, interesting, op_idx, tg_idx]
+        Each point: [bearing_deg, range_nm, altitude_ft, military, interesting, op_idx, tg_idx, tc_idx]
         op_idx 0–9 = top-10 operators by point count; 10 = other/unknown.
         tg_idx 0–7 = TYPE_GROUPS index; 8 = other/unknown.
-        Returns 'operators': list of operator names; 'type_groups': list of group labels.
+        tc_idx 0–9 = top-10 type codes by point count; 10 = other/unknown.
+        When military, operator, type_codes, or type_category_prefix is set, stride is skipped.
         """
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        flag_clause = " AND COALESCE(ar.military, 0) = 1" if military else ""
+        op_clause   = " AND ar.operator = ?"           if operator  else ""
+
+        # Type filter: exact code list (IN) or category prefix (LIKE)
+        type_extra_params: list = []
+        if type_codes:
+            placeholders = ",".join("?" * len(type_codes))
+            tc_clause = f" AND ar.type_code IN ({placeholders})"
+            type_extra_params = list(type_codes)
+        elif type_category_prefix:
+            tc_clause = " AND ar.type_category LIKE ?"
+            type_extra_params = [type_category_prefix + "%"]
+        else:
+            tc_clause = ""
+
         with self._connect() as conn:
-            total = conn.execute("""
-                SELECT COUNT(*) FROM coverage_samples
-                WHERE ts >= ? AND altitude IS NOT NULL AND range_nm > 0 AND altitude > 0
-            """, (cutoff,)).fetchone()[0]
-            stride = max(1, -(-total // max_points))
-            rows = conn.execute("""
+            if military or operator or type_codes or type_category_prefix:
+                stride = 1
+            else:
+                total = conn.execute(f"""
+                    SELECT COUNT(*) FROM coverage_samples cs
+                    LEFT JOIN aircraft_registry ar ON cs.icao = ar.icao
+                    WHERE cs.ts >= ? AND cs.altitude IS NOT NULL
+                      AND cs.range_nm > 0 AND cs.altitude > 0{flag_clause}
+                """, (cutoff,)).fetchone()[0]
+                stride = max(1, -(-total // max_points))
+            params: list = [cutoff]
+            if operator:
+                params.append(operator)
+            params.extend(type_extra_params)
+            params.append(stride)
+            rows = conn.execute(f"""
                 SELECT cs.bearing_deg,
                        cs.range_nm,
                        cs.altitude,
@@ -2255,17 +2287,22 @@ class StatsDB:
                 WHERE cs.ts >= ?
                   AND cs.altitude  IS NOT NULL
                   AND cs.range_nm  > 0
-                  AND cs.altitude  > 0
+                  AND cs.altitude  > 0{flag_clause}{op_clause}{tc_clause}
                   AND (cs.rowid % ?) = 0
-            """, (cutoff, stride)).fetchall()
+            """, params).fetchall()
 
-        # Top-10 operators by point count for compact colour index
+        # Top-10 operators and top-10 type codes by point count for compact colour indices
         op_counts: dict[str, int] = {}
+        tc_counts: dict[str, int] = {}
         for r in rows:
             if r["operator"]:
                 op_counts[r["operator"]] = op_counts.get(r["operator"], 0) + 1
-        top_ops = [op for op, _ in sorted(op_counts.items(), key=lambda x: -x[1])[:10]]
+            if r["type_code"]:
+                tc_counts[r["type_code"]] = tc_counts.get(r["type_code"], 0) + 1
+        top_ops  = [op for op, _ in sorted(op_counts.items(), key=lambda x: -x[1])[:10]]
+        top_tcs  = [tc for tc, _ in sorted(tc_counts.items(), key=lambda x: -x[1])[:10]]
         op_idx_map = {op: i for i, op in enumerate(top_ops)}
+        tc_idx_map = {tc: i for i, tc in enumerate(top_tcs)}
 
         TYPE_GROUP_LABELS = [
             'Widebody', 'Narrowbody', 'Regional', 'Biz Jet',
@@ -2275,12 +2312,14 @@ class StatsDB:
         return {
             "count":       len(rows),
             "operators":   top_ops,
+            "type_codes":  top_tcs,
             "type_groups": TYPE_GROUP_LABELS,
             "points": [
                 [round(r["bearing_deg"], 1), round(r["range_nm"], 1),
                  int(r["altitude"]), int(r["military"]), int(r["interesting"]),
                  op_idx_map.get(r["operator"], 10),
-                 self._get_type_group_idx(r["type_code"], r["type_category"])]
+                 self._get_type_group_idx(r["type_code"], r["type_category"]),
+                 tc_idx_map.get(r["type_code"], 10)]
                 for r in rows
             ],
         }
@@ -2329,6 +2368,7 @@ class StatsDB:
                     "military":    bool(r["military"]),
                     "interesting": bool(r["interesting"]),
                     "tg_idx":      self._get_type_group_idx(r["type_code"], r["type_category"]),
+                    "type_code":   r["type_code"],
                     "operator":    r["operator"],
                 }
 

@@ -59,6 +59,16 @@ _rlat = os.getenv("RECEIVER_LAT")
 _rlon = os.getenv("RECEIVER_LON")
 RECEIVER_LAT: Optional[float] = float(_rlat) if _rlat else None
 RECEIVER_LON: Optional[float] = float(_rlon) if _rlon else None
+def _parse_alt_ft(val: str) -> float:
+    """Parse altitude: '32m' → feet, '106ft' → feet, bare number → feet."""
+    v = val.strip().lower()
+    if v.endswith('m'):
+        return float(v[:-1]) * 3.28084
+    if v.endswith('ft'):
+        return float(v[:-2])
+    return float(v)
+
+RECEIVER_ALT_FT: float = _parse_alt_ft(os.getenv("RECEIVER_ALT_FT", "0"))
 
 # DEBUG_ENRICHMENT: 0=off, 1=all (enrichment + ACAS), 2=ACAS only
 # Accepts integer (0/1/2) or boolean-style string (true/false)

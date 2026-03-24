@@ -98,6 +98,7 @@ def query_tracks(start_ts: int, end_ts: int) -> dict:
             "military":    m.get("military",    False),
             "interesting": m.get("interesting", False),
             "tg_idx":      tg_idx,
+            "type_code":   m.get("type_code"),
             "operator":    m.get("operator"),
             "points":      window,
         })

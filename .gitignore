@@ -2,8 +2,8 @@
 memory/
 MEMORY.md
 CLAUDE.md
-IMPROVEMENTS.md
-stage*.md
+docs/superpowers/
+docs/development/
 
 # Environment files
 .env

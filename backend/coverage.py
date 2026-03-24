@@ -13,6 +13,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 from db import stats_db
+import config
 
 # ── Coastline helpers ────────────────────────────────────────────────────────
 
@@ -163,13 +164,26 @@ async def coverage_flow(
 
 @router.get("/points")
 async def coverage_points(
-    days:       int = Query(default=30,     ge=1,    le=365),
-    max_points: int = Query(default=100000, ge=10000, le=500000),
+    days:                 int        = Query(default=30,     ge=1,    le=365),
+    max_points:           int        = Query(default=100000, ge=10000, le=500000),
+    military:             bool       = Query(default=False),
+    operator:             str | None = Query(default=None),
+    type_codes:           str | None = Query(default=None),   # comma-separated
+    type_category_prefix: str | None = Query(default=None),   # e.g. "H" for rotary
 ) -> dict:
     """Downsampled coverage points for the 3-D coverage view.
-    Returns flat list-of-lists [bearing_deg, range_nm, altitude_ft, military, interesting]
-    to minimise payload size."""
-    return await asyncio.to_thread(stats_db.query_coverage_points, days, max_points)
+    military, operator, type_codes, or type_category_prefix filters return all
+    matching points unsampled (stride=1)."""
+    tc_list = [c.strip() for c in type_codes.split(",") if c.strip()] if type_codes else None
+    result = await asyncio.to_thread(
+        stats_db.query_coverage_points, days, max_points,
+        True if military else None,
+        operator or None,
+        tc_list or None,
+        type_category_prefix or None,
+    )
+    result["receiver_alt_ft"] = config.RECEIVER_ALT_FT
+    return result
 
 
 @router.get("/coastline")

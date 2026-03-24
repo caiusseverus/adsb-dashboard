@@ -3,9 +3,17 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import styles from './CoveragePage.module.css'
 import { NAMED_PALETTE, TYPE_GROUPS, TYPE_GROUP_OTHER_COLOR, getTypeGroup } from '../utils/typeGroups'
+import { buildTerrainMesh } from '../utils/terrain'
 
-const VERT_EXAG     = 8
+// ── Mutable rendering parameters — updated before each redraw ────────────────
+// Module-level so all builder functions (buildPoints, buildTrails, etc.) share them
+// without parameter threading. Only one CoveragePage mounts at a time.
+let _altScale  = 8       // vertical exaggeration (replaces VERT_EXAG)
+let _curveMode = false   // true = spherical ECEF, false = flat ENU
+// Curvature k is always equal to _altScale so horizon crossing matches reality
+
 const FEET_PER_NM   = 6076.115
+const R_NM          = 3440.065   // Earth radius in NM
 const ALT_SCALE_FT  = 45000   // fixed colour scale ceiling — not data-driven
 
 // Maximum trail points kept per aircraft (~10 min at 1 Hz)
@@ -101,13 +109,45 @@ function altColor(alt_ft) {
 }
 
 // [bearing_deg, range_nm, alt_ft] → Three.js world coords
-function toWorld(bearing_deg, range_nm, alt_ft) {
+// Reads _altScale, _curveMode — update those before calling buildPoints etc.
+
+function _toWorldFlat(bearing_deg, range_nm, alt_ft) {
   const rad = bearing_deg * Math.PI / 180
   return [
     range_nm * Math.sin(rad),
-    (alt_ft / FEET_PER_NM) * VERT_EXAG,
+    (alt_ft / FEET_PER_NM) * _altScale,
     -range_nm * Math.cos(rad),   // negate: North (0°) → −Z, into scene
   ]
+}
+
+function _toWorldCurved(bearing_deg, range_nm, alt_ft) {
+  const R_eff  = R_NM / _altScale   // k = altScale: correct relative horizon crossing
+  const gc_rad = range_nm / R_eff
+  const bRad   = bearing_deg * Math.PI / 180
+  const sin_gc = Math.sin(gc_rad)
+  const cos_gc = Math.cos(gc_rad)
+  const r = R_eff + (alt_ft / FEET_PER_NM) * _altScale   // scale before unit-vector multiply
+  return [
+    r * sin_gc * Math.sin(bRad),
+    r * cos_gc - R_eff,            // receiver surface = y=0
+    -r * sin_gc * Math.cos(bRad),
+  ]
+}
+
+function toWorld(bearing_deg, range_nm, alt_ft) {
+  return _curveMode
+    ? _toWorldCurved(bearing_deg, range_nm, alt_ft)
+    : _toWorldFlat(bearing_deg, range_nm, alt_ft)
+}
+
+// Helper: altitude axis line (rebuilt when altScale changes)
+function makeAltAxis() {
+  const altTopY = (ALT_SCALE_FT / FEET_PER_NM) * _altScale + 5
+  const geo = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0, 0, 0),
+    new THREE.Vector3(0, altTopY, 0),
+  ])
+  return new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0x484f58 }))
 }
 
 // Build a Points object from (already-filtered) raw point data + colour mode
@@ -117,7 +157,7 @@ function buildPoints(points, colorMode) {
   const colors    = new Float32Array(n * 3)
 
   for (let i = 0; i < n; i++) {
-    const [bearing, range, alt, military, interesting, op_idx, tg_idx] = points[i]
+    const [bearing, range, alt, military, interesting, op_idx, tg_idx, tc_idx] = points[i]
     const [x, y, z] = toWorld(bearing, range, alt)
     positions[i * 3]     = x
     positions[i * 3 + 1] = y
@@ -128,6 +168,8 @@ function buildPoints(points, colorMode) {
       col = altColor(alt)
     } else if (colorMode === 'operator') {
       col = (op_idx != null && op_idx < 10) ? C_OP_PALETTE[op_idx] : C_OP_OTHER
+    } else if (colorMode === 'type_code') {
+      col = (tc_idx != null && tc_idx < 10) ? C_OP_PALETTE[tc_idx] : C_OP_OTHER
     } else if (colorMode === 'type_group') {
       col = (tg_idx != null && tg_idx < 8) ? C_TG_PALETTE[tg_idx] : C_TG_OTHER
     } else {
@@ -158,12 +200,18 @@ function buildPoints(points, colorMode) {
 // Altitude mode is handled per-vertex in buildTrails; this covers the rest.
 // Shared colour function for live aircraft dots/trails and timelapse tracks.
 // obj may be a live aircraft snapshot or a timelapse track — both shapes supported.
-function pointColor(obj, colorMode, operators = []) {
+function pointColor(obj, colorMode, operators = [], typeCodes = []) {
   if (colorMode === 'type_group') {
     // Timelapse tracks carry pre-computed tg_idx; live aircraft have type_code/category
     if (obj.tg_idx != null) return obj.tg_idx < 8 ? C_TG_PALETTE[obj.tg_idx] : C_TG_OTHER
     const g = getTypeGroup(obj.type_code, obj.type_category)
     return g ? new THREE.Color(g.color) : C_TG_OTHER
+  }
+  if (colorMode === 'type_code') {
+    // History points carry pre-computed tc_idx; live aircraft carry type_code string
+    const idx = obj.tc_idx != null ? obj.tc_idx
+              : obj.type_code ? typeCodes.indexOf(obj.type_code) : -1
+    return (idx >= 0 && idx < 10) ? C_OP_PALETTE[idx] : C_OP_OTHER
   }
   if (colorMode === 'operator') {
     // History points carry pre-computed op_idx; live aircraft carry operator string
@@ -180,7 +228,7 @@ function pointColor(obj, colorMode, operators = []) {
 }
 
 // Build merged LineSegments for all live aircraft trails
-function buildTrails(trails, colorMode, operators) {
+function buildTrails(trails, colorMode, operators, typeCodes) {
   let totalSegs = 0
   for (const pts of Object.values(trails)) {
     if (pts.length < 2) continue
@@ -197,7 +245,7 @@ function buildTrails(trails, colorMode, operators) {
   for (const pts of Object.values(trails)) {
     if (pts.length < 2) continue
     // For non-altitude modes, one colour per aircraft (from last point)
-    const acCol = colorMode !== 'altitude' ? pointColor(pts[pts.length - 1], colorMode, operators) : null
+    const acCol = colorMode !== 'altitude' ? pointColor(pts[pts.length - 1], colorMode, operators, typeCodes) : null
 
     for (let i = 0; i < pts.length - 1; i++) {
       const a = pts[i], b = pts[i + 1]
@@ -227,7 +275,7 @@ function buildTrails(trails, colorMode, operators) {
 }
 
 // Build a Points object with one bright dot at each aircraft's current position
-function buildLiveDots(trails, colorMode, operators) {
+function buildLiveDots(trails, colorMode, operators, typeCodes) {
   const entries = Object.values(trails).filter(pts => pts.length > 0)
   if (entries.length === 0) return null
 
@@ -242,7 +290,7 @@ function buildLiveDots(trails, colorMode, operators) {
     positions[i * 3 + 1] = y
     positions[i * 3 + 2] = z
     const col = colorMode === 'altitude' ? altColor(last.alt ?? 0)
-              : pointColor(last, colorMode, operators)
+              : pointColor(last, colorMode, operators, typeCodes)
     colors[i * 3]     = col.r
     colors[i * 3 + 1] = col.g
     colors[i * 3 + 2] = col.b
@@ -258,12 +306,13 @@ function buildLiveDots(trails, colorMode, operators) {
   }))
 }
 
-// Ground-plane range ring — brighter than before
+// Range ring — uses toWorld so it curves correctly in curved mode
 function makeRing(radius) {
   const pts = []
   for (let i = 0; i <= 128; i++) {
-    const a = (i / 128) * Math.PI * 2
-    pts.push(new THREE.Vector3(Math.sin(a) * radius, 0, Math.cos(a) * radius))
+    const bearing = (i / 128) * 360
+    const [x, y, z] = toWorld(bearing, radius, 0)
+    pts.push(new THREE.Vector3(x, y, z))
   }
   return new THREE.Line(
     new THREE.BufferGeometry().setFromPoints(pts),
@@ -271,16 +320,33 @@ function makeRing(radius) {
   )
 }
 
-// Cardinal spoke
+// Cardinal spoke — subdivided so it follows Earth's curve in curved mode
 function makeSpoke(bearing_deg, length) {
-  const rad = bearing_deg * Math.PI / 180
+  const STEPS = 32
+  const pts = []
+  for (let i = 0; i <= STEPS; i++) {
+    const r = (i / STEPS) * length
+    const [x, y, z] = toWorld(bearing_deg, r, 0)
+    pts.push(new THREE.Vector3(x, y, z))
+  }
   return new THREE.Line(
-    new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(0, 0, 0),
-      new THREE.Vector3(Math.sin(rad) * length, 0, -Math.cos(rad) * length),
-    ]),
+    new THREE.BufferGeometry().setFromPoints(pts),
     new THREE.LineBasicMaterial({ color: 0x30363d }),
   )
+}
+
+// Rebuild all ring + spoke objects into the scene; dispose old ones first.
+// Returns array of the new objects so they can be tracked in sceneRef.gridObjs.
+function rebuildGridObjects(scene, existingObjs) {
+  for (const obj of existingObjs) {
+    scene.remove(obj)
+    obj.geometry.dispose()
+    obj.material.dispose()
+  }
+  const objs = []
+  for (let r = 50; r <= 250; r += 50) { const o = makeRing(r); scene.add(o); objs.push(o) }
+  for (const b of [0, 90, 180, 270]) { const o = makeSpoke(b, 270); scene.add(o); objs.push(o) }
+  return objs
 }
 
 // Canvas-texture sprite for compass labels
@@ -307,10 +373,10 @@ function buildCoastline(segments) {
   const positions = new Float32Array(segments.length * 6)
   let idx = 0
   for (const [b1, r1, b2, r2] of segments) {
-    const [x0, , z0] = toWorld(b1, r1, 0)
-    const [x1, , z1] = toWorld(b2, r2, 0)
-    positions[idx++] = x0; positions[idx++] = 0; positions[idx++] = z0
-    positions[idx++] = x1; positions[idx++] = 0; positions[idx++] = z1
+    const [x0, y0, z0] = toWorld(b1, r1, 0)
+    const [x1, y1, z1] = toWorld(b2, r2, 0)
+    positions[idx++] = x0; positions[idx++] = y0; positions[idx++] = z0
+    positions[idx++] = x1; positions[idx++] = y1; positions[idx++] = z1
   }
   const geo = new THREE.BufferGeometry()
   geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
@@ -339,9 +405,9 @@ function buildAirports(airports) {
   // Dots — single Points object for all airports
   const positions = new Float32Array(airports.length * 3)
   airports.forEach((ap, i) => {
-    const [x, , z] = toWorld(ap.bearing, ap.range_nm, 0)
+    const [x, y, z] = toWorld(ap.bearing, ap.range_nm, 0)
     positions[i * 3]     = x
-    positions[i * 3 + 1] = 0.5  // slightly above ground to avoid z-fighting with coastline
+    positions[i * 3 + 1] = y + 0.5  // slightly above surface (curved or flat)
     positions[i * 3 + 2] = z
   })
   const geo = new THREE.BufferGeometry()
@@ -366,8 +432,8 @@ function buildAirports(airports) {
     const sprite = new THREE.Sprite(
       new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), transparent: true }),
     )
-    const [x, , z] = toWorld(ap.bearing, ap.range_nm, 0)
-    sprite.position.set(x + 2, 3, z)   // offset slightly right of dot, float above ground
+    const [x, y, z] = toWorld(ap.bearing, ap.range_nm, 0)
+    sprite.position.set(x + 2, y + 3, z)  // offset right of dot, float above surface
     sprite.scale.set(16, 3, 1)
     group.add(sprite)
   })
@@ -442,12 +508,30 @@ export default function CoveragePage({ aircraft = [] }) {
   const [fetchedN,     setFetchedN]     = useState(0)
   const [shownN,       setShownN]       = useState(0)
   const [operators,    setOperators]    = useState([])
+  const [typeCodes,    setTypeCodes]    = useState([])
+  const allOperatorsRef = useRef([])   // full operator list from options endpoint; drives datalist
+  const [selectedOperator,  setSelectedOperator]  = useState('')
+  const [opInput,           setOpInput]           = useState('')
+  const [selectedTypeGroup, setSelectedTypeGroup] = useState('')  // TYPE_GROUPS value
+  const [selectedTypeCode,  setSelectedTypeCode]  = useState('')  // exact ICAO type code
+  const [tcInput,           setTcInput]           = useState('')
+  const allTypeCodesRef = useRef([])   // full type code list from options endpoint
+
+  // Colour mode overrides when a filter narrows to one operator or one type:
+  //  operator selected → colour by type_code (fleet composition)
+  //  type filter active → colour by operator (which operators fly this type)
+  const effectiveColorMode =
+    (colorMode === 'operator' && selectedOperator) ? 'type_code' :
+    (colorMode === 'type_group' && (selectedTypeGroup || selectedTypeCode)) ? 'operator' :
+    colorMode
   const [showCoastline, setShowCoastline] = useState(true)
   const showCoastlineRef = useRef(true)  // avoids stale closure in fetch callback
   const [showAirportsLarge,  setShowAirportsLarge]  = useState(true)
   const [showAirportsMedium, setShowAirportsMedium] = useState(false)
   const showAirportsLargeRef  = useRef(true)
   const showAirportsMediumRef = useRef(false)
+  const airportsLargeDataRef  = useRef(null)   // raw airport arrays for rebuild on mode change
+  const airportsMediumDataRef = useRef(null)
 
   // ── Timelapse state ──────────────────────────────────────────────────
   const [tlActive,  setTlActive]  = useState(false)
@@ -472,7 +556,34 @@ export default function CoveragePage({ aircraft = [] }) {
   const tlIsLiveRef    = useRef(true)   // mirrors tlIsLive for use in RAF/timeout closures
   const colorModeRef   = useRef('type_group')
   const tlActiveRef    = useRef(false)  // mirrors tlActive for use in non-reactive closures
-  const tlOperatorsRef = useRef([])     // top-10 operators from loaded timelapse data
+  const tlOperatorsRef  = useRef([])   // top-10 operators from loaded timelapse window
+  const tlTypeCodesRef  = useRef([])   // top-10 type codes from loaded timelapse window
+  // Filter refs — kept in sync with state so renderTlFrame ([] deps) can read them
+  const tlFilterOpRef   = useRef('')   // mirrors selectedOperator
+  const tlFilterTcRef   = useRef('')   // mirrors selectedTypeCode
+  const tlFilterTgRef   = useRef('')   // mirrors selectedTypeGroup
+  const coastlineDataRef = useRef(null) // raw segments for coastline rebuild on mode change
+
+  // ── Filter state (military — fetches unsampled subset) ──────────────
+  const [militaryOnly, setMilitaryOnly] = useState(false)
+  // ── Receiver view state ──────────────────────────────────────────────
+  const [receiverView,   setReceiverView]   = useState(false)
+  const recvAzRef  = useRef(0)    // look azimuth degrees (0 = north)
+  const recvElRef  = useRef(3)    // look elevation degrees above horizon
+  // Center-cell terrain elevation in metres — populated by terrain fetch, 0 when no terrain
+  const terrainCenterElevMRef = useRef(0)
+  // When non-null, the RAF animate loop applies receiver camera instead of controls.update()
+  const receiverCamRef = useRef(null)
+
+  // ── Terrain / coordinate-mode state ─────────────────────────────────
+  const [showTerrain,  setShowTerrain]  = useState(false)
+  const [terrainWire,  setTerrainWire]  = useState(false)
+  const terrainWireRef = useRef(false)   // ref so async terrain fetch reads current value
+  const [terrainHiRes, setTerrainHiRes] = useState(false)
+  const [curveMode,    setCurveMode]    = useState(false)
+  const [altScale,     setAltScale]     = useState(8)
+  // sceneVersion bumps to force a full redraw when coordinate params change
+  const [sceneVersion, setSceneVersion] = useState(0)
 
   // ── Initialise Three.js (once) ──────────────────────────────────────
   useEffect(() => {
@@ -482,6 +593,12 @@ export default function CoveragePage({ aircraft = [] }) {
 
     const scene    = new THREE.Scene()
     scene.background = new THREE.Color(0x0b0c10)
+
+    // Lighting for terrain (MeshLambertMaterial). Points use MeshBasicMaterial so unaffected.
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0)
+    dirLight.position.set(1, 3, 1)   // high-angle sun from NE
+    scene.add(dirLight)
+    scene.add(new THREE.AmbientLight(0x404050, 0.7))  // fill so shadowed faces aren't black
 
     const camera = new THREE.PerspectiveCamera(50, W / H, 0.1, 5000)
     camera.position.set(0, 90, 260)
@@ -499,8 +616,7 @@ export default function CoveragePage({ aircraft = [] }) {
     controls.maxDistance   = 800
     controls.update()
 
-    for (let r = 50; r <= 250; r += 50) scene.add(makeRing(r))
-    for (const b of [0, 90, 180, 270]) scene.add(makeSpoke(b, 270))
+    const initialGridObjs = rebuildGridObjects(scene, [])
 
     const LR = 278
     scene.add(makeLabel('N',    0, -LR))
@@ -508,14 +624,8 @@ export default function CoveragePage({ aircraft = [] }) {
     scene.add(makeLabel('E',  LR,    0))
     scene.add(makeLabel('W', -LR,    0))
 
-    const altTopY = (ALT_SCALE_FT / FEET_PER_NM) * VERT_EXAG
-    scene.add(new THREE.Line(
-      new THREE.BufferGeometry().setFromPoints([
-        new THREE.Vector3(0, 0, 0),
-        new THREE.Vector3(0, altTopY + 5, 0),
-      ]),
-      new THREE.LineBasicMaterial({ color: 0x484f58 }),
-    ))
+    const altAxis = makeAltAxis()
+    scene.add(altAxis)
 
     // Update the 2D compass rose to match the camera's horizontal azimuth.
     // Direct DOM manipulation (not React state) to avoid a re-render every frame.
@@ -528,7 +638,29 @@ export default function CoveragePage({ aircraft = [] }) {
     updateCompass()  // set correct initial rotation
 
     let rafId
-    const animate = () => { rafId = requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera) }
+    const animate = () => {
+      rafId = requestAnimationFrame(animate)
+      const rc = receiverCamRef.current
+      if (rc) {
+        // Receiver view: same altScale× coordinate space as aircraft and terrain.
+        // Camera y = (terrain_elev + 10 ft) * altScale — both scale together so
+        // the receiver always sits 10-ft*altScale above the terrain surface.
+        // An aircraft is above the camera whenever alt_ft > terrain_elev_ft + 10,
+        // which is true for any aircraft genuinely above the receiver location.
+        const recvY = (Math.max(0, terrainCenterElevMRef.current) / 1852 + 10 / FEET_PER_NM) * _altScale
+        const az = rc.az * Math.PI / 180
+        const el = rc.el * Math.PI / 180
+        camera.position.set(0, recvY, 0)
+        camera.lookAt(
+          Math.sin(az) * Math.cos(el) * 5000,
+          recvY + Math.sin(el) * 5000,
+          -Math.cos(az) * Math.cos(el) * 5000,
+        )
+      } else {
+        controls.update()
+      }
+      renderer.render(scene, camera)
+    }
     animate()
 
     const onResize = () => {
@@ -539,7 +671,7 @@ export default function CoveragePage({ aircraft = [] }) {
     }
     window.addEventListener('resize', onResize)
 
-    sceneRef.current = { scene, camera, renderer, controls, pointsObj: null, trailsObj: null, liveDotsObj: null, coastlineObj: null, airportsLargeObj: null, airportsMediumObj: null }
+    sceneRef.current = { scene, camera, renderer, controls, pointsObj: null, trailsObj: null, liveDotsObj: null, coastlineObj: null, airportsLargeObj: null, airportsMediumObj: null, terrainObjs: [], altAxisObj: altAxis, gridObjs: initialGridObjs }
 
     return () => {
       cancelAnimationFrame(rafId)
@@ -551,13 +683,15 @@ export default function CoveragePage({ aircraft = [] }) {
     }
   }, [])
 
-  // ── Fetch and render coastline once ─────────────────────────────────
+  // ── Fetch coastline once, rebuild geometry when coordinate mode changes ─
   useEffect(() => {
     fetch('/api/coverage/coastline')
       .then(r => r.ok ? r.json() : null)
       .then(data => {
+        if (!data?.segments?.length) return
+        coastlineDataRef.current = data.segments   // store for rebuilds
         const ref = sceneRef.current
-        if (!ref || !data?.segments?.length) return
+        if (!ref) return
         const obj = buildCoastline(data.segments)
         if (!obj) return
         obj.visible = showCoastlineRef.current
@@ -569,12 +703,14 @@ export default function CoveragePage({ aircraft = [] }) {
 
   // ── Fetch and render airports (large + medium fetched separately) ────
   useEffect(() => {
-    function fetchLayer(types, refKey, visibleRef) {
+    function fetchLayer(types, refKey, dataRef, visibleRef) {
       fetch(`/api/coverage/airports?types=${types}`)
         .then(r => r.ok ? r.json() : null)
         .then(data => {
+          if (!data?.airports?.length) return
+          dataRef.current = data.airports   // store for rebuild on mode change
           const ref = sceneRef.current
-          if (!ref || !data?.airports?.length) return
+          if (!ref) return
           const obj = buildAirports(data.airports)
           if (!obj) return
           obj.visible = visibleRef.current
@@ -583,12 +719,197 @@ export default function CoveragePage({ aircraft = [] }) {
         })
         .catch(() => {})
     }
-    fetchLayer('large_airport',  'airportsLargeObj',  showAirportsLargeRef)
-    fetchLayer('medium_airport', 'airportsMediumObj', showAirportsMediumRef)
+    fetchLayer('large_airport',  'airportsLargeObj',  airportsLargeDataRef,  showAirportsLargeRef)
+    fetchLayer('medium_airport', 'airportsMediumObj', airportsMediumDataRef, showAirportsMediumRef)
   }, [])  // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Keep colorModeRef in sync for the timelapse RAF loop ────────────
-  useEffect(() => { colorModeRef.current = colorMode }, [colorMode])
+  // ── Keep colorModeRef + filter refs in sync for the timelapse RAF loop ─
+  useEffect(() => { colorModeRef.current = effectiveColorMode }, [effectiveColorMode])
+  useEffect(() => { tlFilterOpRef.current = selectedOperator  }, [selectedOperator])
+  useEffect(() => { tlFilterTcRef.current = selectedTypeCode  }, [selectedTypeCode])
+  useEffect(() => { tlFilterTgRef.current = selectedTypeGroup }, [selectedTypeGroup])
+
+  // ── Sync coordinate mode into module-level vars, bump scene version ──
+  // Must update module vars BEFORE setSceneVersion so redraw sees new values.
+  const bumpScene = useCallback((newAltScale, newCurveMode) => {
+    _altScale  = newAltScale
+    _curveMode = newCurveMode
+    setSceneVersion(v => v + 1)
+  }, [])
+
+  // ── Extend camera far plane in curved mode (scene extends much further) ─
+  useEffect(() => {
+    const ref = sceneRef.current
+    if (!ref) return
+    _curveMode = curveMode
+    ref.camera.far = curveMode ? 20000 : 5000
+    ref.camera.updateProjectionMatrix()
+  }, [curveMode])
+
+  // ── Rebuild altitude axis when altScale changes ──────────────────────
+  useEffect(() => {
+    const ref = sceneRef.current
+    if (!ref?.altAxisObj) return
+    ref.scene.remove(ref.altAxisObj)
+    ref.altAxisObj.geometry.dispose()
+    ref.altAxisObj.material.dispose()
+    const newAxis = makeAltAxis()
+    ref.scene.add(newAxis)
+    ref.altAxisObj = newAxis
+  }, [altScale])
+
+  // ── Rebuild rings/spokes and coastline when coordinate mode changes ──
+  // (sceneVersion bumps whenever altScale or curveMode change)
+  useEffect(() => {
+    const ref = sceneRef.current
+    if (!ref) return
+    // Rings + spokes
+    ref.gridObjs = rebuildGridObjects(ref.scene, ref.gridObjs ?? [])
+    // Coastline — rebuild from stored segments so no re-fetch needed
+    const segs = coastlineDataRef.current
+    if (segs?.length) {
+      if (ref.coastlineObj) {
+        ref.scene.remove(ref.coastlineObj)
+        ref.coastlineObj.geometry.dispose()
+        ref.coastlineObj.material.dispose()
+      }
+      const obj = buildCoastline(segs)
+      if (obj) {
+        obj.visible = showCoastlineRef.current
+        ref.scene.add(obj)
+        ref.coastlineObj = obj
+      }
+    }
+    // Airports — rebuild so positions follow curved/flat coordinate change
+    function rebuildAirportLayer(refKey, dataRef, visRef) {
+      const existing = ref[refKey]
+      if (existing) {
+        ref.scene.remove(existing)
+        existing.traverse(child => {
+          if (child.geometry) child.geometry.dispose()
+          if (child.material) { child.material.map?.dispose(); child.material.dispose() }
+        })
+      }
+      const airports = dataRef.current
+      if (airports?.length) {
+        const obj = buildAirports(airports)
+        if (obj) { obj.visible = visRef.current; ref.scene.add(obj); ref[refKey] = obj }
+      }
+    }
+    rebuildAirportLayer('airportsLargeObj',  airportsLargeDataRef,  showAirportsLargeRef)
+    rebuildAirportLayer('airportsMediumObj', airportsMediumDataRef, showAirportsMediumRef)
+  }, [sceneVersion])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Terrain: fetch LOD zones when showTerrain toggles or scene redraws ─
+  useEffect(() => {
+    const ref = sceneRef.current
+    if (!ref) return
+    // Dispose all existing terrain meshes tracked from previous runs
+    for (const obj of ref.terrainObjs) {
+      ref.scene.remove(obj)
+      obj.geometry.dispose()
+      obj.material.dispose()
+    }
+    ref.terrainObjs = []
+    if (!showTerrain) {
+      terrainCenterElevMRef.current = 0
+      return
+    }
+
+    // Single uniform grid — consistent resolution across full 400nm radius
+    let cancelled = false
+    const localMeshes = []   // meshes added by this effect run, for cleanup on cancel
+    ;(async () => {
+      try {
+        const gridN = terrainHiRes ? 2048 : 512
+        const resp = await fetch(`/api/terrain/grid?radius_nm=400&grid_n=${gridN}&min_radius_nm=0`)
+        if (!resp.ok || cancelled) return
+        const data = await resp.json()
+        if (cancelled) return
+        const r2 = sceneRef.current
+        if (!r2) return
+        // Store center-cell elevation for receiver-view camera floor
+        const ci = Math.floor(data.grid_n / 2) * data.grid_n + Math.floor(data.grid_n / 2)
+        terrainCenterElevMRef.current = Math.max(0, data.elevations[ci] ?? 0)
+        const mesh = buildTerrainMesh(data, _altScale, _curveMode, _altScale)
+        mesh.material.wireframe = terrainWireRef.current
+        r2.scene.add(mesh)
+        r2.terrainObjs.push(mesh)
+        localMeshes.push(mesh)
+      } catch {
+        // terrain is optional — degrade silently on download failure
+      }
+    })()
+    return () => {
+      cancelled = true
+      // Remove any meshes added before cancellation
+      const r2 = sceneRef.current
+      for (const obj of localMeshes) {
+        if (r2) r2.scene.remove(obj)
+        obj.geometry.dispose()
+        obj.material.dispose()
+      }
+      if (r2) r2.terrainObjs = r2.terrainObjs.filter(o => !localMeshes.includes(o))
+    }
+  }, [showTerrain, terrainHiRes, sceneVersion])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Terrain wireframe toggle (no rebuild needed) ─────────────────────
+  useEffect(() => {
+    terrainWireRef.current = terrainWire
+    const ref = sceneRef.current
+    if (!ref) return
+    for (const obj of ref.terrainObjs) obj.material.wireframe = terrainWire
+  }, [terrainWire])
+
+  // ── Receiver view — fixed camera at receiver, mouse look ─────────────
+  // receiverCamRef drives the RAF loop: non-null = receiver view active.
+  // The RAF reads it every frame so controls.update() is bypassed entirely —
+  // no damping residual can override the camera orientation.
+  useEffect(() => {
+    const ref = sceneRef.current
+    if (!ref) return
+
+    if (!receiverView) {
+      receiverCamRef.current = null
+      ref.controls.enabled = true
+      ref.camera.position.set(0, 90, 260)
+      ref.controls.target.set(0, 25, 0)
+      ref.controls.update()
+      return
+    }
+
+    ref.controls.enabled = false
+    // Initialise cam state; RAF picks it up next frame
+    receiverCamRef.current = {
+      az: recvAzRef.current,
+      el: recvElRef.current,
+    }
+
+    let lastX = 0, lastY = 0, dragging = false
+    function onDown(e) { dragging = true; lastX = e.clientX; lastY = e.clientY }
+    function onMove(e) {
+      if (!dragging) return
+      recvAzRef.current = (recvAzRef.current + (e.clientX - lastX) * 0.3) % 360
+      recvElRef.current = Math.max(-85, Math.min(85, recvElRef.current - (e.clientY - lastY) * 0.2))
+      lastX = e.clientX; lastY = e.clientY
+      // Update the ref the RAF reads — camera applied next frame
+      receiverCamRef.current = {
+        az: recvAzRef.current,
+        el: recvElRef.current,
+      }
+    }
+    function onUp() { dragging = false }
+
+    const canvas = ref.renderer.domElement
+    canvas.addEventListener('mousedown', onDown)
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup',   onUp)
+    return () => {
+      canvas.removeEventListener('mousedown', onDown)
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup',   onUp)
+    }
+  }, [receiverView])  // sceneVersion intentionally excluded — RAF reads _altScale live
 
   // ── Timelapse: render one frame into pre-allocated geometries ────────
   const renderTlFrame = useCallback((dt) => {
@@ -606,7 +927,19 @@ export default function CoveragePage({ aircraft = [] }) {
     let di = 0   // dot vertex index
     let ti = 0   // trail segment index
 
+    const filterOp = tlFilterOpRef.current
+    const filterTc = tlFilterTcRef.current
+    const filterTg = tlFilterTgRef.current
+
     for (const track of data.tracks) {
+      // Apply active filter — skip non-matching tracks
+      if (filterOp && track.operator !== filterOp) continue
+      if (filterTc && track.type_code !== filterTc) continue
+      if (filterTg) {
+        const tgIdx = TYPE_GROUPS.findIndex(g => g.value === filterTg)
+        if (tgIdx >= 0 && track.tg_idx !== tgIdx) continue
+      }
+
       const pts    = track.points
       const lastPt = pts[pts.length - 1]
       const si     = findSegIdx(pts, dt)
@@ -624,7 +957,7 @@ export default function CoveragePage({ aircraft = [] }) {
       if (di >= TL_MAX_AC) break
       const [x, y, z] = toWorld(bearing, range, alt)
       dp[di * 3] = x; dp[di * 3 + 1] = y; dp[di * 3 + 2] = z
-      const col = mode === 'altitude' ? altColor(alt) : pointColor(track, mode, tlOperatorsRef.current)
+      const col = mode === 'altitude' ? altColor(alt) : pointColor(track, mode, tlOperatorsRef.current, tlTypeCodesRef.current)
       dc[di * 3] = col.r; dc[di * 3 + 1] = col.g; dc[di * 3 + 2] = col.b
       di++
 
@@ -633,7 +966,7 @@ export default function CoveragePage({ aircraft = [] }) {
       // seamlessly. Each step emits one segment [prev, current]; interior points
       // are not duplicated in memory — they're computed and forwarded as "prev".
       const anchor = Math.floor(dt / TRAIL_INTERVAL_S) * TRAIL_INTERVAL_S
-      const acCol  = mode === 'altitude' ? null : pointColor(track, mode, tlOperatorsRef.current)
+      const acCol  = mode === 'altitude' ? null : pointColor(track, mode, tlOperatorsRef.current, tlTypeCodesRef.current)
       let sd = si
       let prevX = x, prevY = y, prevZ = z
       let prevFR = col.r, prevFG = col.g, prevFB = col.b   // lead is full brightness
@@ -826,10 +1159,14 @@ export default function CoveragePage({ aircraft = [] }) {
         const minDt = data.tracks.length > 0
           ? Math.min(...data.tracks.map(t => t.points[0]?.[0] ?? 0))
           : 0
-        // Compute top-10 operators from this timelapse window for operator colour mode
-        const tlOpCounts = {}
-        for (const t of data.tracks) if (t.operator) tlOpCounts[t.operator] = (tlOpCounts[t.operator] || 0) + 1
+        // Compute top-10 operators and type codes from this timelapse window
+        const tlOpCounts = {}, tlTcCounts = {}
+        for (const t of data.tracks) {
+          if (t.operator)  tlOpCounts[t.operator]  = (tlOpCounts[t.operator]  || 0) + 1
+          if (t.type_code) tlTcCounts[t.type_code] = (tlTcCounts[t.type_code] || 0) + 1
+        }
         tlOperatorsRef.current = Object.entries(tlOpCounts).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([op]) => op)
+        tlTypeCodesRef.current = Object.entries(tlTcCounts).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([tc]) => tc)
 
         tlDataRef.current        = data
         tlStartDtRef.current     = minDt
@@ -910,19 +1247,33 @@ export default function CoveragePage({ aircraft = [] }) {
     if (tlActiveRef.current) obj.visible = false   // keep hidden if timelapse is active
   }, [])
 
-  // ── Fetch when days or maxPoints changes ────────────────────────────
+  // ── Fetch when days / maxPoints / militaryOnly / selectedOperator changes ──
   useEffect(() => {
     let cancelled = false
     setLoadingPhase('fetching')
     setError(null)
 
-    fetch(`/api/coverage/points?days=${days}&max_points=${maxPoints}`)
+    const milParam = militaryOnly ? '&military=true' : ''
+    const opParam  = selectedOperator ? `&operator=${encodeURIComponent(selectedOperator)}` : ''
+    let typeParam = ''
+    if (selectedTypeCode) {
+      typeParam = `&type_codes=${encodeURIComponent(selectedTypeCode)}`
+    } else if (selectedTypeGroup) {
+      const grp = TYPE_GROUPS.find(g => g.value === selectedTypeGroup)
+      if (grp) {
+        typeParam = grp.category
+          ? `&type_category_prefix=${encodeURIComponent(grp.category)}`
+          : `&type_codes=${encodeURIComponent(grp.types.join(','))}`
+      }
+    }
+    fetch(`/api/coverage/points?days=${days}&max_points=${maxPoints}${milParam}${opParam}${typeParam}`)
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() })
-      .then(({ points, operators: ops, type_groups: tgs }) => {
+      .then(({ points, operators: ops, type_codes: tcs, type_groups: tgs }) => {
         if (cancelled) return
         pendingRef.current = { points, ops, tgs }
         setFetchedN(points.length)
         setOperators(ops ?? [])
+        setTypeCodes(tcs ?? [])
         // Transition to 'rendering' so React can paint the "Building scene…" message
         // before the synchronous buffer-build blocks the main thread.
         setLoadingPhase('rendering')
@@ -931,7 +1282,7 @@ export default function CoveragePage({ aircraft = [] }) {
 
     return () => { cancelled = true }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [days, maxPoints])
+  }, [days, maxPoints, militaryOnly, selectedOperator, selectedTypeGroup, selectedTypeCode])
 
   // ── After 'rendering' phase is painted, do the expensive buffer build ──
   useEffect(() => {
@@ -941,7 +1292,7 @@ export default function CoveragePage({ aircraft = [] }) {
 
     const id = setTimeout(() => {
       dataRef.current = pending.points
-      redraw(pending.points, colorMode, showMode)
+      redraw(pending.points, effectiveColorMode, showMode)
       setLoadingPhase(null)
     }, 30)   // 30 ms gives React time to paint the "Building scene…" message
 
@@ -951,8 +1302,8 @@ export default function CoveragePage({ aircraft = [] }) {
 
   // ── Re-colour / re-filter from stored data (no fetch) ───────────────
   useEffect(() => {
-    if (dataRef.current.length) redraw(dataRef.current, colorMode, showMode)
-  }, [colorMode, showMode, redraw])
+    if (dataRef.current.length) redraw(dataRef.current, effectiveColorMode, showMode)
+  }, [colorMode, effectiveColorMode, showMode, sceneVersion, redraw])
 
   // ── Accumulate live aircraft trails ─────────────────────────────────
   useEffect(() => {
@@ -1025,12 +1376,37 @@ export default function CoveragePage({ aircraft = [] }) {
       if (trail.length > MAX_TRAIL_PTS) trail.splice(0, trail.length - MAX_TRAIL_PTS)
     }
 
-    // Compute top-10 operators from currently live aircraft for trail colouring.
-    // Using live aircraft rather than the history-derived `operators` state ensures
-    // operator mode works even before coverage history is loaded.
-    const opCounts = {}
-    for (const ac of aircraft) if (ac.operator) opCounts[ac.operator] = (opCounts[ac.operator] || 0) + 1
+    // Filter live trails to match the active operator/type filter.
+    let filteredTrails = trails
+    if (selectedOperator) {
+      filteredTrails = Object.fromEntries(Object.entries(trails).filter(([, pts]) =>
+        pts.length > 0 && pts[pts.length - 1].operator === selectedOperator))
+    } else if (selectedTypeCode) {
+      filteredTrails = Object.fromEntries(Object.entries(trails).filter(([, pts]) =>
+        pts.length > 0 && pts[pts.length - 1].type_code === selectedTypeCode))
+    } else if (selectedTypeGroup) {
+      const grp = TYPE_GROUPS.find(g => g.value === selectedTypeGroup)
+      if (grp) {
+        filteredTrails = Object.fromEntries(Object.entries(trails).filter(([, pts]) => {
+          if (!pts.length) return false
+          const last = pts[pts.length - 1]
+          return grp.category
+            ? last.type_category?.startsWith(grp.category)
+            : grp.types.includes(last.type_code)
+        }))
+      }
+    }
+
+    // Compute top-10 operators and type codes from visible live aircraft for colouring.
+    const opCounts = {}, tcCounts = {}
+    for (const pts of Object.values(filteredTrails)) {
+      if (!pts.length) continue
+      const last = pts[pts.length - 1]
+      if (last.operator)  opCounts[last.operator]  = (opCounts[last.operator]  || 0) + 1
+      if (last.type_code) tcCounts[last.type_code]  = (tcCounts[last.type_code] || 0) + 1
+    }
     const liveOps = Object.entries(opCounts).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([op]) => op)
+    const liveTcs = Object.entries(tcCounts).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([tc]) => tc)
 
     // Rebuild trail lines and current-position dots
     const { scene } = ref
@@ -1046,11 +1422,11 @@ export default function CoveragePage({ aircraft = [] }) {
       ref.liveDotsObj.material.dispose()
       ref.liveDotsObj = null
     }
-    const mesh = buildTrails(trails, colorMode, liveOps)
+    const mesh = buildTrails(filteredTrails, effectiveColorMode, liveOps, liveTcs)
     if (mesh) { scene.add(mesh); ref.trailsObj = mesh; if (tlActiveRef.current) mesh.visible = false }
-    const dots = buildLiveDots(trails, colorMode, liveOps)
+    const dots = buildLiveDots(filteredTrails, effectiveColorMode, liveOps, liveTcs)
     if (dots) { scene.add(dots); ref.liveDotsObj = dots; if (tlActiveRef.current) dots.visible = false }
-  }, [aircraft, showMode, colorMode])
+  }, [aircraft, showMode, colorMode, effectiveColorMode, selectedOperator, selectedTypeGroup, selectedTypeCode, sceneVersion])
 
   const toggleCoastline = useCallback(() => {
     const v = !showCoastlineRef.current
@@ -1087,6 +1463,17 @@ export default function CoveragePage({ aircraft = [] }) {
     ref.camera.position.set(0, 90, 260)
     ref.controls.target.set(0, 25, 0)
     ref.controls.update()
+  }, [])
+
+  // ── Load full operator + type code lists once for autocomplete datalists ─
+  useEffect(() => {
+    fetch('/api/history/heatmap/options')
+      .then(r => r.json())
+      .then(d => {
+        allOperatorsRef.current = [...d.operators].sort()
+        allTypeCodesRef.current = [...d.types].sort()
+      })
+      .catch(() => {})
   }, [])
 
   const isTagMode = colorMode === 'tag'
@@ -1130,6 +1517,69 @@ export default function CoveragePage({ aircraft = [] }) {
           <button className={colorMode === 'tag'        ? styles.btnActive : styles.btn} onClick={() => setColorMode('tag')}>By tag</button>
         </div>
 
+        {/* Type filters — visible when "By type" colour mode is active */}
+        {colorMode === 'type_group' && (<>
+          {(selectedTypeGroup || selectedTypeCode) ? (
+            <span className={styles.filterLabel}>
+              {selectedTypeGroup
+                ? TYPE_GROUPS.find(g => g.value === selectedTypeGroup)?.label
+                : selectedTypeCode}
+            </span>
+          ) : (<>
+            <select
+              className={styles.searchInput}
+              value={selectedTypeGroup}
+              onChange={e => { setSelectedTypeGroup(e.target.value); setSelectedTypeCode(''); setTcInput('') }}
+            >
+              <option value="">— Type group —</option>
+              {TYPE_GROUPS.map(g => <option key={g.value} value={g.value}>{g.label}</option>)}
+            </select>
+            <div className={styles.searchGroup}>
+              <input
+                className={styles.searchInput}
+                list="cov-tc-list"
+                placeholder="Filter type…"
+                value={tcInput}
+                onChange={e => setTcInput(e.target.value)}
+                onBlur={e  => { const v = e.target.value.trim().toUpperCase(); if (v) { setSelectedTypeCode(v); setSelectedTypeGroup(''); setTcInput('') } }}
+                onKeyDown={e => { if (e.key === 'Enter') { const v = tcInput.trim().toUpperCase(); if (v) { setSelectedTypeCode(v); setSelectedTypeGroup(''); setTcInput('') } } }}
+              />
+              <datalist id="cov-tc-list">
+                {allTypeCodesRef.current.map(t => <option key={t} value={t} />)}
+              </datalist>
+            </div>
+          </>)}
+          {(selectedTypeGroup || selectedTypeCode) && (
+            <button className={styles.clearBtn} onClick={() => { setSelectedTypeGroup(''); setSelectedTypeCode(''); setTcInput('') }}>Clear</button>
+          )}
+        </>)}
+
+        {/* Operator filter — visible when "By operator" colour mode is active */}
+        {colorMode === 'operator' && (<>
+          {selectedOperator
+            ? <span className={styles.filterLabel}>Operator: {selectedOperator}</span>
+            : (
+              <div className={styles.searchGroup}>
+                <input
+                  className={styles.searchInput}
+                  list="cov-op-list"
+                  placeholder="Filter operator…"
+                  value={opInput}
+                  onChange={e => setOpInput(e.target.value)}
+                  onBlur={e  => { const v = e.target.value.trim(); if (v) { setSelectedOperator(v); setOpInput('') } }}
+                  onKeyDown={e => { if (e.key === 'Enter') { const v = opInput.trim(); if (v) { setSelectedOperator(v); setOpInput('') } } }}
+                />
+                <datalist id="cov-op-list">
+                  {allOperatorsRef.current.map(o => <option key={o} value={o} />)}
+                </datalist>
+              </div>
+            )
+          }
+          {selectedOperator && (
+            <button className={styles.clearBtn} onClick={() => { setSelectedOperator(''); setOpInput('') }}>Clear</button>
+          )}
+        </>)}
+
         <div className={styles.sep} />
 
         {/* Show mode */}
@@ -1139,11 +1589,51 @@ export default function CoveragePage({ aircraft = [] }) {
           <button className={showMode === 'live'    ? styles.btnActive : styles.btn} onClick={() => setShowMode('live')}>Live</button>
         </div>
 
+        {/* Filter: military-only requery */}
+        <button className={militaryOnly ? styles.btnActive : styles.btn}
+          onClick={() => setMilitaryOnly(v => !v)}>Military</button>
+        <div className={styles.sep} />
+
         <button className={styles.resetBtn} onClick={resetCamera}>Reset view</button>
         <button className={showCoastline ? styles.btnActive : styles.btn} onClick={toggleCoastline}>Coastline</button>
         <button className={showAirportsLarge  ? styles.btnActive : styles.btn} onClick={toggleAirportsLarge}>Airports</button>
         <button className={showAirportsMedium ? styles.btnActive : styles.btn} onClick={toggleAirportsMedium}>Med</button>
         <div className={styles.sep} />
+
+        {/* Terrain */}
+        <button className={showTerrain ? styles.btnActive : styles.btn}
+          onClick={() => setShowTerrain(v => !v)}>Terrain</button>
+        {showTerrain && (<>
+          <button className={terrainWire ? styles.btnActive : styles.btn}
+            onClick={() => setTerrainWire(v => !v)}>Wire</button>
+          <button className={terrainHiRes ? styles.btnActive : styles.btn}
+            onClick={() => setTerrainHiRes(v => !v)}>Hi</button>
+        </>)}
+        <div className={styles.sep} />
+
+        {/* Curved Earth */}
+        <button className={curveMode ? styles.btnActive : styles.btn}
+          onClick={() => {
+            const next = !curveMode
+            setCurveMode(next)
+            _curveMode = next
+            bumpScene(_altScale, next)
+          }}>Curved</button>
+        <div className={styles.sep} />
+
+        {/* Altitude scale slider */}
+        <span className={styles.sliderLabel}>Alt ×{altScale}</span>
+        <input type="range" className={styles.sceneSlider}
+          min="1" max="20" step="1" value={altScale}
+          onChange={e => {
+            const v = +e.target.value
+            setAltScale(v)
+            _altScale = v
+            bumpScene(v, _curveMode)
+          }} />
+
+        <div className={styles.sep} />
+
         <button className={tlActive ? styles.btnActive : styles.btn} onClick={() => setTlActive(v => !v)}>Timelapse</button>
       </div>
 
@@ -1221,7 +1711,7 @@ export default function CoveragePage({ aircraft = [] }) {
       </div>
 
       <div className={styles.legend}>
-        {isTgMode ? (
+        {isTgMode && !(selectedTypeGroup || selectedTypeCode) ? (
           <>
             {TYPE_GROUPS.map((g) => (
               <span key={g.value} className={styles.legendItem}>
@@ -1229,6 +1719,18 @@ export default function CoveragePage({ aircraft = [] }) {
               </span>
             ))}
             <span className={styles.legendItem}><span className={styles.dot} style={{ background: TYPE_GROUP_OTHER_COLOR }} />Other</span>
+          </>
+        ) : isTgMode && (selectedTypeGroup || selectedTypeCode) ? (
+          // Type filter active — legend shows operators (effectiveColorMode = 'operator')
+          <>
+            {operators.map((op, i) => (
+              <span key={op} className={styles.legendItem}>
+                <span className={styles.dot} style={{ background: NAMED_PALETTE[i] }} />{op}
+              </span>
+            ))}
+            {operators.length > 0 && (
+              <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#484f58' }} />Other</span>
+            )}
           </>
         ) : isTagMode ? (
           <>
@@ -1238,13 +1740,30 @@ export default function CoveragePage({ aircraft = [] }) {
           </>
         ) : isOpMode ? (
           <>
-            {operators.map((op, i) => (
-              <span key={op} className={styles.legendItem}>
-                <span className={styles.dot} style={{ background: NAMED_PALETTE[i] }} />{op}
-              </span>
-            ))}
-            {operators.length > 0 && (
-              <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#484f58' }} />Other</span>
+            {selectedOperator ? (
+              // Operator selected → legend shows type codes (fleet composition)
+              <>
+                {typeCodes.map((tc, i) => (
+                  <span key={tc} className={styles.legendItem}>
+                    <span className={styles.dot} style={{ background: NAMED_PALETTE[i] }} />{tc}
+                  </span>
+                ))}
+                {typeCodes.length > 0 && (
+                  <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#484f58' }} />Other</span>
+                )}
+              </>
+            ) : (
+              // No operator selected → legend shows operator names
+              <>
+                {operators.map((op, i) => (
+                  <span key={op} className={styles.legendItem}>
+                    <span className={styles.dot} style={{ background: NAMED_PALETTE[i] }} />{op}
+                  </span>
+                ))}
+                {operators.length > 0 && (
+                  <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#484f58' }} />Other</span>
+                )}
+              </>
             )}
           </>
         ) : (
@@ -1256,7 +1775,7 @@ export default function CoveragePage({ aircraft = [] }) {
           </>
         )}
         <span className={styles.legendItem} style={{ marginLeft: 'auto', color: '#484f58' }}>
-          rings = 50 nm · vertical ×{VERT_EXAG} · trails = live aircraft
+          rings = 50 nm · vertical ×{altScale}{curveMode ? ' · curved' : ''} · trails = live aircraft
         </span>
       </div>
     </div>
