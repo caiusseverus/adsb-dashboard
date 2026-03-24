@@ -39,6 +39,7 @@ from fastapi.responses import Response
 import config
 
 log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)  # terrain build progress always visible regardless of DEBUG_LOG
 router = APIRouter(tags=["terrain"])
 
 _cache_lock = threading.Lock()
