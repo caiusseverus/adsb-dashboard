@@ -280,6 +280,7 @@ class StatsDB:
                     range_nm    REAL    NOT NULL,
                     altitude    INTEGER,
                     signal      INTEGER,
+                    mlat        INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (ts, icao)
                 );
                 CREATE INDEX IF NOT EXISTS coverage_samples_ts
@@ -419,6 +420,13 @@ class StatsDB:
                     conn.execute(f"ALTER TABLE daily_aircraft_seen ADD COLUMN {col}")
                 except Exception:
                     pass  # column already exists
+
+        # Migrate: add mlat column to coverage_samples
+        with self._connect() as conn:
+            try:
+                conn.execute("ALTER TABLE coverage_samples ADD COLUMN mlat INTEGER NOT NULL DEFAULT 0")
+            except Exception:
+                pass  # column already exists
 
         log.info("DB: schema ready at %s", config.DB_PATH)
 
@@ -770,26 +778,26 @@ class StatsDB:
     def write_coverage(self, samples: list[dict]) -> None:
         """Persist one coverage sample per aircraft that has a position.
         Called from the minute write task. Each sample: {icao, ts, bearing_deg,
-        range_nm, altitude, signal}."""
+        range_nm, altitude, signal, mlat}."""
         if not samples:
             return
         with self._connect() as conn:
             conn.executemany(
                 "INSERT OR REPLACE INTO coverage_samples "
-                "(ts, icao, bearing_deg, range_nm, altitude, signal) "
-                "VALUES (:ts, :icao, :bearing_deg, :range_nm, :altitude, :signal)",
+                "(ts, icao, bearing_deg, range_nm, altitude, signal, mlat) "
+                "VALUES (:ts, :icao, :bearing_deg, :range_nm, :altitude, :signal, :mlat)",
                 samples,
             )
 
     def write_coverage_tuples(self, samples: list[tuple]) -> None:
         """Like write_coverage but accepts pre-built (ts, icao, bearing_deg, range_nm,
-        altitude, signal) tuples — avoids per-row dict construction in the caller."""
+        altitude, signal, mlat) tuples — avoids per-row dict construction in the caller."""
         if not samples:
             return
         with self._connect() as conn:
             conn.executemany(
                 "INSERT OR REPLACE INTO coverage_samples "
-                "(ts, icao, bearing_deg, range_nm, altitude, signal) VALUES (?,?,?,?,?,?)",
+                "(ts, icao, bearing_deg, range_nm, altitude, signal, mlat) VALUES (?,?,?,?,?,?,?)",
                 samples,
             )
 
@@ -2232,6 +2240,7 @@ class StatsDB:
         operator: str | None = None,
         type_codes: list[str] | None = None,
         type_category_prefix: str | None = None,
+        mlat: bool = False,
     ) -> dict:
         """Return downsampled coverage_samples joined with aircraft_registry flags.
 
@@ -2239,11 +2248,12 @@ class StatsDB:
         op_idx 0–9 = top-10 operators by point count; 10 = other/unknown.
         tg_idx 0–7 = TYPE_GROUPS index; 8 = other/unknown.
         tc_idx 0–9 = top-10 type codes by point count; 10 = other/unknown.
-        When military, operator, type_codes, or type_category_prefix is set, stride is skipped.
+        When military, operator, type_codes, type_category_prefix, or mlat is set, stride is skipped.
         """
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
         flag_clause = " AND COALESCE(ar.military, 0) = 1" if military else ""
         op_clause   = " AND ar.operator = ?"           if operator  else ""
+        mlat_clause = " AND cs.mlat = 1"               if mlat      else ""
 
         # Type filter: exact code list (IN) or category prefix (LIKE)
         type_extra_params: list = []
@@ -2258,7 +2268,7 @@ class StatsDB:
             tc_clause = ""
 
         with self._connect() as conn:
-            if military or operator or type_codes or type_category_prefix:
+            if military or operator or type_codes or type_category_prefix or mlat:
                 stride = 1
             else:
                 total = conn.execute(f"""
@@ -2287,7 +2297,7 @@ class StatsDB:
                 WHERE cs.ts >= ?
                   AND cs.altitude  IS NOT NULL
                   AND cs.range_nm  > 0
-                  AND cs.altitude  > 0{flag_clause}{op_clause}{tc_clause}
+                  AND cs.altitude  > 0{flag_clause}{op_clause}{tc_clause}{mlat_clause}
                   AND (cs.rowid % ?) = 0
             """, params).fetchall()
 
@@ -2342,7 +2352,8 @@ class StatsDB:
                        COALESCE(ar.interesting, 0) AS interesting,
                        ar.type_code,
                        ar.type_category,
-                       ar.operator
+                       ar.operator,
+                       COALESCE(cs.mlat, 0) AS mlat
                 FROM coverage_samples cs
                 LEFT JOIN aircraft_registry ar ON cs.icao = ar.icao
                 WHERE cs.ts >= ? AND cs.ts <= ?
@@ -2370,6 +2381,7 @@ class StatsDB:
                     "tg_idx":      self._get_type_group_idx(r["type_code"], r["type_category"]),
                     "type_code":   r["type_code"],
                     "operator":    r["operator"],
+                    "mlat":        bool(r["mlat"]),
                 }
 
         tracks = [

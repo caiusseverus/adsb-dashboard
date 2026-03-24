@@ -20,7 +20,7 @@ HIRES_MAX_AGE_S  = 86_400  # 24 hours
 
 _lock      = threading.Lock()
 _tracks:    dict[str, deque]  = {}   # icao → deque of (ts, bearing, range, alt)
-_meta:      dict[str, dict]   = {}   # icao → {military, interesting, type_code, type_category, operator}
+_meta:      dict[str, dict]   = {}   # icao → {military, interesting, type_code, type_category, operator, mlat}
 _last_ts:   dict[str, int]    = {}   # icao → last recorded ts (rate-limiter)
 
 
@@ -29,7 +29,7 @@ def record(samples: list[tuple]) -> None:
 
     Each element of `samples`:
         (ts, icao, bearing_deg, range_nm, alt_ft,
-         military, interesting, type_code, type_category, operator)
+         military, interesting, type_code, type_category, operator, mlat)
 
     Silently ignores samples where the same ICAO was recorded fewer than
     HIRES_INTERVAL_S seconds ago.  Prunes entries older than HIRES_MAX_AGE_S
@@ -39,7 +39,7 @@ def record(samples: list[tuple]) -> None:
         return
     cutoff = int(time.time()) - HIRES_MAX_AGE_S
     with _lock:
-        for ts, icao, bearing, range_nm, alt, military, interesting, tc, tcat, operator in samples:
+        for ts, icao, bearing, range_nm, alt, military, interesting, tc, tcat, operator, mlat in samples:
             if ts - _last_ts.get(icao, 0) < HIRES_INTERVAL_S:
                 continue
             _last_ts[icao] = ts
@@ -55,6 +55,7 @@ def record(samples: list[tuple]) -> None:
                 "type_code":     tc,
                 "type_category": tcat,
                 "operator":      operator,
+                "mlat":          bool(mlat),
             }
             # Prune the tail of this deque (oldest entries first)
             while dq and dq[0][0] < cutoff:
@@ -100,6 +101,7 @@ def query_tracks(start_ts: int, end_ts: int) -> dict:
             "tg_idx":      tg_idx,
             "type_code":   m.get("type_code"),
             "operator":    m.get("operator"),
+            "mlat":        m.get("mlat",        False),
             "points":      window,
         })
 

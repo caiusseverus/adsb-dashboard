@@ -559,13 +559,15 @@ export default function CoveragePage({ aircraft = [] }) {
   const tlOperatorsRef  = useRef([])   // top-10 operators from loaded timelapse window
   const tlTypeCodesRef  = useRef([])   // top-10 type codes from loaded timelapse window
   // Filter refs — kept in sync with state so renderTlFrame ([] deps) can read them
-  const tlFilterOpRef   = useRef('')   // mirrors selectedOperator
-  const tlFilterTcRef   = useRef('')   // mirrors selectedTypeCode
-  const tlFilterTgRef   = useRef('')   // mirrors selectedTypeGroup
+  const tlFilterOpRef   = useRef('')     // mirrors selectedOperator
+  const tlFilterTcRef   = useRef('')     // mirrors selectedTypeCode
+  const tlFilterTgRef   = useRef('')     // mirrors selectedTypeGroup
+  const tlFilterMlatRef = useRef(false)  // mirrors mlatOnly
   const coastlineDataRef = useRef(null) // raw segments for coastline rebuild on mode change
 
-  // ── Filter state (military — fetches unsampled subset) ──────────────
+  // ── Filter state (military / mlat — fetch unsampled subset) ─────────
   const [militaryOnly, setMilitaryOnly] = useState(false)
+  const [mlatOnly,     setMlatOnly]     = useState(false)
   // ── Receiver view state ──────────────────────────────────────────────
   const [receiverView,   setReceiverView]   = useState(false)
   const recvAzRef  = useRef(0)    // look azimuth degrees (0 = north)
@@ -724,10 +726,11 @@ export default function CoveragePage({ aircraft = [] }) {
   }, [])  // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Keep colorModeRef + filter refs in sync for the timelapse RAF loop ─
-  useEffect(() => { colorModeRef.current = effectiveColorMode }, [effectiveColorMode])
-  useEffect(() => { tlFilterOpRef.current = selectedOperator  }, [selectedOperator])
-  useEffect(() => { tlFilterTcRef.current = selectedTypeCode  }, [selectedTypeCode])
-  useEffect(() => { tlFilterTgRef.current = selectedTypeGroup }, [selectedTypeGroup])
+  useEffect(() => { colorModeRef.current    = effectiveColorMode }, [effectiveColorMode])
+  useEffect(() => { tlFilterOpRef.current   = selectedOperator   }, [selectedOperator])
+  useEffect(() => { tlFilterTcRef.current   = selectedTypeCode   }, [selectedTypeCode])
+  useEffect(() => { tlFilterTgRef.current   = selectedTypeGroup  }, [selectedTypeGroup])
+  useEffect(() => { tlFilterMlatRef.current = mlatOnly           }, [mlatOnly])
 
   // ── Sync coordinate mode into module-level vars, bump scene version ──
   // Must update module vars BEFORE setSceneVersion so redraw sees new values.
@@ -927,12 +930,14 @@ export default function CoveragePage({ aircraft = [] }) {
     let di = 0   // dot vertex index
     let ti = 0   // trail segment index
 
-    const filterOp = tlFilterOpRef.current
-    const filterTc = tlFilterTcRef.current
-    const filterTg = tlFilterTgRef.current
+    const filterOp   = tlFilterOpRef.current
+    const filterTc   = tlFilterTcRef.current
+    const filterTg   = tlFilterTgRef.current
+    const filterMlat = tlFilterMlatRef.current
 
     for (const track of data.tracks) {
       // Apply active filter — skip non-matching tracks
+      if (filterMlat && !track.mlat) continue
       if (filterOp && track.operator !== filterOp) continue
       if (filterTc && track.type_code !== filterTc) continue
       if (filterTg) {
@@ -1253,8 +1258,9 @@ export default function CoveragePage({ aircraft = [] }) {
     setLoadingPhase('fetching')
     setError(null)
 
-    const milParam = militaryOnly ? '&military=true' : ''
-    const opParam  = selectedOperator ? `&operator=${encodeURIComponent(selectedOperator)}` : ''
+    const milParam  = militaryOnly ? '&military=true' : ''
+    const mlatParam = mlatOnly     ? '&mlat=true'     : ''
+    const opParam   = selectedOperator ? `&operator=${encodeURIComponent(selectedOperator)}` : ''
     let typeParam = ''
     if (selectedTypeCode) {
       typeParam = `&type_codes=${encodeURIComponent(selectedTypeCode)}`
@@ -1266,7 +1272,7 @@ export default function CoveragePage({ aircraft = [] }) {
           : `&type_codes=${encodeURIComponent(grp.types.join(','))}`
       }
     }
-    fetch(`/api/coverage/points?days=${days}&max_points=${maxPoints}${milParam}${opParam}${typeParam}`)
+    fetch(`/api/coverage/points?days=${days}&max_points=${maxPoints}${milParam}${mlatParam}${opParam}${typeParam}`)
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() })
       .then(({ points, operators: ops, type_codes: tcs, type_groups: tgs }) => {
         if (cancelled) return
@@ -1282,7 +1288,7 @@ export default function CoveragePage({ aircraft = [] }) {
 
     return () => { cancelled = true }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [days, maxPoints, militaryOnly, selectedOperator, selectedTypeGroup, selectedTypeCode])
+  }, [days, maxPoints, militaryOnly, mlatOnly, selectedOperator, selectedTypeGroup, selectedTypeCode])
 
   // ── After 'rendering' phase is painted, do the expensive buffer build ──
   useEffect(() => {
@@ -1376,8 +1382,12 @@ export default function CoveragePage({ aircraft = [] }) {
       if (trail.length > MAX_TRAIL_PTS) trail.splice(0, trail.length - MAX_TRAIL_PTS)
     }
 
-    // Filter live trails to match the active operator/type filter.
+    // Filter live trails to match the active operator/type/mlat filter.
     let filteredTrails = trails
+    if (mlatOnly) {
+      filteredTrails = Object.fromEntries(Object.entries(trails).filter(([, pts]) =>
+        pts.length > 0 && pts[pts.length - 1].mlat))
+    }
     if (selectedOperator) {
       filteredTrails = Object.fromEntries(Object.entries(trails).filter(([, pts]) =>
         pts.length > 0 && pts[pts.length - 1].operator === selectedOperator))
@@ -1589,9 +1599,11 @@ export default function CoveragePage({ aircraft = [] }) {
           <button className={showMode === 'live'    ? styles.btnActive : styles.btn} onClick={() => setShowMode('live')}>Live</button>
         </div>
 
-        {/* Filter: military-only requery */}
+        {/* Filter: military / mlat requery */}
         <button className={militaryOnly ? styles.btnActive : styles.btn}
           onClick={() => setMilitaryOnly(v => !v)}>Military</button>
+        <button className={mlatOnly ? styles.btnActive : styles.btn}
+          onClick={() => setMlatOnly(v => !v)}>MLAT</button>
         <div className={styles.sep} />
 
         <button className={styles.resetBtn} onClick={resetCamera}>Reset view</button>

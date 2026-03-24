@@ -167,12 +167,13 @@ async def coverage_points(
     days:                 int        = Query(default=30,     ge=1,    le=365),
     max_points:           int        = Query(default=100000, ge=10000, le=500000),
     military:             bool       = Query(default=False),
+    mlat:                 bool       = Query(default=False),
     operator:             str | None = Query(default=None),
     type_codes:           str | None = Query(default=None),   # comma-separated
     type_category_prefix: str | None = Query(default=None),   # e.g. "H" for rotary
 ) -> dict:
     """Downsampled coverage points for the 3-D coverage view.
-    military, operator, type_codes, or type_category_prefix filters return all
+    military, mlat, operator, type_codes, or type_category_prefix filters return all
     matching points unsampled (stride=1)."""
     tc_list = [c.strip() for c in type_codes.split(",") if c.strip()] if type_codes else None
     result = await asyncio.to_thread(
@@ -181,6 +182,7 @@ async def coverage_points(
         operator or None,
         tc_list or None,
         type_category_prefix or None,
+        mlat,
     )
     result["receiver_alt_ft"] = config.RECEIVER_ALT_FT
     return result
