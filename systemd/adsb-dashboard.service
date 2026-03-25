@@ -1,0 +1,28 @@
+[Unit]
+Description=ADS-B Dashboard
+Documentation=https://github.com/caiusseverus/adsb-dashboard
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=adsb
+Group=adsb
+
+WorkingDirectory=/opt/adsb-dashboard
+
+# uv resolves the venv and all dependencies automatically
+ExecStart=/usr/local/bin/uv run --directory backend uvicorn main:app --host 0.0.0.0 --port 8000
+
+# Load environment from the .env file in the install directory
+EnvironmentFile=/opt/adsb-dashboard/backend/.env
+
+Restart=on-failure
+RestartSec=5
+
+# Harden: prevent the service from writing outside its data directory and /tmp
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

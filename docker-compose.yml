@@ -1,0 +1,17 @@
+services:
+  adsb-dashboard:
+    image: caiusseverus/adsb-dashboard:latest
+    # To build from source instead of using the published image, replace the
+    # line above with:  build: .
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    # Copy .env.example to .env and fill in your values before starting.
+    # See INSTALL.md for instructions.
+    env_file: backend/.env
+    volumes:
+      # Named volume keeps the SQLite database and SRTM terrain tiles across restarts.
+      - adsb-data:/app/backend/data
+
+volumes:
+  adsb-data:
