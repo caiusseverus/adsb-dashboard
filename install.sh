@@ -208,6 +208,10 @@ fi
 _step "Installing Python dependencies"
 uv sync --directory "$INSTALL_DIR/backend" --no-dev --frozen
 
+_step "Fetching airport and coastline data"
+python3 "$INSTALL_DIR/tools/fetch_airports.py"
+python3 "$INSTALL_DIR/tools/fetch_coastline.py"
+
 _step "Building frontend"
 cd "$INSTALL_DIR/frontend"
 npm ci --ignore-scripts

@@ -27,16 +27,21 @@ COPY backend/pyproject.toml backend/uv.lock ./backend/
 # Install Python dependencies into the project venv (no editable install)
 RUN uv sync --directory backend --no-dev --frozen
 
-# Copy the backend source
+# Copy the backend source and seed scripts
 COPY backend/ ./backend/
+COPY tools/ ./tools/
 
 # Copy the built frontend so the backend can serve it as static files
 COPY --from=frontend-build /build/frontend/dist ./frontend/dist
 
+# Fetch static data files (airports + coastline) and bake them into the image.
+# Must run before VOLUME is declared so the files are preserved in the image layer
+# and copied into the named volume on first container initialisation.
+RUN python3 tools/fetch_airports.py && python3 tools/fetch_coastline.py
+
 # Create the data directory before declaring the VOLUME so Docker initialises
 # the named volume with the correct ownership (not root).
 RUN useradd --create-home --shell /bin/false adsb \
-    && mkdir -p /app/backend/data \
     && chown -R adsb:adsb /app
 
 # Persistent data lives in a volume so it survives container restarts
