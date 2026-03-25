@@ -421,11 +421,11 @@ async def _route_enricher() -> None:
 
 
 async def _push_updates() -> None:
-    """Broadcast a state snapshot to every connected WebSocket client every second."""
+    """Broadcast a state snapshot to every connected WebSocket client."""
     import time
     global _watchlist_cache, _watchlist_cache_ts
     while True:
-        await asyncio.sleep(1)
+        await asyncio.sleep(config.PUSH_INTERVAL_S)
         expired = state.expire_aircraft()
 
         # Close visit records for aircraft that just timed out
@@ -447,7 +447,19 @@ async def _push_updates() -> None:
                                         _route_queue_drops, vid, ac.callsign)
                         _route_queue.append((vid, ac.callsign))
 
-        _snap_mode = memory_policy.get_policy()["snapshot_mode"] if config.MEMORY_POLICY_ENABLED else "full"
+        # Determine broadcast snapshot mode.
+        # When no clients are connected use thin mode — the snapshot is still
+        # needed for track recording and notifications, but we skip building the
+        # expensive full-field dict that would only be serialised and discarded.
+        if _clients:
+            if config.SNAPSHOT_MODE_OVERRIDE:
+                _snap_mode = config.SNAPSHOT_MODE_OVERRIDE
+            elif config.MEMORY_POLICY_ENABLED:
+                _snap_mode = memory_policy.get_policy()["snapshot_mode"]
+            else:
+                _snap_mode = "full"
+        else:
+            _snap_mode = "thin"
         _queue_depth_samples.append(_msg_queue.qsize())
         t_snap = time.perf_counter()
         snapshot = state.get_snapshot(mode=_snap_mode)

@@ -185,6 +185,14 @@ HIRES_MAX_POINTS: int = int(os.getenv("HIRES_MAX_POINTS", "500000"))
 # blocking the broadcast to all other clients.
 WS_SEND_TIMEOUT_S: float = float(os.getenv("WS_SEND_TIMEOUT_S", "2.0"))
 
+# How often to push a snapshot to WebSocket clients (seconds).
+# Default 1.0 s.  Pi deployments can set 1.5 or 2.0 to halve broadcast CPU.
+PUSH_INTERVAL_S: float = float(os.getenv("PUSH_INTERVAL_S", "1.0"))
+
+# Force snapshot mode for broadcast, overriding the memory-policy auto-detection.
+# Valid values: full, reduced, thin.  Leave empty to use auto-detection (default).
+SNAPSHOT_MODE_OVERRIDE: str = os.getenv("SNAPSHOT_MODE_OVERRIDE", "").lower()
+
 # Enable adaptive memory pressure policy (reads /proc/meminfo every 10 s).
 # Set to "false" to lock the system to normal/full-retention mode regardless
 # of available RAM.  Has no effect on non-Linux hosts.
