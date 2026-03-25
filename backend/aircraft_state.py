@@ -1229,47 +1229,42 @@ class AircraftState:
 
     def get_snapshot(self, mode: str = "full") -> dict:
         now = time.time()
+
+        # ----------------------------------------------------------------
+        # Stage 1 — acquire lock, copy minimal state, release immediately.
+        #
+        # Heavy dict-building work (per-aircraft field extraction, history
+        # list construction, mode stripping) runs in Stage 2 without the
+        # lock, so the decode thread is not blocked while we iterate.
+        #
+        # Safety of attribute reads outside the lock:
+        #   - Simple scalar attributes (int, float, str, bool, None) are
+        #     safe: the GIL makes single-attribute assignment atomic.
+        #   - Container attributes (mlat_fixes, mlat_residuals, etc.) are
+        #     accessed defensively with try/except RuntimeError to handle
+        #     the rare case where the decode thread resizes them mid-read.
+        #   - aircraft_refs is a list() snapshot taken under the lock, so
+        #     it is stable even if self._aircraft is mutated afterwards.
+        # ----------------------------------------------------------------
         with self._lock:
-            # Average msg/sec over the last 10 completed seconds
-            recent = list(self._sec_counts)[-10:]
-            msg_per_sec = round(sum(c for _, c in recent) / max(len(recent), 1), 1)
+            # Scalar counters
+            total_messages = self._total
+            mlat_total     = self._mlat_total
+            unique_today         = len(self._today_icaos)
+            unique_today_military = len(self._today_mil_icaos)
+            adsbx_qsize    = len(self._adsbx_queue)
+            hexdb_qsize    = len(self._hexdb_queue)
 
-            # MLAT msg/sec (same rolling 10-second window)
-            mlat_recent = list(self._mlat_sec_counts)[-10:]
-            mlat_per_sec = round(sum(c for _, c in mlat_recent) / max(len(mlat_recent), 1), 1)
+            # Rate data — small bounded deque slices
+            sec_slice      = list(self._sec_counts)[-10:]
+            mlat_sec_slice = list(self._mlat_sec_counts)[-10:]
+            cur_min_secs   = list(self._cur_min_sec_counts)
+            cur_min_sigs   = list(self._cur_min_signals)
+            cur_min        = self._cur_min
+            cur_min_df     = dict(self._cur_min_df_counts)
+            cur_min_mlat   = self._cur_min_mlat_count
 
-            # Rate history for the chart (completed minutes + current partial minute)
-            secs = list(self._cur_min_sec_counts)
-            if secs:
-                cur_mn, cur_mx, cur_me = min(secs), max(secs), round(sum(secs) / len(secs), 1)
-            else:
-                cur_mn = cur_mx = cur_me = 0.0
-            cur_total = len(self._aircraft)
-            # Single pass: collect all per-aircraft counters and the aircraft list.
-            # Replaces four separate O(N) scans that previously ran inside the lock.
-            cur_mil = cur_with_pos = cur_mlat_pos = mlat_aircraft_count = 0
-            for ac in self._aircraft.values():
-                has_published_pos = _pos_reliable(ac)
-                if ac.military:
-                    cur_mil += 1
-                if has_published_pos:
-                    cur_with_pos += 1
-                if ac.mlat:
-                    mlat_aircraft_count += 1
-                    if has_published_pos:
-                        cur_mlat_pos += 1
-            live_military = cur_mil
-
-            cur_sigs = self._cur_min_signals
-            cur_sig_avg = round(sum(cur_sigs) / len(cur_sigs), 1) if cur_sigs else None
-            cur_stats = (self._cur_min, cur_mn, cur_mx, cur_me,
-                         cur_total, cur_total - cur_mil, cur_mil,
-                         cur_sig_avg, min(cur_sigs) if cur_sigs else None,
-                         max(cur_sigs) if cur_sigs else None,
-                         cur_with_pos, cur_mlat_pos)
-
-            # Rebuild history list copies only when the minute rolls over.
-            # At 1 Hz this avoids 3 deque→list copies per second (59 of 60 are free).
+            # History cache — rebuilt at most once per minute
             if self._snapshot_history_minute != self._cur_min or self._snapshot_history_cache is None:
                 self._snapshot_history_cache = (
                     list(self._min_stats),
@@ -1278,98 +1273,144 @@ class AircraftState:
                 )
                 self._snapshot_history_minute = self._cur_min
             hist_min_stats, hist_df_stats, hist_mlat_counts = self._snapshot_history_cache
-            rate_history = hist_min_stats + [cur_stats]
-            df_history = hist_df_stats + [(self._cur_min, dict(self._cur_min_df_counts))]
-            mlat_history = hist_mlat_counts + [(self._cur_min, self._cur_min_mlat_count)]
 
-            aircraft_list = []
-            for ac in self._aircraft.values():
-                pub_lat, pub_lon, pub_range_nm, pub_bearing_deg = _published_position(ac)
-                aircraft_list.append({
-                    "icao": ac.icao,
-                    "callsign": ac.callsign,
-                    "altitude": ac.altitude if _alt_baro_reliable(ac) else None,
-                    "squawk": ac.squawk,
-                    "signal": ac.signal,
-                    "msg_count": ac.msg_count,
-                    "age": round(now - ac.last_seen, 1),
-                    "registration": ac.registration,
-                    "type_code": ac.type_code,
-                    "type_desc": ac.type_desc,
-                    "type_full_name": ac.type_full_name,
-                    "type_category": ac.type_category,
-                    "wtc": ac.wtc,
-                    "military": ac.military,
-                    "operator": ac.operator,
-                    "country": ac.country,
-                    "year": ac.year,
-                    "manufacturer": ac.manufacturer,
-                    "lat":              pub_lat,
-                    "lon":              pub_lon,
-                    "range_nm":         pub_range_nm,
-                    "bearing_deg":      pub_bearing_deg,
-                    "airspeed_kts":     ac.airspeed_kts,
-                    "airspeed_type":    ac.airspeed_type,
-                    "heading_deg":      ac.heading_deg,
-                    "vertical_rate_fpm": ac.vertical_rate_fpm,
-                    "mach":             ac.mach,
-                    "selected_alt":     ac.selected_alt,
-                    "interesting":        bool(ac.type_code and ac.type_code.upper() in INTERESTING_TYPE_CODES),
-                    "sighting_count":     ac.sighting_count,
-                    "mlat":              ac.mlat,
-                    "mlat_source":       ac.mlat_source,
-                    "mlat_msg_count":    ac.mlat_msg_count,
-                    "last_pos_age":      round(now - ac.last_pos_ts, 1) if ac.last_pos_ts > 0 else None,
-                    "last_alt_age":      round(now - ac.last_alt_ts, 1) if ac.last_alt_ts > 0 else None,
-                    "mlat_quality":      dict(ac.mlat_quality_scores),
-                    "mlat_sources": {
-                        src: {
-                            "fixes":           len(buf),
-                            "spikes":          sum(ac.mlat_spike_counts.get(src, {}).values()),
-                            "spike_detail":    dict(ac.mlat_spike_counts.get(src, {})),
-                            "median_residual": (
-                                round(sorted(ac.mlat_residuals[src])[len(ac.mlat_residuals[src]) // 2], 3)
-                                if src in ac.mlat_residuals and len(ac.mlat_residuals[src]) >= 3
-                                else None
-                            ),
-                        }
-                        for src, buf in ac.mlat_fixes.items()
-                    },
-                    "acas_ra_active":     ac.acas_ra_ts is not None and (now - ac.acas_ra_ts) < 60,
-                    "acas_ra_desc":       ac.acas_ra_desc,
-                    "acas_ra_corrective": ac.acas_ra_corrective,
-                    "acas_threat_icao":   ac.acas_threat_icao,
-                    "acas_sensitivity":   ac.acas_sensitivity,
-                    "pos_global":         ac.pos_global,
-                    "pos_reliable_odd":   ac.pos_reliable_odd,
-                    "pos_reliable_even":  ac.pos_reliable_even,
-                    "pos_confident":      _pos_reliable(ac),
-                })
+            # Stable list of aircraft object references — O(N) pointer copy
+            aircraft_refs = list(self._aircraft.values())
 
-            # Apply snapshot mode stripping outside the per-aircraft loop
-            # to keep the hot path clean.
-            if mode == "reduced":
-                for entry in aircraft_list:
-                    for key in self._REDUCED_DROP:
-                        entry.pop(key, None)
-            elif mode == "thin":
-                aircraft_list = [
-                    {k: v for k, v in entry.items() if k in self._THIN_KEEP}
-                    for entry in aircraft_list
-                ]
+        # ----------------------------------------------------------------
+        # Stage 2 — build payload outside lock
+        # ----------------------------------------------------------------
+
+        msg_per_sec  = round(sum(c for _, c in sec_slice)      / max(len(sec_slice), 1),      1)
+        mlat_per_sec = round(sum(c for _, c in mlat_sec_slice) / max(len(mlat_sec_slice), 1), 1)
+
+        if cur_min_secs:
+            cur_mn = min(cur_min_secs)
+            cur_mx = max(cur_min_secs)
+            cur_me = round(sum(cur_min_secs) / len(cur_min_secs), 1)
+        else:
+            cur_mn = cur_mx = cur_me = 0.0
+
+        cur_sig_avg = round(sum(cur_min_sigs) / len(cur_min_sigs), 1) if cur_min_sigs else None
+
+        cur_mil = cur_with_pos = cur_mlat_pos = mlat_aircraft_count = 0
+        aircraft_list = []
+
+        for ac in aircraft_refs:
+            pub_lat, pub_lon, pub_range_nm, pub_bearing_deg = _published_position(ac)
+            has_pos = _pos_reliable(ac)
+
+            if ac.military:
+                cur_mil += 1
+            if has_pos:
+                cur_with_pos += 1
+            if ac.mlat:
+                mlat_aircraft_count += 1
+                if has_pos:
+                    cur_mlat_pos += 1
+
+            # mlat_sources iterates container attributes that the decode
+            # thread can mutate; wrap defensively.
+            try:
+                mlat_sources = {
+                    src: {
+                        "fixes":        len(buf),
+                        "spikes":       sum(ac.mlat_spike_counts.get(src, {}).values()),
+                        "spike_detail": dict(ac.mlat_spike_counts.get(src, {})),
+                        "median_residual": (
+                            round(sorted(ac.mlat_residuals[src])[len(ac.mlat_residuals[src]) // 2], 3)
+                            if src in ac.mlat_residuals and len(ac.mlat_residuals[src]) >= 3
+                            else None
+                        ),
+                    }
+                    for src, buf in ac.mlat_fixes.items()
+                }
+            except RuntimeError:
+                mlat_sources = {}
+
+            aircraft_list.append({
+                "icao":              ac.icao,
+                "callsign":          ac.callsign,
+                "altitude":          ac.altitude if _alt_baro_reliable(ac) else None,
+                "squawk":            ac.squawk,
+                "signal":            ac.signal,
+                "msg_count":         ac.msg_count,
+                "age":               round(now - ac.last_seen, 1),
+                "registration":      ac.registration,
+                "type_code":         ac.type_code,
+                "type_desc":         ac.type_desc,
+                "type_full_name":    ac.type_full_name,
+                "type_category":     ac.type_category,
+                "wtc":               ac.wtc,
+                "military":          ac.military,
+                "operator":          ac.operator,
+                "country":           ac.country,
+                "year":              ac.year,
+                "manufacturer":      ac.manufacturer,
+                "lat":               pub_lat,
+                "lon":               pub_lon,
+                "range_nm":          pub_range_nm,
+                "bearing_deg":       pub_bearing_deg,
+                "airspeed_kts":      ac.airspeed_kts,
+                "airspeed_type":     ac.airspeed_type,
+                "heading_deg":       ac.heading_deg,
+                "vertical_rate_fpm": ac.vertical_rate_fpm,
+                "mach":              ac.mach,
+                "selected_alt":      ac.selected_alt,
+                "interesting":       bool(ac.type_code and ac.type_code.upper() in INTERESTING_TYPE_CODES),
+                "sighting_count":    ac.sighting_count,
+                "mlat":              ac.mlat,
+                "mlat_source":       ac.mlat_source,
+                "mlat_msg_count":    ac.mlat_msg_count,
+                "last_pos_age":      round(now - ac.last_pos_ts, 1) if ac.last_pos_ts > 0 else None,
+                "last_alt_age":      round(now - ac.last_alt_ts, 1) if ac.last_alt_ts > 0 else None,
+                "mlat_quality":      dict(ac.mlat_quality_scores),
+                "mlat_sources":      mlat_sources,
+                "acas_ra_active":    ac.acas_ra_ts is not None and (now - ac.acas_ra_ts) < 60,
+                "acas_ra_desc":      ac.acas_ra_desc,
+                "acas_ra_corrective": ac.acas_ra_corrective,
+                "acas_threat_icao":  ac.acas_threat_icao,
+                "acas_sensitivity":  ac.acas_sensitivity,
+                "pos_global":        ac.pos_global,
+                "pos_reliable_odd":  ac.pos_reliable_odd,
+                "pos_reliable_even": ac.pos_reliable_even,
+                "pos_confident":     has_pos,
+            })
+
+        live_military = cur_mil
+        cur_stats = (cur_min, cur_mn, cur_mx, cur_me,
+                     len(aircraft_refs), len(aircraft_refs) - cur_mil, cur_mil,
+                     cur_sig_avg, min(cur_min_sigs) if cur_min_sigs else None,
+                     max(cur_min_sigs) if cur_min_sigs else None,
+                     cur_with_pos, cur_mlat_pos)
+
+        rate_history = hist_min_stats + [cur_stats]
+        df_history   = hist_df_stats  + [(cur_min, cur_min_df)]
+        mlat_history = hist_mlat_counts + [(cur_min, cur_min_mlat)]
+
+        # Mode stripping
+        if mode == "reduced":
+            for entry in aircraft_list:
+                for key in self._REDUCED_DROP:
+                    entry.pop(key, None)
+        elif mode == "thin":
+            aircraft_list = [
+                {k: v for k, v in entry.items() if k in self._THIN_KEEP}
+                for entry in aircraft_list
+            ]
 
         return {
-            "aircraft_count": len(aircraft_list),
-            "live_military": live_military,
-            "msg_per_sec": msg_per_sec,
-            "total_messages": self._total,
-            "mlat_total": self._mlat_total,
-            "mlat_per_sec": mlat_per_sec,
-            "mlat_aircraft_count": mlat_aircraft_count,
-            "unique_today": len(self._today_icaos),
-            "unique_today_military": len(self._today_mil_icaos),
-            "adsbx_queue_size": len(self._adsbx_queue),
-            "hexdb_queue_size": len(self._hexdb_queue),
+            "aircraft_count":         len(aircraft_list),
+            "live_military":          live_military,
+            "msg_per_sec":            msg_per_sec,
+            "total_messages":         total_messages,
+            "mlat_total":             mlat_total,
+            "mlat_per_sec":           mlat_per_sec,
+            "mlat_aircraft_count":    mlat_aircraft_count,
+            "unique_today":           unique_today,
+            "unique_today_military":  unique_today_military,
+            "adsbx_queue_size":       adsbx_qsize,
+            "hexdb_queue_size":       hexdb_qsize,
             "aircraft": sorted(aircraft_list, key=lambda x: x["msg_count"], reverse=True),
             "rate_history": [
                 {"minute": m, "min": mn, "max": mx, "mean": me,
