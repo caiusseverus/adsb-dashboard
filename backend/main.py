@@ -447,6 +447,12 @@ async def _push_updates() -> None:
                                         _route_queue_drops, vid, ac.callsign)
                         _route_queue.append((vid, ac.callsign))
 
+        # Sample queue depth; report to memory_policy for CPU-pressure tracking.
+        _current_queue_depth = _msg_queue.qsize()
+        _queue_depth_samples.append(_current_queue_depth)
+        if config.MEMORY_POLICY_ENABLED:
+            memory_policy.report_queue_depth(_current_queue_depth)
+
         # Determine broadcast snapshot mode.
         # When no clients are connected use thin mode — the snapshot is still
         # needed for track recording and notifications, but we skip building the
@@ -460,7 +466,6 @@ async def _push_updates() -> None:
                 _snap_mode = "full"
         else:
             _snap_mode = "thin"
-        _queue_depth_samples.append(_msg_queue.qsize())
         t_snap = time.perf_counter()
         snapshot = state.get_snapshot(mode=_snap_mode)
         snapshot_ms = (time.perf_counter() - t_snap) * 1000

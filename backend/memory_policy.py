@@ -22,6 +22,7 @@ Non-Linux fallback:
   once.  All get_* functions remain safe to call.
 """
 
+import collections
 import logging
 import pathlib
 import threading
@@ -49,11 +50,23 @@ DEESCALATE_READINGS = 3
 # ---------------------------------------------------------------------------
 
 _lock = threading.Lock()
+
+# --- Memory pressure state ---
 _mem_total_kb: int = 0          # read once; 0 means /proc/meminfo unavailable
 _available: bool = False         # True once MemTotal was read successfully
 _current_level_idx: int = 0     # index into _LEVELS (0 = normal)
 _deescalate_count: int = 0      # consecutive readings at a better level
 _pending_level_idx: int = 0     # candidate for de-escalation
+
+# --- Queue / CPU pressure state ---
+# Median queue depth over a sliding window drives snapshot degradation
+# independently of memory pressure.  Hires retention and aircraft timeout
+# are NOT altered by queue pressure — those are RAM-driven responses only.
+_QUEUE_WINDOW = 6               # ~6 s at default 1 Hz push rate
+_queue_depths: collections.deque = collections.deque(maxlen=_QUEUE_WINDOW)
+_queue_level_idx: int = 0
+_queue_deescalate_count: int = 0
+_queue_pending_idx: int = 0
 
 
 def _read_meminfo() -> dict[str, int]:
@@ -157,16 +170,78 @@ def check() -> str:
         return _LEVELS[_current_level_idx][0]
 
 
-def get_level() -> str:
-    """Return current pressure level name without re-evaluating."""
+def report_queue_depth(depth: int) -> None:
+    """Record a queue depth sample and update the queue-pressure level.
+
+    Called each push cycle from main._push_updates().  Escalation is
+    immediate when the window median exceeds a threshold; de-escalation
+    requires DEESCALATE_READINGS consecutive windows below the threshold.
+
+    Only snapshot_mode is affected by queue pressure — hires retention and
+    aircraft timeout are memory-driven responses and are left unchanged.
+    """
+    global _queue_level_idx, _queue_deescalate_count, _queue_pending_idx
+
+    import config  # late import — avoids circular dependency at module load
+    _queue_depths.append(depth)
+
+    if len(_queue_depths) < _QUEUE_WINDOW:
+        return  # wait for window to fill before acting
+
+    median = sorted(_queue_depths)[_QUEUE_WINDOW // 2]
+
+    if config.QUEUE_PRESSURE_CRITICAL and median >= config.QUEUE_PRESSURE_CRITICAL:
+        new_idx = 3
+    elif config.QUEUE_PRESSURE_HIGH and median >= config.QUEUE_PRESSURE_HIGH:
+        new_idx = 2
+    elif config.QUEUE_PRESSURE_ELEVATED and median >= config.QUEUE_PRESSURE_ELEVATED:
+        new_idx = 1
+    else:
+        new_idx = 0
+
     with _lock:
-        return _LEVELS[_current_level_idx][0]
+        if new_idx > _queue_level_idx:
+            old = _LEVELS[_queue_level_idx][0]
+            _queue_level_idx = new_idx
+            _queue_deescalate_count = 0
+            _queue_pending_idx = new_idx
+            log.info("memory_policy: queue pressure %s → %s (queue median=%d)",
+                     old, _LEVELS[_queue_level_idx][0], median)
+        elif new_idx < _queue_level_idx:
+            if new_idx == _queue_pending_idx:
+                _queue_deescalate_count += 1
+            else:
+                _queue_pending_idx = new_idx
+                _queue_deescalate_count = 1
+            if _queue_deescalate_count >= DEESCALATE_READINGS:
+                old = _LEVELS[_queue_level_idx][0]
+                _queue_level_idx = new_idx
+                _queue_deescalate_count = 0
+                _queue_pending_idx = new_idx
+                log.info("memory_policy: queue pressure %s → %s (queue median=%d)",
+                         old, _LEVELS[_queue_level_idx][0], median)
+        else:
+            _queue_deescalate_count = 0
+            _queue_pending_idx = new_idx
+
+
+def get_level() -> str:
+    """Return effective pressure level name (most severe of memory and queue)."""
+    with _lock:
+        return _LEVELS[max(_current_level_idx, _queue_level_idx)][0]
 
 
 def get_policy() -> dict:
-    """Return active policy values for consumers."""
+    """Return active policy values for consumers.
+
+    Snapshot mode reflects the most severe of memory and queue pressure.
+    Hires retention and aircraft timeout are memory-driven only — queue
+    pressure alone does not shrink history or expire aircraft faster.
+    """
     with _lock:
-        _, _, age_s, interval_s, snap_mode, halve_timeout = _LEVELS[_current_level_idx]
+        snap_idx = max(_current_level_idx, _queue_level_idx)
+        _, _, age_s, interval_s, _, halve_timeout = _LEVELS[_current_level_idx]
+        snap_mode = _LEVELS[snap_idx][4]
         return {
             "snapshot_mode":    snap_mode,
             "hires_max_age_s":  age_s,
@@ -178,15 +253,22 @@ def get_policy() -> dict:
 def get_status() -> dict:
     """Return current state for /api/status observability."""
     with _lock:
-        idx = _current_level_idx
-        level_name, min_pct, age_s, interval_s, snap_mode, halve_timeout = _LEVELS[idx]
+        mem_idx  = _current_level_idx
+        q_idx    = _queue_level_idx
+        eff_idx  = max(mem_idx, q_idx)
+        mem_name = _LEVELS[mem_idx][0]
+        q_name   = _LEVELS[q_idx][0]
+        eff_name = _LEVELS[eff_idx][0]
+        _, _, age_s, interval_s, snap_mode, halve_timeout = _LEVELS[eff_idx]
 
     info = _read_meminfo()
     mem_avail_kb = info.get("MemAvailable", 0)
     pct_free = round((mem_avail_kb / _mem_total_kb) * 100.0, 1) if _mem_total_kb else None
 
     return {
-        "level":            level_name,
+        "level":            eff_name,
+        "memory_level":     mem_name,
+        "queue_level":      q_name,
         "mem_available_mb": round(mem_avail_kb / 1024, 1) if mem_avail_kb else None,
         "mem_total_mb":     round(_mem_total_kb / 1024, 1) if _mem_total_kb else None,
         "pct_free":         pct_free,

@@ -193,6 +193,14 @@ PUSH_INTERVAL_S: float = float(os.getenv("PUSH_INTERVAL_S", "1.0"))
 # Valid values: full, reduced, thin.  Leave empty to use auto-detection (default).
 SNAPSHOT_MODE_OVERRIDE: str = os.getenv("SNAPSHOT_MODE_OVERRIDE", "").lower()
 
+# Queue-depth thresholds for CPU-pressure-triggered snapshot degradation.
+# When the median queue depth over a 6-cycle window exceeds a threshold the
+# snapshot mode escalates (same levels as memory pressure: elevated/high/critical).
+# Set a threshold to 0 to disable that level.  Defaults are tuned for Pi 4.
+QUEUE_PRESSURE_ELEVATED: int = int(os.getenv("QUEUE_PRESSURE_ELEVATED", "200"))
+QUEUE_PRESSURE_HIGH:     int = int(os.getenv("QUEUE_PRESSURE_HIGH",     "1000"))
+QUEUE_PRESSURE_CRITICAL: int = int(os.getenv("QUEUE_PRESSURE_CRITICAL", "3000"))
+
 # Enable adaptive memory pressure policy (reads /proc/meminfo every 10 s).
 # Set to "false" to lock the system to normal/full-retention mode regardless
 # of available RAM.  Has no effect on non-Linux hosts.
