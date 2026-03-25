@@ -30,6 +30,10 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Per-message total processing time in seconds (includes lock acquisition + decode)
 msg_timings: deque[float] = deque(maxlen=2000)
+# Per-message time spent waiting to acquire self._lock (seconds)
+lock_wait_timings: deque[float] = deque(maxlen=2000)
+# Per-message time spent doing actual work under the lock (seconds)
+decode_timings: deque[float] = deque(maxlen=2000)
 # Per-_push_updates invocation breakdown: {loop_ms, broadcast_ms, total_ms, ac_count}
 push_timings: deque[dict] = deque(maxlen=120)
 
@@ -991,12 +995,16 @@ class AircraftState:
 
         t0 = time.perf_counter()
         with self._lock:
+            t_locked = time.perf_counter()
             self._total += 1
             if mlat:
                 self._mlat_total += 1
             self._tick(now, mlat=mlat)
             self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
-        msg_timings.append(time.perf_counter() - t0)
+        t_done = time.perf_counter()
+        msg_timings.append(t_done - t0)
+        lock_wait_timings.append(t_locked - t0)
+        decode_timings.append(t_done - t_locked)
 
     def expire_aircraft(self) -> list["Aircraft"]:
         """Remove stale aircraft and return them for visit logging."""

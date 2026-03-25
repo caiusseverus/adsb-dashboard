@@ -23,6 +23,7 @@ import config
 import enrichment
 from beast_client import BeastClient
 from aircraft_state import AircraftState, push_timings as _push_timings_store
+from collections import deque as _deque
 from db import stats_db
 from track_store import TrackStore
 from history import router as history_router
@@ -87,6 +88,12 @@ _MSG_QUEUE_MAX = 5000
 _msg_queue: queue.Queue = queue.Queue(maxsize=_MSG_QUEUE_MAX)
 _DECODE_SENTINEL = object()   # placed on queue to signal the decoder thread to exit
 _decoder_thread: threading.Thread | None = None
+# Cumulative count of Beast/MLAT messages dropped due to full queue
+_msg_drops: int = 0
+# Queue depth sampled once per push cycle (maxlen matches push_timings window)
+_queue_depth_samples: _deque[int] = _deque(maxlen=120)
+# Cumulative count of WebSocket clients disconnected due to send timeout
+_ws_clients_dropped: int = 0
 
 
 def _start_msg_processor() -> threading.Thread:
@@ -104,10 +111,11 @@ def _start_msg_processor() -> threading.Thread:
 
 async def _beast_runner() -> None:
     def on_message(msg: dict) -> None:
+        global _msg_drops
         try:
             _msg_queue.put_nowait((msg, None))
         except queue.Full:
-            pass  # drop new: decoder is behind, discard this arrival
+            _msg_drops += 1  # decoder is behind; count the loss
 
     client = BeastClient(config.BEAST_HOST, config.BEAST_PORT, on_message)
     await client.run()
@@ -115,10 +123,11 @@ async def _beast_runner() -> None:
 
 async def _mlat_runner(name: str, host: str, port: int) -> None:
     def on_mlat_message(msg: dict) -> None:
+        global _msg_drops
         try:
             _msg_queue.put_nowait((msg, name))
         except queue.Full:
-            pass
+            _msg_drops += 1  # decoder is behind; count the loss
 
     client = BeastClient(host, port, on_mlat_message)
     log.info("MLAT runner starting: %s (%s:%s)", name, host, port)
@@ -439,7 +448,10 @@ async def _push_updates() -> None:
                         _route_queue.append((vid, ac.callsign))
 
         _snap_mode = memory_policy.get_policy()["snapshot_mode"] if config.MEMORY_POLICY_ENABLED else "full"
+        _queue_depth_samples.append(_msg_queue.qsize())
+        t_snap = time.perf_counter()
         snapshot = state.get_snapshot(mode=_snap_mode)
+        snapshot_ms = (time.perf_counter() - t_snap) * 1000
 
         # Record track points (rate-limited to 1/5s per aircraft inside TrackStore)
         now = time.time()
@@ -529,41 +541,63 @@ async def _push_updates() -> None:
 
         if not _clients:
             _push_timings_store.append({
-                "sync_ms":     round((t_sync_end - t_loop_start) * 1000, 2),
-                "gather_ms":   round((t_gather_end - t_sync_end) * 1000, 2),
+                "sync_ms":      round((t_sync_end - t_loop_start) * 1000, 2),
+                "snapshot_ms":  round(snapshot_ms, 2),
+                "gather_ms":    round((t_gather_end - t_sync_end) * 1000, 2),
                 "notify_tasks": len(notify_tasks),
                 "broadcast_ms": 0.0,
-                "total_ms":    round((t_gather_end - t_loop_start) * 1000, 2),
-                "ac_count":    len(snapshot["aircraft"]),
+                "serialize_ms": 0.0,
+                "total_ms":     round((t_gather_end - t_loop_start) * 1000, 2),
+                "ac_count":     len(snapshot["aircraft"]),
+                "ws_client_count":   0,
+                "ws_clients_dropped": 0,
+                "ws_send_max_ms":    0.0,
             })
             continue
 
+        t_ser = time.perf_counter()
         payload = _json_dumps(snapshot)
+        serialize_ms = (time.perf_counter() - t_ser) * 1000
 
-        async def _send_one(ws: WebSocket) -> WebSocket | None:
+        ws_client_count = len(_clients)
+
+        async def _send_one(ws: WebSocket) -> tuple[WebSocket | None, float]:
+            t = time.perf_counter()
             try:
                 await asyncio.wait_for(ws.send_text(payload), timeout=config.WS_SEND_TIMEOUT_S)
-                return None
+                return None, (time.perf_counter() - t) * 1000
             except Exception:
-                return ws
+                return ws, (time.perf_counter() - t) * 1000
 
         results = await asyncio.gather(*[_send_one(ws) for ws in list(_clients)])
-        for ws in results:
+        ws_dropped_this_cycle = 0
+        send_times: list[float] = []
+        for ws, send_ms in results:
+            send_times.append(send_ms)
             if ws is not None:
+                ws_dropped_this_cycle += 1
                 try:
                     _clients.remove(ws)
                 except ValueError:
                     pass
 
+        global _ws_clients_dropped
+        _ws_clients_dropped += ws_dropped_this_cycle
+
         t_done = time.perf_counter()
         _push_timings_store.append({
-            "sync_ms":      round((t_sync_end - t_loop_start) * 1000, 2),
-            "gather_ms":    round((t_gather_end - t_sync_end) * 1000, 2),
-            "notify_tasks": len(notify_tasks),
-            "broadcast_ms": round((t_done - t_gather_end) * 1000, 2),
-            "total_ms":     round((t_done - t_loop_start) * 1000, 2),
-            "ac_count":     len(snapshot["aircraft"]),
-            "payload_bytes": len(payload),
+            "sync_ms":           round((t_sync_end - t_loop_start) * 1000, 2),
+            "snapshot_ms":       round(snapshot_ms, 2),
+            "gather_ms":         round((t_gather_end - t_sync_end) * 1000, 2),
+            "notify_tasks":      len(notify_tasks),
+            "broadcast_ms":      round((t_done - t_gather_end) * 1000, 2),
+            "serialize_ms":      round(serialize_ms, 2),
+            "total_ms":          round((t_done - t_loop_start) * 1000, 2),
+            "ac_count":          len(snapshot["aircraft"]),
+            "payload_bytes":     len(payload),
+            "ws_client_count":   ws_client_count,
+            "ws_clients_dropped": ws_dropped_this_cycle,
+            "ws_send_max_ms":    round(max(send_times), 2) if send_times else 0.0,
         })
 
 
