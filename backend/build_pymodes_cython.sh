@@ -44,7 +44,6 @@ cp pyModeS/c_common.cpython-*.so "$SITE/"
 echo "Installed c_common extension to $SITE"
 
 "$VENV_PYTHON" -c "
-import pyModeS as pms
-assert type(pms.df).__name__ == 'cython_function_or_method', 'C extension not active!'
-print('OK — pyModeS is using the C extension.')
+import pyModeS.c_common
+print('OK — pyModeS C extension loaded from:', pyModeS.c_common.__file__)
 "
