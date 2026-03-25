@@ -27,9 +27,17 @@ COPY backend/pyproject.toml backend/uv.lock ./backend/
 # Install Python dependencies into the project venv (no editable install)
 RUN uv sync --directory backend --no-dev --frozen
 
-# Copy the backend source and seed scripts
+# Copy the full backend source and seed scripts
 COPY backend/ ./backend/
 COPY tools/ ./tools/
+
+# Build the pyModeS Cython extension now that the venv and source are both present.
+# build-essential is purged afterwards to keep the image slim.
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends build-essential \
+    && bash backend/build_pymodes_cython.sh \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy the built frontend so the backend can serve it as static files
 COPY --from=frontend-build /build/frontend/dist ./frontend/dist
