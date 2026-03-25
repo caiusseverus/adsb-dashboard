@@ -47,6 +47,7 @@ EXPOSE 8000
 USER adsb
 
 # Run from backend/ so relative paths (../frontend/dist, data/) resolve correctly.
-# Invoke uvicorn directly from the pre-built venv — uv is not needed at runtime.
+# HOST_PORT controls the port uvicorn binds to (default 8000); this allows the
+# port to be changed via environment variable when using network_mode: host.
 WORKDIR /app/backend
-CMD [".venv/bin/uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["/bin/sh", "-c", ".venv/bin/uvicorn main:app --host 0.0.0.0 --port ${HOST_PORT:-8000}"]

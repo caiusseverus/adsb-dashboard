@@ -4,8 +4,7 @@ services:
     # To build from source instead of using the published image, replace the
     # line above with:  build: .
     restart: unless-stopped
-    ports:
-      - "${HOST_PORT:-8000}:8000"
+    network_mode: host
     environment:
       # -----------------------------------------------------------------------
       # Receiver connection (REQUIRED — change these before starting)
