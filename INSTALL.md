@@ -1,9 +1,10 @@
 # Installing ADS-B Dashboard
 
-Two installation methods are available:
+Three installation methods are available:
 
 - **Bare Metal (Raspberry Pi)** — runs directly on Raspberry Pi OS. The installer handles everything.
 - **Docker** — uses a pre-built image from Docker Hub. Runs on any Linux, macOS, or Windows machine with Docker installed.
+- **Dockge** — uses the same Docker image, configured directly in the Dockge UI.
 
 ---
 
@@ -74,22 +75,16 @@ See `backend/.env.example` for a description of every available option.
 
 ### Install
 
-**Step 1 — Download the two required files**
+**Step 1 — Download the compose file**
 
 ```bash
 mkdir adsb-dashboard && cd adsb-dashboard
 curl -fsSL https://raw.githubusercontent.com/caiusseverus/adsb-dashboard/main/docker-compose.yml -o docker-compose.yml
-curl -fsSL https://raw.githubusercontent.com/caiusseverus/adsb-dashboard/main/backend/.env.example -o backend/.env.example
 ```
 
-**Step 2 — Create your configuration file**
+**Step 2 — Edit your configuration**
 
-```bash
-mkdir -p backend
-cp backend/.env.example backend/.env
-```
-
-Open `backend/.env` in a text editor and fill in your values. At a minimum, set:
+Open `docker-compose.yml` in a text editor and fill in the environment variables. At a minimum, set:
 
 | Variable | What it is |
 |---|---|
@@ -99,7 +94,7 @@ Open `backend/.env` in a text editor and fill in your values. At a minimum, set:
 | `RECEIVER_LON` | Your longitude in decimal degrees (e.g. `-0.1`) |
 | `HOME_COUNTRY` | Your country name (e.g. `United Kingdom`) |
 
-Every option has a comment explaining what it does. Optional settings can be left commented out.
+Optional settings are included as commented-out lines — uncomment and set any you need.
 
 **Step 3 — Pull the image and start**
 
@@ -128,6 +123,32 @@ docker compose up -d
 ```
 
 Docker will download the new image and restart the container. The database and SRTM terrain tiles are stored in a named volume (`adsb-data`) and are preserved across updates.
+
+---
+
+## Dockge
+
+### Prerequisites
+
+- [Dockge](https://github.com/louislam/dockge) installed and running
+- A working ADS-B receiver reachable from the Dockge host on Beast TCP port 30005
+
+### Install
+
+1. In the Dockge UI, click **+ Compose**
+2. Give the stack a name (e.g. `adsb-dashboard`)
+3. Paste in the contents of [`docker-compose.yml`](https://raw.githubusercontent.com/caiusseverus/adsb-dashboard/main/docker-compose.yml)
+4. Edit the environment variables directly in the editor — at minimum set:
+   - `BEAST_HOST` — IP or hostname of your receiver
+   - `RECEIVER_LAT` and `RECEIVER_LON` — your coordinates
+   - `HOME_COUNTRY` — your country name
+5. Click **Deploy**
+
+Open **http://\<your-host-ip\>:8000** in a browser.
+
+### Updating
+
+In the Dockge UI, click the stack → **Pull & Restart**. Your data volume is preserved automatically.
 
 ---
 
