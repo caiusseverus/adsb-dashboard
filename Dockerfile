@@ -33,8 +33,10 @@ COPY backend/ ./backend/
 # Copy the built frontend so the backend can serve it as static files
 COPY --from=frontend-build /build/frontend/dist ./frontend/dist
 
-# Run as a non-root user; create home so uv cache works if ever invoked manually
+# Create the data directory before declaring the VOLUME so Docker initialises
+# the named volume with the correct ownership (not root).
 RUN useradd --create-home --shell /bin/false adsb \
+    && mkdir -p /app/backend/data \
     && chown -R adsb:adsb /app
 
 # Persistent data lives in a volume so it survives container restarts
