@@ -33,13 +33,18 @@ COPY backend/ ./backend/
 # Copy the built frontend so the backend can serve it as static files
 COPY --from=frontend-build /build/frontend/dist ./frontend/dist
 
+# Run as a non-root user; create home so uv cache works if ever invoked manually
+RUN useradd --create-home --shell /bin/false adsb \
+    && chown -R adsb:adsb /app
+
 # Persistent data lives in a volume so it survives container restarts
 VOLUME ["/app/backend/data"]
 
 EXPOSE 8000
 
-# Run as a non-root user
-RUN useradd --no-create-home --shell /bin/false adsb
 USER adsb
 
-CMD ["uv", "run", "--directory", "backend", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run from backend/ so relative paths (../frontend/dist, data/) resolve correctly.
+# Invoke uvicorn directly from the pre-built venv — uv is not needed at runtime.
+WORKDIR /app/backend
+CMD [".venv/bin/uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
