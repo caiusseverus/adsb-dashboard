@@ -1006,6 +1006,53 @@ class AircraftState:
         lock_wait_timings.append(t_locked - t0)
         decode_timings.append(t_done - t_locked)
 
+    def process_messages_batch(self, batch: list[tuple[dict, "Optional[str]"]]) -> None:
+        """Process a batch of decoded Beast messages under a single lock acquisition.
+
+        Reduces per-message lock acquire/release overhead and GIL context-switch
+        frequency compared to calling process_message() for each message individually.
+        All messages share one timestamp (now) — at typical batch sizes the staleness
+        is <5 ms, which is negligible for rate counters and position freshness gates.
+        """
+        if not batch:
+            return
+        now = time.time()
+
+        # MLAT detection is pure computation — run outside the lock.
+        processed: list[tuple[str, int, bool, "Optional[str]"]] = []
+        for msg, mlat_source in batch:
+            raw: str = msg["raw"]
+            signal: int = msg.get("signal", 0)
+            timestamp: int = msg.get("timestamp", 0)
+            if timestamp == _MLAT_TS_MARKER:
+                if mlat_source is None:
+                    mlat_source = "mlat"
+            else:
+                mlat_source = None
+            processed.append((raw, signal, mlat_source is not None, mlat_source))
+
+        t0 = time.perf_counter()
+        with self._lock:
+            t_locked = time.perf_counter()
+            for raw, signal, mlat, mlat_source in processed:
+                self._total += 1
+                if mlat:
+                    self._mlat_total += 1
+                self._tick(now, mlat=mlat)
+                self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
+        t_done = time.perf_counter()
+
+        # Record per-message averages so timing deques remain comparable with
+        # single-message path (lock_wait is shared across the batch).
+        n = len(batch)
+        per_total  = (t_done - t0)      / n
+        per_wait   = (t_locked - t0)    / n
+        per_decode = (t_done - t_locked) / n
+        for _ in range(n):
+            msg_timings.append(per_total)
+            lock_wait_timings.append(per_wait)
+            decode_timings.append(per_decode)
+
     def expire_aircraft(self) -> list["Aircraft"]:
         """Remove stale aircraft and return them for visit logging."""
         now = time.time()

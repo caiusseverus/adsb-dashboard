@@ -193,6 +193,12 @@ PUSH_INTERVAL_S: float = float(os.getenv("PUSH_INTERVAL_S", "1.0"))
 # Valid values: full, reduced, thin.  Leave empty to use auto-detection (default).
 SNAPSHOT_MODE_OVERRIDE: str = os.getenv("SNAPSHOT_MODE_OVERRIDE", "").lower()
 
+# Decoder batch size: number of messages drained from the queue per lock
+# acquisition.  Higher values reduce lock/GIL overhead at the cost of longer
+# lock holds per batch.  Default 16 is tuned for Pi 4 at ~2500 msg/s.
+# Set to 1 to restore single-message-per-lock behaviour.
+DECODE_BATCH_SIZE: int = int(os.getenv("DECODE_BATCH_SIZE", "16"))
+
 # Queue-depth thresholds for CPU-pressure-triggered snapshot degradation.
 # When the median queue depth over a 6-cycle window exceeds a threshold the
 # snapshot mode escalates (same levels as memory pressure: elevated/high/critical).
