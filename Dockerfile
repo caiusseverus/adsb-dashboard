@@ -34,14 +34,19 @@ COPY tools/ ./tools/
 # Copy the built frontend so the backend can serve it as static files
 COPY --from=frontend-build /build/frontend/dist ./frontend/dist
 
-# Fetch static data files (airports + coastline) and bake them into the image.
-# Must run before VOLUME is declared so the files are preserved in the image layer
-# and copied into the named volume on first container initialisation.
-RUN python3 tools/fetch_airports.py && python3 tools/fetch_coastline.py
+# Fetch airports and coastline data into /app/static_data/ (outside the volume).
+# The entrypoint copies them into /app/backend/data/ at startup if missing,
+# so they are available on both fresh volumes and existing volumes after an update.
+RUN python3 tools/fetch_airports.py && python3 tools/fetch_coastline.py \
+    && mkdir -p /app/static_data \
+    && mv /app/backend/data/airports.json /app/static_data/ \
+    && mv /app/backend/data/coastline.json /app/static_data/
 
-# Create the data directory before declaring the VOLUME so Docker initialises
-# the named volume with the correct ownership (not root).
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+
 RUN useradd --create-home --shell /bin/false adsb \
+    && mkdir -p /app/backend/data \
+    && chmod +x /app/docker-entrypoint.sh \
     && chown -R adsb:adsb /app
 
 # Persistent data lives in a volume so it survives container restarts
@@ -51,8 +56,5 @@ EXPOSE 8000
 
 USER adsb
 
-# Run from backend/ so relative paths (../frontend/dist, data/) resolve correctly.
-# HOST_PORT controls the port uvicorn binds to (default 8000); this allows the
-# port to be changed via environment variable when using network_mode: host.
 WORKDIR /app/backend
-CMD ["/bin/sh", "-c", ".venv/bin/uvicorn main:app --host 0.0.0.0 --port ${HOST_PORT:-8000}"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
