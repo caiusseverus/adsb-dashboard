@@ -21,7 +21,7 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
 fi
 
 echo "Installing Cython and setuptools into venv…"
-"$VENV_PYTHON" -m pip install --quiet cython setuptools
+"$VENV_PYTHON" -m pip install --quiet "cython<3" setuptools
 
 echo "Downloading pyModeS 2.9 source…"
 export TMPDIR="$(mktemp -d)"
