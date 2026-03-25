@@ -53,6 +53,17 @@ def record(samples: list[tuple]) -> None:
         return
     cutoff = int(time.time()) - HIRES_MAX_AGE_S
     with _lock:
+        # When at the point cap, sweep ALL tracks for aged-out entries before
+        # processing new samples.  Without this, data from inactive aircraft
+        # (landed / out of range) is never pruned — they never appear in a new
+        # samples batch so their per-deque pruning never runs — causing the cap
+        # to stay permanently hit and new data to be silently dropped.
+        if _total_points >= HIRES_MAX_POINTS:
+            for dq in _tracks.values():
+                while dq and dq[0][0] < cutoff:
+                    dq.popleft()
+                    _total_points -= 1
+
         for ts, icao, bearing, range_nm, alt, military, interesting, tc, tcat, operator, mlat in samples:
             if ts - _last_ts.get(icao, 0) < HIRES_INTERVAL_S:
                 continue
@@ -63,12 +74,13 @@ def record(samples: list[tuple]) -> None:
                 dq = deque()
                 _tracks[icao] = dq
 
-            # Prune aged-out entries first so the cap check sees the true count
+            # Prune aged-out entries for this aircraft so the cap check sees
+            # the true count after any recent window shrinkage.
             while dq and dq[0][0] < cutoff:
                 dq.popleft()
                 _total_points -= 1
 
-            # Hard cap: drop this sample rather than growing without bound
+            # Hard cap: drop only if still at limit after the global sweep above
             if _total_points >= HIRES_MAX_POINTS:
                 if not _cap_logged:
                     log.warning(
