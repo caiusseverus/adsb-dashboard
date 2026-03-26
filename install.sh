@@ -294,9 +294,10 @@ SERVICE_DEST="/etc/systemd/system/$SERVICE_NAME.service"
 
 [[ -f "$SERVICE_SRC" ]] || _die "Service file not found: $SERVICE_SRC"
 
-# Patch the WorkingDirectory and EnvironmentFile to the actual install path
+# Patch install-path-specific fields to the actual install location
 sed \
-    -e "s|WorkingDirectory=.*|WorkingDirectory=$INSTALL_DIR|" \
+    -e "s|WorkingDirectory=.*|WorkingDirectory=$INSTALL_DIR/backend|" \
+    -e "s|ExecStart=.*|ExecStart=$INSTALL_DIR/backend/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000|" \
     -e "s|EnvironmentFile=.*|EnvironmentFile=$INSTALL_DIR/backend/.env|" \
     "$SERVICE_SRC" > "$SERVICE_DEST"
 
