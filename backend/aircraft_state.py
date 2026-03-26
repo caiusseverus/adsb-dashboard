@@ -1768,8 +1768,11 @@ class AircraftState:
                                 ac.country = op.get("c")
 
                 # Altitude (type codes 9-18, 20-22)
-                if (alt := _nd.get('baro_alt')) is not None:
-                    _accept_altitude(ac, alt, source, crc_clean, now)
+                alt = _nd.get('baro_alt')
+                if alt is None:
+                    alt = _nd.get('geom_alt')
+                if alt is not None:
+                    _accept_altitude(ac, int(alt), source, crc_clean, now)
 
                 # CPR position (type codes 9-22)
                 if _nd.get('cpr_valid'):

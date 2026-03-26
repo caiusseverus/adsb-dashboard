@@ -26,6 +26,8 @@ typedef struct {
     /* Altitude */
     bool     baro_alt_valid;
     int      baro_alt;        /* barometric altitude, feet */
+    bool     geom_alt_valid;
+    int      geom_alt;        /* geometric (GNSS) altitude, feet */
     int      airground;       /* airground_t: 0=invalid,1=ground,2=air,3=uncertain */
 
     /* Squawk */
