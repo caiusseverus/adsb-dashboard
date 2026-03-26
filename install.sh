@@ -260,7 +260,7 @@ _step "Installing Python dependencies"
 mkdir -p "$VENV_DIR"
 # Install the venv to /var/lib (root filesystem) rather than /opt, which may
 # be mounted noexec on some Raspberry Pi configurations.
-UV_PROJECT_ENVIRONMENT="$VENV_DIR/.venv" uv sync --directory "$INSTALL_DIR/backend" --no-dev --frozen
+UV_PROJECT_ENVIRONMENT="$VENV_DIR/.venv" uv sync --directory "$INSTALL_DIR/backend" --no-dev --frozen --python-preference only-system
 
 _step "Building native extensions"
 if ! dpkg -s build-essential &>/dev/null 2>&1; then
