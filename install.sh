@@ -208,12 +208,14 @@ fi
 _step "Installing Python dependencies"
 uv sync --directory "$INSTALL_DIR/backend" --no-dev --frozen
 
-_step "Building pyModeS Cython extension"
+_step "Building native extensions"
 if ! dpkg -s build-essential &>/dev/null 2>&1; then
-    echo "  Installing build-essential for Cython compilation…"
+    echo "  Installing build-essential for compilation…"
     apt-get install -y -qq build-essential
 fi
 bash "$INSTALL_DIR/backend/build_pymodes_cython.sh"
+make -C "$INSTALL_DIR/backend/native"
+make -C "$INSTALL_DIR/backend/native" install
 
 _step "Fetching airport and coastline data"
 python3 "$INSTALL_DIR/tools/fetch_airports.py"

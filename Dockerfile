@@ -31,12 +31,16 @@ RUN uv sync --directory backend --no-dev --frozen
 COPY backend/ ./backend/
 COPY tools/ ./tools/
 
-# Build the pyModeS Cython extension now that the venv and source are both present.
+# Build native extensions:
+#   1. pyModeS Cython extension (c_common.pyx) — speeds up hot decode path
+#   2. libdecode.so — readsb-derived C decode library used by decode_cffi.py
 # build-essential is purged afterwards to keep the image slim.
 RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends build-essential \
     && bash backend/build_pymodes_cython.sh \
-    && apt-get purge -y --auto-remove build-essential \
+    && make -C backend/native \
+    && make -C backend/native install \
+    && make -C backend/native clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the built frontend so the backend can serve it as static files
