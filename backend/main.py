@@ -23,6 +23,8 @@ import config
 import enrichment
 from beast_client import BeastClient
 from aircraft_state import AircraftState, push_timings as _push_timings_store
+import readsb_ingest
+import readsb_stats
 from collections import deque as _deque
 from db import stats_db
 from track_store import TrackStore
@@ -724,16 +726,34 @@ async def lifespan(app: FastAPI):
     }
     await asyncio.to_thread(stats_db.fix_military_countries, corrections, config.HOME_COUNTRY)
 
-    global _decoder_thread
-    _decoder_thread = _start_msg_processor()
     _bg_tasks: list[asyncio.Task] = []
     def _bg(coro):
         t = asyncio.create_task(coro)
         _bg_tasks.append(t)
         return t
-    _bg(_beast_runner())
-    for name, host, port in config.MLAT_SERVERS:
-        _bg(_mlat_runner(name, host, port))
+
+    global _decoder_thread
+    if config.INGEST_MODE == "beast":
+        # Default: decode raw Beast TCP stream in Python
+        _decoder_thread = _start_msg_processor()
+        _bg(_beast_runner())
+        for name, host, port in config.MLAT_SERVERS:
+            _bg(_mlat_runner(name, host, port))
+    elif config.INGEST_MODE == "readsb":
+        # Pure readsb mode: no Beast connection, no decode thread
+        log.info("Ingest mode: readsb JSON (no Beast TCP)")
+        _bg(readsb_ingest.readsb_poller(state))
+        _bg(readsb_stats.readsb_stats_poller())
+    elif config.INGEST_MODE == "hybrid":
+        # Hybrid: readsb JSON for positions + Beast/MLAT for ACAS and raw DF counts
+        log.info("Ingest mode: hybrid (readsb JSON + Beast MLAT)")
+        _bg(readsb_ingest.readsb_poller(state))
+        _bg(readsb_stats.readsb_stats_poller())
+        _decoder_thread = _start_msg_processor()
+        for name, host, port in config.MLAT_SERVERS:
+            _bg(_mlat_runner(name, host, port))
+    else:
+        raise ValueError(f"Unknown INGEST_MODE: {config.INGEST_MODE!r} (expected beast/readsb/hybrid)")
     _bg(_push_updates())
     _bg(_db_writer())
     _bg(_db_update_checker())

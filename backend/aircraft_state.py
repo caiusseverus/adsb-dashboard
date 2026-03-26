@@ -896,6 +896,32 @@ class Aircraft:
     # dict: {x, P, ref_lat, ref_lon, ts}  or None before first fix
     kalman_state:        Optional[dict] = None
 
+    # ── Fields available only from readsb JSON (None in Beast-only mode) ──────
+    alt_geom:         Optional[int]   = None  # geometric (GNSS) altitude ft
+    gs:               Optional[float] = None  # ground speed kt
+    track:            Optional[float] = None  # true track over ground °
+    track_rate:       Optional[float] = None  # track rate of change °/s
+    roll:             Optional[float] = None  # roll angle °
+    true_heading:     Optional[float] = None  # true heading °
+    geom_rate:        Optional[int]   = None  # geometric vertical rate fpm
+    emergency:        Optional[str]   = None  # "none"|"general"|"lifeguard"…
+    nav_qnh:          Optional[float] = None  # altimeter setting hPa
+    nav_altitude_fms: Optional[int]   = None  # FMS selected altitude ft
+    nav_heading:      Optional[float] = None  # selected heading °
+    nav_modes:        Optional[list]  = None  # ["autopilot","vnav",…]
+    nic:              Optional[int]   = None  # navigation integrity category
+    rc:               Optional[int]   = None  # radius of containment m
+    nac_p:            Optional[int]   = None  # navigation accuracy (position)
+    nac_v:            Optional[int]   = None  # navigation accuracy (velocity)
+    sil:              Optional[int]   = None  # source integrity level
+    gva:              Optional[int]   = None  # geometric vertical accuracy
+    sda:              Optional[int]   = None  # system design assurance
+    adsb_version:     Optional[int]   = None  # ADS-B transponder version 0/1/2
+    wind_dir:         Optional[int]   = None  # derived wind direction °
+    wind_speed:       Optional[int]   = None  # derived wind speed kt
+    oat:              Optional[int]   = None  # outside air temperature °C
+    tat:              Optional[int]   = None  # total air temperature °C
+
 
 class AircraftState:
     def __init__(self, aircraft_timeout: int = 60):
@@ -958,6 +984,12 @@ class AircraftState:
         # of 60×/min (once per second).
         self._snapshot_history_minute: int = -1
         self._snapshot_history_cache: tuple | None = None  # (rate_list, df_list, mlat_list)
+
+        # readsb ingest tracking — not used in Beast mode
+        # Cumulative message total from the last aircraft.json poll (for delta computation)
+        self._readsb_last_total: int = 0
+        # Per-aircraft readsb cumulative message counts (for per-session delta tracking)
+        self._readsb_msg_counts: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -1422,6 +1454,31 @@ class AircraftState:
                 "pos_reliable_odd":  ac.pos_reliable_odd,
                 "pos_reliable_even": ac.pos_reliable_even,
                 "pos_confident":     has_pos,
+                # readsb-only fields (None when in Beast mode)
+                "alt_geom":          ac.alt_geom,
+                "gs":                ac.gs,
+                "track":             ac.track,
+                "track_rate":        ac.track_rate,
+                "roll":              ac.roll,
+                "true_heading":      ac.true_heading,
+                "geom_rate":         ac.geom_rate,
+                "emergency":         ac.emergency,
+                "nav_qnh":           ac.nav_qnh,
+                "nav_altitude_fms":  ac.nav_altitude_fms,
+                "nav_heading":       ac.nav_heading,
+                "nav_modes":         ac.nav_modes,
+                "nic":               ac.nic,
+                "rc":                ac.rc,
+                "nac_p":             ac.nac_p,
+                "nac_v":             ac.nac_v,
+                "sil":               ac.sil,
+                "gva":               ac.gva,
+                "sda":               ac.sda,
+                "adsb_version":      ac.adsb_version,
+                "wind_dir":          ac.wind_dir,
+                "wind_speed":        ac.wind_speed,
+                "oat":               ac.oat,
+                "tat":               ac.tat,
             })
 
         live_military = cur_mil
@@ -1977,3 +2034,257 @@ class AircraftState:
             return None
 
         return code
+
+    # ------------------------------------------------------------------
+    # readsb JSON ingest path (INGEST_MODE=readsb or hybrid)
+    # ------------------------------------------------------------------
+
+    def update_from_json(
+        self,
+        aircraft_list: list[dict],
+        now: float,
+        total_messages: int,
+    ) -> None:
+        """Update aircraft state from a readsb aircraft.json payload.
+
+        Called by readsb_ingest.py once per poll cycle (~1 s).  Processes the
+        complete aircraft snapshot rather than individual Beast frames, so there
+        is no per-message queue or decoder thread.  Per-second and per-minute
+        stats are derived from the total_messages delta between polls.
+        """
+        with self._lock:
+            self._update_from_json_locked(aircraft_list, now, total_messages)
+
+    def _update_from_json_locked(
+        self,
+        aircraft_list: list[dict],
+        now: float,
+        total_messages: int,
+    ) -> None:
+        """Inner implementation — must be called with self._lock held."""
+
+        # ── Message-count bookkeeping ──────────────────────────────────────
+        delta = max(0, total_messages - self._readsb_last_total)
+        self._readsb_last_total = total_messages
+        self._total += delta
+
+        # Replicate _tick() logic: accumulate per-second count; roll minute.
+        # We treat the entire poll-period delta as a single second-bucket entry.
+        sec = int(now)
+        if sec != self._cur_sec:
+            self._sec_counts.append((self._cur_sec, self._cur_sec_count))
+            self._mlat_sec_counts.append((self._cur_sec, self._cur_sec_mlat_count))
+            self._cur_min_sec_counts.append(self._cur_sec_count)
+            self._cur_sec = sec
+            self._cur_sec_count = 0
+            self._cur_sec_mlat_count = 0
+        self._cur_sec_count += delta
+
+        minute = int(now // 60)
+        if minute != self._cur_min:
+            secs = self._cur_min_sec_counts
+            if secs:
+                mn, mx, me = min(secs), max(secs), round(sum(secs) / len(secs), 1)
+            else:
+                mn = mx = me = 0.0
+            total_ac = len(self._aircraft)
+            mil      = sum(1 for ac in self._aircraft.values() if ac.military)
+            with_pos = sum(1 for ac in self._aircraft.values() if _pos_reliable(ac))
+            mlat_pos = sum(1 for ac in self._aircraft.values() if ac.mlat and _pos_reliable(ac))
+            sigs     = self._cur_min_signals
+            sig_avg  = round(sum(sigs) / len(sigs), 1) if sigs else None
+            sig_min  = min(sigs) if sigs else None
+            sig_max  = max(sigs) if sigs else None
+            self._min_stats.append(
+                (self._cur_min, mn, mx, me, total_ac, total_ac - mil, mil,
+                 sig_avg, sig_min, sig_max, with_pos, mlat_pos)
+            )
+            self._min_df_stats.append((self._cur_min, dict(self._cur_min_df_counts)))
+            self._min_mlat_counts.append((self._cur_min, self._cur_min_mlat_count))
+            self._cur_min = minute
+            self._cur_min_sec_counts = []
+            self._cur_min_signals = []
+            self._cur_min_df_counts = {}
+            self._cur_min_mlat_count = 0
+
+        # Midnight rollover (mirrors process_message path)
+        today = date.today().isoformat()
+        if today != self._today_date:
+            self._today_date = today
+            self._today_icaos.clear()
+            self._today_mil_icaos.clear()
+
+        # ── Per-aircraft update ────────────────────────────────────────────
+        for ac_data in aircraft_list:
+            raw_icao = ac_data.get("hex", "")
+            if not raw_icao:
+                continue
+            # TIS-B addresses carry a '~' prefix — strip it but still track them
+            icao = raw_icao.lstrip("~").upper()
+            if not _ICAO_HEX_RE.fullmatch(icao):
+                continue
+
+            is_new = icao not in self._aircraft
+            if is_new:
+                ac = Aircraft(icao=icao, sighting_count=self._sighting_counts.get(icao, 1))
+                ac.country = enrichment.db.get_country_by_icao(icao)
+                hexdb_cached = enrichment.db.get_hexdb_cached(icao)
+                if hexdb_cached:
+                    _apply_hexdb_data(ac, hexdb_cached)
+                # Defer SQLite enrichment to _adsbx_task
+                self._adsbx_queue.add(icao)
+                self._aircraft[icao] = ac
+                self._today_icaos.add(icao)
+
+            ac = self._aircraft[icao]
+            ac.last_seen = now
+
+            # Callsign
+            flight = ac_data.get("flight")
+            if flight is not None:
+                cs = flight.strip()
+                if cs:
+                    ac.callsign = cs
+
+            # Altitude — readsb encodes "ground" as the string "ground"
+            alt_baro = ac_data.get("alt_baro")
+            if alt_baro == "ground":
+                ac.altitude = 0
+            elif isinstance(alt_baro, (int, float)):
+                ac.altitude = int(alt_baro)
+
+            # Signal: readsb rssi is dBFS (negative float) → Beast 0–255 scale
+            # Formula: raw = clamp(-rssi * 2, 0, 255)  (0 = strongest, matches Beast)
+            rssi = ac_data.get("rssi")
+            if rssi is not None:
+                ac.signal = max(0, min(255, int(-rssi * 2)))
+                self._cur_min_signals.append(ac.signal)
+
+            # Per-aircraft message delta (readsb gives cumulative from its start)
+            readsb_msgs = ac_data.get("messages")
+            if readsb_msgs is not None:
+                prev_msgs = self._readsb_msg_counts.get(icao, readsb_msgs)
+                msg_delta = max(0, readsb_msgs - prev_msgs)
+                self._readsb_msg_counts[icao] = readsb_msgs
+                ac.msg_count += msg_delta
+
+            # MLAT flag: type=="mlat" or lat is in the mlat-derived field list
+            ac_type    = ac_data.get("type", "")
+            mlat_fields = ac_data.get("mlat", [])
+            is_mlat = ac_type == "mlat" or "lat" in mlat_fields
+            if is_mlat:
+                ac.mlat = True
+                self._mlat_total += 1
+                self._cur_sec_mlat_count += 1
+                self._cur_min_mlat_count += 1
+            elif ac_type.startswith("adsb"):
+                # Confirmed ADS-B — clear any prior MLAT tag
+                ac.mlat = False
+                ac.has_adsb = True
+
+            # Position
+            lat = ac_data.get("lat")
+            lon = ac_data.get("lon")
+            if lat is not None and lon is not None:
+                ac.lat = lat
+                ac.lon = lon
+                seen_pos = ac_data.get("seen_pos", 0)
+                ac.last_pos_ts = now - seen_pos
+                # Trust readsb's CPR decode: set reliability to max
+                ac.pos_reliable_odd  = _POS_RELIABLE_MAX
+                ac.pos_reliable_even = _POS_RELIABLE_MAX
+                ac.pos_global = True
+                _update_range_bearing(ac)
+
+            # Squawk
+            squawk = ac_data.get("squawk")
+            if squawk is not None:
+                ac.squawk = squawk
+
+            # Emitter category (A0–D7)
+            category = ac_data.get("category")
+            if category is not None:
+                ac.type_category = category
+
+            # EHS fields
+            tas = ac_data.get("tas")
+            ias = ac_data.get("ias")
+            if tas is not None:
+                ac.airspeed_kts  = int(tas)
+                ac.airspeed_type = "TAS"
+            elif ias is not None:
+                ac.airspeed_kts  = int(ias)
+                ac.airspeed_type = "IAS"
+
+            mag_heading = ac_data.get("mag_heading")
+            if mag_heading is not None:
+                ac.heading_deg = mag_heading
+
+            baro_rate = ac_data.get("baro_rate")
+            if baro_rate is not None:
+                ac.vertical_rate_fpm = int(baro_rate)
+
+            mach = ac_data.get("mach")
+            if mach is not None:
+                ac.mach = mach
+
+            nav_alt_mcp = ac_data.get("nav_altitude_mcp")
+            if nav_alt_mcp is not None:
+                ac.selected_alt = int(nav_alt_mcp)
+
+            # Enrichment from readsb --db-file / --db-file-lt (free lookups)
+            r = ac_data.get("r")
+            if r and not ac.registration:
+                ac.registration = r
+
+            t = ac_data.get("t")
+            if t and not ac.type_code:
+                ac.type_code = t
+                ti = enrichment.db.get_type_info(t)
+                if ti:
+                    ac.type_desc      = ti.get("Description", "")
+                    ac.type_full_name = ti.get("Name", "")
+                    ac.wtc            = ti.get("WTC", "")
+
+            desc = ac_data.get("desc")
+            if desc and not ac.type_full_name:
+                ac.type_full_name = desc
+
+            # Military/interesting from dbFlags bitfield (requires readsb --db-file)
+            db_flags = ac_data.get("dbFlags")
+            if db_flags is not None:
+                ac.military = bool(db_flags & 1)
+
+            if ac.military:
+                self._today_mil_icaos.add(icao)
+
+            # ── readsb-only fields ──────────────────────────────────────────
+            def _maybe(key, attr, cast=None):
+                v = ac_data.get(key)
+                if v is not None:
+                    setattr(ac, attr, cast(v) if cast else v)
+
+            _maybe("alt_geom",          "alt_geom",         int)
+            _maybe("gs",                "gs")
+            _maybe("track",             "track")
+            _maybe("track_rate",        "track_rate")
+            _maybe("roll",              "roll")
+            _maybe("true_heading",      "true_heading")
+            _maybe("geom_rate",         "geom_rate",        int)
+            _maybe("emergency",         "emergency")
+            _maybe("nav_qnh",           "nav_qnh")
+            _maybe("nav_altitude_fms",  "nav_altitude_fms", int)
+            _maybe("nav_heading",       "nav_heading")
+            _maybe("nav_modes",         "nav_modes")
+            _maybe("nic",               "nic",              int)
+            _maybe("rc",                "rc",               int)
+            _maybe("nac_p",             "nac_p",            int)
+            _maybe("nac_v",             "nac_v",            int)
+            _maybe("sil",               "sil",              int)
+            _maybe("gva",               "gva",              int)
+            _maybe("sda",               "sda",              int)
+            _maybe("version",           "adsb_version",     int)
+            _maybe("wd",                "wind_dir",         int)
+            _maybe("ws",                "wind_speed",       int)
+            _maybe("oat",               "oat",              int)
+            _maybe("tat",               "tat",              int)

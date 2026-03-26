@@ -165,6 +165,20 @@ REGISTRY_FLUSH_SECONDS: float = float(os.getenv("REGISTRY_FLUSH_SECONDS", "300")
 READSB_AIRCRAFT_JSON_PATH: str = os.getenv("READSB_AIRCRAFT_JSON_PATH", "/run/readsb/aircraft.json")
 READSB_AIRCRAFT_JSON_URL: str = os.getenv("READSB_AIRCRAFT_JSON_URL", "http://adsbpi.local/tar1090/data/aircraft.json")
 
+# ---------------------------------------------------------------------------
+# Ingest mode (Phase 3)
+# ---------------------------------------------------------------------------
+# beast   — decode raw Beast TCP stream (current behaviour, default)
+# readsb  — poll readsb JSON files; no Beast connection
+# hybrid  — readsb JSON for positions + Beast/MLAT for ACAS/raw DF counts
+INGEST_MODE: str = os.getenv("INGEST_MODE", "beast").lower()
+# Directory written by readsb (aircraft.json, stats.json, receiver.json).
+READSB_JSON_DIR: str = os.getenv("READSB_JSON_DIR", "/run/readsb")
+# Path to airspy_adsb stats.json — optional, only present on Airspy SDR installs.
+AIRSPY_STATS_PATH: str = os.getenv("AIRSPY_STATS_PATH", "/run/airspy_adsb/stats.json")
+# How often to poll aircraft.json (seconds); should match readsb's --write-json interval.
+READSB_POLL_INTERVAL_S: float = float(os.getenv("READSB_POLL_INTERVAL_S", "1.0"))
+
 # Maximum range (nm) from the receiver for accepted ADS-B positions.
 # Mirrors readsb's receiver_range config; 300 nm is a typical ADS-B horizon.
 MAX_RANGE_NM: float = float(os.getenv("MAX_RANGE_NM", "300"))
