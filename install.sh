@@ -68,9 +68,11 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "$IS_UPDATE" == true ]]; then
     _step "Updating repository"
-    # The repo is owned by the service user; pass safe.directory so git
-    # doesn't refuse to operate on a directory owned by a different user.
-    git -C "$INSTALL_DIR" -c safe.directory="$INSTALL_DIR" pull --ff-only
+    # The repo is owned by the service user; mark it safe for the root user
+    # running this script (git rejects operations on directories owned by
+    # a different uid without this).
+    git config --global --add safe.directory "$INSTALL_DIR"
+    git -C "$INSTALL_DIR" pull --ff-only
 else
     _step "Cloning repository to $INSTALL_DIR"
     git clone "$REPO_URL" "$INSTALL_DIR"
