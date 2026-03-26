@@ -50,12 +50,11 @@ for pkg in "${PACKAGES[@]}"; do
     fi
 done
 
-# Install uv (Python package/project manager)
-if ! command -v uv &>/dev/null; then
+# Install uv (Python package/project manager) into /usr/local/bin so it is
+# on the system PATH for all users and survives repeated sudo invocations.
+if ! [[ -x /usr/local/bin/uv ]]; then
     echo "  Installing uv …"
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    # Make uv available in the current shell
-    export PATH="$HOME/.local/bin:$PATH"
+    curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
 fi
 
 # Verify Node version is >=18 (required for Vite)
@@ -69,7 +68,9 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "$IS_UPDATE" == true ]]; then
     _step "Updating repository"
-    git -C "$INSTALL_DIR" pull --ff-only
+    # The repo is owned by the service user; pass safe.directory so git
+    # doesn't refuse to operate on a directory owned by a different user.
+    git -C "$INSTALL_DIR" -c safe.directory="$INSTALL_DIR" pull --ff-only
 else
     _step "Cloning repository to $INSTALL_DIR"
     git clone "$REPO_URL" "$INSTALL_DIR"
