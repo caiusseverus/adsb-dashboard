@@ -16,6 +16,15 @@ from typing import NamedTuple, Optional
 import pyModeS as pms
 from pyModeS.decoder.bds import bds40 as _bds40, bds50 as _bds50, bds60 as _bds60
 
+# Native C decode library (Phase 2 acceleration).  Falls back to pyModeS if
+# libdecode.so has not been built.
+try:
+    import decode_cffi as _decode_cffi
+    _decode_cffi._get_lib()          # trigger load / init now; raises on failure
+    _NATIVE_DECODE = True
+except Exception:
+    _NATIVE_DECODE = False
+
 import acas as acas_decoder
 import config
 import enrichment
@@ -1586,60 +1595,98 @@ class AircraftState:
         if len(raw) < 14:          # Too short to contain an ICAO address
             return
 
-        try:
-            df = pms.df(raw)
-        except Exception:
-            return
+        # ── Native C decode path ─────────────────────────────────────────────
+        # decode_cffi.decode_message() handles CRC check, ICAO extraction, and
+        # all field decoding in one call.  The C library applies DF-field
+        # correction (Modes.fixDF=1) and CRC bit correction (Modes.nfix_crc=1)
+        # exactly as readsb does, so _try_fix_df17 is no longer needed.
+        if _NATIVE_DECODE:
+            try:
+                msg_bytes = bytes.fromhex(raw)
+            except ValueError:
+                return
+            _nd = _decode_cffi.decode_message(msg_bytes, signal)
+            if _nd is None:
+                return   # bad CRC or unknown DF — discard
 
-        # DF17 type fixup: recover frames where a single-bit error corrupted the
-        # DF field.  Only for 112-bit (28 hex char) messages.  Sets df17_corrected
-        # so that crc_clean is forced False — lower good_crc in the altitude filter.
-        df17_corrected = False
-        if len(raw) == 28 and df != 17:
-            fixed = _try_fix_df17(bytes.fromhex(raw))
-            if fixed is not None:
-                raw = fixed.hex().upper()
-                df = 17
-                df17_corrected = True
+            df = _nd['df']
+            # correctedbits>0 covers both DF-field and CRC-bit corrections.
+            # Treat corrected DF17 frames as lower-confidence (crc_clean=False).
+            df17_corrected = (df == 17 and _nd['correctedbits'] > 0)
 
-        # --- CRC check + ICAO extraction + source classification ---
-        icao: Optional[str] = None
-        crc_clean = False
-        source = MsgSource.INVALID
-        try:
+            icao: Optional[str] = None
+            crc_clean = False
+            source = MsgSource.INVALID
+
+            addr = _nd.get('addr')
+            if addr:
+                icao = f"{addr:06X}"
+
             if df in (17, 18):
-                # DF17/18: true CRC covers entire message; residual 0 = clean.
-                # pyModeS crc() returns the 24-bit remainder on the original bytes.
-                crc_residual = pms.crc(raw)
-                # Corrected frames have CRC=0 after fixup but are lower confidence.
-                crc_clean = (crc_residual == 0) and not df17_corrected
-                icao = pms.icao(raw)
+                crc_clean = (_nd['correctedbits'] == 0) and not df17_corrected
                 if icao:
-                    icao_up = icao.upper()
-                    # Register as confirmed ICAO (readsb: icaoFilterAdd)
-                    self._confirmed_icaos[icao_up] = now
-                    self._confirmed_icaos.move_to_end(icao_up)
+                    self._confirmed_icaos[icao] = now
+                    self._confirmed_icaos.move_to_end(icao)
                     if len(self._confirmed_icaos) > _CONFIRMED_ICAO_MAX:
                         self._confirmed_icaos.popitem(last=False)
-                    source = MsgSource.ADSR if df == 18 else MsgSource.ADSB
+                source = MsgSource.ADSR if df == 18 else MsgSource.ADSB
             elif df == 11:
-                icao = pms.icao(raw)
-                # DF11 CRC includes Interrogator ID in lower 7 bits — less
-                # reliable for ICAO confirmation; do NOT add to confirmed set.
                 source = MsgSource.MODE_S_CHECKED
             elif df in _AP_DFS:
-                # Address/Parity: CRC syndrome IS the ICAO address.
-                # Only accept if previously confirmed by a DF17/18.
-                icao = pms.icao(raw)
-                if not icao or icao.upper() not in self._confirmed_icaos:
+                if not icao or icao not in self._confirmed_icaos:
                     return
-                # Refresh LRU timestamp
-                icao_up = icao.upper()
-                self._confirmed_icaos[icao_up] = now
-                self._confirmed_icaos.move_to_end(icao_up)
+                self._confirmed_icaos[icao] = now
+                self._confirmed_icaos.move_to_end(icao)
                 source = MsgSource.MODE_S
-        except Exception:
-            pass
+        else:
+            # ── pyModeS fallback (used when libdecode.so is not available) ───
+            _nd = None
+            try:
+                df = pms.df(raw)
+            except Exception:
+                return
+
+            # DF17 type fixup
+            df17_corrected = False
+            if len(raw) == 28 and df != 17:
+                fixed = _try_fix_df17(bytes.fromhex(raw))
+                if fixed is not None:
+                    raw = fixed.hex().upper()
+                    df = 17
+                    df17_corrected = True
+
+            icao: Optional[str] = None
+            crc_clean = False
+            source = MsgSource.INVALID
+            try:
+                if df in (17, 18):
+                    crc_residual = pms.crc(raw)
+                    crc_clean = (crc_residual == 0) and not df17_corrected
+                    icao = pms.icao(raw)
+                    if icao:
+                        icao_up = icao.upper()
+                        self._confirmed_icaos[icao_up] = now
+                        self._confirmed_icaos.move_to_end(icao_up)
+                        if len(self._confirmed_icaos) > _CONFIRMED_ICAO_MAX:
+                            self._confirmed_icaos.popitem(last=False)
+                        icao = icao_up
+                        source = MsgSource.ADSR if df == 18 else MsgSource.ADSB
+                elif df == 11:
+                    icao = pms.icao(raw)
+                    if icao:
+                        icao = icao.upper()
+                    source = MsgSource.MODE_S_CHECKED
+                elif df in _AP_DFS:
+                    icao = pms.icao(raw)
+                    if not icao or icao.upper() not in self._confirmed_icaos:
+                        return
+                    icao_up = icao.upper()
+                    self._confirmed_icaos[icao_up] = now
+                    self._confirmed_icaos.move_to_end(icao_up)
+                    icao = icao_up
+                    source = MsgSource.MODE_S
+            except Exception:
+                pass
 
         if not icao:
             return
@@ -1708,55 +1755,32 @@ class AircraftState:
         # DF17: Extended Squitter with true 24-bit CRC — highest integrity source.
         # DF18: TIS-B / ADS-R rebroadcast — same message structure, same altitude quality.
         if df in (17, 18) and len(raw) == 28:
-            try:
-                tc = pms.adsb.typecode(raw)
-            except Exception:
-                return
+            if _nd is not None:
+                # Native path: C library decoded all fields.
+                # Callsign (type codes 1-4)
+                if cs := _nd.get('callsign'):
+                    ac.callsign = cs.strip().rstrip('_')
+                    if ac.callsign and not ac.operator:
+                        op = enrichment.db.get_operator(ac.callsign[:3])
+                        if op:
+                            ac.operator = op.get("n")
+                            if not ac.country:
+                                ac.country = op.get("c")
 
-            if tc is None:
-                return
+                # Altitude (type codes 9-18, 20-22)
+                if (alt := _nd.get('baro_alt')) is not None:
+                    _accept_altitude(ac, alt, source, crc_clean, now)
 
-            # Identification (callsign)
-            if 1 <= tc <= 4:
-                try:
-                    cs = pms.adsb.callsign(raw)
-                    if cs:
-                        ac.callsign = cs.strip().rstrip('_')
-                        if ac.callsign and not ac.operator:
-                            op = enrichment.db.get_operator(ac.callsign[:3])
-                            if op:
-                                ac.operator = op.get("n")
-                                if not ac.country:
-                                    ac.country = op.get("c")
-                except Exception:
-                    pass
-
-            # Airborne position – altitude + CPR lat/lon
-            elif 9 <= tc <= 18 or 20 <= tc <= 22:
-                try:
-                    alt = pms.adsb.altitude(raw)
-                    if alt is not None:
-                        _accept_altitude(ac, int(alt), source, crc_clean, now)
-                except Exception:
-                    pass
-                try:
-                    oe = pms.adsb.oe_flag(raw)
-
-                    # Duplicate check: same raw frame within _CPR_DUP_WINDOW_S means
-                    # multiple receivers forwarded the same transponder transmission.
-                    # Skip CPR pairing and pos_reliable update to avoid inflating
-                    # confidence at multi-feeder/reflection sites (readsb:
-                    # cpr_duplicate_check in track.c).
-                    if not _is_cpr_duplicate(ac, raw, oe, now):
-                        if oe == 0:
+                # CPR position (type codes 9-22)
+                if _nd.get('cpr_valid'):
+                    _cpr_oe = 1 if _nd['cpr_odd'] else 0
+                    # CPR pairing uses raw hex strings for the pyModeS position solver
+                    if not _is_cpr_duplicate(ac, raw, _cpr_oe, now):
+                        if _cpr_oe == 0:
                             ac.cpr_even = (raw, now)
                         else:
                             ac.cpr_odd = (raw, now)
 
-                        # Global decode is always preferred: geometrically unambiguous.
-                        # Local decode can pick the wrong CPR longitude zone when the
-                        # receiver is west of the aircraft (e.g. UK receiver + aircraft
-                        # over the North Sea).
                         pos = None
                         pos_from_global = False
                         global_bad = False
@@ -1769,13 +1793,8 @@ class AircraftState:
                             if pos is not None:
                                 pos_from_global = True
                             elif ac.pos_global:
-                                # Established aircraft + None from global most likely
-                                # means bad data (-2), not zone mismatch (-1).
-                                # Block local fallback to avoid wrong-zone write.
                                 global_bad = True
 
-                        # Local decode fallback: only when global was not attempted
-                        # or failed with a likely zone mismatch (not bad data).
                         if not pos_from_global and not global_bad:
                             ref_lat = ac.lat if ac.lat is not None else config.RECEIVER_LAT
                             ref_lon = ac.lon if ac.lon is not None else config.RECEIVER_LON
@@ -1785,17 +1804,13 @@ class AircraftState:
                         if pos:
                             lat, lon = pos
                             if -90 <= lat <= 90 and -180 <= lon <= 180:
-                                # Range gate: reject positions beyond receiver range
                                 if (config.RECEIVER_LAT is not None
                                         and config.RECEIVER_LON is not None
                                         and _haversine_nm(
                                             config.RECEIVER_LAT, config.RECEIVER_LON,
                                             lat, lon) > config.MAX_RANGE_NM):
-                                    pass  # discard — beyond ADS-B range
+                                    pass
                                 elif mlat and not ac.has_adsb:
-                                    # Genuine MLAT position: buffer, spike-detect, fuse.
-                                    # MLAT force: if ADS-B position is stale and MLAT
-                                    # fix is far away, force-accept to transition.
                                     if (ac.has_adsb
                                             and ac.lat is not None
                                             and now - ac._last_mlat_force_ts > _MLAT_FORCE_INTERVAL_S
@@ -1805,9 +1820,92 @@ class AircraftState:
                                         ac.pos_reliable_even = _POS_RELIABLE_PUBLISH
                                     _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
                                 elif not mlat:
-                                    _accept_adsb_position(ac, lat, lon, pos_from_global, oe == 1, now)
+                                    _accept_adsb_position(ac, lat, lon, pos_from_global, _cpr_oe == 1, now)
+            else:
+                # pyModeS fallback path
+                try:
+                    tc = pms.adsb.typecode(raw)
                 except Exception:
-                    pass
+                    return
+                if tc is None:
+                    return
+
+                # Identification (callsign)
+                if 1 <= tc <= 4:
+                    try:
+                        cs = pms.adsb.callsign(raw)
+                        if cs:
+                            ac.callsign = cs.strip().rstrip('_')
+                            if ac.callsign and not ac.operator:
+                                op = enrichment.db.get_operator(ac.callsign[:3])
+                                if op:
+                                    ac.operator = op.get("n")
+                                    if not ac.country:
+                                        ac.country = op.get("c")
+                    except Exception:
+                        pass
+
+                # Airborne position – altitude + CPR lat/lon
+                elif 9 <= tc <= 18 or 20 <= tc <= 22:
+                    try:
+                        alt = pms.adsb.altitude(raw)
+                        if alt is not None:
+                            _accept_altitude(ac, int(alt), source, crc_clean, now)
+                    except Exception:
+                        pass
+                    try:
+                        oe = pms.adsb.oe_flag(raw)
+
+                        # Duplicate check: same raw frame within _CPR_DUP_WINDOW_S means
+                        # multiple receivers forwarded the same transponder transmission.
+                        if not _is_cpr_duplicate(ac, raw, oe, now):
+                            if oe == 0:
+                                ac.cpr_even = (raw, now)
+                            else:
+                                ac.cpr_odd = (raw, now)
+
+                            pos = None
+                            pos_from_global = False
+                            global_bad = False
+                            if (ac.cpr_even and ac.cpr_odd
+                                    and abs(ac.cpr_even[1] - ac.cpr_odd[1]) < 10):
+                                pos = pms.adsb.position(
+                                    ac.cpr_even[0], ac.cpr_odd[0],
+                                    ac.cpr_even[1], ac.cpr_odd[1],
+                                )
+                                if pos is not None:
+                                    pos_from_global = True
+                                elif ac.pos_global:
+                                    global_bad = True
+
+                            if not pos_from_global and not global_bad:
+                                ref_lat = ac.lat if ac.lat is not None else config.RECEIVER_LAT
+                                ref_lon = ac.lon if ac.lon is not None else config.RECEIVER_LON
+                                if ref_lat is not None and ref_lon is not None:
+                                    pos = pms.adsb.position_with_ref(raw, ref_lat, ref_lon)
+
+                            if pos:
+                                lat, lon = pos
+                                if -90 <= lat <= 90 and -180 <= lon <= 180:
+                                    if (config.RECEIVER_LAT is not None
+                                            and config.RECEIVER_LON is not None
+                                            and _haversine_nm(
+                                                config.RECEIVER_LAT, config.RECEIVER_LON,
+                                                lat, lon) > config.MAX_RANGE_NM):
+                                        pass  # discard — beyond ADS-B range
+                                    elif mlat and not ac.has_adsb:
+                                        if (ac.has_adsb
+                                                and ac.lat is not None
+                                                and now - ac._last_mlat_force_ts > _MLAT_FORCE_INTERVAL_S
+                                                and _haversine_nm(ac.lat, ac.lon, lat, lon) > _MLAT_FORCE_DISTANCE_NM):
+                                            ac._last_mlat_force_ts = now
+                                            ac.pos_reliable_odd  = _POS_RELIABLE_PUBLISH
+                                            ac.pos_reliable_even = _POS_RELIABLE_PUBLISH
+                                        _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
+                                    elif not mlat:
+                                        _accept_adsb_position(ac, lat, lon, pos_from_global, oe == 1, now)
+                    except Exception:
+                        pass
 
         # --- Altitude from surveillance altitude reply (DF 4) ---
         # Lower integrity than ADS-B: parity is XOR-masked with aircraft address.
@@ -1817,7 +1915,10 @@ class AircraftState:
         elif df == 4 and len(raw) == 14:
             if not mlat:
                 try:
-                    alt = pms.altcode(raw)
+                    if _nd is not None:
+                        alt = _nd.get('baro_alt')
+                    else:
+                        alt = pms.altcode(raw)
                     if alt is not None:
                         _accept_altitude(ac, int(alt), MsgSource.MODE_S, False, now)
                 except Exception:
@@ -1828,71 +1929,102 @@ class AircraftState:
             # Altitude from DF20 — same parity integrity as DF4; same MLAT suppression.
             if df == 20 and not mlat:
                 try:
-                    alt = pms.altcode(raw)
+                    if _nd is not None:
+                        alt = _nd.get('baro_alt')
+                    else:
+                        alt = pms.altcode(raw)
                     if alt is not None:
                         _accept_altitude(ac, int(alt), MsgSource.MODE_S, False, now)
                 except Exception:
                     pass
 
-            # EHS decode: direct is40/is50/is60 checks — ~5x faster than pms.bds.infer()
-            # which speculatively tries ~20 registers. Checks are mutually exclusive in practice.
-            if _bds40.is40(raw):
-                # Selected altitude (autopilot target) — altitude field; suppress for MLAT.
+            # EHS decode — C library decodes BDS 4.0/5.0/6.0 in one call;
+            # pyModeS fallback uses direct is40/is50/is60 checks.
+            if _nd is not None:
+                # BDS 4.0: selected altitude
                 if not mlat:
+                    if (sel := _nd.get('nav_altitude_mcp')) is not None:
+                        ac.selected_alt = sel
+
+                # BDS 5.0: TAS + ground track
+                if (tas := _nd.get('tas')) is not None:
+                    ac.airspeed_kts = tas
+                    ac.airspeed_type = "TAS"
+                # heading_type 1 = HEADING_GROUND_TRACK (BDS 5.0 track)
+                if (_nd.get('heading_valid') and _nd.get('heading_type') == 1
+                        and (hdg := _nd.get('heading')) is not None):
+                    ac.heading_deg = round(float(hdg), 1)
+
+                # BDS 6.0: IAS + Mach + magnetic heading + baro vertical rate
+                if (ias := _nd.get('ias')) is not None:
+                    ac.airspeed_kts = ias
+                    ac.airspeed_type = "IAS"
+                if (mach := _nd.get('mach')) is not None:
+                    ac.mach = round(float(mach), 3)
+                # heading_type 3 = HEADING_MAGNETIC (BDS 6.0 heading)
+                if (_nd.get('heading_valid') and _nd.get('heading_type') == 3
+                        and (hdg := _nd.get('heading')) is not None):
+                    ac.heading_deg = round(float(hdg), 1)
+                if not mlat:
+                    if (vr := _nd.get('baro_rate')) is not None:
+                        ac.vertical_rate_fpm = vr
+                        ac._vrate_baro_fpm = vr
+                        ac._vrate_baro_ts  = now
+            else:
+                # pyModeS EHS fallback
+                if _bds40.is40(raw):
+                    if not mlat:
+                        try:
+                            sel = pms.commb.selalt40mcp(raw)
+                            if sel is not None:
+                                ac.selected_alt = int(sel)
+                        except Exception:
+                            pass
+
+                elif _bds50.is50(raw):
                     try:
-                        sel = pms.commb.selalt40mcp(raw)
-                        if sel is not None:
-                            ac.selected_alt = int(sel)
+                        tas = pms.commb.tas50(raw)
+                        if tas is not None:
+                            ac.airspeed_kts = int(round(tas))
+                            ac.airspeed_type = "TAS"
+                    except Exception:
+                        pass
+                    try:
+                        trk = pms.commb.trk50(raw)
+                        if trk is not None:
+                            ac.heading_deg = round(float(trk), 1)
                     except Exception:
                         pass
 
-            elif _bds50.is50(raw):
-                # TAS + track angle + roll
-                try:
-                    tas = pms.commb.tas50(raw)
-                    if tas is not None:
-                        ac.airspeed_kts = int(round(tas))
-                        ac.airspeed_type = "TAS"
-                except Exception:
-                    pass
-                try:
-                    trk = pms.commb.trk50(raw)
-                    if trk is not None:
-                        ac.heading_deg = round(float(trk), 1)
-                except Exception:
-                    pass
-
-            elif _bds60.is60(raw):
-                # IAS + Mach + magnetic heading + baro vertical rate
-                try:
-                    ias = pms.commb.ias60(raw)
-                    if ias is not None:
-                        ac.airspeed_kts = int(round(ias))
-                        ac.airspeed_type = "IAS"
-                except Exception:
-                    pass
-                try:
-                    mach = pms.commb.mach60(raw)
-                    if mach is not None:
-                        ac.mach = round(float(mach), 3)
-                except Exception:
-                    pass
-                try:
-                    hdg = pms.commb.hdg60(raw)
-                    if hdg is not None:
-                        ac.heading_deg = round(float(hdg), 1)
-                except Exception:
-                    pass
-                if not mlat:  # baro vertical rate is altitude-derived; suppress for MLAT
+                elif _bds60.is60(raw):
                     try:
-                        vr = pms.commb.vr60baro(raw)
-                        if vr is not None:
-                            ac.vertical_rate_fpm = int(round(vr))
-                            # Feed altitude filter dynamic rate window
-                            ac._vrate_baro_fpm = int(round(vr))
-                            ac._vrate_baro_ts  = now
+                        ias = pms.commb.ias60(raw)
+                        if ias is not None:
+                            ac.airspeed_kts = int(round(ias))
+                            ac.airspeed_type = "IAS"
                     except Exception:
                         pass
+                    try:
+                        mach = pms.commb.mach60(raw)
+                        if mach is not None:
+                            ac.mach = round(float(mach), 3)
+                    except Exception:
+                        pass
+                    try:
+                        hdg = pms.commb.hdg60(raw)
+                        if hdg is not None:
+                            ac.heading_deg = round(float(hdg), 1)
+                    except Exception:
+                        pass
+                    if not mlat:
+                        try:
+                            vr = pms.commb.vr60baro(raw)
+                            if vr is not None:
+                                ac.vertical_rate_fpm = int(round(vr))
+                                ac._vrate_baro_fpm = int(round(vr))
+                                ac._vrate_baro_ts  = now
+                        except Exception:
+                            pass
 
         # --- DF16: Long Air-Air Surveillance (ACAS RA in MV field) ---
         # Altitude from DF16 is intentionally not used — DF16 is an ACAS air-to-air
@@ -1917,7 +2049,10 @@ class AircraftState:
         # --- Squawk from identity reply (DF 5 / DF 21) ---
         if df in (5, 21):
             try:
-                sq = pms.idcode(raw)
+                if _nd is not None:
+                    sq = _nd.get('squawk')
+                else:
+                    sq = pms.idcode(raw)
                 if sq:
                     ac.squawk = sq
             except Exception:

@@ -12,6 +12,7 @@ name = "adsb-dashboard"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "cffi" },
     { name = "fastapi" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -29,6 +30,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cffi", specifier = ">=2.0.0" },
     { name = "fastapi", specifier = ">=0.110.0" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "orjson", specifier = ">=3.9" },
