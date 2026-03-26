@@ -111,6 +111,11 @@ _ffi.cdef(_CDEF)
 
 _lib = None   # loaded lazily on first call
 
+# Pre-allocated output buffers for CPR solvers.
+# Reused on every call — safe because the decode thread is single-threaded.
+_cpr_out_lat = _ffi.new("double *")
+_cpr_out_lon = _ffi.new("double *")
+
 def _get_lib():
     global _lib
     if _lib is None:
@@ -223,13 +228,10 @@ def solve_cpr_airborne(even_cprlat: int, even_cprlon: int,
     fflag = 0 if the most-recently-received frame is even, 1 if odd.
     Returns (lat, lon) on success, None on failure (ambiguous zone, etc.).
     """
-    lib = _get_lib()
-    out_lat = _ffi.new("double *")
-    out_lon = _ffi.new("double *")
-    rc = lib.solve_cpr_airborne(even_cprlat, even_cprlon,
-                                odd_cprlat,  odd_cprlon,
-                                fflag, out_lat, out_lon)
-    return (out_lat[0], out_lon[0]) if rc == 0 else None
+    rc = _get_lib().solve_cpr_airborne(even_cprlat, even_cprlon,
+                                       odd_cprlat,  odd_cprlon,
+                                       fflag, _cpr_out_lat, _cpr_out_lon)
+    return (_cpr_out_lat[0], _cpr_out_lon[0]) if rc == 0 else None
 
 
 def solve_cpr_relative(reflat: float, reflon: float,
@@ -240,12 +242,10 @@ def solve_cpr_relative(reflat: float, reflon: float,
     surface = 0 for airborne (default), 1 for surface movement.
     Returns (lat, lon) on success, None on failure.
     """
-    lib = _get_lib()
-    out_lat = _ffi.new("double *")
-    out_lon = _ffi.new("double *")
-    rc = lib.solve_cpr_relative(reflat, reflon, cprlat, cprlon,
-                                fflag, surface, out_lat, out_lon)
-    return (out_lat[0], out_lon[0]) if rc == 0 else None
+    rc = _get_lib().solve_cpr_relative(reflat, reflon, cprlat, cprlon,
+                                       fflag, surface,
+                                       _cpr_out_lat, _cpr_out_lon)
+    return (_cpr_out_lat[0], _cpr_out_lon[0]) if rc == 0 else None
 
 
 def cleanup() -> None:
