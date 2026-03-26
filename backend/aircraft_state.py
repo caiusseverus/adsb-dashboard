@@ -1835,7 +1835,7 @@ class AircraftState:
                                         ac.pos_reliable_odd  = _POS_RELIABLE_PUBLISH
                                         ac.pos_reliable_even = _POS_RELIABLE_PUBLISH
                                     _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
-                                elif not mlat:
+                                elif not mlat and config.INGEST_MODE != "hybrid":
                                     _accept_adsb_position(ac, lat, lon, pos_from_global, _cpr_oe == 1, now)
             else:
                 # pyModeS fallback path
@@ -1918,7 +1918,7 @@ class AircraftState:
                                             ac.pos_reliable_odd  = _POS_RELIABLE_PUBLISH
                                             ac.pos_reliable_even = _POS_RELIABLE_PUBLISH
                                         _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
-                                    elif not mlat:
+                                    elif not mlat and config.INGEST_MODE != "hybrid":
                                         _accept_adsb_position(ac, lat, lon, pos_from_global, oe == 1, now)
                     except Exception:
                         pass

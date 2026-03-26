@@ -720,11 +720,14 @@ async def lifespan(app: FastAPI):
         _bg(readsb_ingest.readsb_poller(state))
         _bg(readsb_stats.readsb_stats_poller())
     elif config.INGEST_MODE == "hybrid":
-        # Hybrid: readsb JSON for positions + Beast/MLAT for ACAS and raw DF counts
-        log.info("Ingest mode: hybrid (readsb JSON + Beast MLAT)")
+        # Hybrid: readsb JSON for positions/EHS + Beast TCP for ACAS, DF counts,
+        # and per-source MLAT attribution.  Beast CPR position updates are suppressed
+        # in aircraft_state so readsb JSON remains authoritative for position.
+        log.info("Ingest mode: hybrid (readsb JSON + Beast TCP for ACAS/MLAT)")
         _bg(readsb_ingest.readsb_poller(state))
         _bg(readsb_stats.readsb_stats_poller())
         _decoder_thread = _start_msg_processor()
+        _bg(_beast_runner())
         for name, host, port in config.MLAT_SERVERS:
             _bg(_mlat_runner(name, host, port))
     else:
