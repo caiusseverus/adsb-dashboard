@@ -2314,5 +2314,5 @@ class AircraftState:
         # airspy_adsb stats.json provides per-period DF counts that map directly
         # to the live message-type chart.  Use them to replace the current-minute
         # bucket so the receiver page shows a real breakdown.
-        if df_counts:
+        if isinstance(df_counts, dict) and df_counts:
             self._cur_min_df_counts = {int(k): int(v) for k, v in df_counts.items()}

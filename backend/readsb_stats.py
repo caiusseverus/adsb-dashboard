@@ -90,6 +90,18 @@ def _parse_readsb_stats(data: dict) -> dict:
     }
 
 
+def _normalise_df_counts(raw: Any) -> dict[int, int] | None:
+    """Convert df_counts to {df: count} regardless of whether airspy gave a list or dict."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return {int(k): int(v) for k, v in raw.items() if v}
+    if isinstance(raw, list):
+        # list indexed by DF number: position = DF type, value = count
+        return {i: int(v) for i, v in enumerate(raw) if v}
+    return None
+
+
 def _parse_airspy_stats(data: dict) -> dict:
     """Extract fields from airspy_adsb stats.json."""
     def _quartile(obj: Any) -> dict | None:
@@ -104,7 +116,8 @@ def _parse_airspy_stats(data: dict) -> dict:
         "airspy_gain":           data.get("gain"),
         "airspy_lost_buffers":   data.get("lost_buffers"),
         "airspy_max_aircraft":   data.get("max_aircraft_count"),
-        "airspy_df_counts":      data.get("df_counts"),
+        # df_counts may be a list (indexed by DF number) or a dict — normalise to dict
+        "airspy_df_counts":      _normalise_df_counts(data.get("df_counts")),
         "airspy_samplerate":     data.get("samplerate"),
         "airspy_preamble_filter":data.get("preamble_filter"),
     }
