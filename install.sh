@@ -260,11 +260,10 @@ _step "Installing Python dependencies"
 mkdir -p "$VENV_DIR"
 # Install the venv to /var/lib (root filesystem) rather than /opt, which may
 # be mounted noexec on some Raspberry Pi configurations.
-# uv's managed Python defaults to /root/.local/share which is inaccessible to
-# the service user.  Redirect it to a shared location.
-UV_PYTHON_INSTALL_DIR=/usr/local/share/uv/python \
+# Use the system Python — uv's managed downloads land in /root/.local/share
+# which is inaccessible to the service user.
 UV_PROJECT_ENVIRONMENT="$VENV_DIR/.venv" \
-    uv sync --directory "$INSTALL_DIR/backend" --no-dev --frozen
+    uv sync --directory "$INSTALL_DIR/backend" --no-dev --frozen --python-preference only-system
 
 _step "Building native extensions"
 if ! dpkg -s build-essential &>/dev/null 2>&1; then
