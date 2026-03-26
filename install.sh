@@ -268,8 +268,17 @@ make -C "$INSTALL_DIR/backend/native"
 make -C "$INSTALL_DIR/backend/native" install
 
 _step "Fetching airport and coastline data"
-python3 "$INSTALL_DIR/tools/fetch_airports.py"
-python3 "$INSTALL_DIR/tools/fetch_coastline.py"
+DATA_DIR="$INSTALL_DIR/backend/data"
+if [[ ! -f "$DATA_DIR/airports.json" ]]; then
+    python3 "$INSTALL_DIR/tools/fetch_airports.py"
+else
+    echo "  airports.json already present — skipping"
+fi
+if [[ ! -f "$DATA_DIR/coastline.json" ]]; then
+    python3 "$INSTALL_DIR/tools/fetch_coastline.py"
+else
+    echo "  coastline.json already present — skipping"
+fi
 
 _step "Building frontend"
 cd "$INSTALL_DIR/frontend"
