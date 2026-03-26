@@ -294,12 +294,36 @@ SERVICE_DEST="/etc/systemd/system/$SERVICE_NAME.service"
 
 [[ -f "$SERVICE_SRC" ]] || _die "Service file not found: $SERVICE_SRC"
 
-# Patch install-path-specific fields to the actual install location
-sed \
-    -e "s|WorkingDirectory=.*|WorkingDirectory=$INSTALL_DIR/backend|" \
-    -e "s|ExecStart=.*|ExecStart=$INSTALL_DIR/backend/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000|" \
-    -e "s|EnvironmentFile=.*|EnvironmentFile=$INSTALL_DIR/backend/.env|" \
-    "$SERVICE_SRC" > "$SERVICE_DEST"
+# Write the installed service file with paths resolved to INSTALL_DIR.
+# Using a heredoc avoids sed quoting issues, especially for the ExecStart
+# sh -c wrapper needed to expand HOST_PORT at runtime.
+cat > "$SERVICE_DEST" << EOF
+[Unit]
+Description=ADS-B Dashboard
+Documentation=https://github.com/caiusseverus/adsb-dashboard
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_USER
+
+WorkingDirectory=$INSTALL_DIR/backend
+
+ExecStart=/bin/sh -c 'exec $INSTALL_DIR/backend/.venv/bin/uvicorn main:app --host 0.0.0.0 --port "\${HOST_PORT:-8000}"'
+
+EnvironmentFile=$INSTALL_DIR/backend/.env
+
+Restart=on-failure
+RestartSec=5
+
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
