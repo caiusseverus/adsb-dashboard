@@ -1049,10 +1049,12 @@ class AircraftState:
         t0 = time.perf_counter()
         with self._lock:
             t_locked = time.perf_counter()
-            self._total += 1
-            if mlat:
-                self._mlat_total += 1
-            self._tick(now, mlat=mlat)
+            # In hybrid mode readsb stats owns the message totals/rates.
+            if config.INGEST_MODE != "hybrid":
+                self._total += 1
+                if mlat:
+                    self._mlat_total += 1
+                self._tick(now, mlat=mlat)
             self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
         t_done = time.perf_counter()
         msg_timings.append(t_done - t0)
@@ -1088,10 +1090,12 @@ class AircraftState:
         with self._lock:
             t_locked = time.perf_counter()
             for raw, signal, mlat, mlat_source in processed:
-                self._total += 1
-                if mlat:
-                    self._mlat_total += 1
-                self._tick(now, mlat=mlat)
+                # In hybrid mode readsb stats owns the message totals/rates.
+                if config.INGEST_MODE != "hybrid":
+                    self._total += 1
+                    if mlat:
+                        self._mlat_total += 1
+                    self._tick(now, mlat=mlat)
                 self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
         t_done = time.perf_counter()
 
