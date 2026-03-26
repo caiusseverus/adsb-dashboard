@@ -456,7 +456,7 @@ def _pos_reliable(ac: "Aircraft") -> bool:
         return True
     return (ac.pos_reliable_odd  >= _POS_RELIABLE_PUBLISH and
             ac.pos_reliable_even >= _POS_RELIABLE_PUBLISH and
-            ac.pos_global)
+            (ac.pos_global or ac.pos_by_ref))
 
 
 def _published_position(ac: "Aircraft") -> tuple[float | None, float | None, float | None, float | None]:
@@ -521,8 +521,9 @@ def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
         ac.cpr_even  = None
         ac.cpr_odd   = None
         ac.pos_global = False
+        ac.pos_by_ref = False
         # Fall through — no speed check; accept position and begin fresh
-    elif ac.lat is not None and ac.lon is not None and ac.last_pos_ts > 0 and ac.pos_global:
+    elif ac.lat is not None and ac.lon is not None and ac.last_pos_ts > 0 and (ac.pos_global or ac.pos_by_ref):
         elapsed_s = now - ac.last_pos_ts
         if elapsed_s > 0:
             dist_nm = _haversine_nm(ac.lat, ac.lon, lat, lon)
@@ -540,12 +541,13 @@ def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
                         ac.cpr_even  = None
                         ac.cpr_odd   = None
                         ac.pos_global = False
+                        ac.pos_by_ref = False
                     _add_to_discard_cache(ac, lat, lon, now)
                 return  # discard this position
 
     # Fast-track: if within ~27 nm (50 km) of last known position, promote
     # directly to publish threshold (mirrors readsb incrementReliable fast-path)
-    if ac.lat is not None and ac.lon is not None and ac.pos_global:
+    if ac.lat is not None and ac.lon is not None and (ac.pos_global or ac.pos_by_ref):
         dist_nm = _haversine_nm(ac.lat, ac.lon, lat, lon)
         if dist_nm < 27.0:
             if cpr_odd:
@@ -563,6 +565,12 @@ def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
     ac.last_pos_ts = now
     if pos_from_global:
         ac.pos_global = True
+        ac.pos_by_ref = False
+    else:
+        # Local-CPR decode (position_with_ref): still require even/odd reliability
+        # before publish, but allow it to become publishable when global pairing is
+        # temporarily unavailable (e.g. corrected frames in native decode path).
+        ac.pos_by_ref = True
     _update_range_bearing(ac)
 
 
@@ -849,6 +857,7 @@ class Aircraft:
     cpr_even: Optional[tuple] = field(default=None, repr=False)   # (raw_msg, timestamp)
     cpr_odd:  Optional[tuple] = field(default=None, repr=False)
     pos_global: bool = False  # True once a global CPR decode (even+odd pair) has succeeded
+    pos_by_ref: bool = False  # True once a local position_with_ref decode has succeeded
     # Soft position reliability score (readsb: pos_reliable_odd/even in track.c).
     # Incremented by +1.0 on each accepted position; penalised by -0.26 on speed-check
     # failure; CPR state reset when either falls to zero.  lat/lon suppressed in snapshot
