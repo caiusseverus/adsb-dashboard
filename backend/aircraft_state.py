@@ -2146,12 +2146,18 @@ class AircraftState:
                 if cs:
                     ac.callsign = cs
 
-            # Altitude — readsb encodes "ground" as the string "ground"
+            # Altitude — readsb encodes "ground" as the string "ground".
+            # readsb has already validated the altitude, so set alt_reliable
+            # to the publish threshold so it isn't suppressed in get_snapshot().
             alt_baro = ac_data.get("alt_baro")
             if alt_baro == "ground":
                 ac.altitude = 0
+                ac.alt_reliable = _ALT_RELIABLE_PUBLISH
+                ac.last_alt_ts = now
             elif isinstance(alt_baro, (int, float)):
                 ac.altitude = int(alt_baro)
+                ac.alt_reliable = _ALT_RELIABLE_PUBLISH
+                ac.last_alt_ts = now
 
             # Signal: readsb rssi is dBFS (negative float) → Beast 0–255 scale
             # Formula: raw = clamp(-rssi * 2, 0, 255)  (0 = strongest, matches Beast)
