@@ -41,7 +41,7 @@ OVERRIDEABLE_FIELDS = {
 @router.get("/perf")
 async def get_perf() -> dict:
     """Return performance timing statistics for message decode and push-updates."""
-    from main import _msg_queue, _msg_drops, _queue_depth_samples, _ws_clients_dropped
+    from main import _msg_queue, _msg_drops, _queue_depth_samples
     msg_t        = sorted(_state_module.msg_timings)
     lock_wait_t  = sorted(_state_module.lock_wait_timings)
     decode_t     = sorted(_state_module.decode_timings)
@@ -95,7 +95,7 @@ async def get_perf() -> dict:
             "total_avg":              push_avg("total_ms"),
             "ac_count_avg":           push_avg("ac_count"),
             "ws_client_count_avg":    push_avg("ws_client_count"),
-            "ws_clients_dropped_total": _ws_clients_dropped,
+            "ws_clients_dropped_total": 0,
             "ws_send_max_avg":        push_avg("ws_send_max_ms"),
         },
     }

@@ -66,7 +66,13 @@ log.setLevel(logging.INFO)  # main module always logs at INFO regardless of DEBU
 # ---------------------------------------------------------------------------
 state = AircraftState(aircraft_timeout=config.AIRCRAFT_TIMEOUT)
 track_store = TrackStore()
-_clients: list[WebSocket] = []
+# Each connected WebSocket gets its own bounded send queue.
+# _push_updates enqueues the serialised payload and returns immediately;
+# a per-client sender coroutine drains the queue asynchronously.
+# maxsize=2: one frame in-flight + one queued.  If the client falls behind
+# a second full cycle, the new frame is dropped (QueueFull) — the client
+# will receive the next cycle's snapshot instead.
+_clients: dict[WebSocket, asyncio.Queue] = {}
 
 # Emergency squawk tracking: {icao: {squawk, db_id}} for ongoing events
 EMERGENCY_SQUAWKS = frozenset({"7700", "7600", "7500"})
@@ -94,8 +100,6 @@ _decoder_thread: threading.Thread | None = None
 _msg_drops: int = 0
 # Queue depth sampled once per push cycle (maxlen matches push_timings window)
 _queue_depth_samples: _deque[int] = _deque(maxlen=120)
-# Cumulative count of WebSocket clients disconnected due to send timeout
-_ws_clients_dropped: int = 0
 
 
 def _start_msg_processor() -> threading.Thread:
@@ -558,50 +562,21 @@ async def _push_updates() -> None:
             await asyncio.gather(*notify_tasks)
         t_gather_end = time.perf_counter()
 
-        if not _clients:
-            _push_timings_store.append({
-                "sync_ms":      round((t_sync_end - t_loop_start) * 1000, 2),
-                "snapshot_ms":  round(snapshot_ms, 2),
-                "gather_ms":    round((t_gather_end - t_sync_end) * 1000, 2),
-                "notify_tasks": len(notify_tasks),
-                "broadcast_ms": 0.0,
-                "serialize_ms": 0.0,
-                "total_ms":     round((t_gather_end - t_loop_start) * 1000, 2),
-                "ac_count":     len(snapshot["aircraft"]),
-                "ws_client_count":   0,
-                "ws_clients_dropped": 0,
-                "ws_send_max_ms":    0.0,
-            })
-            continue
-
         t_ser = time.perf_counter()
-        payload = _json_dumps(snapshot)
+        payload = _json_dumps(snapshot) if _clients else None
         serialize_ms = (time.perf_counter() - t_ser) * 1000
 
-        ws_client_count = len(_clients)
-
-        async def _send_one(ws: WebSocket) -> tuple[WebSocket | None, float]:
-            t = time.perf_counter()
-            try:
-                await asyncio.wait_for(ws.send_text(payload), timeout=config.WS_SEND_TIMEOUT_S)
-                return None, (time.perf_counter() - t) * 1000
-            except Exception:
-                return ws, (time.perf_counter() - t) * 1000
-
-        results = await asyncio.gather(*[_send_one(ws) for ws in list(_clients)])
-        ws_dropped_this_cycle = 0
-        send_times: list[float] = []
-        for ws, send_ms in results:
-            send_times.append(send_ms)
-            if ws is not None:
-                ws_dropped_this_cycle += 1
+        # Enqueue to each client's send queue — non-blocking, O(1) per client.
+        # Clients that fall behind (QueueFull) get this frame dropped; they
+        # receive the next snapshot instead.  Actual WS sends happen in the
+        # per-client sender coroutine started by websocket_endpoint.
+        ws_frames_dropped = 0
+        if payload is not None:
+            for q in list(_clients.values()):
                 try:
-                    _clients.remove(ws)
-                except ValueError:
-                    pass
-
-        global _ws_clients_dropped
-        _ws_clients_dropped += ws_dropped_this_cycle
+                    q.put_nowait(payload)
+                except asyncio.QueueFull:
+                    ws_frames_dropped += 1
 
         t_done = time.perf_counter()
         _push_timings_store.append({
@@ -613,10 +588,10 @@ async def _push_updates() -> None:
             "serialize_ms":      round(serialize_ms, 2),
             "total_ms":          round((t_done - t_loop_start) * 1000, 2),
             "ac_count":          len(snapshot["aircraft"]),
-            "payload_bytes":     len(payload),
-            "ws_client_count":   ws_client_count,
-            "ws_clients_dropped": ws_dropped_this_cycle,
-            "ws_send_max_ms":    round(max(send_times), 2) if send_times else 0.0,
+            "payload_bytes":     len(payload) if payload else 0,
+            "ws_client_count":   len(_clients),
+            "ws_clients_dropped": ws_frames_dropped,
+            "ws_send_max_ms":    0.0,
         })
 
 
@@ -860,13 +835,25 @@ app.add_middleware(
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
     await ws.accept()
-    _clients.append(ws)
+    send_queue: asyncio.Queue = asyncio.Queue(maxsize=2)
+    _clients[ws] = send_queue
     log.info("WebSocket client connected  (total: %d)", len(_clients))
 
+    async def _sender() -> None:
+        """Drain the per-client send queue; runs independently of _push_updates."""
+        while True:
+            payload = await send_queue.get()
+            if payload is None:
+                return
+            await asyncio.wait_for(
+                ws.send_text(payload), timeout=config.WS_SEND_TIMEOUT_S
+            )
+
+    sender_task = asyncio.create_task(_sender())
     try:
         # Send the current snapshot immediately on connect
         await ws.send_text(_json_dumps(state.get_snapshot()))
-        # Keep the connection open; the push loop handles subsequent updates
+        # Receive loop — keeps the connection alive; client messages are ignored
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
@@ -874,9 +861,11 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     except Exception as exc:
         log.debug("WebSocket error: %s", exc)
     finally:
+        _clients.pop(ws, None)
+        sender_task.cancel()
         try:
-            _clients.remove(ws)
-        except ValueError:
+            await sender_task
+        except (asyncio.CancelledError, Exception):
             pass
         log.info("WebSocket client disconnected (total: %d)", len(_clients))
 
