@@ -79,6 +79,16 @@ void decode_cleanup(void);
 int  decode_message(const uint8_t *msg_bytes, int msg_len,
                     uint8_t signal, uint64_t timestamp,
                     decode_result_t *result);
+
+int solve_cpr_airborne(int even_cprlat, int even_cprlon,
+                       int odd_cprlat,  int odd_cprlon,
+                       int fflag,
+                       double *out_lat, double *out_lon);
+
+int solve_cpr_relative(double reflat,  double reflon,
+                       int cprlat,     int cprlon,
+                       int fflag,      int surface,
+                       double *out_lat, double *out_lon);
 """
 
 # ── Library loading ────────────────────────────────────────────────────────
@@ -203,6 +213,39 @@ def decode_message(msg_bytes: bytes, signal: int = 0,
         out["emergency"] = r.emergency
 
     return out
+
+
+def solve_cpr_airborne(even_cprlat: int, even_cprlon: int,
+                       odd_cprlat: int, odd_cprlon: int,
+                       fflag: int) -> tuple | None:
+    """Global CPR decode from an even+odd frame pair.
+
+    fflag = 0 if the most-recently-received frame is even, 1 if odd.
+    Returns (lat, lon) on success, None on failure (ambiguous zone, etc.).
+    """
+    lib = _get_lib()
+    out_lat = _ffi.new("double *")
+    out_lon = _ffi.new("double *")
+    rc = lib.solve_cpr_airborne(even_cprlat, even_cprlon,
+                                odd_cprlat,  odd_cprlon,
+                                fflag, out_lat, out_lon)
+    return (out_lat[0], out_lon[0]) if rc == 0 else None
+
+
+def solve_cpr_relative(reflat: float, reflon: float,
+                       cprlat: int, cprlon: int,
+                       fflag: int, surface: int = 0) -> tuple | None:
+    """Local CPR decode using a reference position.
+
+    surface = 0 for airborne (default), 1 for surface movement.
+    Returns (lat, lon) on success, None on failure.
+    """
+    lib = _get_lib()
+    out_lat = _ffi.new("double *")
+    out_lon = _ffi.new("double *")
+    rc = lib.solve_cpr_relative(reflat, reflon, cprlat, cprlon,
+                                fflag, surface, out_lat, out_lon)
+    return (out_lat[0], out_lon[0]) if rc == 0 else None
 
 
 def cleanup() -> None:

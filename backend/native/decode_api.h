@@ -80,6 +80,24 @@ typedef struct {
 /* Call once at process start.  Thread-safe after initialisation. */
 void decode_init(void);
 
+/* CPR position solving — thin wrappers over cpr.c */
+
+/* Global (airborne) CPR: requires an even+odd frame pair.
+ * fflag = 0 if the most-recently-received frame is even, 1 if odd.
+ * Returns 0 on success (out_lat/out_lon populated), -1 on failure. */
+int solve_cpr_airborne(int even_cprlat, int even_cprlon,
+                       int odd_cprlat,  int odd_cprlon,
+                       int fflag,
+                       double *out_lat, double *out_lon);
+
+/* Local (relative) CPR: single frame decoded against a reference position.
+ * surface = 0 for airborne, 1 for surface movement.
+ * Returns 0 on success, -1 on failure. */
+int solve_cpr_relative(double reflat,  double reflon,
+                       int cprlat,     int cprlon,
+                       int fflag,      int surface,
+                       double *out_lat, double *out_lon);
+
 /* Release tables allocated by decode_init(). */
 void decode_cleanup(void);
 

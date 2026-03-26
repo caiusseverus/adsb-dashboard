@@ -1781,23 +1781,28 @@ class AircraftState:
                     _accept_altitude(ac, alt, source, crc_clean, now)
 
                 # CPR position (type codes 9-22)
-                if _nd.get('cpr_valid'):
+                # decode_cffi omits cpr_valid key; presence of cpr_odd signals valid CPR
+                if 'cpr_odd' in _nd:
                     _cpr_oe = 1 if _nd['cpr_odd'] else 0
-                    # CPR pairing uses raw hex strings for the pyModeS position solver
+                    # Dup detection uses raw hex; pairing stores decoded CPR integers
                     if not _is_cpr_duplicate(ac, raw, _cpr_oe, now):
+                        _cpr_lat_int = _nd['cpr_lat']
+                        _cpr_lon_int = _nd['cpr_lon']
                         if _cpr_oe == 0:
-                            ac.cpr_even = (raw, now)
+                            ac.cpr_even = (_cpr_lat_int, _cpr_lon_int, now)
                         else:
-                            ac.cpr_odd = (raw, now)
+                            ac.cpr_odd  = (_cpr_lat_int, _cpr_lon_int, now)
 
                         pos = None
                         pos_from_global = False
                         global_bad = False
+                        # timestamp is at index 2 in the native (int, int, ts) tuple
                         if (ac.cpr_even and ac.cpr_odd
-                                and abs(ac.cpr_even[1] - ac.cpr_odd[1]) < 10):
-                            pos = pms.adsb.position(
-                                ac.cpr_even[0], ac.cpr_odd[0],
-                                ac.cpr_even[1], ac.cpr_odd[1],
+                                and abs(ac.cpr_even[2] - ac.cpr_odd[2]) < 10):
+                            pos = _decode_cffi.solve_cpr_airborne(
+                                ac.cpr_even[0], ac.cpr_even[1],
+                                ac.cpr_odd[0],  ac.cpr_odd[1],
+                                _cpr_oe,
                             )
                             if pos is not None:
                                 pos_from_global = True
@@ -1808,7 +1813,9 @@ class AircraftState:
                             ref_lat = ac.lat if ac.lat is not None else config.RECEIVER_LAT
                             ref_lon = ac.lon if ac.lon is not None else config.RECEIVER_LON
                             if ref_lat is not None and ref_lon is not None:
-                                pos = pms.adsb.position_with_ref(raw, ref_lat, ref_lon)
+                                pos = _decode_cffi.solve_cpr_relative(
+                                    ref_lat, ref_lon, _cpr_lat_int, _cpr_lon_int, _cpr_oe,
+                                )
 
                         if pos:
                             lat, lon = pos
@@ -1960,7 +1967,8 @@ class AircraftState:
                     ac.airspeed_kts = tas
                     ac.airspeed_type = "TAS"
                 # heading_type 1 = HEADING_GROUND_TRACK (BDS 5.0 track)
-                if (_nd.get('heading_valid') and _nd.get('heading_type') == 1
+                # decode_cffi omits heading_valid; presence of heading_type is sufficient
+                if (_nd.get('heading_type') == 1
                         and (hdg := _nd.get('heading')) is not None):
                     ac.heading_deg = round(float(hdg), 1)
 
@@ -1971,7 +1979,7 @@ class AircraftState:
                 if (mach := _nd.get('mach')) is not None:
                     ac.mach = round(float(mach), 3)
                 # heading_type 3 = HEADING_MAGNETIC (BDS 6.0 heading)
-                if (_nd.get('heading_valid') and _nd.get('heading_type') == 3
+                if (_nd.get('heading_type') == 3
                         and (hdg := _nd.get('heading')) is not None):
                     ac.heading_deg = round(float(hdg), 1)
                 if not mlat:

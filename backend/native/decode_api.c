@@ -11,6 +11,7 @@
 #include "mode_s.h"         /* decodeModesMessage()              */
 #include "crc.h"            /* modesChecksumInit(), crcCleanupTables() */
 #include "icao_filter.h"    /* icaoFilterInit(), icaoFilterDestroy() */
+#include "cpr.h"            /* decodeCPRairborne(), decodeCPRrelative() */
 
 #include <string.h>
 
@@ -174,4 +175,23 @@ int decode_message(const uint8_t *msg_bytes, int msg_len,
     }
 
     return 0;
+}
+
+int solve_cpr_airborne(int even_cprlat, int even_cprlon,
+                       int odd_cprlat,  int odd_cprlon,
+                       int fflag,
+                       double *out_lat, double *out_lon) {
+    return decodeCPRairborne(even_cprlat, even_cprlon,
+                             odd_cprlat,  odd_cprlon,
+                             fflag, out_lat, out_lon);
+}
+
+int solve_cpr_relative(double reflat,  double reflon,
+                       int cprlat,     int cprlon,
+                       int fflag,      int surface,
+                       double *out_lat, double *out_lon) {
+    return decodeCPRrelative(reflat, reflon,
+                             cprlat, cprlon,
+                             fflag, surface,
+                             out_lat, out_lon);
 }
