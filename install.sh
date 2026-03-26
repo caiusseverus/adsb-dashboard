@@ -284,6 +284,14 @@ fi
 
 chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
 
+# .env contains secrets — world access is never appropriate.
+# Own it by the real (sudoing) user so they can edit without sudo,
+# with group adsb so the service can read it.
+# Falls back to root:adsb when run directly as root.
+_env_owner="${SUDO_USER:-root}"
+chown "${_env_owner}:${SERVICE_USER}" "$ENV_FILE"
+chmod 640 "$ENV_FILE"
+
 # ---------------------------------------------------------------------------
 # Step 7 — install and start the systemd service
 # ---------------------------------------------------------------------------
