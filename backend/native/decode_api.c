@@ -97,10 +97,6 @@ int decode_message(const uint8_t *msg_bytes, int msg_len,
         result->baro_alt_valid = true;
         result->baro_alt       = mm.baro_alt;
     }
-    if (mm.geom_alt_valid) {
-        result->geom_alt_valid = true;
-        result->geom_alt       = mm.geom_alt;
-    }
     result->airground = (int)mm.airground;
 
     /* ── Squawk ── */

@@ -32,8 +32,6 @@ typedef struct {
 
     bool     baro_alt_valid;
     int      baro_alt;
-    bool     geom_alt_valid;
-    int      geom_alt;
     int      airground;
 
     bool     squawk_valid;
@@ -156,8 +154,6 @@ def decode_message(msg_bytes: bytes, signal: int = 0,
 
     if r.baro_alt_valid:
         out["baro_alt"] = r.baro_alt
-    if r.geom_alt_valid:
-        out["geom_alt"] = r.geom_alt
 
     if r.squawk_valid:
         # squawk is stored as hex-encoded integer e.g. 0x7700 → "7700"
