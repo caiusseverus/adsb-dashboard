@@ -1262,11 +1262,14 @@ class StatsDB:
         bucket_secs = bucket_mins * 60
         with self._connect() as conn:
             if df is None:
+                # Use minute_stats.msg_mean * 60 for the total so this view works
+                # in both Beast mode (where minute_df_counts is populated) and
+                # readsb mode (where only minute_stats has message count data).
                 rows = conn.execute(f"""
-                    SELECT date(ts, 'unixepoch')      AS day,
+                    SELECT date(ts, 'unixepoch')        AS day,
                            (ts % 86400) / {bucket_secs} AS bucket,
-                           SUM(count)                 AS value
-                    FROM minute_df_counts
+                           CAST(SUM(msg_mean * 60) AS INTEGER) AS value
+                    FROM minute_stats
                     WHERE ts >= ?
                     GROUP BY day, bucket
                     ORDER BY day, bucket

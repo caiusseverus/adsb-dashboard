@@ -986,8 +986,11 @@ class AircraftState:
         self._snapshot_history_cache: tuple | None = None  # (rate_list, df_list, mlat_list)
 
         # readsb ingest tracking — not used in Beast mode
-        # Cumulative message total from the last aircraft.json poll (for delta computation)
-        self._readsb_last_total: int = 0
+        # Cumulative message total from the last aircraft.json poll (for delta computation).
+        # Initialised to -1 so the first poll is detected and its delta suppressed
+        # (readsb's cumulative count could be millions at startup — without this the
+        # first poll floods _cur_sec_count and spikes msg_per_sec for 60 seconds).
+        self._readsb_last_total: int = -1
         # Per-aircraft readsb cumulative message counts (for per-session delta tracking)
         self._readsb_msg_counts: dict[str, int] = {}
 
@@ -2044,6 +2047,7 @@ class AircraftState:
         aircraft_list: list[dict],
         now: float,
         total_messages: int,
+        df_counts: dict | None = None,
     ) -> None:
         """Update aircraft state from a readsb aircraft.json payload.
 
@@ -2051,21 +2055,32 @@ class AircraftState:
         complete aircraft snapshot rather than individual Beast frames, so there
         is no per-message queue or decoder thread.  Per-second and per-minute
         stats are derived from the total_messages delta between polls.
+
+        df_counts: optional per-DF message counts from airspy_adsb stats.json
+        (e.g. {17: 5000, 11: 1000, ...}).  When provided, populates the live
+        DF type breakdown chart on the receiver page.
         """
         with self._lock:
-            self._update_from_json_locked(aircraft_list, now, total_messages)
+            self._update_from_json_locked(aircraft_list, now, total_messages, df_counts)
 
     def _update_from_json_locked(
         self,
         aircraft_list: list[dict],
         now: float,
         total_messages: int,
+        df_counts: dict | None = None,
     ) -> None:
         """Inner implementation — must be called with self._lock held."""
 
         # ── Message-count bookkeeping ──────────────────────────────────────
-        delta = max(0, total_messages - self._readsb_last_total)
-        self._readsb_last_total = total_messages
+        if self._readsb_last_total < 0:
+            # First poll: readsb's cumulative count could be very large (millions).
+            # Set baseline without generating a delta to avoid spiking msg_per_sec.
+            self._readsb_last_total = total_messages
+            delta = 0
+        else:
+            delta = max(0, total_messages - self._readsb_last_total)
+            self._readsb_last_total = total_messages
         self._total += delta
 
         # Replicate _tick() logic: accumulate per-second count; roll minute.
@@ -2294,3 +2309,10 @@ class AircraftState:
             _maybe("ws",                "wind_speed",       int)
             _maybe("oat",               "oat",              int)
             _maybe("tat",               "tat",              int)
+
+        # ── DF type breakdown from airspy_adsb (optional) ─────────────────
+        # airspy_adsb stats.json provides per-period DF counts that map directly
+        # to the live message-type chart.  Use them to replace the current-minute
+        # bucket so the receiver page shows a real breakdown.
+        if df_counts:
+            self._cur_min_df_counts = {int(k): int(v) for k, v in df_counts.items()}

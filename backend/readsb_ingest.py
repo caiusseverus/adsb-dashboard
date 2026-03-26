@@ -23,6 +23,7 @@ except ImportError:
         return _json_lib.loads(data)
 
 import config
+import readsb_stats
 
 if TYPE_CHECKING:
     from aircraft_state import AircraftState
@@ -117,8 +118,12 @@ async def readsb_poller(state: "AircraftState") -> None:
                 total_messages = data.get("messages", 0)
                 now            = file_now if file_now is not None else wall_now
 
+                # Pass airspy df_counts if available for live DF type breakdown
+                latest_stats = readsb_stats.get_latest()
+                df_counts = latest_stats.get("airspy_df_counts") or None
+
                 await asyncio.to_thread(
-                    state.update_from_json, aircraft_list, now, total_messages
+                    state.update_from_json, aircraft_list, now, total_messages, df_counts
                 )
 
         except asyncio.CancelledError:
