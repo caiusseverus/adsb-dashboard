@@ -296,6 +296,10 @@ fi
 
 chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
 
+# uv may create venv scripts without the execute bit (depends on root umask).
+# Ensure every file in .venv/bin/ is executable.
+chmod -R +x "$INSTALL_DIR/backend/.venv/bin/"
+
 # .env contains secrets — world access is never appropriate.
 # Own it by the real (sudoing) user so they can edit without sudo,
 # with group adsb so the service can read it.
@@ -331,7 +335,7 @@ Group=$SERVICE_USER
 
 WorkingDirectory=$INSTALL_DIR/backend
 
-ExecStart=/bin/sh -c 'exec $INSTALL_DIR/backend/.venv/bin/uvicorn main:app --host 0.0.0.0 --port "\${HOST_PORT:-8000}"'
+ExecStart=/bin/sh -c 'exec $INSTALL_DIR/backend/.venv/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port "\${HOST_PORT:-8000}"'
 
 EnvironmentFile=$INSTALL_DIR/backend/.env
 
