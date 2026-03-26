@@ -5,6 +5,7 @@
 set -euo pipefail
 
 INSTALL_DIR="/opt/adsb-dashboard"
+VENV_DIR="/var/lib/adsb-dashboard"   # venv lives outside /opt to avoid noexec issues
 SERVICE_USER="adsb"
 SERVICE_NAME="adsb-dashboard"
 REPO_URL="https://github.com/caiusseverus/adsb-dashboard.git"
@@ -256,7 +257,10 @@ fi
 # Step 5 — install application dependencies
 # ---------------------------------------------------------------------------
 _step "Installing Python dependencies"
-uv sync --directory "$INSTALL_DIR/backend" --no-dev --frozen
+mkdir -p "$VENV_DIR"
+# Install the venv to /var/lib (root filesystem) rather than /opt, which may
+# be mounted noexec on some Raspberry Pi configurations.
+UV_PROJECT_ENVIRONMENT="$VENV_DIR/.venv" uv sync --directory "$INSTALL_DIR/backend" --no-dev --frozen
 
 _step "Building native extensions"
 if ! dpkg -s build-essential &>/dev/null 2>&1; then
@@ -295,10 +299,7 @@ if ! id "$SERVICE_USER" &>/dev/null; then
 fi
 
 chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
-
-# uv may create venv scripts without the execute bit (depends on root umask).
-# Ensure every file in .venv/bin/ is executable.
-chmod -R +x "$INSTALL_DIR/backend/.venv/bin/"
+chown -R "$SERVICE_USER:$SERVICE_USER" "$VENV_DIR"
 
 # .env contains secrets — world access is never appropriate.
 # Own it by the real (sudoing) user so they can edit without sudo,
@@ -335,7 +336,7 @@ Group=$SERVICE_USER
 
 WorkingDirectory=$INSTALL_DIR/backend
 
-ExecStart=/bin/sh -c 'exec $INSTALL_DIR/backend/.venv/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port "\${HOST_PORT:-8000}"'
+ExecStart=/bin/sh -c 'exec $VENV_DIR/.venv/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port "\${HOST_PORT:-8000}"'
 
 EnvironmentFile=$INSTALL_DIR/backend/.env
 
