@@ -17,11 +17,21 @@ _bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
 _step() { echo; _bold "==> $*"; }
 _die()  { _red "ERROR: $*"; exit 1; }
 
+# Detect whether this is a fresh install or an update
+IS_UPDATE=false
+[[ -d "$INSTALL_DIR/.git" ]] && IS_UPDATE=true
+
 # ---------------------------------------------------------------------------
 # Step 1 — check we are running as root (or via sudo)
 # ---------------------------------------------------------------------------
 _step "Checking permissions"
 [[ $EUID -eq 0 ]] || _die "This installer must be run as root. Try: sudo bash install.sh"
+
+if [[ "$IS_UPDATE" == true ]]; then
+    _bold "  Updating existing installation at $INSTALL_DIR"
+else
+    _bold "  Fresh installation to $INSTALL_DIR"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 2 — install system dependencies
@@ -55,14 +65,13 @@ if [[ "$NODE_MAJOR" -lt 18 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3 — clone the repository
+# Step 3 — clone or update the repository
 # ---------------------------------------------------------------------------
-_step "Cloning repository to $INSTALL_DIR"
-
-if [[ -d "$INSTALL_DIR/.git" ]]; then
-    echo "  Repository already exists — pulling latest changes"
+if [[ "$IS_UPDATE" == true ]]; then
+    _step "Updating repository"
     git -C "$INSTALL_DIR" pull --ff-only
 else
+    _step "Cloning repository to $INSTALL_DIR"
     git clone "$REPO_URL" "$INSTALL_DIR"
 fi
 
@@ -79,6 +88,44 @@ ENV_FILE="$INSTALL_DIR/backend/.env"
 if [[ -f "$ENV_FILE" ]]; then
     echo "  $ENV_FILE already exists — skipping interactive setup."
     echo "  To reconfigure, delete $ENV_FILE and re-run this installer."
+
+    # On update: check for keys in .env.example that are absent from .env.
+    # New config options added since the last install are appended commented-out
+    # so the service starts with defaults while the user can review and enable them.
+    if [[ "$IS_UPDATE" == true ]]; then
+        NEW_KEYS=()
+        while IFS= read -r line; do
+            # Active key: KEY=value
+            if [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]]; then
+                key="${BASH_REMATCH[1]}"
+                val="${BASH_REMATCH[2]}"
+                if ! grep -qE "^#?[[:space:]]*${key}=" "$ENV_FILE"; then
+                    NEW_KEYS+=("${key}=${val}")
+                fi
+            # Commented-out optional key: # KEY=value
+            elif [[ "$line" =~ ^#[[:space:]]([A-Z_][A-Z0-9_]*)=(.*)$ ]]; then
+                key="${BASH_REMATCH[1]}"
+                val="${BASH_REMATCH[2]}"
+                if ! grep -qE "^#?[[:space:]]*${key}=" "$ENV_FILE"; then
+                    NEW_KEYS+=("# ${key}=${val}")
+                fi
+            fi
+        done < "$ENV_EXAMPLE"
+
+        if [[ ${#NEW_KEYS[@]} -gt 0 ]]; then
+            echo
+            echo "  New configuration options found — appending to $ENV_FILE:"
+            { echo; echo "# Options added by update on $(date)"; } >> "$ENV_FILE"
+            for entry in "${NEW_KEYS[@]}"; do
+                echo "    $entry"
+                echo "$entry" >> "$ENV_FILE"
+            done
+            echo
+            _bold "  Review new options in $ENV_FILE — defaults are active unless commented out."
+        else
+            echo "  No new configuration options since last install."
+        fi
+    fi
 else
     echo "  You will be prompted for each configuration value."
     echo "  Press Enter to accept the default shown in [brackets]."
@@ -261,9 +308,15 @@ systemctl restart "$SERVICE_NAME"
 # Done
 # ---------------------------------------------------------------------------
 echo
-_green "=========================================="
-_green " ADS-B Dashboard installed successfully!"
-_green "=========================================="
+if [[ "$IS_UPDATE" == true ]]; then
+    _green "=========================================="
+    _green " ADS-B Dashboard updated successfully!"
+    _green "=========================================="
+else
+    _green "=========================================="
+    _green " ADS-B Dashboard installed successfully!"
+    _green "=========================================="
+fi
 echo
 echo "  Dashboard URL : http://$(hostname -I | awk '{print $1}'):8000"
 echo
