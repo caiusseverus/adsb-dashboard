@@ -362,7 +362,8 @@ def _cast(lan_url: str, device_name: str, display_seconds: int, token: str) -> N
     pychromecast.discovery.stop_discovery(browser)
 
     mc = cc.media_controller
-    mc.play_media(display_url, "image/jpeg")
+    log.info("cast: sending image URL %s", display_url)
+    mc.play_media(display_url, "image/jpeg", stream_type="NONE")
     mc.block_until_active(timeout=15)
     log.info("cast: displaying on %r for %d s", device_name, display_seconds)
 
@@ -387,7 +388,7 @@ def check(aircraft_list: list[dict]) -> None:
     device_name = cfg.get("device_name", "").strip()
     lan_url     = cfg.get("lan_url", "").strip()
     if not device_name or not lan_url:
-        log.warning("cast: skipping — device_name or lan_url not configured (cfg=%r)", cfg)
+        log.debug("cast: skipping — device_name or lan_url not configured")
         return
 
     if not _in_active_hours(cfg):
@@ -402,7 +403,7 @@ def check(aircraft_list: list[dict]) -> None:
 
     rules = _get_rules()
     if not rules:
-        log.warning("cast: skipping — no rules in DB")
+        log.debug("cast: skipping — no rules in DB")
         return
 
     log.debug("cast: checking %d aircraft against %d rules", len(aircraft_list), len(rules))
