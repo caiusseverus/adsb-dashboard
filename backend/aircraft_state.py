@@ -856,6 +856,8 @@ class Aircraft:
     bearing_deg: Optional[float] = None   # bearing from receiver (degrees true)
     cpr_even: Optional[tuple] = field(default=None, repr=False)   # (raw_msg, timestamp)
     cpr_odd:  Optional[tuple] = field(default=None, repr=False)
+    mlat_cpr_even: Optional[tuple] = field(default=None, repr=False)  # MLAT-only pair (same format)
+    mlat_cpr_odd:  Optional[tuple] = field(default=None, repr=False)
     pos_global: bool = False  # True once a global CPR decode (even+odd pair) has succeeded
     pos_by_ref: bool = False  # True once a local position_with_ref decode has succeeded
     # Soft position reliability score (readsb: pos_reliable_odd/even in track.c).
@@ -1049,12 +1051,16 @@ class AircraftState:
         t0 = time.perf_counter()
         with self._lock:
             t_locked = time.perf_counter()
-            # In hybrid mode readsb stats owns the message totals/rates.
+            # In hybrid mode readsb stats owns non-MLAT totals/rates.
+            # MLAT messages are not in readsb JSON so still count those via Beast.
             if config.INGEST_MODE != "hybrid":
                 self._total += 1
                 if mlat:
                     self._mlat_total += 1
                 self._tick(now, mlat=mlat)
+            elif mlat:
+                self._mlat_total += 1
+                self._tick(now, mlat=True)
             self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
         t_done = time.perf_counter()
         msg_timings.append(t_done - t0)
@@ -1090,12 +1096,16 @@ class AircraftState:
         with self._lock:
             t_locked = time.perf_counter()
             for raw, signal, mlat, mlat_source in processed:
-                # In hybrid mode readsb stats owns the message totals/rates.
+                # In hybrid mode readsb stats owns non-MLAT totals/rates.
+                # MLAT messages are not in readsb JSON so still count those via Beast.
                 if config.INGEST_MODE != "hybrid":
                     self._total += 1
                     if mlat:
                         self._mlat_total += 1
                     self._tick(now, mlat=mlat)
+                elif mlat:
+                    self._mlat_total += 1
+                    self._tick(now, mlat=True)
                 self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
         t_done = time.perf_counter()
 
@@ -1792,11 +1802,15 @@ class AircraftState:
                     if not _is_cpr_duplicate(ac, raw, _cpr_oe, now):
                         _cpr_lat_int = _nd['cpr_lat']
                         _cpr_lon_int = _nd['cpr_lon']
-                        # MLAT frames must not update the shared even/odd CPR state.
-                        # Mixing an MLAT-sourced half-pair with an ADS-B half-pair in
-                        # the global solver produces garbage positions, causing every
-                        # subsequent fix to appear as a speed spike.
-                        if not mlat:
+                        # ADS-B and MLAT frames maintain independent even/odd CPR pairs.
+                        # Mixing a frame from one source with a half-pair from the other
+                        # in the global solver produces garbage positions → speed spikes.
+                        if mlat:
+                            if _cpr_oe == 0:
+                                ac.mlat_cpr_even = (_cpr_lat_int, _cpr_lon_int, now)
+                            else:
+                                ac.mlat_cpr_odd  = (_cpr_lat_int, _cpr_lon_int, now)
+                        else:
                             if _cpr_oe == 0:
                                 ac.cpr_even = (_cpr_lat_int, _cpr_lon_int, now)
                             else:
@@ -1805,14 +1819,26 @@ class AircraftState:
                         pos = None
                         pos_from_global = False
                         global_bad = False
-                        # Global CPR only for ADS-B (consistent CPR state guaranteed).
-                        # timestamp is at index 2 in the native (int, int, ts) tuple
+                        # Global CPR: use source-matched pair (ADS-B vs MLAT) so frames
+                        # are never cross-paired.  timestamp is at index 2.
                         if (not mlat
                                 and ac.cpr_even and ac.cpr_odd
                                 and abs(ac.cpr_even[2] - ac.cpr_odd[2]) < 10):
                             pos = _decode_cffi.solve_cpr_airborne(
                                 ac.cpr_even[0], ac.cpr_even[1],
                                 ac.cpr_odd[0],  ac.cpr_odd[1],
+                                _cpr_oe,
+                            )
+                            if pos is not None:
+                                pos_from_global = True
+                            elif ac.pos_global:
+                                global_bad = True
+                        elif (mlat
+                                and ac.mlat_cpr_even and ac.mlat_cpr_odd
+                                and abs(ac.mlat_cpr_even[2] - ac.mlat_cpr_odd[2]) < 10):
+                            pos = _decode_cffi.solve_cpr_airborne(
+                                ac.mlat_cpr_even[0], ac.mlat_cpr_even[1],
+                                ac.mlat_cpr_odd[0],  ac.mlat_cpr_odd[1],
                                 _cpr_oe,
                             )
                             if pos is not None:
@@ -1886,11 +1912,13 @@ class AircraftState:
                         # Duplicate check: same raw frame within _CPR_DUP_WINDOW_S means
                         # multiple receivers forwarded the same transponder transmission.
                         if not _is_cpr_duplicate(ac, raw, oe, now):
-                            # MLAT frames must not update the shared even/odd CPR state.
-                            # Mixing an MLAT-sourced half-pair with an ADS-B half-pair in
-                            # the global solver produces garbage positions, causing every
-                            # subsequent fix to appear as a speed spike.
-                            if not mlat:
+                            # ADS-B and MLAT frames maintain independent even/odd CPR pairs.
+                            if mlat:
+                                if oe == 0:
+                                    ac.mlat_cpr_even = (raw, now)
+                                else:
+                                    ac.mlat_cpr_odd = (raw, now)
+                            else:
                                 if oe == 0:
                                     ac.cpr_even = (raw, now)
                                 else:
@@ -1899,13 +1927,24 @@ class AircraftState:
                             pos = None
                             pos_from_global = False
                             global_bad = False
-                            # Global CPR only for ADS-B (consistent CPR state guaranteed).
+                            # Global CPR: use source-matched pair so frames are never cross-paired.
                             if (not mlat
                                     and ac.cpr_even and ac.cpr_odd
                                     and abs(ac.cpr_even[1] - ac.cpr_odd[1]) < 10):
                                 pos = pms.adsb.position(
                                     ac.cpr_even[0], ac.cpr_odd[0],
                                     ac.cpr_even[1], ac.cpr_odd[1],
+                                )
+                                if pos is not None:
+                                    pos_from_global = True
+                                elif ac.pos_global:
+                                    global_bad = True
+                            elif (mlat
+                                    and ac.mlat_cpr_even and ac.mlat_cpr_odd
+                                    and abs(ac.mlat_cpr_even[1] - ac.mlat_cpr_odd[1]) < 10):
+                                pos = pms.adsb.position(
+                                    ac.mlat_cpr_even[0], ac.mlat_cpr_odd[0],
+                                    ac.mlat_cpr_even[1], ac.mlat_cpr_odd[1],
                                 )
                                 if pos is not None:
                                     pos_from_global = True
