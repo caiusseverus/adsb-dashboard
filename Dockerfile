@@ -14,18 +14,22 @@ RUN npm run build
 # ---------------------------------------------------------------------------
 # Stage 2 — Python runtime with the backend + built frontend
 # ---------------------------------------------------------------------------
-FROM python:3.10-slim AS runtime
+FROM python:3.12-slim AS runtime
 
 # Install uv (pinned for reproducibility; update as needed)
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 
+# Keep uv aligned with the image interpreter; avoid auto-selecting newer
+# managed Python versions (e.g. 3.14) that can break Cython extension builds.
+ENV UV_PYTHON=3.12
+
 # Copy dependency manifests first so this layer is cached when code changes
 COPY backend/pyproject.toml backend/uv.lock ./backend/
 
 # Install Python dependencies into the project venv (no editable install)
-RUN uv sync --directory backend --no-dev --frozen
+RUN uv sync --directory backend --no-dev --frozen --python 3.12
 
 # Copy the full backend source and seed scripts
 COPY backend/ ./backend/
