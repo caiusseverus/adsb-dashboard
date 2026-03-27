@@ -41,6 +41,8 @@ import memory_policy
 from status import router as status_router, register_runtime_stats
 from debug import router as debug_router
 from notify_settings import router as notify_settings_router
+import cast
+from cast_api import router as cast_router
 import health as health_module
 from health import router as health_router
 import tracks as tracks_module
@@ -561,6 +563,10 @@ async def _push_updates() -> None:
 
         if notify_tasks:
             await asyncio.gather(*notify_tasks)
+
+        # Cast check — non-blocking; dispatches I/O to thread internally
+        cast.check(snapshot["aircraft"])
+
         t_gather_end = time.perf_counter()
 
         t_ser = time.perf_counter()
@@ -816,6 +822,7 @@ app.include_router(acas_router)
 app.include_router(squawks_router)
 app.include_router(status_router)
 app.include_router(notify_settings_router)
+app.include_router(cast_router)
 app.include_router(debug_router)
 position_quality_module._state = state
 position_quality_module._checker = PositionQualityChecker(state)

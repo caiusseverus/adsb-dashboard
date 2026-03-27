@@ -423,6 +423,17 @@ class StatsDB:
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS cast_config (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS cast_rules (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    match_type   TEXT    NOT NULL,
+                    match_value  TEXT,
+                    max_range_nm REAL,
+                    enabled      INTEGER NOT NULL DEFAULT 1
+                );
             """)
 
         # Migrate: add mlat/had_pos columns to daily_aircraft_seen
@@ -439,6 +450,22 @@ class StatsDB:
                 conn.execute("ALTER TABLE coverage_samples ADD COLUMN mlat INTEGER NOT NULL DEFAULT 0")
             except Exception:
                 pass  # column already exists
+
+        # Migrate: create cast tables if upgrading from older DB
+        with self._connect() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS cast_config (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS cast_rules (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    match_type   TEXT    NOT NULL,
+                    match_value  TEXT,
+                    max_range_nm REAL,
+                    enabled      INTEGER NOT NULL DEFAULT 1
+                );
+            """)
 
         log.info("DB: schema ready at %s", config.DB_PATH)
 
@@ -2796,6 +2823,55 @@ class StatsDB:
     def remove_from_watchlist(self, icao: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM notify_watchlist WHERE icao=?", (icao,))
+
+    # ------------------------------------------------------------------
+    # Cast config + rules
+    # ------------------------------------------------------------------
+
+    def get_cast_config(self) -> dict:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT key, value FROM cast_config").fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+    def set_cast_config(self, key: str, value: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO cast_config (key, value) VALUES (?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+
+    def get_cast_rules(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, match_type, match_value, max_range_nm, enabled "
+                "FROM cast_rules ORDER BY id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_cast_rule(self, match_type: str, match_value: str | None,
+                      max_range_nm: float | None) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO cast_rules (match_type, match_value, max_range_nm) "
+                "VALUES (?,?,?)",
+                (match_type, match_value, max_range_nm),
+            )
+        return cur.lastrowid
+
+    def update_cast_rule(self, rule_id: int, match_type: str,
+                         match_value: str | None, max_range_nm: float | None,
+                         enabled: bool) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE cast_rules SET match_type=?, match_value=?, "
+                "max_range_nm=?, enabled=? WHERE id=?",
+                (match_type, match_value, max_range_nm, int(enabled), rule_id),
+            )
+
+    def delete_cast_rule(self, rule_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM cast_rules WHERE id=?", (rule_id,))
 
     # ------------------------------------------------------------------
     # Visit log
