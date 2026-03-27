@@ -76,6 +76,7 @@ async def put_cast_config(payload: CastConfigPayload):
             stats_db.set_cast_config(key, value)
 
     await asyncio.to_thread(_write)
+    cast.reset_config_cache()
     return {"ok": True}
 
 

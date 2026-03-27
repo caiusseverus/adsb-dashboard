@@ -93,6 +93,12 @@ def _get_config() -> dict:
     return _config_cache
 
 
+def reset_config_cache() -> None:
+    """Force next _get_config() call to re-read from DB. Call after a config save."""
+    global _config_cache_ts
+    _config_cache_ts = 0.0
+
+
 def _get_rules() -> list[dict]:
     from db import stats_db
     return stats_db.get_cast_rules()
@@ -345,14 +351,16 @@ def _cast(lan_url: str, device_name: str, display_seconds: int, token: str) -> N
     chromecasts, browser = pychromecast.get_listed_chromecasts(
         friendly_names=[device_name], timeout=10
     )
-    pychromecast.discovery.stop_discovery(browser)
 
     if not chromecasts:
+        pychromecast.discovery.stop_discovery(browser)
         log.warning("cast: device %r not found on LAN", device_name)
         return
 
     cc = chromecasts[0]
-    cc.wait()
+    cc.wait()  # resolve service info — zeroconf must still be running
+    pychromecast.discovery.stop_discovery(browser)
+
     mc = cc.media_controller
     mc.play_media(display_url, "image/jpeg")
     mc.block_until_active(timeout=15)
