@@ -695,12 +695,15 @@ def _record_mlat_fix(ac: "Aircraft", source: str, lat: float, lon: float, now: f
             )
             is_spike = True
         else:
-            dt = now - prev_ts
+            prev = buf[-1]
+            # Use accepted-fix timestamp for speed calc to avoid cascade:
+            # mlat_last_fix_ts includes spiked fixes, so dt would shrink
+            # while distance stays large → every subsequent fix looks fast.
+            dt = now - prev.ts
             if dt < _MLAT_MIN_DT_S:
                 # Gap too small for a reliable speed estimate — skip check, don't count as spike
                 pass
             else:
-                prev = buf[-1]
                 speed_kt = (_haversine_nm(prev.lat, prev.lon, lat, lon) / dt) * 3600
                 if speed_kt > _MLAT_MAX_SPEED_KT:
                     ac.mlat_spike_counts[source]["speed"] = (
