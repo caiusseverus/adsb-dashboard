@@ -403,6 +403,14 @@ def run_benchmark(n_msgs: int = 5000, paused: bool = False) -> dict:
         results["pymodes_version"] = "?"
         results["pymodes_cython"]  = False
 
+    # Primary decode path used by AircraftState: native readsb-derived C library
+    # via decode_cffi when available, otherwise pyModeS fallback.
+    try:
+        import aircraft_state as _as
+        results["native_c_decoder"] = bool(getattr(_as, "_NATIVE_DECODE", False))
+    except Exception:
+        results["native_c_decoder"] = False
+
     t_start = time.perf_counter()
 
     results["stage_beast_parse"]   = _bench_beast_parse(n_msgs)

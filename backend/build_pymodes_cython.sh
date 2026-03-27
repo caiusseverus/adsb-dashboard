@@ -13,10 +13,16 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
+# Prefer the same environment path uv sync used when available.
+# install.sh sets UV_PROJECT_ENVIRONMENT to /var/lib/adsb-dashboard/.venv.
+if [[ -n "${UV_PROJECT_ENVIRONMENT:-}" ]]; then
+  VENV_PYTHON="$UV_PROJECT_ENVIRONMENT/bin/python"
+else
+  VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
+fi
 
 if [[ ! -x "$VENV_PYTHON" ]]; then
-  echo "ERROR: venv not found. Run 'uv sync' first." >&2
+  echo "ERROR: venv not found at $VENV_PYTHON. Run 'uv sync' first." >&2
   exit 1
 fi
 
