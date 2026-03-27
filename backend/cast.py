@@ -230,7 +230,7 @@ def _rule_matches(rule: dict, ac: dict) -> bool:
     max_nm = rule.get("max_range_nm")
     if max_nm is not None:
         ac_range = ac.get("range_nm")
-        if ac_range is not None and ac_range > max_nm:
+        if ac_range is None or ac_range > max_nm:
             return False
 
     return True
