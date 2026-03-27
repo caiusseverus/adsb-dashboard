@@ -7,14 +7,16 @@ take effect immediately without a restart.
 Flow:
   main.py broadcast loop → cast.check(aircraft_snapshot)
     → rule match + time gate + cooldown check
-    → generate short-lived token, store snapshot
-    → send Cast command: Chromecast fetches /api/cast/display/<token>
-    → /api/cast/display/<token> renders JPEG via Pillow (photo + data overlay)
+    → if cast idle: dispatch immediately; if busy: store as pending (last-in wins)
+    → _cast_worker() loop: generate token, send Cast command, wait, then check pending
+    → Chromecast fetches /api/cast/display/<token>
+    → /api/cast/display/<token> renders JPEG via Pillow (photo + data overlay + route)
 """
 
 import io
 import json
 import logging
+import threading
 import time
 import urllib.request
 import uuid
@@ -74,7 +76,69 @@ def _mark_cast(icao: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Config helpers — read from DB each call (TTL-cached in caller)
+# Serialized cast queue — one active session + one pending slot (last-in wins)
+# A threading.Event signals the worker thread to pick up the pending aircraft.
+# ---------------------------------------------------------------------------
+_cast_lock      = threading.Lock()
+_cast_busy      = False          # True while a _cast() session is running
+_cast_pending:  dict | None = None   # aircraft snapshot waiting to be cast
+_cast_event     = threading.Event()  # set when a pending item is ready
+
+
+def _enqueue(aircraft: dict, lan_url: str, device_name: str,
+             display_seconds: int) -> None:
+    """Schedule aircraft for casting. If idle, start worker; if busy, replace pending."""
+    global _cast_busy, _cast_pending
+
+    with _cast_lock:
+        _cast_pending = aircraft
+        if _cast_busy:
+            # Worker is already running; it will pick up _cast_pending when done.
+            _cast_event.set()
+            return
+        _cast_busy = True
+
+    # Start worker thread — it drains the pending slot until empty.
+    t = threading.Thread(
+        target=_cast_worker,
+        args=(lan_url, device_name, display_seconds),
+        daemon=True,
+        name="cast-worker",
+    )
+    t.start()
+
+
+def _cast_worker(lan_url: str, device_name: str, display_seconds: int) -> None:
+    """Worker: cast pending aircraft, then loop until no more are queued."""
+    global _cast_busy, _cast_pending
+
+    while True:
+        with _cast_lock:
+            aircraft = _cast_pending
+            _cast_pending = None
+            _cast_event.clear()
+
+        if aircraft is None:
+            with _cast_lock:
+                _cast_busy = False
+            return
+
+        token = _store_token(aircraft)
+        try:
+            _cast(lan_url, device_name, display_seconds, token)
+        except Exception:
+            log.exception("cast: unhandled error in _cast()")
+
+        # After displaying, check if another aircraft queued up during the session.
+        with _cast_lock:
+            if _cast_pending is None:
+                _cast_busy = False
+                return
+            # There's a pending aircraft — loop to cast it.
+
+
+# ---------------------------------------------------------------------------
+# Config helpers — read from DB each call (TTL-cached)
 # ---------------------------------------------------------------------------
 
 _config_cache: dict = {}
@@ -113,7 +177,7 @@ def _in_active_hours(cfg: dict) -> bool:
     start_str = cfg.get("active_hours_start", "")
     end_str   = cfg.get("active_hours_end", "")
     if not start_str or not end_str:
-        return True  # no restriction configured
+        return True
     try:
         now_t = datetime.now().time()
         start = datetime.strptime(start_str, "%H:%M").time()
@@ -139,7 +203,7 @@ def _rule_matches(rule: dict, ac: dict) -> bool:
     if not rule.get("enabled", 1):
         return False
 
-    match_type = rule.get("match_type", "")
+    match_type  = rule.get("match_type", "")
     match_value = (rule.get("match_value") or "").strip().upper()
 
     if match_type == "icao":
@@ -158,12 +222,11 @@ def _rule_matches(rule: dict, ac: dict) -> bool:
         if ac.get("squawk") not in ("7500", "7600", "7700"):
             return False
     elif match_type == "any":
-        pass  # always matches
+        pass
     else:
         log.warning("cast: unknown match_type %r, skipping rule", match_type)
         return False
 
-    # Range gate — only applied when aircraft has a known position
     max_nm = rule.get("max_range_nm")
     if max_nm is not None:
         ac_range = ac.get("range_nm")
@@ -171,6 +234,48 @@ def _rule_matches(rule: dict, ac: dict) -> bool:
             return False
 
     return True
+
+
+# ---------------------------------------------------------------------------
+# Airport name lookup (reuses the same airports.json as fleet.py/coverage.py)
+# ---------------------------------------------------------------------------
+
+_airport_map: dict[str, str] | None = None
+
+
+def _airport_name(icao: str) -> str | None:
+    global _airport_map
+    if _airport_map is None:
+        try:
+            from coverage import _load_airports
+            _airport_map = {
+                ap["icao"]: ap["name"]
+                for ap in _load_airports()
+                if ap.get("icao") and ap.get("name")
+            }
+        except Exception:
+            _airport_map = {}
+    return _airport_map.get((icao or "").upper())
+
+
+def _get_route(icao: str) -> tuple[str | None, str | None, str | None, str | None]:
+    """Return (origin_icao, origin_name, dest_icao, dest_name) from the most recent visit."""
+    try:
+        from db import stats_db
+        with stats_db._connect() as conn:
+            row = conn.execute(
+                "SELECT origin_icao, dest_icao FROM visits "
+                "WHERE icao=? AND origin_icao IS NOT NULL AND origin_icao != '' "
+                "ORDER BY start_ts DESC LIMIT 1",
+                (icao.upper(),),
+            ).fetchone()
+        if not row:
+            return None, None, None, None
+        o, d = row["origin_icao"], row["dest_icao"]
+        return o, _airport_name(o), d, _airport_name(d)
+    except Exception as exc:
+        log.debug("cast: route lookup failed for %s: %s", icao, exc)
+        return None, None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -201,74 +306,102 @@ def _fetch_photo(icao: str) -> bytes | None:
         return None
 
 
+def _gradient_edge(img, x_start: int, x_end: int, bg: tuple) -> None:
+    """Blend columns x_start..x_end toward bg colour (right-to-left fade)."""
+    w = x_end - x_start
+    h = img.height
+    pixels = img.load()
+    for x in range(x_start, x_end):
+        alpha = (x - x_start) / w
+        br, bg_c, bb = bg
+        for y in range(h):
+            r0, g0, b0 = pixels[x, y]
+            pixels[x, y] = (
+                int(r0 * (1 - alpha) + br * alpha),
+                int(g0 * (1 - alpha) + bg_c * alpha),
+                int(b0 * (1 - alpha) + bb * alpha),
+            )
+
+
 def render_display_image(aircraft: dict) -> bytes:
     """
     Generate a 1280×720 JPEG for display on the Chromecast.
-    Shows aircraft photo (if available) with a data overlay.
+    Photo occupies the left 800 px; data overlay the right 480 px.
     Returns raw JPEG bytes.
     """
     from PIL import Image, ImageDraw, ImageFont
 
-    W, H = 1280, 720
-    BG       = (11, 12, 16)       # #0b0c10 — matches dashboard background
-    CARD     = (22, 27, 34)       # #161b22
-    ACCENT   = (56, 139, 253)     # #388bfd blue
-    TEXT     = (201, 209, 217)    # #c9d1d9
-    SUBTEXT  = (110, 118, 129)    # muted
-    WHITE    = (255, 255, 255)
-    MILITARY = (188, 140, 255)    # #bc8cff purple
+    W, H      = 1280, 720
+    PHOTO_W   = 800          # photo panel width
+    DATA_X    = PHOTO_W + 8  # left edge of data text
+    DATA_W    = W - DATA_X   # available text width
 
-    img = Image.new("RGB", (W, H), BG)
+    BG       = (11, 12, 16)
+    ACCENT   = (56, 139, 253)
+    TEXT     = (201, 209, 217)
+    SUBTEXT  = (110, 118, 129)
+    DIM      = (72, 79, 88)
+    WHITE    = (255, 255, 255)
+    MILITARY = (188, 140, 255)
+    EMERGENCY = (218, 54, 51)
+
+    img  = Image.new("RGB", (W, H), BG)
     draw = ImageDraw.Draw(img)
 
-    # --- load fonts (fall back to default if not available) ---
-    def _font(size: int):
-        try:
-            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
-        except Exception:
-            return ImageFont.load_default()
+    # --- fonts ---
+    def _bold(size: int):
+        for path in (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                pass
+        return ImageFont.load_default()
 
-    def _font_regular(size: int):
-        try:
-            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
-        except Exception:
-            return ImageFont.load_default()
+    def _regular(size: int):
+        for path in (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                pass
+        return ImageFont.load_default()
 
-    font_large  = _font(52)
-    font_medium = _font(32)
-    font_small  = _font_regular(22)
-    font_tiny   = _font_regular(18)
+    f_headline = _bold(46)
+    f_sub      = _regular(18)
+    f_label    = _regular(13)
+    f_value    = _bold(22)
+    f_route    = _bold(18)
+    f_badge    = _bold(13)
 
-    # --- photo panel (left half) ---
-    photo_bytes = _fetch_photo(aircraft.get("icao", ""))
+    # --- photo panel ---
+    icao = aircraft.get("icao", "").upper()
+    photo_bytes = _fetch_photo(icao)
     if photo_bytes:
         try:
             photo = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
-            # fill left 640×720, letterboxed
-            photo.thumbnail((640, 720), Image.LANCZOS)
-            px = (640 - photo.width)  // 2
-            py = (720 - photo.height) // 2
-            img.paste(photo, (px, py))
-            # subtle gradient overlay on right edge of photo to blend into data panel
-            for x in range(560, 640):
-                alpha = (x - 560) / 80
-                for y in range(H):
-                    r0, g0, b0 = img.getpixel((x, y))
-                    br, bg, bb = BG
-                    blended = (
-                        int(r0 * (1 - alpha) + br * alpha),
-                        int(g0 * (1 - alpha) + bg * alpha),
-                        int(b0 * (1 - alpha) + bb * alpha),
-                    )
-                    img.putpixel((x, y), blended)
+            # Scale to fill PHOTO_W × H, cropping to centre
+            scale = max(PHOTO_W / photo.width, H / photo.height)
+            new_w = int(photo.width  * scale)
+            new_h = int(photo.height * scale)
+            photo = photo.resize((new_w, new_h), Image.LANCZOS)
+            cx = (new_w - PHOTO_W) // 2
+            cy = (new_h - H)       // 2
+            photo = photo.crop((cx, cy, cx + PHOTO_W, cy + H))
+            img.paste(photo, (0, 0))
+            # Fade right edge of photo into background
+            _gradient_edge(img, PHOTO_W - 120, PHOTO_W, BG)
         except Exception as exc:
             log.debug("cast: photo render failed: %s", exc)
 
-    # --- data panel (right half) ---
-    PX = 680  # left edge of data panel
-    PY = 60   # top padding
+    # Accent bar separating photo from data panel
+    draw.rectangle([PHOTO_W, 0, PHOTO_W + 3, H], fill=ACCENT)
 
-    icao      = aircraft.get("icao", "").upper()
+    # --- data panel ---
     callsign  = aircraft.get("callsign") or ""
     operator  = aircraft.get("operator") or ""
     type_desc = aircraft.get("type_desc") or aircraft.get("type_code") or ""
@@ -278,58 +411,112 @@ def render_display_image(aircraft: dict) -> bytes:
     military  = aircraft.get("military", False)
     reg       = aircraft.get("registration") or ""
 
-    # callsign / ICAO headline
+    origin_icao, origin_name, dest_icao, dest_name = _get_route(icao)
+
+    y = 32
+
+    # Headline: callsign (large) + ICAO below
     headline = callsign if callsign else icao
-    draw.text((PX, PY), headline, font=font_large, fill=WHITE)
+    draw.text((DATA_X, y), headline, font=f_headline, fill=WHITE)
+    y += 50
     if callsign:
-        draw.text((PX, PY + 58), icao, font=font_small, fill=SUBTEXT)
+        draw.text((DATA_X, y), icao, font=f_sub, fill=SUBTEXT)
+        y += 22
+    y += 6
 
-    y = PY + 110
-
-    # military badge
+    # Badges (military / emergency) — inline on one row
+    badge_x = DATA_X
     if military:
-        draw.rectangle([PX, y, PX + 120, y + 34], fill=MILITARY)
-        draw.text((PX + 8, y + 6), "MILITARY", font=font_tiny, fill=BG)
-        y += 46
-
-    # emergency squawk badge
+        bw = 90
+        draw.rectangle([badge_x, y, badge_x + bw, y + 22], fill=MILITARY)
+        draw.text((badge_x + 5, y + 4), "MILITARY", font=f_badge, fill=BG)
+        badge_x += bw + 6
     if squawk in ("7500", "7600", "7700"):
         labels = {"7500": "HIJACK", "7600": "RADIO FAIL", "7700": "EMERGENCY"}
-        draw.rectangle([PX, y, PX + 180, y + 34], fill=(218, 54, 51))
-        draw.text((PX + 8, y + 6), labels[squawk], font=font_tiny, fill=WHITE)
-        y += 46
+        label  = labels[squawk]
+        bw     = 8 + len(label) * 7
+        draw.rectangle([badge_x, y, badge_x + bw, y + 22], fill=EMERGENCY)
+        draw.text((badge_x + 5, y + 4), label, font=f_badge, fill=WHITE)
+        badge_x += bw + 6
+    if military or squawk in ("7500", "7600", "7700"):
+        y += 30
 
-    y += 10
+    y += 4
 
-    # data rows
-    def row(label: str, value: str, colour=TEXT) -> None:
+    # Helper: draw a label + value row
+    def row(label: str, value: str, colour=TEXT, gap_after: int = 28) -> None:
         nonlocal y
-        draw.text((PX, y), label, font=font_tiny, fill=SUBTEXT)
-        draw.text((PX, y + 20), value, font=font_medium, fill=colour)
-        y += 72
+        draw.text((DATA_X, y), label, font=f_label, fill=DIM)
+        y += 14
+        draw.text((DATA_X, y), value, font=f_value, fill=colour)
+        y += gap_after
+
+    # Helper to truncate text to DATA_W pixels
+    def trunc(text: str, font) -> str:
+        if not text:
+            return text
+        while text and draw.textlength(text, font=font) > DATA_W - 4:
+            text = text[:-1]
+        return text
 
     if operator:
-        row("OPERATOR", operator, ACCENT)
+        draw.text((DATA_X, y), "OPERATOR", font=f_label, fill=DIM)
+        y += 14
+        draw.text((DATA_X, y), trunc(operator, f_value), font=f_value, fill=ACCENT)
+        y += 28
+
     if type_desc:
-        row("TYPE", type_desc)
+        draw.text((DATA_X, y), "TYPE", font=f_label, fill=DIM)
+        y += 14
+        draw.text((DATA_X, y), trunc(type_desc, f_value), font=f_value, fill=TEXT)
+        y += 28
+
     if reg:
-        row("REGISTRATION", reg)
+        draw.text((DATA_X, y), "REGISTRATION", font=f_label, fill=DIM)
+        y += 14
+        draw.text((DATA_X, y), reg, font=f_value, fill=TEXT)
+        y += 28
+
+    # Route — origin → dest with airport names below codes
+    if origin_icao or dest_icao:
+        draw.text((DATA_X, y), "ROUTE", font=f_label, fill=DIM)
+        y += 14
+        o_str = origin_icao or "?"
+        d_str = dest_icao   or "?"
+        draw.text((DATA_X, y), f"{o_str}  →  {d_str}", font=f_route, fill=ACCENT)
+        y += 20
+        o_name = trunc(origin_name or "", f_label) if origin_name else ""
+        d_name = trunc(dest_name   or "", f_label) if dest_name   else ""
+        if o_name or d_name:
+            sep = "  →  " if o_name and d_name else ""
+            draw.text((DATA_X, y), f"{o_name}{sep}{d_name}", font=f_label, fill=SUBTEXT)
+            y += 16
+        y += 8
+
     if altitude is not None:
-        row("ALTITUDE", f"{altitude:,} ft")
+        draw.text((DATA_X, y), "ALTITUDE", font=f_label, fill=DIM)
+        y += 14
+        draw.text((DATA_X, y), f"{altitude:,} ft", font=f_value, fill=TEXT)
+        y += 28
+
     if range_nm is not None:
-        row("RANGE", f"{range_nm:.1f} nm")
+        draw.text((DATA_X, y), "RANGE", font=f_label, fill=DIM)
+        y += 14
+        draw.text((DATA_X, y), f"{range_nm:.1f} nm", font=f_value, fill=TEXT)
+        y += 28
+
     if squawk and squawk not in ("7500", "7600", "7700"):
-        row("SQUAWK", squawk)
+        draw.text((DATA_X, y), "SQUAWK", font=f_label, fill=DIM)
+        y += 14
+        draw.text((DATA_X, y), squawk, font=f_value, fill=TEXT)
+        y += 28
 
-    # timestamp footer
+    # Timestamp footer
     ts = datetime.now().strftime("%H:%M:%S")
-    draw.text((PX, H - 40), ts, font=font_tiny, fill=SUBTEXT)
-
-    # accent bar along top of data panel
-    draw.rectangle([PX - 4, 0, PX - 1, H], fill=ACCENT)
+    draw.text((DATA_X, H - 24), ts, font=f_label, fill=DIM)
 
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
+    img.save(buf, format="JPEG", quality=88)
     return buf.getvalue()
 
 
@@ -338,7 +525,7 @@ def render_display_image(aircraft: dict) -> bytes:
 # ---------------------------------------------------------------------------
 
 def _cast(lan_url: str, device_name: str, display_seconds: int, token: str) -> None:
-    """Send Cast command to the named Chromecast device (blocking, run in thread)."""
+    """Send Cast command to the named Chromecast device (blocking, runs in worker thread)."""
     try:
         import pychromecast
     except ImportError:
@@ -362,7 +549,7 @@ def _cast(lan_url: str, device_name: str, display_seconds: int, token: str) -> N
     pychromecast.discovery.stop_discovery(browser)
 
     mc = cc.media_controller
-    log.info("cast: sending image URL %s", display_url)
+    log.info("cast: sending to %r — %s", device_name, display_url)
     mc.play_media(display_url, "image/jpeg", stream_type="NONE")
     mc.block_until_active(timeout=15)
     log.info("cast: displaying on %r for %d s", device_name, display_seconds)
@@ -379,10 +566,9 @@ def _cast(lan_url: str, device_name: str, display_seconds: int, token: str) -> N
 def check(aircraft_list: list[dict]) -> None:
     """
     Evaluate cast rules against the current aircraft snapshot list.
-    Called from the broadcast loop — must return quickly (does no I/O itself;
-    dispatches blocking work to a thread).
+    Called from the broadcast loop — returns immediately; all blocking work
+    is handled by the worker thread via _enqueue().
     """
-    import asyncio
     cfg = _get_config()
 
     device_name = cfg.get("device_name", "").strip()
@@ -416,22 +602,13 @@ def check(aircraft_list: list[dict]) -> None:
         for rule in rules:
             if _rule_matches(rule, ac):
                 _mark_cast(icao)
-                token = _store_token(ac)
                 log.info(
                     "cast: triggered for %s (%s) by rule %s:%s",
                     icao, ac.get("callsign") or "-",
                     rule["match_type"], rule.get("match_value") or "*",
                 )
-                # Run blocking Cast I/O in a background thread — don't block the event loop
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.run_in_executor(
-                        None, _cast, lan_url, device_name, display_seconds, token
-                    )
-                except RuntimeError:
-                    # No running loop (e.g. during tests) — skip
-                    pass
-                break  # one cast per aircraft per check cycle
+                _enqueue(ac, lan_url, device_name, display_seconds)
+                break  # one trigger per aircraft per cycle
 
 
 # ---------------------------------------------------------------------------
