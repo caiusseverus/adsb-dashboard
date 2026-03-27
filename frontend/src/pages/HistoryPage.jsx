@@ -4,7 +4,7 @@ import TrendChart from '../components/TrendChart'
 import AltHeatmap from '../components/AltHeatmap'
 import styles from './HistoryPage.module.css'
 
-export default function HistoryPage({ snapshot }) {
+export default function HistoryPage() {
   return (
     <main className={styles.main}>
       <HourlyHeatmap />

@@ -159,12 +159,16 @@ export default function BenchmarkPanel() {
     // Poll status every 800ms; fetch result when done
     pollRef.current = setInterval(async () => {
       try {
-        const s = await fetch(`${API_BASE}/api/debug/benchmark/status`).then(r => r.json())
+        const sr = await fetch(`${API_BASE}/api/debug/benchmark/status`)
+        if (!sr.ok) throw new Error(`HTTP ${sr.status}`)
+        const s = await sr.json()
         if (!s.running) {
           stopPolling()
           setRunning(false)
           // Fetch the completed result
-          const d = await fetch(`${API_BASE}/api/debug/benchmark`).then(r => r.json())
+          const dr = await fetch(`${API_BASE}/api/debug/benchmark`)
+          if (!dr.ok) throw new Error(`HTTP ${dr.status}`)
+          const d = await dr.json()
           setResult(d)
         }
       } catch {

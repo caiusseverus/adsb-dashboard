@@ -10,21 +10,24 @@ import logging
 import smtplib
 import time
 import urllib.request
+from collections import OrderedDict
 from email.message import EmailMessage
 
 import config
 
 log = logging.getLogger(__name__)
 
-_notified: set[str] = set()
+# OrderedDict used as an ordered set: keys are notification keys, values are None.
+# Insertion order is preserved so the oldest entry is evicted when at capacity.
+_notified: OrderedDict[str, None] = OrderedDict()
 _NOTIFIED_MAX = 5_000  # ~300 KB worst case; prevents unbounded growth on busy sites
 
 
 def _mark_notified(key: str) -> None:
-    """Add key to _notified, evicting one arbitrary entry if at capacity."""
+    """Add key to _notified, evicting the oldest entry if at capacity."""
     if len(_notified) >= _NOTIFIED_MAX:
-        _notified.pop()
-    _notified.add(key)
+        _notified.popitem(last=False)  # evict oldest insertion
+    _notified[key] = None
 
 
 # Prefs cache — avoid a DB query on every per-aircraft call
