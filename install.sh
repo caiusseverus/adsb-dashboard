@@ -270,7 +270,7 @@ if ! dpkg -s build-essential &>/dev/null 2>&1; then
     echo "  Installing build-essential for compilation…"
     apt-get install -y -qq build-essential
 fi
-bash "$INSTALL_DIR/backend/build_pymodes_cython.sh"
+UV_PROJECT_ENVIRONMENT="$VENV_DIR/.venv" bash "$INSTALL_DIR/backend/build_pymodes_cython.sh"
 make -C "$INSTALL_DIR/backend/native"
 make -C "$INSTALL_DIR/backend/native" install
 

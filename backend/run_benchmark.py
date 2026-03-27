@@ -75,16 +75,19 @@ def _print_results(r):
     corpus_size = r['corpus_size']
     warm_count  = r.get('warm_aircraft_count', '?')
     n_msgs      = r['n_msgs']
+    native_c    = r.get('native_c_decoder', False)
     cython      = r.get('pymodes_cython', False)
     orj         = r.get('orjson', False)
     paused      = r.get('decoder_paused_during_run', False)
 
+    native_str  = _c('OK decode_cffi active', GREEN) if native_c else _c('X pyModeS fallback active', YELLOW)
     cython_str  = _c('OK loaded', GREEN) if cython else _c('X pure Python -- pip install pyModeS[cython]', RED)
     orjson_str  = _c('OK ' + orjson_ver, GREEN) if orj else _c('X not installed -- pip install orjson', YELLOW)
     paused_str  = _c('yes - clean measurement', GREEN) if paused else _c('no - may include GIL noise', YELLOW)
 
     print(f"\n  {_c('Environment', BOLD)}")
     print(f"  Python        {_c(py_ver, CYAN)}")
+    print(f"  Native decode {native_str}")
     print(f"  pyModeS       {_c(pymodes_ver, CYAN)}  Cython: {cython_str}")
     print(f"  orjson        {orjson_str}")
     print(f"  Corpus        {corpus_size} frame types, {warm_count} warm aircraft")

@@ -307,6 +307,7 @@ export default function BenchmarkPanel() {
           <div style={{ color: '#484f58', fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.06em', padding: '0.5rem 0 0.2rem' }}>Environment</div>
           <EnvRow label="Python"         value={result.python_version} />
           <EnvRow label="orjson"         value={result.orjson ? `✓ ${result.orjson_version}` : '✗ not installed'} ok={result.orjson} warn={!result.orjson} />
+          <EnvRow label="Native C decoder" value={result.native_c_decoder ? '✓ decode_cffi active' : '✗ pyModeS fallback active'} ok={result.native_c_decoder} warn={!result.native_c_decoder} />
           <EnvRow label="pyModeS"        value={result.pymodes_version} />
           <EnvRow label="pyModeS Cython" value={result.pymodes_cython ? '✓ C extension loaded' : '✗ pure Python — install pyModeS[cython]'} ok={result.pymodes_cython} warn={!result.pymodes_cython} />
           <EnvRow label="Warm aircraft"  value={result.warm_aircraft_count} />
