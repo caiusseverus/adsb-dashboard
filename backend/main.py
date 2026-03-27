@@ -565,7 +565,10 @@ async def _push_updates() -> None:
             await asyncio.gather(*notify_tasks)
 
         # Cast check — non-blocking; dispatches I/O to thread internally
-        cast.check(snapshot["aircraft"])
+        try:
+            cast.check(snapshot["aircraft"])
+        except Exception:
+            log.exception("cast: unhandled error in check()")
 
         t_gather_end = time.perf_counter()
 

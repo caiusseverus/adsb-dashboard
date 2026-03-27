@@ -379,9 +379,11 @@ def check(aircraft_list: list[dict]) -> None:
     device_name = cfg.get("device_name", "").strip()
     lan_url     = cfg.get("lan_url", "").strip()
     if not device_name or not lan_url:
-        return  # cast not configured
+        log.warning("cast: skipping — device_name or lan_url not configured (cfg=%r)", cfg)
+        return
 
     if not _in_active_hours(cfg):
+        log.debug("cast: skipping — outside active hours")
         return
 
     try:
@@ -392,8 +394,10 @@ def check(aircraft_list: list[dict]) -> None:
 
     rules = _get_rules()
     if not rules:
+        log.warning("cast: skipping — no rules in DB")
         return
 
+    log.debug("cast: checking %d aircraft against %d rules", len(aircraft_list), len(rules))
     for ac in aircraft_list:
         icao = ac.get("icao", "")
         if not icao:
