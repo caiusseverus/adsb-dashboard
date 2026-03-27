@@ -2,7 +2,7 @@
 
 Date: 2026-03-27
 Last updated: 2026-03-27
-Status: **In progress** — D1–D3 complete; T1–T5 scripts written; T1–T5 pending live run; T6 pending high traffic
+Status: **In progress** — D1–D3 complete; T1 confirmed passing; T2–T5 scripts written pending live run; T6 pending high traffic
 
 Prerequisite: Phase 3 (hybrid mode) complete and deployed. Full-load traffic (165–200 aircraft) needed for T6 only; all other tests can be run at any traffic level.
 
@@ -63,7 +63,15 @@ cd backend && uv run python ../tools/parity_check.py ../corpus.beast
 cd backend && uv run python ../tools/parity_check.py ../corpus.beast --verbose
 ```
 
-**Status:** Script written and imports verified. Pending live corpus capture and run.
+**Result:** 3968 frames, 0 unexpected divergences. **T1 PASS** (commit f6521f0).
+
+Notes from live run:
+- 31 frames classified as "C AP/ICAO filter" — expected. C correctly requires prior DF11/17/18
+  confirmation before accepting AP-field frames (DF0/4/5/20/21); stateless corpus reader
+  cannot provide this. Not a failure.
+- Script required fixes after first run: DF11 crc_ok excluded (PI≠zero-residual CRC);
+  AP-frame C-rejections reclassified; TC28 squawk bit offsets corrected (me[8:21]→me[11:24],
+  B/D bits shifted past marker bit). All fixed in commit f6521f0.
 
 ### ✅ T2 — readsb vs Beast snapshot diff script (complete)
 
@@ -280,7 +288,7 @@ Compare against Pi baseline from Phase 3 proposal: `msg_queue p95=4834`, `broadc
 | D1 — live endpoint fields | Code change | ✅ Complete (commit 703a76e) |
 | D2 — readsb_stats → DB | Code change | ✅ Complete (commit 703a76e) |
 | D3 — queue telemetry fix | Code change | ✅ Complete (commit 703a76e) |
-| T1 — C extension parity | Script written | ⬜ Pending corpus capture |
+| T1 — C extension parity | Automated | ✅ Confirmed passing (3968 frames, 0 divergences) |
 | T2 — snapshot diff | Script written | ⬜ Pending two-instance run |
 | T3 — hybrid validation | Script written | ⬜ Pending hybrid + MLAT run |
 | T4c — unknown INGEST_MODE | Automated | ✅ Confirmed passing |
