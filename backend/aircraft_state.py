@@ -859,8 +859,8 @@ class Aircraft:
     bearing_deg: Optional[float] = None   # bearing from receiver (degrees true)
     cpr_even: Optional[tuple] = field(default=None, repr=False)   # (raw_msg, timestamp)
     cpr_odd:  Optional[tuple] = field(default=None, repr=False)
-    mlat_cpr_even: Optional[tuple] = field(default=None, repr=False)  # MLAT-only pair (same format)
-    mlat_cpr_odd:  Optional[tuple] = field(default=None, repr=False)
+    mlat_cpr_even: dict = field(default_factory=dict, repr=False)  # source → (cpr_lat, cpr_lon, ts) or (raw, ts)
+    mlat_cpr_odd:  dict = field(default_factory=dict, repr=False)
     pos_global: bool = False  # True once a global CPR decode (even+odd pair) has succeeded
     pos_by_ref: bool = False  # True once a local position_with_ref decode has succeeded
     # Soft position reliability score (readsb: pos_reliable_odd/even in track.c).
@@ -1834,10 +1834,11 @@ class AircraftState:
                         # Mixing a frame from one source with a half-pair from the other
                         # in the global solver produces garbage positions → speed spikes.
                         if mlat:
+                            _msrc = mlat_source or "mlat"
                             if _cpr_oe == 0:
-                                ac.mlat_cpr_even = (_cpr_lat_int, _cpr_lon_int, now)
+                                ac.mlat_cpr_even[_msrc] = (_cpr_lat_int, _cpr_lon_int, now)
                             else:
-                                ac.mlat_cpr_odd  = (_cpr_lat_int, _cpr_lon_int, now)
+                                ac.mlat_cpr_odd[_msrc]  = (_cpr_lat_int, _cpr_lon_int, now)
                         else:
                             if _cpr_oe == 0:
                                 ac.cpr_even = (_cpr_lat_int, _cpr_lon_int, now)
@@ -1862,11 +1863,11 @@ class AircraftState:
                             elif ac.pos_global:
                                 global_bad = True
                         elif (mlat
-                                and ac.mlat_cpr_even and ac.mlat_cpr_odd
-                                and abs(ac.mlat_cpr_even[2] - ac.mlat_cpr_odd[2]) < 10):
+                                and _msrc in ac.mlat_cpr_even and _msrc in ac.mlat_cpr_odd
+                                and abs(ac.mlat_cpr_even[_msrc][2] - ac.mlat_cpr_odd[_msrc][2]) < 10):
                             pos = _decode_cffi.solve_cpr_airborne(
-                                ac.mlat_cpr_even[0], ac.mlat_cpr_even[1],
-                                ac.mlat_cpr_odd[0],  ac.mlat_cpr_odd[1],
+                                ac.mlat_cpr_even[_msrc][0], ac.mlat_cpr_even[_msrc][1],
+                                ac.mlat_cpr_odd[_msrc][0],  ac.mlat_cpr_odd[_msrc][1],
                                 _cpr_oe,
                             )
                             if pos is not None:
@@ -1941,11 +1942,13 @@ class AircraftState:
                         # multiple receivers forwarded the same transponder transmission.
                         if not _is_cpr_duplicate(ac, raw, oe, now):
                             # ADS-B and MLAT frames maintain independent even/odd CPR pairs.
+                            # Per-source keying prevents cross-network CPR contamination.
                             if mlat:
+                                _msrc = mlat_source or "mlat"
                                 if oe == 0:
-                                    ac.mlat_cpr_even = (raw, now)
+                                    ac.mlat_cpr_even[_msrc] = (raw, now)
                                 else:
-                                    ac.mlat_cpr_odd = (raw, now)
+                                    ac.mlat_cpr_odd[_msrc] = (raw, now)
                             else:
                                 if oe == 0:
                                     ac.cpr_even = (raw, now)
@@ -1968,11 +1971,11 @@ class AircraftState:
                                 elif ac.pos_global:
                                     global_bad = True
                             elif (mlat
-                                    and ac.mlat_cpr_even and ac.mlat_cpr_odd
-                                    and abs(ac.mlat_cpr_even[1] - ac.mlat_cpr_odd[1]) < 10):
+                                    and _msrc in ac.mlat_cpr_even and _msrc in ac.mlat_cpr_odd
+                                    and abs(ac.mlat_cpr_even[_msrc][1] - ac.mlat_cpr_odd[_msrc][1]) < 10):
                                 pos = pms.adsb.position(
-                                    ac.mlat_cpr_even[0], ac.mlat_cpr_odd[0],
-                                    ac.mlat_cpr_even[1], ac.mlat_cpr_odd[1],
+                                    ac.mlat_cpr_even[_msrc][0], ac.mlat_cpr_odd[_msrc][0],
+                                    ac.mlat_cpr_even[_msrc][1], ac.mlat_cpr_odd[_msrc][1],
                                 )
                                 if pos is not None:
                                     pos_from_global = True
@@ -1994,7 +1997,7 @@ class AircraftState:
                                                 config.RECEIVER_LAT, config.RECEIVER_LON,
                                                 lat, lon) > config.MAX_RANGE_NM):
                                         pass  # discard — beyond ADS-B range
-                                    elif mlat and not ac.has_adsb:
+                                    elif mlat:
                                         if (ac.has_adsb
                                                 and ac.lat is not None
                                                 and now - ac._last_mlat_force_ts > _MLAT_FORCE_INTERVAL_S
