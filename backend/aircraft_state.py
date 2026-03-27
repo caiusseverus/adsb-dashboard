@@ -1792,16 +1792,23 @@ class AircraftState:
                     if not _is_cpr_duplicate(ac, raw, _cpr_oe, now):
                         _cpr_lat_int = _nd['cpr_lat']
                         _cpr_lon_int = _nd['cpr_lon']
-                        if _cpr_oe == 0:
-                            ac.cpr_even = (_cpr_lat_int, _cpr_lon_int, now)
-                        else:
-                            ac.cpr_odd  = (_cpr_lat_int, _cpr_lon_int, now)
+                        # MLAT frames must not update the shared even/odd CPR state.
+                        # Mixing an MLAT-sourced half-pair with an ADS-B half-pair in
+                        # the global solver produces garbage positions, causing every
+                        # subsequent fix to appear as a speed spike.
+                        if not mlat:
+                            if _cpr_oe == 0:
+                                ac.cpr_even = (_cpr_lat_int, _cpr_lon_int, now)
+                            else:
+                                ac.cpr_odd  = (_cpr_lat_int, _cpr_lon_int, now)
 
                         pos = None
                         pos_from_global = False
                         global_bad = False
+                        # Global CPR only for ADS-B (consistent CPR state guaranteed).
                         # timestamp is at index 2 in the native (int, int, ts) tuple
-                        if (ac.cpr_even and ac.cpr_odd
+                        if (not mlat
+                                and ac.cpr_even and ac.cpr_odd
                                 and abs(ac.cpr_even[2] - ac.cpr_odd[2]) < 10):
                             pos = _decode_cffi.solve_cpr_airborne(
                                 ac.cpr_even[0], ac.cpr_even[1],
@@ -1879,15 +1886,22 @@ class AircraftState:
                         # Duplicate check: same raw frame within _CPR_DUP_WINDOW_S means
                         # multiple receivers forwarded the same transponder transmission.
                         if not _is_cpr_duplicate(ac, raw, oe, now):
-                            if oe == 0:
-                                ac.cpr_even = (raw, now)
-                            else:
-                                ac.cpr_odd = (raw, now)
+                            # MLAT frames must not update the shared even/odd CPR state.
+                            # Mixing an MLAT-sourced half-pair with an ADS-B half-pair in
+                            # the global solver produces garbage positions, causing every
+                            # subsequent fix to appear as a speed spike.
+                            if not mlat:
+                                if oe == 0:
+                                    ac.cpr_even = (raw, now)
+                                else:
+                                    ac.cpr_odd = (raw, now)
 
                             pos = None
                             pos_from_global = False
                             global_bad = False
-                            if (ac.cpr_even and ac.cpr_odd
+                            # Global CPR only for ADS-B (consistent CPR state guaranteed).
+                            if (not mlat
+                                    and ac.cpr_even and ac.cpr_odd
                                     and abs(ac.cpr_even[1] - ac.cpr_odd[1]) < 10):
                                 pos = pms.adsb.position(
                                     ac.cpr_even[0], ac.cpr_odd[0],
