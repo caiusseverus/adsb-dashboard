@@ -341,6 +341,18 @@ class StatsDB:
                 except Exception:
                     pass  # column already exists
 
+        # Migrate: add readsb-sourced SDR/CPR health columns to minute_stats
+        with self._connect() as conn:
+            for col in (
+                "noise_dbfs REAL", "blocks_dropped INTEGER",
+                "cpr_global_ok INTEGER", "cpr_global_bad INTEGER", "cpr_local_ok INTEGER",
+                "tracks_all INTEGER", "tracks_single_msg INTEGER",
+            ):
+                try:
+                    conn.execute(f"ALTER TABLE minute_stats ADD COLUMN {col}")
+                except Exception:
+                    pass  # column already exists
+
         # Migrate: add lat/lon/operator/manufacturer/year to aircraft_registry
         with self._connect() as conn:
             for col in ("lat REAL", "lon REAL", "operator TEXT", "manufacturer TEXT", "year TEXT"):
@@ -519,6 +531,36 @@ class StatsDB:
         if now - self._last_rarity_recalc >= self._rarity_recalc_interval:
             self.recalculate_type_rarity()
             self._last_rarity_recalc = now
+
+    def write_readsb_stats(self, ts: int, stats: dict) -> None:
+        """Update SDR/CPR health columns on the minute_stats row for timestamp ts.
+
+        Called from readsb_stats_poller() after each 60-second poll.  Uses UPDATE
+        rather than INSERT so it never creates orphan rows — if write_minute() hasn't
+        written the row yet the update is a no-op (harmless; next poll will catch it).
+        """
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE minute_stats SET
+                    noise_dbfs      = ?,
+                    blocks_dropped  = ?,
+                    cpr_global_ok   = ?,
+                    cpr_global_bad  = ?,
+                    cpr_local_ok    = ?,
+                    tracks_all      = ?,
+                    tracks_single_msg = ?
+                WHERE ts = ?""",
+                (
+                    stats.get("noise_dbfs"),
+                    stats.get("blocks_dropped"),
+                    stats.get("cpr_global_ok"),
+                    stats.get("cpr_global_bad"),
+                    stats.get("cpr_local_ok"),
+                    stats.get("tracks_all"),
+                    stats.get("tracks_single_msg"),
+                    ts,
+                ),
+            )
 
     def _flush_registry(self, now_ts: int) -> None:
         """Write all buffered dirty aircraft to the registry in a single transaction."""

@@ -453,11 +453,12 @@ async def _push_updates() -> None:
                                         _route_queue_drops, vid, ac.callsign)
                         _route_queue.append((vid, ac.callsign))
 
-        # Sample queue depth; report to memory_policy for CPU-pressure tracking.
-        _current_queue_depth = _msg_queue.qsize()
-        _queue_depth_samples.append(_current_queue_depth)
-        if config.MEMORY_POLICY_ENABLED:
-            memory_policy.report_queue_depth(_current_queue_depth)
+        # Sample queue depth (Beast mode only — queue unused in readsb/hybrid).
+        if config.INGEST_MODE == "beast":
+            _current_queue_depth = _msg_queue.qsize()
+            _queue_depth_samples.append(_current_queue_depth)
+            if config.MEMORY_POLICY_ENABLED:
+                memory_policy.report_queue_depth(_current_queue_depth)
 
         # Determine broadcast snapshot mode.
         # When no clients are connected use thin mode — the snapshot is still

@@ -26,6 +26,7 @@ except ImportError:
         return _json_lib.loads(data)
 
 import config
+from db import stats_db
 
 log = logging.getLogger(__name__)
 
@@ -152,6 +153,12 @@ async def readsb_stats_poller() -> None:
 
             _latest    = result
             _latest_ts = result["ts"]
+
+            # Persist SDR/CPR health into the most recently completed minute row.
+            # last1min data aligns with the previous 60-second boundary.
+            if stats_data:
+                minute_ts = (int(_latest_ts) // 60) * 60 - 60
+                await asyncio.to_thread(stats_db.write_readsb_stats, minute_ts, result)
 
         except asyncio.CancelledError:
             raise
