@@ -49,7 +49,7 @@ def get_mlat_fixes(icao: str) -> dict:
     if _state is None:
         raise HTTPException(503, "State not available")
 
-    icao = icao.lower()
+    icao = icao.upper()
     with _state._lock:
         ac = _state._aircraft.get(icao)
         if ac is None:

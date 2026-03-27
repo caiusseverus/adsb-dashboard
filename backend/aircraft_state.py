@@ -688,8 +688,8 @@ def _record_mlat_fix(ac: "Aircraft", source: str, lat: float, lon: float, now: f
     is_spike = False
 
     if prev_ts is not None and buf:
-        if now <= prev_ts:
-            # Non-monotonic timestamp
+        if now < prev_ts:
+            # Non-monotonic timestamp (strict: equal timestamps from same batch are not spikes)
             ac.mlat_spike_counts[source]["nonmonotonic"] = (
                 ac.mlat_spike_counts[source].get("nonmonotonic", 0) + 1
             )
@@ -1891,7 +1891,7 @@ class AircraftState:
                                             config.RECEIVER_LAT, config.RECEIVER_LON,
                                             lat, lon) > config.MAX_RANGE_NM):
                                     pass
-                                elif mlat and not ac.has_adsb:
+                                elif mlat:
                                     if (ac.has_adsb
                                             and ac.lat is not None
                                             and now - ac._last_mlat_force_ts > _MLAT_FORCE_INTERVAL_S
