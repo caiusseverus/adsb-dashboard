@@ -97,27 +97,24 @@ function residualColor(nm) {
   return '#f85149'                  // poor
 }
 
-const MAX_TRAIL = 300  // position history depth (~5 min at 1 Hz)
-const MAX_TRAIL_GAP_S = 20
-const MAX_TRAIL_IMPLIED_SPEED_KT = 900
-const MAX_SOURCE_SWITCH_JUMP_NM = 3
-
-
-function haversineNm(lat1, lon1, lat2, lon2) {
-  const R_NM = 3440.065
-  const dLat = (lat2 - lat1) * Math.PI / 180
-  const dLon = (lon2 - lon1) * Math.PI / 180
-  const a = Math.sin(dLat / 2) ** 2
-    + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2
-  return R_NM * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+// Build compact label text for permanent tooltip
+function makeLabelContent(ac) {
+  const id = ac.registration || ac.icao.toUpperCase()
+  const parts = [id]
+  if (ac.type_code) parts.push(ac.type_code)
+  if (ac.airspeed_kts != null) parts.push(`${ac.airspeed_kts}kt`)
+  if (ac.altitude != null) parts.push(`${ac.altitude.toLocaleString()}ft`)
+  return parts.join(' · ')
 }
+
 
 export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
   const mapRef            = useRef(null)
   const mountRef          = useRef(null)
   const markersRef        = useRef(new Map())   // icao → L.Marker
-  const trailsRef         = useRef(new Map())   // icao → { line: L.Polyline, color }
-  const posHistRef        = useRef(new Map())   // icao → [lat, lon][]
+  const hiresTrailsRef    = useRef(new Map())   // icao → { line: L.Polyline }
+  const hiresPollRef      = useRef(null)
+  const labelsRef         = useRef(new Map())   // icao → last label string (for dirty-check)
   const fittedRef         = useRef(false)
   const initCenteredRef   = useRef(false)  // true if map was init'd at receiver pos
   const receiverMarkerRef = useRef(null)
@@ -132,6 +129,8 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
   const [acCount,         setAcCount]         = useState(0)
   const [showResiduals,   setShowResiduals]   = useState(false)
   const [showMlatSources, setShowMlatSources] = useState(false)
+  const [showTrails,      setShowTrails]      = useState(false)
+  const [showLabels,      setShowLabels]      = useState(false)
 
   // ── Init Leaflet (once on mount) ────────────────────────────────────────
   useEffect(() => {
@@ -155,8 +154,8 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
       map.remove()
       mapRef.current = null
       markersRef.current.clear()
-      trailsRef.current.clear()
-      posHistRef.current.clear()
+      hiresTrailsRef.current.clear()
+      labelsRef.current.clear()
       fittedRef.current = false
       initCenteredRef.current = false
       residualLayerRef.current = []
@@ -164,6 +163,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
       mlatDotsRef.current.clear()
       mlatSeenRef.current.clear()
       clearInterval(mlatPollRef.current)
+      clearInterval(hiresPollRef.current)
     }
   }, [])
 
@@ -199,6 +199,72 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
         .catch(() => {})
     }
   }, [receiverPos])
+
+  // ── Hi-res trails: poll /api/tracks when enabled ──────────────────────
+  useEffect(() => {
+    const clearTrails = () => {
+      hiresTrailsRef.current.forEach(({ line }) => line.remove())
+      hiresTrailsRef.current.clear()
+    }
+
+    if (!showTrails) {
+      clearTrails()
+      clearInterval(hiresPollRef.current)
+      return
+    }
+
+    const drawTrails = (data) => {
+      const map = mapRef.current
+      if (!map) return
+
+      const incoming = new Set(Object.keys(data))
+
+      // Remove trails for aircraft no longer in track data
+      for (const [icao, entry] of hiresTrailsRef.current) {
+        if (!incoming.has(icao)) {
+          entry.line.remove()
+          hiresTrailsRef.current.delete(icao)
+        }
+      }
+
+      for (const [icao, points] of Object.entries(data)) {
+        const pts = points.filter(p => p.lat != null && p.lon != null).map(p => [p.lat, p.lon])
+        if (pts.length < 2) continue
+        // Color trail by the most recent point's altitude
+        const lastAlt = points[points.length - 1]?.altitude_ft
+        const color = altColor(lastAlt)
+        const existing = hiresTrailsRef.current.get(icao)
+        if (existing) {
+          existing.line.setLatLngs(pts)
+          // Re-color if altitude band changed
+          if (existing.color !== color) {
+            existing.line.setStyle({ color })
+            existing.color = color
+          }
+        } else {
+          const line = L.polyline(pts, {
+            color, weight: 1.5, opacity: 0.55, smoothFactor: 1,
+            lineCap: 'round', lineJoin: 'round',
+          }).addTo(map)
+          hiresTrailsRef.current.set(icao, { line, color })
+        }
+      }
+    }
+
+    const poll = () => {
+      fetch(`${API_BASE}/api/tracks`)
+        .then(r => r.ok ? r.json() : {})
+        .then(drawTrails)
+        .catch(() => {})
+    }
+
+    poll()
+    hiresPollRef.current = setInterval(poll, 5000)
+    return () => {
+      clearInterval(hiresPollRef.current)
+      clearTrails()
+    }
+  }, [showTrails])
 
   // ── MLAT source dots: poll bulk fixes endpoint, accumulate dots ───────────
   useEffect(() => {
@@ -347,7 +413,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
     return { colorFn, legendItems }
   }, [colorMode, snapshot?.aircraft])
 
-  // ── Update markers and trails on each snapshot tick ──────────────────
+  // ── Update markers and labels on each snapshot tick ───────────────────
   useEffect(() => {
     const map = mapRef.current
     if (!map) return
@@ -357,47 +423,18 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
     const aircraft    = showMlatSources ? allAircraft.filter(ac => ac.mlat) : allAircraft
     const icaoSet     = new Set(aircraft.map(ac => ac.icao))
 
-    // ── Update position histories ──────────────────────────────────────
-    const nowS = Date.now() / 1000
-    for (const ac of aircraft) {
-      if (!posHistRef.current.has(ac.icao)) posHistRef.current.set(ac.icao, [])
-      const hist = posHistRef.current.get(ac.icao)
-      const last = hist[hist.length - 1]
-      // Only push if position actually changed (avoids cluttering history when stationary)
-      if ((ac.pos_global || ac.mlat) && (!last || last.lat !== ac.lat || last.lon !== ac.lon)) {
-        if (last) {
-          const dt = nowS - last.ts
-          const distNm = haversineNm(last.lat, last.lon, ac.lat, ac.lon)
-          const impliedSpeedKt = dt > 0 ? (distNm / dt) * 3600 : Infinity
-          const sourceSwitched = !!ac.mlat !== !!last.mlat
-          const shouldBreak = dt > MAX_TRAIL_GAP_S
-            || impliedSpeedKt > MAX_TRAIL_IMPLIED_SPEED_KT
-            || (sourceSwitched && distNm > MAX_SOURCE_SWITCH_JUMP_NM)
-          if (shouldBreak) hist.length = 0
-        }
-        hist.push({ lat: ac.lat, lon: ac.lon, ts: nowS, mlat: !!ac.mlat })
-        if (hist.length > MAX_TRAIL) hist.shift()
-      }
-    }
-
-    // ── Remove stale markers, trails, and MLAT dots ───────────────────
+    // ── Remove stale markers, labels, and MLAT dots ───────────────────
     for (const [icao, marker] of markersRef.current) {
       if (!icaoSet.has(icao)) {
         marker.remove()
         markersRef.current.delete(icao)
+        labelsRef.current.delete(icao)
         // Clear accumulated MLAT dots when aircraft leaves sight
         if (mlatDotsRef.current.has(icao)) {
           mlatDotsRef.current.get(icao).forEach(dots => dots.forEach(d => d.remove()))
           mlatDotsRef.current.delete(icao)
           mlatSeenRef.current.delete(icao)
         }
-      }
-    }
-    for (const [icao, trail] of trailsRef.current) {
-      if (!icaoSet.has(icao)) {
-        trail.line.remove()
-        trailsRef.current.delete(icao)
-        posHistRef.current.delete(icao)
       }
     }
 
@@ -419,25 +456,37 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
       }
     }
 
-    // ── Draw trails ────────────────────────────────────────────────────
-    for (const ac of aircraft) {
-      const hist  = posHistRef.current.get(ac.icao) ?? []
-      const color = colorFn(ac)
-      const existing = trailsRef.current.get(ac.icao)
-
-      if (existing && existing.color === color) {
-        // Reuse existing polyline — update latlngs
-        const pts = hist.length >= 2 ? hist.map(p => [p.lat, p.lon]) : []
-        existing.line.setLatLngs(pts)
-      } else {
-        existing?.line.remove()
-        const pts = hist.length >= 2 ? hist.map(p => [p.lat, p.lon]) : []
-        const line = L.polyline(pts, {
-          color, weight: 1.5, opacity: 0.6, smoothFactor: 1,
-          lineCap: 'round', lineJoin: 'round',
-        }).addTo(map)
-        trailsRef.current.set(ac.icao, { line, color })
+    // ── Permanent aircraft labels ──────────────────────────────────────
+    if (showLabels) {
+      for (const ac of aircraft) {
+        const marker = markersRef.current.get(ac.icao)
+        if (!marker) continue
+        const content = makeLabelContent(ac)
+        const prev = labelsRef.current.get(ac.icao)
+        if (prev !== content) {
+          // Unbind hover tooltip and replace with permanent label
+          marker.unbindTooltip()
+          marker.bindTooltip(content, {
+            permanent: true,
+            direction: 'right',
+            offset: [8, 0],
+            className: 'ac-label',
+          })
+          labelsRef.current.set(ac.icao, content)
+        }
       }
+    } else if (labelsRef.current.size > 0) {
+      // Labels were just turned off — restore hover tooltips
+      for (const [icao] of labelsRef.current) {
+        const marker = markersRef.current.get(icao)
+        if (!marker) continue
+        const ac = aircraft.find(a => a.icao === icao)
+        if (!ac) continue
+        const label = [ac.callsign, ac.type_code, ac.operator].filter(Boolean).join(' · ') || ac.icao
+        marker.unbindTooltip()
+        marker.bindTooltip(label, { direction: 'top', offset: [0, -10] })
+      }
+      labelsRef.current.clear()
     }
 
     setAcCount(aircraft.length)
@@ -448,7 +497,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
       map.fitBounds(bounds.pad(0.1))
       fittedRef.current = true
     }
-  }, [snapshot?.aircraft, colorFn, onSelectIcao, showMlatSources])
+  }, [snapshot?.aircraft, colorFn, onSelectIcao, showMlatSources, showLabels])
 
   return (
     <div className={styles.page}>
@@ -462,6 +511,18 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
               onClick={() => setColorMode(m.value)}
             >{m.label}</button>
           ))}
+        </div>
+        <div className={styles.modeGroup}>
+          <button
+            className={showTrails ? styles.btnActive : styles.btn}
+            onClick={() => setShowTrails(v => !v)}
+            title="Show 30-minute hi-res track trails"
+          >Trails</button>
+          <button
+            className={showLabels ? styles.btnActive : styles.btn}
+            onClick={() => setShowLabels(v => !v)}
+            title="Show registration, type, speed and altitude labels"
+          >Labels</button>
         </div>
         <button
           className={showMlatSources ? styles.btnActive : styles.btn}
