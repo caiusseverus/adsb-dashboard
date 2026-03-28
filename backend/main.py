@@ -366,11 +366,13 @@ async def _db_writer() -> None:
             squawking_icaos.add(icao)
             if icao in _active_squawks and _active_squawks[icao]["squawk"] == sq:
                 entry = _active_squawks[icao]
+                entry["obs_count"] += 1
                 if entry["db_id"] is None:
-                    # Pending confirmation — write to DB only after 60s sustained squawk.
-                    # Accidental transponder scrolling through emergency codes typically
-                    # clears within seconds; genuine emergencies persist.
-                    if now_ts - entry["first_seen"] >= 60:
+                    # Pending confirmation — require ≥5 separate snapshot observations
+                    # AND ≥120s sustained squawk before writing to DB.
+                    # The dual gate catches both transient code scrolling (clears in
+                    # seconds) and noisy-receiver bursts (many obs but short-lived).
+                    if entry["obs_count"] >= 5 and now_ts - entry["first_seen"] >= 120:
                         db_id = await asyncio.to_thread(
                             stats_db.write_squawk_event,
                             icao, sq, ac.get("callsign"), ac.get("altitude"),
@@ -396,6 +398,7 @@ async def _db_writer() -> None:
                 _active_squawks[icao] = {
                     "squawk": sq, "db_id": None,
                     "first_seen": now_ts, "last_update": now_ts,
+                    "obs_count": 1,
                 }
         # Close out events for aircraft no longer squawking emergency
         for icao in list(_active_squawks.keys()):
