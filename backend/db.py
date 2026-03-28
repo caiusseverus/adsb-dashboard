@@ -1428,16 +1428,18 @@ class StatsDB:
                 SELECT (ts % 86400) / 3600 AS hour_of_day,
                        AVG(ac_total)       AS ac_avg,
                        AVG(msg_mean)       AS msg_avg,
-                       AVG(signal_avg)     AS sig_avg
+                       AVG(signal_avg)     AS sig_avg,
+                       AVG(ac_mlat)        AS mlat_avg
                 FROM minute_stats
                 WHERE ts >= ?
                 GROUP BY hour_of_day
                 ORDER BY hour_of_day
             """, (cutoff,)).fetchall()
         return [{"hour": r["hour_of_day"],
-                 "ac_avg":  round(r["ac_avg"] or 0, 1),
-                 "msg_avg": round(r["msg_avg"] or 0, 1),
-                 "sig_avg": round(r["sig_avg"] or 0, 1) if r["sig_avg"] else None}
+                 "ac_avg":   round(r["ac_avg"] or 0, 1),
+                 "msg_avg":  round(r["msg_avg"] or 0, 1),
+                 "sig_avg":  round(r["sig_avg"] or 0, 1) if r["sig_avg"] else None,
+                 "mlat_avg": round(r["mlat_avg"] or 0, 1)}
                 for r in rows]
 
     def get_aircraft(self, icao: str) -> dict | None:
@@ -2597,6 +2599,79 @@ class StatsDB:
             for r in rows
         ]
         return {"min_ts": min_ts, "minutes": minutes, "cells": cells, "max_alt_observed": max_alt_observed}
+
+    def query_range_heatmap(self, hours: int = 24) -> dict:
+        """Return range-time heatmap data from coverage_samples.
+
+        Each cell: [minute_index, range_nm_bucket, distinct_aircraft_count].
+        Range is bucketed to 1 nm. minute_index is relative to min_ts.
+        """
+        cutoff = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp())
+        min_ts = (cutoff // 60) * 60
+
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT
+                    (ts / 60) * 60            AS minute_ts,
+                    CAST(range_nm AS INTEGER) AS range_bucket,
+                    COUNT(DISTINCT icao)       AS cnt
+                FROM coverage_samples
+                WHERE ts >= ?
+                  AND range_nm IS NOT NULL
+                  AND range_nm >= 0
+                  AND range_nm <= 500
+                GROUP BY minute_ts, range_bucket
+                ORDER BY minute_ts
+            """, (min_ts,)).fetchall()
+
+        if not rows:
+            return {"min_ts": min_ts, "minutes": hours * 60, "cells": [], "max_range_observed": 0}
+
+        max_ts = int(rows[-1]["minute_ts"])
+        minutes = (max_ts - min_ts) // 60 + 1
+        max_range_observed = max(int(r["range_bucket"]) for r in rows)
+
+        cells = [
+            [(int(r["minute_ts"]) - min_ts) // 60, int(r["range_bucket"]), int(r["cnt"])]
+            for r in rows
+        ]
+        return {"min_ts": min_ts, "minutes": minutes, "cells": cells, "max_range_observed": max_range_observed}
+
+    def query_signal_heatmap(self, hours: int = 24) -> dict:
+        """Return signal-time heatmap data from coverage_samples.
+
+        Each cell: [minute_index, dbfs_bucket, distinct_aircraft_count].
+        dbfs_bucket = CAST(signal / 2 AS INTEGER): 0 = strongest (0 dBFS),
+        127 = weakest (~-127 dBFS). minute_index is relative to min_ts.
+        """
+        cutoff = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp())
+        min_ts = (cutoff // 60) * 60
+
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT
+                    (ts / 60) * 60              AS minute_ts,
+                    CAST(signal / 2 AS INTEGER) AS dbfs_bucket,
+                    COUNT(DISTINCT icao)         AS cnt
+                FROM coverage_samples
+                WHERE ts >= ?
+                  AND signal IS NOT NULL
+                GROUP BY minute_ts, dbfs_bucket
+                ORDER BY minute_ts
+            """, (min_ts,)).fetchall()
+
+        if not rows:
+            return {"min_ts": min_ts, "minutes": hours * 60, "cells": [], "max_dbfs_bucket": 0}
+
+        max_ts = int(rows[-1]["minute_ts"])
+        minutes = (max_ts - min_ts) // 60 + 1
+        max_dbfs_bucket = max(int(r["dbfs_bucket"]) for r in rows)
+
+        cells = [
+            [(int(r["minute_ts"]) - min_ts) // 60, int(r["dbfs_bucket"]), int(r["cnt"])]
+            for r in rows
+        ]
+        return {"min_ts": min_ts, "minutes": minutes, "cells": cells, "max_dbfs_bucket": max_dbfs_bucket}
 
     def backup(self, dest_dir: "Path") -> "Path":
         """Hot-backup the database to dest_dir/adsb_backup_YYYY-MM-DD.db.

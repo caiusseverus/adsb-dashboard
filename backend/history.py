@@ -205,6 +205,16 @@ async def alt_heatmap(hours: int = Query(24, ge=1, le=168)) -> dict:
     return await asyncio.to_thread(stats_db.query_alt_heatmap, hours)
 
 
+@router.get("/range_heatmap")
+async def range_heatmap(hours: int = Query(24, ge=1, le=168)) -> dict:
+    return await asyncio.to_thread(stats_db.query_range_heatmap, hours)
+
+
+@router.get("/signal_heatmap")
+async def signal_heatmap(hours: int = Query(24, ge=1, le=168)) -> dict:
+    return await asyncio.to_thread(stats_db.query_signal_heatmap, hours)
+
+
 @router.get("/notable")
 async def notable(
     limit: int = Query(100, ge=1, le=500),
