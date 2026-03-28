@@ -44,8 +44,9 @@ def record(samples: list[tuple]) -> None:
 
     Silently ignores samples where the same ICAO was recorded fewer than
     HIRES_INTERVAL_S seconds ago.  Prunes entries older than HIRES_MAX_AGE_S
-    from each affected deque.  Drops new samples when the global point cap
-    is reached (oldest retained data stays until it ages out naturally).
+    from each affected deque.  When the global point cap is reached the
+    globally oldest point is evicted to make room — the buffer behaves like
+    a ring buffer, always retaining the most recent data.
     """
     global _total_points, _cap_logged
 
@@ -80,16 +81,26 @@ def record(samples: list[tuple]) -> None:
                 dq.popleft()
                 _total_points -= 1
 
-            # Hard cap: drop only if still at limit after the global sweep above
+            # Hard cap: evict the globally oldest point to make room rather than
+            # dropping the incoming sample.  This keeps the buffer acting like a
+            # ring buffer — recent data is always retained.
             if _total_points >= HIRES_MAX_POINTS:
                 if not _cap_logged:
                     log.warning(
                         "hires_buffer: global cap of %d points reached — "
-                        "new samples dropped until old data ages out",
+                        "evicting oldest points to retain recent data",
                         HIRES_MAX_POINTS,
                     )
                     _cap_logged = True
-                continue
+                oldest_icao = min(
+                    (k for k, v in _tracks.items() if v),
+                    key=lambda k: _tracks[k][0][0],
+                    default=None,
+                )
+                if oldest_icao is None:
+                    continue  # nothing to evict; skip this sample
+                _tracks[oldest_icao].popleft()
+                _total_points -= 1
 
             _cap_logged = False  # reset warning once we're below the cap again
             dq.append((ts, bearing, range_nm, alt))
