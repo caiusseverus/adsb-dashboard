@@ -508,7 +508,7 @@ const DAY_OPTIONS      = [{ label: '24h', value: 1 }, { label: '7d', value: 7 },
 const MAX_POINT_OPTIONS = [50000, 100000, 200000, 500000]
 const DEFAULT_MAX_POINTS = 50000
 
-export default function CoveragePage({ aircraft = [] }) {
+export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
   const mountRef    = useRef(null)
   const sceneRef    = useRef(null)   // { scene, camera, renderer, controls, pointsObj, trailsObj, liveDotsObj }
   const dataRef     = useRef([])     // raw fetched points (unfiltered)
@@ -541,7 +541,7 @@ export default function CoveragePage({ aircraft = [] }) {
   const [selectedTypeCode,  setSelectedTypeCode]  = useState('')  // exact ICAO type code
   const [tcInput,           setTcInput]           = useState('')
   const allTypeCodesRef = useRef([])   // full type code list from options endpoint
-  const [selectedIcao,  setSelectedIcao]  = useState('')
+  const [selectedIcao,  setSelectedIcao]  = useState(initialIcao)
   const [icaoInput,     setIcaoInput]     = useState('')
 
   const [showCoastline, setShowCoastline] = useState(true)

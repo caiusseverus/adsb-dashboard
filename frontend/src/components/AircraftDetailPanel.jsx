@@ -132,7 +132,7 @@ function RouteDisplay({ visits, visitId }) {
   )
 }
 
-export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefreshed, initialVisitTs }) {
+export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefreshed, initialVisitTs, onOpenCoverage }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(false)
@@ -253,6 +253,11 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
               className={`${styles.watchBtn}${watched ? ' ' + styles.watching : ''}`}
               onClick={toggleWatch}
             >{watched ? '★ Watching' : '☆ Watch'}</button>
+            {onOpenCoverage && (
+              <button className={styles.iconBtn} onClick={() => onOpenCoverage(icao)} title="View on 3D coverage map">
+                3D
+              </button>
+            )}
             <button className={styles.iconBtn} onClick={refresh} disabled={refreshing} title="Re-apply enrichment">
               {refreshing ? '…' : '↻'}
             </button>

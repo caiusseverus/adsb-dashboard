@@ -33,11 +33,19 @@ export default function App() {
   const [tab, setTab] = useState('live')
   const [selectedIcao, setSelectedIcao] = useState(null)
   const [selectedVisitTs, setSelectedVisitTs] = useState(null)
+  const [coverageIcao, setCoverageIcao] = useState('')
   const [notableRefreshKey, setNotableRefreshKey] = useState(0)
   const [receiverPos, setReceiverPos] = useState(null)
   const [debugMode, setDebugMode] = useState(false)
   const wsRef = useRef(null)
   const retryRef = useRef(null)
+
+  function handleOpenCoverage(icao) {
+    setCoverageIcao(icao)
+    setTab('coverage')
+    setSelectedIcao(null)
+    setSelectedVisitTs(null)
+  }
 
   // Accept either a plain icao string or { icao, visitTs } from pages that
   // want to pre-select a specific visit in the detail panel.
@@ -187,7 +195,7 @@ export default function App() {
         {tab === 'history' && <HistoryPage snapshot={snapshot} />}
         {tab === 'sightings' && <SightingsPage onSelectIcao={handleSelectIcao} notableRefreshKey={notableRefreshKey} />}
         {tab === 'receiver' && <ReceiverPage snapshot={snapshot} />}
-        {tab === 'coverage' && <CoveragePage aircraft={snapshot?.aircraft ?? []} />}
+        {tab === 'coverage' && <CoveragePage aircraft={snapshot?.aircraft ?? []} initialIcao={coverageIcao} />}
         {tab === 'flow' && <FlowMapPage />}
         {tab === 'fleet' && <FleetPage onSelectIcao={handleSelectIcao} />}
         {tab === 'events' && <EventsPage onSelectIcao={handleSelectIcao} />}
@@ -204,6 +212,7 @@ export default function App() {
           snapshot={snapshot}
           onClose={() => { setSelectedIcao(null); setSelectedVisitTs(null) }}
           onRefreshed={() => setNotableRefreshKey(k => k + 1)}
+          onOpenCoverage={handleOpenCoverage}
         />
       )}
     </div>
