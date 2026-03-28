@@ -119,6 +119,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
   const trailsRef         = useRef(new Map())   // icao → { line: L.Polyline, color }
   const posHistRef        = useRef(new Map())   // icao → [lat, lon][]
   const fittedRef         = useRef(false)
+  const initCenteredRef   = useRef(false)  // true if map was init'd at receiver pos
   const receiverMarkerRef = useRef(null)
   const residualLayerRef  = useRef([])          // L.CircleMarker[] for residual overlay
   const residualTimerRef  = useRef(null)
@@ -139,6 +140,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
     // map opens centred correctly without a later re-zoom
     const initCenter = receiverPos ?? [51.5, -0.1]
     const initZoom   = receiverPos ? 9 : 8
+    if (receiverPos) initCenteredRef.current = true
     const map = L.map(mountRef.current, { center: initCenter, zoom: initZoom, zoomControl: true })
     // CartoDB Dark Matter — free, no API key, attribution required
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
@@ -156,6 +158,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
       trailsRef.current.clear()
       posHistRef.current.clear()
       fittedRef.current = false
+      initCenteredRef.current = false
       residualLayerRef.current = []
       clearInterval(residualTimerRef.current)
       mlatDotsRef.current.clear()
@@ -174,8 +177,13 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
         .bindTooltip('Receiver', { direction: 'top' })
         .addTo(map)
       fittedRef.current = true  // don't auto-fit to aircraft if receiver is known
-      // Only re-zoom if the map wasn't already initialised at receiver pos
-      if (!receiverPos) map.setView([lat, lon], 9)
+      // Re-center only if the map was initialised at the fallback coords (receiverPos
+      // was null at mount time). If it was already centred at init, leave the user's
+      // current viewport alone. initCenteredRef avoids a stale-closure read of the prop.
+      if (!initCenteredRef.current) {
+        map.setView([lat, lon], 9)
+        initCenteredRef.current = true
+      }
     }
 
     if (receiverPos) {

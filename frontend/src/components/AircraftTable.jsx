@@ -213,6 +213,11 @@ export default function AircraftTable({ aircraft, onSelectIcao, queueSize = 0 })
                 <td colSpan={15} className={styles.empty}>No aircraft tracked yet</td>
               </tr>
             )}
+            {aircraft.length > 0 && filtered.length === 0 && (
+              <tr>
+                <td colSpan={15} className={styles.empty}>No aircraft match this filter</td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
