@@ -192,7 +192,9 @@ HIRES_MAX_AGE_S: int = int(os.getenv("HIRES_MAX_AGE_S", "43200"))
 # Hard cap on total points across all ICAOs.  When hit, new samples are
 # dropped until old data ages out.  500 k points ≈ 100–200 MB Python RSS
 # depending on GC pressure; reduce if running on a constrained device.
-HIRES_MAX_POINTS: int = int(os.getenv("HIRES_MAX_POINTS", "500000"))
+# Set to 0 or leave unset to disable the cap and rely solely on age-based eviction.
+_hmp = os.getenv("HIRES_MAX_POINTS", "")
+HIRES_MAX_POINTS: int | None = int(_hmp) if _hmp.strip() and int(_hmp) > 0 else None
 
 # Per-client WebSocket send timeout.  Clients that can't accept a payload
 # within this window are disconnected — prevents one stalled browser from

@@ -10,7 +10,10 @@ Thread-safe: a single Lock guards all state.
 
 Memory controls (both configurable via .env):
   HIRES_MAX_AGE_S   — retention window (default 12 h)
-  HIRES_MAX_POINTS  — global hard cap on total stored points (default 500 k)
+  HIRES_MAX_POINTS  — global hard cap on total stored points (default: disabled).
+                      When set, the oldest point is evicted whenever the cap is
+                      reached so recent data is always retained.  Leave unset
+                      (or set to 0) to rely solely on age-based eviction.
 """
 
 import logging
@@ -59,7 +62,7 @@ def record(samples: list[tuple]) -> None:
         # (landed / out of range) is never pruned — they never appear in a new
         # samples batch so their per-deque pruning never runs — causing the cap
         # to stay permanently hit and new data to be silently dropped.
-        if _total_points >= HIRES_MAX_POINTS:
+        if HIRES_MAX_POINTS is not None and _total_points >= HIRES_MAX_POINTS:
             for dq in _tracks.values():
                 while dq and dq[0][0] < cutoff:
                     dq.popleft()
@@ -84,7 +87,7 @@ def record(samples: list[tuple]) -> None:
             # Hard cap: evict the globally oldest point to make room rather than
             # dropping the incoming sample.  This keeps the buffer acting like a
             # ring buffer — recent data is always retained.
-            if _total_points >= HIRES_MAX_POINTS:
+            if HIRES_MAX_POINTS is not None and _total_points >= HIRES_MAX_POINTS:
                 if not _cap_logged:
                     log.warning(
                         "hires_buffer: global cap of %d points reached — "
@@ -166,7 +169,7 @@ def stats() -> dict:
         return {
             "icao_count":   len(_tracks),
             "total_points": _total_points,
-            "max_points":   HIRES_MAX_POINTS,
+            "max_points":   HIRES_MAX_POINTS,  # None = disabled
             "max_age_s":    HIRES_MAX_AGE_S,
             "interval_s":   HIRES_INTERVAL_S,
         }
