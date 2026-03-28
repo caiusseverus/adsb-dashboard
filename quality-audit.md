@@ -24,6 +24,10 @@
 | B-M10 | `global _route_queue_drops` moved to function top in `_push_updates` | — | ✅ Fixed |
 | F-M1 | Dead expression `{filter === 'all' && ... && null}` removed | — | ✅ Fixed |
 | F-M7 | AltHeatmap fetch callback used stale `ceilFt` — fixed via `extendedRef` | — | ✅ Fixed |
+| F-M5 | `ALL_DAYS`/`DAY_LABELS` stale after midnight — moved into component with midnight timer | — | ✅ Fixed |
+| F-M4 | `new Date()` allocated per cell in CalendarHeatmap `buildWeeks` — hoisted before loop | — | ✅ Fixed |
+| F-M15 | PositionQualityPage off-palette colors `#22c55e`/`#38bdf8` → `#3fb950`/`#388bfd` | — | ✅ Fixed |
+| F-M12 | `milParam` local var in `TopOperators` shadowed outer function — renamed to `milFilter` | — | ✅ Fixed |
 
 ---
 
@@ -33,9 +37,9 @@
 |----------|---------|----------|---------------|-------|-------|
 | Critical | 0       | 0        | 0             | **0** | —     |
 | High     | 3       | 4        | 0             | **7** | 7     |
-| Medium   | 10      | 19       | 2             | **31**| 6     |
+| Medium   | 10      | 19       | 2             | **31**| 10    |
 | Low      | 10      | 8        | 1             | **19**| 0     |
-| **Total**| **23**  | **31**   | **3**         | **57**| **13** |
+| **Total**| **23**  | **31**   | **3**         | **57**| **17** |
 
 ---
 

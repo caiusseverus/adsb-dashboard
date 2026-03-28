@@ -133,8 +133,8 @@ export default function PositionQualityPage() {
                   <YAxis />
                   <Tooltip />
                   <Legend />
-                  <Line type="monotone" dataKey="internalAltitude" name="Internal" stroke="#22c55e" dot={false} />
-                  <Line type="monotone" dataKey="readsbAltitude" name="readsb" stroke="#38bdf8" dot={false} />
+                  <Line type="monotone" dataKey="internalAltitude" name="Internal" stroke="#3fb950" dot={false} />
+                  <Line type="monotone" dataKey="readsbAltitude" name="readsb" stroke="#388bfd" dot={false} />
                 </LineChart>
               </ResponsiveContainer>
             </div>

@@ -200,8 +200,8 @@ function TopTypes({ since }) {
 // ---------------------------------------------------------------------------
 function TopOperators({ since }) {
   const [filter, setFilter] = useState('all')
-  const milParam = filter === 'military' ? '&military=1' : filter === 'civil' ? '&military=0' : ''
-  const { data, loading } = useFetch(appendSince(`${API_BASE}/api/fleet/operators?limit=20${milParam}`, since))
+  const milFilter = filter === 'military' ? '&military=1' : filter === 'civil' ? '&military=0' : ''
+  const { data, loading } = useFetch(appendSince(`${API_BASE}/api/fleet/operators?limit=20${milFilter}`, since))
 
   const chartData = useMemo(() =>
     (data || []).map(d => ({
