@@ -434,175 +434,178 @@ async def _push_updates() -> None:
     global _watchlist_cache, _watchlist_cache_ts
     while True:
         await asyncio.sleep(config.PUSH_INTERVAL_S)
-        expired = state.expire_aircraft()
-
-        # Close visit records for aircraft that just timed out
-        if expired:
-            credible = [ac for ac in expired if _credible_aircraft(ac)]
-            if credible:
-                tuples = [
-                    (ac.icao, int(ac.first_seen), int(ac.last_seen),
-                     ac.callsign, ac.squawk, ac.max_altitude, ac.msg_count)
-                    for ac in credible
-                ]
-                visit_ids = await asyncio.to_thread(stats_db.write_visits, tuples)
-                for ac, vid in zip(credible, visit_ids):
-                    if ac.callsign:
-                        global _route_queue_drops
-                        if len(_route_queue) == _route_queue.maxlen:
-                            _route_queue_drops += 1
-                            log.warning("route enrichment queue full — drop #%d (visit %d %s)",
-                                        _route_queue_drops, vid, ac.callsign)
-                        _route_queue.append((vid, ac.callsign))
-
-        # Sample queue depth (Beast mode only — queue unused in readsb/hybrid).
-        if config.INGEST_MODE == "beast":
-            _current_queue_depth = _msg_queue.qsize()
-            _queue_depth_samples.append(_current_queue_depth)
-            if config.MEMORY_POLICY_ENABLED:
-                memory_policy.report_queue_depth(_current_queue_depth)
-
-        # Determine broadcast snapshot mode.
-        # When no clients are connected use thin mode — the snapshot is still
-        # needed for track recording and notifications, but we skip building the
-        # expensive full-field dict that would only be serialised and discarded.
-        if _clients:
-            if config.SNAPSHOT_MODE_OVERRIDE:
-                _snap_mode = config.SNAPSHOT_MODE_OVERRIDE
-            elif config.MEMORY_POLICY_ENABLED:
-                _snap_mode = memory_policy.get_policy()["snapshot_mode"]
-            else:
-                _snap_mode = "full"
-        else:
-            _snap_mode = "thin"
-        t_snap = time.perf_counter()
-        snapshot = state.get_snapshot(mode=_snap_mode)
-        snapshot_ms = (time.perf_counter() - t_snap) * 1000
-
-        # Record track points (rate-limited to 1/5s per aircraft inside TrackStore)
-        now = time.time()
-
-        # Refresh watchlist cache from DB every 30s
-        if now - _watchlist_cache_ts > 30:
-            rows = await asyncio.to_thread(stats_db.get_notify_watchlist)
-            _watchlist_cache = {r["icao"]: r["max_range_nm"] for r in rows}
-            _watchlist_cache_ts = now
-
-        # All live ICAOs — used to expire tracks for aircraft that have left the set.
-        # Kept separate from the recording condition so a temporary loss of position
-        # doesn't prematurely prune an existing trail.
-        active_icaos: set[str] = {ac["icao"] for ac in snapshot["aircraft"]}
-        # Build notification tasks and track positions in a single pass.
-        # Skip thread dispatch entirely when no notification channel is configured —
-        # avoids O(N × thread_overhead) per second even for no-op calls.
-        notify_tasks = []
-        _notify_enabled = notifications.any_channel()
-        # Check per-trigger prefs once per cycle (uses cached prefs, <1µs each).
-        # Avoids dispatching any threads for triggers the user has turned off.
-        _mil_on  = _notify_enabled and notifications.trigger_enabled("notify_military")
-        _int_on  = _notify_enabled and notifications.trigger_enabled("notify_interesting")
-        # Collect matching aircraft first; dispatch at most 3 threads per cycle
-        # regardless of how many aircraft match, replacing the previous O(N) dispatch.
-        _mil_batch: list[dict] = []
-        _int_batch: list[dict] = []
-        _wl_batch:  list[dict] = []
-        t_loop_start = time.perf_counter()
-        for ac in snapshot["aircraft"]:
-            icao = ac["icao"]
-            if _notify_enabled:
-                if icao in _watchlist_cache and not notifications.already_notified(f"watchlist:{icao}"):
-                    _wl_batch.append({
-                        "icao": icao, "callsign": ac.get("callsign"),
-                        "registration": ac.get("registration"), "operator": ac.get("operator"),
-                        "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
-                        "max_range_nm": _watchlist_cache[icao],
-                    })
-                if _mil_on and ac.get("military") and not notifications.already_notified(f"military:{icao}"):
-                    _mil_batch.append({
-                        "icao": icao, "callsign": ac.get("callsign"),
-                        "operator": ac.get("operator"), "country": ac.get("country"),
-                        "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
-                    })
-                if _int_on and ac.get("interesting") and not notifications.already_notified(f"interesting:{icao}"):
-                    _int_batch.append({
-                        "icao": icao, "callsign": ac.get("callsign"),
-                        "type_code": ac.get("type_code"), "operator": ac.get("operator"),
-                        "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
-                    })
-            # Only record once the position is confirmed reliable:
-            # - pos_global=True: a global CPR decode (even+odd pair) has succeeded,
-            #   guaranteeing the position is not from the potentially-wrong local
-            #   decode fallback that runs before the first pair is available.
-            # - mlat=True: position established by multilateration, also reliable.
-            if (ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
-                    and ac.get("lat") is not None
-                    and ac.get("pos_confident")):  # pos_confident = _pos_reliable() in snapshot
-                track_store.record(
-                    icao=ac["icao"],
-                    bearing_deg=ac["bearing_deg"],
-                    range_nm=ac["range_nm"],
-                    altitude_ft=ac.get("altitude"),
-                    lat=ac["lat"],
-                    lon=ac["lon"],
-                    military=bool(ac.get("military")),
-                    mlat=bool(ac.get("mlat")),
-                    interesting=bool(ac.get("interesting")),
-                    acas_ra_active=bool(ac.get("acas_ra_active")),
-                    mlat_source=ac.get("mlat_source"),
-                    now=now,
-                )
-        if _mil_batch:
-            notify_tasks.append(asyncio.to_thread(notifications.notify_military_batch, _mil_batch))
-        if _int_batch:
-            notify_tasks.append(asyncio.to_thread(notifications.notify_interesting_batch, _int_batch))
-        if _wl_batch:
-            notify_tasks.append(asyncio.to_thread(notifications.notify_watchlist_batch, _wl_batch))
-        # Prune tracks for aircraft that have left the live set
-        track_store.expire(active_icaos)
-        t_sync_end = time.perf_counter()
-
-        if notify_tasks:
-            await asyncio.gather(*notify_tasks)
-
-        # Cast check — non-blocking; dispatches I/O to thread internally
         try:
-            cast.check(snapshot["aircraft"])
+            expired = state.expire_aircraft()
+
+            # Close visit records for aircraft that just timed out
+            if expired:
+                credible = [ac for ac in expired if _credible_aircraft(ac)]
+                if credible:
+                    tuples = [
+                        (ac.icao, int(ac.first_seen), int(ac.last_seen),
+                         ac.callsign, ac.squawk, ac.max_altitude, ac.msg_count)
+                        for ac in credible
+                    ]
+                    visit_ids = await asyncio.to_thread(stats_db.write_visits, tuples)
+                    for ac, vid in zip(credible, visit_ids):
+                        if ac.callsign:
+                            global _route_queue_drops
+                            if len(_route_queue) == _route_queue.maxlen:
+                                _route_queue_drops += 1
+                                log.warning("route enrichment queue full — drop #%d (visit %d %s)",
+                                            _route_queue_drops, vid, ac.callsign)
+                            _route_queue.append((vid, ac.callsign))
+
+            # Sample queue depth (Beast mode only — queue unused in readsb/hybrid).
+            if config.INGEST_MODE == "beast":
+                _current_queue_depth = _msg_queue.qsize()
+                _queue_depth_samples.append(_current_queue_depth)
+                if config.MEMORY_POLICY_ENABLED:
+                    memory_policy.report_queue_depth(_current_queue_depth)
+
+            # Determine broadcast snapshot mode.
+            # When no clients are connected use thin mode — the snapshot is still
+            # needed for track recording and notifications, but we skip building the
+            # expensive full-field dict that would only be serialised and discarded.
+            if _clients:
+                if config.SNAPSHOT_MODE_OVERRIDE:
+                    _snap_mode = config.SNAPSHOT_MODE_OVERRIDE
+                elif config.MEMORY_POLICY_ENABLED:
+                    _snap_mode = memory_policy.get_policy()["snapshot_mode"]
+                else:
+                    _snap_mode = "full"
+            else:
+                _snap_mode = "thin"
+            t_snap = time.perf_counter()
+            snapshot = state.get_snapshot(mode=_snap_mode)
+            snapshot_ms = (time.perf_counter() - t_snap) * 1000
+
+            # Record track points (rate-limited to 1/5s per aircraft inside TrackStore)
+            now = time.time()
+
+            # Refresh watchlist cache from DB every 30s
+            if now - _watchlist_cache_ts > 30:
+                rows = await asyncio.to_thread(stats_db.get_notify_watchlist)
+                _watchlist_cache = {r["icao"]: r["max_range_nm"] for r in rows}
+                _watchlist_cache_ts = now
+
+            # All live ICAOs — used to expire tracks for aircraft that have left the set.
+            # Kept separate from the recording condition so a temporary loss of position
+            # doesn't prematurely prune an existing trail.
+            active_icaos: set[str] = {ac["icao"] for ac in snapshot["aircraft"]}
+            # Build notification tasks and track positions in a single pass.
+            # Skip thread dispatch entirely when no notification channel is configured —
+            # avoids O(N × thread_overhead) per second even for no-op calls.
+            notify_tasks = []
+            _notify_enabled = notifications.any_channel()
+            # Check per-trigger prefs once per cycle (uses cached prefs, <1µs each).
+            # Avoids dispatching any threads for triggers the user has turned off.
+            _mil_on  = _notify_enabled and notifications.trigger_enabled("notify_military")
+            _int_on  = _notify_enabled and notifications.trigger_enabled("notify_interesting")
+            # Collect matching aircraft first; dispatch at most 3 threads per cycle
+            # regardless of how many aircraft match, replacing the previous O(N) dispatch.
+            _mil_batch: list[dict] = []
+            _int_batch: list[dict] = []
+            _wl_batch:  list[dict] = []
+            t_loop_start = time.perf_counter()
+            for ac in snapshot["aircraft"]:
+                icao = ac["icao"]
+                if _notify_enabled:
+                    if icao in _watchlist_cache and not notifications.already_notified(f"watchlist:{icao}"):
+                        _wl_batch.append({
+                            "icao": icao, "callsign": ac.get("callsign"),
+                            "registration": ac.get("registration"), "operator": ac.get("operator"),
+                            "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
+                            "max_range_nm": _watchlist_cache[icao],
+                        })
+                    if _mil_on and ac.get("military") and not notifications.already_notified(f"military:{icao}"):
+                        _mil_batch.append({
+                            "icao": icao, "callsign": ac.get("callsign"),
+                            "operator": ac.get("operator"), "country": ac.get("country"),
+                            "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
+                        })
+                    if _int_on and ac.get("interesting") and not notifications.already_notified(f"interesting:{icao}"):
+                        _int_batch.append({
+                            "icao": icao, "callsign": ac.get("callsign"),
+                            "type_code": ac.get("type_code"), "operator": ac.get("operator"),
+                            "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
+                        })
+                # Only record once the position is confirmed reliable:
+                # - pos_global=True: a global CPR decode (even+odd pair) has succeeded,
+                #   guaranteeing the position is not from the potentially-wrong local
+                #   decode fallback that runs before the first pair is available.
+                # - mlat=True: position established by multilateration, also reliable.
+                if (ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
+                        and ac.get("lat") is not None
+                        and ac.get("pos_confident")):  # pos_confident = _pos_reliable() in snapshot
+                    track_store.record(
+                        icao=ac["icao"],
+                        bearing_deg=ac["bearing_deg"],
+                        range_nm=ac["range_nm"],
+                        altitude_ft=ac.get("altitude"),
+                        lat=ac["lat"],
+                        lon=ac["lon"],
+                        military=bool(ac.get("military")),
+                        mlat=bool(ac.get("mlat")),
+                        interesting=bool(ac.get("interesting")),
+                        acas_ra_active=bool(ac.get("acas_ra_active")),
+                        mlat_source=ac.get("mlat_source"),
+                        now=now,
+                    )
+            if _mil_batch:
+                notify_tasks.append(asyncio.to_thread(notifications.notify_military_batch, _mil_batch))
+            if _int_batch:
+                notify_tasks.append(asyncio.to_thread(notifications.notify_interesting_batch, _int_batch))
+            if _wl_batch:
+                notify_tasks.append(asyncio.to_thread(notifications.notify_watchlist_batch, _wl_batch))
+            # Prune tracks for aircraft that have left the live set
+            track_store.expire(active_icaos)
+            t_sync_end = time.perf_counter()
+
+            if notify_tasks:
+                await asyncio.gather(*notify_tasks)
+
+            # Cast check — non-blocking; dispatches I/O to thread internally
+            try:
+                cast.check(snapshot["aircraft"])
+            except Exception:
+                log.exception("cast: unhandled error in check()")
+
+            t_gather_end = time.perf_counter()
+
+            t_ser = time.perf_counter()
+            payload = _json_dumps(snapshot) if _clients else None
+            serialize_ms = (time.perf_counter() - t_ser) * 1000
+
+            # Enqueue to each client's send queue — non-blocking, O(1) per client.
+            # Clients that fall behind (QueueFull) get this frame dropped; they
+            # receive the next snapshot instead.  Actual WS sends happen in the
+            # per-client sender coroutine started by websocket_endpoint.
+            ws_frames_dropped = 0
+            if payload is not None:
+                for q in list(_clients.values()):
+                    try:
+                        q.put_nowait(payload)
+                    except asyncio.QueueFull:
+                        ws_frames_dropped += 1
+
+            t_done = time.perf_counter()
+            _push_timings_store.append({
+                "sync_ms":           round((t_sync_end - t_loop_start) * 1000, 2),
+                "snapshot_ms":       round(snapshot_ms, 2),
+                "gather_ms":         round((t_gather_end - t_sync_end) * 1000, 2),
+                "notify_tasks":      len(notify_tasks),
+                "broadcast_ms":      round((t_done - t_gather_end) * 1000, 2),
+                "serialize_ms":      round(serialize_ms, 2),
+                "total_ms":          round((t_done - t_loop_start) * 1000, 2),
+                "ac_count":          len(snapshot["aircraft"]),
+                "payload_bytes":     len(payload) if payload else 0,
+                "ws_client_count":   len(_clients),
+                "ws_clients_dropped": ws_frames_dropped,
+                "ws_send_max_ms":    0.0,
+            })
         except Exception:
-            log.exception("cast: unhandled error in check()")
-
-        t_gather_end = time.perf_counter()
-
-        t_ser = time.perf_counter()
-        payload = _json_dumps(snapshot) if _clients else None
-        serialize_ms = (time.perf_counter() - t_ser) * 1000
-
-        # Enqueue to each client's send queue — non-blocking, O(1) per client.
-        # Clients that fall behind (QueueFull) get this frame dropped; they
-        # receive the next snapshot instead.  Actual WS sends happen in the
-        # per-client sender coroutine started by websocket_endpoint.
-        ws_frames_dropped = 0
-        if payload is not None:
-            for q in list(_clients.values()):
-                try:
-                    q.put_nowait(payload)
-                except asyncio.QueueFull:
-                    ws_frames_dropped += 1
-
-        t_done = time.perf_counter()
-        _push_timings_store.append({
-            "sync_ms":           round((t_sync_end - t_loop_start) * 1000, 2),
-            "snapshot_ms":       round(snapshot_ms, 2),
-            "gather_ms":         round((t_gather_end - t_sync_end) * 1000, 2),
-            "notify_tasks":      len(notify_tasks),
-            "broadcast_ms":      round((t_done - t_gather_end) * 1000, 2),
-            "serialize_ms":      round(serialize_ms, 2),
-            "total_ms":          round((t_done - t_loop_start) * 1000, 2),
-            "ac_count":          len(snapshot["aircraft"]),
-            "payload_bytes":     len(payload) if payload else 0,
-            "ws_client_count":   len(_clients),
-            "ws_clients_dropped": ws_frames_dropped,
-            "ws_send_max_ms":    0.0,
-        })
+            log.exception("_push_updates: unhandled error in broadcast cycle — continuing")
 
 
 async def _hires_writer() -> None:
