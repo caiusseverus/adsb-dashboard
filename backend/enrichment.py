@@ -36,6 +36,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import threading
 import time
 import urllib.request
 from collections import OrderedDict
@@ -311,8 +312,11 @@ def _cache_age(filename: str) -> float:
 
 class EnrichmentDB:
     def __init__(self) -> None:
-        # ADSBExchange data lives in SQLite (enrichment.db); connection opened lazily
+        # ADSBExchange data lives in SQLite (enrichment.db); connection opened lazily.
+        # _adsbx_lock guards both the connection reference and all execute() calls because
+        # _adsbx_conn can be called from multiple asyncio.to_thread workers concurrently.
         self._adsbx_conn: sqlite3.Connection | None = None
+        self._adsbx_lock = threading.RLock()  # RLock because methods call each other
         # Per-ICAO LRU caches — bounded so they can't grow unboundedly
         self._adsbx_lru: OrderedDict[str, dict | None] = OrderedDict()
         self._tar1090_lru: OrderedDict[str, dict | None] = OrderedDict()
@@ -560,47 +564,50 @@ class EnrichmentDB:
 
     def _open_adsbx_db(self) -> None:
         """Open (or reuse) the SQLite connection for ADSBExchange data."""
-        if self._adsbx_conn is None:
-            path = str(config.DATA_DIR / _ADSBX_DB)
-            conn = sqlite3.connect(path, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA cache_size=-4096")  # 4 MB page cache
-            self._adsbx_conn = conn
+        with self._adsbx_lock:
+            if self._adsbx_conn is None:
+                path = str(config.DATA_DIR / _ADSBX_DB)
+                conn = sqlite3.connect(path, check_same_thread=False)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA cache_size=-4096")  # 4 MB page cache
+                self._adsbx_conn = conn
 
     def _create_adsbx_db(self) -> None:
         """Ensure the SQLite DB and adsbx table exist."""
-        self._open_adsbx_db()
-        assert self._adsbx_conn is not None
-        self._adsbx_conn.execute("""
-            CREATE TABLE IF NOT EXISTS adsbx (
-                icao         TEXT PRIMARY KEY,
-                reg          TEXT,
-                icaotype     TEXT,
-                ownop        TEXT,
-                year         TEXT,
-                mil          INTEGER,
-                manufacturer TEXT,
-                model        TEXT,
-                short_type   TEXT
-            )
-        """)
-        self._adsbx_conn.commit()
+        with self._adsbx_lock:
+            self._open_adsbx_db()
+            assert self._adsbx_conn is not None
+            self._adsbx_conn.execute("""
+                CREATE TABLE IF NOT EXISTS adsbx (
+                    icao         TEXT PRIMARY KEY,
+                    reg          TEXT,
+                    icaotype     TEXT,
+                    ownop        TEXT,
+                    year         TEXT,
+                    mil          INTEGER,
+                    manufacturer TEXT,
+                    model        TEXT,
+                    short_type   TEXT
+                )
+            """)
+            self._adsbx_conn.commit()
 
     def _adsbx_db_lookup(self, icao_upper: str) -> Optional[dict]:
         """Single-row SELECT from the adsbx table; returns dict or None."""
-        if self._adsbx_conn is None:
-            return None
-        try:
-            row = self._adsbx_conn.execute(
-                "SELECT reg, icaotype, ownop, year, mil, manufacturer, model, short_type "
-                "FROM adsbx WHERE icao = ?",
-                (icao_upper,),
-            ).fetchone()
-        except Exception as exc:
-            log.debug("adsbx DB lookup failed for %s: %s", icao_upper, exc)
-            return None
+        with self._adsbx_lock:
+            if self._adsbx_conn is None:
+                return None
+            try:
+                row = self._adsbx_conn.execute(
+                    "SELECT reg, icaotype, ownop, year, mil, manufacturer, model, short_type "
+                    "FROM adsbx WHERE icao = ?",
+                    (icao_upper,),
+                ).fetchone()
+            except Exception as exc:
+                log.debug("adsbx DB lookup failed for %s: %s", icao_upper, exc)
+                return None
         if row is None:
             return None
         return {
@@ -616,16 +623,17 @@ class EnrichmentDB:
 
     def _load_or_init_adsbx_db(self) -> None:
         """Connect to an existing DB or create and populate a fresh one."""
-        db_path = config.DATA_DIR / _ADSBX_DB
-        if db_path.exists():
-            self._open_adsbx_db()
-            try:
-                count = self._adsbx_conn.execute("SELECT COUNT(*) FROM adsbx").fetchone()[0]  # type: ignore[union-attr]
-                if count > 0:
-                    log.info("Enrichment: ADSBExchange DB ready (%d records)", count)
-                    return
-            except Exception:
-                pass  # table may not exist yet — fall through to create/import
+        with self._adsbx_lock:
+            db_path = config.DATA_DIR / _ADSBX_DB
+            if db_path.exists():
+                self._open_adsbx_db()
+                try:
+                    count = self._adsbx_conn.execute("SELECT COUNT(*) FROM adsbx").fetchone()[0]  # type: ignore[union-attr]
+                    if count > 0:
+                        log.info("Enrichment: ADSBExchange DB ready (%d records)", count)
+                        return
+                except Exception:
+                    pass  # table may not exist yet — fall through to create/import
         # DB absent or empty — create table then import data
         self._create_adsbx_db()
         if (config.DATA_DIR / _ADSBX_RAW).exists():
@@ -652,98 +660,100 @@ class EnrichmentDB:
     def _import_adsbx_ndjson(self, raw_gz: bytes) -> None:
         """Stream-parse ADSBExchange NDJSON gzip into SQLite in batches.
         Avoids building a full in-memory dict — only one batch is in RAM at a time."""
-        assert self._adsbx_conn is not None
-        BATCH = 10_000
-        count = 0
-        batch: list[tuple] = []
-        try:
+        with self._adsbx_lock:
+            assert self._adsbx_conn is not None
+            BATCH = 10_000
+            count = 0
+            batch: list[tuple] = []
+            try:
+                self._adsbx_conn.execute("DELETE FROM adsbx")
+                self._adsbx_conn.commit()
+                with gzip.open(io.BytesIO(raw_gz)) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        icao = (rec.get("icao") or "").upper()
+                        if len(icao) != 6:
+                            continue
+                        batch.append((
+                            icao,
+                            rec.get("reg") or "",
+                            rec.get("icaotype") or "",
+                            rec.get("ownop") or "",
+                            rec.get("year") or "",
+                            1 if rec.get("mil") else 0,
+                            rec.get("manufacturer") or "",
+                            rec.get("model") or "",
+                            rec.get("short_type") or "",
+                        ))
+                        if len(batch) >= BATCH:
+                            self._adsbx_conn.executemany(
+                                "INSERT OR REPLACE INTO adsbx VALUES (?,?,?,?,?,?,?,?,?)", batch
+                            )
+                            self._adsbx_conn.commit()
+                            count += len(batch)
+                            batch.clear()
+                if batch:
+                    self._adsbx_conn.executemany(
+                        "INSERT OR REPLACE INTO adsbx VALUES (?,?,?,?,?,?,?,?,?)", batch
+                    )
+                    self._adsbx_conn.commit()
+                    count += len(batch)
+            except Exception as exc:
+                log.error("Enrichment: ADSBExchange import failed: %s", exc)
+                return
+            self._adsbx_lru.clear()
+            log.info("Enrichment: imported %d ADSBExchange records into SQLite", count)
+
+    def _import_adsbx_legacy_cache(self) -> None:
+        """One-time migration: import old adsbx_cache.json.gz dict into SQLite.
+        After this runs, the cache file is no longer needed."""
+        with self._adsbx_lock:
+            assert self._adsbx_conn is not None
+            try:
+                raw = (config.DATA_DIR / _ADSBX_CACHE).read_bytes()
+                data: dict = json.loads(gzip.decompress(raw).decode("utf-8"))
+            except Exception as exc:
+                log.warning("Enrichment: legacy cache read failed (%s) — downloading fresh", exc)
+                self._download_and_reimport_adsbx()
+                return
+            BATCH = 10_000
+            count = 0
+            batch: list[tuple] = []
             self._adsbx_conn.execute("DELETE FROM adsbx")
             self._adsbx_conn.commit()
-            with gzip.open(io.BytesIO(raw_gz)) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    icao = (rec.get("icao") or "").upper()
-                    if len(icao) != 6:
-                        continue
-                    batch.append((
-                        icao,
-                        rec.get("reg") or "",
-                        rec.get("icaotype") or "",
-                        rec.get("ownop") or "",
-                        rec.get("year") or "",
-                        1 if rec.get("mil") else 0,
-                        rec.get("manufacturer") or "",
-                        rec.get("model") or "",
-                        rec.get("short_type") or "",
-                    ))
-                    if len(batch) >= BATCH:
-                        self._adsbx_conn.executemany(
-                            "INSERT OR REPLACE INTO adsbx VALUES (?,?,?,?,?,?,?,?,?)", batch
-                        )
-                        self._adsbx_conn.commit()
-                        count += len(batch)
-                        batch.clear()
+            for icao, rec in data.items():
+                batch.append((
+                    icao.upper(),
+                    rec.get("reg") or "",
+                    rec.get("icaotype") or "",
+                    rec.get("ownop") or "",
+                    rec.get("year") or "",
+                    1 if rec.get("mil") else 0,
+                    rec.get("manufacturer") or "",
+                    rec.get("model") or "",
+                    rec.get("short_type") or "",
+                ))
+                if len(batch) >= BATCH:
+                    self._adsbx_conn.executemany(
+                        "INSERT OR REPLACE INTO adsbx VALUES (?,?,?,?,?,?,?,?,?)", batch
+                    )
+                    self._adsbx_conn.commit()
+                    count += len(batch)
+                    batch.clear()
             if batch:
                 self._adsbx_conn.executemany(
                     "INSERT OR REPLACE INTO adsbx VALUES (?,?,?,?,?,?,?,?,?)", batch
                 )
                 self._adsbx_conn.commit()
                 count += len(batch)
-        except Exception as exc:
-            log.error("Enrichment: ADSBExchange import failed: %s", exc)
-            return
-        self._adsbx_lru.clear()
-        log.info("Enrichment: imported %d ADSBExchange records into SQLite", count)
-
-    def _import_adsbx_legacy_cache(self) -> None:
-        """One-time migration: import old adsbx_cache.json.gz dict into SQLite.
-        After this runs, the cache file is no longer needed."""
-        assert self._adsbx_conn is not None
-        try:
-            raw = (config.DATA_DIR / _ADSBX_CACHE).read_bytes()
-            data: dict = json.loads(gzip.decompress(raw).decode("utf-8"))
-        except Exception as exc:
-            log.warning("Enrichment: legacy cache read failed (%s) — downloading fresh", exc)
-            self._download_and_reimport_adsbx()
-            return
-        BATCH = 10_000
-        count = 0
-        batch: list[tuple] = []
-        self._adsbx_conn.execute("DELETE FROM adsbx")
-        self._adsbx_conn.commit()
-        for icao, rec in data.items():
-            batch.append((
-                icao.upper(),
-                rec.get("reg") or "",
-                rec.get("icaotype") or "",
-                rec.get("ownop") or "",
-                rec.get("year") or "",
-                1 if rec.get("mil") else 0,
-                rec.get("manufacturer") or "",
-                rec.get("model") or "",
-                rec.get("short_type") or "",
-            ))
-            if len(batch) >= BATCH:
-                self._adsbx_conn.executemany(
-                    "INSERT OR REPLACE INTO adsbx VALUES (?,?,?,?,?,?,?,?,?)", batch
-                )
-                self._adsbx_conn.commit()
-                count += len(batch)
-                batch.clear()
-        if batch:
-            self._adsbx_conn.executemany(
-                "INSERT OR REPLACE INTO adsbx VALUES (?,?,?,?,?,?,?,?,?)", batch
-            )
-            self._adsbx_conn.commit()
-            count += len(batch)
-        self._adsbx_lru.clear()
-        log.info("Enrichment: migrated %d records from legacy cache to SQLite", count)
+            self._adsbx_lru.clear()
+            log.info("Enrichment: migrated %d records from legacy cache to SQLite", count)
 
     # ------------------------------------------------------------------
     # tar1090-db auxiliary files (operators + type info)

@@ -1206,10 +1206,13 @@ export default function CoveragePage({ aircraft = [] }) {
     fetch(url)
       .then(r => r.ok ? r.json() : r.json().then(e => Promise.reject(e.detail)))
       .then(data => {
-        // Find the earliest dt across all tracks so the scrubber starts at first data
-        const minDt = data.tracks.length > 0
-          ? Math.min(...data.tracks.map(t => t.points[0]?.[0] ?? 0))
-          : 0
+        // Find the earliest dt across all tracks so the scrubber starts at first data.
+        // Avoid Math.min(...spread) — V8 has a ~65k argument limit that large timelapse
+        // datasets can exceed, throwing a RangeError.
+        const minDt = data.tracks.reduce((min, t) => {
+          const ts = t.points[0]?.[0] ?? 0
+          return ts < min ? ts : min
+        }, data.tracks.length > 0 ? (data.tracks[0].points[0]?.[0] ?? 0) : 0)
         // Compute top-10 operators and type codes from this timelapse window
         const tlOpCounts = {}, tlTcCounts = {}
         for (const t of data.tracks) {
