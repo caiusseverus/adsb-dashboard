@@ -1435,11 +1435,15 @@ export default function CoveragePage({ aircraft = [] }) {
       if (trail.length > MAX_TRAIL_PTS) trail.splice(0, trail.length - MAX_TRAIL_PTS)
     }
 
-    // Filter live trails to match the active operator/type/mlat filter.
+    // Filter live trails to match the active operator/type/mlat/military filter.
     let filteredTrails = trails
     if (mlatOnly) {
       filteredTrails = Object.fromEntries(Object.entries(trails).filter(([, pts]) =>
         pts.length > 0 && pts[pts.length - 1].mlat))
+    }
+    if (militaryOnly) {
+      filteredTrails = Object.fromEntries(Object.entries(filteredTrails).filter(([, pts]) =>
+        pts.length > 0 && pts[pts.length - 1].military))
     }
     if (selectedOperator) {
       filteredTrails = Object.fromEntries(Object.entries(trails).filter(([, pts]) =>
@@ -1489,7 +1493,7 @@ export default function CoveragePage({ aircraft = [] }) {
     if (mesh) { scene.add(mesh); ref.trailsObj = mesh; if (tlActiveRef.current) mesh.visible = false }
     const dots = buildLiveDots(filteredTrails, effectiveColorMode, liveOps, liveTcs)
     if (dots) { scene.add(dots); ref.liveDotsObj = dots; if (tlActiveRef.current) dots.visible = false }
-  }, [aircraft, showMode, colorMode, effectiveColorMode, selectedOperator, selectedTypeGroup, selectedTypeCode, sceneVersion])
+  }, [aircraft, showMode, colorMode, effectiveColorMode, militaryOnly, selectedOperator, selectedTypeGroup, selectedTypeCode, sceneVersion])
 
   const toggleCoastline = useCallback(() => {
     const v = !showCoastlineRef.current
