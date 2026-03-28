@@ -1364,6 +1364,44 @@ export default function CoveragePage({ aircraft = [] }) {
     if (dataRef.current.length) redraw(dataRef.current, effectiveColorMode, showMode)
   }, [colorMode, effectiveColorMode, showMode, sceneVersion, redraw])
 
+  // ── Backfill trailsRef from hires buffer on first load ──────────────
+  // Pre-populates trails so the live view shows history from server start,
+  // not just from when this browser tab was opened.
+  useEffect(() => {
+    if (showMode === 'history') return
+    const end   = Math.floor(Date.now() / 1000)
+    const start = end - 3600   // last hour
+    fetch(`/api/coverage/timelapse_hires?start_ts=${start}&end_ts=${end}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (!data?.tracks?.length) return
+        const trails = trailsRef.current
+        for (const track of data.tracks) {
+          if (!track.points?.length) continue
+          const pts = track.points.map(([dt, bearing, range, alt]) => ({
+            bearing,
+            range,
+            alt,
+            ts:          start + dt,
+            military:    track.military,
+            mlat:        track.mlat,
+            interesting: track.interesting,
+            acas:        false,
+            type_code:   track.type_code,
+            type_category: null,
+            operator:    track.operator,
+            lat:         null,
+            lon:         null,
+          }))
+          // Only backfill if no live data has arrived yet for this ICAO
+          if (!trails[track.icao]) {
+            trails[track.icao] = pts.slice(-MAX_TRAIL_PTS)
+          }
+        }
+      })
+      .catch(() => {})  // backfill is best-effort
+  }, [])  // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Accumulate live aircraft trails ─────────────────────────────────
   useEffect(() => {
     const ref = sceneRef.current
