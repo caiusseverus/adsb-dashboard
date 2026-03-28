@@ -132,7 +132,7 @@ function RouteDisplay({ visits, visitId }) {
   )
 }
 
-export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefreshed }) {
+export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefreshed, initialVisitTs }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(false)
@@ -225,6 +225,13 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
     ? [data.type_code, data.type_full_name].filter(Boolean).join(' · ')
     : data?.type_desc || ''
   const opStr = formatOperator(data?.operator) || ''
+
+  // Auto-select the visit that contains the given timestamp (e.g. from an events page link)
+  useEffect(() => {
+    if (!initialVisitTs || !visits.length || activeVisitId) return
+    const match = visits.find(v => v.start_ts <= initialVisitTs && initialVisitTs <= v.end_ts)
+    if (match) setActiveVisitId(match.id)
+  }, [visits, initialVisitTs]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleVisitRowClick = (visitId) => {
     setActiveVisitId(prev => prev === visitId ? null : visitId)

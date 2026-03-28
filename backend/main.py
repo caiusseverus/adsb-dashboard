@@ -367,11 +367,14 @@ async def _db_writer() -> None:
             if icao in _active_squawks and _active_squawks[icao]["squawk"] == sq:
                 entry = _active_squawks[icao]
                 if entry["db_id"] is None:
-                    # Pending confirmation — write to DB only after 10s sustained squawk
-                    if now_ts - entry["first_seen"] >= 10:
+                    # Pending confirmation — write to DB only after 60s sustained squawk.
+                    # Accidental transponder scrolling through emergency codes typically
+                    # clears within seconds; genuine emergencies persist.
+                    if now_ts - entry["first_seen"] >= 60:
                         db_id = await asyncio.to_thread(
                             stats_db.write_squawk_event,
-                            icao, sq, ac.get("callsign"), ac.get("altitude"), entry["first_seen"],
+                            icao, sq, ac.get("callsign"), ac.get("altitude"),
+                            entry["first_seen"], now_ts,   # ts=first_seen, ts_last=now
                         )
                         entry["db_id"] = db_id
                         entry["last_update"] = now_ts
@@ -397,7 +400,13 @@ async def _db_writer() -> None:
         # Close out events for aircraft no longer squawking emergency
         for icao in list(_active_squawks.keys()):
             if icao not in squawking_icaos:
-                del _active_squawks[icao]
+                entry = _active_squawks.pop(icao)
+                # Record final timestamp if the event was confirmed and written to DB
+                if entry["db_id"] is not None:
+                    await asyncio.to_thread(
+                        stats_db.update_squawk_event_last,
+                        entry["db_id"], now_ts, None,
+                    )
 
 
 async def _route_enricher() -> None:

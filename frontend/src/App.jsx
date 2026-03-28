@@ -32,11 +32,24 @@ export default function App() {
   const [connected, setConnected] = useState(false)
   const [tab, setTab] = useState('live')
   const [selectedIcao, setSelectedIcao] = useState(null)
+  const [selectedVisitTs, setSelectedVisitTs] = useState(null)
   const [notableRefreshKey, setNotableRefreshKey] = useState(0)
   const [receiverPos, setReceiverPos] = useState(null)
   const [debugMode, setDebugMode] = useState(false)
   const wsRef = useRef(null)
   const retryRef = useRef(null)
+
+  // Accept either a plain icao string or { icao, visitTs } from pages that
+  // want to pre-select a specific visit in the detail panel.
+  function handleSelectIcao(value) {
+    if (value && typeof value === 'object') {
+      setSelectedIcao(value.icao)
+      setSelectedVisitTs(value.visitTs ?? null)
+    } else {
+      setSelectedIcao(value)
+      setSelectedVisitTs(null)
+    }
+  }
 
   const connect = useCallback(() => {
     const ws = new WebSocket(WS_URL)
@@ -159,7 +172,7 @@ export default function App() {
                 <MlatScorecard aircraft={snapshot.aircraft} />
               )}
               <MessageRateChart data={snapshot.rate_history} />
-              <AircraftTable aircraft={snapshot.aircraft} onSelectIcao={setSelectedIcao} queueSize={snapshot.hexdb_queue_size ?? 0} />
+              <AircraftTable aircraft={snapshot.aircraft} onSelectIcao={handleSelectIcao} queueSize={snapshot.hexdb_queue_size ?? 0} />
             </>
           ) : (
             <div className={styles.waiting}>
@@ -170,15 +183,15 @@ export default function App() {
       )}
 
       <Suspense fallback={null}>
-        {tab === 'map' && <MapPage snapshot={snapshot} onSelectIcao={setSelectedIcao} selectedIcao={selectedIcao} receiverPos={receiverPos} />}
+        {tab === 'map' && <MapPage snapshot={snapshot} onSelectIcao={handleSelectIcao} selectedIcao={selectedIcao} receiverPos={receiverPos} />}
         {tab === 'history' && <HistoryPage snapshot={snapshot} />}
-        {tab === 'sightings' && <SightingsPage onSelectIcao={setSelectedIcao} notableRefreshKey={notableRefreshKey} />}
+        {tab === 'sightings' && <SightingsPage onSelectIcao={handleSelectIcao} notableRefreshKey={notableRefreshKey} />}
         {tab === 'receiver' && <ReceiverPage snapshot={snapshot} />}
         {tab === 'coverage' && <CoveragePage aircraft={snapshot?.aircraft ?? []} />}
         {tab === 'flow' && <FlowMapPage />}
-        {tab === 'fleet' && <FleetPage onSelectIcao={setSelectedIcao} />}
-        {tab === 'events' && <EventsPage onSelectIcao={setSelectedIcao} />}
-        {tab === 'sky' && <SkyView snapshot={snapshot} onSelectIcao={setSelectedIcao} />}
+        {tab === 'fleet' && <FleetPage onSelectIcao={handleSelectIcao} />}
+        {tab === 'events' && <EventsPage onSelectIcao={handleSelectIcao} />}
+        {tab === 'sky' && <SkyView snapshot={snapshot} onSelectIcao={handleSelectIcao} />}
         {tab === 'positionqa' && debugMode && <PositionQualityPage />}
         {tab === 'status' && <StatusPage />}
         {tab === 'settings' && <SettingsPage />}
@@ -187,8 +200,9 @@ export default function App() {
       {selectedIcao && (
         <AircraftDetailPanel
           icao={selectedIcao}
+          initialVisitTs={selectedVisitTs}
           snapshot={snapshot}
-          onClose={() => setSelectedIcao(null)}
+          onClose={() => { setSelectedIcao(null); setSelectedVisitTs(null) }}
           onRefreshed={() => setNotableRefreshKey(k => k + 1)}
         />
       )}

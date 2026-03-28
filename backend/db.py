@@ -928,13 +928,13 @@ class StatsDB:
             """, events)
 
     def write_squawk_event(self, icao: str, squawk: str, callsign: str | None,
-                            altitude: int | None, ts: int) -> int:
+                            altitude: int | None, ts: int, ts_last: int | None = None) -> int:
         """Insert a new squawk event; returns the new row id."""
         with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO squawk_events (ts, ts_last, icao, squawk, callsign, altitude) "
                 "VALUES (?,?,?,?,?,?)",
-                (ts, ts, icao, squawk, callsign, altitude),
+                (ts, ts_last if ts_last is not None else ts, icao, squawk, callsign, altitude),
             )
             return cur.lastrowid
 
