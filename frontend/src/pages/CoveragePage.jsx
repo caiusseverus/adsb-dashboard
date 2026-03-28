@@ -4,6 +4,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import styles from './CoveragePage.module.css'
 import { NAMED_PALETTE, TYPE_GROUPS, TYPE_GROUP_OTHER_COLOR, getTypeGroup } from '../utils/typeGroups'
 import { buildTerrainMesh } from '../utils/terrain'
+import { haversineNm } from '../utils/geo'
 
 // ── Mutable rendering parameters — updated before each redraw ────────────────
 // Module-level so all builder functions (buildPoints, buildTrails, etc.) share them
@@ -31,16 +32,6 @@ const MAX_SOURCE_SWITCH_JUMP_NM = 3
 function bearingDeltaDeg(a, b) {
   const d = Math.abs((a ?? 0) - (b ?? 0)) % 360
   return d > 180 ? 360 - d : d
-}
-
-function haversineNm(lat1, lon1, lat2, lon2) {
-  if ([lat1, lon1, lat2, lon2].some(v => v == null)) return null
-  const R_NM = 3440.065
-  const dLat = (lat2 - lat1) * Math.PI / 180
-  const dLon = (lon2 - lon1) * Math.PI / 180
-  const a = Math.sin(dLat / 2) ** 2
-    + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2
-  return R_NM * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
 }
 
 function isTrailSegmentValid(a, b) {

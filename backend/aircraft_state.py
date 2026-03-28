@@ -14,6 +14,7 @@ from enum import IntEnum
 from typing import NamedTuple, Optional
 
 import pyModeS as pms
+from utils_geo import haversine_nm as _haversine_nm, bearing_deg as _bearing_deg
 from pyModeS.decoder.bds import bds40 as _bds40, bds50 as _bds50, bds60 as _bds60
 
 # Native C decode library (Phase 2 acceleration).  Falls back to pyModeS if
@@ -46,7 +47,6 @@ decode_timings: deque[float] = deque(maxlen=2000)
 # Per-_push_updates invocation breakdown: {loop_ms, broadcast_ms, total_ms, ac_count}
 push_timings: deque[dict] = deque(maxlen=120)
 
-_R_NM = 3440.065  # Earth radius in nautical miles
 # Beast timestamp value used by mlat-client for all synthesized positions.
 # Bytes: FF 00 4D 4C 41 54  ("FF00" + "MLAT" in ASCII).
 # Aggregators recognise this as non-real so they don't ingest MLAT positions as ADS-B.
@@ -399,21 +399,6 @@ def _accept_altitude(ac: "Aircraft", alt: int, source: "MsgSource",
     # Layer 8: discard path — cumulative penalty
     _penalise_alt_reliable(ac, good_crc)
     return False
-
-def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """True bearing from (lat1,lon1) to (lat2,lon2) in degrees (0=N, 90=E)."""
-    dlon = math.radians(lon2 - lon1)
-    x = math.sin(dlon) * math.cos(math.radians(lat2))
-    y = (math.cos(math.radians(lat1)) * math.sin(math.radians(lat2))
-         - math.sin(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.cos(dlon))
-    return (math.degrees(math.atan2(x, y)) + 360) % 360
-
-def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat / 2) ** 2
-         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2)
-    return _R_NM * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def _update_range_bearing(ac: "Aircraft") -> None:

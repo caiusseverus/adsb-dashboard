@@ -8,12 +8,12 @@ GET /api/coverage/coastline           — coastlines + borders projected to bear
 
 import asyncio
 import json
-import math
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 from db import stats_db
 import config
+from utils_geo import haversine_nm as _haversine_nm, bearing_deg as _bearing_deg
 
 # ── Coastline helpers ────────────────────────────────────────────────────────
 
@@ -31,22 +31,6 @@ def _load_coastline() -> list:
             _coastline_cache = []
     return _coastline_cache
 
-
-def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 3440.065  # Earth radius in nautical miles
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlam = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(min(1.0, a)))
-
-
-def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dlam = math.radians(lon2 - lon1)
-    x = math.sin(dlam) * math.cos(phi2)
-    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlam)
-    return (math.degrees(math.atan2(x, y)) + 360) % 360
 
 
 def _project_coastline(range_nm: float) -> dict:
