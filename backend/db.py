@@ -2313,6 +2313,7 @@ class StatsDB:
         type_codes: list[str] | None = None,
         type_category_prefix: str | None = None,
         mlat: bool = False,
+        icao: str | None = None,
     ) -> dict:
         """Return downsampled coverage_samples joined with aircraft_registry flags.
 
@@ -2320,12 +2321,13 @@ class StatsDB:
         op_idx 0–9 = top-10 operators by point count; 10 = other/unknown.
         tg_idx 0–7 = TYPE_GROUPS index; 8 = other/unknown.
         tc_idx 0–9 = top-10 type codes by point count; 10 = other/unknown.
-        When military, operator, type_codes, type_category_prefix, or mlat is set, stride is skipped.
+        When military, operator, type_codes, type_category_prefix, mlat, or icao is set, stride is skipped.
         """
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
         flag_clause = " AND COALESCE(ar.military, 0) = 1" if military else ""
         op_clause   = " AND ar.operator = ?"           if operator  else ""
         mlat_clause = " AND cs.mlat = 1"               if mlat      else ""
+        icao_clause = " AND cs.icao = ?"               if icao      else ""
 
         # Type filter: exact code list (IN) or category prefix (LIKE)
         type_extra_params: list = []
@@ -2340,7 +2342,7 @@ class StatsDB:
             tc_clause = ""
 
         with self._connect() as conn:
-            if military or operator or type_codes or type_category_prefix or mlat:
+            if military or operator or type_codes or type_category_prefix or mlat or icao:
                 stride = 1
             else:
                 total = conn.execute(f"""
@@ -2354,6 +2356,8 @@ class StatsDB:
             if operator:
                 params.append(operator)
             params.extend(type_extra_params)
+            if icao:
+                params.append(icao.upper())
             params.append(stride)
             rows = conn.execute(f"""
                 SELECT cs.bearing_deg,
@@ -2369,7 +2373,7 @@ class StatsDB:
                 WHERE cs.ts >= ?
                   AND cs.altitude  IS NOT NULL
                   AND cs.range_nm  > 0
-                  AND cs.altitude  > 0{flag_clause}{op_clause}{tc_clause}{mlat_clause}
+                  AND cs.altitude  > 0{flag_clause}{op_clause}{tc_clause}{mlat_clause}{icao_clause}
                   AND (cs.rowid % ?) = 0
             """, params).fetchall()
 

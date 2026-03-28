@@ -541,6 +541,8 @@ export default function CoveragePage({ aircraft = [] }) {
   const [selectedTypeCode,  setSelectedTypeCode]  = useState('')  // exact ICAO type code
   const [tcInput,           setTcInput]           = useState('')
   const allTypeCodesRef = useRef([])   // full type code list from options endpoint
+  const [selectedIcao,  setSelectedIcao]  = useState('')
+  const [icaoInput,     setIcaoInput]     = useState('')
 
   const [showCoastline, setShowCoastline] = useState(true)
   const showCoastlineRef = useRef(true)  // avoids stale closure in fetch callback
@@ -1314,6 +1316,7 @@ export default function CoveragePage({ aircraft = [] }) {
     const milParam  = militaryOnly ? '&military=true' : ''
     const mlatParam = mlatOnly     ? '&mlat=true'     : ''
     const opParam   = selectedOperator ? `&operator=${encodeURIComponent(selectedOperator)}` : ''
+    const icaoParam = selectedIcao     ? `&icao=${encodeURIComponent(selectedIcao)}`         : ''
     let typeParam = ''
     if (selectedTypeCode) {
       typeParam = `&type_codes=${encodeURIComponent(selectedTypeCode)}`
@@ -1325,7 +1328,7 @@ export default function CoveragePage({ aircraft = [] }) {
           : `&type_codes=${encodeURIComponent(grp.types.join(','))}`
       }
     }
-    fetch(`/api/coverage/points?days=${days}&max_points=${maxPoints}${milParam}${mlatParam}${opParam}${typeParam}`)
+    fetch(`/api/coverage/points?days=${days}&max_points=${maxPoints}${milParam}${mlatParam}${opParam}${typeParam}${icaoParam}`)
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() })
       .then(({ points, operators: ops, type_codes: tcs, type_groups: tgs }) => {
         if (cancelled) return
@@ -1341,7 +1344,7 @@ export default function CoveragePage({ aircraft = [] }) {
 
     return () => { cancelled = true }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [days, maxPoints, militaryOnly, mlatOnly, selectedOperator, selectedTypeGroup, selectedTypeCode])
+  }, [days, maxPoints, militaryOnly, mlatOnly, selectedOperator, selectedTypeGroup, selectedTypeCode, selectedIcao])
 
   // ── After 'rendering' phase is painted, do the expensive buffer build ──
   useEffect(() => {
@@ -1473,8 +1476,12 @@ export default function CoveragePage({ aircraft = [] }) {
       if (trail.length > MAX_TRAIL_PTS) trail.splice(0, trail.length - MAX_TRAIL_PTS)
     }
 
-    // Filter live trails to match the active operator/type/mlat/military filter.
+    // Filter live trails to match active filters. ICAO is most specific — takes precedence.
     let filteredTrails = trails
+    if (selectedIcao) {
+      filteredTrails = Object.fromEntries(Object.entries(trails).filter(([icao]) =>
+        icao === selectedIcao))
+    } else {
     if (mlatOnly) {
       filteredTrails = Object.fromEntries(Object.entries(trails).filter(([, pts]) =>
         pts.length > 0 && pts[pts.length - 1].mlat))
@@ -1501,6 +1508,7 @@ export default function CoveragePage({ aircraft = [] }) {
         }))
       }
     }
+    }  // end else (non-ICAO filters)
 
     // Compute top-10 operators and type codes from visible live aircraft for colouring.
     const opCounts = {}, tcCounts = {}
@@ -1531,7 +1539,7 @@ export default function CoveragePage({ aircraft = [] }) {
     if (mesh) { scene.add(mesh); ref.trailsObj = mesh; if (tlActiveRef.current) mesh.visible = false }
     const dots = buildLiveDots(filteredTrails, effectiveColorMode, liveOps, liveTcs)
     if (dots) { scene.add(dots); ref.liveDotsObj = dots; if (tlActiveRef.current) dots.visible = false }
-  }, [aircraft, showMode, colorMode, effectiveColorMode, militaryOnly, selectedOperator, selectedTypeGroup, selectedTypeCode, sceneVersion])
+  }, [aircraft, showMode, colorMode, effectiveColorMode, militaryOnly, selectedIcao, selectedOperator, selectedTypeGroup, selectedTypeCode, sceneVersion])
 
   const toggleCoastline = useCallback(() => {
     const v = !showCoastlineRef.current
@@ -1699,6 +1707,25 @@ export default function CoveragePage({ aircraft = [] }) {
           onClick={() => setMilitaryOnly(v => !v)}>Military</button>
         <button className={mlatOnly ? styles.btnActive : styles.btn}
           onClick={() => setMlatOnly(v => !v)}>MLAT</button>
+
+        {/* Filter: single ICAO */}
+        {selectedIcao
+          ? <span className={styles.filterLabel}>{selectedIcao}</span>
+          : (
+            <input
+              className={styles.searchInput}
+              placeholder="ICAO…"
+              maxLength={6}
+              value={icaoInput}
+              onChange={e => setIcaoInput(e.target.value.toUpperCase())}
+              onBlur={e  => { const v = e.target.value.trim().toUpperCase(); if (v) { setSelectedIcao(v); setIcaoInput('') } }}
+              onKeyDown={e => { if (e.key === 'Enter') { const v = icaoInput.trim().toUpperCase(); if (v) { setSelectedIcao(v); setIcaoInput('') } } }}
+            />
+          )
+        }
+        {selectedIcao && (
+          <button className={styles.clearBtn} onClick={() => { setSelectedIcao(''); setIcaoInput('') }}>Clear</button>
+        )}
         <div className={styles.sep} />
 
         <button className={styles.resetBtn} onClick={resetCamera}>Reset view</button>
