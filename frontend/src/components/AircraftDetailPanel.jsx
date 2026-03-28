@@ -1,5 +1,6 @@
 import { Fragment, useState, useEffect, useCallback, useRef } from 'react'
 import L from 'leaflet'
+import 'leaflet/dist/leaflet.css'
 import styles from './AircraftDetailPanel.module.css'
 import { formatOperator } from '../utils/formatOperator'
 
@@ -60,63 +61,49 @@ function Field({ label, value, href }) {
 // Reconstruct lat/lon track from visit on a Leaflet mini-map
 function MiniMap({ icao, visitId }) {
   const containerRef = useRef(null)
-  const mapRef       = useRef(null)
-  const readyRef     = useRef(false)  // true once map has non-zero dimensions
+  const mapRef = useRef(null)
 
-  // Draw (or redraw) the track polyline on the already-initialised map
-  const drawTrack = (icao, visitId) => {
+  useEffect(() => {
+    if (!containerRef.current) return
+
+    // Init map once
+    if (!mapRef.current) {
+      mapRef.current = L.map(containerRef.current, {
+        zoomControl: true,
+        attributionControl: false,
+        scrollWheelZoom: false,
+      })
+      L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        maxZoom: 18,
+      }).addTo(mapRef.current)
+      // The container is inside a conditionally-rendered table row; Leaflet measures
+      // it before layout is fully settled. invalidateSize() forces a re-measure.
+      mapRef.current.invalidateSize()
+    }
+
     const map = mapRef.current
-    if (!map) return
+    // Clear previous layers
     map.eachLayer(l => { if (l instanceof L.Polyline || l instanceof L.CircleMarker) map.removeLayer(l) })
+
     fetch(`${API_BASE}/api/aircraft/${icao}/visits/${visitId}/track`)
       .then(r => r.ok ? r.json() : [])
       .then(pts => {
-        if (!pts.length || !mapRef.current) return
+        if (!pts.length) return
         const latlngs = pts.map(p => [p.lat, p.lon])
         L.polyline(latlngs, { color: '#388bfd', weight: 2, opacity: 0.8 }).addTo(map)
+        // Start/end markers
         L.circleMarker(latlngs[0], { radius: 5, color: '#3fb950', fillColor: '#3fb950', fillOpacity: 1, weight: 0 }).addTo(map)
         L.circleMarker(latlngs[latlngs.length - 1], { radius: 5, color: '#f85149', fillColor: '#f85149', fillOpacity: 1, weight: 0 }).addTo(map)
+        // Re-measure again before fitting bounds in case the table row expansion
+        // changed layout after the initial invalidateSize call above.
+        map.invalidateSize()
         map.fitBounds(L.polyline(latlngs).getBounds(), { padding: [16, 16] })
       })
       .catch(() => {})
-  }
 
-  useEffect(() => {
-    const container = containerRef.current
-    if (!container) return
-
-    // Init map lazily once the container has real pixel dimensions.
-    // The container lives inside a conditionally-rendered table row; Leaflet
-    // measures 0×0 if we call L.map() before the browser has painted it.
-    // ResizeObserver fires as soon as the element is given non-zero size.
-    const ro = new ResizeObserver(entries => {
-      const { width, height } = entries[0].contentRect
-      if (width === 0 || height === 0) return
-
-      if (!mapRef.current) {
-        mapRef.current = L.map(container, {
-          zoomControl: true,
-          attributionControl: false,
-          scrollWheelZoom: false,
-        })
-        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-          maxZoom: 18,
-        }).addTo(mapRef.current)
-      }
-
-      if (!readyRef.current) {
-        readyRef.current = true
-        mapRef.current.invalidateSize()
-        drawTrack(icao, visitId)
-      }
-    })
-    ro.observe(container)
-    return () => ro.disconnect()
-  }, [])  // run once on mount
-
-  // Redraw when visitId changes (map already initialised)
-  useEffect(() => {
-    if (readyRef.current) drawTrack(icao, visitId)
+    return () => {
+      // Keep map instance alive across visitId changes — don't destroy
+    }
   }, [icao, visitId])
 
   // Destroy on unmount
@@ -125,7 +112,6 @@ function MiniMap({ icao, visitId }) {
       if (mapRef.current) {
         mapRef.current.remove()
         mapRef.current = null
-        readyRef.current = false
       }
     }
   }, [])
