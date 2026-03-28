@@ -492,7 +492,7 @@ function CastSection() {
   const [cfgSaving, setCfgSaving] = useState(false)
   const [cfgMsg,    setCfgMsg]    = useState(null)
   const [rules,     setRules]     = useState([])
-  const [newRule,   setNewRule]   = useState({ match_type: 'military', match_value: '', max_range_nm: '' })
+  const [newRule,   setNewRule]   = useState({ match_type: 'military', match_value: '', max_range_nm: '', max_altitude_ft: '' })
   const [addingRule, setAddingRule] = useState(false)
   const [rulesErr,  setRulesErr]  = useState(null)
 
@@ -555,16 +555,17 @@ function CastSection() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          match_type:   newRule.match_type,
-          match_value:  newRule.match_type === 'icao' ? newRule.match_value.trim().toUpperCase() : null,
-          max_range_nm: newRule.max_range_nm ? parseFloat(newRule.max_range_nm) : null,
+          match_type:      newRule.match_type,
+          match_value:     newRule.match_type === 'icao' ? newRule.match_value.trim().toUpperCase() : null,
+          max_range_nm:    newRule.max_range_nm    ? parseFloat(newRule.max_range_nm)    : null,
+          max_altitude_ft: newRule.max_altitude_ft ? parseInt(newRule.max_altitude_ft)   : null,
         }),
       })
       if (!r.ok) {
         const d = await r.json().catch(() => ({}))
         setRulesErr(d.detail || `Error ${r.status}`)
       } else {
-        setNewRule({ match_type: 'military', match_value: '', max_range_nm: '' })
+        setNewRule({ match_type: 'military', match_value: '', max_range_nm: '', max_altitude_ft: '' })
         loadRules()
       }
     } catch (e) {
@@ -711,6 +712,12 @@ function CastSection() {
           onChange={e => setNewRule(r => ({ ...r, max_range_nm: e.target.value }))}
         />
         <span className={styles.rangeUnit}>nm</span>
+        <input type="number" className={styles.rangeInput}
+          placeholder="max alt (ft)" min={0} step={500}
+          value={newRule.max_altitude_ft}
+          onChange={e => setNewRule(r => ({ ...r, max_altitude_ft: e.target.value }))}
+        />
+        <span className={styles.rangeUnit}>ft</span>
         <button className={styles.addBtn} onClick={addRule} disabled={addingRule}>
           {addingRule ? 'Adding…' : 'Add rule'}
         </button>
@@ -726,6 +733,7 @@ function CastSection() {
               <th>Match</th>
               <th>Value</th>
               <th className={styles.num}>Max range</th>
+              <th className={styles.num}>Max alt</th>
               <th>On</th>
               <th></th>
             </tr>
@@ -736,6 +744,7 @@ function CastSection() {
                 <td>{MATCH_TYPE_LABELS[rule.match_type] ?? rule.match_type}</td>
                 <td className={styles.icao}>{rule.match_value || '—'}</td>
                 <td className={styles.num}>{rule.max_range_nm != null ? `${rule.max_range_nm} nm` : 'any'}</td>
+                <td className={styles.num}>{rule.max_altitude_ft != null ? `${rule.max_altitude_ft.toLocaleString()} ft` : 'any'}</td>
                 <td>
                   <label className={styles.toggle}>
                     <input type="checkbox" checked={!!rule.enabled} onChange={() => toggleRule(rule)} />

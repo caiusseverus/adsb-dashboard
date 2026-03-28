@@ -428,11 +428,12 @@ class StatsDB:
                     value TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS cast_rules (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    match_type   TEXT    NOT NULL,
-                    match_value  TEXT,
-                    max_range_nm REAL,
-                    enabled      INTEGER NOT NULL DEFAULT 1
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    match_type       TEXT    NOT NULL,
+                    match_value      TEXT,
+                    max_range_nm     REAL,
+                    max_altitude_ft  INTEGER,
+                    enabled          INTEGER NOT NULL DEFAULT 1
                 );
             """)
 
@@ -459,13 +460,21 @@ class StatsDB:
                     value TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS cast_rules (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    match_type   TEXT    NOT NULL,
-                    match_value  TEXT,
-                    max_range_nm REAL,
-                    enabled      INTEGER NOT NULL DEFAULT 1
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    match_type       TEXT    NOT NULL,
+                    match_value      TEXT,
+                    max_range_nm     REAL,
+                    max_altitude_ft  INTEGER,
+                    enabled          INTEGER NOT NULL DEFAULT 1
                 );
             """)
+
+        # Migrate: add max_altitude_ft to cast_rules if missing
+        with self._connect() as conn:
+            try:
+                conn.execute("ALTER TABLE cast_rules ADD COLUMN max_altitude_ft INTEGER")
+            except Exception:
+                pass  # column already exists
 
         log.info("DB: schema ready at %s", config.DB_PATH)
 
@@ -2848,29 +2857,30 @@ class StatsDB:
     def get_cast_rules(self) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, match_type, match_value, max_range_nm, enabled "
+                "SELECT id, match_type, match_value, max_range_nm, max_altitude_ft, enabled "
                 "FROM cast_rules ORDER BY id"
             ).fetchall()
         return [dict(r) for r in rows]
 
     def add_cast_rule(self, match_type: str, match_value: str | None,
-                      max_range_nm: float | None) -> int:
+                      max_range_nm: float | None,
+                      max_altitude_ft: int | None) -> int:
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO cast_rules (match_type, match_value, max_range_nm) "
-                "VALUES (?,?,?)",
-                (match_type, match_value, max_range_nm),
+                "INSERT INTO cast_rules (match_type, match_value, max_range_nm, max_altitude_ft) "
+                "VALUES (?,?,?,?)",
+                (match_type, match_value, max_range_nm, max_altitude_ft),
             )
         return cur.lastrowid
 
     def update_cast_rule(self, rule_id: int, match_type: str,
                          match_value: str | None, max_range_nm: float | None,
-                         enabled: bool) -> None:
+                         max_altitude_ft: int | None, enabled: bool) -> None:
         with self._connect() as conn:
             conn.execute(
                 "UPDATE cast_rules SET match_type=?, match_value=?, "
-                "max_range_nm=?, enabled=? WHERE id=?",
-                (match_type, match_value, max_range_nm, int(enabled), rule_id),
+                "max_range_nm=?, max_altitude_ft=?, enabled=? WHERE id=?",
+                (match_type, match_value, max_range_nm, max_altitude_ft, int(enabled), rule_id),
             )
 
     def delete_cast_rule(self, rule_id: int) -> None:

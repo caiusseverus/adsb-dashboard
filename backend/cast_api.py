@@ -35,10 +35,11 @@ class CastConfigPayload(BaseModel):
 
 
 class CastRulePayload(BaseModel):
-    match_type:  str
-    match_value: Optional[str] = None
-    max_range_nm: Optional[float] = None
-    enabled:     bool = True
+    match_type:      str
+    match_value:     Optional[str]   = None
+    max_range_nm:    Optional[float] = None
+    max_altitude_ft: Optional[int]   = None
+    enabled:         bool            = True
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +102,7 @@ async def add_cast_rule(payload: CastRulePayload):
         payload.match_type,
         _normalise_value(payload.match_type, payload.match_value),
         payload.max_range_nm,
+        payload.max_altitude_ft,
     )
     return {"id": rule_id}
 
@@ -114,6 +116,7 @@ async def update_cast_rule(rule_id: int, payload: CastRulePayload):
         payload.match_type,
         _normalise_value(payload.match_type, payload.match_value),
         payload.max_range_nm,
+        payload.max_altitude_ft,
         payload.enabled,
     )
     return {"ok": True}
@@ -168,6 +171,8 @@ def _validate_rule(payload: CastRulePayload) -> None:
         raise HTTPException(status_code=422, detail="match_value required for match_type 'icao'")
     if payload.max_range_nm is not None and payload.max_range_nm <= 0:
         raise HTTPException(status_code=422, detail="max_range_nm must be positive")
+    if payload.max_altitude_ft is not None and payload.max_altitude_ft <= 0:
+        raise HTTPException(status_code=422, detail="max_altitude_ft must be positive")
 
 
 def _normalise_value(match_type: str, value: Optional[str]) -> Optional[str]:

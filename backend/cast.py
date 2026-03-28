@@ -59,6 +59,14 @@ def _expire_tokens() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Live snapshot — updated every broadcast cycle so the display worker can
+# check whether a triggered aircraft is still visible.
+# Assignment is GIL-atomic; we copy the list to avoid mid-iteration replacement.
+# ---------------------------------------------------------------------------
+_current_snapshot: list[dict] = []
+
+
+# ---------------------------------------------------------------------------
 # Cooldown — prevent re-notifying the same ICAO within the configured window
 # ---------------------------------------------------------------------------
 _cooldown: dict[str, float] = {}  # icao → last_cast_ts
@@ -124,8 +132,9 @@ def _cast_worker(lan_url: str, device_name: str, display_seconds: int) -> None:
             return
 
         token = _store_token(aircraft)
+        icao  = aircraft.get("icao", "").upper()
         try:
-            _cast(lan_url, device_name, display_seconds, token)
+            _cast(lan_url, device_name, display_seconds, token, icao)
         except Exception:
             log.exception("cast: unhandled error in _cast()")
 
@@ -231,6 +240,12 @@ def _rule_matches(rule: dict, ac: dict) -> bool:
     if max_nm is not None:
         ac_range = ac.get("range_nm")
         if ac_range is None or ac_range > max_nm:
+            return False
+
+    max_alt = rule.get("max_altitude_ft")
+    if max_alt is not None:
+        ac_alt = ac.get("altitude")
+        if ac_alt is None or ac_alt > max_alt:
             return False
 
     return True
@@ -497,7 +512,12 @@ def render_display_image(aircraft: dict) -> bytes:
 # Cast dispatch
 # ---------------------------------------------------------------------------
 
-def _cast(lan_url: str, device_name: str, display_seconds: int, token: str) -> None:
+_DISPLAY_POLL_S = 5    # check interval while displaying
+_DISPLAY_MAX_S  = 900  # hard cap (15 min) so a forgotten cast doesn't run forever
+
+
+def _cast(lan_url: str, device_name: str, display_seconds: int,
+          token: str, icao: str) -> None:
     """Send Cast command to the named Chromecast device (blocking, runs in worker thread)."""
     try:
         import pychromecast
@@ -525,11 +545,30 @@ def _cast(lan_url: str, device_name: str, display_seconds: int, token: str) -> N
     log.info("cast: sending to %r — %s", device_name, display_url)
     mc.play_media(display_url, "image/jpeg", stream_type="NONE")
     mc.block_until_active(timeout=15)
-    log.info("cast: displaying on %r for %d s", device_name, display_seconds)
+    log.info("cast: displaying %s on %r (min %ds, cap %ds)",
+             icao, device_name, display_seconds, _DISPLAY_MAX_S)
 
-    time.sleep(display_seconds)
+    # Stay on screen while the aircraft is still visible.
+    # Yield early only when another aircraft is pending AND the minimum
+    # display time has elapsed — so multiple triggers cycle fairly.
+    elapsed = 0
+    while elapsed < _DISPLAY_MAX_S:
+        time.sleep(_DISPLAY_POLL_S)
+        elapsed += _DISPLAY_POLL_S
+
+        with _cast_lock:
+            has_pending = _cast_pending is not None
+        if has_pending and elapsed >= display_seconds:
+            log.info("cast: %s — pending aircraft waiting, yielding after %ds", icao, elapsed)
+            break
+
+        snapshot = _current_snapshot  # atomic read of current reference
+        if not any(ac.get("icao", "").upper() == icao for ac in snapshot):
+            log.info("cast: %s left snapshot after %ds — ending display", icao, elapsed)
+            break
+
     cc.quit_app()
-    log.info("cast: display complete")
+    log.info("cast: display ended for %s after %ds", icao, elapsed)
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +581,9 @@ def check(aircraft_list: list[dict]) -> None:
     Called from the broadcast loop — returns immediately; all blocking work
     is handled by the worker thread via _enqueue().
     """
+    global _current_snapshot
+    _current_snapshot = list(aircraft_list)  # copy so worker sees a stable list
+
     cfg = _get_config()
 
     device_name = cfg.get("device_name", "").strip()
