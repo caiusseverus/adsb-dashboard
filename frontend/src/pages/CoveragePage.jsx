@@ -1788,7 +1788,7 @@ export default function CoveragePage({ aircraft = [] }) {
       </div>
 
       <div className={styles.legend}>
-        {isTgMode && !(selectedTypeGroup || selectedTypeCode) ? (
+        {isTgMode && !(selectedTypeGroup || selectedTypeCode) && !(militaryOnly || mlatOnly) ? (
           <>
             {TYPE_GROUPS.map((g) => (
               <span key={g.value} className={styles.legendItem}>
@@ -1796,6 +1796,18 @@ export default function CoveragePage({ aircraft = [] }) {
               </span>
             ))}
             <span className={styles.legendItem}><span className={styles.dot} style={{ background: TYPE_GROUP_OTHER_COLOR }} />Other</span>
+          </>
+        ) : isTgMode && (militaryOnly || mlatOnly) && !(selectedTypeGroup || selectedTypeCode) ? (
+          // Military/MLAT filter active — legend shows type codes (effectiveColorMode = 'type_code')
+          <>
+            {typeCodes.map((tc, i) => (
+              <span key={tc} className={styles.legendItem}>
+                <span className={styles.dot} style={{ background: NAMED_PALETTE[i] }} />{tc}
+              </span>
+            ))}
+            {typeCodes.length > 0 && (
+              <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#484f58' }} />Other</span>
+            )}
           </>
         ) : isTgMode && (selectedTypeGroup || selectedTypeCode) ? (
           // Type filter active — legend shows operators (effectiveColorMode = 'operator')
