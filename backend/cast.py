@@ -349,14 +349,15 @@ def render_display_image(aircraft: dict) -> bytes:
                 pass
         return ImageFont.load_default()
 
-    f_reg   = _bold(52)
-    f_type  = _regular(28)
-    f_op    = _bold(26)
-    f_call  = _bold(52)
-    f_route = _bold(24)
-    f_rname = _regular(22)
-    f_badge = _bold(13)
-    f_ts    = _regular(13)
+    f_reg      = _bold(48)
+    f_type_sm  = _regular(40)
+    f_op       = _regular(32)
+    f_call     = _bold(52)
+    f_route    = _bold(28)
+    f_rname    = _bold(44)
+    f_badge    = _bold(13)
+    f_ts       = _regular(13)
+    f_sightings = _bold(18)
 
     # --- base: dark BG, then full-bleed photo ---
     img = Image.new("RGBA", (W, H), (*BG, 255))
@@ -404,24 +405,32 @@ def render_display_image(aircraft: dict) -> bytes:
     operator  = aircraft.get("operator") or ""
 
     y = PAD
+
+    # Line 1: registration + type name on the same line
     if reg:
         draw.text((PAD, y), reg, font=f_reg, fill=WHITE)
-        y += 60
-    if type_name:
-        draw.text((PAD, y), trunc(type_name, f_type, max_w), font=f_type, fill=TEXT)
-        y += 36
+        reg_w = int(draw.textlength(reg, font=f_reg))
+        if type_name:
+            type_text = trunc(type_name, f_type_sm, max_w - reg_w - 20)
+            # vertically center the slightly smaller type text alongside reg
+            draw.text((PAD + reg_w + 16, y + 4), type_text, font=f_type_sm, fill=TEXT)
+        y += 56
+    elif type_name:
+        draw.text((PAD, y), trunc(type_name, f_type_sm, max_w), font=f_type_sm, fill=TEXT)
+        y += 32
 
-    # Operator — top right, white text on semi-transparent dark pill
+    # Line 2: operator — no pill, plain text below reg/type
     if operator:
-        op_text  = trunc(operator, f_op, W // 2)
-        op_w     = int(draw.textlength(op_text, font=f_op))
-        BPX, BPY = 12, 7   # box padding x / y
-        bx0 = W - PAD - op_w - BPX * 2
-        bx1 = W - PAD
-        by0 = PAD - BPY
-        by1 = PAD + 30 + BPY
-        draw.rectangle([bx0, by0, bx1, by1], fill=(0, 0, 0, 170))
-        draw.text((bx0 + BPX, PAD), op_text, font=f_op, fill=WHITE)
+        op_text = trunc(operator, f_op, max_w)
+        draw.text((PAD, y), op_text, font=f_op, fill=TEXT)
+        y += 40
+
+    # Sightings count — top right corner
+    sighting_count = aircraft.get("sighting_count")
+    if sighting_count:
+        sc_label = f"{sighting_count} sighting{'s' if sighting_count != 1 else ''}"
+        sc_w = int(draw.textlength(sc_label, font=f_sightings))
+        draw.text((W - PAD - sc_w, PAD + 4), sc_label, font=f_sightings, fill=SUBTEXT)
 
     # --- bottom block (built upward from the bottom edge) ---
     callsign = aircraft.get("callsign") or icao
@@ -431,32 +440,33 @@ def render_display_image(aircraft: dict) -> bytes:
 
     y = H - PAD
 
-    # Timestamp — bottom right
+    # Timestamp — bottom right (absolute position)
     ts   = datetime.now().strftime("%H:%M:%S")
     ts_w = int(draw.textlength(ts, font=f_ts))
-    draw.text((W - PAD - ts_w, y - 14), ts, font=f_ts, fill=SUBTEXT)
+    draw.text((W - PAD - ts_w, H - PAD - 14), ts, font=f_ts, fill=SUBTEXT)
 
-    # Range / bearing — above timestamp, bottom right
+    # Right-side data lines stacked upward: range/bearing (bottom), altitude (above)
     range_nm  = aircraft.get("range_nm")
     bearing   = aircraft.get("bearing_deg")
+    altitude  = aircraft.get("altitude")
+    right_items = []
     if range_nm is not None and bearing is not None:
-        rb_text = f"{range_nm:.1f} nm  {bearing:.0f}°"
-        rb_w    = int(draw.textlength(rb_text, font=f_route))
-        draw.text((W - PAD - rb_w, y - 46), rb_text, font=f_route, fill=TEXT)
+        right_items.append(f"{range_nm:.1f} nm  {bearing:.0f}°")
+    if altitude is not None:
+        right_items.append(f"{altitude:,} ft")  # altitude sits above range/bearing
+    for i, line in enumerate(right_items):
+        lw = int(draw.textlength(line, font=f_route))
+        draw.text((W - PAD - lw, H - PAD - 48 - i * 36), line, font=f_route, fill=TEXT)
 
-    # Route
+    # Route: airport names only
     if origin_icao or dest_icao:
-        o_str = origin_icao or "?"
-        d_str = dest_icao   or "?"
         if origin_name and dest_name:
             name_line = f"{origin_name}  →  {dest_name}"
         else:
             name_line = origin_name or dest_name or ""
         if name_line:
-            draw.text((PAD, y - 22), trunc(name_line, f_rname, max_w), font=f_rname, fill=SUBTEXT)
-            y -= 28
-        draw.text((PAD, y - 30), f"{o_str}  →  {d_str}", font=f_route, fill=ACCENT)
-        y -= 40
+            draw.text((PAD, y - 50), trunc(name_line, f_rname, max_w), font=f_rname, fill=TEXT)
+            y -= 58
 
     y -= 10  # gap above callsign
 

@@ -28,6 +28,7 @@ MOCK = {
     "bearing_deg":   137.0,
     "squawk":        "1234",
     "military":      False,
+    "sighting_count": 14,
 }
 
 MOCK_ROUTE = ("EGKK", "London Gatwick", "EDDF", "Frankfurt Airport")
