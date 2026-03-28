@@ -119,8 +119,13 @@ export default function AltHeatmap() {
 
   const [hours,    setHours]    = useState(24)
   const [extended, setExtended] = useState(false)
+  const extendedRef = useRef(false)   // ref so fetch callback reads current toggle value
   const [loading,  setLoading]  = useState(true)
   const [error,    setError]    = useState(null)
+
+  // Keep ref in sync so the fetch callback can read the current toggle value
+  // without capturing a stale closure.
+  useEffect(() => { extendedRef.current = extended }, [extended])
 
   // Compute ceiling: normal = 45,000ft; extended = max observed rounded up
   // to the next 5,000ft, minimum 50,000ft.
@@ -148,15 +153,20 @@ export default function AltHeatmap() {
       .then(data => {
         if (cancelled) return
         dataRef.current = data
+        // Compute ceiling fresh from the new data — the closure value of ceilFt
+        // is stale here because extendedCeil depends on dataRef which just changed.
+        const freshExtCeil = data.max_alt_observed
+          ? Math.max(50000, Math.ceil(data.max_alt_observed / 5000) * 5000)
+          : 60000
+        const freshCeilFt = extendedRef.current ? freshExtCeil : NORMAL_CEIL_FT
         setLoading(false)
-        if (yAxisRef.current)   drawYAxis(yAxisRef.current, ceilFt)
-        if (heatmapRef.current) drawHeatmap(heatmapRef.current, data, ceilFt)
+        if (yAxisRef.current)   drawYAxis(yAxisRef.current, freshCeilFt)
+        if (heatmapRef.current) drawHeatmap(heatmapRef.current, data, freshCeilFt)
       })
       .catch(e => { if (!cancelled) { setLoading(false); setError(e.message) } })
 
     return () => { cancelled = true }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hours])  // ceilFt intentionally excluded — range toggle handled by the effect above
+  }, [hours])  // extended handled by [ceilFt] effect above; extendedRef keeps it current
 
   return (
     <section className={styles.section}>

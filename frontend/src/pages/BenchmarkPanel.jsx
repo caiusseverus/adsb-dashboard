@@ -125,25 +125,10 @@ export default function BenchmarkPanel() {
   const timerRef  = useRef(null)
   const startedAt = useRef(null)
 
-  // On mount, fetch cached result / status without triggering a run
-  useEffect(() => {
-    fetch(`${API_BASE}/api/debug/benchmark/status`)
-      .then(r => r.ok ? r.json() : null)
-      .then(s => {
-        if (!s) return
-        if (s.running) {
-          startPolling()
-        } else if (s.has_result) {
-          // Load the cached result immediately
-          fetch(`${API_BASE}/api/debug/benchmark`)
-            .then(r => r.ok ? r.json() : null)
-            .then(d => { if (d) setResult(d) })
-            .catch(() => {})
-        }
-      })
-      .catch(() => {})
-    return stopPolling
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  const stopPolling = useCallback(() => {
+    clearInterval(pollRef.current)
+    clearInterval(timerRef.current)
+  }, [])
 
   const startPolling = useCallback(() => {
     stopPolling()
@@ -177,12 +162,27 @@ export default function BenchmarkPanel() {
         setError('Lost connection while benchmark was running')
       }
     }, 800)
-  }, [])
+  }, [stopPolling])
 
-  const stopPolling = useCallback(() => {
-    clearInterval(pollRef.current)
-    clearInterval(timerRef.current)
-  }, [])
+  // On mount, fetch cached result / status without triggering a run
+  useEffect(() => {
+    fetch(`${API_BASE}/api/debug/benchmark/status`)
+      .then(r => r.ok ? r.json() : null)
+      .then(s => {
+        if (!s) return
+        if (s.running) {
+          startPolling()
+        } else if (s.has_result) {
+          // Load the cached result immediately
+          fetch(`${API_BASE}/api/debug/benchmark`)
+            .then(r => r.ok ? r.json() : null)
+            .then(d => { if (d) setResult(d) })
+            .catch(() => {})
+        }
+      })
+      .catch(() => {})
+    return stopPolling
+  }, [startPolling, stopPolling])
 
   const handleRun = useCallback(async (fresh = true) => {
     setError(null)

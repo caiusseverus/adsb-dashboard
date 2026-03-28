@@ -443,7 +443,7 @@ async def _route_enricher() -> None:
 async def _push_updates() -> None:
     """Broadcast a state snapshot to every connected WebSocket client."""
     import time
-    global _watchlist_cache, _watchlist_cache_ts
+    global _watchlist_cache, _watchlist_cache_ts, _route_queue_drops
     while True:
         await asyncio.sleep(config.PUSH_INTERVAL_S)
         try:
@@ -461,7 +461,6 @@ async def _push_updates() -> None:
                     visit_ids = await asyncio.to_thread(stats_db.write_visits, tuples)
                     for ac, vid in zip(credible, visit_ids):
                         if ac.callsign:
-                            global _route_queue_drops
                             if len(_route_queue) == _route_queue.maxlen:
                                 _route_queue_drops += 1
                                 log.warning("route enrichment queue full — drop #%d (visit %d %s)",
@@ -849,6 +848,10 @@ app.include_router(health_router)
 if config.DEBUG_ENRICHMENT:
     log.info("Debug router mounted (DEBUG_ENRICHMENT=%s)", config.DEBUG_ENRICHMENT)
 
+# Security note: no authentication is enforced on any endpoint.
+# This is intentional for a LAN-only deployment (behind a home router/firewall).
+# If this service is ever exposed to the internet, add token auth or an API key
+# before all destructive endpoints (debug overrides, cast rules, history cleanup).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ORIGINS,

@@ -121,7 +121,6 @@ export default function AircraftTable({ aircraft, onSelectIcao, queueSize = 0 })
       <div className={styles.heading}>
         Live Aircraft
         <span className={styles.count}>{filtered.length}</span>
-        {filter === 'all' && aircraft.length !== filtered.length && null}
         <span className={styles.filterGroup}>
           {FILTERS.map(f => (
             <button

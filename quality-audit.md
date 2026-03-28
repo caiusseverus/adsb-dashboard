@@ -18,6 +18,12 @@
 | F-H2 | MapPage stale `receiverPos` closure | `fe42c9a` | ✅ Fixed |
 | F-M2 | AircraftTable filter empty state | `fe42c9a` | ✅ Fixed |
 | X-M1 / B-M2 / F-M11 | Consolidate `haversine`/`bearing` into `utils_geo.py` + `geo.js` | — | ✅ Fixed |
+| F-H1 | CoveragePage module-level `_altScale`/`_curveMode` → `useRef` + param threading | — | ✅ Fixed |
+| F-H4 | BenchmarkPanel stale `startPolling` closure; reorder hooks + fix deps | — | ✅ Fixed |
+| B-H2 | No auth on any endpoint — document LAN-only assumption in `main.py` | — | ✅ Fixed |
+| B-M10 | `global _route_queue_drops` moved to function top in `_push_updates` | — | ✅ Fixed |
+| F-M1 | Dead expression `{filter === 'all' && ... && null}` removed | — | ✅ Fixed |
+| F-M7 | AltHeatmap fetch callback used stale `ceilFt` — fixed via `extendedRef` | — | ✅ Fixed |
 
 ---
 
@@ -26,10 +32,10 @@
 | Severity | Backend | Frontend | Cross-cutting | Total | Fixed |
 |----------|---------|----------|---------------|-------|-------|
 | Critical | 0       | 0        | 0             | **0** | —     |
-| High     | 3       | 4        | 0             | **7** | 4     |
-| Medium   | 10      | 19       | 2             | **31**| 2     |
+| High     | 3       | 4        | 0             | **7** | 7     |
+| Medium   | 10      | 19       | 2             | **31**| 6     |
 | Low      | 10      | 8        | 1             | **19**| 0     |
-| **Total**| **23**  | **31**   | **3**         | **57**| **6** |
+| **Total**| **23**  | **31**   | **3**         | **57**| **13** |
 
 ---
 

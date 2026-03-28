@@ -6,12 +6,8 @@ import { NAMED_PALETTE, TYPE_GROUPS, TYPE_GROUP_OTHER_COLOR, getTypeGroup } from
 import { buildTerrainMesh } from '../utils/terrain'
 import { haversineNm } from '../utils/geo'
 
-// ── Mutable rendering parameters — updated before each redraw ────────────────
-// Module-level so all builder functions (buildPoints, buildTrails, etc.) share them
-// without parameter threading. Only one CoveragePage mounts at a time.
-let _altScale  = 8       // vertical exaggeration (replaces VERT_EXAG)
-let _curveMode = false   // true = spherical ECEF, false = flat ENU
-// Curvature k is always equal to _altScale so horizon crossing matches reality
+// Rendering parameters — altScale and curveMode — are owned by useRef inside the
+// component and passed explicitly to all builder functions below.
 
 const FEET_PER_NM   = 6076.115
 const R_NM          = 3440.065   // Earth radius in NM
@@ -100,24 +96,22 @@ function altColor(alt_ft) {
 }
 
 // [bearing_deg, range_nm, alt_ft] → Three.js world coords
-// Reads _altScale, _curveMode — update those before calling buildPoints etc.
-
-function _toWorldFlat(bearing_deg, range_nm, alt_ft) {
+function _toWorldFlat(bearing_deg, range_nm, alt_ft, altScale) {
   const rad = bearing_deg * Math.PI / 180
   return [
     range_nm * Math.sin(rad),
-    (alt_ft / FEET_PER_NM) * _altScale,
+    (alt_ft / FEET_PER_NM) * altScale,
     -range_nm * Math.cos(rad),   // negate: North (0°) → −Z, into scene
   ]
 }
 
-function _toWorldCurved(bearing_deg, range_nm, alt_ft) {
-  const R_eff  = R_NM / _altScale   // k = altScale: correct relative horizon crossing
+function _toWorldCurved(bearing_deg, range_nm, alt_ft, altScale) {
+  const R_eff  = R_NM / altScale   // k = altScale: correct relative horizon crossing
   const gc_rad = range_nm / R_eff
   const bRad   = bearing_deg * Math.PI / 180
   const sin_gc = Math.sin(gc_rad)
   const cos_gc = Math.cos(gc_rad)
-  const r = R_eff + (alt_ft / FEET_PER_NM) * _altScale   // scale before unit-vector multiply
+  const r = R_eff + (alt_ft / FEET_PER_NM) * altScale   // scale before unit-vector multiply
   return [
     r * sin_gc * Math.sin(bRad),
     r * cos_gc - R_eff,            // receiver surface = y=0
@@ -125,15 +119,15 @@ function _toWorldCurved(bearing_deg, range_nm, alt_ft) {
   ]
 }
 
-function toWorld(bearing_deg, range_nm, alt_ft) {
-  return _curveMode
-    ? _toWorldCurved(bearing_deg, range_nm, alt_ft)
-    : _toWorldFlat(bearing_deg, range_nm, alt_ft)
+function toWorld(bearing_deg, range_nm, alt_ft, altScale, curveMode) {
+  return curveMode
+    ? _toWorldCurved(bearing_deg, range_nm, alt_ft, altScale)
+    : _toWorldFlat(bearing_deg, range_nm, alt_ft, altScale)
 }
 
 // Helper: altitude axis line (rebuilt when altScale changes)
-function makeAltAxis() {
-  const altTopY = (ALT_SCALE_FT / FEET_PER_NM) * _altScale + 5
+function makeAltAxis(altScale) {
+  const altTopY = (ALT_SCALE_FT / FEET_PER_NM) * altScale + 5
   const geo = new THREE.BufferGeometry().setFromPoints([
     new THREE.Vector3(0, 0, 0),
     new THREE.Vector3(0, altTopY, 0),
@@ -142,14 +136,14 @@ function makeAltAxis() {
 }
 
 // Build a Points object from (already-filtered) raw point data + colour mode
-function buildPoints(points, colorMode) {
+function buildPoints(points, colorMode, altScale, curveMode) {
   const n = points.length
   const positions = new Float32Array(n * 3)
   const colors    = new Float32Array(n * 3)
 
   for (let i = 0; i < n; i++) {
     const [bearing, range, alt, military, interesting, op_idx, tg_idx, tc_idx] = points[i]
-    const [x, y, z] = toWorld(bearing, range, alt)
+    const [x, y, z] = toWorld(bearing, range, alt, altScale, curveMode)
     positions[i * 3]     = x
     positions[i * 3 + 1] = y
     positions[i * 3 + 2] = z
@@ -219,7 +213,7 @@ function pointColor(obj, colorMode, operators = [], typeCodes = []) {
 }
 
 // Build merged LineSegments for all live aircraft trails
-function buildTrails(trails, colorMode, operators, typeCodes) {
+function buildTrails(trails, colorMode, operators, typeCodes, altScale, curveMode) {
   let totalSegs = 0
   for (const pts of Object.values(trails)) {
     if (pts.length < 2) continue
@@ -242,8 +236,8 @@ function buildTrails(trails, colorMode, operators, typeCodes) {
       const a = pts[i], b = pts[i + 1]
       // Skip segment on time gap or impossible position jump (CPR glitch guard)
       if (!isTrailSegmentValid(a, b)) continue
-      const [x0, y0, z0] = toWorld(a.bearing, a.range, a.alt ?? 0)
-      const [x1, y1, z1] = toWorld(b.bearing, b.range, b.alt ?? 0)
+      const [x0, y0, z0] = toWorld(a.bearing, a.range, a.alt ?? 0, altScale, curveMode)
+      const [x1, y1, z1] = toWorld(b.bearing, b.range, b.alt ?? 0, altScale, curveMode)
       // Altitude mode: colour each vertex by its own altitude (gradient along trail)
       const colA = colorMode === 'altitude' ? altColor(a.alt ?? 0) : acCol
       const colB = colorMode === 'altitude' ? altColor(b.alt ?? 0) : acCol
@@ -266,7 +260,7 @@ function buildTrails(trails, colorMode, operators, typeCodes) {
 }
 
 // Build a Points object with one bright dot at each aircraft's current position
-function buildLiveDots(trails, colorMode, operators, typeCodes) {
+function buildLiveDots(trails, colorMode, operators, typeCodes, altScale, curveMode) {
   const entries = Object.values(trails).filter(pts => pts.length > 0)
   if (entries.length === 0) return null
 
@@ -276,7 +270,7 @@ function buildLiveDots(trails, colorMode, operators, typeCodes) {
 
   entries.forEach((pts, i) => {
     const last = pts[pts.length - 1]
-    const [x, y, z] = toWorld(last.bearing, last.range, last.alt ?? 0)
+    const [x, y, z] = toWorld(last.bearing, last.range, last.alt ?? 0, altScale, curveMode)
     positions[i * 3]     = x
     positions[i * 3 + 1] = y
     positions[i * 3 + 2] = z
@@ -300,8 +294,8 @@ function buildLiveDots(trails, colorMode, operators, typeCodes) {
 // Opaque earth sphere for curved mode — occludes aircraft/coastline behind the horizon.
 // R_eff matches the coordinate system: receiver at y=0, earth centre at y=-R_eff.
 // polygonOffset pushes it fractionally behind terrain/grid at the same depth.
-function buildEarthSphere() {
-  const R_eff = R_NM / _altScale
+function buildEarthSphere(altScale) {
+  const R_eff = R_NM / altScale
   const geo = new THREE.SphereGeometry(R_eff, 72, 54)
   const mat = new THREE.MeshBasicMaterial({
     color: 0x0b0c10,   // match scene background — curved/flat modes look identical
@@ -315,11 +309,11 @@ function buildEarthSphere() {
 }
 
 // Range ring — uses toWorld so it curves correctly in curved mode
-function makeRing(radius) {
+function makeRing(radius, altScale, curveMode) {
   const pts = []
   for (let i = 0; i <= 128; i++) {
     const bearing = (i / 128) * 360
-    const [x, y, z] = toWorld(bearing, radius, 0)
+    const [x, y, z] = toWorld(bearing, radius, 0, altScale, curveMode)
     pts.push(new THREE.Vector3(x, y, z))
   }
   return new THREE.Line(
@@ -329,12 +323,12 @@ function makeRing(radius) {
 }
 
 // Cardinal spoke — subdivided so it follows Earth's curve in curved mode
-function makeSpoke(bearing_deg, length) {
+function makeSpoke(bearing_deg, length, altScale, curveMode) {
   const STEPS = 32
   const pts = []
   for (let i = 0; i <= STEPS; i++) {
     const r = (i / STEPS) * length
-    const [x, y, z] = toWorld(bearing_deg, r, 0)
+    const [x, y, z] = toWorld(bearing_deg, r, 0, altScale, curveMode)
     pts.push(new THREE.Vector3(x, y, z))
   }
   return new THREE.Line(
@@ -345,15 +339,15 @@ function makeSpoke(bearing_deg, length) {
 
 // Rebuild all ring + spoke objects into the scene; dispose old ones first.
 // Returns array of the new objects so they can be tracked in sceneRef.gridObjs.
-function rebuildGridObjects(scene, existingObjs) {
+function rebuildGridObjects(scene, existingObjs, altScale, curveMode) {
   for (const obj of existingObjs) {
     scene.remove(obj)
     obj.geometry.dispose()
     obj.material.dispose()
   }
   const objs = []
-  for (let r = 50; r <= 250; r += 50) { const o = makeRing(r); scene.add(o); objs.push(o) }
-  for (const b of [0, 90, 180, 270]) { const o = makeSpoke(b, 270); scene.add(o); objs.push(o) }
+  for (let r = 50; r <= 250; r += 50) { const o = makeRing(r, altScale, curveMode); scene.add(o); objs.push(o) }
+  for (const b of [0, 90, 180, 270]) { const o = makeSpoke(b, 270, altScale, curveMode); scene.add(o); objs.push(o) }
   return objs
 }
 
@@ -376,13 +370,13 @@ function makeLabel(text, x, z) {
 }
 
 // Build ground-plane LineSegments for coastline + country borders
-function buildCoastline(segments) {
+function buildCoastline(segments, altScale, curveMode) {
   if (!segments || segments.length === 0) return null
   const positions = new Float32Array(segments.length * 6)
   let idx = 0
   for (const [b1, r1, b2, r2] of segments) {
-    const [x0, y0, z0] = toWorld(b1, r1, 0)
-    const [x1, y1, z1] = toWorld(b2, r2, 0)
+    const [x0, y0, z0] = toWorld(b1, r1, 0, altScale, curveMode)
+    const [x1, y1, z1] = toWorld(b2, r2, 0, altScale, curveMode)
     positions[idx++] = x0; positions[idx++] = y0; positions[idx++] = z0
     positions[idx++] = x1; positions[idx++] = y1; positions[idx++] = z1
   }
@@ -406,14 +400,14 @@ function shortAirportName(name) {
 }
 
 // Build a THREE.Group containing amber dots + billboard name labels for airports
-function buildAirports(airports) {
+function buildAirports(airports, altScale, curveMode) {
   if (!airports || airports.length === 0) return null
   const group = new THREE.Group()
 
   // Dots — single Points object for all airports
   const positions = new Float32Array(airports.length * 3)
   airports.forEach((ap, i) => {
-    const [x, y, z] = toWorld(ap.bearing, ap.range_nm, 0)
+    const [x, y, z] = toWorld(ap.bearing, ap.range_nm, 0, altScale, curveMode)
     positions[i * 3]     = x
     positions[i * 3 + 1] = y + 0.5  // slightly above surface (curved or flat)
     positions[i * 3 + 2] = z
@@ -440,7 +434,7 @@ function buildAirports(airports) {
     const sprite = new THREE.Sprite(
       new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), transparent: true }),
     )
-    const [x, y, z] = toWorld(ap.bearing, ap.range_nm, 0)
+    const [x, y, z] = toWorld(ap.bearing, ap.range_nm, 0, altScale, curveMode)
     sprite.position.set(x + 2, y + 3, z)  // offset right of dot, float above surface
     sprite.scale.set(16, 3, 1)
     group.add(sprite)
@@ -607,6 +601,10 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
   const [terrainLoading, setTerrainLoading] = useState(false)
   const [curveMode,    setCurveMode]    = useState(false)
   const [altScale,     setAltScale]     = useState(8)
+  // Refs so RAF loop and async effects always read the current coordinate params
+  // without being captured in stale closures.
+  const altScaleRef  = useRef(8)
+  const curveModeRef = useRef(false)
   // sceneVersion bumps to force a full redraw when coordinate params change
   const [sceneVersion, setSceneVersion] = useState(0)
 
@@ -641,7 +639,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
     controls.maxDistance   = 800
     controls.update()
 
-    const initialGridObjs = rebuildGridObjects(scene, [])
+    const initialGridObjs = rebuildGridObjects(scene, [], altScaleRef.current, curveModeRef.current)
 
     const LR = 278
     scene.add(makeLabel('N',    0, -LR))
@@ -649,7 +647,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
     scene.add(makeLabel('E',  LR,    0))
     scene.add(makeLabel('W', -LR,    0))
 
-    const altAxis = makeAltAxis()
+    const altAxis = makeAltAxis(altScaleRef.current)
     scene.add(altAxis)
 
     // Update the 2D compass rose to match the camera's horizontal azimuth.
@@ -672,7 +670,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
         // the receiver always sits 10-ft*altScale above the terrain surface.
         // An aircraft is above the camera whenever alt_ft > terrain_elev_ft + 10,
         // which is true for any aircraft genuinely above the receiver location.
-        const recvY = (Math.max(0, terrainCenterElevMRef.current) / 1852 + 10 / FEET_PER_NM) * _altScale
+        const recvY = (Math.max(0, terrainCenterElevMRef.current) / 1852 + 10 / FEET_PER_NM) * altScaleRef.current
         const az = rc.az * Math.PI / 180
         const el = rc.el * Math.PI / 180
         camera.position.set(0, recvY, 0)
@@ -717,7 +715,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
         coastlineDataRef.current = data.segments   // store for rebuilds
         const ref = sceneRef.current
         if (!ref) return
-        const obj = buildCoastline(data.segments)
+        const obj = buildCoastline(data.segments, altScaleRef.current, curveModeRef.current)
         if (!obj) return
         obj.visible = showCoastlineRef.current
         ref.scene.add(obj)
@@ -736,7 +734,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
           dataRef.current = data.airports   // store for rebuild on mode change
           const ref = sceneRef.current
           if (!ref) return
-          const obj = buildAirports(data.airports)
+          const obj = buildAirports(data.airports, altScaleRef.current, curveModeRef.current)
           if (!obj) return
           obj.visible = visibleRef.current
           ref.scene.add(obj)
@@ -755,11 +753,11 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
   useEffect(() => { tlFilterTgRef.current   = selectedTypeGroup  }, [selectedTypeGroup])
   useEffect(() => { tlFilterMlatRef.current = mlatOnly           }, [mlatOnly])
 
-  // ── Sync coordinate mode into module-level vars, bump scene version ──
-  // Must update module vars BEFORE setSceneVersion so redraw sees new values.
+  // ── Sync coordinate params into refs, bump scene version ──
+  // Must update refs BEFORE setSceneVersion so the redrawn scene sees new values.
   const bumpScene = useCallback((newAltScale, newCurveMode) => {
-    _altScale  = newAltScale
-    _curveMode = newCurveMode
+    altScaleRef.current  = newAltScale
+    curveModeRef.current = newCurveMode
     setSceneVersion(v => v + 1)
   }, [])
 
@@ -767,7 +765,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
   useEffect(() => {
     const ref = sceneRef.current
     if (!ref) return
-    _curveMode = curveMode
+    curveModeRef.current = curveMode
     ref.camera.far = curveMode ? 20000 : 5000
     ref.camera.updateProjectionMatrix()
   }, [curveMode])
@@ -779,7 +777,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
     ref.scene.remove(ref.altAxisObj)
     ref.altAxisObj.geometry.dispose()
     ref.altAxisObj.material.dispose()
-    const newAxis = makeAltAxis()
+    const newAxis = makeAltAxis(altScale)
     ref.scene.add(newAxis)
     ref.altAxisObj = newAxis
   }, [altScale])
@@ -789,8 +787,9 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
   useEffect(() => {
     const ref = sceneRef.current
     if (!ref) return
+    const as = altScaleRef.current, cm = curveModeRef.current
     // Rings + spokes
-    ref.gridObjs = rebuildGridObjects(ref.scene, ref.gridObjs ?? [])
+    ref.gridObjs = rebuildGridObjects(ref.scene, ref.gridObjs ?? [], as, cm)
     // Earth sphere — opaque globe in curved mode so objects behind the horizon are occluded
     if (ref.earthObj) {
       ref.scene.remove(ref.earthObj)
@@ -798,8 +797,8 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
       ref.earthObj.material.dispose()
       ref.earthObj = null
     }
-    if (_curveMode) {
-      ref.earthObj = buildEarthSphere()
+    if (cm) {
+      ref.earthObj = buildEarthSphere(as)
       ref.scene.add(ref.earthObj)
     }
     // Coastline — rebuild from stored segments so no re-fetch needed
@@ -810,7 +809,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
         ref.coastlineObj.geometry.dispose()
         ref.coastlineObj.material.dispose()
       }
-      const obj = buildCoastline(segs)
+      const obj = buildCoastline(segs, as, cm)
       if (obj) {
         obj.visible = showCoastlineRef.current
         ref.scene.add(obj)
@@ -829,7 +828,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
       }
       const airports = dataRef.current
       if (airports?.length) {
-        const obj = buildAirports(airports)
+        const obj = buildAirports(airports, as, cm)
         if (obj) { obj.visible = visRef.current; ref.scene.add(obj); ref[refKey] = obj }
       }
     }
@@ -875,7 +874,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
         // Store center-cell elevation for receiver-view camera floor
         const ci = Math.floor(data.grid_n / 2) * data.grid_n + Math.floor(data.grid_n / 2)
         terrainCenterElevMRef.current = Math.max(0, data.elevations[ci] ?? 0)
-        const mesh = buildTerrainMesh(data, _altScale, _curveMode, _altScale)
+        const mesh = buildTerrainMesh(data, altScaleRef.current, curveModeRef.current, altScaleRef.current)
         mesh.material.wireframe = terrainWireRef.current
         r2.scene.add(mesh)
         r2.terrainObjs.push(mesh)
@@ -955,7 +954,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup',   onUp)
     }
-  }, [receiverView])  // sceneVersion intentionally excluded — RAF reads _altScale live
+  }, [receiverView])  // sceneVersion intentionally excluded — RAF reads altScaleRef.current live
 
   // ── Timelapse: render one frame into pre-allocated geometries ────────
   const renderTlFrame = useCallback((dt) => {
@@ -1003,7 +1002,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
       const alt     = p0[3] + alpha * (p1[3] - p0[3])
 
       if (di >= TL_MAX_AC) break
-      const [x, y, z] = toWorld(bearing, range, alt)
+      const [x, y, z] = toWorld(bearing, range, alt, altScaleRef.current, curveModeRef.current)
       dp[di * 3] = x; dp[di * 3 + 1] = y; dp[di * 3 + 2] = z
       const col = mode === 'altitude' ? altColor(alt) : pointColor(track, mode, tlOperatorsRef.current, tlTypeCodesRef.current)
       dc[di * 3] = col.r; dc[di * 3 + 1] = col.g; dc[di * 3 + 2] = col.b
@@ -1030,7 +1029,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
         const altD = q0[3] + aD * (q1[3] - q0[3])
         const fade = 1 - (step * TRAIL_INTERVAL_S) / (TRAIL_DURATION_S + TRAIL_INTERVAL_S)
         const cD   = mode === 'altitude' ? altColor(altD) : acCol
-        const [wx, wy, wz] = toWorld(bD, rD, altD)
+        const [wx, wy, wz] = toWorld(bD, rD, altD, altScaleRef.current, curveModeRef.current)
         const fr = cD.r * fade + TL_BG_R * (1 - fade)
         const fg = cD.g * fade + TL_BG_G * (1 - fade)
         const fb = cD.b * fade + TL_BG_B * (1 - fade)
@@ -1292,7 +1291,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
       ref.pointsObj.material.dispose()
     }
     if (points.length === 0) { ref.pointsObj = null; return }
-    const obj = buildPoints(points, mode)
+    const obj = buildPoints(points, mode, altScaleRef.current, curveModeRef.current)
     ref.scene.add(obj)
     ref.pointsObj = obj
     if (tlActiveRef.current) obj.visible = false   // keep hidden if timelapse is active
@@ -1535,9 +1534,9 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
       ref.liveDotsObj.material.dispose()
       ref.liveDotsObj = null
     }
-    const mesh = buildTrails(filteredTrails, effectiveColorMode, liveOps, liveTcs)
+    const mesh = buildTrails(filteredTrails, effectiveColorMode, liveOps, liveTcs, altScaleRef.current, curveModeRef.current)
     if (mesh) { scene.add(mesh); ref.trailsObj = mesh; if (tlActiveRef.current) mesh.visible = false }
-    const dots = buildLiveDots(filteredTrails, effectiveColorMode, liveOps, liveTcs)
+    const dots = buildLiveDots(filteredTrails, effectiveColorMode, liveOps, liveTcs, altScaleRef.current, curveModeRef.current)
     if (dots) { scene.add(dots); ref.liveDotsObj = dots; if (tlActiveRef.current) dots.visible = false }
   }, [aircraft, showMode, colorMode, effectiveColorMode, militaryOnly, selectedIcao, selectedOperator, selectedTypeGroup, selectedTypeCode, sceneVersion])
 
@@ -1752,8 +1751,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
           onClick={() => {
             const next = !curveMode
             setCurveMode(next)
-            _curveMode = next
-            bumpScene(_altScale, next)
+            bumpScene(altScaleRef.current, next)
           }}>Curved</button>
         <div className={styles.sep} />
 
@@ -1764,8 +1762,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
           onChange={e => {
             const v = +e.target.value
             setAltScale(v)
-            _altScale = v
-            bumpScene(v, _curveMode)
+            bumpScene(v, curveModeRef.current)
           }} />
 
         <div className={styles.sep} />
