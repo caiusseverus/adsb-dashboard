@@ -542,15 +542,6 @@ export default function CoveragePage({ aircraft = [] }) {
   const [tcInput,           setTcInput]           = useState('')
   const allTypeCodesRef = useRef([])   // full type code list from options endpoint
 
-  // Colour mode overrides when a filter narrows to one operator or one type:
-  //  operator selected → colour by type_code (fleet composition)
-  //  type filter active → colour by operator (which operators fly this type)
-  //  military/mlat filter active → colour by type_code (fewer aircraft, broad groups aren't useful)
-  const effectiveColorMode =
-    (colorMode === 'operator' && selectedOperator) ? 'type_code' :
-    (colorMode === 'type_group' && (selectedTypeGroup || selectedTypeCode)) ? 'operator' :
-    (colorMode === 'type_group' && (militaryOnly || mlatOnly)) ? 'type_code' :
-    colorMode
   const [showCoastline, setShowCoastline] = useState(true)
   const showCoastlineRef = useRef(true)  // avoids stale closure in fetch callback
   const [showAirportsLarge,  setShowAirportsLarge]  = useState(true)
@@ -595,6 +586,17 @@ export default function CoveragePage({ aircraft = [] }) {
   // ── Filter state (military / mlat — fetch unsampled subset) ─────────
   const [militaryOnly, setMilitaryOnly] = useState(false)
   const [mlatOnly,     setMlatOnly]     = useState(false)
+
+  // Colour mode overrides when a filter narrows to one operator or one type:
+  //  operator selected → colour by type_code (fleet composition)
+  //  type filter active → colour by operator (which operators fly this type)
+  //  military/mlat filter active → colour by type_code (fewer aircraft, broad groups aren't useful)
+  const effectiveColorMode =
+    (colorMode === 'operator' && selectedOperator) ? 'type_code' :
+    (colorMode === 'type_group' && (selectedTypeGroup || selectedTypeCode)) ? 'operator' :
+    (colorMode === 'type_group' && (militaryOnly || mlatOnly)) ? 'type_code' :
+    colorMode
+
   // ── Receiver view state ──────────────────────────────────────────────
   const [receiverView,   setReceiverView]   = useState(false)
   const recvAzRef  = useRef(0)    // look azimuth degrees (0 = north)
