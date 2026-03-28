@@ -306,49 +306,27 @@ def _fetch_photo(icao: str) -> bytes | None:
         return None
 
 
-def _gradient_edge(img, x_start: int, x_end: int, bg: tuple) -> None:
-    """Blend columns x_start..x_end toward bg colour (right-to-left fade)."""
-    w = x_end - x_start
-    h = img.height
-    pixels = img.load()
-    for x in range(x_start, x_end):
-        alpha = (x - x_start) / w
-        br, bg_c, bb = bg
-        for y in range(h):
-            r0, g0, b0 = pixels[x, y]
-            pixels[x, y] = (
-                int(r0 * (1 - alpha) + br * alpha),
-                int(g0 * (1 - alpha) + bg_c * alpha),
-                int(b0 * (1 - alpha) + bb * alpha),
-            )
-
-
 def render_display_image(aircraft: dict) -> bytes:
     """
     Generate a 1280×720 JPEG for display on the Chromecast.
-    Photo occupies the left 800 px; data overlay the right 480 px.
+    Full-bleed photo with dark gradient bands at top and bottom.
+    Top band: registration, aircraft type, operator.
+    Bottom band: callsign, route (if known).
     Returns raw JPEG bytes.
     """
     from PIL import Image, ImageDraw, ImageFont
 
-    W, H      = 1280, 720
-    PHOTO_W   = 800          # photo panel width
-    DATA_X    = PHOTO_W + 8  # left edge of data text
-    DATA_W    = W - DATA_X   # available text width
+    W, H = 1280, 720
+    PAD  = 32
 
-    BG       = (11, 12, 16)
-    ACCENT   = (56, 139, 253)
-    TEXT     = (201, 209, 217)
-    SUBTEXT  = (110, 118, 129)
-    DIM      = (72, 79, 88)
-    WHITE    = (255, 255, 255)
-    MILITARY = (188, 140, 255)
+    BG        = (11, 12, 16)
+    ACCENT    = (56, 139, 253)
+    TEXT      = (201, 209, 217)
+    SUBTEXT   = (110, 118, 129)
+    WHITE     = (255, 255, 255)
+    MILITARY  = (188, 140, 255)
     EMERGENCY = (218, 54, 51)
 
-    img  = Image.new("RGB", (W, H), BG)
-    draw = ImageDraw.Draw(img)
-
-    # --- fonts ---
     def _bold(size: int):
         for path in (
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -371,152 +349,137 @@ def render_display_image(aircraft: dict) -> bytes:
                 pass
         return ImageFont.load_default()
 
-    f_headline = _bold(46)
-    f_sub      = _regular(18)
-    f_label    = _regular(13)
-    f_value    = _bold(22)
-    f_route    = _bold(18)
-    f_badge    = _bold(13)
+    f_reg   = _bold(52)
+    f_type  = _regular(28)
+    f_op    = _bold(26)
+    f_call  = _bold(52)
+    f_route = _bold(24)
+    f_rname = _regular(22)
+    f_badge = _bold(13)
+    f_ts    = _regular(13)
 
-    # --- photo panel ---
+    # --- base: dark BG, then full-bleed photo ---
+    img = Image.new("RGBA", (W, H), (*BG, 255))
+
     icao = aircraft.get("icao", "").upper()
     photo_bytes = _fetch_photo(icao)
     if photo_bytes:
         try:
-            photo = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
-            # Scale to fill PHOTO_W × H, cropping to centre
-            scale = max(PHOTO_W / photo.width, H / photo.height)
+            photo = Image.open(io.BytesIO(photo_bytes)).convert("RGBA")
+            scale = max(W / photo.width, H / photo.height)
             new_w = int(photo.width  * scale)
             new_h = int(photo.height * scale)
             photo = photo.resize((new_w, new_h), Image.LANCZOS)
-            cx = (new_w - PHOTO_W) // 2
-            cy = (new_h - H)       // 2
-            photo = photo.crop((cx, cy, cx + PHOTO_W, cy + H))
+            cx = (new_w - W) // 2
+            cy = (new_h - H) // 2
+            photo = photo.crop((cx, cy, cx + W, cy + H))
             img.paste(photo, (0, 0))
-            # Fade right edge of photo into background
-            _gradient_edge(img, PHOTO_W - 120, PHOTO_W, BG)
         except Exception as exc:
             log.debug("cast: photo render failed: %s", exc)
 
-    # Accent bar separating photo from data panel
-    draw.rectangle([PHOTO_W, 0, PHOTO_W + 3, H], fill=ACCENT)
+    # --- gradient bands: top and bottom darken toward BG ---
+    BAND = 210
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw_ov = ImageDraw.Draw(overlay)
+    for i in range(BAND):
+        top_alpha = int(230 * (1 - i / BAND))
+        draw_ov.line([(0, i), (W - 1, i)], fill=(*BG, top_alpha))
+        bot_alpha = int(230 * i / BAND)
+        draw_ov.line([(0, H - BAND + i), (W - 1, H - BAND + i)], fill=(*BG, bot_alpha))
+    img = Image.alpha_composite(img, overlay)
 
-    # --- data panel ---
-    callsign  = aircraft.get("callsign") or ""
-    operator  = aircraft.get("operator") or ""
-    type_desc = aircraft.get("type_desc") or aircraft.get("type_code") or ""
-    altitude  = aircraft.get("altitude")
-    squawk    = aircraft.get("squawk") or ""
-    range_nm  = aircraft.get("range_nm")
-    military  = aircraft.get("military", False)
+    draw = ImageDraw.Draw(img)
+
+    def trunc(text: str, font, max_w: int) -> str:
+        while text and draw.textlength(text, font=font) > max_w:
+            text = text[:-1]
+        return text
+
+    max_w = W - 2 * PAD
+
+    # --- top block ---
     reg       = aircraft.get("registration") or ""
+    type_name = (aircraft.get("type_full_name") or aircraft.get("type_desc")
+                 or aircraft.get("type_code") or "")
+    operator  = aircraft.get("operator") or ""
 
+    y = PAD
+    if reg:
+        draw.text((PAD, y), reg, font=f_reg, fill=WHITE)
+        y += 60
+    if type_name:
+        draw.text((PAD, y), trunc(type_name, f_type, max_w), font=f_type, fill=TEXT)
+        y += 36
+
+    # Operator — top right, white text on semi-transparent dark pill
+    if operator:
+        op_text  = trunc(operator, f_op, W // 2)
+        op_w     = int(draw.textlength(op_text, font=f_op))
+        BPX, BPY = 12, 7   # box padding x / y
+        bx0 = W - PAD - op_w - BPX * 2
+        bx1 = W - PAD
+        by0 = PAD - BPY
+        by1 = PAD + 30 + BPY
+        draw.rectangle([bx0, by0, bx1, by1], fill=(0, 0, 0, 170))
+        draw.text((bx0 + BPX, PAD), op_text, font=f_op, fill=WHITE)
+
+    # --- bottom block (built upward from the bottom edge) ---
+    callsign = aircraft.get("callsign") or icao
+    military = aircraft.get("military", False)
+    squawk   = aircraft.get("squawk") or ""
     origin_icao, origin_name, dest_icao, dest_name = _get_route(icao)
 
-    y = 32
+    y = H - PAD
 
-    # Headline: callsign (large) + ICAO below
-    headline = callsign if callsign else icao
-    draw.text((DATA_X, y), headline, font=f_headline, fill=WHITE)
-    y += 50
-    if callsign:
-        draw.text((DATA_X, y), icao, font=f_sub, fill=SUBTEXT)
-        y += 22
-    y += 6
+    # Timestamp — bottom right
+    ts   = datetime.now().strftime("%H:%M:%S")
+    ts_w = int(draw.textlength(ts, font=f_ts))
+    draw.text((W - PAD - ts_w, y - 14), ts, font=f_ts, fill=SUBTEXT)
 
-    # Badges (military / emergency) — inline on one row
-    badge_x = DATA_X
+    # Range / bearing — above timestamp, bottom right
+    range_nm  = aircraft.get("range_nm")
+    bearing   = aircraft.get("bearing_deg")
+    if range_nm is not None and bearing is not None:
+        rb_text = f"{range_nm:.1f} nm  {bearing:.0f}°"
+        rb_w    = int(draw.textlength(rb_text, font=f_route))
+        draw.text((W - PAD - rb_w, y - 46), rb_text, font=f_route, fill=TEXT)
+
+    # Route
+    if origin_icao or dest_icao:
+        o_str = origin_icao or "?"
+        d_str = dest_icao   or "?"
+        if origin_name and dest_name:
+            name_line = f"{origin_name}  →  {dest_name}"
+        else:
+            name_line = origin_name or dest_name or ""
+        if name_line:
+            draw.text((PAD, y - 22), trunc(name_line, f_rname, max_w), font=f_rname, fill=SUBTEXT)
+            y -= 28
+        draw.text((PAD, y - 30), f"{o_str}  →  {d_str}", font=f_route, fill=ACCENT)
+        y -= 40
+
+    y -= 10  # gap above callsign
+
+    # Callsign
+    draw.text((PAD, y - 58), callsign, font=f_call, fill=WHITE)
+    y -= 66
+
+    # Badges (above callsign)
+    badge_x = PAD
     if military:
         bw = 90
-        draw.rectangle([badge_x, y, badge_x + bw, y + 22], fill=MILITARY)
-        draw.text((badge_x + 5, y + 4), "MILITARY", font=f_badge, fill=BG)
+        draw.rectangle([badge_x, y - 22, badge_x + bw, y], fill=MILITARY)
+        draw.text((badge_x + 5, y - 18), "MILITARY", font=f_badge, fill=BG)
         badge_x += bw + 6
     if squawk in ("7500", "7600", "7700"):
         labels = {"7500": "HIJACK", "7600": "RADIO FAIL", "7700": "EMERGENCY"}
         label  = labels[squawk]
         bw     = 8 + len(label) * 7
-        draw.rectangle([badge_x, y, badge_x + bw, y + 22], fill=EMERGENCY)
-        draw.text((badge_x + 5, y + 4), label, font=f_badge, fill=WHITE)
-        badge_x += bw + 6
-    if military or squawk in ("7500", "7600", "7700"):
-        y += 30
-
-    y += 4
-
-    # Helper: draw a label + value row
-    def row(label: str, value: str, colour=TEXT, gap_after: int = 28) -> None:
-        nonlocal y
-        draw.text((DATA_X, y), label, font=f_label, fill=DIM)
-        y += 14
-        draw.text((DATA_X, y), value, font=f_value, fill=colour)
-        y += gap_after
-
-    # Helper to truncate text to DATA_W pixels
-    def trunc(text: str, font) -> str:
-        if not text:
-            return text
-        while text and draw.textlength(text, font=font) > DATA_W - 4:
-            text = text[:-1]
-        return text
-
-    if operator:
-        draw.text((DATA_X, y), "OPERATOR", font=f_label, fill=DIM)
-        y += 14
-        draw.text((DATA_X, y), trunc(operator, f_value), font=f_value, fill=ACCENT)
-        y += 28
-
-    if type_desc:
-        draw.text((DATA_X, y), "TYPE", font=f_label, fill=DIM)
-        y += 14
-        draw.text((DATA_X, y), trunc(type_desc, f_value), font=f_value, fill=TEXT)
-        y += 28
-
-    if reg:
-        draw.text((DATA_X, y), "REGISTRATION", font=f_label, fill=DIM)
-        y += 14
-        draw.text((DATA_X, y), reg, font=f_value, fill=TEXT)
-        y += 28
-
-    # Route — origin → dest with airport names below codes
-    if origin_icao or dest_icao:
-        draw.text((DATA_X, y), "ROUTE", font=f_label, fill=DIM)
-        y += 14
-        o_str = origin_icao or "?"
-        d_str = dest_icao   or "?"
-        draw.text((DATA_X, y), f"{o_str}  →  {d_str}", font=f_route, fill=ACCENT)
-        y += 20
-        o_name = trunc(origin_name or "", f_label) if origin_name else ""
-        d_name = trunc(dest_name   or "", f_label) if dest_name   else ""
-        if o_name or d_name:
-            sep = "  →  " if o_name and d_name else ""
-            draw.text((DATA_X, y), f"{o_name}{sep}{d_name}", font=f_label, fill=SUBTEXT)
-            y += 16
-        y += 8
-
-    if altitude is not None:
-        draw.text((DATA_X, y), "ALTITUDE", font=f_label, fill=DIM)
-        y += 14
-        draw.text((DATA_X, y), f"{altitude:,} ft", font=f_value, fill=TEXT)
-        y += 28
-
-    if range_nm is not None:
-        draw.text((DATA_X, y), "RANGE", font=f_label, fill=DIM)
-        y += 14
-        draw.text((DATA_X, y), f"{range_nm:.1f} nm", font=f_value, fill=TEXT)
-        y += 28
-
-    if squawk and squawk not in ("7500", "7600", "7700"):
-        draw.text((DATA_X, y), "SQUAWK", font=f_label, fill=DIM)
-        y += 14
-        draw.text((DATA_X, y), squawk, font=f_value, fill=TEXT)
-        y += 28
-
-    # Timestamp footer
-    ts = datetime.now().strftime("%H:%M:%S")
-    draw.text((DATA_X, H - 24), ts, font=f_label, fill=DIM)
+        draw.rectangle([badge_x, y - 22, badge_x + bw, y], fill=EMERGENCY)
+        draw.text((badge_x + 5, y - 18), label, font=f_badge, fill=WHITE)
 
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=88)
+    img.convert("RGB").save(buf, format="JPEG", quality=88)
     return buf.getvalue()
 
 
