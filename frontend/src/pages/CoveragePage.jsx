@@ -545,9 +545,11 @@ export default function CoveragePage({ aircraft = [] }) {
   // Colour mode overrides when a filter narrows to one operator or one type:
   //  operator selected → colour by type_code (fleet composition)
   //  type filter active → colour by operator (which operators fly this type)
+  //  military/mlat filter active → colour by type_code (fewer aircraft, broad groups aren't useful)
   const effectiveColorMode =
     (colorMode === 'operator' && selectedOperator) ? 'type_code' :
     (colorMode === 'type_group' && (selectedTypeGroup || selectedTypeCode)) ? 'operator' :
+    (colorMode === 'type_group' && (militaryOnly || mlatOnly)) ? 'type_code' :
     colorMode
   const [showCoastline, setShowCoastline] = useState(true)
   const showCoastlineRef = useRef(true)  // avoids stale closure in fetch callback
