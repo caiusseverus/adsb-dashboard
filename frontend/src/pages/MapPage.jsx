@@ -97,14 +97,17 @@ function residualColor(nm) {
   return '#f85149'                  // poor
 }
 
-// Build compact label text for permanent tooltip
+// Build two-line HTML label for permanent tooltip
 function makeLabelContent(ac) {
   const id = ac.registration || ac.icao.toUpperCase()
-  const parts = [id]
-  if (ac.type_code) parts.push(ac.type_code)
-  if (ac.airspeed_kts != null) parts.push(`${ac.airspeed_kts}kt`)
-  if (ac.altitude != null) parts.push(`${ac.altitude.toLocaleString()}ft`)
-  return parts.join(' · ')
+  const row1 = [id, ac.type_code].filter(Boolean).join(' ')
+  const row2 = [
+    ac.airspeed_kts != null ? `${ac.airspeed_kts}kt` : null,
+    ac.altitude != null     ? `${ac.altitude.toLocaleString()}ft` : null,
+  ].filter(Boolean).join(' ')
+  return row2
+    ? `<span>${row1}</span><br><span class="ac-label-sub">${row2}</span>`
+    : `<span>${row1}</span>`
 }
 
 

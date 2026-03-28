@@ -105,3 +105,7 @@
 .mapWrap :global(.ac-label::before) {
   display: none;
 }
+.mapWrap :global(.ac-label .ac-label-sub) {
+  color: #8b949e;
+  font-size: 0.63rem;
+}
