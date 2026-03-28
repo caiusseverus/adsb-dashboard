@@ -75,6 +75,9 @@ function MiniMap({ icao, visitId }) {
       L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
         maxZoom: 18,
       }).addTo(mapRef.current)
+      // The container is inside a conditionally-rendered table row; Leaflet measures
+      // it before layout is fully settled. invalidateSize() forces a re-measure.
+      mapRef.current.invalidateSize()
     }
 
     const map = mapRef.current
@@ -90,6 +93,9 @@ function MiniMap({ icao, visitId }) {
         // Start/end markers
         L.circleMarker(latlngs[0], { radius: 5, color: '#3fb950', fillColor: '#3fb950', fillOpacity: 1, weight: 0 }).addTo(map)
         L.circleMarker(latlngs[latlngs.length - 1], { radius: 5, color: '#f85149', fillColor: '#f85149', fillOpacity: 1, weight: 0 }).addTo(map)
+        // Re-measure again before fitting bounds in case the table row expansion
+        // changed layout after the initial invalidateSize call above.
+        map.invalidateSize()
         map.fitBounds(L.polyline(latlngs).getBounds(), { padding: [16, 16] })
       })
       .catch(() => {})
