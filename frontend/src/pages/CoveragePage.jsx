@@ -1396,9 +1396,18 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
             lat:         null,
             lon:         null,
           }))
-          // Only backfill if no live data has arrived yet for this ICAO
-          if (!trails[track.icao]) {
+          // Prepend historical points; append any live points already collected
+          const live = trails[track.icao]
+          if (!live?.length) {
             trails[track.icao] = pts.slice(-MAX_TRAIL_PTS)
+          } else {
+            // live already has some points — prepend history that predates them
+            const liveStart = live[0].ts
+            const historical = pts.filter(p => p.ts < liveStart)
+            if (historical.length) {
+              const merged = [...historical, ...live]
+              trails[track.icao] = merged.slice(-MAX_TRAIL_PTS)
+            }
           }
         }
       })
