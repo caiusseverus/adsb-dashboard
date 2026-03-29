@@ -29,6 +29,7 @@ export default function PositionQualityPage() {
 
   useEffect(() => {
     let alive = true
+    let id = null
     const pull = async () => {
       try {
         const res = await fetch(`${API_BASE}/api/position-quality`)
@@ -40,17 +41,18 @@ export default function PositionQualityPage() {
         if (alive) setRows([])
       }
     }
-    pull()
-    const id = setInterval(pull, 1000)
-    return () => {
-      alive = false
-      clearInterval(id)
-    }
+    const start = () => { pull(); id = setInterval(pull, 1000) }
+    const stop  = () => clearInterval(id)
+    const onVisibility = () => document.hidden ? stop() : start()
+    document.addEventListener('visibilitychange', onVisibility)
+    if (!document.hidden) start()
+    return () => { alive = false; stop(); document.removeEventListener('visibilitychange', onVisibility) }
   }, [])
 
   useEffect(() => {
     if (!selectedIcao) return
     let alive = true
+    let id = null
     const pull = async () => {
       try {
         const res = await fetch(`${API_BASE}/api/position-quality/${selectedIcao}`)
@@ -61,12 +63,12 @@ export default function PositionQualityPage() {
         // ignored
       }
     }
-    pull()
-    const id = setInterval(pull, 1000)
-    return () => {
-      alive = false
-      clearInterval(id)
-    }
+    const start = () => { pull(); id = setInterval(pull, 1000) }
+    const stop  = () => clearInterval(id)
+    const onVisibility = () => document.hidden ? stop() : start()
+    document.addEventListener('visibilitychange', onVisibility)
+    if (!document.hidden) start()
+    return () => { alive = false; stop(); document.removeEventListener('visibilitychange', onVisibility) }
   }, [selectedIcao])
 
   const chartData = useMemo(

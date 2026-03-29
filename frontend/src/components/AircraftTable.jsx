@@ -1,14 +1,9 @@
 import { useState } from 'react'
 import styles from './AircraftTable.module.css'
 import { formatOperator } from '../utils/formatOperator'
+import { EMERGENCY_SQUAWKS } from '../utils/squawks'
 
 const WTC_CLASS = { L: styles.wtcL, M: styles.wtcM, H: styles.wtcH, J: styles.wtcJ }
-
-const EMERGENCY_SQUAWKS = {
-  '7700': 'General emergency',
-  '7600': 'Radio failure',
-  '7500': 'Hijack',
-}
 
 function WtcBadge({ wtc }) {
   if (!wtc) return null

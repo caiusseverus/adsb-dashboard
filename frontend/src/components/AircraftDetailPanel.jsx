@@ -3,14 +3,9 @@ import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import styles from './AircraftDetailPanel.module.css'
 import { formatOperator } from '../utils/formatOperator'
+import { EMERGENCY_SQUAWKS } from '../utils/squawks'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
-
-const EMERGENCY_SQUAWKS = {
-  '7700': 'General emergency',
-  '7600': 'Radio failure',
-  '7500': 'Hijack',
-}
 
 function fmtDateTime(unix) {
   if (!unix) return '—'

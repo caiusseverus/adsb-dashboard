@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import styles from './MlatScorecard.module.css'
 
 /**
@@ -60,10 +61,9 @@ function qualityBar(q) {
 }
 
 export default function MlatScorecard({ aircraft }) {
-  if (!aircraft?.length) return null
-
-  const rows = aggregateSources(aircraft)
-  if (rows.length === 0) return null
+  // useMemo must be called unconditionally — early return is on rows, not aircraft
+  const rows = useMemo(() => aggregateSources(aircraft ?? []), [aircraft])
+  if (!rows.length) return null
 
   return (
     <div className={styles.card}>
