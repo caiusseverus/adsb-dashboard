@@ -4,14 +4,19 @@ import {
   ResponsiveContainer, BarChart, Bar, Cell, AreaChart, Area, Legend,
 } from 'recharts'
 import DFHeatmap from '../components/DFHeatmap'
+import SignalHeatmap from '../components/SignalHeatmap'
 import styles from './ReceiverPage.module.css'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 
-// Beast RSSI byte: 0=strongest, 255=weakest
-// dBFS = -(raw / 2)  →  0 dBFS is full scale, -127.5 dBFS is minimum
+// Beast/readsb signal byte: 0=strongest, 255=weakest
+// readsb dBFS = 10 * log10((255 - raw) / 255)
 function rawToDbfs(raw) {
-  return raw != null ? Math.round(-raw / 2 * 10) / 10 : null
+  if (raw == null) return null
+  const clamped = Math.max(0, Math.min(255, Number(raw)))
+  const signalLevel = (255 - clamped) / 255
+  if (signalLevel <= 0) return -80.0
+  return Math.round(Math.log10(signalLevel) * 100) / 10
 }
 function fmtDbfs(raw) {
   const v = rawToDbfs(raw)
@@ -27,6 +32,16 @@ function signalColour(raw) {
   if (pct > 66) return '#3fb950'
   if (pct > 33) return '#d29922'
   return '#f85149'
+}
+
+function normalizePercentTriplet(adsbRaw, mlatRaw, noPosRaw) {
+  const values = [adsbRaw, mlatRaw, noPosRaw].map(v => {
+    const n = Number(v)
+    return Number.isFinite(n) ? n : 0
+  })
+  const total = values[0] + values[1] + values[2]
+  const scale = total > 0 && total <= 1.5 ? 100 : 1
+  return values.map(v => Math.max(0, Math.min(100, Math.round(v * scale * 10) / 10)))
 }
 
 function useFetch(url) {
@@ -621,18 +636,17 @@ function BaselineComparison({ snapshot }) {
 
   const current = snapshot ? {
     ac:      snapshot.aircraft_count,
-    msgs:    snapshot.msg_per_sec * 60,
-    signal:  snapshot.rate_history?.slice(-1)[0]?.signal_avg,
-    adsbPct: aircraft.length ? Math.round(aircraft.filter(a => a.callsign).length / aircraft.length * 100) : null,
-    regPct:  aircraft.length ? Math.round(aircraft.filter(a => a.registration).length / aircraft.length * 100) : null,
+    msgs:    snapshot.msg_per_sec,
+    mlat:    snapshot.mlat_aircraft_count,
+    withPos: aircraft.filter(a => a.lat != null).length,
+    today:   snapshot.unique_today,
   } : null
 
-  function Stat({ label, current, baseline, unit = '', isDbfs = false }) {
+  function Stat({ label, current, baseline, unit = '' }) {
     if (current == null) return null
-    const fmt = v => isDbfs ? `${v.toFixed(1)}` : Math.round(v)
+    const fmt = v => Math.round(v)
     const diff = baseline != null ? current - baseline : null
     const pct  = diff != null && Math.abs(baseline) > 0.1 ? Math.round((diff / Math.abs(baseline)) * 100) : null
-    // For dBFS: less negative = stronger = better, so positive diff = better
     const colour = diff == null ? '#8b949e' : diff >= 0 ? '#3fb950' : '#f85149'
     return (
       <div className={styles.baselineStat}>
@@ -648,20 +662,15 @@ function BaselineComparison({ snapshot }) {
     )
   }
 
-  // Convert raw RSSI byte to dBFS for display
-  const currentSigDbfs = current?.signal != null ? rawToDbfs(current.signal) : null
-  const baseSigDbfs    = base?.sig_avg   != null ? rawToDbfs(base.sig_avg)   : null
-
   return (
     <Card title={`Current vs 30-day baseline — hour ${currentHour}:00`}>
       {loading || !base || !current ? <Empty loading={loading} /> : (
         <div className={styles.baselineGrid}>
-          <Stat label="Aircraft"       current={current.ac}          baseline={base.ac_avg} />
-          <Stat label="Msgs / min"     current={current.msgs}        baseline={base.msg_avg * 60} />
-          <Stat label="Signal"         current={currentSigDbfs}      baseline={baseSigDbfs}
-            unit=" dB" isDbfs />
-          <Stat label="ADS-B equipped" current={current.adsbPct}     unit="%" />
-          <Stat label="Reg resolved"   current={current.regPct}      unit="%" />
+          <Stat label="Aircraft"    current={current.ac}      baseline={base.ac_avg} />
+          <Stat label="Msgs/s"      current={current.msgs}    baseline={base.msg_avg} />
+          <Stat label="MLAT"        current={current.mlat}    baseline={base.mlat_avg} />
+          <Stat label="With pos"    current={current.withPos} />
+          <Stat label="Unique today" current={current.today} />
         </div>
       )}
     </Card>
@@ -707,10 +716,11 @@ function PositionDecodeRate({ days, onDaysChange }) {
   const chartData = useMemo(() => {
     if (!data?.length) return []
     return data.map(d => ({
-      date:   d.date,
-      adsb:   d.adsb_pct   ?? 0,
-      mlat:   d.mlat_pct   ?? 0,
-      no_pos: d.no_pos_pct ?? 0,
+      date: d.date,
+      ...(() => {
+        const [adsb, mlat, no_pos] = normalizePercentTriplet(d.adsb_pct, d.mlat_pct, d.no_pos_pct)
+        return { adsb, mlat, no_pos }
+      })(),
     }))
   }, [data])
 
@@ -729,7 +739,8 @@ function PositionDecodeRate({ days, onDaysChange }) {
               <CartesianGrid stroke="#21262d" vertical={false} />
               <XAxis dataKey="date" tick={{ fill: '#484f58', fontSize: 10 }}
                 interval={Math.max(0, Math.floor(chartData.length / 6))} />
-              <YAxis domain={[0, 100]} tick={{ fill: '#484f58', fontSize: 11 }} width={44}
+              <YAxis domain={[0, 100]} ticks={[0, 25, 50, 75, 100]}
+                tick={{ fill: '#484f58', fontSize: 11 }} width={52}
                 tickFormatter={v => `${v}%`} />
               <Tooltip
                 contentStyle={{ background: '#161b22', border: '1px solid #30363d', fontSize: 12 }}
@@ -787,6 +798,7 @@ export default function ReceiverPage({ snapshot }) {
         <PositionDecodeRate    days={decodeDays}   onDaysChange={setDecodeDays} />
       </div>
       <DFHeatmap />
+      <SignalHeatmap />
     </main>
   )
 }

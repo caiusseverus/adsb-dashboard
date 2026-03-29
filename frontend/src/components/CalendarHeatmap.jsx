@@ -32,6 +32,7 @@ function buildWeeks(dataByDate, months) {
   const back = dow === 0 ? 6 : dow - 1
   start.setDate(start.getDate() - back)
 
+  const now = new Date()
   const weeks = []
   const cur = new Date(start)
   while (cur <= end) {
@@ -41,7 +42,7 @@ function buildWeeks(dataByDate, months) {
       week.push({
         date: dateStr,
         value: dataByDate[dateStr] ?? null,
-        future: cur > new Date(),
+        future: cur > now,
       })
       cur.setDate(cur.getDate() + 1)
     }

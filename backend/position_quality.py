@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import time
 import urllib.request
 from collections import deque
@@ -16,26 +15,13 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 
 import config
+from utils_geo import haversine_nm as _haversine_nm
 
 router = APIRouter(prefix="/api/position-quality")
 log = logging.getLogger(__name__)
 
 _state = None
 _checker = None
-
-_R_NM = 3440.065
-
-
-def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = (
-        math.sin(dlat / 2) ** 2
-        + math.cos(math.radians(lat1))
-        * math.cos(math.radians(lat2))
-        * math.sin(dlon / 2) ** 2
-    )
-    return _R_NM * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 class PositionQualityChecker:

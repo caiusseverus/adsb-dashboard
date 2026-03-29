@@ -470,6 +470,299 @@ function MaintenanceSection() {
 }
 
 // ---------------------------------------------------------------------------
+// Cast section
+// ---------------------------------------------------------------------------
+const MATCH_TYPE_LABELS = {
+  icao:        'Specific ICAO',
+  military:    'Military aircraft',
+  watchlist:   'Watchlist aircraft',
+  interesting: 'Interesting aircraft',
+  emergency:   'Emergency squawk',
+  any:         'Any aircraft',
+}
+const MATCH_TYPES = Object.keys(MATCH_TYPE_LABELS)
+
+function CastSection() {
+  const [cfg, setCfg] = useState({
+    device_name: '', lan_url: '', display_seconds: 30,
+    cooldown_minutes: 30, active_hours_start: '', active_hours_end: '',
+  })
+  const [devices,   setDevices]   = useState([])
+  const [scanning,  setScanning]  = useState(false)
+  const [cfgSaving, setCfgSaving] = useState(false)
+  const [cfgMsg,    setCfgMsg]    = useState(null)
+  const [rules,     setRules]     = useState([])
+  const [newRule,   setNewRule]   = useState({ match_type: 'military', match_value: '', max_range_nm: '', max_altitude_ft: '' })
+  const [addingRule, setAddingRule] = useState(false)
+  const [rulesErr,  setRulesErr]  = useState(null)
+
+  const loadRules = useCallback(() => {
+    fetch(`${API_BASE}/api/cast/rules`)
+      .then(r => r.ok ? r.json() : { rules: [] })
+      .then(d => setRules(d.rules || []))
+      .catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    fetch(`${API_BASE}/api/cast/config`)
+      .then(r => r.ok ? r.json() : {})
+      .then(d => setCfg(c => ({ ...c, ...d })))
+      .catch(() => {})
+    loadRules()
+  }, [loadRules])
+
+  const scan = async () => {
+    setScanning(true)
+    try {
+      const r = await fetch(`${API_BASE}/api/cast/devices`)
+      const d = r.ok ? await r.json() : { devices: [] }
+      setDevices(d.devices || [])
+    } finally {
+      setScanning(false)
+    }
+  }
+
+  const saveConfig = async () => {
+    setCfgSaving(true); setCfgMsg(null)
+    try {
+      const r = await fetch(`${API_BASE}/api/cast/config`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...cfg,
+          display_seconds:  Number(cfg.display_seconds),
+          cooldown_minutes: Number(cfg.cooldown_minutes),
+        }),
+      })
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}))
+        setCfgMsg({ ok: false, text: d.detail || `Error ${r.status}` })
+      } else {
+        setCfgMsg({ ok: true, text: 'Saved' })
+        setTimeout(() => setCfgMsg(null), 2000)
+      }
+    } catch (e) {
+      setCfgMsg({ ok: false, text: String(e) })
+    } finally {
+      setCfgSaving(false)
+    }
+  }
+
+  const addRule = async () => {
+    setAddingRule(true); setRulesErr(null)
+    try {
+      const r = await fetch(`${API_BASE}/api/cast/rules`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          match_type:      newRule.match_type,
+          match_value:     newRule.match_type === 'icao' ? newRule.match_value.trim().toUpperCase() : null,
+          max_range_nm:    newRule.max_range_nm    ? parseFloat(newRule.max_range_nm)    : null,
+          max_altitude_ft: newRule.max_altitude_ft ? parseInt(newRule.max_altitude_ft)   : null,
+        }),
+      })
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}))
+        setRulesErr(d.detail || `Error ${r.status}`)
+      } else {
+        setNewRule({ match_type: 'military', match_value: '', max_range_nm: '', max_altitude_ft: '' })
+        loadRules()
+      }
+    } catch (e) {
+      setRulesErr(String(e))
+    } finally {
+      setAddingRule(false)
+    }
+  }
+
+  const toggleRule = async (rule) => {
+    await fetch(`${API_BASE}/api/cast/rules/${rule.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...rule, enabled: !rule.enabled }),
+    })
+    loadRules()
+  }
+
+  const deleteRule = async (id) => {
+    await fetch(`${API_BASE}/api/cast/rules/${id}`, { method: 'DELETE' })
+    loadRules()
+  }
+
+  const inputSt  = { background: '#0b0c10', border: '1px solid #30363d', borderRadius: 6, color: '#c9d1d9', fontSize: '0.82rem', padding: '0.35rem 0.6rem' }
+  const selectSt = { ...inputSt, cursor: 'pointer' }
+
+  return (
+    <div className={styles.card}>
+      <div className={styles.cardHeader}>
+        <span className={styles.cardTitle}>Chromecast display</span>
+        {cfgSaving && <span className={styles.saving}>Saving…</span>}
+      </div>
+      <p className={styles.hint}>
+        Cast an aircraft photo and details to a Chromecast when a rule matches.
+        The backend must be reachable by the Chromecast at the LAN URL configured below.
+      </p>
+
+      {/* Config fields */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem', marginBottom: '1rem' }}>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+          <label className={styles.fieldLabel} style={{ minWidth: 120 }}>Device</label>
+          {devices.length > 0 ? (
+            <select style={{ ...selectSt, minWidth: 200 }}
+              value={cfg.device_name}
+              onChange={e => setCfg(c => ({ ...c, device_name: e.target.value }))}
+            >
+              <option value="">— select device —</option>
+              {devices.map(d => <option key={d} value={d}>{d}</option>)}
+            </select>
+          ) : (
+            <input style={{ ...inputSt, minWidth: 200 }}
+              placeholder="e.g. Living Room TV"
+              value={cfg.device_name}
+              onChange={e => setCfg(c => ({ ...c, device_name: e.target.value }))}
+            />
+          )}
+          <button className={styles.addBtn} onClick={scan} disabled={scanning}>
+            {scanning ? 'Scanning…' : 'Scan LAN'}
+          </button>
+          {devices.length > 0 && (
+            <span className={styles.saving}>{devices.length} device{devices.length !== 1 ? 's' : ''} found</span>
+          )}
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+          <label className={styles.fieldLabel} style={{ minWidth: 120 }}>Backend LAN URL</label>
+          <input style={{ ...inputSt, minWidth: 260 }}
+            placeholder="http://192.168.1.x:8000"
+            value={cfg.lan_url}
+            onChange={e => setCfg(c => ({ ...c, lan_url: e.target.value }))}
+          />
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '1.5rem', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <label className={styles.rangeLabel}>Display for</label>
+            <input type="number" className={styles.rangeInput} min={5} step={5}
+              value={cfg.display_seconds}
+              onChange={e => setCfg(c => ({ ...c, display_seconds: e.target.value }))}
+            />
+            <span className={styles.rangeUnit}>seconds</span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <label className={styles.rangeLabel}>Cooldown</label>
+            <input type="number" className={styles.rangeInput} min={1} step={1}
+              value={cfg.cooldown_minutes}
+              onChange={e => setCfg(c => ({ ...c, cooldown_minutes: e.target.value }))}
+            />
+            <span className={styles.rangeUnit}>min / aircraft</span>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+          <label className={styles.rangeLabel} style={{ minWidth: 120 }}>Active hours</label>
+          <input type="time" style={{ ...inputSt, width: 110 }}
+            value={cfg.active_hours_start}
+            onChange={e => setCfg(c => ({ ...c, active_hours_start: e.target.value }))}
+          />
+          <span className={styles.rangeUnit}>to</span>
+          <input type="time" style={{ ...inputSt, width: 110 }}
+            value={cfg.active_hours_end}
+            onChange={e => setCfg(c => ({ ...c, active_hours_end: e.target.value }))}
+          />
+          <span className={styles.rangeUnit}>(blank = always active)</span>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          <button className={styles.saveBtn} onClick={saveConfig} disabled={cfgSaving}>
+            Save settings
+          </button>
+          {cfgMsg && <span className={cfgMsg.ok ? styles.msgOk : styles.msgErr}>{cfgMsg.text}</span>}
+        </div>
+      </div>
+
+      {/* Rules */}
+      <div className={styles.cardHeader}
+        style={{ borderTop: '1px solid #21262d', paddingTop: '0.75rem', marginTop: '0.25rem' }}>
+        <span className={styles.cardTitle}>Cast rules</span>
+        <span className={styles.count}>{rules.length}</span>
+      </div>
+      <p className={styles.hint}>
+        Aircraft matching any enabled rule will trigger a cast. Leave range blank to match at any distance.
+      </p>
+
+      <div className={styles.addRow}>
+        <select style={selectSt}
+          value={newRule.match_type}
+          onChange={e => setNewRule(r => ({ ...r, match_type: e.target.value, match_value: '' }))}
+        >
+          {MATCH_TYPES.map(t => <option key={t} value={t}>{MATCH_TYPE_LABELS[t]}</option>)}
+        </select>
+        {newRule.match_type === 'icao' && (
+          <input className={styles.icaoInput}
+            placeholder="ICAO hex"
+            value={newRule.match_value}
+            onChange={e => setNewRule(r => ({ ...r, match_value: e.target.value.toUpperCase().slice(0, 6) }))}
+            maxLength={6} spellCheck={false}
+          />
+        )}
+        <input type="number" className={styles.rangeInput}
+          placeholder="range (nm)" min={0} step={1}
+          value={newRule.max_range_nm}
+          onChange={e => setNewRule(r => ({ ...r, max_range_nm: e.target.value }))}
+        />
+        <span className={styles.rangeUnit}>nm</span>
+        <input type="number" className={styles.rangeInput}
+          placeholder="max alt (ft)" min={0} step={500}
+          value={newRule.max_altitude_ft}
+          onChange={e => setNewRule(r => ({ ...r, max_altitude_ft: e.target.value }))}
+        />
+        <span className={styles.rangeUnit}>ft</span>
+        <button className={styles.addBtn} onClick={addRule} disabled={addingRule}>
+          {addingRule ? 'Adding…' : 'Add rule'}
+        </button>
+        {rulesErr && <span className={styles.errorMsg}>{rulesErr}</span>}
+      </div>
+
+      {rules.length === 0 ? (
+        <div className={styles.empty}>No cast rules configured.</div>
+      ) : (
+        <table className={styles.table}>
+          <thead>
+            <tr>
+              <th>Match</th>
+              <th>Value</th>
+              <th className={styles.num}>Max range</th>
+              <th className={styles.num}>Max alt</th>
+              <th>On</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {rules.map(rule => (
+              <tr key={rule.id}>
+                <td>{MATCH_TYPE_LABELS[rule.match_type] ?? rule.match_type}</td>
+                <td className={styles.icao}>{rule.match_value || '—'}</td>
+                <td className={styles.num}>{rule.max_range_nm != null ? `${rule.max_range_nm} nm` : 'any'}</td>
+                <td className={styles.num}>{rule.max_altitude_ft != null ? `${rule.max_altitude_ft.toLocaleString()} ft` : 'any'}</td>
+                <td>
+                  <label className={styles.toggle}>
+                    <input type="checkbox" checked={!!rule.enabled} onChange={() => toggleRule(rule)} />
+                  </label>
+                </td>
+                <td>
+                  <button className={styles.removeBtn} onClick={() => deleteRule(rule.id)}>Remove</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Page root
 // ---------------------------------------------------------------------------
 export default function SettingsPage() {
@@ -477,6 +770,7 @@ export default function SettingsPage() {
     <main className={styles.main}>
       <TriggersSection />
       <WatchlistSection />
+      <CastSection />
       <BackupSection />
       <MaintenanceSection />
     </main>

@@ -125,6 +125,45 @@ export default function BenchmarkPanel() {
   const timerRef  = useRef(null)
   const startedAt = useRef(null)
 
+  const stopPolling = useCallback(() => {
+    clearInterval(pollRef.current)
+    clearInterval(timerRef.current)
+  }, [])
+
+  const startPolling = useCallback(() => {
+    stopPolling()
+    startedAt.current = Date.now()
+    setRunning(true)
+    setElapsed(0)
+
+    // Elapsed-time ticker
+    timerRef.current = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startedAt.current) / 1000))
+    }, 500)
+
+    // Poll status every 800ms; fetch result when done
+    pollRef.current = setInterval(async () => {
+      try {
+        const sr = await fetch(`${API_BASE}/api/debug/benchmark/status`)
+        if (!sr.ok) throw new Error(`HTTP ${sr.status}`)
+        const s = await sr.json()
+        if (!s.running) {
+          stopPolling()
+          setRunning(false)
+          // Fetch the completed result
+          const dr = await fetch(`${API_BASE}/api/debug/benchmark`)
+          if (!dr.ok) throw new Error(`HTTP ${dr.status}`)
+          const d = await dr.json()
+          setResult(d)
+        }
+      } catch {
+        stopPolling()
+        setRunning(false)
+        setError('Lost connection while benchmark was running')
+      }
+    }, 800)
+  }, [stopPolling])
+
   // On mount, fetch cached result / status without triggering a run
   useEffect(() => {
     fetch(`${API_BASE}/api/debug/benchmark/status`)
@@ -143,42 +182,7 @@ export default function BenchmarkPanel() {
       })
       .catch(() => {})
     return stopPolling
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
-
-  const startPolling = useCallback(() => {
-    stopPolling()
-    startedAt.current = Date.now()
-    setRunning(true)
-    setElapsed(0)
-
-    // Elapsed-time ticker
-    timerRef.current = setInterval(() => {
-      setElapsed(Math.floor((Date.now() - startedAt.current) / 1000))
-    }, 500)
-
-    // Poll status every 800ms; fetch result when done
-    pollRef.current = setInterval(async () => {
-      try {
-        const s = await fetch(`${API_BASE}/api/debug/benchmark/status`).then(r => r.json())
-        if (!s.running) {
-          stopPolling()
-          setRunning(false)
-          // Fetch the completed result
-          const d = await fetch(`${API_BASE}/api/debug/benchmark`).then(r => r.json())
-          setResult(d)
-        }
-      } catch {
-        stopPolling()
-        setRunning(false)
-        setError('Lost connection while benchmark was running')
-      }
-    }, 800)
-  }, [])
-
-  const stopPolling = useCallback(() => {
-    clearInterval(pollRef.current)
-    clearInterval(timerRef.current)
-  }, [])
+  }, [startPolling, stopPolling])
 
   const handleRun = useCallback(async (fresh = true) => {
     setError(null)
@@ -303,6 +307,7 @@ export default function BenchmarkPanel() {
           <div style={{ color: '#484f58', fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.06em', padding: '0.5rem 0 0.2rem' }}>Environment</div>
           <EnvRow label="Python"         value={result.python_version} />
           <EnvRow label="orjson"         value={result.orjson ? `✓ ${result.orjson_version}` : '✗ not installed'} ok={result.orjson} warn={!result.orjson} />
+          <EnvRow label="Native C decoder" value={result.native_c_decoder ? '✓ decode_cffi active' : '✗ pyModeS fallback active'} ok={result.native_c_decoder} warn={!result.native_c_decoder} />
           <EnvRow label="pyModeS"        value={result.pymodes_version} />
           <EnvRow label="pyModeS Cython" value={result.pymodes_cython ? '✓ C extension loaded' : '✗ pure Python — install pyModeS[cython]'} ok={result.pymodes_cython} warn={!result.pymodes_cython} />
           <EnvRow label="Warm aircraft"  value={result.warm_aircraft_count} />

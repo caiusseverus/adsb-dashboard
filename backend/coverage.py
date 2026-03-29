@@ -8,11 +8,12 @@ GET /api/coverage/coastline           — coastlines + borders projected to bear
 
 import asyncio
 import json
-import math
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 from db import stats_db
+import config
+from utils_geo import haversine_nm as _haversine_nm, bearing_deg as _bearing_deg
 
 # ── Coastline helpers ────────────────────────────────────────────────────────
 
@@ -30,22 +31,6 @@ def _load_coastline() -> list:
             _coastline_cache = []
     return _coastline_cache
 
-
-def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 3440.065  # Earth radius in nautical miles
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlam = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(min(1.0, a)))
-
-
-def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dlam = math.radians(lon2 - lon1)
-    x = math.sin(dlam) * math.cos(phi2)
-    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlam)
-    return (math.degrees(math.atan2(x, y)) + 360) % 360
 
 
 def _project_coastline(range_nm: float) -> dict:
@@ -163,13 +148,30 @@ async def coverage_flow(
 
 @router.get("/points")
 async def coverage_points(
-    days:       int = Query(default=30,     ge=1,    le=365),
-    max_points: int = Query(default=100000, ge=10000, le=500000),
+    days:                 int        = Query(default=30,     ge=1,    le=365),
+    max_points:           int        = Query(default=100000, ge=10000, le=500000),
+    military:             bool       = Query(default=False),
+    mlat:                 bool       = Query(default=False),
+    operator:             str | None = Query(default=None),
+    type_codes:           str | None = Query(default=None),   # comma-separated
+    type_category_prefix: str | None = Query(default=None),   # e.g. "H" for rotary
+    icao:                 str | None = Query(default=None),
 ) -> dict:
     """Downsampled coverage points for the 3-D coverage view.
-    Returns flat list-of-lists [bearing_deg, range_nm, altitude_ft, military, interesting]
-    to minimise payload size."""
-    return await asyncio.to_thread(stats_db.query_coverage_points, days, max_points)
+    military, mlat, operator, type_codes, type_category_prefix, or icao filters return all
+    matching points unsampled (stride=1)."""
+    tc_list = [c.strip() for c in type_codes.split(",") if c.strip()] if type_codes else None
+    result = await asyncio.to_thread(
+        stats_db.query_coverage_points, days, max_points,
+        True if military else None,
+        operator or None,
+        tc_list or None,
+        type_category_prefix or None,
+        mlat,
+        icao.strip().upper() if icao else None,
+    )
+    result["receiver_alt_ft"] = config.RECEIVER_ALT_FT
+    return result
 
 
 @router.get("/coastline")

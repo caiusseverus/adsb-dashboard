@@ -9,8 +9,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import pytest
-from enrichment import _ICAO_COUNTRY_RANGES, _CR_LO, _CR_HI, _CR_NAME
+from enrichment import _CR_LO, _CR_HI, _CR_NAME
 import bisect
 
 

@@ -1,14 +1,9 @@
 import { useState } from 'react'
 import styles from './AircraftTable.module.css'
 import { formatOperator } from '../utils/formatOperator'
+import { EMERGENCY_SQUAWKS } from '../utils/squawks'
 
 const WTC_CLASS = { L: styles.wtcL, M: styles.wtcM, H: styles.wtcH, J: styles.wtcJ }
-
-const EMERGENCY_SQUAWKS = {
-  '7700': 'General emergency',
-  '7600': 'Radio failure',
-  '7500': 'Hijack',
-}
 
 function WtcBadge({ wtc }) {
   if (!wtc) return null
@@ -121,7 +116,6 @@ export default function AircraftTable({ aircraft, onSelectIcao, queueSize = 0 })
       <div className={styles.heading}>
         Live Aircraft
         <span className={styles.count}>{filtered.length}</span>
-        {filter === 'all' && aircraft.length !== filtered.length && null}
         <span className={styles.filterGroup}>
           {FILTERS.map(f => (
             <button
@@ -211,6 +205,11 @@ export default function AircraftTable({ aircraft, onSelectIcao, queueSize = 0 })
             {aircraft.length === 0 && (
               <tr>
                 <td colSpan={15} className={styles.empty}>No aircraft tracked yet</td>
+              </tr>
+            )}
+            {aircraft.length > 0 && filtered.length === 0 && (
+              <tr>
+                <td colSpan={15} className={styles.empty}>No aircraft match this filter</td>
               </tr>
             )}
           </tbody>

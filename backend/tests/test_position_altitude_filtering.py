@@ -193,3 +193,117 @@ class TestSnapshotPublication:
 
         assert snapshot["aircraft"][0]["lat"] == pytest.approx(51.5, abs=0.001)
         assert snapshot["aircraft"][0]["lon"] == pytest.approx(-0.1, abs=0.001)
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: _accept_altitude() — tighter no-vrate window and override ceiling
+# ---------------------------------------------------------------------------
+
+class TestAcceptAltitude:
+
+    def _make_alt_ac(self, altitude=None, alt_reliable=0, alt_ts=0.0,
+                     alt_source=None, mlat=False):
+        """Minimal Aircraft for altitude testing."""
+        ac = make_ac(mlat=mlat)
+        ac.altitude = altitude
+        ac.alt_reliable = alt_reliable
+        ac._alt_ts = alt_ts
+        ac._alt_source = alt_source
+        ac._vrate_baro_fpm = None
+        ac._vrate_baro_ts = 0.0
+        ac._vrate_geom_fpm = None
+        ac._vrate_geom_ts = 0.0
+        ac.max_altitude = altitude
+        ac.last_alt_ts = alt_ts
+        return ac
+
+    # --- First altitude always accepted ---
+
+    def test_first_altitude_accepted(self):
+        """No prior altitude → delta=0 → unconditional accept."""
+        ac = self._make_alt_ac(altitude=None)
+        result = _accept_altitude(ac, alt=35000, source=MsgSource.ADSB,
+                                   crc_clean=True, now=1000.0)
+        assert result is True
+        assert ac.altitude == 35000
+
+    # --- Small delta always accepted ---
+
+    def test_small_delta_accepted_regardless_of_rate(self):
+        """Delta < 300ft is unconditionally accepted (no rate check)."""
+        ac = self._make_alt_ac(altitude=35000, alt_reliable=10, alt_ts=999.0)
+        result = _accept_altitude(ac, alt=35200, source=MsgSource.ADSB,
+                                   crc_clean=True, now=1000.0)
+        assert result is True
+        assert ac.altitude == 35200
+
+    # --- Tighter no-vrate fallback window (was ±12500, now ±3000 fpm) ---
+
+    def test_implausible_rate_rejected_when_no_vrate(self):
+        """
+        Large altitude jump with no vrate data.
+        Implied rate: (35000-25000)ft / 1s * 600 / (10+10) = 300,000 fpm >> 3000.
+        Must be rejected.
+        """
+        ac = self._make_alt_ac(altitude=35000, alt_reliable=10, alt_ts=999.0)
+        # No vrate data set (both _vrate_baro_fpm and _vrate_geom_fpm are None)
+        result = _accept_altitude(ac, alt=25000, source=MsgSource.MODE_S,
+                                   crc_clean=False, now=1000.0)
+        assert result is False
+        assert ac.altitude == 35000  # unchanged
+
+    def test_plausible_rate_accepted_when_no_vrate(self):
+        """
+        Gentle climb within the 3000 fpm window should still be accepted.
+        Delta 300ft over 30s → implied rate = 300*600/(300+10) ≈ 581 fpm < 3000.
+        """
+        ac = self._make_alt_ac(altitude=35000, alt_reliable=10, alt_ts=970.0)
+        result = _accept_altitude(ac, alt=35300, source=MsgSource.ADSB,
+                                   crc_clean=True, now=1000.0)
+        assert result is True
+        assert ac.altitude == 35300
+
+    # --- good_crc override ceiling (was unlimited, now ≤ 6000 fpm) ---
+
+    def test_good_crc_override_blocked_for_impossible_rate(self):
+        """
+        CRC-clean ADS-B message (good_crc=20) must not override history if
+        implied rate > 6000 fpm. This is the coverage-edge teleport scenario.
+
+        Setup: aircraft at 35000ft, alt_reliable=5 (good_crc=20 > 5, so override
+        path fires in old code). New message: 25000ft 1 second later.
+        Rate ≈ 300,000 fpm >> 6000 → must be rejected even though good_crc > alt_reliable.
+        """
+        ac = self._make_alt_ac(altitude=35000, alt_reliable=5, alt_ts=999.0,
+                                alt_source=MsgSource.ADSB)
+        result = _accept_altitude(ac, alt=25000, source=MsgSource.ADSB,
+                                   crc_clean=True, now=1000.0)
+        assert result is False
+        assert ac.altitude == 35000
+
+    def test_good_crc_override_allowed_for_plausible_rate(self):
+        """
+        CRC-clean override path must still work for physically plausible rates.
+        Delta 300ft over 30s → ~581 fpm < 6000 fpm → override allowed.
+        """
+        ac = self._make_alt_ac(altitude=35000, alt_reliable=3, alt_ts=970.0,
+                                alt_source=MsgSource.MODE_S)
+        # ADSB source with clean CRC → good_crc computed inside _accept_altitude
+        # good_crc > alt_reliable(3) → override path. Rate plausible → accept.
+        result = _accept_altitude(ac, alt=35300, source=MsgSource.ADSB,
+                                   crc_clean=True, now=1000.0)
+        assert result is True
+        assert ac.altitude == 35300
+
+    # --- source override ceiling ---
+
+    def test_source_override_blocked_for_impossible_rate(self):
+        """
+        Better source (ADSB > MODE_S) must not override if rate > 6000 fpm.
+        """
+        ac = self._make_alt_ac(altitude=35000, alt_reliable=15, alt_ts=999.0,
+                                alt_source=MsgSource.MODE_S)
+        result = _accept_altitude(ac, alt=25000, source=MsgSource.ADSB,
+                                   crc_clean=True, now=1000.0)
+        assert result is False
+        assert ac.altitude == 35000

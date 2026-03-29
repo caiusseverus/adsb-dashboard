@@ -50,8 +50,15 @@ _decoder_resume.set()                 # starts in running state
 
 
 def make_pause_aware_decoder(msg_queue, state, sentinel):
-    """Return a _run() function for the decoder thread that honours pause events."""
+    """Return a _run() function for the decoder thread that honours pause events.
+
+    Drains up to DECODE_BATCH_SIZE messages per lock acquisition to reduce
+    per-message lock/GIL overhead at high message rates.  Set DECODE_BATCH_SIZE=1
+    to restore single-message behaviour.
+    """
     import logging
+    import queue as _queue
+    import config
     log = logging.getLogger(__name__)
 
     def _run() -> None:
@@ -60,14 +67,27 @@ def make_pause_aware_decoder(msg_queue, state, sentinel):
             if item is sentinel:
                 log.debug("beast-decoder: shutdown sentinel received")
                 return
-            # Finish the current message first so _lock is never held across
-            # the wait — avoids deadlock with get_snapshot().
+            # Check pause after completing the current item — avoids holding
+            # _lock across the wait, which would deadlock with get_snapshot().
             if _decoder_paused.is_set():
                 log.debug("beast-decoder: paused for benchmark")
                 _decoder_resume.wait()
                 log.debug("beast-decoder: resumed")
-            msg, mlat_source = item
-            state.process_message(msg, mlat_source)
+
+            batch = [item]
+            for _ in range(config.DECODE_BATCH_SIZE - 1):
+                try:
+                    next_item = msg_queue.get_nowait()
+                    if next_item is sentinel:
+                        # Process current batch then exit cleanly
+                        state.process_messages_batch(batch)
+                        log.debug("beast-decoder: shutdown sentinel received mid-batch")
+                        return
+                    batch.append(next_item)
+                except _queue.Empty:
+                    break
+
+            state.process_messages_batch(batch)
 
     return _run
 
@@ -352,7 +372,8 @@ def run_benchmark(n_msgs: int = 5000, paused: bool = False) -> dict:
         Should be True when called from the HTTP endpoint after the decoder
         has been paused via DecoderPaused.  Recorded in results for display.
     """
-    import platform, sys
+    import platform
+    import sys
 
     results: dict[str, Any] = {
         "n_msgs":                    n_msgs,
@@ -375,13 +396,21 @@ def run_benchmark(n_msgs: int = 5000, paused: bool = False) -> dict:
         import pyModeS
         results["pymodes_version"] = getattr(pyModeS, "__version__", "?")
         try:
-            from pyModeS.c_decoder import common as _  # type: ignore
+            import pyModeS.c_common  # type: ignore  # pyModeS 2.9 extension location
             results["pymodes_cython"] = True
         except ImportError:
             results["pymodes_cython"] = False
     except Exception:
         results["pymodes_version"] = "?"
         results["pymodes_cython"]  = False
+
+    # Primary decode path used by AircraftState: native readsb-derived C library
+    # via decode_cffi when available, otherwise pyModeS fallback.
+    try:
+        import aircraft_state as _as
+        results["native_c_decoder"] = bool(getattr(_as, "_NATIVE_DECODE", False))
+    except Exception:
+        results["native_c_decoder"] = False
 
     t_start = time.perf_counter()
 

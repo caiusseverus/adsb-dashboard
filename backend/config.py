@@ -59,6 +59,16 @@ _rlat = os.getenv("RECEIVER_LAT")
 _rlon = os.getenv("RECEIVER_LON")
 RECEIVER_LAT: Optional[float] = float(_rlat) if _rlat else None
 RECEIVER_LON: Optional[float] = float(_rlon) if _rlon else None
+def _parse_alt_ft(val: str) -> float:
+    """Parse altitude: '32m' → feet, '106ft' → feet, bare number → feet."""
+    v = val.strip().lower()
+    if v.endswith('m'):
+        return float(v[:-1]) * 3.28084
+    if v.endswith('ft'):
+        return float(v[:-2])
+    return float(v)
+
+RECEIVER_ALT_FT: float = _parse_alt_ft(os.getenv("RECEIVER_ALT_FT", "0"))
 
 # DEBUG_ENRICHMENT: 0=off, 1=all (enrichment + ACAS), 2=ACAS only
 # Accepts integer (0/1/2) or boolean-style string (true/false)
@@ -155,6 +165,71 @@ REGISTRY_FLUSH_SECONDS: float = float(os.getenv("REGISTRY_FLUSH_SECONDS", "300")
 READSB_AIRCRAFT_JSON_PATH: str = os.getenv("READSB_AIRCRAFT_JSON_PATH", "/run/readsb/aircraft.json")
 READSB_AIRCRAFT_JSON_URL: str = os.getenv("READSB_AIRCRAFT_JSON_URL", "http://adsbpi.local/tar1090/data/aircraft.json")
 
+# ---------------------------------------------------------------------------
+# Ingest mode (Phase 3)
+# ---------------------------------------------------------------------------
+# beast   — decode raw Beast TCP stream (current behaviour, default)
+# readsb  — poll readsb JSON files; no Beast connection
+# hybrid  — readsb JSON for positions + Beast/MLAT for ACAS/raw DF counts
+INGEST_MODE: str = os.getenv("INGEST_MODE", "beast").lower()
+# Directory written by readsb (aircraft.json, stats.json, receiver.json).
+READSB_JSON_DIR: str = os.getenv("READSB_JSON_DIR", "/run/readsb")
+# Path to airspy_adsb stats.json — optional, only present on Airspy SDR installs.
+AIRSPY_STATS_PATH: str = os.getenv("AIRSPY_STATS_PATH", "/run/airspy_adsb/stats.json")
+# How often to poll aircraft.json (seconds); should match readsb's --write-json interval.
+READSB_POLL_INTERVAL_S: float = float(os.getenv("READSB_POLL_INTERVAL_S", "1.0"))
+
 # Maximum range (nm) from the receiver for accepted ADS-B positions.
 # Mirrors readsb's receiver_range config; 300 nm is a typical ADS-B horizon.
 MAX_RANGE_NM: float = float(os.getenv("MAX_RANGE_NM", "300"))
+
+# ---------------------------------------------------------------------------
+# Hi-res timelapse buffer
+# ---------------------------------------------------------------------------
+# How long to retain in-memory position samples.  12 h is the default
+# (down from the original 24 h) to halve worst-case RAM usage.
+HIRES_MAX_AGE_S: int = int(os.getenv("HIRES_MAX_AGE_S", "43200"))
+# Hard cap on total points across all ICAOs.  When hit, new samples are
+# dropped until old data ages out.  500 k points ≈ 100–200 MB Python RSS
+# depending on GC pressure; reduce if running on a constrained device.
+# Set to 0 or leave unset to disable the cap and rely solely on age-based eviction.
+_hmp = os.getenv("HIRES_MAX_POINTS", "")
+HIRES_MAX_POINTS: int | None = int(_hmp) if _hmp.strip() and int(_hmp) > 0 else None
+
+# Per-client WebSocket send timeout.  Clients that can't accept a payload
+# within this window are disconnected — prevents one stalled browser from
+# blocking the broadcast to all other clients.
+WS_SEND_TIMEOUT_S: float = float(os.getenv("WS_SEND_TIMEOUT_S", "2.0"))
+
+# How often to push a snapshot to WebSocket clients (seconds).
+# Default 1.0 s.  Pi deployments can set 1.5 or 2.0 to halve broadcast CPU.
+PUSH_INTERVAL_S: float = float(os.getenv("PUSH_INTERVAL_S", "1.0"))
+
+# Force snapshot mode for broadcast, overriding the memory-policy auto-detection.
+# Valid values: full, reduced, thin.  Leave empty to use auto-detection (default).
+SNAPSHOT_MODE_OVERRIDE: str = os.getenv("SNAPSHOT_MODE_OVERRIDE", "").lower()
+
+# Decoder batch size: number of messages drained from the queue per lock
+# acquisition.  Higher values reduce lock/GIL overhead at the cost of longer
+# lock holds per batch.  Default 16 is tuned for Pi 4 at ~2500 msg/s.
+# Set to 1 to restore single-message-per-lock behaviour.
+DECODE_BATCH_SIZE: int = int(os.getenv("DECODE_BATCH_SIZE", "16"))
+
+# Queue-depth thresholds for CPU-pressure-triggered snapshot degradation.
+# When the median queue depth over a 6-cycle window exceeds a threshold the
+# snapshot mode escalates (same levels as memory pressure: elevated/high/critical).
+# Set a threshold to 0 to disable that level.  Defaults are tuned for Pi 4.
+QUEUE_PRESSURE_ELEVATED: int = int(os.getenv("QUEUE_PRESSURE_ELEVATED", "200"))
+QUEUE_PRESSURE_HIGH:     int = int(os.getenv("QUEUE_PRESSURE_HIGH",     "1000"))
+QUEUE_PRESSURE_CRITICAL: int = int(os.getenv("QUEUE_PRESSURE_CRITICAL", "3000"))
+
+# Enable adaptive memory pressure policy (reads /proc/meminfo every 10 s).
+# Set to "false" to lock the system to normal/full-retention mode regardless
+# of available RAM.  Has no effect on non-Linux hosts.
+MEMORY_POLICY_ENABLED: bool = os.getenv("MEMORY_POLICY_ENABLED", "true").lower() not in ("false", "0", "no")
+
+# Enable SRTM terrain downloads and the terrain overlay in the 3D coverage view.
+# Set to "false" on systems with limited storage (SRTM tiles are ~25 MB each;
+# a full 400 nm radius requires up to ~350 tiles).  When disabled, the terrain
+# button is hidden in the UI and no tile downloads or grid processing occur.
+TERRAIN_ENABLED: bool = os.getenv("TERRAIN_ENABLED", "true").lower() not in ("false", "0", "no")

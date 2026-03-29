@@ -13,15 +13,21 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
+# Prefer the same environment path uv sync used when available.
+# install.sh sets UV_PROJECT_ENVIRONMENT to /var/lib/adsb-dashboard/.venv.
+if [[ -n "${UV_PROJECT_ENVIRONMENT:-}" ]]; then
+  VENV_PYTHON="$UV_PROJECT_ENVIRONMENT/bin/python"
+else
+  VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
+fi
 
 if [[ ! -x "$VENV_PYTHON" ]]; then
-  echo "ERROR: venv not found. Run 'uv sync' first." >&2
+  echo "ERROR: venv not found at $VENV_PYTHON. Run 'uv sync' first." >&2
   exit 1
 fi
 
 echo "Installing Cython and setuptools into venv…"
-uv pip install --quiet cython setuptools
+uv pip install --python "$VENV_PYTHON" --quiet "cython<3" setuptools
 
 echo "Downloading pyModeS 2.9 source…"
 export TMPDIR="$(mktemp -d)"
@@ -44,7 +50,6 @@ cp pyModeS/c_common.cpython-*.so "$SITE/"
 echo "Installed c_common extension to $SITE"
 
 "$VENV_PYTHON" -c "
-import pyModeS as pms
-assert type(pms.df).__name__ == 'cython_function_or_method', 'C extension not active!'
-print('OK — pyModeS is using the C extension.')
+import pyModeS.c_common
+print('OK — pyModeS C extension loaded from:', pyModeS.c_common.__file__)
 "

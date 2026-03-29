@@ -14,7 +14,17 @@ from enum import IntEnum
 from typing import NamedTuple, Optional
 
 import pyModeS as pms
+from utils_geo import haversine_nm as _haversine_nm, bearing_deg as _bearing_deg
 from pyModeS.decoder.bds import bds40 as _bds40, bds50 as _bds50, bds60 as _bds60
+
+# Native C decode library (Phase 2 acceleration).  Falls back to pyModeS if
+# libdecode.so has not been built.
+try:
+    import decode_cffi as _decode_cffi
+    _decode_cffi._get_lib()          # trigger load / init now; raises on failure
+    _NATIVE_DECODE = True
+except Exception:
+    _NATIVE_DECODE = False
 
 import acas as acas_decoder
 import config
@@ -30,10 +40,13 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Per-message total processing time in seconds (includes lock acquisition + decode)
 msg_timings: deque[float] = deque(maxlen=2000)
+# Per-message time spent waiting to acquire self._lock (seconds)
+lock_wait_timings: deque[float] = deque(maxlen=2000)
+# Per-message time spent doing actual work under the lock (seconds)
+decode_timings: deque[float] = deque(maxlen=2000)
 # Per-_push_updates invocation breakdown: {loop_ms, broadcast_ms, total_ms, ac_count}
 push_timings: deque[dict] = deque(maxlen=120)
 
-_R_NM = 3440.065  # Earth radius in nautical miles
 # Beast timestamp value used by mlat-client for all synthesized positions.
 # Bytes: FF 00 4D 4C 41 54  ("FF00" + "MLAT" in ASCII).
 # Aggregators recognise this as non-real so they don't ingest MLAT positions as ADS-B.
@@ -208,15 +221,19 @@ def _kf_update(x_p: list, P_p: list,
     y1 = n_meas - x_p[1]
 
     # S = H·P·H' + R  (top-left 2×2 of P, plus R on diagonal)
-    S00 = P_p[0] + R;  S01 = P_p[1]
-    S10 = P_p[4];      S11 = P_p[5] + R
+    S00 = P_p[0] + R
+    S01 = P_p[1]
+    S10 = P_p[4]
+    S11 = P_p[5] + R
 
     det_S = S00*S11 - S01*S10
     if abs(det_S) < 1.0:          # degenerate — skip update
         return x_p, P_p, False
 
-    Si00 =  S11 / det_S;  Si01 = -S01 / det_S
-    Si10 = -S10 / det_S;  Si11 =  S00 / det_S
+    Si00 = S11 / det_S
+    Si01 = -S01 / det_S
+    Si10 = -S10 / det_S
+    Si11 = S00 / det_S
 
     # Chi-squared innovations gate: d² = y' S⁻¹ y
     d2 = Si00*y0*y0 + (Si01+Si10)*y0*y1 + Si11*y1*y1
@@ -387,21 +404,6 @@ def _accept_altitude(ac: "Aircraft", alt: int, source: "MsgSource",
     _penalise_alt_reliable(ac, good_crc)
     return False
 
-def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """True bearing from (lat1,lon1) to (lat2,lon2) in degrees (0=N, 90=E)."""
-    dlon = math.radians(lon2 - lon1)
-    x = math.sin(dlon) * math.cos(math.radians(lat2))
-    y = (math.cos(math.radians(lat1)) * math.sin(math.radians(lat2))
-         - math.sin(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.cos(dlon))
-    return (math.degrees(math.atan2(x, y)) + 360) % 360
-
-def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat / 2) ** 2
-         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2)
-    return _R_NM * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
 
 def _update_range_bearing(ac: "Aircraft") -> None:
     """Recompute range_nm and bearing_deg from ac.lat/lon and receiver coords."""
@@ -443,7 +445,7 @@ def _pos_reliable(ac: "Aircraft") -> bool:
         return True
     return (ac.pos_reliable_odd  >= _POS_RELIABLE_PUBLISH and
             ac.pos_reliable_even >= _POS_RELIABLE_PUBLISH and
-            ac.pos_global)
+            (ac.pos_global or ac.pos_by_ref))
 
 
 def _published_position(ac: "Aircraft") -> tuple[float | None, float | None, float | None, float | None]:
@@ -508,8 +510,9 @@ def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
         ac.cpr_even  = None
         ac.cpr_odd   = None
         ac.pos_global = False
+        ac.pos_by_ref = False
         # Fall through — no speed check; accept position and begin fresh
-    elif ac.lat is not None and ac.lon is not None and ac.last_pos_ts > 0 and ac.pos_global:
+    elif ac.lat is not None and ac.lon is not None and ac.last_pos_ts > 0 and (ac.pos_global or ac.pos_by_ref):
         elapsed_s = now - ac.last_pos_ts
         if elapsed_s > 0:
             dist_nm = _haversine_nm(ac.lat, ac.lon, lat, lon)
@@ -527,12 +530,13 @@ def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
                         ac.cpr_even  = None
                         ac.cpr_odd   = None
                         ac.pos_global = False
+                        ac.pos_by_ref = False
                     _add_to_discard_cache(ac, lat, lon, now)
                 return  # discard this position
 
     # Fast-track: if within ~27 nm (50 km) of last known position, promote
     # directly to publish threshold (mirrors readsb incrementReliable fast-path)
-    if ac.lat is not None and ac.lon is not None and ac.pos_global:
+    if ac.lat is not None and ac.lon is not None and (ac.pos_global or ac.pos_by_ref):
         dist_nm = _haversine_nm(ac.lat, ac.lon, lat, lon)
         if dist_nm < 27.0:
             if cpr_odd:
@@ -550,6 +554,12 @@ def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
     ac.last_pos_ts = now
     if pos_from_global:
         ac.pos_global = True
+        ac.pos_by_ref = False
+    else:
+        # Local-CPR decode (position_with_ref): still require even/odd reliability
+        # before publish, but allow it to become publishable when global pairing is
+        # temporarily unavailable (e.g. corrected frames in native decode path).
+        ac.pos_by_ref = True
     _update_range_bearing(ac)
 
 
@@ -667,19 +677,22 @@ def _record_mlat_fix(ac: "Aircraft", source: str, lat: float, lon: float, now: f
     is_spike = False
 
     if prev_ts is not None and buf:
-        if now <= prev_ts:
-            # Non-monotonic timestamp
+        if now < prev_ts:
+            # Non-monotonic timestamp (strict: equal timestamps from same batch are not spikes)
             ac.mlat_spike_counts[source]["nonmonotonic"] = (
                 ac.mlat_spike_counts[source].get("nonmonotonic", 0) + 1
             )
             is_spike = True
         else:
-            dt = now - prev_ts
+            prev = buf[-1]
+            # Use accepted-fix timestamp for speed calc to avoid cascade:
+            # mlat_last_fix_ts includes spiked fixes, so dt would shrink
+            # while distance stays large → every subsequent fix looks fast.
+            dt = now - prev.ts
             if dt < _MLAT_MIN_DT_S:
                 # Gap too small for a reliable speed estimate — skip check, don't count as spike
                 pass
             else:
-                prev = buf[-1]
                 speed_kt = (_haversine_nm(prev.lat, prev.lon, lat, lon) / dt) * 3600
                 if speed_kt > _MLAT_MAX_SPEED_KT:
                     ac.mlat_spike_counts[source]["speed"] = (
@@ -835,7 +848,10 @@ class Aircraft:
     bearing_deg: Optional[float] = None   # bearing from receiver (degrees true)
     cpr_even: Optional[tuple] = field(default=None, repr=False)   # (raw_msg, timestamp)
     cpr_odd:  Optional[tuple] = field(default=None, repr=False)
+    mlat_cpr_even: dict = field(default_factory=dict, repr=False)  # source → (cpr_lat, cpr_lon, ts) or (raw, ts)
+    mlat_cpr_odd:  dict = field(default_factory=dict, repr=False)
     pos_global: bool = False  # True once a global CPR decode (even+odd pair) has succeeded
+    pos_by_ref: bool = False  # True once a local position_with_ref decode has succeeded
     # Soft position reliability score (readsb: pos_reliable_odd/even in track.c).
     # Incremented by +1.0 on each accepted position; penalised by -0.26 on speed-check
     # failure; CPR state reset when either falls to zero.  lat/lon suppressed in snapshot
@@ -891,6 +907,32 @@ class Aircraft:
     # Kalman filter state — populated on first MLAT fix when MLAT_FUSION=kalman
     # dict: {x, P, ref_lat, ref_lon, ts}  or None before first fix
     kalman_state:        Optional[dict] = None
+
+    # ── Fields available only from readsb JSON (None in Beast-only mode) ──────
+    alt_geom:         Optional[int]   = None  # geometric (GNSS) altitude ft
+    gs:               Optional[float] = None  # ground speed kt
+    track:            Optional[float] = None  # true track over ground °
+    track_rate:       Optional[float] = None  # track rate of change °/s
+    roll:             Optional[float] = None  # roll angle °
+    true_heading:     Optional[float] = None  # true heading °
+    geom_rate:        Optional[int]   = None  # geometric vertical rate fpm
+    emergency:        Optional[str]   = None  # "none"|"general"|"lifeguard"…
+    nav_qnh:          Optional[float] = None  # altimeter setting hPa
+    nav_altitude_fms: Optional[int]   = None  # FMS selected altitude ft
+    nav_heading:      Optional[float] = None  # selected heading °
+    nav_modes:        Optional[list]  = None  # ["autopilot","vnav",…]
+    nic:              Optional[int]   = None  # navigation integrity category
+    rc:               Optional[int]   = None  # radius of containment m
+    nac_p:            Optional[int]   = None  # navigation accuracy (position)
+    nac_v:            Optional[int]   = None  # navigation accuracy (velocity)
+    sil:              Optional[int]   = None  # source integrity level
+    gva:              Optional[int]   = None  # geometric vertical accuracy
+    sda:              Optional[int]   = None  # system design assurance
+    adsb_version:     Optional[int]   = None  # ADS-B transponder version 0/1/2
+    wind_dir:         Optional[int]   = None  # derived wind direction °
+    wind_speed:       Optional[int]   = None  # derived wind speed kt
+    oat:              Optional[int]   = None  # outside air temperature °C
+    tat:              Optional[int]   = None  # total air temperature °C
 
 
 class AircraftState:
@@ -955,6 +997,15 @@ class AircraftState:
         self._snapshot_history_minute: int = -1
         self._snapshot_history_cache: tuple | None = None  # (rate_list, df_list, mlat_list)
 
+        # readsb ingest tracking — not used in Beast mode
+        # Cumulative message total from the last aircraft.json poll (for delta computation).
+        # Initialised to -1 so the first poll is detected and its delta suppressed
+        # (readsb's cumulative count could be millions at startup — without this the
+        # first poll floods _cur_sec_count and spikes msg_per_sec for 60 seconds).
+        self._readsb_last_total: int = -1
+        # Per-aircraft readsb cumulative message counts (for per-session delta tracking)
+        self._readsb_msg_counts: dict[str, int] = {}
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -991,12 +1042,130 @@ class AircraftState:
 
         t0 = time.perf_counter()
         with self._lock:
-            self._total += 1
-            if mlat:
+            t_locked = time.perf_counter()
+            # In hybrid mode readsb stats owns non-MLAT totals/rates.
+            # MLAT messages are not in readsb JSON so still count those via Beast.
+            if config.INGEST_MODE != "hybrid":
+                self._total += 1
+                if mlat:
+                    self._mlat_total += 1
+                self._tick(now, mlat=mlat)
+            elif mlat:
                 self._mlat_total += 1
-            self._tick(now, mlat=mlat)
+                self._tick(now, mlat=True)
             self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
-        msg_timings.append(time.perf_counter() - t0)
+        t_done = time.perf_counter()
+        msg_timings.append(t_done - t0)
+        lock_wait_timings.append(t_locked - t0)
+        decode_timings.append(t_done - t_locked)
+
+    def process_messages_batch(self, batch: list[tuple[dict, "Optional[str]"]]) -> None:
+        """Process a batch of decoded Beast messages under a single lock acquisition.
+
+        Reduces per-message lock acquire/release overhead and GIL context-switch
+        frequency compared to calling process_message() for each message individually.
+        All messages share one timestamp (now) — at typical batch sizes the staleness
+        is <5 ms, which is negligible for rate counters and position freshness gates.
+        """
+        if not batch:
+            return
+        now = time.time()
+
+        # MLAT detection is pure computation — run outside the lock.
+        processed: list[tuple[str, int, bool, "Optional[str]"]] = []
+        for msg, mlat_source in batch:
+            raw: str = msg["raw"]
+            signal: int = msg.get("signal", 0)
+            timestamp: int = msg.get("timestamp", 0)
+            if timestamp == _MLAT_TS_MARKER:
+                if mlat_source is None:
+                    mlat_source = "mlat"
+            else:
+                mlat_source = None
+            processed.append((raw, signal, mlat_source is not None, mlat_source))
+
+        t0 = time.perf_counter()
+        with self._lock:
+            t_locked = time.perf_counter()
+            for raw, signal, mlat, mlat_source in processed:
+                # In hybrid mode readsb stats owns non-MLAT totals/rates.
+                # MLAT messages are not in readsb JSON so still count those via Beast.
+                if config.INGEST_MODE != "hybrid":
+                    self._total += 1
+                    if mlat:
+                        self._mlat_total += 1
+                    self._tick(now, mlat=mlat)
+                elif mlat:
+                    self._mlat_total += 1
+                    self._tick(now, mlat=True)
+                self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
+        t_done = time.perf_counter()
+
+        # Record per-message averages so timing deques remain comparable with
+        # single-message path (lock_wait is shared across the batch).
+        n = len(batch)
+        per_total  = (t_done - t0)      / n
+        per_wait   = (t_locked - t0)    / n
+        per_decode = (t_done - t_locked) / n
+        for _ in range(n):
+            msg_timings.append(per_total)
+            lock_wait_timings.append(per_wait)
+            decode_timings.append(per_decode)
+
+    # ── MLAT diagnostic helpers (used by mlat.py endpoints) ─────────────────
+
+    def get_mlat_fixes_all(self) -> dict:
+        """Per-source fix positions for every tracked MLAT aircraft."""
+        out: dict = {}
+        with self._lock:
+            for icao, ac in self._aircraft.items():
+                if not ac.mlat or not ac.mlat_fixes:
+                    continue
+                srcs = {
+                    src: [[round(f.lat, 6), round(f.lon, 6)] for f in buf]
+                    for src, buf in ac.mlat_fixes.items()
+                    if buf
+                }
+                if srcs:
+                    out[icao] = srcs
+        return out
+
+    def get_mlat_fixes_for(self, icao: str) -> dict | None:
+        """Per-source fix buffer for a single aircraft, or None if not tracked."""
+        with self._lock:
+            ac = self._aircraft.get(icao)
+            if ac is None:
+                return None
+            return {
+                src: [[round(f.lat, 6), round(f.lon, 6)] for f in buf]
+                for src, buf in ac.mlat_fixes.items()
+            }
+
+    def get_mlat_residuals(self) -> list:
+        """Residual data for all MLAT aircraft that have a position and residuals."""
+        import statistics as _statistics
+        out: list = []
+        with self._lock:
+            for icao, ac in self._aircraft.items():
+                if not ac.mlat or ac.lat is None or ac.lon is None:
+                    continue
+                if not ac.mlat_residuals:
+                    continue
+                all_vals = [
+                    _statistics.median(buf)
+                    for buf in ac.mlat_residuals.values()
+                    if len(buf) >= 3
+                ]
+                if not all_vals:
+                    continue
+                out.append({
+                    "icao":            icao,
+                    "lat":             round(ac.lat, 5),
+                    "lon":             round(ac.lon, 5),
+                    "sources":         list(ac.mlat_residuals.keys()),
+                    "avg_residual_nm": round(sum(all_vals) / len(all_vals), 3),
+                })
+        return out
 
     def expire_aircraft(self) -> list["Aircraft"]:
         """Remove stale aircraft and return them for visit logging."""
@@ -1024,6 +1193,11 @@ class AircraftState:
                         ac.pos_reliable_odd  = 0.0
                         ac.pos_reliable_even = 0.0
         return expired
+
+    def set_timeout(self, seconds: int) -> None:
+        """Update the aircraft expiry timeout (called by memory_guard on pressure changes)."""
+        with self._lock:
+            self._timeout = seconds
 
     def init_today(self, icaos: set[str], mil_icaos: set[str]) -> None:
         """Seed today's unique-aircraft sets from DB on startup (persistence across restarts)."""
@@ -1122,6 +1296,31 @@ class AircraftState:
                 "acas_ra_corrective": ac.acas_ra_corrective,
                 "acas_threat_icao":   ac.acas_threat_icao,
                 "acas_sensitivity":   ac.acas_sensitivity,
+                # readsb-only fields (None in Beast-only mode)
+                "alt_geom":          ac.alt_geom,
+                "gs":                ac.gs,
+                "track":             ac.track,
+                "track_rate":        ac.track_rate,
+                "roll":              ac.roll,
+                "true_heading":      ac.true_heading,
+                "geom_rate":         ac.geom_rate,
+                "emergency":         ac.emergency,
+                "nav_qnh":           ac.nav_qnh,
+                "nav_altitude_fms":  ac.nav_altitude_fms,
+                "nav_heading":       ac.nav_heading,
+                "nav_modes":         ac.nav_modes,
+                "nic":               ac.nic,
+                "rc":                ac.rc,
+                "nac_p":             ac.nac_p,
+                "nac_v":             ac.nac_v,
+                "sil":               ac.sil,
+                "gva":               ac.gva,
+                "sda":               ac.sda,
+                "adsb_version":      ac.adsb_version,
+                "wind_dir":          ac.wind_dir,
+                "wind_speed":        ac.wind_speed,
+                "oat":               ac.oat,
+                "tat":               ac.tat,
             }
 
     def pop_adsbx_queue(self, max_n: int = 20) -> set[str]:
@@ -1198,49 +1397,60 @@ class AircraftState:
                 return
             _apply_hexdb_data(ac, data)
 
-    def get_snapshot(self) -> dict:
+    # Fields stripped in 'reduced' mode (elevated/high pressure).
+    # Diagnostic data not needed for core live display.
+    _REDUCED_DROP = frozenset({
+        "mlat_sources", "mlat_quality",
+        "pos_global", "pos_reliable_odd", "pos_reliable_even",
+        "acas_ra_desc", "acas_ra_corrective", "acas_threat_icao", "acas_sensitivity",
+    })
+
+    # Allowlist for 'thin' mode (critical pressure).
+    # Only fields required to render the live table and map.
+    _THIN_KEEP = frozenset({
+        "icao", "callsign", "lat", "lon", "altitude", "bearing_deg", "range_nm",
+        "signal", "msg_count", "military", "interesting", "mlat", "mlat_source",
+        "type_code", "operator", "age", "acas_ra_active", "squawk", "pos_confident",
+    })
+
+    def get_snapshot(self, mode: str = "full") -> dict:
         now = time.time()
+
+        # ----------------------------------------------------------------
+        # Stage 1 — acquire lock, copy minimal state, release immediately.
+        #
+        # Heavy dict-building work (per-aircraft field extraction, history
+        # list construction, mode stripping) runs in Stage 2 without the
+        # lock, so the decode thread is not blocked while we iterate.
+        #
+        # Safety of attribute reads outside the lock:
+        #   - Simple scalar attributes (int, float, str, bool, None) are
+        #     safe: the GIL makes single-attribute assignment atomic.
+        #   - Container attributes (mlat_fixes, mlat_residuals, etc.) are
+        #     accessed defensively with try/except RuntimeError to handle
+        #     the rare case where the decode thread resizes them mid-read.
+        #   - aircraft_refs is a list() snapshot taken under the lock, so
+        #     it is stable even if self._aircraft is mutated afterwards.
+        # ----------------------------------------------------------------
         with self._lock:
-            # Average msg/sec over the last 10 completed seconds
-            recent = list(self._sec_counts)[-10:]
-            msg_per_sec = round(sum(c for _, c in recent) / max(len(recent), 1), 1)
+            # Scalar counters
+            total_messages = self._total
+            mlat_total     = self._mlat_total
+            unique_today         = len(self._today_icaos)
+            unique_today_military = len(self._today_mil_icaos)
+            adsbx_qsize    = len(self._adsbx_queue)
+            hexdb_qsize    = len(self._hexdb_queue)
 
-            # MLAT msg/sec (same rolling 10-second window)
-            mlat_recent = list(self._mlat_sec_counts)[-10:]
-            mlat_per_sec = round(sum(c for _, c in mlat_recent) / max(len(mlat_recent), 1), 1)
+            # Rate data — small bounded deque slices
+            sec_slice      = list(self._sec_counts)[-10:]
+            mlat_sec_slice = list(self._mlat_sec_counts)[-10:]
+            cur_min_secs   = list(self._cur_min_sec_counts)
+            cur_min_sigs   = list(self._cur_min_signals)
+            cur_min        = self._cur_min
+            cur_min_df     = dict(self._cur_min_df_counts)
+            cur_min_mlat   = self._cur_min_mlat_count
 
-            # Rate history for the chart (completed minutes + current partial minute)
-            secs = list(self._cur_min_sec_counts)
-            if secs:
-                cur_mn, cur_mx, cur_me = min(secs), max(secs), round(sum(secs) / len(secs), 1)
-            else:
-                cur_mn = cur_mx = cur_me = 0.0
-            cur_total = len(self._aircraft)
-            # Single pass: collect all per-aircraft counters and the aircraft list.
-            # Replaces four separate O(N) scans that previously ran inside the lock.
-            cur_mil = cur_with_pos = cur_mlat_pos = mlat_aircraft_count = 0
-            for ac in self._aircraft.values():
-                has_published_pos = _pos_reliable(ac)
-                if ac.military:
-                    cur_mil += 1
-                if has_published_pos:
-                    cur_with_pos += 1
-                if ac.mlat:
-                    mlat_aircraft_count += 1
-                    if has_published_pos:
-                        cur_mlat_pos += 1
-            live_military = cur_mil
-
-            cur_sigs = self._cur_min_signals
-            cur_sig_avg = round(sum(cur_sigs) / len(cur_sigs), 1) if cur_sigs else None
-            cur_stats = (self._cur_min, cur_mn, cur_mx, cur_me,
-                         cur_total, cur_total - cur_mil, cur_mil,
-                         cur_sig_avg, min(cur_sigs) if cur_sigs else None,
-                         max(cur_sigs) if cur_sigs else None,
-                         cur_with_pos, cur_mlat_pos)
-
-            # Rebuild history list copies only when the minute rolls over.
-            # At 1 Hz this avoids 3 deque→list copies per second (59 of 60 are free).
+            # History cache — rebuilt at most once per minute
             if self._snapshot_history_minute != self._cur_min or self._snapshot_history_cache is None:
                 self._snapshot_history_cache = (
                     list(self._min_stats),
@@ -1249,86 +1459,169 @@ class AircraftState:
                 )
                 self._snapshot_history_minute = self._cur_min
             hist_min_stats, hist_df_stats, hist_mlat_counts = self._snapshot_history_cache
-            rate_history = hist_min_stats + [cur_stats]
-            df_history = hist_df_stats + [(self._cur_min, dict(self._cur_min_df_counts))]
-            mlat_history = hist_mlat_counts + [(self._cur_min, self._cur_min_mlat_count)]
 
-            aircraft_list = []
-            for ac in self._aircraft.values():
-                pub_lat, pub_lon, pub_range_nm, pub_bearing_deg = _published_position(ac)
-                aircraft_list.append({
-                    "icao": ac.icao,
-                    "callsign": ac.callsign,
-                    "altitude": ac.altitude if _alt_baro_reliable(ac) else None,
-                    "squawk": ac.squawk,
-                    "signal": ac.signal,
-                    "msg_count": ac.msg_count,
-                    "age": round(now - ac.last_seen, 1),
-                    "registration": ac.registration,
-                    "type_code": ac.type_code,
-                    "type_desc": ac.type_desc,
-                    "type_full_name": ac.type_full_name,
-                    "type_category": ac.type_category,
-                    "wtc": ac.wtc,
-                    "military": ac.military,
-                    "operator": ac.operator,
-                    "country": ac.country,
-                    "year": ac.year,
-                    "manufacturer": ac.manufacturer,
-                    "lat":              pub_lat,
-                    "lon":              pub_lon,
-                    "range_nm":         pub_range_nm,
-                    "bearing_deg":      pub_bearing_deg,
-                    "airspeed_kts":     ac.airspeed_kts,
-                    "airspeed_type":    ac.airspeed_type,
-                    "heading_deg":      ac.heading_deg,
-                    "vertical_rate_fpm": ac.vertical_rate_fpm,
-                    "mach":             ac.mach,
-                    "selected_alt":     ac.selected_alt,
-                    "interesting":        bool(ac.type_code and ac.type_code.upper() in INTERESTING_TYPE_CODES),
-                    "sighting_count":     ac.sighting_count,
-                    "mlat":              ac.mlat,
-                    "mlat_source":       ac.mlat_source,
-                    "mlat_msg_count":    ac.mlat_msg_count,
-                    "last_pos_age":      round(now - ac.last_pos_ts, 1) if ac.last_pos_ts > 0 else None,
-                    "last_alt_age":      round(now - ac.last_alt_ts, 1) if ac.last_alt_ts > 0 else None,
-                    "mlat_quality":      dict(ac.mlat_quality_scores),
-                    "mlat_sources": {
-                        src: {
-                            "fixes":           len(buf),
-                            "spikes":          sum(ac.mlat_spike_counts.get(src, {}).values()),
-                            "spike_detail":    dict(ac.mlat_spike_counts.get(src, {})),
-                            "median_residual": (
-                                round(sorted(ac.mlat_residuals[src])[len(ac.mlat_residuals[src]) // 2], 3)
-                                if src in ac.mlat_residuals and len(ac.mlat_residuals[src]) >= 3
-                                else None
-                            ),
-                        }
-                        for src, buf in ac.mlat_fixes.items()
-                    },
-                    "acas_ra_active":     ac.acas_ra_ts is not None and (now - ac.acas_ra_ts) < 60,
-                    "acas_ra_desc":       ac.acas_ra_desc,
-                    "acas_ra_corrective": ac.acas_ra_corrective,
-                    "acas_threat_icao":   ac.acas_threat_icao,
-                    "acas_sensitivity":   ac.acas_sensitivity,
-                    "pos_global":         ac.pos_global,
-                    "pos_reliable_odd":   ac.pos_reliable_odd,
-                    "pos_reliable_even":  ac.pos_reliable_even,
-                    "pos_confident":      _pos_reliable(ac),
-                })
+            # Stable list of aircraft object references — O(N) pointer copy
+            aircraft_refs = list(self._aircraft.values())
+
+        # ----------------------------------------------------------------
+        # Stage 2 — build payload outside lock
+        # ----------------------------------------------------------------
+
+        msg_per_sec  = round(sum(c for _, c in sec_slice)      / max(len(sec_slice), 1),      1)
+        mlat_per_sec = round(sum(c for _, c in mlat_sec_slice) / max(len(mlat_sec_slice), 1), 1)
+
+        if cur_min_secs:
+            cur_mn = min(cur_min_secs)
+            cur_mx = max(cur_min_secs)
+            cur_me = round(sum(cur_min_secs) / len(cur_min_secs), 1)
+        else:
+            cur_mn = cur_mx = cur_me = 0.0
+
+        cur_sig_avg = round(sum(cur_min_sigs) / len(cur_min_sigs), 1) if cur_min_sigs else None
+
+        cur_mil = cur_with_pos = cur_mlat_pos = mlat_aircraft_count = 0
+        aircraft_list = []
+
+        for ac in aircraft_refs:
+            pub_lat, pub_lon, pub_range_nm, pub_bearing_deg = _published_position(ac)
+            has_pos = _pos_reliable(ac)
+
+            if ac.military:
+                cur_mil += 1
+            if has_pos:
+                cur_with_pos += 1
+            if ac.mlat:
+                mlat_aircraft_count += 1
+                if has_pos:
+                    cur_mlat_pos += 1
+
+            # mlat_sources iterates container attributes that the decode
+            # thread can mutate; wrap defensively.
+            try:
+                mlat_sources = {
+                    src: {
+                        "fixes":        len(buf),
+                        "spikes":       sum(ac.mlat_spike_counts.get(src, {}).values()),
+                        "spike_detail": dict(ac.mlat_spike_counts.get(src, {})),
+                        "median_residual": (
+                            round(sorted(ac.mlat_residuals[src])[len(ac.mlat_residuals[src]) // 2], 3)
+                            if src in ac.mlat_residuals and len(ac.mlat_residuals[src]) >= 3
+                            else None
+                        ),
+                    }
+                    for src, buf in ac.mlat_fixes.items()
+                }
+            except RuntimeError:
+                mlat_sources = {}
+
+            aircraft_list.append({
+                "icao":              ac.icao,
+                "callsign":          ac.callsign,
+                "altitude":          ac.altitude if _alt_baro_reliable(ac) else None,
+                "squawk":            ac.squawk,
+                "signal":            ac.signal,
+                "msg_count":         ac.msg_count,
+                "age":               round(now - ac.last_seen, 1),
+                "registration":      ac.registration,
+                "type_code":         ac.type_code,
+                "type_desc":         ac.type_desc,
+                "type_full_name":    ac.type_full_name,
+                "type_category":     ac.type_category,
+                "wtc":               ac.wtc,
+                "military":          ac.military,
+                "operator":          ac.operator,
+                "country":           ac.country,
+                "year":              ac.year,
+                "manufacturer":      ac.manufacturer,
+                "lat":               pub_lat,
+                "lon":               pub_lon,
+                "range_nm":          pub_range_nm,
+                "bearing_deg":       pub_bearing_deg,
+                "airspeed_kts":      ac.airspeed_kts,
+                "airspeed_type":     ac.airspeed_type,
+                "heading_deg":       ac.heading_deg,
+                "vertical_rate_fpm": ac.vertical_rate_fpm,
+                "mach":              ac.mach,
+                "selected_alt":      ac.selected_alt,
+                "interesting":       bool(ac.type_code and ac.type_code.upper() in INTERESTING_TYPE_CODES),
+                "sighting_count":    ac.sighting_count,
+                "mlat":              ac.mlat,
+                "mlat_source":       ac.mlat_source,
+                "mlat_msg_count":    ac.mlat_msg_count,
+                "last_pos_age":      round(now - ac.last_pos_ts, 1) if ac.last_pos_ts > 0 else None,
+                "last_alt_age":      round(now - ac.last_alt_ts, 1) if ac.last_alt_ts > 0 else None,
+                "mlat_quality":      dict(ac.mlat_quality_scores),
+                "mlat_sources":      mlat_sources,
+                "acas_ra_active":    ac.acas_ra_ts is not None and (now - ac.acas_ra_ts) < 60,
+                "acas_ra_desc":      ac.acas_ra_desc,
+                "acas_ra_corrective": ac.acas_ra_corrective,
+                "acas_threat_icao":  ac.acas_threat_icao,
+                "acas_sensitivity":  ac.acas_sensitivity,
+                "pos_global":        ac.pos_global,
+                "pos_reliable_odd":  ac.pos_reliable_odd,
+                "pos_reliable_even": ac.pos_reliable_even,
+                "pos_confident":     has_pos,
+                # readsb-only fields (None when in Beast mode)
+                "alt_geom":          ac.alt_geom,
+                "gs":                ac.gs,
+                "track":             ac.track,
+                "track_rate":        ac.track_rate,
+                "roll":              ac.roll,
+                "true_heading":      ac.true_heading,
+                "geom_rate":         ac.geom_rate,
+                "emergency":         ac.emergency,
+                "nav_qnh":           ac.nav_qnh,
+                "nav_altitude_fms":  ac.nav_altitude_fms,
+                "nav_heading":       ac.nav_heading,
+                "nav_modes":         ac.nav_modes,
+                "nic":               ac.nic,
+                "rc":                ac.rc,
+                "nac_p":             ac.nac_p,
+                "nac_v":             ac.nac_v,
+                "sil":               ac.sil,
+                "gva":               ac.gva,
+                "sda":               ac.sda,
+                "adsb_version":      ac.adsb_version,
+                "wind_dir":          ac.wind_dir,
+                "wind_speed":        ac.wind_speed,
+                "oat":               ac.oat,
+                "tat":               ac.tat,
+            })
+
+        live_military = cur_mil
+        cur_stats = (cur_min, cur_mn, cur_mx, cur_me,
+                     len(aircraft_refs), len(aircraft_refs) - cur_mil, cur_mil,
+                     cur_sig_avg, min(cur_min_sigs) if cur_min_sigs else None,
+                     max(cur_min_sigs) if cur_min_sigs else None,
+                     cur_with_pos, cur_mlat_pos)
+
+        rate_history = hist_min_stats + [cur_stats]
+        df_history   = hist_df_stats  + [(cur_min, cur_min_df)]
+        mlat_history = hist_mlat_counts + [(cur_min, cur_min_mlat)]
+
+        # Mode stripping
+        if mode == "reduced":
+            for entry in aircraft_list:
+                for key in self._REDUCED_DROP:
+                    entry.pop(key, None)
+        elif mode == "thin":
+            aircraft_list = [
+                {k: v for k, v in entry.items() if k in self._THIN_KEEP}
+                for entry in aircraft_list
+            ]
 
         return {
-            "aircraft_count": len(aircraft_list),
-            "live_military": live_military,
-            "msg_per_sec": msg_per_sec,
-            "total_messages": self._total,
-            "mlat_total": self._mlat_total,
-            "mlat_per_sec": mlat_per_sec,
-            "mlat_aircraft_count": mlat_aircraft_count,
-            "unique_today": len(self._today_icaos),
-            "unique_today_military": len(self._today_mil_icaos),
-            "adsbx_queue_size": len(self._adsbx_queue),
-            "hexdb_queue_size": len(self._hexdb_queue),
+            "aircraft_count":         len(aircraft_list),
+            "live_military":          live_military,
+            "msg_per_sec":            msg_per_sec,
+            "total_messages":         total_messages,
+            "mlat_total":             mlat_total,
+            "mlat_per_sec":           mlat_per_sec,
+            "mlat_aircraft_count":    mlat_aircraft_count,
+            "unique_today":           unique_today,
+            "unique_today_military":  unique_today_military,
+            "adsbx_queue_size":       adsbx_qsize,
+            "hexdb_queue_size":       hexdb_qsize,
             "aircraft": sorted(aircraft_list, key=lambda x: x["msg_count"], reverse=True),
             "rate_history": [
                 {"minute": m, "min": mn, "max": mx, "mean": me,
@@ -1397,60 +1690,98 @@ class AircraftState:
         if len(raw) < 14:          # Too short to contain an ICAO address
             return
 
-        try:
-            df = pms.df(raw)
-        except Exception:
-            return
+        # ── Native C decode path ─────────────────────────────────────────────
+        # decode_cffi.decode_message() handles CRC check, ICAO extraction, and
+        # all field decoding in one call.  The C library applies DF-field
+        # correction (Modes.fixDF=1) and CRC bit correction (Modes.nfix_crc=1)
+        # exactly as readsb does, so _try_fix_df17 is no longer needed.
+        if _NATIVE_DECODE:
+            try:
+                msg_bytes = bytes.fromhex(raw)
+            except ValueError:
+                return
+            _nd = _decode_cffi.decode_message(msg_bytes, signal)
+            if _nd is None:
+                return   # bad CRC or unknown DF — discard
 
-        # DF17 type fixup: recover frames where a single-bit error corrupted the
-        # DF field.  Only for 112-bit (28 hex char) messages.  Sets df17_corrected
-        # so that crc_clean is forced False — lower good_crc in the altitude filter.
-        df17_corrected = False
-        if len(raw) == 28 and df != 17:
-            fixed = _try_fix_df17(bytes.fromhex(raw))
-            if fixed is not None:
-                raw = fixed.hex().upper()
-                df = 17
-                df17_corrected = True
+            df = _nd['df']
+            # correctedbits>0 covers both DF-field and CRC-bit corrections.
+            # Treat corrected DF17 frames as lower-confidence (crc_clean=False).
+            df17_corrected = (df == 17 and _nd['correctedbits'] > 0)
 
-        # --- CRC check + ICAO extraction + source classification ---
-        icao: Optional[str] = None
-        crc_clean = False
-        source = MsgSource.INVALID
-        try:
+            icao: Optional[str] = None
+            crc_clean = False
+            source = MsgSource.INVALID
+
+            addr = _nd.get('addr')
+            if addr:
+                icao = f"{addr:06X}"
+
             if df in (17, 18):
-                # DF17/18: true CRC covers entire message; residual 0 = clean.
-                # pyModeS crc() returns the 24-bit remainder on the original bytes.
-                crc_residual = pms.crc(raw)
-                # Corrected frames have CRC=0 after fixup but are lower confidence.
-                crc_clean = (crc_residual == 0) and not df17_corrected
-                icao = pms.icao(raw)
+                crc_clean = (_nd['correctedbits'] == 0) and not df17_corrected
                 if icao:
-                    icao_up = icao.upper()
-                    # Register as confirmed ICAO (readsb: icaoFilterAdd)
-                    self._confirmed_icaos[icao_up] = now
-                    self._confirmed_icaos.move_to_end(icao_up)
+                    self._confirmed_icaos[icao] = now
+                    self._confirmed_icaos.move_to_end(icao)
                     if len(self._confirmed_icaos) > _CONFIRMED_ICAO_MAX:
                         self._confirmed_icaos.popitem(last=False)
-                    source = MsgSource.ADSR if df == 18 else MsgSource.ADSB
+                source = MsgSource.ADSR if df == 18 else MsgSource.ADSB
             elif df == 11:
-                icao = pms.icao(raw)
-                # DF11 CRC includes Interrogator ID in lower 7 bits — less
-                # reliable for ICAO confirmation; do NOT add to confirmed set.
                 source = MsgSource.MODE_S_CHECKED
             elif df in _AP_DFS:
-                # Address/Parity: CRC syndrome IS the ICAO address.
-                # Only accept if previously confirmed by a DF17/18.
-                icao = pms.icao(raw)
-                if not icao or icao.upper() not in self._confirmed_icaos:
+                if not icao or icao not in self._confirmed_icaos:
                     return
-                # Refresh LRU timestamp
-                icao_up = icao.upper()
-                self._confirmed_icaos[icao_up] = now
-                self._confirmed_icaos.move_to_end(icao_up)
+                self._confirmed_icaos[icao] = now
+                self._confirmed_icaos.move_to_end(icao)
                 source = MsgSource.MODE_S
-        except Exception:
-            pass
+        else:
+            # ── pyModeS fallback (used when libdecode.so is not available) ───
+            _nd = None
+            try:
+                df = pms.df(raw)
+            except Exception:
+                return
+
+            # DF17 type fixup
+            df17_corrected = False
+            if len(raw) == 28 and df != 17:
+                fixed = _try_fix_df17(bytes.fromhex(raw))
+                if fixed is not None:
+                    raw = fixed.hex().upper()
+                    df = 17
+                    df17_corrected = True
+
+            icao: Optional[str] = None
+            crc_clean = False
+            source = MsgSource.INVALID
+            try:
+                if df in (17, 18):
+                    crc_residual = pms.crc(raw)
+                    crc_clean = (crc_residual == 0) and not df17_corrected
+                    icao = pms.icao(raw)
+                    if icao:
+                        icao_up = icao.upper()
+                        self._confirmed_icaos[icao_up] = now
+                        self._confirmed_icaos.move_to_end(icao_up)
+                        if len(self._confirmed_icaos) > _CONFIRMED_ICAO_MAX:
+                            self._confirmed_icaos.popitem(last=False)
+                        icao = icao_up
+                        source = MsgSource.ADSR if df == 18 else MsgSource.ADSB
+                elif df == 11:
+                    icao = pms.icao(raw)
+                    if icao:
+                        icao = icao.upper()
+                    source = MsgSource.MODE_S_CHECKED
+                elif df in _AP_DFS:
+                    icao = pms.icao(raw)
+                    if not icao or icao.upper() not in self._confirmed_icaos:
+                        return
+                    icao_up = icao.upper()
+                    self._confirmed_icaos[icao_up] = now
+                    self._confirmed_icaos.move_to_end(icao_up)
+                    icao = icao_up
+                    source = MsgSource.MODE_S
+            except Exception:
+                pass
 
         if not icao:
             return
@@ -1511,7 +1842,7 @@ class AircraftState:
             self._today_mil_icaos.add(icao)
 
         # Accumulate per-minute signal and DF stats
-        if signal:
+        if signal is not None:
             self._cur_min_signals.append(signal)
         self._cur_min_df_counts[df] = self._cur_min_df_counts.get(df, 0) + 1
 
@@ -1519,94 +1850,93 @@ class AircraftState:
         # DF17: Extended Squitter with true 24-bit CRC — highest integrity source.
         # DF18: TIS-B / ADS-R rebroadcast — same message structure, same altitude quality.
         if df in (17, 18) and len(raw) == 28:
-            try:
-                tc = pms.adsb.typecode(raw)
-            except Exception:
-                return
+            if _nd is not None:
+                # Native path: C library decoded all fields.
+                # Callsign (type codes 1-4)
+                if cs := _nd.get('callsign'):
+                    ac.callsign = cs.strip().rstrip('_')
+                    if ac.callsign and not ac.operator:
+                        op = enrichment.db.get_operator(ac.callsign[:3])
+                        if op:
+                            ac.operator = op.get("n")
+                            if not ac.country:
+                                ac.country = op.get("c")
 
-            if tc is None:
-                return
+                # Altitude (type codes 9-18, 20-22)
+                if (alt := _nd.get('baro_alt')) is not None:
+                    _accept_altitude(ac, alt, source, crc_clean, now)
 
-            # Identification (callsign)
-            if 1 <= tc <= 4:
-                try:
-                    cs = pms.adsb.callsign(raw)
-                    if cs:
-                        ac.callsign = cs.strip().rstrip('_')
-                        if ac.callsign and not ac.operator:
-                            op = enrichment.db.get_operator(ac.callsign[:3])
-                            if op:
-                                ac.operator = op.get("n")
-                                if not ac.country:
-                                    ac.country = op.get("c")
-                except Exception:
-                    pass
-
-            # Airborne position – altitude + CPR lat/lon
-            elif 9 <= tc <= 18 or 20 <= tc <= 22:
-                try:
-                    alt = pms.adsb.altitude(raw)
-                    if alt is not None:
-                        _accept_altitude(ac, int(alt), source, crc_clean, now)
-                except Exception:
-                    pass
-                try:
-                    oe = pms.adsb.oe_flag(raw)
-
-                    # Duplicate check: same raw frame within _CPR_DUP_WINDOW_S means
-                    # multiple receivers forwarded the same transponder transmission.
-                    # Skip CPR pairing and pos_reliable update to avoid inflating
-                    # confidence at multi-feeder/reflection sites (readsb:
-                    # cpr_duplicate_check in track.c).
-                    if not _is_cpr_duplicate(ac, raw, oe, now):
-                        if oe == 0:
-                            ac.cpr_even = (raw, now)
+                # CPR position (type codes 9-22)
+                # decode_cffi omits cpr_valid key; presence of cpr_odd signals valid CPR
+                if 'cpr_odd' in _nd:
+                    _cpr_oe = 1 if _nd['cpr_odd'] else 0
+                    # Dup detection uses raw hex; pairing stores decoded CPR integers
+                    if not _is_cpr_duplicate(ac, raw, _cpr_oe, now):
+                        _cpr_lat_int = _nd['cpr_lat']
+                        _cpr_lon_int = _nd['cpr_lon']
+                        # ADS-B and MLAT frames maintain independent even/odd CPR pairs.
+                        # Mixing a frame from one source with a half-pair from the other
+                        # in the global solver produces garbage positions → speed spikes.
+                        if mlat:
+                            _msrc = mlat_source or "mlat"
+                            if _cpr_oe == 0:
+                                ac.mlat_cpr_even[_msrc] = (_cpr_lat_int, _cpr_lon_int, now)
+                            else:
+                                ac.mlat_cpr_odd[_msrc]  = (_cpr_lat_int, _cpr_lon_int, now)
                         else:
-                            ac.cpr_odd = (raw, now)
+                            if _cpr_oe == 0:
+                                ac.cpr_even = (_cpr_lat_int, _cpr_lon_int, now)
+                            else:
+                                ac.cpr_odd  = (_cpr_lat_int, _cpr_lon_int, now)
 
-                        # Global decode is always preferred: geometrically unambiguous.
-                        # Local decode can pick the wrong CPR longitude zone when the
-                        # receiver is west of the aircraft (e.g. UK receiver + aircraft
-                        # over the North Sea).
                         pos = None
                         pos_from_global = False
                         global_bad = False
-                        if (ac.cpr_even and ac.cpr_odd
-                                and abs(ac.cpr_even[1] - ac.cpr_odd[1]) < 10):
-                            pos = pms.adsb.position(
-                                ac.cpr_even[0], ac.cpr_odd[0],
-                                ac.cpr_even[1], ac.cpr_odd[1],
+                        # Global CPR: use source-matched pair (ADS-B vs MLAT) so frames
+                        # are never cross-paired.  timestamp is at index 2.
+                        if (not mlat
+                                and ac.cpr_even and ac.cpr_odd
+                                and abs(ac.cpr_even[2] - ac.cpr_odd[2]) < 10):
+                            pos = _decode_cffi.solve_cpr_airborne(
+                                ac.cpr_even[0], ac.cpr_even[1],
+                                ac.cpr_odd[0],  ac.cpr_odd[1],
+                                _cpr_oe,
                             )
                             if pos is not None:
                                 pos_from_global = True
                             elif ac.pos_global:
-                                # Established aircraft + None from global most likely
-                                # means bad data (-2), not zone mismatch (-1).
-                                # Block local fallback to avoid wrong-zone write.
+                                global_bad = True
+                        elif (mlat
+                                and _msrc in ac.mlat_cpr_even and _msrc in ac.mlat_cpr_odd
+                                and abs(ac.mlat_cpr_even[_msrc][2] - ac.mlat_cpr_odd[_msrc][2]) < 10):
+                            pos = _decode_cffi.solve_cpr_airborne(
+                                ac.mlat_cpr_even[_msrc][0], ac.mlat_cpr_even[_msrc][1],
+                                ac.mlat_cpr_odd[_msrc][0],  ac.mlat_cpr_odd[_msrc][1],
+                                _cpr_oe,
+                            )
+                            if pos is not None:
+                                pos_from_global = True
+                            elif ac.pos_global:
                                 global_bad = True
 
-                        # Local decode fallback: only when global was not attempted
-                        # or failed with a likely zone mismatch (not bad data).
                         if not pos_from_global and not global_bad:
                             ref_lat = ac.lat if ac.lat is not None else config.RECEIVER_LAT
                             ref_lon = ac.lon if ac.lon is not None else config.RECEIVER_LON
                             if ref_lat is not None and ref_lon is not None:
-                                pos = pms.adsb.position_with_ref(raw, ref_lat, ref_lon)
+                                pos = _decode_cffi.solve_cpr_relative(
+                                    ref_lat, ref_lon, _cpr_lat_int, _cpr_lon_int, _cpr_oe,
+                                )
 
                         if pos:
                             lat, lon = pos
                             if -90 <= lat <= 90 and -180 <= lon <= 180:
-                                # Range gate: reject positions beyond receiver range
                                 if (config.RECEIVER_LAT is not None
                                         and config.RECEIVER_LON is not None
                                         and _haversine_nm(
                                             config.RECEIVER_LAT, config.RECEIVER_LON,
                                             lat, lon) > config.MAX_RANGE_NM):
-                                    pass  # discard — beyond ADS-B range
-                                elif mlat and not ac.has_adsb:
-                                    # Genuine MLAT position: buffer, spike-detect, fuse.
-                                    # MLAT force: if ADS-B position is stale and MLAT
-                                    # fix is far away, force-accept to transition.
+                                    pass
+                                elif mlat:
                                     if (ac.has_adsb
                                             and ac.lat is not None
                                             and now - ac._last_mlat_force_ts > _MLAT_FORCE_INTERVAL_S
@@ -1615,10 +1945,115 @@ class AircraftState:
                                         ac.pos_reliable_odd  = _POS_RELIABLE_PUBLISH
                                         ac.pos_reliable_even = _POS_RELIABLE_PUBLISH
                                     _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
-                                elif not mlat:
-                                    _accept_adsb_position(ac, lat, lon, pos_from_global, oe == 1, now)
+                                elif not mlat and config.INGEST_MODE != "hybrid":
+                                    _accept_adsb_position(ac, lat, lon, pos_from_global, _cpr_oe == 1, now)
+            else:
+                # pyModeS fallback path
+                try:
+                    tc = pms.adsb.typecode(raw)
                 except Exception:
-                    pass
+                    return
+                if tc is None:
+                    return
+
+                # Identification (callsign)
+                if 1 <= tc <= 4:
+                    try:
+                        cs = pms.adsb.callsign(raw)
+                        if cs:
+                            ac.callsign = cs.strip().rstrip('_')
+                            if ac.callsign and not ac.operator:
+                                op = enrichment.db.get_operator(ac.callsign[:3])
+                                if op:
+                                    ac.operator = op.get("n")
+                                    if not ac.country:
+                                        ac.country = op.get("c")
+                    except Exception:
+                        pass
+
+                # Airborne position – altitude + CPR lat/lon
+                elif 9 <= tc <= 18 or 20 <= tc <= 22:
+                    try:
+                        alt = pms.adsb.altitude(raw)
+                        if alt is not None:
+                            _accept_altitude(ac, int(alt), source, crc_clean, now)
+                    except Exception:
+                        pass
+                    try:
+                        oe = pms.adsb.oe_flag(raw)
+
+                        # Duplicate check: same raw frame within _CPR_DUP_WINDOW_S means
+                        # multiple receivers forwarded the same transponder transmission.
+                        if not _is_cpr_duplicate(ac, raw, oe, now):
+                            # ADS-B and MLAT frames maintain independent even/odd CPR pairs.
+                            # Per-source keying prevents cross-network CPR contamination.
+                            if mlat:
+                                _msrc = mlat_source or "mlat"
+                                if oe == 0:
+                                    ac.mlat_cpr_even[_msrc] = (raw, now)
+                                else:
+                                    ac.mlat_cpr_odd[_msrc] = (raw, now)
+                            else:
+                                if oe == 0:
+                                    ac.cpr_even = (raw, now)
+                                else:
+                                    ac.cpr_odd = (raw, now)
+
+                            pos = None
+                            pos_from_global = False
+                            global_bad = False
+                            # Global CPR: use source-matched pair so frames are never cross-paired.
+                            if (not mlat
+                                    and ac.cpr_even and ac.cpr_odd
+                                    and abs(ac.cpr_even[1] - ac.cpr_odd[1]) < 10):
+                                pos = pms.adsb.position(
+                                    ac.cpr_even[0], ac.cpr_odd[0],
+                                    ac.cpr_even[1], ac.cpr_odd[1],
+                                )
+                                if pos is not None:
+                                    pos_from_global = True
+                                elif ac.pos_global:
+                                    global_bad = True
+                            elif (mlat
+                                    and _msrc in ac.mlat_cpr_even and _msrc in ac.mlat_cpr_odd
+                                    and abs(ac.mlat_cpr_even[_msrc][1] - ac.mlat_cpr_odd[_msrc][1]) < 10):
+                                pos = pms.adsb.position(
+                                    ac.mlat_cpr_even[_msrc][0], ac.mlat_cpr_odd[_msrc][0],
+                                    ac.mlat_cpr_even[_msrc][1], ac.mlat_cpr_odd[_msrc][1],
+                                )
+                                if pos is not None:
+                                    pos_from_global = True
+                                elif ac.pos_global:
+                                    global_bad = True
+
+                            if not pos_from_global and not global_bad:
+                                ref_lat = ac.lat if ac.lat is not None else config.RECEIVER_LAT
+                                ref_lon = ac.lon if ac.lon is not None else config.RECEIVER_LON
+                                if ref_lat is not None and ref_lon is not None:
+                                    pos = pms.adsb.position_with_ref(raw, ref_lat, ref_lon)
+
+                            if pos:
+                                lat, lon = pos
+                                if -90 <= lat <= 90 and -180 <= lon <= 180:
+                                    if (config.RECEIVER_LAT is not None
+                                            and config.RECEIVER_LON is not None
+                                            and _haversine_nm(
+                                                config.RECEIVER_LAT, config.RECEIVER_LON,
+                                                lat, lon) > config.MAX_RANGE_NM):
+                                        pass  # discard — beyond ADS-B range
+                                    elif mlat:
+                                        if (ac.has_adsb
+                                                and ac.lat is not None
+                                                and now - ac._last_mlat_force_ts > _MLAT_FORCE_INTERVAL_S
+                                                and _haversine_nm(ac.lat, ac.lon, lat, lon) > _MLAT_FORCE_DISTANCE_NM):
+                                            ac._last_mlat_force_ts = now
+                                            ac.pos_reliable_odd  = _POS_RELIABLE_PUBLISH
+                                            ac.pos_reliable_even = _POS_RELIABLE_PUBLISH
+                                        _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
+                                    elif not mlat and config.INGEST_MODE != "hybrid":
+                                        _accept_adsb_position(ac, lat, lon, pos_from_global, oe == 1, now)
+                    except Exception:
+                        pass
 
         # --- Altitude from surveillance altitude reply (DF 4) ---
         # Lower integrity than ADS-B: parity is XOR-masked with aircraft address.
@@ -1628,7 +2063,10 @@ class AircraftState:
         elif df == 4 and len(raw) == 14:
             if not mlat:
                 try:
-                    alt = pms.altcode(raw)
+                    if _nd is not None:
+                        alt = _nd.get('baro_alt')
+                    else:
+                        alt = pms.altcode(raw)
                     if alt is not None:
                         _accept_altitude(ac, int(alt), MsgSource.MODE_S, False, now)
                 except Exception:
@@ -1639,71 +2077,103 @@ class AircraftState:
             # Altitude from DF20 — same parity integrity as DF4; same MLAT suppression.
             if df == 20 and not mlat:
                 try:
-                    alt = pms.altcode(raw)
+                    if _nd is not None:
+                        alt = _nd.get('baro_alt')
+                    else:
+                        alt = pms.altcode(raw)
                     if alt is not None:
                         _accept_altitude(ac, int(alt), MsgSource.MODE_S, False, now)
                 except Exception:
                     pass
 
-            # EHS decode: direct is40/is50/is60 checks — ~5x faster than pms.bds.infer()
-            # which speculatively tries ~20 registers. Checks are mutually exclusive in practice.
-            if _bds40.is40(raw):
-                # Selected altitude (autopilot target) — altitude field; suppress for MLAT.
+            # EHS decode — C library decodes BDS 4.0/5.0/6.0 in one call;
+            # pyModeS fallback uses direct is40/is50/is60 checks.
+            if _nd is not None:
+                # BDS 4.0: selected altitude
                 if not mlat:
+                    if (sel := _nd.get('nav_altitude_mcp')) is not None:
+                        ac.selected_alt = sel
+
+                # BDS 5.0: TAS + ground track
+                if (tas := _nd.get('tas')) is not None:
+                    ac.airspeed_kts = tas
+                    ac.airspeed_type = "TAS"
+                # heading_type 1 = HEADING_GROUND_TRACK (BDS 5.0 track)
+                # decode_cffi omits heading_valid; presence of heading_type is sufficient
+                if (_nd.get('heading_type') == 1
+                        and (hdg := _nd.get('heading')) is not None):
+                    ac.heading_deg = round(float(hdg), 1)
+
+                # BDS 6.0: IAS + Mach + magnetic heading + baro vertical rate
+                if (ias := _nd.get('ias')) is not None:
+                    ac.airspeed_kts = ias
+                    ac.airspeed_type = "IAS"
+                if (mach := _nd.get('mach')) is not None:
+                    ac.mach = round(float(mach), 3)
+                # heading_type 3 = HEADING_MAGNETIC (BDS 6.0 heading)
+                if (_nd.get('heading_type') == 3
+                        and (hdg := _nd.get('heading')) is not None):
+                    ac.heading_deg = round(float(hdg), 1)
+                if not mlat:
+                    if (vr := _nd.get('baro_rate')) is not None:
+                        ac.vertical_rate_fpm = vr
+                        ac._vrate_baro_fpm = vr
+                        ac._vrate_baro_ts  = now
+            else:
+                # pyModeS EHS fallback
+                if _bds40.is40(raw):
+                    if not mlat:
+                        try:
+                            sel = pms.commb.selalt40mcp(raw)
+                            if sel is not None:
+                                ac.selected_alt = int(sel)
+                        except Exception:
+                            pass
+
+                elif _bds50.is50(raw):
                     try:
-                        sel = pms.commb.selalt40mcp(raw)
-                        if sel is not None:
-                            ac.selected_alt = int(sel)
+                        tas = pms.commb.tas50(raw)
+                        if tas is not None:
+                            ac.airspeed_kts = int(round(tas))
+                            ac.airspeed_type = "TAS"
+                    except Exception:
+                        pass
+                    try:
+                        trk = pms.commb.trk50(raw)
+                        if trk is not None:
+                            ac.heading_deg = round(float(trk), 1)
                     except Exception:
                         pass
 
-            elif _bds50.is50(raw):
-                # TAS + track angle + roll
-                try:
-                    tas = pms.commb.tas50(raw)
-                    if tas is not None:
-                        ac.airspeed_kts = int(round(tas))
-                        ac.airspeed_type = "TAS"
-                except Exception:
-                    pass
-                try:
-                    trk = pms.commb.trk50(raw)
-                    if trk is not None:
-                        ac.heading_deg = round(float(trk), 1)
-                except Exception:
-                    pass
-
-            elif _bds60.is60(raw):
-                # IAS + Mach + magnetic heading + baro vertical rate
-                try:
-                    ias = pms.commb.ias60(raw)
-                    if ias is not None:
-                        ac.airspeed_kts = int(round(ias))
-                        ac.airspeed_type = "IAS"
-                except Exception:
-                    pass
-                try:
-                    mach = pms.commb.mach60(raw)
-                    if mach is not None:
-                        ac.mach = round(float(mach), 3)
-                except Exception:
-                    pass
-                try:
-                    hdg = pms.commb.hdg60(raw)
-                    if hdg is not None:
-                        ac.heading_deg = round(float(hdg), 1)
-                except Exception:
-                    pass
-                if not mlat:  # baro vertical rate is altitude-derived; suppress for MLAT
+                elif _bds60.is60(raw):
                     try:
-                        vr = pms.commb.vr60baro(raw)
-                        if vr is not None:
-                            ac.vertical_rate_fpm = int(round(vr))
-                            # Feed altitude filter dynamic rate window
-                            ac._vrate_baro_fpm = int(round(vr))
-                            ac._vrate_baro_ts  = now
+                        ias = pms.commb.ias60(raw)
+                        if ias is not None:
+                            ac.airspeed_kts = int(round(ias))
+                            ac.airspeed_type = "IAS"
                     except Exception:
                         pass
+                    try:
+                        mach = pms.commb.mach60(raw)
+                        if mach is not None:
+                            ac.mach = round(float(mach), 3)
+                    except Exception:
+                        pass
+                    try:
+                        hdg = pms.commb.hdg60(raw)
+                        if hdg is not None:
+                            ac.heading_deg = round(float(hdg), 1)
+                    except Exception:
+                        pass
+                    if not mlat:
+                        try:
+                            vr = pms.commb.vr60baro(raw)
+                            if vr is not None:
+                                ac.vertical_rate_fpm = int(round(vr))
+                                ac._vrate_baro_fpm = int(round(vr))
+                                ac._vrate_baro_ts  = now
+                        except Exception:
+                            pass
 
         # --- DF16: Long Air-Air Surveillance (ACAS RA in MV field) ---
         # Altitude from DF16 is intentionally not used — DF16 is an ACAS air-to-air
@@ -1728,7 +2198,10 @@ class AircraftState:
         # --- Squawk from identity reply (DF 5 / DF 21) ---
         if df in (5, 21):
             try:
-                sq = pms.idcode(raw)
+                if _nd is not None:
+                    sq = _nd.get('squawk')
+                else:
+                    sq = pms.idcode(raw)
                 if sq:
                     ac.squawk = sq
             except Exception:
@@ -1848,3 +2321,283 @@ class AircraftState:
             return None
 
         return code
+
+    # ------------------------------------------------------------------
+    # readsb JSON ingest path (INGEST_MODE=readsb or hybrid)
+    # ------------------------------------------------------------------
+
+    def update_from_json(
+        self,
+        aircraft_list: list[dict],
+        now: float,
+        total_messages: int,
+        df_counts: dict | None = None,
+    ) -> None:
+        """Update aircraft state from a readsb aircraft.json payload.
+
+        Called by readsb_ingest.py once per poll cycle (~1 s).  Processes the
+        complete aircraft snapshot rather than individual Beast frames, so there
+        is no per-message queue or decoder thread.  Per-second and per-minute
+        stats are derived from the total_messages delta between polls.
+
+        df_counts: optional per-DF message counts from airspy_adsb stats.json
+        (e.g. {17: 5000, 11: 1000, ...}).  When provided, populates the live
+        DF type breakdown chart on the receiver page.
+        """
+        with self._lock:
+            self._update_from_json_locked(aircraft_list, now, total_messages, df_counts)
+
+    def _update_from_json_locked(
+        self,
+        aircraft_list: list[dict],
+        now: float,
+        total_messages: int,
+        df_counts: dict | None = None,
+    ) -> None:
+        """Inner implementation — must be called with self._lock held."""
+
+        # ── Message-count bookkeeping ──────────────────────────────────────
+        if self._readsb_last_total < 0:
+            # First poll: readsb's cumulative count could be very large (millions).
+            # Set baseline without generating a delta to avoid spiking msg_per_sec.
+            self._readsb_last_total = total_messages
+            delta = 0
+        else:
+            delta = max(0, total_messages - self._readsb_last_total)
+            self._readsb_last_total = total_messages
+        self._total += delta
+
+        # Replicate _tick() logic: accumulate per-second count; roll minute.
+        # We treat the entire poll-period delta as a single second-bucket entry.
+        sec = int(now)
+        if sec != self._cur_sec:
+            self._sec_counts.append((self._cur_sec, self._cur_sec_count))
+            self._mlat_sec_counts.append((self._cur_sec, self._cur_sec_mlat_count))
+            self._cur_min_sec_counts.append(self._cur_sec_count)
+            self._cur_sec = sec
+            self._cur_sec_count = 0
+            self._cur_sec_mlat_count = 0
+        self._cur_sec_count += delta
+
+        minute = int(now // 60)
+        if minute != self._cur_min:
+            secs = self._cur_min_sec_counts
+            if secs:
+                mn, mx, me = min(secs), max(secs), round(sum(secs) / len(secs), 1)
+            else:
+                mn = mx = me = 0.0
+            total_ac = len(self._aircraft)
+            mil      = sum(1 for ac in self._aircraft.values() if ac.military)
+            with_pos = sum(1 for ac in self._aircraft.values() if _pos_reliable(ac))
+            mlat_pos = sum(1 for ac in self._aircraft.values() if ac.mlat and _pos_reliable(ac))
+            sigs     = self._cur_min_signals
+            sig_avg  = round(sum(sigs) / len(sigs), 1) if sigs else None
+            sig_min  = min(sigs) if sigs else None
+            sig_max  = max(sigs) if sigs else None
+            self._min_stats.append(
+                (self._cur_min, mn, mx, me, total_ac, total_ac - mil, mil,
+                 sig_avg, sig_min, sig_max, with_pos, mlat_pos)
+            )
+            self._min_df_stats.append((self._cur_min, dict(self._cur_min_df_counts)))
+            self._min_mlat_counts.append((self._cur_min, self._cur_min_mlat_count))
+            self._cur_min = minute
+            self._cur_min_sec_counts = []
+            self._cur_min_signals = []
+            self._cur_min_df_counts = {}
+            self._cur_min_mlat_count = 0
+
+        # Midnight rollover (mirrors process_message path)
+        today = date.today().isoformat()
+        if today != self._today_date:
+            self._today_date = today
+            self._today_icaos.clear()
+            self._today_mil_icaos.clear()
+
+        # ── Per-aircraft update ────────────────────────────────────────────
+        for ac_data in aircraft_list:
+            raw_icao = ac_data.get("hex", "")
+            if not raw_icao:
+                continue
+            # TIS-B addresses carry a '~' prefix — strip it but still track them
+            icao = raw_icao.lstrip("~").upper()
+            if not _ICAO_HEX_RE.fullmatch(icao):
+                continue
+
+            is_new = icao not in self._aircraft
+            if is_new:
+                ac = Aircraft(icao=icao, sighting_count=self._sighting_counts.get(icao, 1))
+                ac.country = enrichment.db.get_country_by_icao(icao)
+                hexdb_cached = enrichment.db.get_hexdb_cached(icao)
+                if hexdb_cached:
+                    _apply_hexdb_data(ac, hexdb_cached)
+                # Defer SQLite enrichment to _adsbx_task
+                self._adsbx_queue.add(icao)
+                self._aircraft[icao] = ac
+                self._today_icaos.add(icao)
+
+            ac = self._aircraft[icao]
+            ac.last_seen = now
+
+            # Callsign
+            flight = ac_data.get("flight")
+            if flight is not None:
+                cs = flight.strip()
+                if cs:
+                    ac.callsign = cs
+
+            # Altitude — readsb encodes "ground" as the string "ground".
+            # readsb has already validated the altitude, so set alt_reliable
+            # to the publish threshold so it isn't suppressed in get_snapshot().
+            alt_baro = ac_data.get("alt_baro")
+            if alt_baro == "ground":
+                ac.altitude = 0
+                ac.alt_reliable = _ALT_RELIABLE_PUBLISH
+                ac.last_alt_ts = now
+            elif isinstance(alt_baro, (int, float)):
+                ac.altitude = int(alt_baro)
+                ac.alt_reliable = _ALT_RELIABLE_PUBLISH
+                ac.last_alt_ts = now
+
+            # Signal: readsb rssi is dBFS, so convert it back to the Beast/readsb
+            # raw byte convention used elsewhere in the app: 0 = strongest.
+            rssi = ac_data.get("rssi")
+            if rssi is not None:
+                signal_level = max(0.0, min(1.0, math.pow(10.0, float(rssi) / 10.0)))
+                ac.signal = max(0, min(255, int(round(255.0 - signal_level * 255.0))))
+                self._cur_min_signals.append(ac.signal)
+
+            # Per-aircraft message delta (readsb gives cumulative from its start)
+            readsb_msgs = ac_data.get("messages")
+            if readsb_msgs is not None:
+                prev_msgs = self._readsb_msg_counts.get(icao, readsb_msgs)
+                msg_delta = max(0, readsb_msgs - prev_msgs)
+                self._readsb_msg_counts[icao] = readsb_msgs
+                ac.msg_count += msg_delta
+
+            # MLAT flag: type=="mlat" or lat is in the mlat-derived field list
+            ac_type    = ac_data.get("type", "")
+            mlat_fields = ac_data.get("mlat", [])
+            is_mlat = ac_type == "mlat" or "lat" in mlat_fields
+            if is_mlat:
+                ac.mlat = True
+                self._mlat_total += 1
+                self._cur_sec_mlat_count += 1
+                self._cur_min_mlat_count += 1
+            elif ac_type.startswith("adsb"):
+                # Confirmed ADS-B — clear any prior MLAT tag
+                ac.mlat = False
+                ac.has_adsb = True
+
+            # Position
+            lat = ac_data.get("lat")
+            lon = ac_data.get("lon")
+            if lat is not None and lon is not None:
+                ac.lat = lat
+                ac.lon = lon
+                seen_pos = ac_data.get("seen_pos", 0)
+                ac.last_pos_ts = now - seen_pos
+                # Trust readsb's CPR decode: set reliability to max
+                ac.pos_reliable_odd  = _POS_RELIABLE_MAX
+                ac.pos_reliable_even = _POS_RELIABLE_MAX
+                ac.pos_global = True
+                _update_range_bearing(ac)
+
+            # Squawk
+            squawk = ac_data.get("squawk")
+            if squawk is not None:
+                ac.squawk = squawk
+
+            # Emitter category (A0–D7)
+            category = ac_data.get("category")
+            if category is not None:
+                ac.type_category = category
+
+            # EHS fields
+            tas = ac_data.get("tas")
+            ias = ac_data.get("ias")
+            if tas is not None:
+                ac.airspeed_kts  = int(tas)
+                ac.airspeed_type = "TAS"
+            elif ias is not None:
+                ac.airspeed_kts  = int(ias)
+                ac.airspeed_type = "IAS"
+
+            mag_heading = ac_data.get("mag_heading")
+            if mag_heading is not None:
+                ac.heading_deg = mag_heading
+
+            baro_rate = ac_data.get("baro_rate")
+            if baro_rate is not None:
+                ac.vertical_rate_fpm = int(baro_rate)
+
+            mach = ac_data.get("mach")
+            if mach is not None:
+                ac.mach = mach
+
+            nav_alt_mcp = ac_data.get("nav_altitude_mcp")
+            if nav_alt_mcp is not None:
+                ac.selected_alt = int(nav_alt_mcp)
+
+            # Enrichment from readsb --db-file / --db-file-lt (free lookups)
+            r = ac_data.get("r")
+            if r and not ac.registration:
+                ac.registration = r
+
+            t = ac_data.get("t")
+            if t and not ac.type_code:
+                ac.type_code = t
+                ti = enrichment.db.get_type_info(t)
+                if ti:
+                    ac.type_desc      = ti.get("Description", "")
+                    ac.type_full_name = ti.get("Name", "")
+                    ac.wtc            = ti.get("WTC", "")
+
+            desc = ac_data.get("desc")
+            if desc and not ac.type_full_name:
+                ac.type_full_name = desc
+
+            # Military/interesting from dbFlags bitfield (requires readsb --db-file)
+            db_flags = ac_data.get("dbFlags")
+            if db_flags is not None:
+                ac.military = bool(db_flags & 1)
+
+            if ac.military:
+                self._today_mil_icaos.add(icao)
+
+            # ── readsb-only fields ──────────────────────────────────────────
+            def _maybe(key, attr, cast=None):
+                v = ac_data.get(key)
+                if v is not None:
+                    setattr(ac, attr, cast(v) if cast else v)
+
+            _maybe("alt_geom",          "alt_geom",         int)
+            _maybe("gs",                "gs")
+            _maybe("track",             "track")
+            _maybe("track_rate",        "track_rate")
+            _maybe("roll",              "roll")
+            _maybe("true_heading",      "true_heading")
+            _maybe("geom_rate",         "geom_rate",        int)
+            _maybe("emergency",         "emergency")
+            _maybe("nav_qnh",           "nav_qnh")
+            _maybe("nav_altitude_fms",  "nav_altitude_fms", int)
+            _maybe("nav_heading",       "nav_heading")
+            _maybe("nav_modes",         "nav_modes")
+            _maybe("nic",               "nic",              int)
+            _maybe("rc",                "rc",               int)
+            _maybe("nac_p",             "nac_p",            int)
+            _maybe("nac_v",             "nac_v",            int)
+            _maybe("sil",               "sil",              int)
+            _maybe("gva",               "gva",              int)
+            _maybe("sda",               "sda",              int)
+            _maybe("version",           "adsb_version",     int)
+            _maybe("wd",                "wind_dir",         int)
+            _maybe("ws",                "wind_speed",       int)
+            _maybe("oat",               "oat",              int)
+            _maybe("tat",               "tat",              int)
+
+        # ── DF type breakdown from airspy_adsb (optional) ─────────────────
+        # airspy_adsb stats.json provides per-period DF counts that map directly
+        # to the live message-type chart.  Use them to replace the current-minute
+        # bucket so the receiver page shows a real breakdown.
+        if isinstance(df_counts, dict) and df_counts:
+            self._cur_min_df_counts = {int(k): int(v) for k, v in df_counts.items()}

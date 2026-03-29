@@ -1,6 +1,7 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import styles from './HourlyHeatmap.module.css'
 import { TYPE_GROUPS } from '../utils/typeGroups'
+import { cellColor } from '../utils/format'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 const DAYS = 30
@@ -35,33 +36,7 @@ function buildDayList() {
   return days
 }
 
-// Continuous HSL gradient matching scatter plots, reversed: purple (low) → blue → yellow → green (high)
-function cellColor(value, maxVal) {
-  if (!value) return '#21262d'
-  const t = Math.max(0, Math.min(1, value / maxVal))
-  let h
-  if (t < 0.444) {
-    h = 280 - (t / 0.444) * 70           // purple → blue (280→210)
-  } else if (t < 0.778) {
-    h = 210 - ((t - 0.444) / 0.334) * 150 // blue → yellow (210→60)
-  } else {
-    h = 60 + ((t - 0.778) / 0.222) * 60   // yellow → green (60→120)
-  }
-  return `hsl(${Math.round(h)},80%,55%)`
-}
 
-const ALL_DAYS = buildDayList()
-
-const DAY_LABELS = ALL_DAYS.map((d, i) => {
-  const parsed = new Date(d + 'T00:00:00Z')
-  if (i === 0 || parsed.getDate() === 1) {
-    return parsed.toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' })
-  }
-  if (i % 7 === 0) {
-    return parsed.toLocaleDateString(undefined, { day: 'numeric', timeZone: 'UTC' })
-  }
-  return ''
-})
 
 export default function HourlyHeatmap() {
   const [metric, setMetric]         = useState('ac_total')
@@ -76,6 +51,32 @@ export default function HourlyHeatmap() {
   const [loading, setLoading]       = useState(true)
   const [tooltip, setTooltip]       = useState(null)
   const containerRef = useRef(null)
+
+  // Recompute day list at midnight so overnight sessions show correct labels.
+  // dateKey changes at midnight, invalidating the memos below.
+  const [dateKey, setDateKey] = useState(() => new Date().toDateString())
+  useEffect(() => {
+    const now = new Date()
+    const msUntilMidnight =
+      (24 - now.getHours()) * 3_600_000
+      - now.getMinutes() * 60_000
+      - now.getSeconds() * 1_000
+      - now.getMilliseconds()
+    const id = setTimeout(() => setDateKey(new Date().toDateString()), msUntilMidnight)
+    return () => clearTimeout(id)
+  }, [dateKey])
+
+  const allDays = useMemo(() => buildDayList(), [dateKey])
+  const dayLabels = useMemo(() => allDays.map((d, i) => {
+    const parsed = new Date(d + 'T00:00:00Z')
+    if (i === 0 || parsed.getDate() === 1) {
+      return parsed.toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' })
+    }
+    if (i % 7 === 0) {
+      return parsed.toLocaleDateString(undefined, { day: 'numeric', timeZone: 'UTC' })
+    }
+    return ''
+  }), [allDays])
 
   // Load autocomplete options once
   useEffect(() => {
@@ -260,8 +261,8 @@ export default function HourlyHeatmap() {
 
           {/* X-axis: day labels */}
           <div className={styles.xAxis}>
-            {ALL_DAYS.map((d, i) => (
-              <div key={d} className={styles.dayLabel} title={d}>{DAY_LABELS[i]}</div>
+            {allDays.map((d, i) => (
+              <div key={d} className={styles.dayLabel} title={d}>{dayLabels[i]}</div>
             ))}
           </div>
 
@@ -281,7 +282,7 @@ export default function HourlyHeatmap() {
           >
             {Array.from({ length: numBuckets }, (_, i) => {
               const bucket = numBuckets - 1 - i  // reversed: row 0 = last bucket (end of day)
-              return ALL_DAYS.map(day => {
+              return allDays.map(day => {
                 const val = byKey[`${day}-${bucket}`] ?? 0
                 return (
                   <div

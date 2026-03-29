@@ -1,15 +1,12 @@
 import { Fragment, useState, useEffect, useCallback, useRef } from 'react'
 import L from 'leaflet'
+import 'leaflet/dist/leaflet.css'
 import styles from './AircraftDetailPanel.module.css'
 import { formatOperator } from '../utils/formatOperator'
+import { EMERGENCY_SQUAWKS } from '../utils/squawks'
+import { fmtAlt } from '../utils/format'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
-
-const EMERGENCY_SQUAWKS = {
-  '7700': 'General emergency',
-  '7600': 'Radio failure',
-  '7500': 'Hijack',
-}
 
 function fmtDateTime(unix) {
   if (!unix) return '—'
@@ -30,10 +27,6 @@ function sameDay(startTs, endTs) {
   return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
 }
 
-function fmtAlt(alt) {
-  if (alt == null) return null
-  return alt.toLocaleString() + ' ft'
-}
 
 function fmtDuration(startTs, endTs) {
   if (!startTs || !endTs) return null
@@ -75,6 +68,9 @@ function MiniMap({ icao, visitId }) {
       L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
         maxZoom: 18,
       }).addTo(mapRef.current)
+      // The container is inside a conditionally-rendered table row; Leaflet measures
+      // it before layout is fully settled. invalidateSize() forces a re-measure.
+      mapRef.current.invalidateSize()
     }
 
     const map = mapRef.current
@@ -90,6 +86,9 @@ function MiniMap({ icao, visitId }) {
         // Start/end markers
         L.circleMarker(latlngs[0], { radius: 5, color: '#3fb950', fillColor: '#3fb950', fillOpacity: 1, weight: 0 }).addTo(map)
         L.circleMarker(latlngs[latlngs.length - 1], { radius: 5, color: '#f85149', fillColor: '#f85149', fillOpacity: 1, weight: 0 }).addTo(map)
+        // Re-measure again before fitting bounds in case the table row expansion
+        // changed layout after the initial invalidateSize call above.
+        map.invalidateSize()
         map.fitBounds(L.polyline(latlngs).getBounds(), { padding: [16, 16] })
       })
       .catch(() => {})
@@ -126,7 +125,7 @@ function RouteDisplay({ visits, visitId }) {
   )
 }
 
-export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefreshed }) {
+export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefreshed, initialVisitTs, onOpenCoverage }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(false)
@@ -220,6 +219,13 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
     : data?.type_desc || ''
   const opStr = formatOperator(data?.operator) || ''
 
+  // Auto-select the visit that contains the given timestamp (e.g. from an events page link)
+  useEffect(() => {
+    if (!initialVisitTs || !visits.length || activeVisitId) return
+    const match = visits.find(v => v.start_ts <= initialVisitTs && initialVisitTs <= v.end_ts)
+    if (match) setActiveVisitId(match.id)
+  }, [visits, initialVisitTs]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const handleVisitRowClick = (visitId) => {
     setActiveVisitId(prev => prev === visitId ? null : visitId)
   }
@@ -240,6 +246,11 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
               className={`${styles.watchBtn}${watched ? ' ' + styles.watching : ''}`}
               onClick={toggleWatch}
             >{watched ? '★ Watching' : '☆ Watch'}</button>
+            {onOpenCoverage && (
+              <button className={styles.iconBtn} onClick={() => onOpenCoverage(icao)} title="View on 3D coverage map">
+                3D
+              </button>
+            )}
             <button className={styles.iconBtn} onClick={refresh} disabled={refreshing} title="Re-apply enrichment">
               {refreshing ? '…' : '↻'}
             </button>

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import styles from './SkyView.module.css'
+import { EMERGENCY_SQUAWKS } from '../utils/squawks'
 
 const FEET_PER_NM      = 6076.115
 const TRACK_POLL_MS    = 5000
@@ -10,8 +11,6 @@ const HOVER_RADIUS_PX  = 15   // max distance to register a hover/click
 // (catches gaps from aircraft going off-screen then returning, or CPR glitches)
 const MAX_TRAIL_GAP_S  = 20
 
-const EMERGENCY_SQUAWKS = new Set(['7700', '7600', '7500'])
-
 // Elevation angle in degrees above horizon. Returns null if inputs missing.
 function elevDeg(altitude_ft, range_nm) {
   if (altitude_ft == null || range_nm == null || range_nm <= 0) return null
@@ -21,7 +20,7 @@ function elevDeg(altitude_ft, range_nm) {
 // Colours match the live table badge/row scheme exactly.
 // Priority: emergency > military > MLAT > interesting > standard ADS-B
 function acColor(ac) {
-  if (ac.squawk && EMERGENCY_SQUAWKS.has(ac.squawk)) return '#f85149'  // red
+  if (ac.squawk && EMERGENCY_SQUAWKS[ac.squawk]) return '#f85149'  // red
   if (ac.military)    return '#bc8cff'  // purple  (milBadge)
   if (ac.mlat)        return '#388bfd'  // blue    (mlatBadge)
   if (ac.interesting) return '#d29922'  // orange  (intBadge)

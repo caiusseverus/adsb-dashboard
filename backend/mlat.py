@@ -5,7 +5,6 @@ GET /api/mlat/fixes/{icao}     — per-source raw fix positions for one aircraft
 GET /api/mlat/residuals        — all aircraft with positions coloured by cross-source residual
 """
 
-import statistics
 from fastapi import APIRouter, HTTPException
 
 router = APIRouter()
@@ -23,20 +22,7 @@ def get_all_mlat_fixes() -> dict:
     """
     if _state is None:
         return {}
-
-    out = {}
-    with _state._lock:
-        for icao, ac in _state._aircraft.items():
-            if not ac.mlat or not ac.mlat_fixes:
-                continue
-            srcs = {
-                src: [[round(f.lat, 6), round(f.lon, 6)] for f in buf]
-                for src, buf in ac.mlat_fixes.items()
-                if buf
-            }
-            if srcs:
-                out[icao] = srcs
-    return out
+    return _state.get_mlat_fixes_all()
 
 
 @router.get("/api/mlat/fixes/{icao}")
@@ -48,17 +34,9 @@ def get_mlat_fixes(icao: str) -> dict:
     """
     if _state is None:
         raise HTTPException(503, "State not available")
-
-    icao = icao.lower()
-    with _state._lock:
-        ac = _state._aircraft.get(icao)
-        if ac is None:
-            return {"_debug": "aircraft_not_in_live_state"}
-
-        result = {}
-        for src, buf in ac.mlat_fixes.items():
-            result[src] = [[round(f.lat, 6), round(f.lon, 6)] for f in buf]
-
+    result = _state.get_mlat_fixes_for(icao.upper())
+    if result is None:
+        return {"_debug": "aircraft_not_in_live_state"}
     return result
 
 
@@ -71,29 +49,4 @@ def get_mlat_residuals() -> list:
     """
     if _state is None:
         return []
-
-    out = []
-    with _state._lock:
-        for icao, ac in _state._aircraft.items():
-            if not ac.mlat or ac.lat is None or ac.lon is None:
-                continue
-            if not ac.mlat_residuals:
-                continue
-
-            # Median-of-medians across all source residual streams
-            all_vals = []
-            for buf in ac.mlat_residuals.values():
-                if len(buf) >= 3:
-                    all_vals.append(statistics.median(buf))
-            if not all_vals:
-                continue
-
-            out.append({
-                "icao":             icao,
-                "lat":              round(ac.lat, 5),
-                "lon":              round(ac.lon, 5),
-                "sources":          list(ac.mlat_residuals.keys()),
-                "avg_residual_nm":  round(sum(all_vals) / len(all_vals), 3),
-            })
-
-    return out
+    return _state.get_mlat_residuals()

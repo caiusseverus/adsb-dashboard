@@ -11,19 +11,19 @@ import asyncio
 import logging
 import os
 
+import aircraft_state as _state_module
+import benchmark as _benchmark_module
+import enrichment as enrichment_module
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
+from benchmark import DecoderPaused
+from db import stats_db
 
 # On Pi hardware 20k iterations pins all cores for ~20s and can push junction
 # temperature above the 80°C soft-throttle threshold, corrupting the results.
 _IS_PI    = os.path.exists("/sys/firmware/devicetree/base/model")
 _BENCH_MAX = 2_000 if _IS_PI else 20_000
-
-from db import stats_db
-import enrichment as enrichment_module
-import aircraft_state as _state_module
-import benchmark as _benchmark_module
-from benchmark import DecoderPaused
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/debug")
@@ -41,9 +41,12 @@ OVERRIDEABLE_FIELDS = {
 @router.get("/perf")
 async def get_perf() -> dict:
     """Return performance timing statistics for message decode and push-updates."""
-    from main import _msg_queue
-    msg_t  = sorted(_state_module.msg_timings)
-    push_t = list(_state_module.push_timings)
+    from main import _msg_queue, _msg_drops, _queue_depth_samples
+    msg_t        = sorted(_state_module.msg_timings)
+    lock_wait_t  = sorted(_state_module.lock_wait_timings)
+    decode_t     = sorted(_state_module.decode_timings)
+    push_t       = list(_state_module.push_timings)
+    qdepth       = sorted(_queue_depth_samples)
 
     def percentiles(data: list[float], scale: float = 1_000_000) -> dict:
         n = len(data)
@@ -58,22 +61,42 @@ async def get_perf() -> dict:
             "mean": round((sum(data) / n) * scale, 1),
         }
 
+    def int_percentiles(data: list[int]) -> dict:
+        n = len(data)
+        if not n:
+            return {"samples": 0, "p50": 0, "p95": 0, "max": 0}
+        return {
+            "samples": n,
+            "p50": data[int(n * 0.50)],
+            "p95": data[int(n * 0.95)],
+            "max": data[-1],
+        }
+
     def push_avg(key: str) -> float:
         if not push_t:
             return 0.0
-        return round(sum(p[key] for p in push_t) / len(push_t), 2)
+        return round(sum(p.get(key, 0) for p in push_t) / len(push_t), 2)
 
     return {
-        "msg_decode_us":  percentiles(msg_t, scale=1_000_000),
+        "msg_decode_us":   percentiles(msg_t, scale=1_000_000),
+        "lock_wait_us":    percentiles(lock_wait_t, scale=1_000_000),
+        "pure_decode_us":  percentiles(decode_t, scale=1_000_000),
         "msg_queue_depth": _msg_queue.qsize(),
+        "msg_queue_stats": int_percentiles(qdepth),
+        "msg_drops_total": _msg_drops,
         "push_updates_ms": {
-            "samples":          len(push_t),
-            "sync_avg":         push_avg("sync_ms"),
-            "gather_avg":       push_avg("gather_ms"),
-            "notify_tasks_avg": push_avg("notify_tasks"),
-            "broadcast_avg":    push_avg("broadcast_ms"),
-            "total_avg":        push_avg("total_ms"),
-            "ac_count_avg":     push_avg("ac_count"),
+            "samples":                len(push_t),
+            "sync_avg":               push_avg("sync_ms"),
+            "snapshot_avg":           push_avg("snapshot_ms"),
+            "serialize_avg":          push_avg("serialize_ms"),
+            "gather_avg":             push_avg("gather_ms"),
+            "notify_tasks_avg":       push_avg("notify_tasks"),
+            "broadcast_avg":          push_avg("broadcast_ms"),
+            "total_avg":              push_avg("total_ms"),
+            "ac_count_avg":           push_avg("ac_count"),
+            "ws_client_count_avg":    push_avg("ws_client_count"),
+            "ws_clients_dropped_total": 0,
+            "ws_send_max_avg":        push_avg("ws_send_max_ms"),
         },
     }
 

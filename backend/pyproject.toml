@@ -2,11 +2,15 @@
 name = "adsb-dashboard"
 version = "0.1.0"
 description = "ADS-B receiver monitoring dashboard backend"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
+    "cffi>=2.0.0",
     "fastapi>=0.110.0",
+    "numpy>=1.24",
     "orjson>=3.9",
+    "Pillow>=10.0",
     "pymodes==2.9",
+    "pychromecast>=14.0",
     "python-dotenv>=1.0.0",
     "uvicorn[standard]>=0.27.0",
 ]

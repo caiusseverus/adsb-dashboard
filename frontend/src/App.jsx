@@ -1,22 +1,25 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, lazy, Suspense } from 'react'
 import StatsBar from './components/StatsBar'
 import MlatScorecard from './components/MlatScorecard'
 import MessageRateChart from './components/MessageRateChart'
 import AircraftTable from './components/AircraftTable'
 import AircraftDetailPanel from './components/AircraftDetailPanel'
-import HistoryPage from './pages/HistoryPage'
-import ReceiverPage from './pages/ReceiverPage'
-import FleetPage from './pages/FleetPage'
-import CoveragePage from './pages/CoveragePage'
-import MapPage from './pages/MapPage'
-import FlowMapPage from './pages/FlowMapPage'
-import EventsPage from './pages/EventsPage'
-import SightingsPage from './pages/SightingsPage'
-import StatusPage from './pages/StatusPage'
-import SettingsPage from './pages/SettingsPage'
-import SkyView from './pages/SkyView'
-import PositionQualityPage from './pages/PositionQualityPage'
 import styles from './App.module.css'
+
+// Page modules are lazy-loaded so heavy dependencies (Leaflet, Three.js,
+// Recharts) are only fetched when the user first visits that tab.
+const HistoryPage        = lazy(() => import('./pages/HistoryPage'))
+const ReceiverPage       = lazy(() => import('./pages/ReceiverPage'))
+const FleetPage          = lazy(() => import('./pages/FleetPage'))
+const CoveragePage       = lazy(() => import('./pages/CoveragePage'))
+const MapPage            = lazy(() => import('./pages/MapPage'))
+const FlowMapPage        = lazy(() => import('./pages/FlowMapPage'))
+const EventsPage         = lazy(() => import('./pages/EventsPage'))
+const SightingsPage      = lazy(() => import('./pages/SightingsPage'))
+const StatusPage         = lazy(() => import('./pages/StatusPage'))
+const SettingsPage       = lazy(() => import('./pages/SettingsPage'))
+const SkyView            = lazy(() => import('./pages/SkyView'))
+const PositionQualityPage = lazy(() => import('./pages/PositionQualityPage'))
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 
@@ -29,11 +32,32 @@ export default function App() {
   const [connected, setConnected] = useState(false)
   const [tab, setTab] = useState('live')
   const [selectedIcao, setSelectedIcao] = useState(null)
+  const [selectedVisitTs, setSelectedVisitTs] = useState(null)
+  const [coverageIcao, setCoverageIcao] = useState('')
   const [notableRefreshKey, setNotableRefreshKey] = useState(0)
   const [receiverPos, setReceiverPos] = useState(null)
   const [debugMode, setDebugMode] = useState(false)
   const wsRef = useRef(null)
   const retryRef = useRef(null)
+
+  function handleOpenCoverage(icao) {
+    setCoverageIcao(icao)
+    setTab('coverage')
+    setSelectedIcao(null)
+    setSelectedVisitTs(null)
+  }
+
+  // Accept either a plain icao string or { icao, visitTs } from pages that
+  // want to pre-select a specific visit in the detail panel.
+  function handleSelectIcao(value) {
+    if (value && typeof value === 'object') {
+      setSelectedIcao(value.icao)
+      setSelectedVisitTs(value.visitTs ?? null)
+    } else {
+      setSelectedIcao(value)
+      setSelectedVisitTs(null)
+    }
+  }
 
   const connect = useCallback(() => {
     const ws = new WebSocket(WS_URL)
@@ -156,7 +180,7 @@ export default function App() {
                 <MlatScorecard aircraft={snapshot.aircraft} />
               )}
               <MessageRateChart data={snapshot.rate_history} />
-              <AircraftTable aircraft={snapshot.aircraft} onSelectIcao={setSelectedIcao} queueSize={snapshot.hexdb_queue_size ?? 0} />
+              <AircraftTable aircraft={snapshot.aircraft} onSelectIcao={handleSelectIcao} queueSize={snapshot.hexdb_queue_size ?? 0} />
             </>
           ) : (
             <div className={styles.waiting}>
@@ -166,25 +190,29 @@ export default function App() {
         </main>
       )}
 
-      {tab === 'map' && <MapPage snapshot={snapshot} onSelectIcao={setSelectedIcao} selectedIcao={selectedIcao} receiverPos={receiverPos} />}
-      {tab === 'history' && <HistoryPage snapshot={snapshot} />}
-      {tab === 'sightings' && <SightingsPage onSelectIcao={setSelectedIcao} notableRefreshKey={notableRefreshKey} />}
-      {tab === 'receiver' && <ReceiverPage snapshot={snapshot} />}
-      {tab === 'coverage' && <CoveragePage aircraft={snapshot.aircraft ?? []} />}
-      {tab === 'flow' && <FlowMapPage />}
-      {tab === 'fleet' && <FleetPage onSelectIcao={setSelectedIcao} />}
-      {tab === 'events' && <EventsPage onSelectIcao={setSelectedIcao} />}
-      {tab === 'sky' && <SkyView snapshot={snapshot} onSelectIcao={setSelectedIcao} />}
-      {tab === 'positionqa' && debugMode && <PositionQualityPage />}
-      {tab === 'status' && <StatusPage />}
-      {tab === 'settings' && <SettingsPage />}
+      <Suspense fallback={null}>
+        {tab === 'map' && <MapPage snapshot={snapshot} onSelectIcao={handleSelectIcao} selectedIcao={selectedIcao} receiverPos={receiverPos} />}
+        {tab === 'history' && <HistoryPage snapshot={snapshot} />}
+        {tab === 'sightings' && <SightingsPage onSelectIcao={handleSelectIcao} notableRefreshKey={notableRefreshKey} />}
+        {tab === 'receiver' && <ReceiverPage snapshot={snapshot} />}
+        {tab === 'coverage' && <CoveragePage aircraft={snapshot?.aircraft ?? []} initialIcao={coverageIcao} />}
+        {tab === 'flow' && <FlowMapPage />}
+        {tab === 'fleet' && <FleetPage onSelectIcao={handleSelectIcao} />}
+        {tab === 'events' && <EventsPage onSelectIcao={handleSelectIcao} />}
+        {tab === 'sky' && <SkyView snapshot={snapshot} onSelectIcao={handleSelectIcao} />}
+        {tab === 'positionqa' && debugMode && <PositionQualityPage />}
+        {tab === 'status' && <StatusPage />}
+        {tab === 'settings' && <SettingsPage />}
+      </Suspense>
 
       {selectedIcao && (
         <AircraftDetailPanel
           icao={selectedIcao}
+          initialVisitTs={selectedVisitTs}
           snapshot={snapshot}
-          onClose={() => setSelectedIcao(null)}
+          onClose={() => { setSelectedIcao(null); setSelectedVisitTs(null) }}
           onRefreshed={() => setNotableRefreshKey(k => k + 1)}
+          onOpenCoverage={handleOpenCoverage}
         />
       )}
     </div>

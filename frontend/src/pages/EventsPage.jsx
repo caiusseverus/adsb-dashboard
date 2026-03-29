@@ -5,18 +5,9 @@ import {
 } from 'recharts'
 import styles from './EventsPage.module.css'
 import { formatOperator } from '../utils/formatOperator'
+import { fmtTs, fmtAlt } from '../utils/format'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
-
-function fmtTs(unix) {
-  if (!unix) return '—'
-  return new Date(unix * 1000).toLocaleString()
-}
-
-function fmtAlt(alt) {
-  if (alt == null) return '—'
-  return alt.toLocaleString() + ' ft'
-}
 
 function fmtTime(ts) {
   const d = new Date(ts * 1000)
@@ -261,13 +252,13 @@ function EmergencySquawksSection({ onSelectIcao }) {
             </thead>
             <tbody>
               {events.map(ev => (
-                <tr key={ev.id} className={styles.eventRow}
-                  style={{ borderLeft: `3px solid ${(SQUAWK_LABELS[ev.squawk] ?? {}).color ?? '#8b949e'}` }}>
+                <tr key={ev.id}
+                  className={styles.eventRow}
+                  style={{ borderLeft: `3px solid ${(SQUAWK_LABELS[ev.squawk] ?? {}).color ?? '#8b949e'}` }}
+                  onClick={() => onSelectIcao?.({ icao: ev.icao, visitTs: ev.ts })}>
                   <td className={styles.muted}>{fmtTs(ev.ts)}</td>
                   <td className={styles.muted}>{fmtDuration(ev.ts, ev.ts_last)}</td>
-                  <td className={styles.icao}
-                    style={{ cursor: 'pointer' }}
-                    onClick={() => onSelectIcao?.(ev.icao)}>{ev.icao}</td>
+                  <td className={styles.icao}>{ev.icao}</td>
                   <td>{ev.callsign ?? '—'}</td>
                   <td>{ev.registration ?? '—'}</td>
                   <td>{ev.type_code ?? '—'}</td>
@@ -390,7 +381,7 @@ export default function EventsPage({ onSelectIcao }) {
                       onClick={() => toggleExpand(ev)}
                     >
                       <td className={styles.muted}>{fmtTs(ev.ts)}</td>
-                      <td className={styles.icao} onClick={e => { e.stopPropagation(); onSelectIcao?.(ev.icao) }}>
+                      <td className={styles.icao} onClick={e => { e.stopPropagation(); onSelectIcao?.({ icao: ev.icao, visitTs: ev.ts }) }}>
                         {ev.icao}
                       </td>
                       <td>{ev.registration ?? '—'}</td>
@@ -403,7 +394,7 @@ export default function EventsPage({ onSelectIcao }) {
                       <td>
                         {ev.threat_icao
                           ? <span className={styles.threatIcao}
-                              onClick={e => { e.stopPropagation(); onSelectIcao?.(ev.threat_icao) }}>
+                              onClick={e => { e.stopPropagation(); onSelectIcao?.({ icao: ev.threat_icao, visitTs: ev.ts }) }}>
                               {ev.threat_icao}
                             </span>
                           : '—'

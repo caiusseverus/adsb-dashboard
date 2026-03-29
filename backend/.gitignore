@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Native C decode library — built locally; not committed
+native/*.o
+native/libdecode.so
+libdecode.so

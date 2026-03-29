@@ -1,0 +1,71 @@
+services:
+  adsb-dashboard:
+    image: caiusseverus/adsb-dashboard:latest
+    # To build from source instead of using the published image, replace the
+    # line above with:  build: .
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # -----------------------------------------------------------------------
+      # Receiver connection (REQUIRED — change these before starting)
+      # -----------------------------------------------------------------------
+      - BEAST_HOST=localhost
+      - BEAST_PORT=30005
+
+      # -----------------------------------------------------------------------
+      # Receiver location (strongly recommended)
+      # Enables range/bearing, polar chart, and coverage map.
+      # -----------------------------------------------------------------------
+      - RECEIVER_LAT=
+      - RECEIVER_LON=
+      # - RECEIVER_ALT_FT=0
+
+      # -----------------------------------------------------------------------
+      # General settings
+      # -----------------------------------------------------------------------
+      - HOME_COUNTRY=United Kingdom
+      - AIRCRAFT_TIMEOUT=60
+      - RARE_THRESHOLD=5
+      - MINUTE_STATS_RETENTION_DAYS=30
+
+      # -----------------------------------------------------------------------
+      # MLAT streams (optional)
+      # Format: Name@host:port,Name:port  (host defaults to BEAST_HOST if omitted)
+      # -----------------------------------------------------------------------
+      # - MLAT_SERVERS=ADSBx@adsbpi:30158,FlightAware:30105
+
+      # -----------------------------------------------------------------------
+      # Notifications (optional)
+      # -----------------------------------------------------------------------
+      # - NTFY_URL=https://ntfy.sh/your-unique-topic
+      # - NOTIFY_EMAIL_TO=you@example.com
+      # - NOTIFY_EMAIL_FROM=sender@example.com
+      # - NOTIFY_SMTP_HOST=smtp.example.com
+      # - NOTIFY_SMTP_PORT=587
+      # - NOTIFY_SMTP_USER=
+      # - NOTIFY_SMTP_PASS=
+      # - NOTIFY_EMERGENCY=true
+      # - NOTIFY_MILITARY=false
+      # - NOTIFY_INTERESTING=false
+      # - NOTIFY_ACAS=false
+
+      # -----------------------------------------------------------------------
+      # Advanced / optional (safe to leave at defaults)
+      # -----------------------------------------------------------------------
+      # - TERRAIN_ENABLED=true
+      # - GHOST_FILTER_MSGS=2
+      # - MAX_RANGE_NM=300
+      # - BACKUP_PATH=/backups
+      # - BACKUP_RETAIN=7
+      # - HIRES_MAX_AGE_S=43200
+      # - HIRES_MAX_POINTS=500000
+      # - MLAT_FUSION=none
+      # - DEBUG_LOG=false
+      # - DEBUG_ENRICHMENT=false
+
+    volumes:
+      # Named volume keeps the SQLite database and SRTM terrain tiles across restarts.
+      - adsb-data:/app/backend/data
+
+volumes:
+  adsb-data:

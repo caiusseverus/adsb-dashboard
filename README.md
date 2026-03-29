@@ -9,30 +9,39 @@ A real-time web dashboard for monitoring ADS-B receiver performance. Connects to
 - **Receiver tab** — polar coverage chart, azimuth/elevation scatter, range percentiles, signal statistics
 - **Fleet tab** — aircraft registry analysis: types, operators, countries, manufacture years, most-seen individual aircraft
 
-## Prerequisites
+## Install
 
-- A working ADS-B receiver running **readsb** or **dump1090-fa** with Beast TCP output (default port 30005)
-- **Python 3.10+** with [uv](https://docs.astral.sh/uv/getting-started/installation/) (`pip install uv`)
-- **Node.js 18+** with npm
+Three ways to run the dashboard — see [INSTALL.md](INSTALL.md) for full instructions.
 
-## Quick Start
+**Raspberry Pi (bare metal) — single command:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/caiusseverus/adsb-dashboard/main/install.sh | sudo bash
+```
+
+**Docker (any platform):**
+```bash
+mkdir adsb-dashboard && cd adsb-dashboard
+curl -fsSL https://raw.githubusercontent.com/caiusseverus/adsb-dashboard/main/docker-compose.yml -o docker-compose.yml
+curl -fsSL https://raw.githubusercontent.com/caiusseverus/adsb-dashboard/main/backend/.env.example -o backend/.env.example
+mkdir -p backend && cp backend/.env.example backend/.env
+# Edit backend/.env — set BEAST_HOST, RECEIVER_LAT, RECEIVER_LON, HOME_COUNTRY at minimum
+docker compose pull && docker compose up -d
+```
+
+**From source (development):**
+
+Prerequisites: Python 3.10+ with [uv](https://docs.astral.sh/uv/getting-started/installation/), Node.js 18+
 
 ```bash
 git clone https://github.com/caiusseverus/adsb-dashboard
 cd adsb-dashboard
-
-# 1. Configure
 cp backend/.env.example backend/.env
-# Edit backend/.env — set RECEIVER_LAT, RECEIVER_LON and HOME_COUNTRY at minimum
-
-# 2. Build the frontend
+# Edit backend/.env
 cd frontend && npm install && npm run build && cd ..
-
-# 3. Run
 uv run --directory backend uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Open **http://localhost:8000** in your browser. `uv` automatically creates a virtual environment and installs all Python dependencies on first run.
+Open **http://localhost:8000** in your browser.
 
 ## Configuration
 
@@ -83,26 +92,4 @@ Beast TCP stream → beast_client.py (binary frame decode)
 
 ## Production Deployment
 
-The backend serves the built frontend as static files. A simple systemd unit:
-
-```ini
-[Unit]
-Description=ADS-B Dashboard
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/path/to/adsb-dashboard
-ExecStart=uv run --directory backend uvicorn main:app --host 0.0.0.0 --port 8000
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Rebuild the frontend after pulling updates:
-
-```bash
-cd frontend && npm run build
-```
+See [INSTALL.md](INSTALL.md) for full instructions covering the Raspberry Pi bare-metal installer and Docker paths, including how to update, check logs, and troubleshoot common issues.

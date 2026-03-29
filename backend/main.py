@@ -23,19 +23,26 @@ import config
 import enrichment
 from beast_client import BeastClient
 from aircraft_state import AircraftState, push_timings as _push_timings_store
+import readsb_ingest
+import readsb_stats
+from collections import deque as _deque
 from db import stats_db
 from track_store import TrackStore
 from history import router as history_router
 from aircraft import router as aircraft_router
 from fleet import router as fleet_router
 from coverage import router as coverage_router
+from terrain import router as terrain_router, prewarm_cache as terrain_prewarm
 from acas import router as acas_router
 from squawks import router as squawks_router
 import notifications
 import hires_buffer
-from status import router as status_router
+import memory_policy
+from status import router as status_router, register_runtime_stats
 from debug import router as debug_router
 from notify_settings import router as notify_settings_router
+import cast
+from cast_api import router as cast_router
 import health as health_module
 from health import router as health_router
 import tracks as tracks_module
@@ -61,7 +68,13 @@ log.setLevel(logging.INFO)  # main module always logs at INFO regardless of DEBU
 # ---------------------------------------------------------------------------
 state = AircraftState(aircraft_timeout=config.AIRCRAFT_TIMEOUT)
 track_store = TrackStore()
-_clients: list[WebSocket] = []
+# Each connected WebSocket gets its own bounded send queue.
+# _push_updates enqueues the serialised payload and returns immediately;
+# a per-client sender coroutine drains the queue asynchronously.
+# maxsize=2: one frame in-flight + one queued.  If the client falls behind
+# a second full cycle, the new frame is dropped (QueueFull) — the client
+# will receive the next cycle's snapshot instead.
+_clients: dict[WebSocket, asyncio.Queue] = {}
 
 # Emergency squawk tracking: {icao: {squawk, db_id}} for ongoing events
 EMERGENCY_SQUAWKS = frozenset({"7700", "7600", "7500"})
@@ -72,6 +85,7 @@ _watchlist_cache: dict[str, float | None] = {}   # icao → max_range_nm
 
 # Route lookup queue: (visit_id, callsign) pairs awaiting adsbdb.com resolution
 _route_queue: deque[tuple[int, str]] = deque(maxlen=2000)
+_route_queue_drops: int = 0   # count of visits evicted before enrichment
 _watchlist_cache_ts: float = 0.0
 
 # Message decode queue — Beast/MLAT runners push raw messages here; a single
@@ -84,6 +98,10 @@ _MSG_QUEUE_MAX = 5000
 _msg_queue: queue.Queue = queue.Queue(maxsize=_MSG_QUEUE_MAX)
 _DECODE_SENTINEL = object()   # placed on queue to signal the decoder thread to exit
 _decoder_thread: threading.Thread | None = None
+# Cumulative count of Beast/MLAT messages dropped due to full queue
+_msg_drops: int = 0
+# Queue depth sampled once per push cycle (maxlen matches push_timings window)
+_queue_depth_samples: _deque[int] = _deque(maxlen=120)
 
 
 def _start_msg_processor() -> threading.Thread:
@@ -101,10 +119,11 @@ def _start_msg_processor() -> threading.Thread:
 
 async def _beast_runner() -> None:
     def on_message(msg: dict) -> None:
+        global _msg_drops
         try:
             _msg_queue.put_nowait((msg, None))
         except queue.Full:
-            pass  # drop oldest-equivalent: decoder is behind, discard this arrival
+            _msg_drops += 1  # decoder is behind; count the loss
 
     client = BeastClient(config.BEAST_HOST, config.BEAST_PORT, on_message)
     await client.run()
@@ -112,10 +131,11 @@ async def _beast_runner() -> None:
 
 async def _mlat_runner(name: str, host: str, port: int) -> None:
     def on_mlat_message(msg: dict) -> None:
+        global _msg_drops
         try:
             _msg_queue.put_nowait((msg, name))
         except queue.Full:
-            pass
+            _msg_drops += 1  # decoder is behind; count the loss
 
     client = BeastClient(host, port, on_mlat_message)
     log.info("MLAT runner starting: %s (%s:%s)", name, host, port)
@@ -237,33 +257,15 @@ def _wal_checkpoint_passive() -> None:
         log.warning("Periodic WAL checkpoint failed", exc_info=True)
 
 
-def _credible_aircraft(ac) -> bool:
-    """Ghost filter for Aircraft dataclass objects (used at visit close time)."""
+def _is_credible(icao: str, msg_count: int, mlat: bool) -> bool:
+    """Core ghost-filter logic shared by both Aircraft-object and dict callers."""
     if config.GHOST_FILTER_MSGS <= 0:
         return True
-    if ac.msg_count >= config.GHOST_FILTER_MSGS:
-        return True
-    if ac.mlat:
-        return True
-    if enrichment.db.get_adsbx(ac.icao):
-        return True
-    if enrichment.db.get_hexdb_cached(ac.icao):
-        return True
-    if enrichment.db.get_tar1090_cached(ac.icao):
-        return True
-    return False
-
-
-def _ghost_credible(ac: dict) -> bool:
-    """Return True if this aircraft is likely real and should be persisted."""
-    if config.GHOST_FILTER_MSGS <= 0:
-        return True
-    if ac.get("msg_count", 0) >= config.GHOST_FILTER_MSGS:
+    if msg_count >= config.GHOST_FILTER_MSGS:
         return True
     # MLAT-confirmed aircraft are real (multilaterated by multiple receivers)
-    if ac.get("mlat"):
+    if mlat:
         return True
-    icao = ac["icao"]
     if enrichment.db.get_adsbx(icao):
         return True
     if enrichment.db.get_hexdb_cached(icao):
@@ -271,6 +273,16 @@ def _ghost_credible(ac: dict) -> bool:
     if enrichment.db.get_tar1090_cached(icao):
         return True
     return False
+
+
+def _credible_aircraft(ac) -> bool:
+    """Ghost filter for Aircraft dataclass objects (used at visit close time)."""
+    return _is_credible(ac.icao, ac.msg_count, bool(ac.mlat))
+
+
+def _ghost_credible(ac: dict) -> bool:
+    """Return True if this aircraft (dict snapshot) is likely real and should be persisted."""
+    return _is_credible(ac["icao"], ac.get("msg_count", 0), bool(ac.get("mlat")))
 
 
 async def _db_writer() -> None:
@@ -317,7 +329,8 @@ async def _db_writer() -> None:
                   if ((ac.get("last_pos_age") is not None and ac.get("last_pos_age") <= config.POS_FRESH_S)
                       and (ac.get("last_alt_age") is not None and ac.get("last_alt_age") <= config.ALT_FRESH_S))
                   else None),
-                 ac.get("signal"))
+                 ac.get("signal"),
+                 1 if ac.get("mlat") else 0)
                 for ac in snapshot.get("aircraft", [])
                 if ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
             )
@@ -345,12 +358,17 @@ async def _db_writer() -> None:
             squawking_icaos.add(icao)
             if icao in _active_squawks and _active_squawks[icao]["squawk"] == sq:
                 entry = _active_squawks[icao]
+                entry["obs_count"] += 1
                 if entry["db_id"] is None:
-                    # Pending confirmation — write to DB only after 10s sustained squawk
-                    if now_ts - entry["first_seen"] >= 10:
+                    # Pending confirmation — require ≥5 separate snapshot observations
+                    # AND ≥120s sustained squawk before writing to DB.
+                    # The dual gate catches both transient code scrolling (clears in
+                    # seconds) and noisy-receiver bursts (many obs but short-lived).
+                    if entry["obs_count"] >= 5 and now_ts - entry["first_seen"] >= 120:
                         db_id = await asyncio.to_thread(
                             stats_db.write_squawk_event,
-                            icao, sq, ac.get("callsign"), ac.get("altitude"), entry["first_seen"],
+                            icao, sq, ac.get("callsign"), ac.get("altitude"),
+                            entry["first_seen"], now_ts,   # ts=first_seen, ts_last=now
                         )
                         entry["db_id"] = db_id
                         entry["last_update"] = now_ts
@@ -372,11 +390,18 @@ async def _db_writer() -> None:
                 _active_squawks[icao] = {
                     "squawk": sq, "db_id": None,
                     "first_seen": now_ts, "last_update": now_ts,
+                    "obs_count": 1,
                 }
         # Close out events for aircraft no longer squawking emergency
         for icao in list(_active_squawks.keys()):
             if icao not in squawking_icaos:
-                del _active_squawks[icao]
+                entry = _active_squawks.pop(icao)
+                # Record final timestamp if the event was confirmed and written to DB
+                if entry["db_id"] is not None:
+                    await asyncio.to_thread(
+                        stats_db.update_squawk_event_last,
+                        entry["db_id"], now_ts, None,
+                    )
 
 
 async def _route_enricher() -> None:
@@ -408,150 +433,182 @@ async def _route_enricher() -> None:
 
 
 async def _push_updates() -> None:
-    """Broadcast a state snapshot to every connected WebSocket client every second."""
+    """Broadcast a state snapshot to every connected WebSocket client."""
     import time
-    global _watchlist_cache, _watchlist_cache_ts
+    global _watchlist_cache, _watchlist_cache_ts, _route_queue_drops
     while True:
-        await asyncio.sleep(1)
-        expired = state.expire_aircraft()
+        await asyncio.sleep(config.PUSH_INTERVAL_S)
+        try:
+            expired = state.expire_aircraft()
 
-        # Close visit records for aircraft that just timed out
-        if expired:
-            credible = [ac for ac in expired if _credible_aircraft(ac)]
-            if credible:
-                tuples = [
-                    (ac.icao, int(ac.first_seen), int(ac.last_seen),
-                     ac.callsign, ac.squawk, ac.max_altitude, ac.msg_count)
-                    for ac in credible
-                ]
-                visit_ids = await asyncio.to_thread(stats_db.write_visits, tuples)
-                for ac, vid in zip(credible, visit_ids):
-                    if ac.callsign:
-                        _route_queue.append((vid, ac.callsign))
+            # Close visit records for aircraft that just timed out
+            if expired:
+                credible = [ac for ac in expired if _credible_aircraft(ac)]
+                if credible:
+                    tuples = [
+                        (ac.icao, int(ac.first_seen), int(ac.last_seen),
+                         ac.callsign, ac.squawk, ac.max_altitude, ac.msg_count)
+                        for ac in credible
+                    ]
+                    visit_ids = await asyncio.to_thread(stats_db.write_visits, tuples)
+                    for ac, vid in zip(credible, visit_ids):
+                        if ac.callsign:
+                            if len(_route_queue) == _route_queue.maxlen:
+                                _route_queue_drops += 1
+                                log.warning("route enrichment queue full — drop #%d (visit %d %s)",
+                                            _route_queue_drops, vid, ac.callsign)
+                            _route_queue.append((vid, ac.callsign))
 
-        snapshot = state.get_snapshot()
+            # Sample queue depth (Beast mode only — queue unused in readsb/hybrid).
+            if config.INGEST_MODE == "beast":
+                _current_queue_depth = _msg_queue.qsize()
+                _queue_depth_samples.append(_current_queue_depth)
+                if config.MEMORY_POLICY_ENABLED:
+                    memory_policy.report_queue_depth(_current_queue_depth)
 
-        # Record track points (rate-limited to 1/5s per aircraft inside TrackStore)
-        now = time.time()
+            # Determine broadcast snapshot mode.
+            # When no clients are connected use thin mode — the snapshot is still
+            # needed for track recording and notifications, but we skip building the
+            # expensive full-field dict that would only be serialised and discarded.
+            if _clients:
+                if config.SNAPSHOT_MODE_OVERRIDE:
+                    _snap_mode = config.SNAPSHOT_MODE_OVERRIDE
+                elif config.MEMORY_POLICY_ENABLED:
+                    _snap_mode = memory_policy.get_policy()["snapshot_mode"]
+                else:
+                    _snap_mode = "full"
+            else:
+                _snap_mode = "thin"
+            t_snap = time.perf_counter()
+            snapshot = state.get_snapshot(mode=_snap_mode)
+            snapshot_ms = (time.perf_counter() - t_snap) * 1000
 
-        # Refresh watchlist cache from DB every 30s
-        if now - _watchlist_cache_ts > 30:
-            rows = await asyncio.to_thread(stats_db.get_notify_watchlist)
-            _watchlist_cache = {r["icao"]: r["max_range_nm"] for r in rows}
-            _watchlist_cache_ts = now
+            # Record track points (rate-limited to 1/5s per aircraft inside TrackStore)
+            now = time.time()
 
-        # All live ICAOs — used to expire tracks for aircraft that have left the set.
-        # Kept separate from the recording condition so a temporary loss of position
-        # doesn't prematurely prune an existing trail.
-        active_icaos: set[str] = {ac["icao"] for ac in snapshot["aircraft"]}
-        # Build notification tasks and track positions in a single pass.
-        # Skip thread dispatch entirely when no notification channel is configured —
-        # avoids O(N × thread_overhead) per second even for no-op calls.
-        notify_tasks = []
-        _notify_enabled = notifications.any_channel()
-        # Check per-trigger prefs once per cycle (uses cached prefs, <1µs each).
-        # Avoids dispatching any threads for triggers the user has turned off.
-        _mil_on  = _notify_enabled and notifications.trigger_enabled("notify_military")
-        _int_on  = _notify_enabled and notifications.trigger_enabled("notify_interesting")
-        # Collect matching aircraft first; dispatch at most 3 threads per cycle
-        # regardless of how many aircraft match, replacing the previous O(N) dispatch.
-        _mil_batch: list[dict] = []
-        _int_batch: list[dict] = []
-        _wl_batch:  list[dict] = []
-        t_loop_start = time.perf_counter()
-        for ac in snapshot["aircraft"]:
-            icao = ac["icao"]
-            if _notify_enabled:
-                if icao in _watchlist_cache and not notifications.already_notified(f"watchlist:{icao}"):
-                    _wl_batch.append({
-                        "icao": icao, "callsign": ac.get("callsign"),
-                        "registration": ac.get("registration"), "operator": ac.get("operator"),
-                        "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
-                        "max_range_nm": _watchlist_cache[icao],
-                    })
-                if _mil_on and ac.get("military") and not notifications.already_notified(f"military:{icao}"):
-                    _mil_batch.append({
-                        "icao": icao, "callsign": ac.get("callsign"),
-                        "operator": ac.get("operator"), "country": ac.get("country"),
-                        "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
-                    })
-                if _int_on and ac.get("interesting") and not notifications.already_notified(f"interesting:{icao}"):
-                    _int_batch.append({
-                        "icao": icao, "callsign": ac.get("callsign"),
-                        "type_code": ac.get("type_code"), "operator": ac.get("operator"),
-                        "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
-                    })
-            # Only record once the position is confirmed reliable:
-            # - pos_global=True: a global CPR decode (even+odd pair) has succeeded,
-            #   guaranteeing the position is not from the potentially-wrong local
-            #   decode fallback that runs before the first pair is available.
-            # - mlat=True: position established by multilateration, also reliable.
-            if (ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
-                    and ac.get("lat") is not None
-                    and ac.get("pos_confident")):  # pos_confident = _pos_reliable() in snapshot
-                track_store.record(
-                    icao=ac["icao"],
-                    bearing_deg=ac["bearing_deg"],
-                    range_nm=ac["range_nm"],
-                    altitude_ft=ac.get("altitude"),
-                    lat=ac["lat"],
-                    lon=ac["lon"],
-                    military=bool(ac.get("military")),
-                    mlat=bool(ac.get("mlat")),
-                    interesting=bool(ac.get("interesting")),
-                    acas_ra_active=bool(ac.get("acas_ra_active")),
-                    mlat_source=ac.get("mlat_source"),
-                    now=now,
-                )
-        if _mil_batch:
-            notify_tasks.append(asyncio.to_thread(notifications.notify_military_batch, _mil_batch))
-        if _int_batch:
-            notify_tasks.append(asyncio.to_thread(notifications.notify_interesting_batch, _int_batch))
-        if _wl_batch:
-            notify_tasks.append(asyncio.to_thread(notifications.notify_watchlist_batch, _wl_batch))
-        # Prune tracks for aircraft that have left the live set
-        track_store.expire(active_icaos)
-        t_sync_end = time.perf_counter()
+            # Refresh watchlist cache from DB every 30s
+            if now - _watchlist_cache_ts > 30:
+                rows = await asyncio.to_thread(stats_db.get_notify_watchlist)
+                _watchlist_cache = {r["icao"]: r["max_range_nm"] for r in rows}
+                _watchlist_cache_ts = now
 
-        if notify_tasks:
-            await asyncio.gather(*notify_tasks)
-        t_gather_end = time.perf_counter()
+            # All live ICAOs — used to expire tracks for aircraft that have left the set.
+            # Kept separate from the recording condition so a temporary loss of position
+            # doesn't prematurely prune an existing trail.
+            active_icaos: set[str] = {ac["icao"] for ac in snapshot["aircraft"]}
+            # Build notification tasks and track positions in a single pass.
+            # Skip thread dispatch entirely when no notification channel is configured —
+            # avoids O(N × thread_overhead) per second even for no-op calls.
+            notify_tasks = []
+            _notify_enabled = notifications.any_channel()
+            # Check per-trigger prefs once per cycle (uses cached prefs, <1µs each).
+            # Avoids dispatching any threads for triggers the user has turned off.
+            _mil_on  = _notify_enabled and notifications.trigger_enabled("notify_military")
+            _int_on  = _notify_enabled and notifications.trigger_enabled("notify_interesting")
+            # Collect matching aircraft first; dispatch at most 3 threads per cycle
+            # regardless of how many aircraft match, replacing the previous O(N) dispatch.
+            _mil_batch: list[dict] = []
+            _int_batch: list[dict] = []
+            _wl_batch:  list[dict] = []
+            t_loop_start = time.perf_counter()
+            for ac in snapshot["aircraft"]:
+                icao = ac["icao"]
+                if _notify_enabled:
+                    if icao in _watchlist_cache and not notifications.already_notified(f"watchlist:{icao}"):
+                        _wl_batch.append({
+                            "icao": icao, "callsign": ac.get("callsign"),
+                            "registration": ac.get("registration"), "operator": ac.get("operator"),
+                            "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
+                            "max_range_nm": _watchlist_cache[icao],
+                        })
+                    if _mil_on and ac.get("military") and not notifications.already_notified(f"military:{icao}"):
+                        _mil_batch.append({
+                            "icao": icao, "callsign": ac.get("callsign"),
+                            "operator": ac.get("operator"), "country": ac.get("country"),
+                            "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
+                        })
+                    if _int_on and ac.get("interesting") and not notifications.already_notified(f"interesting:{icao}"):
+                        _int_batch.append({
+                            "icao": icao, "callsign": ac.get("callsign"),
+                            "type_code": ac.get("type_code"), "operator": ac.get("operator"),
+                            "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
+                        })
+                # Only record once the position is confirmed reliable:
+                # - pos_global=True: a global CPR decode (even+odd pair) has succeeded,
+                #   guaranteeing the position is not from the potentially-wrong local
+                #   decode fallback that runs before the first pair is available.
+                # - mlat=True: position established by multilateration, also reliable.
+                if (ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
+                        and ac.get("lat") is not None
+                        and ac.get("pos_confident")):  # pos_confident = _pos_reliable() in snapshot
+                    track_store.record(
+                        icao=ac["icao"],
+                        bearing_deg=ac["bearing_deg"],
+                        range_nm=ac["range_nm"],
+                        altitude_ft=ac.get("altitude"),
+                        lat=ac["lat"],
+                        lon=ac["lon"],
+                        military=bool(ac.get("military")),
+                        mlat=bool(ac.get("mlat")),
+                        interesting=bool(ac.get("interesting")),
+                        acas_ra_active=bool(ac.get("acas_ra_active")),
+                        mlat_source=ac.get("mlat_source"),
+                        now=now,
+                    )
+            if _mil_batch:
+                notify_tasks.append(asyncio.to_thread(notifications.notify_military_batch, _mil_batch))
+            if _int_batch:
+                notify_tasks.append(asyncio.to_thread(notifications.notify_interesting_batch, _int_batch))
+            if _wl_batch:
+                notify_tasks.append(asyncio.to_thread(notifications.notify_watchlist_batch, _wl_batch))
+            # Prune tracks for aircraft that have left the live set
+            track_store.expire(active_icaos)
+            t_sync_end = time.perf_counter()
 
-        if not _clients:
-            _push_timings_store.append({
-                "sync_ms":     round((t_sync_end - t_loop_start) * 1000, 2),
-                "gather_ms":   round((t_gather_end - t_sync_end) * 1000, 2),
-                "notify_tasks": len(notify_tasks),
-                "broadcast_ms": 0.0,
-                "total_ms":    round((t_gather_end - t_loop_start) * 1000, 2),
-                "ac_count":    len(snapshot["aircraft"]),
-            })
-            continue
+            if notify_tasks:
+                await asyncio.gather(*notify_tasks)
 
-        payload = _json_dumps(snapshot)
-        dead: list[WebSocket] = []
-
-        for ws in list(_clients):
+            # Cast check — non-blocking; dispatches I/O to thread internally
             try:
-                await ws.send_text(payload)
+                cast.check(snapshot["aircraft"])
             except Exception:
-                dead.append(ws)
+                log.exception("cast: unhandled error in check()")
 
-        for ws in dead:
-            try:
-                _clients.remove(ws)
-            except ValueError:
-                pass
+            t_gather_end = time.perf_counter()
 
-        t_done = time.perf_counter()
-        _push_timings_store.append({
-            "sync_ms":      round((t_sync_end - t_loop_start) * 1000, 2),
-            "gather_ms":    round((t_gather_end - t_sync_end) * 1000, 2),
-            "notify_tasks": len(notify_tasks),
-            "broadcast_ms": round((t_done - t_gather_end) * 1000, 2),
-            "total_ms":     round((t_done - t_loop_start) * 1000, 2),
-            "ac_count":     len(snapshot["aircraft"]),
-        })
+            t_ser = time.perf_counter()
+            payload = _json_dumps(snapshot) if _clients else None
+            serialize_ms = (time.perf_counter() - t_ser) * 1000
+
+            # Enqueue to each client's send queue — non-blocking, O(1) per client.
+            # Clients that fall behind (QueueFull) get this frame dropped; they
+            # receive the next snapshot instead.  Actual WS sends happen in the
+            # per-client sender coroutine started by websocket_endpoint.
+            ws_frames_dropped = 0
+            if payload is not None:
+                for q in list(_clients.values()):
+                    try:
+                        q.put_nowait(payload)
+                    except asyncio.QueueFull:
+                        ws_frames_dropped += 1
+
+            t_done = time.perf_counter()
+            _push_timings_store.append({
+                "sync_ms":           round((t_sync_end - t_loop_start) * 1000, 2),
+                "snapshot_ms":       round(snapshot_ms, 2),
+                "gather_ms":         round((t_gather_end - t_sync_end) * 1000, 2),
+                "notify_tasks":      len(notify_tasks),
+                "broadcast_ms":      round((t_done - t_gather_end) * 1000, 2),
+                "serialize_ms":      round(serialize_ms, 2),
+                "total_ms":          round((t_done - t_loop_start) * 1000, 2),
+                "ac_count":          len(snapshot["aircraft"]),
+                "payload_bytes":     len(payload) if payload else 0,
+                "ws_client_count":   len(_clients),
+                "ws_clients_dropped": ws_frames_dropped,
+                "ws_send_max_ms":    0.0,
+            })
+        except Exception:
+            log.exception("_push_updates: unhandled error in broadcast cycle — continuing")
 
 
 async def _hires_writer() -> None:
@@ -573,7 +630,8 @@ async def _hires_writer() -> None:
                   and (ac.get("last_alt_age") is not None and ac.get("last_alt_age") <= config.ALT_FRESH_S))
               else None),
              ac.get("military", False), ac.get("interesting", False),
-             ac.get("type_code"), ac.get("type_category"), ac.get("operator"))
+             ac.get("type_code"), ac.get("type_category"), ac.get("operator"),
+             bool(ac.get("mlat")))
             for ac in snapshot.get("aircraft", [])
             if (ac.get("bearing_deg") is not None
                 and ac.get("range_nm") is not None
@@ -581,6 +639,39 @@ async def _hires_writer() -> None:
                 and _ghost_credible(ac))
         ]
         hires_buffer.record(samples)
+
+
+def _apply_memory_policy(level: str) -> None:
+    policy = memory_policy.get_policy()
+    hires_buffer.set_policy(policy["hires_max_age_s"], policy["hires_interval_s"])
+    hires_buffer.prune_now()
+    new_timeout = config.AIRCRAFT_TIMEOUT // 2 if policy["halve_timeout"] else config.AIRCRAFT_TIMEOUT
+    state.set_timeout(new_timeout)
+    log.info(
+        "memory_policy applied: level=%s hires_age=%ds hires_interval=%ds "
+        "snapshot=%s aircraft_timeout=%ds",
+        level, policy["hires_max_age_s"], policy["hires_interval_s"],
+        policy["snapshot_mode"], new_timeout,
+    )
+
+
+async def _memory_guard() -> None:
+    """Poll memory pressure every 10 s and apply policy to consumers.
+
+    On level escalation (worsening): immediately shrinks hires_buffer
+    retention and forces a prune, halves aircraft timeout if High/Critical.
+    On de-escalation (improving): restores defaults after sustained readings
+    (handled inside memory_policy.check() via hysteresis counter).
+    """
+    prev_level = memory_policy.check()
+    _apply_memory_policy(prev_level)
+    while True:
+        await asyncio.sleep(10)
+        new_level = memory_policy.check()
+        if new_level == prev_level:
+            continue
+        prev_level = new_level
+        _apply_memory_policy(new_level)
 
 
 # ---------------------------------------------------------------------------
@@ -626,16 +717,37 @@ async def lifespan(app: FastAPI):
     }
     await asyncio.to_thread(stats_db.fix_military_countries, corrections, config.HOME_COUNTRY)
 
-    global _decoder_thread
-    _decoder_thread = _start_msg_processor()
     _bg_tasks: list[asyncio.Task] = []
     def _bg(coro):
         t = asyncio.create_task(coro)
         _bg_tasks.append(t)
         return t
-    _bg(_beast_runner())
-    for name, host, port in config.MLAT_SERVERS:
-        _bg(_mlat_runner(name, host, port))
+
+    global _decoder_thread
+    if config.INGEST_MODE == "beast":
+        # Default: decode raw Beast TCP stream in Python
+        _decoder_thread = _start_msg_processor()
+        _bg(_beast_runner())
+        for name, host, port in config.MLAT_SERVERS:
+            _bg(_mlat_runner(name, host, port))
+    elif config.INGEST_MODE == "readsb":
+        # Pure readsb mode: no Beast connection, no decode thread
+        log.info("Ingest mode: readsb JSON (no Beast TCP)")
+        _bg(readsb_ingest.readsb_poller(state))
+        _bg(readsb_stats.readsb_stats_poller())
+    elif config.INGEST_MODE == "hybrid":
+        # Hybrid: readsb JSON for positions/EHS + Beast TCP for ACAS, DF counts,
+        # and per-source MLAT attribution.  Beast CPR position updates are suppressed
+        # in aircraft_state so readsb JSON remains authoritative for position.
+        log.info("Ingest mode: hybrid (readsb JSON + Beast TCP for ACAS/MLAT)")
+        _bg(readsb_ingest.readsb_poller(state))
+        _bg(readsb_stats.readsb_stats_poller())
+        _decoder_thread = _start_msg_processor()
+        _bg(_beast_runner())
+        for name, host, port in config.MLAT_SERVERS:
+            _bg(_mlat_runner(name, host, port))
+    else:
+        raise ValueError(f"Unknown INGEST_MODE: {config.INGEST_MODE!r} (expected beast/readsb/hybrid)")
     _bg(_push_updates())
     _bg(_db_writer())
     _bg(_db_update_checker())
@@ -644,10 +756,21 @@ async def lifespan(app: FastAPI):
     _bg(_hexdb_task())
     _bg(_backup_runner())  # runs nightly; path resolved from DB/env at runtime
     _bg(_hires_writer())
+    if config.MEMORY_POLICY_ENABLED:
+        _bg(_memory_guard())
     _bg(_route_enricher())
+    if config.RECEIVER_LAT is not None and config.RECEIVER_LON is not None:
+        async def _terrain_prewarm():
+            await asyncio.to_thread(terrain_prewarm, config.RECEIVER_LAT, config.RECEIVER_LON)
+        _bg(_terrain_prewarm())
     _bg(run_position_quality_checker(position_quality_module._checker))
     _bg(health_module.loop_lag_sampler())
     health_module.register_context(_msg_queue, _clients)
+    register_runtime_stats(lambda: {
+        "ws_clients":       len(_clients),
+        "route_queue_size": len(_route_queue),
+        "route_queue_drops": _route_queue_drops,
+    })
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",
              config.BEAST_HOST, config.BEAST_PORT)
 
@@ -703,10 +826,12 @@ mlat_module._state = state
 app.include_router(mlat_router)
 app.include_router(fleet_router)
 app.include_router(coverage_router)
+app.include_router(terrain_router)
 app.include_router(acas_router)
 app.include_router(squawks_router)
 app.include_router(status_router)
 app.include_router(notify_settings_router)
+app.include_router(cast_router)
 app.include_router(debug_router)
 position_quality_module._state = state
 position_quality_module._checker = PositionQualityChecker(state)
@@ -715,10 +840,14 @@ app.include_router(health_router)
 if config.DEBUG_ENRICHMENT:
     log.info("Debug router mounted (DEBUG_ENRICHMENT=%s)", config.DEBUG_ENRICHMENT)
 
+# Security note: no authentication is enforced on any endpoint.
+# This is intentional for a LAN-only deployment (behind a home router/firewall).
+# If this service is ever exposed to the internet, add token auth or an API key
+# before all destructive endpoints (debug overrides, cast rules, history cleanup).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ORIGINS,
-    allow_methods=["GET", "POST", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -730,23 +859,57 @@ app.add_middleware(
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
     await ws.accept()
-    _clients.append(ws)
+    send_queue: asyncio.Queue = asyncio.Queue(maxsize=2)
+    _clients[ws] = send_queue
     log.info("WebSocket client connected  (total: %d)", len(_clients))
 
+    async def _sender() -> None:
+        """Drain the per-client send queue; runs independently of _push_updates."""
+        while True:
+            payload = await send_queue.get()
+            if payload is None:
+                return
+            await asyncio.wait_for(
+                ws.send_text(payload), timeout=config.WS_SEND_TIMEOUT_S
+            )
+
+    sender_task = asyncio.create_task(_sender())
+    receive_task: asyncio.Task | None = None
     try:
         # Send the current snapshot immediately on connect
         await ws.send_text(_json_dumps(state.get_snapshot()))
-        # Keep the connection open; the push loop handles subsequent updates
+        # Receive loop — keeps the connection alive; client messages are ignored
         while True:
-            await ws.receive_text()
+            if receive_task is None:
+                receive_task = asyncio.create_task(ws.receive_text())
+            done, _ = await asyncio.wait(
+                {sender_task, receive_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if sender_task in done:
+                exc = sender_task.exception()
+                if exc is not None:
+                    raise exc
+                break
+            if receive_task in done:
+                await receive_task
+                receive_task = None
     except WebSocketDisconnect:
         pass
     except Exception as exc:
         log.debug("WebSocket error: %s", exc)
     finally:
+        _clients.pop(ws, None)
+        if receive_task is not None:
+            receive_task.cancel()
+            try:
+                await receive_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        sender_task.cancel()
         try:
-            _clients.remove(ws)
-        except ValueError:
+            await sender_task
+        except (asyncio.CancelledError, Exception):
             pass
         log.info("WebSocket client disconnected (total: %d)", len(_clients))
 

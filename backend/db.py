@@ -12,11 +12,36 @@ import threading
 import time
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import config
 import enrichment as _enrichment
 
 log = logging.getLogger(__name__)
+
+
+def _raw_signal_to_dbfs(raw: float | int | None) -> float | None:
+    """Convert a Beast/readsb signal byte to the dBFS value shown by readsb.
+
+    Stored signal values use the Beast convention: 0 = strongest, 255 = weakest.
+    readsb reports 10 * log10((255 - signal) / 255). Clamp the zero-power edge
+    to -80 dBFS so the value remains usable in charts and JSON responses.
+    """
+    if raw is None:
+        return None
+    raw = max(0.0, min(255.0, float(raw)))
+    signal_level = (255.0 - raw) / 255.0
+    if signal_level <= 0.0:
+        return -80.0
+    return round(10.0 * math.log10(signal_level), 1)
+
+
+def _raw_signal_to_dbfs_bucket(raw: float | int | None) -> int | None:
+    """Convert a raw signal byte to a positive dBFS-magnitude heatmap bucket."""
+    dbfs = _raw_signal_to_dbfs(raw)
+    if dbfs is None:
+        return None
+    return max(0, int(round(-dbfs)))
 
 # ---------------------------------------------------------------------------
 # Curated "interesting" type codes
@@ -280,6 +305,7 @@ class StatsDB:
                     range_nm    REAL    NOT NULL,
                     altitude    INTEGER,
                     signal      INTEGER,
+                    mlat        INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (ts, icao)
                 );
                 CREATE INDEX IF NOT EXISTS coverage_samples_ts
@@ -335,6 +361,18 @@ class StatsDB:
         with self._connect() as conn:
             for col in ("signal_avg REAL", "signal_min REAL", "signal_max REAL",
                         "ac_with_pos INTEGER", "ac_mlat INTEGER"):
+                try:
+                    conn.execute(f"ALTER TABLE minute_stats ADD COLUMN {col}")
+                except Exception:
+                    pass  # column already exists
+
+        # Migrate: add readsb-sourced SDR/CPR health columns to minute_stats
+        with self._connect() as conn:
+            for col in (
+                "noise_dbfs REAL", "blocks_dropped INTEGER",
+                "cpr_global_ok INTEGER", "cpr_global_bad INTEGER", "cpr_local_ok INTEGER",
+                "tracks_all INTEGER", "tracks_single_msg INTEGER",
+            ):
                 try:
                     conn.execute(f"ALTER TABLE minute_stats ADD COLUMN {col}")
                 except Exception:
@@ -410,6 +448,18 @@ class StatsDB:
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS cast_config (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS cast_rules (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    match_type       TEXT    NOT NULL,
+                    match_value      TEXT,
+                    max_range_nm     REAL,
+                    max_altitude_ft  INTEGER,
+                    enabled          INTEGER NOT NULL DEFAULT 1
+                );
             """)
 
         # Migrate: add mlat/had_pos columns to daily_aircraft_seen
@@ -419,6 +469,20 @@ class StatsDB:
                     conn.execute(f"ALTER TABLE daily_aircraft_seen ADD COLUMN {col}")
                 except Exception:
                     pass  # column already exists
+
+        # Migrate: add mlat column to coverage_samples
+        with self._connect() as conn:
+            try:
+                conn.execute("ALTER TABLE coverage_samples ADD COLUMN mlat INTEGER NOT NULL DEFAULT 0")
+            except Exception:
+                pass  # column already exists
+
+        # Migrate: add max_altitude_ft to cast_rules if missing
+        with self._connect() as conn:
+            try:
+                conn.execute("ALTER TABLE cast_rules ADD COLUMN max_altitude_ft INTEGER")
+            except Exception:
+                pass  # column already exists
 
         log.info("DB: schema ready at %s", config.DB_PATH)
 
@@ -511,6 +575,36 @@ class StatsDB:
         if now - self._last_rarity_recalc >= self._rarity_recalc_interval:
             self.recalculate_type_rarity()
             self._last_rarity_recalc = now
+
+    def write_readsb_stats(self, ts: int, stats: dict) -> None:
+        """Update SDR/CPR health columns on the minute_stats row for timestamp ts.
+
+        Called from readsb_stats_poller() after each 60-second poll.  Uses UPDATE
+        rather than INSERT so it never creates orphan rows — if write_minute() hasn't
+        written the row yet the update is a no-op (harmless; next poll will catch it).
+        """
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE minute_stats SET
+                    noise_dbfs      = ?,
+                    blocks_dropped  = ?,
+                    cpr_global_ok   = ?,
+                    cpr_global_bad  = ?,
+                    cpr_local_ok    = ?,
+                    tracks_all      = ?,
+                    tracks_single_msg = ?
+                WHERE ts = ?""",
+                (
+                    stats.get("noise_dbfs"),
+                    stats.get("blocks_dropped"),
+                    stats.get("cpr_global_ok"),
+                    stats.get("cpr_global_bad"),
+                    stats.get("cpr_local_ok"),
+                    stats.get("tracks_all"),
+                    stats.get("tracks_single_msg"),
+                    ts,
+                ),
+            )
 
     def _flush_registry(self, now_ts: int) -> None:
         """Write all buffered dirty aircraft to the registry in a single transaction."""
@@ -770,26 +864,26 @@ class StatsDB:
     def write_coverage(self, samples: list[dict]) -> None:
         """Persist one coverage sample per aircraft that has a position.
         Called from the minute write task. Each sample: {icao, ts, bearing_deg,
-        range_nm, altitude, signal}."""
+        range_nm, altitude, signal, mlat}."""
         if not samples:
             return
         with self._connect() as conn:
             conn.executemany(
                 "INSERT OR REPLACE INTO coverage_samples "
-                "(ts, icao, bearing_deg, range_nm, altitude, signal) "
-                "VALUES (:ts, :icao, :bearing_deg, :range_nm, :altitude, :signal)",
+                "(ts, icao, bearing_deg, range_nm, altitude, signal, mlat) "
+                "VALUES (:ts, :icao, :bearing_deg, :range_nm, :altitude, :signal, :mlat)",
                 samples,
             )
 
     def write_coverage_tuples(self, samples: list[tuple]) -> None:
         """Like write_coverage but accepts pre-built (ts, icao, bearing_deg, range_nm,
-        altitude, signal) tuples — avoids per-row dict construction in the caller."""
+        altitude, signal, mlat) tuples — avoids per-row dict construction in the caller."""
         if not samples:
             return
         with self._connect() as conn:
             conn.executemany(
                 "INSERT OR REPLACE INTO coverage_samples "
-                "(ts, icao, bearing_deg, range_nm, altitude, signal) VALUES (?,?,?,?,?,?)",
+                "(ts, icao, bearing_deg, range_nm, altitude, signal, mlat) VALUES (?,?,?,?,?,?,?)",
                 samples,
             )
 
@@ -851,13 +945,13 @@ class StatsDB:
             """, events)
 
     def write_squawk_event(self, icao: str, squawk: str, callsign: str | None,
-                            altitude: int | None, ts: int) -> int:
+                            altitude: int | None, ts: int, ts_last: int | None = None) -> int:
         """Insert a new squawk event; returns the new row id."""
         with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO squawk_events (ts, ts_last, icao, squawk, callsign, altitude) "
                 "VALUES (?,?,?,?,?,?)",
-                (ts, ts, icao, squawk, callsign, altitude),
+                (ts, ts_last if ts_last is not None else ts, icao, squawk, callsign, altitude),
             )
             return cur.lastrowid
 
@@ -1151,11 +1245,10 @@ class StatsDB:
     def query_signal_percentiles(self, days: int) -> list[dict]:
         """Hourly signal strength percentiles (10th/50th/90th) over the last N days.
 
-        Beast RSSI bytes are stored raw (0=strongest, 255=weakest). We sort them
-        ascending per hour so that:
-          p10 raw → strongest 10% of signals → high % strength (best reception)
-          p90 raw → weakest 10% of signals  → low % strength (coverage edge)
-        Both are returned as signal-strength % (inverted from raw).
+        Beast/readsb signal bytes are stored raw (0=strongest, 255=weakest).
+        We sort them ascending per hour so that:
+          p10 raw → strongest 10% of signals → near 0 dBFS
+          p90 raw → weakest 10% of signals  → more negative dBFS
         """
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
         with self._connect() as conn:
@@ -1170,10 +1263,8 @@ class StatsDB:
         for r in rows:
             by_hour[r["hour"]].append(r["signal_avg"])
 
-        # Beast RSSI byte → dBFS: signal_dBFS = -(raw / 2)
-        # Smaller raw byte = stronger signal = less negative dBFS
         def to_dbfs(raw):
-            return round(-raw / 2.0, 1)
+            return _raw_signal_to_dbfs(raw)
 
         def percentile(vals, p):
             idx = max(0, min(len(vals) - 1, int(p / 100 * len(vals))))
@@ -1254,11 +1345,14 @@ class StatsDB:
         bucket_secs = bucket_mins * 60
         with self._connect() as conn:
             if df is None:
+                # Use minute_stats.msg_mean * 60 for the total so this view works
+                # in both Beast mode (where minute_df_counts is populated) and
+                # readsb mode (where only minute_stats has message count data).
                 rows = conn.execute(f"""
-                    SELECT date(ts, 'unixepoch')      AS day,
+                    SELECT date(ts, 'unixepoch')        AS day,
                            (ts % 86400) / {bucket_secs} AS bucket,
-                           SUM(count)                 AS value
-                    FROM minute_df_counts
+                           CAST(SUM(msg_mean * 60) AS INTEGER) AS value
+                    FROM minute_stats
                     WHERE ts >= ?
                     GROUP BY day, bucket
                     ORDER BY day, bucket
@@ -1339,16 +1433,18 @@ class StatsDB:
                 SELECT (ts % 86400) / 3600 AS hour_of_day,
                        AVG(ac_total)       AS ac_avg,
                        AVG(msg_mean)       AS msg_avg,
-                       AVG(signal_avg)     AS sig_avg
+                       AVG(signal_avg)     AS sig_avg,
+                       AVG(ac_mlat)        AS mlat_avg
                 FROM minute_stats
                 WHERE ts >= ?
                 GROUP BY hour_of_day
                 ORDER BY hour_of_day
             """, (cutoff,)).fetchall()
         return [{"hour": r["hour_of_day"],
-                 "ac_avg":  round(r["ac_avg"] or 0, 1),
-                 "msg_avg": round(r["msg_avg"] or 0, 1),
-                 "sig_avg": round(r["sig_avg"] or 0, 1) if r["sig_avg"] else None}
+                 "ac_avg":   round(r["ac_avg"] or 0, 1),
+                 "msg_avg":  round(r["msg_avg"] or 0, 1),
+                 "sig_avg":  round(r["sig_avg"] or 0, 1) if r["sig_avg"] else None,
+                 "mlat_avg": round(r["mlat_avg"] or 0, 1)}
                 for r in rows]
 
     def get_aircraft(self, icao: str) -> dict | None:
@@ -1908,7 +2004,7 @@ class StatsDB:
             """Convert a percentile dict from raw RSSI bytes to dBFS."""
             if d is None:
                 return None
-            return {k: (round(-v / 2, 1) if k != "n" and v is not None else v)
+            return {k: (_raw_signal_to_dbfs(v) if k != "n" and v is not None else v)
                     for k, v in d.items()}
 
         def range_from_hist(conn, cutoff_ts: int) -> dict | None:
@@ -1942,11 +2038,16 @@ class StatsDB:
                 nm = bkt * 5 + 2.5
                 mean_sum += nm * cnt
                 cumulative += cnt
-                if p5  is None and cumulative * 100 >= total *  5: p5  = round(nm, 2)
-                if p25 is None and cumulative * 100 >= total * 25: p25 = round(nm, 2)
-                if p50 is None and cumulative * 100 >= total * 50: p50 = round(nm, 2)
-                if p75 is None and cumulative * 100 >= total * 75: p75 = round(nm, 2)
-                if p95 is None and cumulative * 100 >= total * 95: p95 = round(nm, 2)
+                if p5 is None and cumulative * 100 >= total * 5:
+                    p5 = round(nm, 2)
+                if p25 is None and cumulative * 100 >= total * 25:
+                    p25 = round(nm, 2)
+                if p50 is None and cumulative * 100 >= total * 50:
+                    p50 = round(nm, 2)
+                if p75 is None and cumulative * 100 >= total * 75:
+                    p75 = round(nm, 2)
+                if p95 is None and cumulative * 100 >= total * 95:
+                    p95 = round(nm, 2)
             return {"n": total, "mean": round(mean_sum / total, 2),
                     "p5": p5, "p25": p25, "p50": p50, "p75": p75, "p95": p95}
 
@@ -1991,32 +2092,79 @@ class StatsDB:
     def query_position_decode_rate(self, days: int) -> list[dict]:
         """Daily position breakdown as % of unique aircraft seen that day.
         Three mutually-exclusive categories that sum to 100%:
-          adsb_pct  — had a decoded position but was NOT MLAT-sourced
-          mlat_pct  — had an MLAT-sourced position
-          no_pos_pct — no decoded position at all"""
+          adsb_pct   — had at least one non-MLAT position sample
+          mlat_pct   — had MLAT position samples but no non-MLAT position sample
+          no_pos_pct — was seen that day but never produced a position sample
+
+        Classification is derived from coverage_samples rather than the coarse
+        daily_aircraft_seen flags so aircraft that had both ADS-B and MLAT fixes
+        are counted once, in the ADS-B bucket.
+        """
         cutoff = (date.today() - timedelta(days=days)).isoformat()
         with self._connect() as conn:
             rows = conn.execute("""
+                WITH seen AS (
+                    SELECT date, icao
+                    FROM daily_aircraft_seen
+                    WHERE date >= ?
+                ),
+                pos_flags AS (
+                    SELECT
+                        date(ts, 'unixepoch') AS date,
+                        icao,
+                        MAX(CASE WHEN mlat = 0 THEN 1 ELSE 0 END) AS had_adsb_pos,
+                        MAX(CASE WHEN mlat = 1 THEN 1 ELSE 0 END) AS had_mlat_pos
+                    FROM coverage_samples
+                    WHERE date(ts, 'unixepoch') >= ?
+                    GROUP BY date(ts, 'unixepoch'), icao
+                )
                 SELECT
-                    date,
+                    seen.date AS date,
                     COUNT(*) AS total,
-                    SUM(CASE WHEN mlat = 0 AND had_pos = 1 THEN 1 ELSE 0 END) AS adsb_count,
-                    SUM(CASE WHEN mlat = 1                THEN 1 ELSE 0 END) AS mlat_count,
-                    SUM(CASE WHEN mlat = 0 AND had_pos = 0 THEN 1 ELSE 0 END) AS no_pos_count
-                FROM daily_aircraft_seen
-                WHERE date >= ?
-                GROUP BY date
-                ORDER BY date
-            """, (cutoff,)).fetchall()
-        return [
-            {
+                    SUM(CASE WHEN COALESCE(pos.had_adsb_pos, 0) = 1 THEN 1 ELSE 0 END) AS adsb_count,
+                    SUM(CASE WHEN COALESCE(pos.had_adsb_pos, 0) = 0
+                               AND COALESCE(pos.had_mlat_pos, 0) = 1 THEN 1 ELSE 0 END) AS mlat_count,
+                    SUM(CASE WHEN COALESCE(pos.had_adsb_pos, 0) = 0
+                               AND COALESCE(pos.had_mlat_pos, 0) = 0 THEN 1 ELSE 0 END) AS no_pos_count
+                FROM seen
+                LEFT JOIN pos_flags AS pos
+                  ON pos.date = seen.date AND pos.icao = seen.icao
+                GROUP BY seen.date
+                ORDER BY seen.date
+            """, (cutoff, cutoff)).fetchall()
+
+        def _rounded_pct_parts(adsb_count: int, mlat_count: int, no_pos_count: int, total: int) -> tuple[float, float, float]:
+            if total <= 0:
+                return 0.0, 0.0, 0.0
+            raw = [
+                adsb_count * 100.0 / total,
+                mlat_count * 100.0 / total,
+                no_pos_count * 100.0 / total,
+            ]
+            rounded = [int(v * 10) / 10 for v in raw]
+            remainder = int(round(1000 - sum(rounded) * 10))
+            if remainder > 0:
+                order = sorted(
+                    range(3),
+                    key=lambda i: (raw[i] - rounded[i], raw[i]),
+                    reverse=True,
+                )
+                for i in range(remainder):
+                    rounded[order[i % 3]] += 0.1
+            return tuple(round(v, 1) for v in rounded)
+
+        result = []
+        for r in rows:
+            adsb_pct, mlat_pct, no_pos_pct = _rounded_pct_parts(
+                r["adsb_count"], r["mlat_count"], r["no_pos_count"], r["total"]
+            )
+            result.append({
                 "date":       r["date"],
-                "adsb_pct":   round(r["adsb_count"]   * 100.0 / r["total"], 1) if r["total"] else 0,
-                "mlat_pct":   round(r["mlat_count"]   * 100.0 / r["total"], 1) if r["total"] else 0,
-                "no_pos_pct": round(r["no_pos_count"] * 100.0 / r["total"], 1) if r["total"] else 0,
-            }
-            for r in rows
-        ]
+                "adsb_pct":   adsb_pct,
+                "mlat_pct":   mlat_pct,
+                "no_pos_pct": no_pos_pct,
+            })
+        return result
 
     def query_military_icaos(self) -> list[str]:
         """Return all ICAO addresses flagged military in the registry."""
@@ -2047,9 +2195,18 @@ class StatsDB:
             ).fetchone()
             return dict(row) if row else None
 
+    # Fields that may be overwritten via the debug override endpoint.
+    # Validated here (db layer) as defence-in-depth; the router also checks.
+    _OVERRIDEABLE_FIELDS = frozenset({
+        "country", "registration", "type_code", "operator",
+        "military", "manufacturer", "year",
+    })
+
     def update_aircraft_field(self, icao: str, field: str, value) -> None:
-        """Overwrite a single field in aircraft_registry (field already validated by router).
+        """Overwrite a single field in aircraft_registry.
         When country or military changes, foreign_military is recalculated immediately."""
+        if field not in self._OVERRIDEABLE_FIELDS:
+            raise ValueError(f"Field {field!r} is not overrideable")
         icao = icao.upper()
         with self._connect() as conn:
             conn.execute(
@@ -2226,22 +2383,60 @@ class StatsDB:
             return StatsDB._TYPE_GROUP_BY_CODE.get(type_code.upper(), 8)
         return 8
 
-    def query_coverage_points(self, days: int = 30, max_points: int = 40000) -> dict:
+    def query_coverage_points(
+        self, days: int = 30, max_points: int = 40000,
+        military: bool | None = None,
+        operator: str | None = None,
+        type_codes: list[str] | None = None,
+        type_category_prefix: str | None = None,
+        mlat: bool = False,
+        icao: str | None = None,
+    ) -> dict:
         """Return downsampled coverage_samples joined with aircraft_registry flags.
 
-        Each point: [bearing_deg, range_nm, altitude_ft, military, interesting, op_idx, tg_idx]
+        Each point: [bearing_deg, range_nm, altitude_ft, military, interesting, op_idx, tg_idx, tc_idx]
         op_idx 0–9 = top-10 operators by point count; 10 = other/unknown.
         tg_idx 0–7 = TYPE_GROUPS index; 8 = other/unknown.
-        Returns 'operators': list of operator names; 'type_groups': list of group labels.
+        tc_idx 0–9 = top-10 type codes by point count; 10 = other/unknown.
+        When military, operator, type_codes, type_category_prefix, mlat, or icao is set, stride is skipped.
         """
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+        flag_clause = " AND COALESCE(ar.military, 0) = 1" if military else ""
+        op_clause   = " AND ar.operator = ?"           if operator  else ""
+        mlat_clause = " AND cs.mlat = 1"               if mlat      else ""
+        icao_clause = " AND cs.icao = ?"               if icao      else ""
+
+        # Type filter: exact code list (IN) or category prefix (LIKE)
+        type_extra_params: list = []
+        if type_codes:
+            placeholders = ",".join("?" * len(type_codes))
+            tc_clause = f" AND ar.type_code IN ({placeholders})"
+            type_extra_params = list(type_codes)
+        elif type_category_prefix:
+            tc_clause = " AND ar.type_category LIKE ?"
+            type_extra_params = [type_category_prefix + "%"]
+        else:
+            tc_clause = ""
+
         with self._connect() as conn:
-            total = conn.execute("""
-                SELECT COUNT(*) FROM coverage_samples
-                WHERE ts >= ? AND altitude IS NOT NULL AND range_nm > 0 AND altitude > 0
-            """, (cutoff,)).fetchone()[0]
-            stride = max(1, -(-total // max_points))
-            rows = conn.execute("""
+            if military or operator or type_codes or type_category_prefix or mlat or icao:
+                stride = 1
+            else:
+                total = conn.execute(f"""
+                    SELECT COUNT(*) FROM coverage_samples cs
+                    LEFT JOIN aircraft_registry ar ON cs.icao = ar.icao
+                    WHERE cs.ts >= ? AND cs.altitude IS NOT NULL
+                      AND cs.range_nm > 0 AND cs.altitude > 0{flag_clause}
+                """, (cutoff,)).fetchone()[0]
+                stride = max(1, -(-total // max_points))
+            params: list = [cutoff]
+            if operator:
+                params.append(operator)
+            params.extend(type_extra_params)
+            if icao:
+                params.append(icao.upper())
+            params.append(stride)
+            rows = conn.execute(f"""
                 SELECT cs.bearing_deg,
                        cs.range_nm,
                        cs.altitude,
@@ -2255,17 +2450,22 @@ class StatsDB:
                 WHERE cs.ts >= ?
                   AND cs.altitude  IS NOT NULL
                   AND cs.range_nm  > 0
-                  AND cs.altitude  > 0
+                  AND cs.altitude  > 0{flag_clause}{op_clause}{tc_clause}{mlat_clause}{icao_clause}
                   AND (cs.rowid % ?) = 0
-            """, (cutoff, stride)).fetchall()
+            """, params).fetchall()
 
-        # Top-10 operators by point count for compact colour index
+        # Top-10 operators and top-10 type codes by point count for compact colour indices
         op_counts: dict[str, int] = {}
+        tc_counts: dict[str, int] = {}
         for r in rows:
             if r["operator"]:
                 op_counts[r["operator"]] = op_counts.get(r["operator"], 0) + 1
-        top_ops = [op for op, _ in sorted(op_counts.items(), key=lambda x: -x[1])[:10]]
+            if r["type_code"]:
+                tc_counts[r["type_code"]] = tc_counts.get(r["type_code"], 0) + 1
+        top_ops  = [op for op, _ in sorted(op_counts.items(), key=lambda x: -x[1])[:10]]
+        top_tcs  = [tc for tc, _ in sorted(tc_counts.items(), key=lambda x: -x[1])[:10]]
         op_idx_map = {op: i for i, op in enumerate(top_ops)}
+        tc_idx_map = {tc: i for i, tc in enumerate(top_tcs)}
 
         TYPE_GROUP_LABELS = [
             'Widebody', 'Narrowbody', 'Regional', 'Biz Jet',
@@ -2275,12 +2475,14 @@ class StatsDB:
         return {
             "count":       len(rows),
             "operators":   top_ops,
+            "type_codes":  top_tcs,
             "type_groups": TYPE_GROUP_LABELS,
             "points": [
                 [round(r["bearing_deg"], 1), round(r["range_nm"], 1),
                  int(r["altitude"]), int(r["military"]), int(r["interesting"]),
                  op_idx_map.get(r["operator"], 10),
-                 self._get_type_group_idx(r["type_code"], r["type_category"])]
+                 self._get_type_group_idx(r["type_code"], r["type_category"]),
+                 tc_idx_map.get(r["type_code"], 10)]
                 for r in rows
             ],
         }
@@ -2303,7 +2505,8 @@ class StatsDB:
                        COALESCE(ar.interesting, 0) AS interesting,
                        ar.type_code,
                        ar.type_category,
-                       ar.operator
+                       ar.operator,
+                       COALESCE(cs.mlat, 0) AS mlat
                 FROM coverage_samples cs
                 LEFT JOIN aircraft_registry ar ON cs.icao = ar.icao
                 WHERE cs.ts >= ? AND cs.ts <= ?
@@ -2329,7 +2532,9 @@ class StatsDB:
                     "military":    bool(r["military"]),
                     "interesting": bool(r["interesting"]),
                     "tg_idx":      self._get_type_group_idx(r["type_code"], r["type_category"]),
+                    "type_code":   r["type_code"],
                     "operator":    r["operator"],
+                    "mlat":        bool(r["mlat"]),
                 }
 
         tracks = [
@@ -2461,6 +2666,90 @@ class StatsDB:
         ]
         return {"min_ts": min_ts, "minutes": minutes, "cells": cells, "max_alt_observed": max_alt_observed}
 
+    def query_range_heatmap(self, hours: int = 24) -> dict:
+        """Return range-time heatmap data from coverage_samples.
+
+        Each cell: [minute_index, range_nm_bucket, distinct_aircraft_count].
+        Range is bucketed to 1 nm. minute_index is relative to min_ts.
+        """
+        cutoff = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp())
+        min_ts = (cutoff // 60) * 60
+
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT
+                    (ts / 60) * 60            AS minute_ts,
+                    CAST(range_nm AS INTEGER) AS range_bucket,
+                    COUNT(DISTINCT icao)       AS cnt
+                FROM coverage_samples
+                WHERE ts >= ?
+                  AND range_nm IS NOT NULL
+                  AND range_nm >= 0
+                  AND range_nm <= 500
+                GROUP BY minute_ts, range_bucket
+                ORDER BY minute_ts
+            """, (min_ts,)).fetchall()
+
+        if not rows:
+            return {"min_ts": min_ts, "minutes": hours * 60, "cells": [], "max_range_observed": 0}
+
+        max_ts = int(rows[-1]["minute_ts"])
+        minutes = (max_ts - min_ts) // 60 + 1
+        max_range_observed = max(int(r["range_bucket"]) for r in rows)
+
+        cells = [
+            [(int(r["minute_ts"]) - min_ts) // 60, int(r["range_bucket"]), int(r["cnt"])]
+            for r in rows
+        ]
+        return {"min_ts": min_ts, "minutes": minutes, "cells": cells, "max_range_observed": max_range_observed}
+
+    def query_signal_heatmap(self, hours: int = 24) -> dict:
+        """Return signal-time heatmap data from coverage_samples.
+
+        Each cell: [minute_index, dbfs_bucket, distinct_aircraft_count].
+        dbfs_bucket is the positive magnitude of readsb dBFS, where
+        0 = 0 dBFS (strongest) and larger buckets are weaker. minute_index is
+        relative to min_ts.
+        """
+        cutoff = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp())
+        min_ts = (cutoff // 60) * 60
+
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT
+                    (ts / 60) * 60 AS minute_ts,
+                    signal,
+                    COUNT(DISTINCT icao) AS cnt
+                FROM coverage_samples
+                WHERE ts >= ?
+                  AND signal IS NOT NULL
+                GROUP BY minute_ts, signal
+                ORDER BY minute_ts, signal
+            """, (min_ts,)).fetchall()
+
+        if not rows:
+            return {"min_ts": min_ts, "minutes": hours * 60, "cells": [], "max_dbfs_bucket": 0}
+
+        heatmap: dict[tuple[int, int], int] = defaultdict(int)
+        max_ts = int(rows[-1]["minute_ts"])
+        max_dbfs_bucket = 0
+        for row in rows:
+            bucket = _raw_signal_to_dbfs_bucket(row["signal"])
+            if bucket is None:
+                continue
+            minute_ts = int(row["minute_ts"])
+            count = int(row["cnt"])
+            heatmap[(minute_ts, bucket)] += count
+            max_dbfs_bucket = max(max_dbfs_bucket, bucket)
+
+        minutes = (max_ts - min_ts) // 60 + 1
+
+        cells = [
+            [(minute_ts - min_ts) // 60, bucket, cnt]
+            for (minute_ts, bucket), cnt in sorted(heatmap.items())
+        ]
+        return {"min_ts": min_ts, "minutes": minutes, "cells": cells, "max_dbfs_bucket": max_dbfs_bucket}
+
     def backup(self, dest_dir: "Path") -> "Path":
         """Hot-backup the database to dest_dir/adsb_backup_YYYY-MM-DD.db.
 
@@ -2565,9 +2854,11 @@ class StatsDB:
             ("squawk_events",         "ts",        True,  90),
         ]
 
+        valid_tables = {t[0] for t in tables}
         result = []
         with self._connect() as conn:
             for tbl, ts_col, expires, ret_days in tables:
+                assert tbl in valid_tables, f"Unexpected table name: {tbl!r}"
                 row_count = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
                 oldest = newest = None
                 if ts_col and row_count:
@@ -2699,6 +2990,56 @@ class StatsDB:
     def remove_from_watchlist(self, icao: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM notify_watchlist WHERE icao=?", (icao,))
+
+    # ------------------------------------------------------------------
+    # Cast config + rules
+    # ------------------------------------------------------------------
+
+    def get_cast_config(self) -> dict:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT key, value FROM cast_config").fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+    def set_cast_config(self, key: str, value: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO cast_config (key, value) VALUES (?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+
+    def get_cast_rules(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, match_type, match_value, max_range_nm, max_altitude_ft, enabled "
+                "FROM cast_rules ORDER BY id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_cast_rule(self, match_type: str, match_value: str | None,
+                      max_range_nm: float | None,
+                      max_altitude_ft: int | None) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO cast_rules (match_type, match_value, max_range_nm, max_altitude_ft) "
+                "VALUES (?,?,?,?)",
+                (match_type, match_value, max_range_nm, max_altitude_ft),
+            )
+        return cur.lastrowid
+
+    def update_cast_rule(self, rule_id: int, match_type: str,
+                         match_value: str | None, max_range_nm: float | None,
+                         max_altitude_ft: int | None, enabled: bool) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE cast_rules SET match_type=?, match_value=?, "
+                "max_range_nm=?, max_altitude_ft=?, enabled=? WHERE id=?",
+                (match_type, match_value, max_range_nm, max_altitude_ft, int(enabled), rule_id),
+            )
+
+    def delete_cast_rule(self, rule_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM cast_rules WHERE id=?", (rule_id,))
 
     # ------------------------------------------------------------------
     # Visit log

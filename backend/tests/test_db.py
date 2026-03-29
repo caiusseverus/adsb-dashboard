@@ -11,10 +11,9 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-import sqlite3
-from pathlib import Path
 
 import config
+from datetime import datetime, timezone
 
 
 @pytest.fixture()
@@ -161,3 +160,43 @@ class TestGhostPurge:
             conn.execute("UPDATE aircraft_registry SET sighting_count=2 WHERE icao=?", ("CAFE02",))
         db.purge_ghost_aircraft()
         assert _read_aircraft(db, "CAFE02") is not None
+
+
+class TestPositionDecodeRate:
+    def test_prefers_adsb_when_aircraft_had_both_adsb_and_mlat_positions(self, db):
+        day = "2026-03-28"
+
+        def _ts(hour: int) -> int:
+            return int(datetime(2026, 3, 28, hour, 0, tzinfo=timezone.utc).timestamp())
+
+        with db._connect() as conn:
+            conn.executemany(
+                "INSERT INTO daily_aircraft_seen (date, icao, mlat, had_pos) VALUES (?,?,?,?)",
+                [
+                    (day, "ADSB01", 0, 1),
+                    (day, "MIXED1", 1, 1),
+                    (day, "MLAT01", 1, 1),
+                    (day, "NOPOS1", 0, 0),
+                ],
+            )
+            conn.executemany(
+                """
+                INSERT INTO coverage_samples
+                    (ts, icao, bearing_deg, range_nm, altitude, signal, mlat)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                [
+                    (_ts(1), "ADSB01", 10.0, 20.0, 10000, 80, 0),
+                    (_ts(2), "MIXED1", 20.0, 30.0, 11000, 82, 1),
+                    (_ts(3), "MIXED1", 20.0, 31.0, 11100, 78, 0),
+                    (_ts(4), "MLAT01", 30.0, 40.0, 12000, 75, 1),
+                ],
+            )
+
+        rows = db.query_position_decode_rate(days=365)
+        row = next(r for r in rows if r["date"] == day)
+
+        assert row["adsb_pct"] == 50.0
+        assert row["mlat_pct"] == 25.0
+        assert row["no_pos_pct"] == 25.0
+        assert round(row["adsb_pct"] + row["mlat_pct"] + row["no_pos_pct"], 1) == 100.0
