@@ -18,6 +18,30 @@ import enrichment as _enrichment
 
 log = logging.getLogger(__name__)
 
+
+def _raw_signal_to_dbfs(raw: float | int | None) -> float | None:
+    """Convert a Beast/readsb signal byte to the dBFS value shown by readsb.
+
+    Stored signal values use the Beast convention: 0 = strongest, 255 = weakest.
+    readsb reports 10 * log10((255 - signal) / 255). Clamp the zero-power edge
+    to -80 dBFS so the value remains usable in charts and JSON responses.
+    """
+    if raw is None:
+        return None
+    raw = max(0.0, min(255.0, float(raw)))
+    signal_level = (255.0 - raw) / 255.0
+    if signal_level <= 0.0:
+        return -80.0
+    return round(10.0 * math.log10(signal_level), 1)
+
+
+def _raw_signal_to_dbfs_bucket(raw: float | int | None) -> int | None:
+    """Convert a raw signal byte to a positive dBFS-magnitude heatmap bucket."""
+    dbfs = _raw_signal_to_dbfs(raw)
+    if dbfs is None:
+        return None
+    return max(0, int(round(-dbfs)))
+
 # ---------------------------------------------------------------------------
 # Curated "interesting" type codes
 # Add any type code here to flag matching aircraft as interesting.
@@ -1237,11 +1261,10 @@ class StatsDB:
     def query_signal_percentiles(self, days: int) -> list[dict]:
         """Hourly signal strength percentiles (10th/50th/90th) over the last N days.
 
-        Beast RSSI bytes are stored raw (0=strongest, 255=weakest). We sort them
-        ascending per hour so that:
-          p10 raw → strongest 10% of signals → high % strength (best reception)
-          p90 raw → weakest 10% of signals  → low % strength (coverage edge)
-        Both are returned as signal-strength % (inverted from raw).
+        Beast/readsb signal bytes are stored raw (0=strongest, 255=weakest).
+        We sort them ascending per hour so that:
+          p10 raw → strongest 10% of signals → near 0 dBFS
+          p90 raw → weakest 10% of signals  → more negative dBFS
         """
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
         with self._connect() as conn:
@@ -1256,10 +1279,8 @@ class StatsDB:
         for r in rows:
             by_hour[r["hour"]].append(r["signal_avg"])
 
-        # Beast RSSI byte → dBFS: signal_dBFS = -(raw / 2)
-        # Smaller raw byte = stronger signal = less negative dBFS
         def to_dbfs(raw):
-            return round(-raw / 2.0, 1)
+            return _raw_signal_to_dbfs(raw)
 
         def percentile(vals, p):
             idx = max(0, min(len(vals) - 1, int(p / 100 * len(vals))))
@@ -1999,7 +2020,7 @@ class StatsDB:
             """Convert a percentile dict from raw RSSI bytes to dBFS."""
             if d is None:
                 return None
-            return {k: (round(-v / 2, 1) if k != "n" and v is not None else v)
+            return {k: (_raw_signal_to_dbfs(v) if k != "n" and v is not None else v)
                     for k, v in d.items()}
 
         def range_from_hist(conn, cutoff_ts: int) -> dict | None:
@@ -2650,8 +2671,9 @@ class StatsDB:
         """Return signal-time heatmap data from coverage_samples.
 
         Each cell: [minute_index, dbfs_bucket, distinct_aircraft_count].
-        dbfs_bucket = CAST(signal / 2 AS INTEGER): 0 = strongest (0 dBFS),
-        127 = weakest (~-127 dBFS). minute_index is relative to min_ts.
+        dbfs_bucket is the positive magnitude of readsb dBFS, where
+        0 = 0 dBFS (strongest) and larger buckets are weaker. minute_index is
+        relative to min_ts.
         """
         cutoff = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp())
         min_ts = (cutoff // 60) * 60
@@ -2659,26 +2681,36 @@ class StatsDB:
         with self._connect() as conn:
             rows = conn.execute("""
                 SELECT
-                    (ts / 60) * 60              AS minute_ts,
-                    CAST(signal / 2 AS INTEGER) AS dbfs_bucket,
-                    COUNT(DISTINCT icao)         AS cnt
+                    (ts / 60) * 60 AS minute_ts,
+                    signal,
+                    COUNT(DISTINCT icao) AS cnt
                 FROM coverage_samples
                 WHERE ts >= ?
                   AND signal IS NOT NULL
-                GROUP BY minute_ts, dbfs_bucket
-                ORDER BY minute_ts
+                GROUP BY minute_ts, signal
+                ORDER BY minute_ts, signal
             """, (min_ts,)).fetchall()
 
         if not rows:
             return {"min_ts": min_ts, "minutes": hours * 60, "cells": [], "max_dbfs_bucket": 0}
 
+        heatmap: dict[tuple[int, int], int] = defaultdict(int)
         max_ts = int(rows[-1]["minute_ts"])
+        max_dbfs_bucket = 0
+        for row in rows:
+            bucket = _raw_signal_to_dbfs_bucket(row["signal"])
+            if bucket is None:
+                continue
+            minute_ts = int(row["minute_ts"])
+            count = int(row["cnt"])
+            heatmap[(minute_ts, bucket)] += count
+            max_dbfs_bucket = max(max_dbfs_bucket, bucket)
+
         minutes = (max_ts - min_ts) // 60 + 1
-        max_dbfs_bucket = max(int(r["dbfs_bucket"]) for r in rows)
 
         cells = [
-            [(int(r["minute_ts"]) - min_ts) // 60, int(r["dbfs_bucket"]), int(r["cnt"])]
-            for r in rows
+            [(minute_ts - min_ts) // 60, bucket, cnt]
+            for (minute_ts, bucket), cnt in sorted(heatmap.items())
         ]
         return {"min_ts": min_ts, "minutes": minutes, "cells": cells, "max_dbfs_bucket": max_dbfs_bucket}
 

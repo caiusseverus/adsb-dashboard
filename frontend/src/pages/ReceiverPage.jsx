@@ -9,10 +9,14 @@ import styles from './ReceiverPage.module.css'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 
-// Beast RSSI byte: 0=strongest, 255=weakest
-// dBFS = -(raw / 2)  →  0 dBFS is full scale, -127.5 dBFS is minimum
+// Beast/readsb signal byte: 0=strongest, 255=weakest
+// readsb dBFS = 10 * log10((255 - raw) / 255)
 function rawToDbfs(raw) {
-  return raw != null ? Math.round(-raw / 2 * 10) / 10 : null
+  if (raw == null) return null
+  const clamped = Math.max(0, Math.min(255, Number(raw)))
+  const signalLevel = (255 - clamped) / 255
+  if (signalLevel <= 0) return -80.0
+  return Math.round(Math.log10(signalLevel) * 100) / 10
 }
 function fmtDbfs(raw) {
   const v = rawToDbfs(raw)

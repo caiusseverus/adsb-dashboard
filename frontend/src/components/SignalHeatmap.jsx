@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import styles from './SignalHeatmap.module.css'
 
-// dbfs_bucket = CAST(signal / 2 AS INTEGER): 0 = 0 dBFS (strongest), 127 = ~-127 dBFS (weakest)
-// Y axis: 0 dBFS at top (bucket 0), more negative downward.
+// dbfs_bucket is the positive magnitude of readsb dBFS:
+// 0 = 0 dBFS (strongest), larger buckets are weaker. Y axis puts 0 dBFS at top.
 const NORMAL_CEIL_DB = 80   // show 0 to -80 dBFS in normal view
 const PX_PER_DB      = 4    // canvas rows per 1 dBFS bucket → 320px normal height
 const TIME_AXIS_H    = 22
@@ -45,7 +45,7 @@ function drawYAxis(canvas, ceilDb) {
   ctx.textAlign = 'right'
   ctx.textBaseline = 'middle'
 
-  // Label every 20 dBFS; bucket index equals the magnitude (0=0dBFS, 20=-20dBFS, etc.)
+  // Label every 20 dBFS; bucket index equals the magnitude (0=0 dBFS, 20=-20 dBFS, etc.)
   for (let db = 0; db <= ceilDb; db += 20) {
     const y = db * PX_PER_DB
     ctx.fillText(db === 0 ? '0' : `-${db}`, YAXIS_W - 12, y)
