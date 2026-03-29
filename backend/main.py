@@ -874,18 +874,38 @@ async def websocket_endpoint(ws: WebSocket) -> None:
             )
 
     sender_task = asyncio.create_task(_sender())
+    receive_task: asyncio.Task | None = None
     try:
         # Send the current snapshot immediately on connect
         await ws.send_text(_json_dumps(state.get_snapshot()))
         # Receive loop — keeps the connection alive; client messages are ignored
         while True:
-            await ws.receive_text()
+            if receive_task is None:
+                receive_task = asyncio.create_task(ws.receive_text())
+            done, _ = await asyncio.wait(
+                {sender_task, receive_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if sender_task in done:
+                exc = sender_task.exception()
+                if exc is not None:
+                    raise exc
+                break
+            if receive_task in done:
+                await receive_task
+                receive_task = None
     except WebSocketDisconnect:
         pass
     except Exception as exc:
         log.debug("WebSocket error: %s", exc)
     finally:
         _clients.pop(ws, None)
+        if receive_task is not None:
+            receive_task.cancel()
+            try:
+                await receive_task
+            except (asyncio.CancelledError, Exception):
+                pass
         sender_task.cancel()
         try:
             await sender_task

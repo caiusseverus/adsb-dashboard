@@ -30,32 +30,43 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _TOKEN_TTL = 90
 _tokens: dict[str, tuple[dict, float]] = {}
+_token_lock = threading.Lock()
+
+
+def _expire_tokens_locked(now: float | None = None) -> None:
+    if now is None:
+        now = time.monotonic()
+    expired = [t for t, (_, exp) in _tokens.items() if now > exp]
+    for t in expired:
+        _tokens.pop(t, None)
 
 
 def _store_token(aircraft: dict) -> str:
     token = uuid.uuid4().hex
-    _tokens[token] = (aircraft, time.monotonic() + _TOKEN_TTL)
-    _expire_tokens()
+    now = time.monotonic()
+    with _token_lock:
+        _tokens[token] = (aircraft, now + _TOKEN_TTL)
+        _expire_tokens_locked(now)
     return token
 
 
 def consume_token(token: str) -> dict | None:
     """Return aircraft snapshot and remove token. Returns None if expired/unknown."""
-    _expire_tokens()
-    entry = _tokens.pop(token, None)
-    if entry is None:
-        return None
-    snapshot, expiry = entry
-    if time.monotonic() > expiry:
-        return None
-    return snapshot
+    now = time.monotonic()
+    with _token_lock:
+        _expire_tokens_locked(now)
+        entry = _tokens.pop(token, None)
+        if entry is None:
+            return None
+        snapshot, expiry = entry
+        if now > expiry:
+            return None
+        return snapshot
 
 
 def _expire_tokens() -> None:
-    now = time.monotonic()
-    expired = [t for t, (_, exp) in _tokens.items() if now > exp]
-    for t in expired:
-        _tokens.pop(t, None)
+    with _token_lock:
+        _expire_tokens_locked()
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +167,8 @@ def _cast_worker(lan_url: str, device_name: str, display_seconds: int) -> None:
 _config_cache: dict = {}
 _config_cache_ts: float = 0.0
 _CONFIG_TTL = 10.0  # re-read DB at most every 10 s
+_watchlist_cache: set[str] = set()
+_watchlist_cache_ts: float = 0.0
 
 
 def _get_config() -> dict:
@@ -173,6 +186,21 @@ def reset_config_cache() -> None:
     """Force next _get_config() call to re-read from DB. Call after a config save."""
     global _config_cache_ts
     _config_cache_ts = 0.0
+
+
+def _get_watchlist() -> set[str]:
+    global _watchlist_cache, _watchlist_cache_ts
+    now = time.time()
+    if now - _watchlist_cache_ts < _CONFIG_TTL:
+        return _watchlist_cache
+    from db import stats_db
+    _watchlist_cache = {
+        (row.get("icao") or "").upper()
+        for row in stats_db.get_notify_watchlist()
+        if row.get("icao")
+    }
+    _watchlist_cache_ts = now
+    return _watchlist_cache
 
 
 def _get_rules() -> list[dict]:
@@ -225,7 +253,7 @@ def _rule_matches(rule: dict, ac: dict) -> bool:
         if not ac.get("military"):
             return False
     elif match_type == "watchlist":
-        if not ac.get("watched"):
+        if ac.get("icao", "").upper() not in _get_watchlist():
             return False
     elif match_type == "interesting":
         if not ac.get("interesting"):
