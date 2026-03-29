@@ -34,6 +34,16 @@ function signalColour(raw) {
   return '#f85149'
 }
 
+function normalizePercentTriplet(adsbRaw, mlatRaw, noPosRaw) {
+  const values = [adsbRaw, mlatRaw, noPosRaw].map(v => {
+    const n = Number(v)
+    return Number.isFinite(n) ? n : 0
+  })
+  const total = values[0] + values[1] + values[2]
+  const scale = total > 0 && total <= 1.5 ? 100 : 1
+  return values.map(v => Math.max(0, Math.min(100, Math.round(v * scale * 10) / 10)))
+}
+
 function useFetch(url) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -706,10 +716,11 @@ function PositionDecodeRate({ days, onDaysChange }) {
   const chartData = useMemo(() => {
     if (!data?.length) return []
     return data.map(d => ({
-      date:   d.date,
-      adsb:   d.adsb_pct   ?? 0,
-      mlat:   d.mlat_pct   ?? 0,
-      no_pos: d.no_pos_pct ?? 0,
+      date: d.date,
+      ...(() => {
+        const [adsb, mlat, no_pos] = normalizePercentTriplet(d.adsb_pct, d.mlat_pct, d.no_pos_pct)
+        return { adsb, mlat, no_pos }
+      })(),
     }))
   }, [data])
 
@@ -728,7 +739,8 @@ function PositionDecodeRate({ days, onDaysChange }) {
               <CartesianGrid stroke="#21262d" vertical={false} />
               <XAxis dataKey="date" tick={{ fill: '#484f58', fontSize: 10 }}
                 interval={Math.max(0, Math.floor(chartData.length / 6))} />
-              <YAxis domain={[0, 100]} tick={{ fill: '#484f58', fontSize: 11 }} width={44}
+              <YAxis domain={[0, 100]} ticks={[0, 25, 50, 75, 100]}
+                tick={{ fill: '#484f58', fontSize: 11 }} width={52}
                 tickFormatter={v => `${v}%`} />
               <Tooltip
                 contentStyle={{ background: '#161b22', border: '1px solid #30363d', fontSize: 12 }}

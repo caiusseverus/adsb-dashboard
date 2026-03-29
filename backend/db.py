@@ -2092,32 +2092,79 @@ class StatsDB:
     def query_position_decode_rate(self, days: int) -> list[dict]:
         """Daily position breakdown as % of unique aircraft seen that day.
         Three mutually-exclusive categories that sum to 100%:
-          adsb_pct  — had a decoded position but was NOT MLAT-sourced
-          mlat_pct  — had an MLAT-sourced position
-          no_pos_pct — no decoded position at all"""
+          adsb_pct   — had at least one non-MLAT position sample
+          mlat_pct   — had MLAT position samples but no non-MLAT position sample
+          no_pos_pct — was seen that day but never produced a position sample
+
+        Classification is derived from coverage_samples rather than the coarse
+        daily_aircraft_seen flags so aircraft that had both ADS-B and MLAT fixes
+        are counted once, in the ADS-B bucket.
+        """
         cutoff = (date.today() - timedelta(days=days)).isoformat()
         with self._connect() as conn:
             rows = conn.execute("""
+                WITH seen AS (
+                    SELECT date, icao
+                    FROM daily_aircraft_seen
+                    WHERE date >= ?
+                ),
+                pos_flags AS (
+                    SELECT
+                        date(ts, 'unixepoch') AS date,
+                        icao,
+                        MAX(CASE WHEN mlat = 0 THEN 1 ELSE 0 END) AS had_adsb_pos,
+                        MAX(CASE WHEN mlat = 1 THEN 1 ELSE 0 END) AS had_mlat_pos
+                    FROM coverage_samples
+                    WHERE date(ts, 'unixepoch') >= ?
+                    GROUP BY date(ts, 'unixepoch'), icao
+                )
                 SELECT
-                    date,
+                    seen.date AS date,
                     COUNT(*) AS total,
-                    SUM(CASE WHEN mlat = 0 AND had_pos = 1 THEN 1 ELSE 0 END) AS adsb_count,
-                    SUM(CASE WHEN mlat = 1                THEN 1 ELSE 0 END) AS mlat_count,
-                    SUM(CASE WHEN mlat = 0 AND had_pos = 0 THEN 1 ELSE 0 END) AS no_pos_count
-                FROM daily_aircraft_seen
-                WHERE date >= ?
-                GROUP BY date
-                ORDER BY date
-            """, (cutoff,)).fetchall()
-        return [
-            {
+                    SUM(CASE WHEN COALESCE(pos.had_adsb_pos, 0) = 1 THEN 1 ELSE 0 END) AS adsb_count,
+                    SUM(CASE WHEN COALESCE(pos.had_adsb_pos, 0) = 0
+                               AND COALESCE(pos.had_mlat_pos, 0) = 1 THEN 1 ELSE 0 END) AS mlat_count,
+                    SUM(CASE WHEN COALESCE(pos.had_adsb_pos, 0) = 0
+                               AND COALESCE(pos.had_mlat_pos, 0) = 0 THEN 1 ELSE 0 END) AS no_pos_count
+                FROM seen
+                LEFT JOIN pos_flags AS pos
+                  ON pos.date = seen.date AND pos.icao = seen.icao
+                GROUP BY seen.date
+                ORDER BY seen.date
+            """, (cutoff, cutoff)).fetchall()
+
+        def _rounded_pct_parts(adsb_count: int, mlat_count: int, no_pos_count: int, total: int) -> tuple[float, float, float]:
+            if total <= 0:
+                return 0.0, 0.0, 0.0
+            raw = [
+                adsb_count * 100.0 / total,
+                mlat_count * 100.0 / total,
+                no_pos_count * 100.0 / total,
+            ]
+            rounded = [int(v * 10) / 10 for v in raw]
+            remainder = int(round(1000 - sum(rounded) * 10))
+            if remainder > 0:
+                order = sorted(
+                    range(3),
+                    key=lambda i: (raw[i] - rounded[i], raw[i]),
+                    reverse=True,
+                )
+                for i in range(remainder):
+                    rounded[order[i % 3]] += 0.1
+            return tuple(round(v, 1) for v in rounded)
+
+        result = []
+        for r in rows:
+            adsb_pct, mlat_pct, no_pos_pct = _rounded_pct_parts(
+                r["adsb_count"], r["mlat_count"], r["no_pos_count"], r["total"]
+            )
+            result.append({
                 "date":       r["date"],
-                "adsb_pct":   round(r["adsb_count"]   * 100.0 / r["total"], 1) if r["total"] else 0,
-                "mlat_pct":   round(r["mlat_count"]   * 100.0 / r["total"], 1) if r["total"] else 0,
-                "no_pos_pct": round(r["no_pos_count"] * 100.0 / r["total"], 1) if r["total"] else 0,
-            }
-            for r in rows
-        ]
+                "adsb_pct":   adsb_pct,
+                "mlat_pct":   mlat_pct,
+                "no_pos_pct": no_pos_pct,
+            })
+        return result
 
     def query_military_icaos(self) -> list[str]:
         """Return all ICAO addresses flagged military in the registry."""
