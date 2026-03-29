@@ -372,7 +372,8 @@ def run_benchmark(n_msgs: int = 5000, paused: bool = False) -> dict:
         Should be True when called from the HTTP endpoint after the decoder
         has been paused via DecoderPaused.  Recorded in results for display.
     """
-    import platform, sys
+    import platform
+    import sys
 
     results: dict[str, Any] = {
         "n_msgs":                    n_msgs,
@@ -395,7 +396,7 @@ def run_benchmark(n_msgs: int = 5000, paused: bool = False) -> dict:
         import pyModeS
         results["pymodes_version"] = getattr(pyModeS, "__version__", "?")
         try:
-            import pyModeS.c_common as _  # type: ignore  # pyModeS 2.9 extension location
+            import pyModeS.c_common  # type: ignore  # pyModeS 2.9 extension location
             results["pymodes_cython"] = True
         except ImportError:
             results["pymodes_cython"] = False

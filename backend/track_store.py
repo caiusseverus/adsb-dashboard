@@ -14,13 +14,13 @@ Schema version 2 added mlat_source (index 10) as a trailing field.
 Consumers reading only indices 0–9 are unaffected.
 """
 
-# Increment when tuple schema changes (trailing fields only — safe for existing consumers).
-TRACK_SCHEMA_VERSION = 2
-
 import threading
 import time
 from collections import deque
 from typing import Optional
+
+# Increment when tuple schema changes (trailing fields only — safe for existing consumers).
+TRACK_SCHEMA_VERSION = 2
 
 SAMPLE_INTERVAL_S = 5
 WINDOW_S = 1800  # 30 minutes

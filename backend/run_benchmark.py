@@ -19,7 +19,6 @@ import argparse
 import json
 import os
 import sys
-import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -27,23 +26,34 @@ if HERE not in sys.path:
 
 # ─── Colour helpers ───────────────────────────────────────────────────────────
 
-RESET  = "\033[0m";  BOLD  = "\033[1m";  DIM   = "\033[2m"
-GREEN  = "\033[32m"; YELLOW= "\033[33m"; RED   = "\033[31m"
-CYAN   = "\033[36m"; WHITE = "\033[97m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+CYAN = "\033[36m"
+WHITE = "\033[97m"
 
-def _c(text, *codes): return "".join(codes) + str(text) + RESET
+def _c(text, *codes):
+    return "".join(codes) + str(text) + RESET
+
 def _bar(value, max_val, width=30, colour=CYAN):
     filled = max(0, min(width, int(round((value / max(max_val, 1)) * width))))
     return _c("█" * filled, colour) + _c("░" * (width - filled), DIM)
 
 def _fmt_rate(r):
-    if r >= 3500: return _c(f"{r:,} msg/s", GREEN, BOLD)
-    if r >= 2000: return _c(f"{r:,} msg/s", YELLOW)
+    if r >= 3500:
+        return _c(f"{r:,} msg/s", GREEN, BOLD)
+    if r >= 2000:
+        return _c(f"{r:,} msg/s", YELLOW)
     return _c(f"{r:,} msg/s", RED)
 
 def _fmt_us(us, target):
-    if us <= target:        return _c(f"{us:.1f} µs", GREEN)
-    if us <= target * 2:    return _c(f"{us:.1f} µs", YELLOW)
+    if us <= target:
+        return _c(f"{us:.1f} µs", GREEN)
+    if us <= target * 2:
+        return _c(f"{us:.1f} µs", YELLOW)
     return _c(f"{us:.1f} µs", RED)
 
 # ─── Output ───────────────────────────────────────────────────────────────────
@@ -122,8 +132,10 @@ def _print_results(r):
 # ─── Compare mode ─────────────────────────────────────────────────────────────
 
 def _compare(path_a, path_b):
-    with open(path_a) as f: a = json.load(f)
-    with open(path_b) as f: b = json.load(f)
+    with open(path_a) as f:
+        a = json.load(f)
+    with open(path_b) as f:
+        b = json.load(f)
 
     stages = [
         ("stage_beast_parse",   "Beast parse"),
@@ -145,7 +157,8 @@ def _compare(path_a, path_b):
 
     for key, name in stages:
         da, db_ = a.get(key), b.get(key)
-        if not da or not db_: continue
+        if not da or not db_:
+            continue
         for metric in ("p50_us", "p95_us", "p99_us", "max_sustained_rate"):
             va, vb = da[metric], db_[metric]
             is_rate = metric == "max_sustained_rate"
@@ -159,7 +172,13 @@ def _compare(path_a, path_b):
         print()
 
     va_v, vb_v = a.get("verdict","?"), b.get("verdict","?")
-    vc = lambda v: GREEN if v=="PASS" else YELLOW if v=="MARGINAL" else RED
+    def vc(verdict):
+        if verdict == "PASS":
+            return GREEN
+        if verdict == "MARGINAL":
+            return YELLOW
+        return RED
+
     print(f"  Verdict:  {_c(va_v, vc(va_v), BOLD)}  →  {_c(vb_v, vc(vb_v), BOLD)}")
     print(_c("═" * 72, DIM))
     print()

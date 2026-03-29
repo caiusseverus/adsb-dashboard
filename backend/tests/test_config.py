@@ -9,7 +9,6 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import logging
-import pytest
 from config import _parse_mlat_servers
 
 

@@ -11,8 +11,6 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-import sqlite3
-from pathlib import Path
 
 import config
 

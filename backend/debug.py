@@ -11,19 +11,19 @@ import asyncio
 import logging
 import os
 
+import aircraft_state as _state_module
+import benchmark as _benchmark_module
+import enrichment as enrichment_module
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
+from benchmark import DecoderPaused
+from db import stats_db
 
 # On Pi hardware 20k iterations pins all cores for ~20s and can push junction
 # temperature above the 80°C soft-throttle threshold, corrupting the results.
 _IS_PI    = os.path.exists("/sys/firmware/devicetree/base/model")
 _BENCH_MAX = 2_000 if _IS_PI else 20_000
-
-from db import stats_db
-import enrichment as enrichment_module
-import aircraft_state as _state_module
-import benchmark as _benchmark_module
-from benchmark import DecoderPaused
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/debug")

@@ -221,15 +221,19 @@ def _kf_update(x_p: list, P_p: list,
     y1 = n_meas - x_p[1]
 
     # S = H·P·H' + R  (top-left 2×2 of P, plus R on diagonal)
-    S00 = P_p[0] + R;  S01 = P_p[1]
-    S10 = P_p[4];      S11 = P_p[5] + R
+    S00 = P_p[0] + R
+    S01 = P_p[1]
+    S10 = P_p[4]
+    S11 = P_p[5] + R
 
     det_S = S00*S11 - S01*S10
     if abs(det_S) < 1.0:          # degenerate — skip update
         return x_p, P_p, False
 
-    Si00 =  S11 / det_S;  Si01 = -S01 / det_S
-    Si10 = -S10 / det_S;  Si11 =  S00 / det_S
+    Si00 = S11 / det_S
+    Si01 = -S01 / det_S
+    Si10 = -S10 / det_S
+    Si11 = S00 / det_S
 
     # Chi-squared innovations gate: d² = y' S⁻¹ y
     d2 = Si00*y0*y0 + (Si01+Si10)*y0*y1 + Si11*y1*y1

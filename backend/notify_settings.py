@@ -13,7 +13,6 @@ import asyncio
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from db import stats_db
-import config
 
 router = APIRouter(prefix="/api/notify")
 

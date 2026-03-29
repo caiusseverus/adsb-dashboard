@@ -28,7 +28,7 @@
 | F-M4 | `new Date()` allocated per cell in CalendarHeatmap `buildWeeks` — hoisted before loop | — | ✅ Fixed |
 | F-M15 | PositionQualityPage off-palette colors `#22c55e`/`#38bdf8` → `#3fb950`/`#388bfd` | — | ✅ Fixed |
 | F-M12 | `milParam` local var in `TopOperators` shadowed outer function — renamed to `milFilter` | — | ✅ Fixed |
-| F-M17 | FlowMapPage `delete L.Icon.Default.prototype._getIconUrl` — dead code (no markers created); removed | — | ✅ Fixed |
+| F-M17 | FlowMapPage `delete L.Icon.Default.prototype._getIconUrl` — dead code; removed | — | ✅ Fixed |
 | F-M13 | `EMERGENCY_SQUAWKS` duplicated in AircraftTable/AircraftDetailPanel/SkyView — extracted to `utils/squawks.js` | — | ✅ Fixed |
 | F-M8  | MlatScorecard `aggregateSources` called in render body — wrapped in `useMemo` | — | ✅ Fixed |
 | F-M16 | PositionQualityPage polled at 1 Hz unconditionally — paused via Page Visibility API | — | ✅ Fixed |
@@ -38,6 +38,13 @@
 | B-M5  | Unbounded `_cooldown` dict — expired entries now self-prune in `_on_cooldown` | — | ✅ Fixed |
 | B-M8  | f-string `SELECT COUNT(*) FROM {tbl}` — added assertion against known table set | — | ✅ Fixed |
 | B-M9  | f-string `UPDATE ... SET {field}` — added `_OVERRIDEABLE_FIELDS` whitelist at db layer | — | ✅ Fixed |
+| F-M9  | `makeIcon` creates new `L.divIcon` per frame — cached by `color+heading(5°)` | `3a39ca7` | ✅ Fixed |
+| B-M1  | Duplicate ghost filter logic — extracted `_is_credible()` shared helper | `3a39ca7` | ✅ Fixed |
+| B-M6  | `mlat.py` accessed private `_state._lock`/`_aircraft` — moved to public AircraftState methods | `3a39ca7` | ✅ Fixed |
+| B-M7  | Stale route cache served indefinitely on fetch failure — now falls back to previous valid result | `3a39ca7` | ✅ Fixed |
+| F-M3  | SVG gradient ID collision (`bandGrad`/`totalGrad`) — scoped via `useId()` | `e26de56` | ✅ Fixed |
+| F-M19 | `altColor` allocates `new THREE.Color` per point — reuses `_altColorBuf` | `e26de56` | ✅ Fixed |
+| B-M3  | Cast table schema duplicated in db.py — redundant migration block removed | `e26de56` | ✅ Fixed |
 
 ---
 
@@ -47,9 +54,11 @@
 |----------|---------|----------|---------------|-------|-------|
 | Critical | 0       | 0        | 0             | **0** | —     |
 | High     | 3       | 4        | 0             | **7** | 7     |
-| Medium   | 10      | 19       | 2             | **31**| 21    |
+| Medium   | 10      | 19       | 2             | **31**| 29    |
 | Low      | 10      | 8        | 1             | **19**| 0     |
-| **Total**| **23**  | **31**   | **3**         | **57**| **28** |
+| **Total**| **23**  | **31**   | **3**         | **57**| **36** |
+
+**Remaining:** F-M10 (useFetch/Card/Empty duplication), X-M2 (no linting tooling), 19 Low items.
 
 ---
 
@@ -64,7 +73,7 @@
 - **Description:** `allow_methods=["GET", "POST", "DELETE"]` omits `PUT`. The cast router (`backend/cast_api.py:61`, `:108`) defines `PUT /api/cast/config` and `PUT /api/cast/rules/{rule_id}`. Cross-origin preflight requests for PUT will receive 405 Method Not Allowed.
 - **Impact:** Cast config and rule updates are broken when the frontend is served from a different origin (Vite dev proxy sidesteps this, but any non-proxied CORS client will fail).
 
-#### B-H2 — No authentication on any endpoint
+#### ~~B-H2 — No authentication on any endpoint~~ ✅ Fixed (LAN assumption documented)
 - **Severity:** High
 - **Type:** Security
 - **File:** `backend/main.py` (all routers)
@@ -80,70 +89,70 @@
 
 ### Medium
 
-#### B-M1 — Duplicate ghost filter logic
+#### ~~B-M1 — Duplicate ghost filter logic~~ ✅ Fixed in `3a39ca7`
 - **Severity:** Medium
 - **Type:** Duplication
 - **File:** `backend/main.py:260–293`
 - **Description:** `_credible_aircraft(ac)` operates on `Aircraft` dataclass objects; `_ghost_credible(ac: dict)` does the same logic on dict snapshots. Both perform identical enrichment DB lookups.
 - **Impact:** Maintenance burden; divergent bug fixes if one is updated without the other.
 
-#### B-M2 — `haversine_nm` / `bearing_deg` duplicated across 3 files
+#### ~~B-M2 — `haversine_nm` / `bearing_deg` duplicated across 3 files~~ ✅ Fixed (part of X-M1)
 - **Severity:** Medium
 - **Type:** Duplication
 - **File:** `backend/aircraft_state.py:403,:411`, `backend/coverage.py:35,:44`, `backend/position_quality.py:29`
 - **Description:** Identical implementations of `_haversine_nm()` and `_bearing_deg()` in three separate files.
 - **Impact:** Triple maintenance; any fix must be applied in all three places.
 
-#### B-M3 — Cast table schema duplicated in db.py
+#### ~~B-M3 — Cast table schema duplicated in db.py~~ ✅ Fixed in `e26de56`
 - **Severity:** Medium
 - **Type:** Dead Code / Duplication
 - **File:** `backend/db.py:426–436, :457–468`
 - **Description:** Cast tables (`cast_config`, `cast_rules`) are created in the main schema init block and again in a separate migration block with identical `CREATE TABLE IF NOT EXISTS`. The migration block is redundant for new databases.
 - **Impact:** No functional bug (IF NOT EXISTS is idempotent), but confusing.
 
-#### B-M4 — Unbounded `_route_cache` in aircraft.py
+#### ~~B-M4 — Unbounded `_route_cache` in aircraft.py~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Performance / Resource Leak
 - **File:** `backend/aircraft.py:27`
 - **Description:** `_route_cache: dict[str, tuple[float, dict | None]] = {}` grows without bound. Entries are added but never evicted.
 - **Impact:** Slow memory leak proportional to unique callsigns seen over months.
 
-#### B-M5 — Unbounded `_cooldown` dict in cast.py
+#### ~~B-M5 — Unbounded `_cooldown` dict in cast.py~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Performance / Resource Leak
 - **File:** `backend/cast.py:64`
 - **Description:** `_cooldown: dict[str, float] = {}` accumulates ICAO entries that are never purged.
 - **Impact:** Minor memory leak; grows with every unique ICAO that triggers a cast evaluation.
 
-#### B-M6 — mlat.py accesses private `_state._lock` and `_state._aircraft`
+#### ~~B-M6 — mlat.py accesses private `_state._lock` and `_state._aircraft`~~ ✅ Fixed in `3a39ca7`
 - **Severity:** Medium
 - **Type:** Inconsistency / Encapsulation Violation
 - **File:** `backend/mlat.py:28–29, :53–54, :76–77`
-- **Description:** The mlat router directly acquires `_state._lock` and iterates `_state._aircraft` instead of using public methods on `AircraftState`. No other router does this.
+- **Description:** The mlat router directly acquired `_state._lock` and iterated `_state._aircraft` instead of using public methods on `AircraftState`. No other router does this.
 - **Impact:** Fragile coupling; breaks silently if `AircraftState` internals change.
 
-#### B-M7 — `_route_cache` serves stale entries indefinitely on fetch failure
+#### ~~B-M7 — `_route_cache` serves stale entries indefinitely on fetch failure~~ ✅ Fixed in `3a39ca7`
 - **Severity:** Medium
 - **Type:** Bug (minor)
 - **File:** `backend/aircraft.py:304–311`
 - **Description:** On failed route lookup, the old cache entry remains with its original timestamp, never refreshing. Stale route data is served indefinitely.
 - **Impact:** Low severity since routes rarely change mid-flight, but incorrect after the TTL window.
 
-#### B-M8 — f-string interpolation for SQL table/column names in db.py
+#### ~~B-M8 — f-string interpolation for SQL table/column names in db.py~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Security (Defence-in-depth)
 - **File:** `backend/db.py:2695, :2699`
 - **Description:** `f"SELECT COUNT(*) FROM {tbl}"` uses f-string interpolation. Values come from a hardcoded list (safe today), but there is no whitelist assertion at the db.py layer.
 - **Impact:** No exploitable vulnerability today; would become an injection vector if callers ever pass user input.
 
-#### B-M9 — `update_aircraft_field` f-string column name with distant validation
+#### ~~B-M9 — `update_aircraft_field` f-string column name with distant validation~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Security (Defence-in-depth)
 - **File:** `backend/db.py:2136`, `backend/debug.py:209`
 - **Description:** `f"UPDATE aircraft_registry SET {field} = ?"` interpolates `field`. Validation exists in `debug.py` via `OVERRIDEABLE_FIELDS` whitelist, but not enforced at the db.py layer.
 - **Impact:** SQL injection vector if any future caller bypasses the whitelist.
 
-#### B-M10 — `global _route_queue_drops` declared inside nested scope
+#### ~~B-M10 — `global _route_queue_drops` declared inside nested scope~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Code Quality
 - **File:** `backend/main.py:452`
@@ -230,11 +239,11 @@
 
 ### High
 
-#### F-H1 — Module-level mutable state in CoveragePage
+#### ~~F-H1 — Module-level mutable state in CoveragePage~~ ✅ Fixed
 - **Severity:** High
 - **Type:** Bug / Architecture
 - **File:** `frontend/src/pages/CoveragePage.jsx:11–12`
-- **Description:** `_altScale` and `_curveMode` are module-level `let` variables mutated by UI handlers and read by builder functions. If React StrictMode double-mounts or a second instance is created, these silently corrupt.
+- **Description:** `_altScale` and `_curveMode` were module-level `let` variables mutated by UI handlers and read by builder functions. Replaced with `useRef` + explicit param threading through 13 builder functions.
 - **Impact:** Incorrect 3D scene rendering if single-instance assumption is violated.
 
 #### ~~F-H2 — `useEffect` closes over stale `receiverPos` in MapPage~~ ✅ Fixed in `fe42c9a`
@@ -251,16 +260,16 @@
 - **Description:** CSS grid is hardcoded to 4 columns but the component renders 5–8 stat cards depending on MLAT availability.
 - **Impact:** Visual layout breakage when MLAT cards are shown; extra cards wrap unpredictably.
 
-#### F-H4 — BenchmarkPanel stale closure on re-mount
+#### ~~F-H4 — BenchmarkPanel stale closure on re-mount~~ ✅ Fixed
 - **Severity:** High
 - **Type:** Bug
 - **File:** `frontend/src/pages/BenchmarkPanel.jsx:129–146`
-- **Description:** Mount `useEffect` (line 129) calls `startPolling()` but has `[]` deps with eslint-disable suppressing the missing dependency warning. `startPolling` is a `useCallback` defined later. On re-mount, the closure may reference a stale `startPolling`.
+- **Description:** Mount `useEffect` called `startPolling()` but had `[]` deps with eslint-disable suppressing the missing dependency warning. `startPolling` was a `useCallback` defined later. Reordered hooks and fixed deps.
 - **Impact:** Polling may not restart correctly after component re-mount.
 
 ### Medium
 
-#### F-M1 — Dead expression in AircraftTable
+#### ~~F-M1 — Dead expression in AircraftTable~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Dead Code
 - **File:** `frontend/src/components/AircraftTable.jsx:124`
@@ -274,53 +283,53 @@
 - **Description:** Checks `aircraft.length === 0` for the empty message but should check `filtered.length === 0`. When all aircraft are filtered out, no empty message appears.
 - **Impact:** User sees empty table with no explanation when filter excludes all aircraft.
 
-#### F-M3 — SVG gradient ID collision risk
+#### ~~F-M3 — SVG gradient ID collision risk~~ ✅ Fixed in `e26de56`
 - **Severity:** Medium
 - **Type:** Bug
 - **File:** `frontend/src/components/MessageRateChart.jsx` (ID `bandGrad`), `TrendChart.jsx` (ID `totalGrad`)
-- **Description:** Recharts gradient `<defs>` use hardcoded IDs. Multiple instances on one page would produce ID collisions.
+- **Description:** Recharts gradient `<defs>` used hardcoded IDs. Multiple instances on one page would produce ID collisions. Fixed with `useId()` to generate unique IDs per instance.
 - **Impact:** Visual corruption if multi-instanced. Low risk today since each appears once.
 
-#### F-M4 — `new Date()` per cell in CalendarHeatmap
+#### ~~F-M4 — `new Date()` per cell in CalendarHeatmap~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Performance
 - **File:** `frontend/src/components/CalendarHeatmap.jsx:~44`
 - **Description:** `buildWeeks` creates `new Date()` inside the loop body for `future: cur > new Date()`, allocating per cell per render.
 - **Impact:** Minor GC pressure; should hoist `now` before the loop.
 
-#### F-M5 — `ALL_DAYS` / `DAY_LABELS` stale after midnight
+#### ~~F-M5 — `ALL_DAYS` / `DAY_LABELS` stale after midnight~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Bug
 - **File:** `frontend/src/components/HourlyHeatmap.jsx:53–64`
 - **Description:** Computed at module load time. If the dashboard runs overnight without refresh, day labels become stale.
 - **Impact:** Heatmap shows wrong day labels after midnight.
 
-#### F-M6 — `cellColor` function duplicated across 3 heatmap components
+#### ~~F-M6 — `cellColor` function duplicated across 3 heatmap components~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Duplication
 - **File:** `HourlyHeatmap.jsx`, `DFHeatmap.jsx`, `CalendarHeatmap.jsx`
-- **Description:** Identical heatmap coloring logic copy-pasted. `buildDayList`, `formatBucket`, `ALL_DAYS`, and `DAY_LABELS` also duplicated between HourlyHeatmap and DFHeatmap.
+- **Description:** Identical heatmap coloring logic copy-pasted. Shared implementation extracted to `utils/format.js` for HourlyHeatmap and DFHeatmap (CalendarHeatmap has a distinct null-handling variant kept local).
 - **Impact:** Maintenance burden; color logic can drift.
 
-#### F-M7 — `ceilFt` dependency suppressed in AltHeatmap
+#### ~~F-M7 — `ceilFt` dependency suppressed in AltHeatmap~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Bug
 - **File:** `frontend/src/components/AltHeatmap.jsx:158–159`
-- **Description:** Fetch `useEffect` has eslint-disable suppressing `ceilFt` dependency. Altitude ceiling change does not re-fetch data.
+- **Description:** Fetch `useEffect` had eslint-disable suppressing `ceilFt` dependency. Altitude ceiling change does not re-fetch data. Fixed via `extendedRef`.
 - **Impact:** Heatmap shows data for wrong altitude range after ceiling change.
 
-#### F-M8 — MlatScorecard recomputes aggregation every render
+#### ~~F-M8 — MlatScorecard recomputes aggregation every render~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Performance
 - **File:** `frontend/src/components/MlatScorecard.jsx`
 - **Description:** `aggregateSources(aircraft)` called in render body with no `useMemo`. `aircraft` is a new array from every WebSocket snapshot (1 Hz).
 - **Impact:** Unnecessary CPU work every second.
 
-#### F-M9 — `makeIcon` creates new `L.divIcon` per aircraft per snapshot
+#### ~~F-M9 — `makeIcon` creates new `L.divIcon` per aircraft per snapshot~~ ✅ Fixed in `3a39ca7`
 - **Severity:** Medium
 - **Type:** Performance
 - **File:** `frontend/src/pages/MapPage.jsx`
-- **Description:** Each marker update creates a new Leaflet `divIcon`. With 100+ aircraft at 1 Hz, this is hundreds of short-lived DOM objects per second.
+- **Description:** Each marker update created a new Leaflet `divIcon`. Fixed with module-level `_iconCache` keyed by `color+heading(5° buckets)` — at most ~72 icons per colour.
 - **Impact:** GC pressure and potential jank on low-power devices.
 
 #### F-M10 — Duplicated `useFetch`, `Card`, `Empty` across pages
@@ -330,53 +339,53 @@
 - **Description:** Both pages define identical `useFetch` custom hooks, `Card` wrapper components, and `Empty` placeholders.
 - **Impact:** Fixes in one copy won't propagate to the other.
 
-#### F-M11 — `haversineNm` duplicated across 3 frontend files
+#### ~~F-M11 — `haversineNm` duplicated across 3 frontend files~~ ✅ Fixed (part of X-M1)
 - **Severity:** Medium
 - **Type:** Duplication
 - **File:** `CoveragePage.jsx:36`, `MapPage.jsx`, `ReceiverPage.jsx`
 - **Description:** Haversine function copy-pasted. CoveragePage re-declares `const R_NM = 3440.065` inside function body, shadowing module-level constant.
 - **Impact:** Shadowed constant could diverge; triple maintenance burden.
 
-#### F-M12 — Variable shadowing in FleetPage `TopOperators`
+#### ~~F-M12 — Variable shadowing in FleetPage `TopOperators`~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Bug-prone
 - **File:** `frontend/src/pages/FleetPage.jsx:~203`
 - **Description:** `TopOperators` component shadows outer-scope `milParam` with a local `const milParam`. Outer function changes would be silently masked.
 - **Impact:** Could mask bugs if outer function signature changes.
 
-#### F-M13 — `EMERGENCY_SQUAWKS` duplicated
+#### ~~F-M13 — `EMERGENCY_SQUAWKS` duplicated~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Duplication
 - **File:** `AircraftTable.jsx`, `EventsPage.jsx`
-- **Description:** Emergency squawk code-to-label mapping defined independently in both files.
+- **Description:** Emergency squawk code-to-label mapping defined independently in both files. Extracted to `utils/squawks.js`.
 - **Impact:** Both files must be updated if squawk labels change.
 
-#### F-M14 — Formatting functions (`fmtTs`, `fmtAlt`) duplicated
+#### ~~F-M14 — Formatting functions (`fmtTs`, `fmtAlt`) duplicated~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Duplication
 - **File:** `EventsPage.jsx`, `AircraftDetailPanel.jsx`, and others
-- **Description:** Timestamp and altitude formatting reimplemented in multiple components.
+- **Description:** Timestamp and altitude formatting reimplemented in multiple components. Extracted to `utils/format.js`.
 - **Impact:** Inconsistent formatting if implementations drift.
 
-#### F-M15 — `PositionQualityPage` uses off-palette colors
+#### ~~F-M15 — `PositionQualityPage` uses off-palette colors~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Inconsistency
 - **File:** `frontend/src/pages/PositionQualityPage.jsx`
 - **Description:** Uses `#22c55e` and `#38bdf8` (Tailwind defaults) instead of project palette (`#3fb950`, `#388bfd`).
 - **Impact:** Visual inconsistency with the rest of the dashboard.
 
-#### F-M16 — `PositionQualityPage` polls at 1-second interval unconditionally
+#### ~~F-M16 — `PositionQualityPage` polls at 1-second interval unconditionally~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Performance
 - **File:** `frontend/src/pages/PositionQualityPage.jsx`
-- **Description:** `setInterval` at 1000ms polls the API continuously while the tab is active, even if the user isn't looking.
+- **Description:** `setInterval` at 1000ms polls the API continuously while the tab is active, even if the user isn't looking. Fixed with Page Visibility API.
 - **Impact:** Unnecessary network and server load.
 
-#### F-M17 — FlowMapPage monkey-patches `L.Icon.Default.prototype`
+#### ~~F-M17 — FlowMapPage monkey-patches `L.Icon.Default.prototype`~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Bug-prone
 - **File:** `frontend/src/pages/FlowMapPage.jsx`
-- **Description:** `delete L.Icon.Default.prototype._getIconUrl` at module level permanently modifies the Leaflet prototype globally.
+- **Description:** `delete L.Icon.Default.prototype._getIconUrl` at module level permanently modifies the Leaflet prototype globally. FlowMapPage creates no markers — the entire block was dead code and removed.
 - **Impact:** Could cause unexpected icon behavior in MapPage or AircraftDetailPanel MiniMap.
 
 #### ~~F-M18 — Timelapse `Math.min(...array)` stack overflow risk~~ ✅ Fixed in `3a3990b`
@@ -386,11 +395,11 @@
 - **Description:** `Math.min(...data.tracks.map(...))` spreads entire tracks array as arguments. V8 has a ~65k argument limit. Large timelapse datasets will throw `RangeError`.
 - **Impact:** Crash on very large timelapse datasets.
 
-#### F-M19 — `altColor` allocates new `THREE.Color` per point
+#### ~~F-M19 — `altColor` allocates new `THREE.Color` per point~~ ✅ Fixed in `e26de56`
 - **Severity:** Medium
 - **Type:** Performance
 - **File:** `frontend/src/pages/CoveragePage.jsx:101–109`
-- **Description:** `c0.clone().lerp(c1, ...)` allocates a new `THREE.Color` per point. For 100k+ points, this creates 100k+ temporary objects.
+- **Description:** `c0.clone().lerp(c1, ...)` allocates a new `THREE.Color` per point. Fixed with a module-level `_altColorBuf` reused via `.copy().lerp()`. Trail case captures A's rgb before the second call to avoid shared-buffer aliasing.
 - **Impact:** GC pressure during scene builds.
 
 ### Low
@@ -459,11 +468,11 @@
 
 ### Medium
 
-#### X-M1 — `haversine_nm` / `bearing_deg` duplicated across backend AND frontend
+#### ~~X-M1 — `haversine_nm` / `bearing_deg` duplicated across backend AND frontend~~ ✅ Fixed
 - **Severity:** Medium
 - **Type:** Duplication
 - **File:** Backend (3 files) + Frontend (3 files) = 6 independent implementations
-- **Description:** The haversine distance and bearing calculations are implemented independently in `aircraft_state.py`, `coverage.py`, `position_quality.py`, `CoveragePage.jsx`, `MapPage.jsx`, and `ReceiverPage.jsx`. Backend duplication should be a shared `utils.py` function; frontend should be a shared `utils/geo.js`.
+- **Description:** The haversine distance and bearing calculations are implemented independently in `aircraft_state.py`, `coverage.py`, `position_quality.py`, `CoveragePage.jsx`, `MapPage.jsx`, and `ReceiverPage.jsx`. Consolidated to `utils_geo.py` (backend) and `utils/geo.js` (frontend).
 - **Impact:** Six places to fix if the formula has a bug; high drift risk.
 
 #### X-M2 — No linting or formatting tooling configured
@@ -495,6 +504,6 @@
 5. ✅ **F-H2** — Fix MapPage `receiverPos` stale closure (`fe42c9a`)
 6. ✅ **F-M2** — AircraftTable filter empty state (`fe42c9a`)
 7. ✅ **MiniMap** — `invalidateSize()` on init and before fitBounds (`ededf70`)
-8. **X-M1 / B-M2 / F-M11** — Consolidate `haversine`/`bearing` into shared utils (6 dupes)
-9. **B-H2** — Document the "LAN-only" security assumption; optionally add auth
-10. **F-H1** — Refactor CoveragePage module-level mutable state into React state/ref
+8. ✅ **X-M1 / B-M2 / F-M11** — Consolidate `haversine`/`bearing` into shared utils (6 dupes)
+9. ✅ **B-H2** — Document the "LAN-only" security assumption; optionally add auth
+10. ✅ **F-H1** — Refactor CoveragePage module-level mutable state into React state/ref

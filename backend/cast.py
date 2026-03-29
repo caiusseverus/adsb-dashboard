@@ -338,7 +338,6 @@ def render_display_image(aircraft: dict) -> bytes:
     PAD  = 32
 
     BG        = (11, 12, 16)
-    ACCENT    = (56, 139, 253)
     TEXT      = (201, 209, 217)
     SUBTEXT   = (110, 118, 129)
     WHITE     = (255, 255, 255)

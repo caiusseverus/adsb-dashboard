@@ -98,8 +98,10 @@ def _decode_acas_mv(mv_bin: str, sensitivity_level: int | None = None) -> dict |
     if corr and positive:
         direction = "Descend" if down else "Climb"
         parts = [direction]
-        if crossing: parts.append("crossing")
-        if increase: parts.append("increase rate")
+        if crossing:
+            parts.append("crossing")
+        if increase:
+            parts.append("increase rate")
         ra_sense = ", ".join(parts)
         ra_corrective = True
     elif corr:

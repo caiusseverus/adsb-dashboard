@@ -12,6 +12,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import config
 import enrichment as _enrichment
@@ -2037,11 +2038,16 @@ class StatsDB:
                 nm = bkt * 5 + 2.5
                 mean_sum += nm * cnt
                 cumulative += cnt
-                if p5  is None and cumulative * 100 >= total *  5: p5  = round(nm, 2)
-                if p25 is None and cumulative * 100 >= total * 25: p25 = round(nm, 2)
-                if p50 is None and cumulative * 100 >= total * 50: p50 = round(nm, 2)
-                if p75 is None and cumulative * 100 >= total * 75: p75 = round(nm, 2)
-                if p95 is None and cumulative * 100 >= total * 95: p95 = round(nm, 2)
+                if p5 is None and cumulative * 100 >= total * 5:
+                    p5 = round(nm, 2)
+                if p25 is None and cumulative * 100 >= total * 25:
+                    p25 = round(nm, 2)
+                if p50 is None and cumulative * 100 >= total * 50:
+                    p50 = round(nm, 2)
+                if p75 is None and cumulative * 100 >= total * 75:
+                    p75 = round(nm, 2)
+                if p95 is None and cumulative * 100 >= total * 95:
+                    p95 = round(nm, 2)
             return {"n": total, "mean": round(mean_sum / total, 2),
                     "p5": p5, "p25": p25, "p50": p50, "p75": p75, "p95": p95}
 

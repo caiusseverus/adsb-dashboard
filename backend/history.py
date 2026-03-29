@@ -228,7 +228,7 @@ async def notable(
     if flag not in _VALID_FLAGS:
         raise HTTPException(400, f"Unknown flag. Valid: {sorted(_VALID_FLAGS)}")
     if sort_col and sort_col not in _NOTABLE_SORT_COLS:
-        raise HTTPException(400, f"Invalid sort column")
+        raise HTTPException(400, "Invalid sort column")
     if sort_dir not in ("asc", "desc"):
         sort_dir = "desc"
     if flag == "unique_sighting":
