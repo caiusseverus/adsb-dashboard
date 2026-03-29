@@ -25,7 +25,8 @@ router = APIRouter(prefix="/api/aircraft")
 
 # In-memory route cache: callsign → (fetched_ts, result_dict | None)
 _route_cache: dict[str, tuple[float, dict | None]] = {}
-_ROUTE_CACHE_TTL = 3600  # 1 hour
+_ROUTE_CACHE_TTL  = 3600   # 1 hour
+_ROUTE_CACHE_MAX  = 2000   # prevent unbounded growth
 
 
 # ---------------------------------------------------------------------------
@@ -309,4 +310,13 @@ async def aircraft_route(icao: str, callsign: str = Query(...)) -> dict | None:
 
     result = await asyncio.to_thread(_fetch_route_blocking, callsign)
     _route_cache[callsign] = (time.time(), result)
+    if len(_route_cache) > _ROUTE_CACHE_MAX:
+        # Evict all expired entries; if still over limit remove the oldest.
+        now = time.time()
+        expired = [k for k, (ts, _) in _route_cache.items() if now - ts >= _ROUTE_CACHE_TTL]
+        for k in expired:
+            del _route_cache[k]
+        if len(_route_cache) > _ROUTE_CACHE_MAX:
+            oldest = min(_route_cache, key=lambda k: _route_cache[k][0])
+            del _route_cache[oldest]
     return result

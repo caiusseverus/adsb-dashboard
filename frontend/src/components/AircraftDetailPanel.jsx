@@ -4,6 +4,7 @@ import 'leaflet/dist/leaflet.css'
 import styles from './AircraftDetailPanel.module.css'
 import { formatOperator } from '../utils/formatOperator'
 import { EMERGENCY_SQUAWKS } from '../utils/squawks'
+import { fmtAlt } from '../utils/format'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 
@@ -26,10 +27,6 @@ function sameDay(startTs, endTs) {
   return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
 }
 
-function fmtAlt(alt) {
-  if (alt == null) return null
-  return alt.toLocaleString() + ' ft'
-}
 
 function fmtDuration(startTs, endTs) {
   if (!startTs || !endTs) return null

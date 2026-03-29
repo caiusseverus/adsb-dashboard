@@ -5,18 +5,9 @@ import {
 } from 'recharts'
 import styles from './EventsPage.module.css'
 import { formatOperator } from '../utils/formatOperator'
+import { fmtTs, fmtAlt } from '../utils/format'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
-
-function fmtTs(unix) {
-  if (!unix) return '—'
-  return new Date(unix * 1000).toLocaleString()
-}
-
-function fmtAlt(alt) {
-  if (alt == null) return '—'
-  return alt.toLocaleString() + ' ft'
-}
 
 function fmtTime(ts) {
   const d = new Date(ts * 1000)

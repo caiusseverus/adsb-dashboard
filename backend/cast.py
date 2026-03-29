@@ -76,7 +76,10 @@ def _on_cooldown(icao: str, cooldown_minutes: int) -> bool:
     last = _cooldown.get(icao)
     if last is None:
         return False
-    return (time.time() - last) < (cooldown_minutes * 60)
+    if (time.time() - last) >= (cooldown_minutes * 60):
+        del _cooldown[icao]   # prune expired entry so dict stays bounded
+        return False
+    return True
 
 
 def _mark_cast(icao: str) -> None:

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import styles from './HourlyHeatmap.module.css'
 import { TYPE_GROUPS } from '../utils/typeGroups'
+import { cellColor } from '../utils/format'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 const DAYS = 30
@@ -35,20 +36,6 @@ function buildDayList() {
   return days
 }
 
-// Continuous HSL gradient matching scatter plots, reversed: purple (low) → blue → yellow → green (high)
-function cellColor(value, maxVal) {
-  if (!value) return '#21262d'
-  const t = Math.max(0, Math.min(1, value / maxVal))
-  let h
-  if (t < 0.444) {
-    h = 280 - (t / 0.444) * 70           // purple → blue (280→210)
-  } else if (t < 0.778) {
-    h = 210 - ((t - 0.444) / 0.334) * 150 // blue → yellow (210→60)
-  } else {
-    h = 60 + ((t - 0.778) / 0.222) * 60   // yellow → green (60→120)
-  }
-  return `hsl(${Math.round(h)},80%,55%)`
-}
 
 
 export default function HourlyHeatmap() {

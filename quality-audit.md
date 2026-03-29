@@ -32,6 +32,12 @@
 | F-M13 | `EMERGENCY_SQUAWKS` duplicated in AircraftTable/AircraftDetailPanel/SkyView — extracted to `utils/squawks.js` | — | ✅ Fixed |
 | F-M8  | MlatScorecard `aggregateSources` called in render body — wrapped in `useMemo` | — | ✅ Fixed |
 | F-M16 | PositionQualityPage polled at 1 Hz unconditionally — paused via Page Visibility API | — | ✅ Fixed |
+| F-M6  | `cellColor` duplicated in HourlyHeatmap + DFHeatmap → extracted to `utils/format.js` | — | ✅ Fixed |
+| F-M14 | `fmtTs`/`fmtAlt` duplicated in EventsPage + AircraftDetailPanel → `utils/format.js` | — | ✅ Fixed |
+| B-M4  | Unbounded `_route_cache` — capped at 2000; evicts expired then oldest on overflow | — | ✅ Fixed |
+| B-M5  | Unbounded `_cooldown` dict — expired entries now self-prune in `_on_cooldown` | — | ✅ Fixed |
+| B-M8  | f-string `SELECT COUNT(*) FROM {tbl}` — added assertion against known table set | — | ✅ Fixed |
+| B-M9  | f-string `UPDATE ... SET {field}` — added `_OVERRIDEABLE_FIELDS` whitelist at db layer | — | ✅ Fixed |
 
 ---
 
@@ -41,9 +47,9 @@
 |----------|---------|----------|---------------|-------|-------|
 | Critical | 0       | 0        | 0             | **0** | —     |
 | High     | 3       | 4        | 0             | **7** | 7     |
-| Medium   | 10      | 19       | 2             | **31**| 14    |
+| Medium   | 10      | 19       | 2             | **31**| 21    |
 | Low      | 10      | 8        | 1             | **19**| 0     |
-| **Total**| **23**  | **31**   | **3**         | **57**| **21** |
+| **Total**| **23**  | **31**   | **3**         | **57**| **28** |
 
 ---
 

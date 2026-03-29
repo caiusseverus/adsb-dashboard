@@ -2138,9 +2138,18 @@ class StatsDB:
             ).fetchone()
             return dict(row) if row else None
 
+    # Fields that may be overwritten via the debug override endpoint.
+    # Validated here (db layer) as defence-in-depth; the router also checks.
+    _OVERRIDEABLE_FIELDS = frozenset({
+        "country", "registration", "type_code", "operator",
+        "military", "manufacturer", "year",
+    })
+
     def update_aircraft_field(self, icao: str, field: str, value) -> None:
-        """Overwrite a single field in aircraft_registry (field already validated by router).
+        """Overwrite a single field in aircraft_registry.
         When country or military changes, foreign_military is recalculated immediately."""
+        if field not in self._OVERRIDEABLE_FIELDS:
+            raise ValueError(f"Field {field!r} is not overrideable")
         icao = icao.upper()
         with self._connect() as conn:
             conn.execute(
@@ -2777,9 +2786,11 @@ class StatsDB:
             ("squawk_events",         "ts",        True,  90),
         ]
 
+        valid_tables = {t[0] for t in tables}
         result = []
         with self._connect() as conn:
             for tbl, ts_col, expires, ret_days in tables:
+                assert tbl in valid_tables, f"Unexpected table name: {tbl!r}"
                 row_count = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
                 oldest = newest = None
                 if ts_col and row_count:
