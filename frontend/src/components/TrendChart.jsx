@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useId } from 'react'
 import {
   ComposedChart,
   Area,
@@ -37,6 +37,8 @@ const CustomTooltip = ({ active, payload, label }) => {
 }
 
 export default function TrendChart() {
+  const uid = useId()
+  const gradId = `totalGrad-${uid}`
   const [days, setDays] = useState(90)
   const [data, setData] = useState([])
   const [loading, setLoading] = useState(true)
@@ -82,7 +84,7 @@ export default function TrendChart() {
         <ResponsiveContainer width="100%" height={180}>
           <ComposedChart data={data} margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
             <defs>
-              <linearGradient id="totalGrad" x1="0" y1="0" x2="0" y2="1">
+              <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
                 <stop offset="5%"  stopColor="#388bfd" stopOpacity={0.15} />
                 <stop offset="95%" stopColor="#388bfd" stopOpacity={0} />
               </linearGradient>
@@ -106,7 +108,7 @@ export default function TrendChart() {
               type="monotone"
               dataKey="total"
               stroke="none"
-              fill="url(#totalGrad)"
+              fill={`url(#${gradId})`}
               dot={false}
               isAnimationActive={false}
             />

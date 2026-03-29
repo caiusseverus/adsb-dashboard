@@ -476,23 +476,6 @@ class StatsDB:
             except Exception:
                 pass  # column already exists
 
-        # Migrate: create cast tables if upgrading from older DB
-        with self._connect() as conn:
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS cast_config (
-                    key   TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS cast_rules (
-                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                    match_type       TEXT    NOT NULL,
-                    match_value      TEXT,
-                    max_range_nm     REAL,
-                    max_altitude_ft  INTEGER,
-                    enabled          INTEGER NOT NULL DEFAULT 1
-                );
-            """)
-
         # Migrate: add max_altitude_ft to cast_rules if missing
         with self._connect() as conn:
             try:

@@ -85,14 +85,16 @@ const ALT_STOPS = [
   [1.00, new THREE.Color(0xbc8cff)],
 ]
 
+// Reused to avoid allocating a new THREE.Color on every call (called per point per frame)
+const _altColorBuf = new THREE.Color()
 function altColor(alt_ft) {
   const t = Math.min(1, Math.max(0, alt_ft / ALT_SCALE_FT))
   for (let i = 1; i < ALT_STOPS.length; i++) {
     const [t0, c0] = ALT_STOPS[i - 1]
     const [t1, c1] = ALT_STOPS[i]
-    if (t <= t1) return c0.clone().lerp(c1, (t - t0) / (t1 - t0))
+    if (t <= t1) return _altColorBuf.copy(c0).lerp(c1, (t - t0) / (t1 - t0))
   }
-  return ALT_STOPS[ALT_STOPS.length - 1][1].clone()
+  return _altColorBuf.copy(ALT_STOPS[ALT_STOPS.length - 1][1])
 }
 
 // [bearing_deg, range_nm, alt_ft] → Three.js world coords
@@ -238,12 +240,14 @@ function buildTrails(trails, colorMode, operators, typeCodes, altScale, curveMod
       if (!isTrailSegmentValid(a, b)) continue
       const [x0, y0, z0] = toWorld(a.bearing, a.range, a.alt ?? 0, altScale, curveMode)
       const [x1, y1, z1] = toWorld(b.bearing, b.range, b.alt ?? 0, altScale, curveMode)
-      // Altitude mode: colour each vertex by its own altitude (gradient along trail)
+      // Altitude mode: colour each vertex by its own altitude (gradient along trail).
+      // _altColorBuf is shared — capture A's rgb before calling altColor again for B.
       const colA = colorMode === 'altitude' ? altColor(a.alt ?? 0) : acCol
+      const rA = colA.r, gA = colA.g, bA = colA.b
       const colB = colorMode === 'altitude' ? altColor(b.alt ?? 0) : acCol
       positions[idx * 6]     = x0; positions[idx * 6 + 1] = y0; positions[idx * 6 + 2] = z0
       positions[idx * 6 + 3] = x1; positions[idx * 6 + 4] = y1; positions[idx * 6 + 5] = z1
-      colors[idx * 6]     = colA.r; colors[idx * 6 + 1] = colA.g; colors[idx * 6 + 2] = colA.b
+      colors[idx * 6]     = rA;    colors[idx * 6 + 1] = gA;    colors[idx * 6 + 2] = bA
       colors[idx * 6 + 3] = colB.r; colors[idx * 6 + 4] = colB.g; colors[idx * 6 + 5] = colB.b
       idx++
     }

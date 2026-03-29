@@ -1,3 +1,4 @@
+import { useId } from 'react'
 import {
   ComposedChart,
   Area,
@@ -65,6 +66,8 @@ function buildWindow(data) {
 }
 
 export default function MessageRateChart({ data }) {
+  const uid = useId()
+  const gradId = `bandGrad-${uid}`
   const formatted = buildWindow(data)
 
   return (
@@ -73,7 +76,7 @@ export default function MessageRateChart({ data }) {
       <ResponsiveContainer width="100%" height={180}>
         <ComposedChart data={formatted} margin={{ top: 4, right: 40, bottom: 0, left: 0 }}>
           <defs>
-            <linearGradient id="bandGrad" x1="0" y1="0" x2="0" y2="1">
+            <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
               <stop offset="5%"  stopColor="#388bfd" stopOpacity={0.20} />
               <stop offset="95%" stopColor="#388bfd" stopOpacity={0.04} />
             </linearGradient>
@@ -109,7 +112,7 @@ export default function MessageRateChart({ data }) {
             type="monotone"
             dataKey="max"
             stroke="none"
-            fill="url(#bandGrad)"
+            fill={`url(#${gradId})`}
             dot={false}
             legendType="none"
             activeDot={false}
