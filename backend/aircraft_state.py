@@ -1108,6 +1108,61 @@ class AircraftState:
             lock_wait_timings.append(per_wait)
             decode_timings.append(per_decode)
 
+    # ── MLAT diagnostic helpers (used by mlat.py endpoints) ─────────────────
+
+    def get_mlat_fixes_all(self) -> dict:
+        """Per-source fix positions for every tracked MLAT aircraft."""
+        out: dict = {}
+        with self._lock:
+            for icao, ac in self._aircraft.items():
+                if not ac.mlat or not ac.mlat_fixes:
+                    continue
+                srcs = {
+                    src: [[round(f.lat, 6), round(f.lon, 6)] for f in buf]
+                    for src, buf in ac.mlat_fixes.items()
+                    if buf
+                }
+                if srcs:
+                    out[icao] = srcs
+        return out
+
+    def get_mlat_fixes_for(self, icao: str) -> dict | None:
+        """Per-source fix buffer for a single aircraft, or None if not tracked."""
+        with self._lock:
+            ac = self._aircraft.get(icao)
+            if ac is None:
+                return None
+            return {
+                src: [[round(f.lat, 6), round(f.lon, 6)] for f in buf]
+                for src, buf in ac.mlat_fixes.items()
+            }
+
+    def get_mlat_residuals(self) -> list:
+        """Residual data for all MLAT aircraft that have a position and residuals."""
+        import statistics as _statistics
+        out: list = []
+        with self._lock:
+            for icao, ac in self._aircraft.items():
+                if not ac.mlat or ac.lat is None or ac.lon is None:
+                    continue
+                if not ac.mlat_residuals:
+                    continue
+                all_vals = [
+                    _statistics.median(buf)
+                    for buf in ac.mlat_residuals.values()
+                    if len(buf) >= 3
+                ]
+                if not all_vals:
+                    continue
+                out.append({
+                    "icao":            icao,
+                    "lat":             round(ac.lat, 5),
+                    "lon":             round(ac.lon, 5),
+                    "sources":         list(ac.mlat_residuals.keys()),
+                    "avg_residual_nm": round(sum(all_vals) / len(all_vals), 3),
+                })
+        return out
+
     def expire_aircraft(self) -> list["Aircraft"]:
         """Remove stale aircraft and return them for visit logging."""
         now = time.time()
@@ -1783,7 +1838,7 @@ class AircraftState:
             self._today_mil_icaos.add(icao)
 
         # Accumulate per-minute signal and DF stats
-        if signal:
+        if signal is not None:
             self._cur_min_signals.append(signal)
         self._cur_min_df_counts[df] = self._cur_min_df_counts.get(df, 0) + 1
 
@@ -2399,11 +2454,12 @@ class AircraftState:
                 ac.alt_reliable = _ALT_RELIABLE_PUBLISH
                 ac.last_alt_ts = now
 
-            # Signal: readsb rssi is dBFS (negative float) → Beast 0–255 scale
-            # Formula: raw = clamp(-rssi * 2, 0, 255)  (0 = strongest, matches Beast)
+            # Signal: readsb rssi is dBFS, so convert it back to the Beast/readsb
+            # raw byte convention used elsewhere in the app: 0 = strongest.
             rssi = ac_data.get("rssi")
             if rssi is not None:
-                ac.signal = max(0, min(255, int(-rssi * 2)))
+                signal_level = max(0.0, min(1.0, math.pow(10.0, float(rssi) / 10.0)))
+                ac.signal = max(0, min(255, int(round(255.0 - signal_level * 255.0))))
                 self._cur_min_signals.append(ac.signal)
 
             # Per-aircraft message delta (readsb gives cumulative from its start)

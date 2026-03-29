@@ -309,6 +309,12 @@ async def aircraft_route(icao: str, callsign: str = Query(...)) -> dict | None:
             return result
 
     result = await asyncio.to_thread(_fetch_route_blocking, callsign)
+    if result is None and cached:
+        # Fetch failed — serve the previous valid result rather than downgrading
+        # to None. Reset timestamp so we retry after another TTL window.
+        _, old_result = cached
+        if old_result is not None:
+            result = old_result
     _route_cache[callsign] = (time.time(), result)
     if len(_route_cache) > _ROUTE_CACHE_MAX:
         # Evict all expired entries; if still over limit remove the oldest.

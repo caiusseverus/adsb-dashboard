@@ -42,21 +42,30 @@ function tagColor(ac) {
 }
 
 // ── Aircraft marker icon ──────────────────────────────────────────────────
+// Cache keyed by "<color>-<roundedHeading|circle>" — heading quantised to 5°
+// so we create at most ~72 icons per colour rather than one per frame.
+const _iconCache = new Map()
 function makeIcon(color, heading) {
-  const hasHeading = heading != null
+  const headingKey = heading != null ? Math.round(heading / 5) * 5 : 'circle'
+  const cacheKey = `${color}-${headingKey}`
+  if (_iconCache.has(cacheKey)) return _iconCache.get(cacheKey)
+
+  const hasHeading = headingKey !== 'circle'
   const html = hasHeading
-    ? `<svg viewBox="-7 -9 14 18" width="14" height="18" style="display:block;transform:rotate(${heading}deg)">
+    ? `<svg viewBox="-7 -9 14 18" width="14" height="18" style="display:block;transform:rotate(${headingKey}deg)">
          <path d="M0,-8 L5,7 L0,3 L-5,7 Z" fill="${color}" stroke="#0b0c10" stroke-width="1" stroke-linejoin="round"/>
        </svg>`
     : `<svg viewBox="-5 -5 10 10" width="10" height="10" style="display:block">
          <circle cx="0" cy="0" r="4" fill="${color}" stroke="#0b0c10" stroke-width="1"/>
        </svg>`
-  return L.divIcon({
+  const icon = L.divIcon({
     html,
     className: '',
     iconSize:   hasHeading ? [14, 18] : [10, 10],
     iconAnchor: hasHeading ? [7, 9]   : [5, 5],
   })
+  _iconCache.set(cacheKey, icon)
+  return icon
 }
 
 // Receiver crosshair icon

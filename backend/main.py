@@ -257,33 +257,15 @@ def _wal_checkpoint_passive() -> None:
         log.warning("Periodic WAL checkpoint failed", exc_info=True)
 
 
-def _credible_aircraft(ac) -> bool:
-    """Ghost filter for Aircraft dataclass objects (used at visit close time)."""
+def _is_credible(icao: str, msg_count: int, mlat: bool) -> bool:
+    """Core ghost-filter logic shared by both Aircraft-object and dict callers."""
     if config.GHOST_FILTER_MSGS <= 0:
         return True
-    if ac.msg_count >= config.GHOST_FILTER_MSGS:
-        return True
-    if ac.mlat:
-        return True
-    if enrichment.db.get_adsbx(ac.icao):
-        return True
-    if enrichment.db.get_hexdb_cached(ac.icao):
-        return True
-    if enrichment.db.get_tar1090_cached(ac.icao):
-        return True
-    return False
-
-
-def _ghost_credible(ac: dict) -> bool:
-    """Return True if this aircraft is likely real and should be persisted."""
-    if config.GHOST_FILTER_MSGS <= 0:
-        return True
-    if ac.get("msg_count", 0) >= config.GHOST_FILTER_MSGS:
+    if msg_count >= config.GHOST_FILTER_MSGS:
         return True
     # MLAT-confirmed aircraft are real (multilaterated by multiple receivers)
-    if ac.get("mlat"):
+    if mlat:
         return True
-    icao = ac["icao"]
     if enrichment.db.get_adsbx(icao):
         return True
     if enrichment.db.get_hexdb_cached(icao):
@@ -291,6 +273,16 @@ def _ghost_credible(ac: dict) -> bool:
     if enrichment.db.get_tar1090_cached(icao):
         return True
     return False
+
+
+def _credible_aircraft(ac) -> bool:
+    """Ghost filter for Aircraft dataclass objects (used at visit close time)."""
+    return _is_credible(ac.icao, ac.msg_count, bool(ac.mlat))
+
+
+def _ghost_credible(ac: dict) -> bool:
+    """Return True if this aircraft (dict snapshot) is likely real and should be persisted."""
+    return _is_credible(ac["icao"], ac.get("msg_count", 0), bool(ac.get("mlat")))
 
 
 async def _db_writer() -> None:
