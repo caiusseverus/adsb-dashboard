@@ -315,7 +315,7 @@ class BeastParser:
             frame = self._frames[i]
             payload = bytes(_ffi.buffer(frame.payload, frame.msg_len))
             out.append({
-                "raw": payload.hex().upper(),
+                "raw": payload,
                 "timestamp": int(frame.timestamp),
                 "signal": int(frame.signal),
                 "type": int(frame.msg_type),

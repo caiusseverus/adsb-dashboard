@@ -175,9 +175,8 @@ class BeastClient:
     def _dispatch(self, msg_type: int, data: bytes) -> None:
         timestamp = int.from_bytes(data[:6], "big")
         signal = data[6]
-        msg_hex = data[7:].hex().upper()
         self._dispatch_frame({
-            "raw": msg_hex,
+            "raw": data[7:],
             "timestamp": timestamp,
             "signal": signal,
             "type": msg_type,

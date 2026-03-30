@@ -149,8 +149,7 @@ class TestParseFrames:
         frame = _build_frame(0x32, ts, 0x01, payload)
         self._feed(frame)
         assert len(self.messages) == 1
-        # The decoded raw hex should start with "1A"
-        assert self.messages[0]["raw"].startswith("1A")
+        assert self.messages[0]["raw"].startswith(b"\x1A")
 
     def test_mode_ac_frame(self):
         # Mode-AC (0x31) frames are silently dropped before dispatch — no ICAO address,

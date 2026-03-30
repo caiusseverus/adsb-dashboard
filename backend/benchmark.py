@@ -171,7 +171,7 @@ _REPEAT   = 250
 _MESSAGES: list[dict] = []
 for _i in range(_REPEAT):
     for _hex, _sig, _ts, _desc in _CORPUS:
-        _MESSAGES.append({"raw": _hex, "signal": _sig, "timestamp": _ts, "type": 0x33})
+        _MESSAGES.append({"raw": bytes.fromhex(_hex), "signal": _sig, "timestamp": _ts, "type": 0x33})
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +270,7 @@ def _bench_new_aircraft(n: int) -> dict:
     seen: set[str] = set()
     first_msgs: list[dict] = []
     for msg in _MESSAGES:
-        icao = msg["raw"][:6]
+        icao = msg["raw"][:3].hex().upper()
         if icao not in seen:
             seen.add(icao)
             first_msgs.append(msg)
@@ -335,7 +335,7 @@ def _bench_full_pipeline(state, n: int) -> dict:
         msg_type = 0x33 if len(payload) == 14 else (0x32 if len(payload) == 7 else 0x31)
         return bytes([0x1A, msg_type]) + bytes(escaped)
 
-    corpus_frames = {h: _make_frame(h, s, t) for h, s, t, _ in _CORPUS}
+    corpus_frames = {bytes.fromhex(h): _make_frame(h, s, t) for h, s, t, _ in _CORPUS}
     msgs  = _MESSAGES[:n]
     times: list[float] = []
     for msg_dict in msgs:
