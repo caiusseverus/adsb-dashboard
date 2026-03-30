@@ -74,11 +74,29 @@ typedef struct {
     int      emergency;
 } decode_result_t;
 
+typedef struct {
+    uint8_t  msg_type;
+    uint64_t timestamp;
+    uint8_t  signal;
+    uint8_t  msg_len;
+    uint8_t  payload[14];
+} beast_frame_t;
+
+typedef struct {
+    uint8_t  data[65536];
+    uint32_t len;
+} beast_parser_t;
+
 void decode_init(void);
 void decode_cleanup(void);
 int  decode_message(const uint8_t *msg_bytes, int msg_len,
                     uint8_t signal, uint64_t timestamp,
                     decode_result_t *result);
+void beast_parser_init(beast_parser_t *parser);
+int  beast_parse_chunk(beast_parser_t *parser,
+                       const uint8_t *chunk, uint32_t chunk_len,
+                       beast_frame_t *out_frames, int max_frames,
+                       uint32_t *malformed_bytes);
 
 int solve_cpr_airborne(int even_cprlat, int even_cprlon,
                        int odd_cprlat,  int odd_cprlon,
@@ -110,6 +128,7 @@ _ffi = FFI()
 _ffi.cdef(_CDEF)
 
 _lib = None   # loaded lazily on first call
+_has_beast_parser = None
 
 # Pre-allocated output buffers for CPR solvers.
 # Reused on every call — safe because the decode thread is single-threaded.
@@ -124,6 +143,17 @@ def _get_lib():
         _lib.decode_init()
         log.info("decode_cffi: loaded %s", path)
     return _lib
+
+
+def has_beast_parser() -> bool:
+    global _has_beast_parser
+    if _has_beast_parser is None:
+        lib = _get_lib()
+        _has_beast_parser = all(
+            hasattr(lib, name)
+            for name in ("beast_parser_init", "beast_parse_chunk")
+        )
+    return bool(_has_beast_parser)
 
 
 # ── Public API ─────────────────────────────────────────────────────────────
@@ -254,3 +284,40 @@ def cleanup() -> None:
     if _lib is not None:
         _lib.decode_cleanup()
         _lib = None
+
+
+class BeastParser:
+    """Stateful wrapper around the native Beast stream parser."""
+
+    def __init__(self, max_frames: int = 256):
+        if max_frames <= 0:
+            raise ValueError("max_frames must be > 0")
+        self._parser = _ffi.new("beast_parser_t *")
+        self._frames = _ffi.new("beast_frame_t[]", max_frames)
+        self._malformed = _ffi.new("uint32_t *")
+        self._max_frames = max_frames
+        _get_lib().beast_parser_init(self._parser)
+
+    def parse_chunk(self, chunk: bytes) -> tuple[list[dict], int]:
+        if not chunk:
+            return [], 0
+        buf = _ffi.from_buffer(chunk)
+        count = _get_lib().beast_parse_chunk(
+            self._parser,
+            buf,
+            len(chunk),
+            self._frames,
+            self._max_frames,
+            self._malformed,
+        )
+        out: list[dict] = []
+        for i in range(count):
+            frame = self._frames[i]
+            payload = bytes(_ffi.buffer(frame.payload, frame.msg_len))
+            out.append({
+                "raw": payload.hex().upper(),
+                "timestamp": int(frame.timestamp),
+                "signal": int(frame.signal),
+                "type": int(frame.msg_type),
+            })
+        return out, int(self._malformed[0])

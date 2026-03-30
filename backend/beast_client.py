@@ -18,6 +18,11 @@ import asyncio
 import logging
 from typing import Callable, Optional, Tuple, Union
 
+try:
+    import decode_cffi as _decode_cffi
+except Exception:  # pragma: no cover - native parser is optional at runtime
+    _decode_cffi = None
+
 log = logging.getLogger(__name__)
 
 _MSG_LEN = {0x31: 2, 0x32: 7, 0x33: 14}
@@ -34,6 +39,13 @@ class BeastClient:
         self._on_message = on_message
         self._buf = bytearray()
         self._running = False
+        self._native_parser = None
+        if _decode_cffi is not None:
+            try:
+                if _decode_cffi.has_beast_parser():
+                    self._native_parser = _decode_cffi.BeastParser()
+            except Exception:
+                log.debug("BeastClient: native parser unavailable", exc_info=True)
 
     async def run(self) -> None:
         self._running = True
@@ -61,18 +73,30 @@ class BeastClient:
                 chunk = await asyncio.wait_for(reader.read(4096), timeout=30)
                 if not chunk:
                     raise ConnectionError("Remote closed the connection")
-                self._buf.extend(chunk)
-                if len(self._buf) > 65536:
-                    # Buffer overflow — likely connected to a non-Beast endpoint or
-                    # a pathological stream. Reconnect rather than exhaust memory.
-                    raise ConnectionError("Beast buffer exceeded 64 KB — reconnecting")
-                self._parse_frames()
+                if self._native_parser is not None:
+                    self._parse_frames_native(chunk)
+                else:
+                    self._buf.extend(chunk)
+                    if len(self._buf) > 65536:
+                        # Buffer overflow — likely connected to a non-Beast endpoint or
+                        # a pathological stream. Reconnect rather than exhaust memory.
+                        raise ConnectionError("Beast buffer exceeded 64 KB — reconnecting")
+                    self._parse_frames()
         finally:
             writer.close()
             try:
                 await writer.wait_closed()
             except Exception:
                 pass
+
+    def _parse_frames_native(self, chunk: bytes) -> None:
+        global malformed_bytes
+        frames, malformed = self._native_parser.parse_chunk(chunk)
+        malformed_bytes += malformed
+        for frame in frames:
+            if frame["type"] == 0x31:
+                continue
+            self._dispatch_frame(frame)
 
     def _parse_frames(self) -> None:
         global malformed_bytes
@@ -152,12 +176,15 @@ class BeastClient:
         timestamp = int.from_bytes(data[:6], "big")
         signal = data[6]
         msg_hex = data[7:].hex().upper()
+        self._dispatch_frame({
+            "raw": msg_hex,
+            "timestamp": timestamp,
+            "signal": signal,
+            "type": msg_type,
+        })
+
+    def _dispatch_frame(self, frame: dict) -> None:
         try:
-            self._on_message({
-                "raw": msg_hex,
-                "timestamp": timestamp,
-                "signal": signal,
-                "type": msg_type,
-            })
+            self._on_message(frame)
         except Exception as exc:
             log.error("Error in Beast message handler: %s", exc)

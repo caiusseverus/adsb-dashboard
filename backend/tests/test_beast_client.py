@@ -159,3 +159,24 @@ class TestParseFrames:
         frame = _build_frame(0x31, ts, 0x20, bytes(2))
         self._feed(frame)
         assert len(self.messages) == 0
+
+    def test_native_parser_matches_python_parser(self):
+        ts1 = b"\x00\x00\x00\x00\x00\x01"
+        ts2 = b"\x00\x00\x00\x00\x00\x02"
+        payload1 = bytes([0x1A] + [0x00] * 6)
+        payload2 = bytes(range(14))
+        stream = _build_frame(0x32, ts1, 0x11, payload1) + _build_frame(0x33, ts2, 0x22, payload2)
+
+        py_messages = []
+        py_client = make_client(py_messages)
+        py_client._native_parser = None
+        py_client._buf.extend(stream)
+        py_client._parse_frames()
+
+        native_messages = []
+        native_client = make_client(native_messages)
+        if native_client._native_parser is None:
+            return
+        native_client._parse_frames_native(bytes(stream))
+
+        assert native_messages == py_messages

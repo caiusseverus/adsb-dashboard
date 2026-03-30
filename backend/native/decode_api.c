@@ -15,6 +15,47 @@
 
 #include <string.h>
 
+static int beast_msg_len(uint8_t msg_type) {
+    switch (msg_type) {
+        case 0x31: return 2;
+        case 0x32: return 7;
+        case 0x33: return 14;
+        default:   return -1;
+    }
+}
+
+static int beast_unescape_frame(const uint8_t *buf, uint32_t buf_len, uint32_t start,
+                                int needed, beast_frame_t *frame, uint32_t *end_pos) {
+    uint32_t pos = start;
+    int out = 0;
+    while (out < needed) {
+        uint8_t b;
+        if (pos >= buf_len) return 0; /* need more data */
+        b = buf[pos];
+        if (b == 0x1A) {
+            if ((pos + 1) >= buf_len) return 0; /* partial escape pair */
+            if (buf[pos + 1] != 0x1A) return -1; /* framing error */
+            b = 0x1A;
+            pos += 2;
+        } else {
+            pos += 1;
+        }
+
+        if (out < 6) {
+            frame->timestamp = (frame->timestamp << 8) | b;
+        } else if (out == 6) {
+            frame->signal = b;
+        } else {
+            frame->payload[out - 7] = b;
+        }
+        out += 1;
+    }
+
+    frame->msg_len = (uint8_t)(needed - 7);
+    *end_pos = pos;
+    return 1;
+}
+
 /* ── Global Modes stub ──────────────────────────────────────────────────── */
 
 /*
@@ -175,6 +216,83 @@ int decode_message(const uint8_t *msg_bytes, int msg_len,
     }
 
     return 0;
+}
+
+void beast_parser_init(beast_parser_t *parser) {
+    if (!parser) return;
+    memset(parser, 0, sizeof(*parser));
+}
+
+int beast_parse_chunk(beast_parser_t *parser,
+                      const uint8_t *chunk, uint32_t chunk_len,
+                      beast_frame_t *out_frames, int max_frames,
+                      uint32_t *malformed_bytes)
+{
+    uint32_t malformed = 0;
+    uint32_t pos = 0;
+    int out_count = 0;
+
+    if (!parser || !out_frames || max_frames <= 0) return 0;
+
+    if (chunk && chunk_len) {
+        if ((uint64_t)parser->len + (uint64_t)chunk_len > sizeof(parser->data)) {
+            parser->len = 0; /* overflow: drop buffered data and resync fresh */
+        }
+        if ((uint64_t)parser->len + (uint64_t)chunk_len <= sizeof(parser->data)) {
+            memcpy(parser->data + parser->len, chunk, chunk_len);
+            parser->len += chunk_len;
+        } else {
+            malformed += chunk_len;
+        }
+    }
+
+    while ((pos + 2) <= parser->len && out_count < max_frames) {
+        uint32_t end_pos = 0;
+        int needed;
+        uint8_t msg_type;
+        beast_frame_t frame;
+
+        if (parser->data[pos] != 0x1A) {
+            uint32_t idx = pos + 1;
+            while (idx < parser->len && parser->data[idx] != 0x1A) idx++;
+            malformed += idx - pos;
+            pos = idx;
+            continue;
+        }
+
+        msg_type = parser->data[pos + 1];
+        needed = beast_msg_len(msg_type);
+        if (needed < 0) {
+            malformed += 1;
+            pos += 1;
+            continue;
+        }
+
+        memset(&frame, 0, sizeof(frame));
+        frame.msg_type = msg_type;
+        switch (beast_unescape_frame(parser->data, parser->len, pos + 2, 7 + needed, &frame, &end_pos)) {
+            case 0:
+                goto done;
+            case -1:
+                malformed += 1;
+                pos += 1;
+                continue;
+            default:
+                out_frames[out_count++] = frame;
+                pos = end_pos;
+                continue;
+        }
+    }
+
+done:
+    if (pos > 0) {
+        if (pos < parser->len) {
+            memmove(parser->data, parser->data + pos, parser->len - pos);
+        }
+        parser->len -= pos;
+    }
+    if (malformed_bytes) *malformed_bytes = malformed;
+    return out_count;
 }
 
 int solve_cpr_airborne(int even_cprlat, int even_cprlon,

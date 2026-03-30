@@ -75,6 +75,19 @@ typedef struct {
     int      emergency;       /* emergency_t cast to int */
 } decode_result_t;
 
+typedef struct {
+    uint8_t  msg_type;        /* Beast frame type: 0x31/0x32/0x33 */
+    uint64_t timestamp;       /* 48-bit Beast timestamp */
+    uint8_t  signal;          /* Beast RSSI byte */
+    uint8_t  msg_len;         /* 2, 7, or 14 payload bytes */
+    uint8_t  payload[14];     /* unescaped payload bytes */
+} beast_frame_t;
+
+typedef struct {
+    uint8_t  data[65536];
+    uint32_t len;
+} beast_parser_t;
+
 /* ── API ────────────────────────────────────────────────────────────────── */
 
 /* Call once at process start.  Thread-safe after initialisation. */
@@ -116,3 +129,22 @@ void decode_cleanup(void);
 int decode_message(const uint8_t *msg_bytes, int msg_len,
                    uint8_t signal, uint64_t timestamp,
                    decode_result_t *result);
+
+/* Stateful Beast stream parser.
+ *
+ * parser      : persistent parser state (zero-init once, then reuse)
+ * chunk       : newly-read TCP bytes
+ * chunk_len   : number of bytes in chunk
+ * out_frames  : destination array for parsed frames
+ * max_frames  : capacity of out_frames
+ * malformed_bytes : optional output; incremented by bytes discarded during resync
+ *
+ * Appends chunk bytes to the parser buffer, extracts up to max_frames complete
+ * frames, compacts any remainder in-place, and returns the number of frames
+ * written to out_frames. Mode-A/C frames are included; caller may skip them.
+ */
+void beast_parser_init(beast_parser_t *parser);
+int  beast_parse_chunk(beast_parser_t *parser,
+                       const uint8_t *chunk, uint32_t chunk_len,
+                       beast_frame_t *out_frames, int max_frames,
+                       uint32_t *malformed_bytes);
