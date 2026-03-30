@@ -464,10 +464,11 @@ def render_display_image(aircraft: dict) -> bytes:
         draw.text((PAD, y), trunc(type_name, f_type_sm, max_w), font=f_type_sm, fill=TEXT)
         y += 32
 
-    # Line 2: operator — no pill, plain text below reg/type
+    # Line 2: operator — leave a little extra breathing room below reg/type
+    # so descenders and long names do not visually touch on the cast card.
     if operator:
         op_text = trunc(operator, f_op, max_w)
-        draw.text((PAD, y), op_text, font=f_op, fill=TEXT)
+        draw.text((PAD, y + 6), op_text, font=f_op, fill=TEXT)
         y += 40
 
     # Sightings count — top right corner

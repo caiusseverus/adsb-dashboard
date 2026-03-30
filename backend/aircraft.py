@@ -157,6 +157,7 @@ async def aircraft_detail(icao: str) -> dict:
             "lat":               live.get("lat"),
             "lon":               live.get("lon"),
             "range_nm":          live.get("range_nm"),
+            "bearing_deg":       live.get("bearing_deg"),
             "airspeed_kts":      live.get("airspeed_kts"),
             "airspeed_type":     live.get("airspeed_type"),
             "heading_deg":       live.get("heading_deg"),
