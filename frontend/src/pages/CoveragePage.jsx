@@ -174,8 +174,9 @@ function buildPoints(points, colorMode, altScale, curveMode) {
   geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
   geo.setAttribute('color',    new THREE.BufferAttribute(colors,    3))
 
+  const pointSize = n < 500 ? 4 : n < 3000 ? 2.5 : 1.5
   return new THREE.Points(geo, new THREE.PointsMaterial({
-    size:            1.5,
+    size:            pointSize,
     vertexColors:    true,
     sizeAttenuation: false,
     transparent:     true,
