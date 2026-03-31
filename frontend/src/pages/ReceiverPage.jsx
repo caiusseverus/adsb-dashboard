@@ -9,14 +9,12 @@ import styles from './ReceiverPage.module.css'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 
-// Beast/readsb signal byte: 0=strongest, 255=weakest
-// readsb dBFS = 10 * log10((255 - raw) / 255)
+// Beast RSSI byte: 0=strongest (0 dBFS), 255=weakest (-127.5 dBFS)
+// airspy_adsb encodes as raw = -2 * dBFS, so dBFS = -(raw / 2)
 function rawToDbfs(raw) {
   if (raw == null) return null
   const clamped = Math.max(0, Math.min(255, Number(raw)))
-  const signalLevel = (255 - clamped) / 255
-  if (signalLevel <= 0) return -80.0
-  return Math.round(Math.log10(signalLevel) * 100) / 10
+  return Math.round(-clamped / 2 * 10) / 10
 }
 function fmtDbfs(raw) {
   const v = rawToDbfs(raw)

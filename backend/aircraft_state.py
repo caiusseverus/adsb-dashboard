@@ -2492,12 +2492,11 @@ class AircraftState:
                 ac.alt_reliable = _ALT_RELIABLE_PUBLISH
                 ac.last_alt_ts = now
 
-            # Signal: readsb rssi is dBFS, so convert it back to the Beast/readsb
-            # raw byte convention used elsewhere in the app: 0 = strongest.
+            # Signal: readsb rssi is dBFS; convert to Beast raw byte convention
+            # (raw = -2 * dBFS, 0=strongest) used throughout the app.
             rssi = ac_data.get("rssi")
             if rssi is not None:
-                signal_level = max(0.0, min(1.0, math.pow(10.0, float(rssi) / 10.0)))
-                ac.signal = max(0, min(255, int(round(255.0 - signal_level * 255.0))))
+                ac.signal = max(0, min(255, int(round(-2.0 * float(rssi)))))
                 self._cur_min_signals.append(ac.signal)
 
             # Per-aircraft message delta (readsb gives cumulative from its start)

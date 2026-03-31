@@ -21,19 +21,15 @@ log = logging.getLogger(__name__)
 
 
 def _raw_signal_to_dbfs(raw: float | int | None) -> float | None:
-    """Convert a Beast/readsb signal byte to the dBFS value shown by readsb.
+    """Convert a Beast RSSI byte to dBFS.
 
-    Stored signal values use the Beast convention: 0 = strongest, 255 = weakest.
-    readsb reports 10 * log10((255 - signal) / 255). Clamp the zero-power edge
-    to -80 dBFS so the value remains usable in charts and JSON responses.
+    Beast convention: 0 = strongest (0 dBFS), 255 = weakest (-127.5 dBFS).
+    airspy_adsb encodes as raw = -2 * dBFS, so dBFS = -(raw / 2).
     """
     if raw is None:
         return None
     raw = max(0.0, min(255.0, float(raw)))
-    signal_level = (255.0 - raw) / 255.0
-    if signal_level <= 0.0:
-        return -80.0
-    return round(10.0 * math.log10(signal_level), 1)
+    return round(-(raw / 2.0), 1)
 
 
 def _raw_signal_to_dbfs_bucket(raw: float | int | None) -> int | None:
