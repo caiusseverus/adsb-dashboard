@@ -38,6 +38,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import ssl
 import urllib.request
 from collections import OrderedDict
 from typing import Optional
@@ -279,6 +280,14 @@ _HEXDB_LRU_MAX = 5000
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Single SSL context shared across all outbound HTTPS requests.
+# urllib.request.urlopen() creates a fresh SSLContext (and calls load_default_certs)
+# on every invocation when no context is supplied — measurably expensive under
+# concurrent enrichment.  Creating it once here amortises that cost for the
+# lifetime of the process.
+_SSL_CTX = ssl.create_default_context()
+
+
 def _fetch(url: str, timeout: int = 15, _attempts: int = 3) -> bytes:
     """Fetch URL with retries and exponential backoff (1 s, 2 s).
     Default timeout reduced to 15 s — 30 s stalled startup enrichment too long on slow links."""
@@ -286,7 +295,7 @@ def _fetch(url: str, timeout: int = 15, _attempts: int = 3) -> bytes:
     last_exc: Exception = RuntimeError("no attempts made")
     for attempt in range(_attempts):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
                 return resp.read()
         except Exception as exc:
             last_exc = exc
