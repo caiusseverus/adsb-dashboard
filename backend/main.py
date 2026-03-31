@@ -183,6 +183,8 @@ async def _mlat_runner(name: str, host: str, port: int) -> None:
 
 
 async def _db_update_checker() -> None:
+    await asyncio.sleep(10)
+    await asyncio.to_thread(enrichment.db.check_for_updates)
     while True:
         await asyncio.sleep(86400)
         await asyncio.to_thread(enrichment.db.check_for_updates)
@@ -231,54 +233,128 @@ async def _adsbx_task() -> None:
 
 
 async def _hexdb_task() -> None:
-    """Process hexdb.io fallback lookups at a polite rate (1 req/sec).
-    Checks the queue every 5 seconds; new aircraft are enriched within ~5s of first contact."""
+    """Process deferred live enrichment in order: ADSBx, tar1090, then hexdb for gaps."""
     await asyncio.sleep(5)  # brief startup delay
     while True:
         batch = state.pop_hexdb_queue(max_n=10)
+        batch.update(enrichment.db.pop_tar1090_pending(max_n=10))
         for icao in batch:
-            data = await asyncio.to_thread(enrichment.db.lookup_hexdb, icao)
-            data_source = "hexdb"
-            if not data:
-                # tar1090-db shard as final fallback (downloads shard on first access)
-                data = await asyncio.to_thread(enrichment.db.get_tar1090, icao)
-                data_source = "tar1090"
-            if data:
-                state.apply_hexdb(icao, data)
-                # Also persist enrichment to DB so offline (historical) aircraft get updated.
-                # Mirrors the field resolution in _apply_hexdb_data().
-                registration  = (data.get("Registration")   or "").strip() or None
-                type_code     = (data.get("ICAOTypeCode")   or "").strip() or None
-                type_category = None
-                if type_code:
-                    ti = enrichment.db.get_type_info(type_code)
-                    if ti:
-                        type_category = ti.get("desc") or None
-                manufacturer = (data.get("Manufacturer") or "").strip() or None
-                # Operator: prefer OperatorFlagCode lookup, fall back to RegisteredOwners
-                operator = None
-                flag_code = (data.get("OperatorFlagCode") or "").strip()
+            cache = {
+                "adsbx": enrichment.db.get_adsbx_cached(icao) is not None,
+                "tar1090": enrichment.db.get_tar1090_cached(icao) is not None,
+                "hexdb": enrichment.db.get_hexdb_cached(icao) is not None,
+            }
+            adsbx = await asyncio.to_thread(enrichment.db.get_adsbx, icao)
+            tar1090 = await asyncio.to_thread(enrichment.db.get_tar1090, icao)
+
+            def _pick(*values):
+                for value in values:
+                    text = (value or "").strip() if isinstance(value, str) else value
+                    if text:
+                        return text
+                return None
+
+            registration = _pick(
+                adsbx.get("reg") if adsbx else None,
+                tar1090.get("Registration") if tar1090 else None,
+            )
+            type_code = _pick(
+                adsbx.get("icaotype") if adsbx else None,
+                tar1090.get("ICAOTypeCode") if tar1090 else None,
+            )
+            operator = _pick(
+                adsbx.get("ownop") if adsbx else None,
+                tar1090.get("RegisteredOwners") if tar1090 else None,
+            )
+            manufacturer = _pick(
+                adsbx.get("manufacturer") if adsbx else None,
+                tar1090.get("Manufacturer") if tar1090 else None,
+            )
+
+            hexdb = None
+            if not registration or not type_code or not operator or not manufacturer:
+                hexdb = await asyncio.to_thread(enrichment.db.lookup_hexdb, icao)
+
+            if tar1090:
+                state.apply_hexdb(icao, tar1090)
+            if hexdb:
+                state.apply_hexdb(icao, hexdb)
+
+            # Also persist enrichment to DB so offline (historical) aircraft get updated.
+            registration = _pick(registration, hexdb.get("Registration") if hexdb else None)
+            type_code = _pick(type_code, hexdb.get("ICAOTypeCode") if hexdb else None)
+            manufacturer = _pick(
+                manufacturer,
+                hexdb.get("Manufacturer") if hexdb else None,
+            )
+            type_category = None
+            if type_code:
+                ti = enrichment.db.get_type_info(type_code)
+                if ti:
+                    type_category = ti.get("desc") or None
+
+            if not operator and hexdb:
+                flag_code = (hexdb.get("OperatorFlagCode") or "").strip()
                 if flag_code:
                     op = enrichment.db.get_operator(flag_code)
                     if op:
                         operator = op.get("n")
                 if not operator:
-                    operator = (data.get("RegisteredOwners") or "").strip() or None
-                if config.DEBUG_ENRICHMENT == 1:
-                    log.info(
-                        "[enrich] %-8s  %-8s  reg=%-9s type=%-6s op=%s",
-                        icao, data_source,
-                        registration or "—",
-                        type_code or "—",
-                        repr(operator) if operator else "—",
-                    )
+                    operator = (hexdb.get("RegisteredOwners") or "").strip() or None
+
+            pending = not all([registration, type_code, operator, manufacturer])
+            resolved_sources = {
+                "registration": (
+                    "adsbx" if adsbx and registration == _pick(adsbx.get("reg")) else
+                    "tar1090" if tar1090 and registration == _pick(tar1090.get("Registration")) else
+                    "hexdb" if hexdb and registration == _pick(hexdb.get("Registration")) else "—"
+                ),
+                "type_code": (
+                    "adsbx" if adsbx and type_code == _pick(adsbx.get("icaotype")) else
+                    "tar1090" if tar1090 and type_code == _pick(tar1090.get("ICAOTypeCode")) else
+                    "hexdb" if hexdb and type_code == _pick(hexdb.get("ICAOTypeCode")) else "—"
+                ),
+                "operator": (
+                    "adsbx" if adsbx and operator == _pick(adsbx.get("ownop")) else
+                    "tar1090" if tar1090 and operator == _pick(tar1090.get("RegisteredOwners")) else
+                    "hexdb" if hexdb and operator == _pick(hexdb.get("RegisteredOwners")) else
+                    "hexdb_flag" if hexdb and operator else "—"
+                ),
+                "manufacturer": (
+                    "adsbx" if adsbx and manufacturer == _pick(adsbx.get("manufacturer")) else
+                    "tar1090" if tar1090 and manufacturer == _pick(tar1090.get("Manufacturer")) else
+                    "hexdb" if hexdb and manufacturer == _pick(hexdb.get("Manufacturer")) else "—"
+                ),
+                "year": (
+                    "adsbx" if adsbx and _pick(adsbx.get("year")) else "—"
+                ),
+                "military": "adsbx" if adsbx else "—",
+            }
+            enrichment.log_enrichment_trace(
+                icao,
+                "live:queued",
+                cache=cache,
+                adsbx=adsbx,
+                tar1090=tar1090,
+                hexdb=hexdb,
+                final={
+                    "registration": registration,
+                    "type_code": type_code,
+                    "operator": operator,
+                    "manufacturer": manufacturer,
+                    "year": _pick(adsbx.get("year") if adsbx else None),
+                    "military": "Y" if bool(adsbx and adsbx.get("mil")) else "N",
+                    "type_category": type_category,
+                },
+                resolved_sources=resolved_sources,
+                pending=pending,
+            )
+
+            if registration or type_code or operator or manufacturer:
                 await asyncio.to_thread(
                     stats_db.update_aircraft_enrichment,
                     icao, registration, type_code, type_category, operator, manufacturer,
                 )
-            else:
-                if config.DEBUG_ENRICHMENT == 1:
-                    log.info("[enrich] %-8s  miss", icao)
             await asyncio.sleep(1)  # 1 req/sec rate limit
         await asyncio.sleep(5)
 

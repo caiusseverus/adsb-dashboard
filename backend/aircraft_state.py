@@ -757,18 +757,38 @@ def _record_mlat_fix(ac: "Aircraft", source: str, lat: float, lon: float, now: f
 
 
 def _log_enrichment(icao: str, ac, adsbx: dict | None, op_source: str) -> None:
-    log.info(
-        "[enrich] %-8s  NEW     adsbx=%-4s  reg=%-9s type=%-6s year=%-4s  "
-        "op=%-30s [%s]  country=%-4s  mil=%s",
+    pending = op_source == "queued"
+    reg_source = "adsbx" if adsbx and (adsbx.get("reg") or "").strip() and ac.registration == (adsbx.get("reg") or "").strip() else "—"
+    type_source = "adsbx" if adsbx and (adsbx.get("icaotype") or "").strip() and ac.type_code == (adsbx.get("icaotype") or "").strip() else "—"
+    mfr_source = "adsbx" if adsbx and (adsbx.get("manufacturer") or "").strip() and ac.manufacturer == (adsbx.get("manufacturer") or "").strip() else "—"
+    year_source = "adsbx" if adsbx and (adsbx.get("year") or "").strip() and ac.year == (adsbx.get("year") or "").strip() else "—"
+    enrichment.log_enrichment_trace(
         icao,
-        "hit" if adsbx else "miss",
-        ac.registration or "—",
-        ac.type_code or "—",
-        ac.year or "—",
-        repr(ac.operator) if ac.operator else "—",
-        op_source,
-        ac.country or "—",
-        "Y" if ac.military else "N",
+        "live:new",
+        cache={
+            "adsbx": enrichment.db.get_adsbx_cached(icao) is not None,
+            "tar1090": enrichment.db.get_tar1090_cached(icao) is not None,
+            "hexdb": enrichment.db.get_hexdb_cached(icao) is not None,
+        },
+        adsbx=adsbx,
+        final={
+            "registration": ac.registration,
+            "type_code": ac.type_code,
+            "operator": ac.operator,
+            "manufacturer": ac.manufacturer,
+            "year": ac.year,
+            "country": ac.country,
+            "military": "Y" if ac.military else "N",
+        },
+        resolved_sources={
+            "registration": reg_source,
+            "type_code": type_source,
+            "operator": op_source,
+            "manufacturer": mfr_source,
+            "year": year_source,
+            "military": "adsbx" if adsbx else "icao_block",
+        },
+        pending=pending,
     )
 
 

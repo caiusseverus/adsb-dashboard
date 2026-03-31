@@ -246,13 +246,13 @@ function extractField(source, sourceKey, field) {
   if (sourceKey === 'hexdb') {
     const map = { country: source.Country, registration: source.Registration,
       type_code: source.ICAOTypeCode, operator: source.RegisteredOwners,
-      manufacturer: null, year: null, military: null }
+      manufacturer: source.Manufacturer, year: source.Year, military: null }
     return map[field] ?? null
   }
   if (sourceKey === 'tar1090') {
     const map = { country: null, registration: source.Registration,
       type_code: source.ICAOTypeCode, operator: source.RegisteredOwners,
-      manufacturer: null, year: null, military: null }
+      manufacturer: source.Manufacturer, year: source.Year, military: null }
     return map[field] ?? null
   }
   if (sourceKey === 'registry') {

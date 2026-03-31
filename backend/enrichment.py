@@ -47,6 +47,8 @@ from typing import Optional
 import config
 
 log = logging.getLogger(__name__)
+if config.DEBUG_ENRICHMENT >= 1:
+    log.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
 # ICAO 24-bit address block → registration country
@@ -259,12 +261,20 @@ _ADSBX_DB    = "enrichment.db"       # SQLite DB replacing in-memory dict
 _ADSBX_MAX_AGE = 7 * 86400           # re-download after 7 days
 
 # tar1090-db supplementary files (operators + type info + per-aircraft shards)
-_DB_BASE_URL   = "https://github.com/wiedehopf/tar1090-db/raw/refs/heads/master/db"
-_OPERATORS_URL = f"{_DB_BASE_URL}/operators.js"
-_TYPES_URL     = f"{_DB_BASE_URL}/icao_aircraft_types.js"
-_TYPES2_URL    = f"{_DB_BASE_URL}/icao_aircraft_types2.js"
+# Use GitHub's raw-content host here. The github.com /raw/... path can return an
+# HTML page to non-browser clients, which breaks shard fetches and silently turns
+# tar1090 enrichment into repeated misses.
+_TAR1090_RAW_BASE_URL = "https://raw.githubusercontent.com/wiedehopf/tar1090-db/master/db"
+_OPERATORS_URL = f"{_TAR1090_RAW_BASE_URL}/operators.js"
+_TYPES_URL     = f"{_TAR1090_RAW_BASE_URL}/icao_aircraft_types.js"
+_TYPES2_URL    = f"{_TAR1090_RAW_BASE_URL}/icao_aircraft_types2.js"
+_FILES_URL     = f"{_TAR1090_RAW_BASE_URL}/files.js"
+_VERSION_URL   = "https://raw.githubusercontent.com/wiedehopf/tar1090-db/refs/heads/master/version"
 _AUX_MAX_AGE        = 30 * 86400     # re-download aux files after 30 days
 _TAR1090_SHARD_AGE  = 30 * 86400     # re-download shard files after 30 days
+_TAR1090_DIRNAME    = "tar1090-db"
+_TAR1090_FILES_NAME = "files.js"
+_TAR1090_VERSION_NAME = "version"
 
 # hexdb.io (on-demand fallback)
 _HEXDB_BASE       = "https://hexdb.io/api/v1/aircraft"
@@ -305,6 +315,13 @@ def _fetch(url: str, timeout: int = 15, _attempts: int = 3) -> bytes:
     raise last_exc
 
 
+def _require_json_like_payload(raw: bytes, source: str) -> None:
+    """Reject obvious HTML/error responses before handing bytes to JSON parsing."""
+    prefix = raw.lstrip()[:64].lower()
+    if prefix.startswith(b"<!doctype html") or prefix.startswith(b"<html"):
+        raise ValueError(f"{source} returned HTML instead of JSON")
+
+
 def _decompress(raw: bytes) -> str:
     return gzip.decompress(raw).decode("utf-8")
 
@@ -313,6 +330,146 @@ def _cache_age(filename: str) -> float:
     """Return seconds since a cache file was last modified, or infinity if absent."""
     path = config.DATA_DIR / filename
     return time.time() - path.stat().st_mtime if path.exists() else float("inf")
+
+
+def _tar1090_dir():
+    path = config.DATA_DIR / _TAR1090_DIRNAME
+    path.mkdir(exist_ok=True)
+    return path
+
+
+def _tar1090_path(filename: str):
+    return _tar1090_dir() / filename
+
+
+def _tar1090_age(filename: str) -> float:
+    path = _tar1090_path(filename)
+    return time.time() - path.stat().st_mtime if path.exists() else float("inf")
+
+
+def _clean(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _source_summary(source: str, data: Optional[dict]) -> dict[str, object]:
+    if not data:
+        return {"hit": False}
+    if source == "adsbx":
+        return {
+            "hit": True,
+            "registration": _clean(data.get("reg")),
+            "type_code": _clean(data.get("icaotype")),
+            "operator": _clean(data.get("ownop")),
+            "manufacturer": _clean(data.get("manufacturer")),
+            "year": _clean(data.get("year")),
+            "military": bool(data.get("mil")),
+        }
+    return {
+        "hit": True,
+        "registration": _clean(data.get("Registration")),
+        "type_code": _clean(data.get("ICAOTypeCode")),
+        "operator": _clean(data.get("RegisteredOwners")),
+        "manufacturer": _clean(data.get("Manufacturer")),
+        "type": _clean(data.get("Type")),
+    }
+
+
+def _fmt_value(value: object) -> str:
+    return str(value) if value not in (None, "", False) else "—"
+
+
+def _fmt_cache(cache: dict[str, bool]) -> str:
+    return " ".join(
+        f"{name}={'yes' if cache.get(name) else 'no'}"
+        for name in ("adsbx", "tar1090", "hexdb")
+    )
+
+
+def _fmt_source(label: str, summary: dict[str, object]) -> str:
+    if not summary.get("hit"):
+        return f"{label} miss"
+    fields = []
+    for key, short in (
+        ("registration", "reg"),
+        ("type_code", "type"),
+        ("operator", "op"),
+        ("manufacturer", "mfr"),
+        ("year", "year"),
+        ("type", "desc"),
+        ("military", "mil"),
+    ):
+        value = summary.get(key)
+        if value not in (None, "", False):
+            fields.append(f"{short}={value}")
+    return f"{label} " + (" ".join(fields) if fields else "hit")
+
+
+def _fmt_final(final: Optional[dict]) -> str:
+    if not final:
+        return "resolved reg=— type=— op=— mfr=— year=— mil=—"
+    return (
+        "resolved "
+        f"reg={_fmt_value(final.get('registration'))} "
+        f"type={_fmt_value(final.get('type_code'))} "
+        f"op={_fmt_value(final.get('operator'))} "
+        f"mfr={_fmt_value(final.get('manufacturer'))} "
+        f"year={_fmt_value(final.get('year'))} "
+        f"mil={_fmt_value(final.get('military'))}"
+    )
+
+
+def _fmt_resolved_with_sources(
+    final: Optional[dict],
+    resolved_sources: Optional[dict[str, str]],
+) -> str:
+    if not final:
+        return _fmt_final(final)
+    def fmt(field: str, short: str) -> str:
+        value = _fmt_value(final.get(field))
+        source = (resolved_sources or {}).get(field, "—")
+        return f"{short}={value}[{source}]"
+    return "resolved " + " ".join([
+        fmt("registration", "reg"),
+        fmt("type_code", "type"),
+        fmt("operator", "op"),
+        fmt("manufacturer", "mfr"),
+        fmt("year", "year"),
+        fmt("military", "mil"),
+    ])
+
+
+def log_enrichment_trace(
+    icao: str,
+    origin: str,
+    *,
+    cache: dict[str, bool],
+    adsbx: Optional[dict] = None,
+    tar1090: Optional[dict] = None,
+    hexdb: Optional[dict] = None,
+    final: Optional[dict] = None,
+    resolved_sources: Optional[dict[str, str]] = None,
+    pending: bool | None = None,
+) -> None:
+    """Emit a structured enrichment trace when DEBUG_ENRICHMENT is enabled."""
+    if config.DEBUG_ENRICHMENT != 1:
+        return
+    adsbx_summary = _source_summary("adsbx", adsbx)
+    tar1090_summary = _source_summary("tar1090", tar1090)
+    hexdb_summary = _source_summary("hexdb", hexdb)
+    log.info(
+        "[enrich] %s %s pending=%s | cache %s | %s | %s | %s | %s",
+        icao,
+        origin,
+        "yes" if pending else "no",
+        _fmt_cache(cache),
+        _fmt_source("adsbx", adsbx_summary),
+        _fmt_source("tar1090", tar1090_summary),
+        _fmt_source("hexdb", hexdb_summary),
+        _fmt_resolved_with_sources(final, resolved_sources),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +486,9 @@ class EnrichmentDB:
         # Per-ICAO LRU caches — bounded so they can't grow unboundedly
         self._adsbx_lru: OrderedDict[str, dict | None] = OrderedDict()
         self._tar1090_lru: OrderedDict[str, dict | None] = OrderedDict()
+        self._tar1090_prefixes: list[str] = []
+        self._tar1090_pending: OrderedDict[str, None] = OrderedDict()
+        self._tar1090_ready: bool = False
         # tar1090-db auxiliary (small, kept in RAM — ~1.5MB total)
         self._operators: dict[str, dict] = {}
         self._type_info: dict[str, dict] = {}
@@ -379,32 +539,27 @@ class EnrichmentDB:
     # ------------------------------------------------------------------
 
     def load_or_download(self) -> None:
-        """Load all enrichment data from cache, downloading anything missing."""
+        """Load startup enrichment data; tar1090 shards are mirrored in the background."""
         self._load_or_init_adsbx_db()
         for fname, url in [
+            (_TAR1090_VERSION_NAME,     _VERSION_URL),
+            (_TAR1090_FILES_NAME,       _FILES_URL),
             ("operators.js",            _OPERATORS_URL),
             ("icao_aircraft_types.js",  _TYPES_URL),
             ("icao_aircraft_types2.js", _TYPES2_URL),
         ]:
-            if (config.DATA_DIR / fname).exists():
+            if _tar1090_path(fname).exists():
                 self._load_aux_file(fname)
             else:
                 self._download_aux(fname, url)
         self._load_hexdb_cache()
 
     def check_for_updates(self) -> None:
-        """Re-download stale files: ADSBExchange after 7 days, aux files after 30 days."""
+        """Refresh stale ADSBx data and maintain the background tar1090 mirror."""
         if _cache_age(_ADSBX_DB) > _ADSBX_MAX_AGE:
             log.info("Enrichment: ADSBExchange DB stale — re-downloading")
             self._download_and_reimport_adsbx()
-        for fname, url in [
-            ("operators.js",            _OPERATORS_URL),
-            ("icao_aircraft_types.js",  _TYPES_URL),
-            ("icao_aircraft_types2.js", _TYPES2_URL),
-        ]:
-            if _cache_age(fname) > _AUX_MAX_AGE:
-                log.info("Enrichment: %s stale — re-downloading", fname)
-                self._download_aux(fname, url)
+        self._refresh_tar1090_mirror()
 
     def get_adsbx(self, icao: str) -> Optional[dict]:
         """Return ADSBExchange record for an ICAO, or None."""
@@ -415,6 +570,11 @@ class EnrichmentDB:
         result = self._adsbx_db_lookup(key)
         self._lru_put(self._adsbx_lru, key, result)
         return result
+
+    def get_adsbx_cached(self, icao: str) -> Optional[dict]:
+        """Return a previously cached ADSBExchange lookup, or None."""
+        found, val = self._lru_get(self._adsbx_lru, icao.upper())
+        return val if found else None  # type: ignore[return-value]
 
     def get_operator(self, prefix: str) -> Optional[dict]:
         """Look up 3-letter ICAO airline designator; returns operator dict or None."""
@@ -461,8 +621,14 @@ class EnrichmentDB:
         found, val = self._lru_get(self._tar1090_lru, key)
         if found:
             return val  # type: ignore[return-value]
-        shard = key[:2].lower()
-        shard_data = self._load_tar1090_shard_data(shard)
+        if not self._tar1090_ready:
+            self._tar1090_pending[key] = None
+            self._tar1090_pending.move_to_end(key)
+            while len(self._tar1090_pending) > _LRU_MAX:
+                self._tar1090_pending.popitem(last=False)
+            return None
+        shard = self._tar1090_shard_for_icao(key)
+        shard_data = self._load_tar1090_shard_data(shard) if shard else None
         result = self._tar1090_lookup(key, shard_data) if shard_data else None
         # Cache the per-ICAO result; shard_data goes out of scope and is GC'd
         self._lru_put(self._tar1090_lru, key, result)
@@ -476,42 +642,43 @@ class EnrichmentDB:
             return None
         reg   = entry[0] if len(entry) > 0 else ""
         tcode = entry[1] if len(entry) > 1 else ""
-        owner = entry[2] if len(entry) > 2 else ""
-        if not any([reg, tcode, owner]):
+        # Current tar1090 shard format is:
+        #   [registration, type_code, owner_code, description]
+        # owner_code is often "00"/"0001"/"10", not a human-readable operator.
+        # Preserve the descriptive aircraft text instead of surfacing the numeric code
+        # as a bogus operator in debug and fallback enrichment.
+        desc  = entry[3] if len(entry) > 3 else ""
+        if not any([reg, tcode, desc]):
             return None
         return {
             "Registration":    reg   or "",
             "ICAOTypeCode":    tcode or "",
-            "RegisteredOwners": owner or "",
+            "Manufacturer":    "",
+            "Type":            desc  or "",
+            "RegisteredOwners": "",
         }
 
     def _load_tar1090_shard_data(self, shard: str) -> Optional[dict]:
-        """Load a tar1090 shard from disk (downloading if absent/stale).
-        Returns the shard dict so the caller can extract what it needs and discard it."""
-        cache_file = f"tar1090_shard_{shard}.json.gz"
-        cache_path = config.DATA_DIR / cache_file
-        if cache_path.exists() and _cache_age(cache_file) < _TAR1090_SHARD_AGE:
-            try:
-                raw = gzip.decompress(cache_path.read_bytes())
-                data = json.loads(raw.decode("utf-8"))
-                log.debug("tar1090 shard %s loaded from disk", shard)
-                return data
-            except Exception as exc:
-                log.warning("tar1090 shard %s unreadable: %s — re-downloading", shard, exc)
-        url = f"{_DB_BASE_URL}/{shard}.js"
+        """Load a tar1090 shard directly from the local mirror."""
+        path = _tar1090_path(shard)
+        if not path.exists():
+            log.debug("tar1090 shard %s missing from mirror", shard)
+            return None
         try:
-            raw = _fetch(url, timeout=15)
+            raw = path.read_bytes()
             text = _decompress(raw)
             data = json.loads(text)
-            log.debug("tar1090 shard %s downloaded (%d entries)", shard, len(data))
-            try:
-                cache_path.write_bytes(gzip.compress(json.dumps(data).encode("utf-8")))
-            except Exception as exc:
-                log.warning("tar1090 shard %s cache write failed: %s", shard, exc)
+            log.debug("tar1090 shard %s loaded from mirror (%d entries)", shard, len(data))
             return data
         except Exception as exc:
-            log.debug("tar1090 shard %s not available: %s", shard, exc)
+            log.warning("tar1090 shard %s unreadable in mirror: %s", shard, exc)
             return None
+
+    def pop_tar1090_pending(self, max_n: int = 20) -> list[str]:
+        batch = list(self._tar1090_pending.keys())[:max_n]
+        for icao in batch:
+            self._tar1090_pending.pop(icao, None)
+        return batch
 
     def lookup_hexdb(self, icao: str) -> Optional[dict]:
         """
@@ -769,9 +936,13 @@ class EnrichmentDB:
     # ------------------------------------------------------------------
 
     def _load_aux_file(self, fname: str) -> None:
-        raw = (config.DATA_DIR / fname).read_bytes()
+        raw = _tar1090_path(fname).read_bytes()
+        if fname == _TAR1090_VERSION_NAME:
+            return
         text = _decompress(raw)
-        if fname == "operators.js":
+        if fname == _TAR1090_FILES_NAME:
+            self._parse_files(text)
+        elif fname == "operators.js":
             self._parse_operators(text)
         elif fname == "icao_aircraft_types.js":
             self._parse_types(text)
@@ -782,11 +953,83 @@ class EnrichmentDB:
         log.info("Enrichment: downloading %s", url)
         try:
             raw = _fetch(url)
-            (config.DATA_DIR / fname).write_bytes(raw)
+            _require_json_like_payload(raw, url)
+            _tar1090_path(fname).write_bytes(raw)
             self._load_aux_file(fname)
             log.info("Enrichment: %s downloaded (%d bytes)", fname, len(raw))
         except Exception as exc:
             log.error("Enrichment: failed to download %s: %s", fname, exc)
+
+    def _refresh_tar1090_mirror(self) -> None:
+        """Keep a local mirror of tar1090 shard files up to date in the background."""
+        tar_dir = _tar1090_dir()
+        version_path = tar_dir / _TAR1090_VERSION_NAME
+        remote_version = None
+        try:
+            remote_version = _fetch(_VERSION_URL, timeout=15).decode("utf-8").strip()
+        except Exception as exc:
+            log.warning("Enrichment: failed to refresh tar1090 version: %s", exc)
+            return
+        local_version = version_path.read_text().strip() if version_path.exists() else ""
+        if remote_version == local_version and self._tar1090_ready:
+            return
+
+        files_path = tar_dir / _TAR1090_FILES_NAME
+        try:
+            raw = _fetch(_FILES_URL, timeout=15)
+            _require_json_like_payload(raw, _FILES_URL)
+            files_path.write_bytes(raw)
+            self._load_aux_file(_TAR1090_FILES_NAME)
+            log.info("Enrichment: tar1090 files manifest refreshed")
+        except Exception as exc:
+            log.warning("Enrichment: failed to refresh tar1090 files manifest: %s", exc)
+            return
+
+        for fname, url in [
+            ("operators.js",            _OPERATORS_URL),
+            ("icao_aircraft_types.js",  _TYPES_URL),
+            ("icao_aircraft_types2.js", _TYPES2_URL),
+        ]:
+            try:
+                raw = _fetch(url, timeout=15)
+                _require_json_like_payload(raw, url)
+                _tar1090_path(fname).write_bytes(raw)
+                self._load_aux_file(fname)
+            except Exception as exc:
+                log.warning("Enrichment: failed to refresh %s: %s", fname, exc)
+                return
+
+        downloaded = 0
+        for prefix in self._tar1090_prefixes:
+            fname = f"{prefix}.js"
+            path = tar_dir / fname
+            url = f"{_TAR1090_RAW_BASE_URL}/{fname}"
+            try:
+                raw = _fetch(url, timeout=15)
+                _require_json_like_payload(raw, url)
+                path.write_bytes(raw)
+                downloaded += 1
+            except Exception as exc:
+                log.warning("Enrichment: failed to mirror tar1090 shard %s: %s", fname, exc)
+        version_path.write_text(remote_version)
+        self._tar1090_ready = True
+        self._tar1090_lru.clear()
+        if downloaded or remote_version != local_version:
+            log.info("Enrichment: tar1090 mirror refreshed (%d shard files, version %s)", downloaded, remote_version)
+
+    def _parse_files(self, text: str) -> None:
+        data = json.loads(text)
+        self._tar1090_prefixes = sorted((str(x).upper() for x in data), key=len, reverse=True)
+        log.info("Enrichment: loaded %d tar1090 shard prefixes", len(self._tar1090_prefixes))
+
+    def _tar1090_shard_for_icao(self, icao: str) -> Optional[str]:
+        if not self._tar1090_prefixes:
+            return None
+        icao = icao.upper()
+        for prefix in self._tar1090_prefixes:
+            if icao.startswith(prefix):
+                return f"{prefix}.js"
+        return None
 
     def _parse_operators(self, text: str) -> None:
         self._operators = json.loads(text)

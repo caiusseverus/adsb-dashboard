@@ -182,12 +182,29 @@ async def benchmark_status() -> dict:
 @router.get("/aircraft/{icao}")
 async def debug_aircraft(icao: str) -> dict:
     icao = icao.upper()
-    adsbx    = enrichment_module.db.get_adsbx(icao)
-    hexdb    = enrichment_module.db.get_hexdb_cached(icao)
-    tar1090  = enrichment_module.db.get_tar1090_cached(icao)
-    country  = enrichment_module.db.get_country_by_icao(icao)
+    adsbx = enrichment_module.db.get_adsbx(icao)
+    country = enrichment_module.db.get_country_by_icao(icao)
     military = enrichment_module.db.is_military(icao)
-    registry = await asyncio.to_thread(stats_db.get_aircraft, icao)
+    cache = {
+        "adsbx": enrichment_module.db.get_adsbx_cached(icao) is not None,
+        "tar1090": enrichment_module.db.get_tar1090_cached(icao) is not None,
+        "hexdb": enrichment_module.db.get_hexdb_cached(icao) is not None,
+    }
+    hexdb, tar1090, registry = await asyncio.gather(
+        asyncio.to_thread(enrichment_module.db.force_lookup_hexdb, icao),
+        asyncio.to_thread(enrichment_module.db.get_tar1090, icao),
+        asyncio.to_thread(stats_db.get_aircraft, icao),
+    )
+    enrichment_module.log_enrichment_trace(
+        icao,
+        "manual_debug",
+        cache=cache,
+        adsbx=adsbx,
+        tar1090=tar1090,
+        hexdb=hexdb,
+        final=dict(registry) if registry else None,
+        pending=False,
+    )
     return {
         "icao":        icao,
         "icao_block":  {"country": country, "military": military},
