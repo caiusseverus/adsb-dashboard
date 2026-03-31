@@ -1866,8 +1866,19 @@ class AircraftState:
         if df in (17, 18) and raw_len == 14:
             if _nd is not None:
                 # Native path: C library decoded all fields.
+                nd_callsign = _nd.get('callsign')
+                nd_baro_alt = _nd.get('baro_alt')
+                nd_cpr_odd = _nd.get('cpr_odd')
+                nd_heading_type = _nd.get('heading_type')
+                nd_heading = _nd.get('heading')
+                nd_ias = _nd.get('ias')
+                nd_tas = _nd.get('tas')
+                nd_mach = _nd.get('mach')
+                nd_baro_rate = _nd.get('baro_rate')
+
                 # Callsign (type codes 1-4)
-                if cs := _nd.get('callsign'):
+                if nd_callsign:
+                    cs = nd_callsign
                     ac.callsign = cs.strip().rstrip('_')
                     if ac.callsign and not ac.operator:
                         op = enrichment.db.get_operator(ac.callsign[:3])
@@ -1877,13 +1888,13 @@ class AircraftState:
                                 ac.country = op.get("c")
 
                 # Altitude (type codes 9-18, 20-22)
-                if (alt := _nd.get('baro_alt')) is not None:
-                    _accept_altitude(ac, alt, source, crc_clean, now)
+                if nd_baro_alt is not None:
+                    _accept_altitude(ac, nd_baro_alt, source, crc_clean, now)
 
                 # CPR position (type codes 9-22)
                 # decode_cffi omits cpr_valid key; presence of cpr_odd signals valid CPR
-                if 'cpr_odd' in _nd:
-                    _cpr_oe = 1 if _nd['cpr_odd'] else 0
+                if nd_cpr_odd is not None:
+                    _cpr_oe = 1 if nd_cpr_odd else 0
                     # Dup detection uses raw hex; pairing stores decoded CPR integers
                     if not _is_cpr_duplicate(ac, raw, _cpr_oe, now):
                         _cpr_lat_int = _nd['cpr_lat']
@@ -2104,35 +2115,38 @@ class AircraftState:
             # EHS decode — C library decodes BDS 4.0/5.0/6.0 in one call;
             # pyModeS fallback uses direct is40/is50/is60 checks.
             if _nd is not None:
+                nd_tas = _nd.get('tas')
+                nd_heading_type = _nd.get('heading_type')
+                nd_heading = _nd.get('heading')
+                nd_ias = _nd.get('ias')
+                nd_mach = _nd.get('mach')
+                nd_baro_rate = _nd.get('baro_rate')
+                nd_nav_altitude_mcp = _nd.get('nav_altitude_mcp')
                 # BDS 4.0: selected altitude
-                if not mlat:
-                    if (sel := _nd.get('nav_altitude_mcp')) is not None:
-                        ac.selected_alt = sel
+                if not mlat and nd_nav_altitude_mcp is not None:
+                    ac.selected_alt = nd_nav_altitude_mcp
 
                 # BDS 5.0: TAS + ground track
-                if (tas := _nd.get('tas')) is not None:
-                    ac.airspeed_kts = tas
+                if nd_tas is not None:
+                    ac.airspeed_kts = nd_tas
                     ac.airspeed_type = "TAS"
                 # heading_type 1 = HEADING_GROUND_TRACK (BDS 5.0 track)
                 # decode_cffi omits heading_valid; presence of heading_type is sufficient
-                if (_nd.get('heading_type') == 1
-                        and (hdg := _nd.get('heading')) is not None):
-                    ac.heading_deg = round(float(hdg), 1)
+                if nd_heading_type == 1 and nd_heading is not None:
+                    ac.heading_deg = round(float(nd_heading), 1)
 
                 # BDS 6.0: IAS + Mach + magnetic heading + baro vertical rate
-                if (ias := _nd.get('ias')) is not None:
-                    ac.airspeed_kts = ias
+                if nd_ias is not None:
+                    ac.airspeed_kts = nd_ias
                     ac.airspeed_type = "IAS"
-                if (mach := _nd.get('mach')) is not None:
-                    ac.mach = round(float(mach), 3)
+                if nd_mach is not None:
+                    ac.mach = round(float(nd_mach), 3)
                 # heading_type 3 = HEADING_MAGNETIC (BDS 6.0 heading)
-                if (_nd.get('heading_type') == 3
-                        and (hdg := _nd.get('heading')) is not None):
-                    ac.heading_deg = round(float(hdg), 1)
-                if not mlat:
-                    if (vr := _nd.get('baro_rate')) is not None:
-                        ac.vertical_rate_fpm = vr
-                        ac._vrate_baro_fpm = vr
+                if nd_heading_type == 3 and nd_heading is not None:
+                    ac.heading_deg = round(float(nd_heading), 1)
+                if not mlat and nd_baro_rate is not None:
+                        ac.vertical_rate_fpm = nd_baro_rate
+                        ac._vrate_baro_fpm = nd_baro_rate
                         ac._vrate_baro_ts  = now
             else:
                 # pyModeS EHS fallback
