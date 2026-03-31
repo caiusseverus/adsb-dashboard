@@ -977,6 +977,7 @@ class AircraftState:
 
         # Unique aircraft seen today (resets at midnight; seeded from DB on startup)
         self._today_date: str = date.today().isoformat()
+        self._today_ordinal: int = date.today().toordinal()
         self._today_icaos: set[str] = set()
         self._today_mil_icaos: set[str] = set()
 
@@ -1839,14 +1840,19 @@ class AircraftState:
             ac.mlat = False
             ac.mlat_source = None
 
-        # Track unique aircraft seen today; reset sets at midnight
-        today = date.today().isoformat()
-        if today != self._today_date:
+        # Track unique aircraft seen today; reset sets at midnight.
+        # Use ordinal day to avoid constructing an ISO date string on every message.
+        today_ordinal = date.today().toordinal()
+        if today_ordinal != self._today_ordinal:
+            self._today_ordinal = today_ordinal
+            self._today_date = date.fromordinal(today_ordinal).isoformat()
             self._today_icaos.clear()
             self._today_mil_icaos.clear()
-            self._today_date = today
-        self._today_icaos.add(icao)
-        if ac.military:
+        if icao not in self._today_icaos:
+            self._today_icaos.add(icao)
+            if ac.military:
+                self._today_mil_icaos.add(icao)
+        elif ac.military and icao not in self._today_mil_icaos:
             self._today_mil_icaos.add(icao)
 
         # Accumulate per-minute signal and DF stats
