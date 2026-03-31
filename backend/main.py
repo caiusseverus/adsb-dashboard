@@ -106,6 +106,21 @@ _msg_drops: int = 0
 # Queue depth sampled once per push cycle (maxlen matches push_timings window)
 _queue_depth_samples: _deque[int] = _deque(maxlen=120)
 
+# Shared snapshot cache — _notify_cast_loop and _broadcast_loop run on the same
+# asyncio thread, so there is no race.  Both loops reuse a snapshot built within
+# the same cycle, avoiding a second get_snapshot() call per second.
+_snapshot_cache: dict | None = None
+_snapshot_cache_ts: float = 0.0
+_snapshot_cache_mode: str = ""
+_SNAPSHOT_CACHE_TTL_S: float = 0.5   # half a cycle — enough to cover both loops
+
+# Unattended trail accumulation — housekeeping records track points at this
+# interval so connecting clients see recent trails even after a no-client period.
+# 10 s = 2× TrackStore.SAMPLE_INTERVAL_S; when clients ARE connected the
+# TrackStore rate limiter makes these calls no-ops, so there is no double work.
+_TRAIL_HOUSEKEEPING_INTERVAL_S: float = 10.0
+_trail_housekeeping_last_ts: float = 0.0
+
 
 def _start_msg_processor() -> threading.Thread:
     """Start the daemon thread that decodes Beast messages from _msg_queue.
@@ -114,6 +129,28 @@ def _start_msg_processor() -> threading.Thread:
     t = threading.Thread(target=_run, daemon=True, name="beast-decoder")
     t.start()
     return t
+
+
+def _get_cycle_snapshot(mode: str = "full") -> dict:
+    """Return a snapshot, reusing the cached one if it was built in this cycle.
+
+    Both async loops run on the same event thread so the cache is never written
+    concurrently.  The TTL is half a push interval — short enough that stale data
+    is never served, long enough to cover both loops landing in the same cycle.
+    """
+    global _snapshot_cache, _snapshot_cache_ts, _snapshot_cache_mode
+    now = time.time()
+    if (
+        _snapshot_cache is not None
+        and _snapshot_cache_mode == mode
+        and now - _snapshot_cache_ts < _SNAPSHOT_CACHE_TTL_S
+    ):
+        return _snapshot_cache
+    snap = state.get_snapshot(mode=mode)
+    _snapshot_cache = snap
+    _snapshot_cache_ts = now
+    _snapshot_cache_mode = mode
+    return snap
 
 
 # ---------------------------------------------------------------------------
@@ -481,11 +518,45 @@ async def _close_expired_visits(expired: list) -> None:
 
 async def _housekeeping_loop() -> None:
     """Keep unattended collection healthy without building broadcast snapshots."""
+    global _trail_housekeeping_last_ts
     while True:
         await asyncio.sleep(config.PUSH_INTERVAL_S)
         try:
             expired = state.expire_aircraft()
             await _close_expired_visits(expired)
+            # Prune tracks for aircraft that have left the live set.  Must run
+            # after expire_aircraft() so the active set reflects post-expiry state.
+            track_store.expire(state.get_icaos())
+
+            # Low-frequency unattended trail accumulation.  Keeps recent trail
+            # history available for clients that connect after a no-client period.
+            # When clients ARE connected, _broadcast_loop records every cycle so
+            # TrackStore's per-aircraft rate limiter makes these calls no-ops.
+            now_ts = time.time()
+            if now_ts - _trail_housekeeping_last_ts >= _TRAIL_HOUSEKEEPING_INTERVAL_S:
+                _trail_housekeeping_last_ts = now_ts
+                _trail_snap = _get_cycle_snapshot("full")
+                for _ac in _trail_snap["aircraft"]:
+                    if (
+                        _ac.get("bearing_deg") is not None
+                        and _ac.get("range_nm") is not None
+                        and _ac.get("lat") is not None
+                        and _ac.get("pos_confident")
+                    ):
+                        track_store.record(
+                            icao=_ac["icao"],
+                            bearing_deg=_ac["bearing_deg"],
+                            range_nm=_ac["range_nm"],
+                            altitude_ft=_ac.get("altitude"),
+                            lat=_ac["lat"],
+                            lon=_ac["lon"],
+                            military=bool(_ac.get("military")),
+                            mlat=bool(_ac.get("mlat")),
+                            interesting=bool(_ac.get("interesting")),
+                            acas_ra_active=bool(_ac.get("acas_ra_active")),
+                            mlat_source=_ac.get("mlat_source"),
+                            now=now_ts,
+                        )
 
             # Sample queue depth (Beast mode only — queue unused in readsb/hybrid).
             if config.INGEST_MODE == "beast":
@@ -508,7 +579,7 @@ async def _notify_cast_loop() -> None:
             if not _notify_enabled and not _cast_on:
                 continue
 
-            snapshot = state.get_snapshot()
+            snapshot = _get_cycle_snapshot("full")
             now = time.time()
 
             # Refresh watchlist cache from DB every 30s
@@ -585,12 +656,11 @@ async def _broadcast_loop() -> None:
             else:
                 _snap_mode = "full"
             t_snap = time.perf_counter()
-            snapshot = state.get_snapshot(mode=_snap_mode)
+            snapshot = _get_cycle_snapshot(_snap_mode)
             snapshot_ms = (time.perf_counter() - t_snap) * 1000
 
             # Record track points (rate-limited to 1/5s per aircraft inside TrackStore)
             now = time.time()
-            active_icaos: set[str] = {ac["icao"] for ac in snapshot["aircraft"]}
             t_loop_start = time.perf_counter()
             for ac in snapshot["aircraft"]:
                 # Only record once the position is confirmed reliable:
@@ -615,8 +685,6 @@ async def _broadcast_loop() -> None:
                         mlat_source=ac.get("mlat_source"),
                         now=now,
                     )
-            # Prune tracks for aircraft that have left the live set
-            track_store.expire(active_icaos)
             t_sync_end = time.perf_counter()
 
             t_ser = time.perf_counter()

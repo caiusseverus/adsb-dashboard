@@ -1195,6 +1195,11 @@ class AircraftState:
                         ac.pos_reliable_even = 0.0
         return expired
 
+    def get_icaos(self) -> set[str]:
+        """Return the current set of tracked ICAO addresses (no snapshot build)."""
+        with self._lock:
+            return set(self._aircraft.keys())
+
     def set_timeout(self, seconds: int) -> None:
         """Update the aircraft expiry timeout (called by memory_guard on pressure changes)."""
         with self._lock:
