@@ -104,6 +104,7 @@ async def add_cast_rule(payload: CastRulePayload):
         payload.max_range_nm,
         payload.max_altitude_ft,
     )
+    cast.reset_rules_cache()
     return {"id": rule_id}
 
 
@@ -119,12 +120,14 @@ async def update_cast_rule(rule_id: int, payload: CastRulePayload):
         payload.max_altitude_ft,
         payload.enabled,
     )
+    cast.reset_rules_cache()
     return {"ok": True}
 
 
 @router.delete("/rules/{rule_id}")
 async def delete_cast_rule(rule_id: int):
     await asyncio.to_thread(stats_db.delete_cast_rule, rule_id)
+    cast.reset_rules_cache()
     return {"ok": True}
 
 

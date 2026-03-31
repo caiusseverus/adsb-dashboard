@@ -16,6 +16,7 @@ Flow:
 import io
 import json
 import logging
+import ssl
 import threading
 import time
 import urllib.request
@@ -169,6 +170,15 @@ _config_cache_ts: float = 0.0
 _CONFIG_TTL = 10.0  # re-read DB at most every 10 s
 _watchlist_cache: set[str] = set()
 _watchlist_cache_ts: float = 0.0
+_rules_cache: list[dict] = []
+_rules_cache_ts: float = 0.0
+_photo_cache: dict[str, tuple[bytes | None, float]] = {}
+_photo_cache_lock = threading.Lock()
+_PHOTO_TTL_S = 3600.0
+_PHOTO_MISS_TTL_S = 300.0
+_ssl_context: ssl.SSLContext | None = None
+_cc_cache: dict[str, object] = {"device_name": None, "cc": None, "ts": 0.0}
+_CC_TTL_S = 300.0
 
 
 def _get_config() -> dict:
@@ -184,8 +194,15 @@ def _get_config() -> dict:
 
 def reset_config_cache() -> None:
     """Force next _get_config() call to re-read from DB. Call after a config save."""
-    global _config_cache_ts
+    global _config_cache_ts, _cc_cache
     _config_cache_ts = 0.0
+    _cc_cache = {"device_name": None, "cc": None, "ts": 0.0}
+
+
+def reset_rules_cache() -> None:
+    """Force next _get_rules() call to re-read from DB."""
+    global _rules_cache_ts
+    _rules_cache_ts = 0.0
 
 
 def _get_watchlist() -> set[str]:
@@ -204,8 +221,21 @@ def _get_watchlist() -> set[str]:
 
 
 def _get_rules() -> list[dict]:
+    global _rules_cache, _rules_cache_ts
+    now = time.time()
+    if now - _rules_cache_ts < _CONFIG_TTL:
+        return _rules_cache
     from db import stats_db
-    return stats_db.get_cast_rules()
+    _rules_cache = stats_db.get_cast_rules()
+    _rules_cache_ts = now
+    return _rules_cache
+
+
+def _get_ssl_context() -> ssl.SSLContext:
+    global _ssl_context
+    if _ssl_context is None:
+        _ssl_context = ssl.create_default_context()
+    return _ssl_context
 
 
 # ---------------------------------------------------------------------------
@@ -330,26 +360,70 @@ def _get_route(icao: str) -> tuple[str | None, str | None, str | None, str | Non
 
 def _fetch_photo(icao: str) -> bytes | None:
     """Fetch thumbnail image bytes from planespotters.net, or None on failure."""
+    icao = icao.upper()
+    now = time.monotonic()
+    with _photo_cache_lock:
+        cached = _photo_cache.get(icao)
+        if cached is not None and now < cached[1]:
+            return cached[0]
     try:
-        api_url = f"https://api.planespotters.net/pub/photos/hex/{icao.upper()}"
+        api_url = f"https://api.planespotters.net/pub/photos/hex/{icao}"
         req = urllib.request.Request(api_url, headers={"User-Agent": "adsb-dashboard/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=8, context=_get_ssl_context()) as resp:
             data = json.loads(resp.read())
         photos = data.get("photos", [])
         if not photos:
+            with _photo_cache_lock:
+                _photo_cache[icao] = (None, now + _PHOTO_MISS_TTL_S)
             return None
         src = (photos[0].get("thumbnail_large") or {}).get("src") or \
               (photos[0].get("thumbnail") or {}).get("src")
         if not src:
+            with _photo_cache_lock:
+                _photo_cache[icao] = (None, now + _PHOTO_MISS_TTL_S)
             return None
         with urllib.request.urlopen(
             urllib.request.Request(src, headers={"User-Agent": "adsb-dashboard/1.0"}),
             timeout=10,
+            context=_get_ssl_context(),
         ) as img_resp:
-            return img_resp.read()
+            photo = img_resp.read()
+        with _photo_cache_lock:
+            _photo_cache[icao] = (photo, now + _PHOTO_TTL_S)
+        return photo
     except Exception as exc:
         log.debug("cast: photo fetch failed for %s: %s", icao, exc)
+        with _photo_cache_lock:
+            _photo_cache[icao] = (None, now + _PHOTO_MISS_TTL_S)
         return None
+
+
+def _get_chromecast(device_name: str):
+    now = time.monotonic()
+    cached_name = _cc_cache.get("device_name")
+    cached_cc = _cc_cache.get("cc")
+    cached_ts = _cc_cache.get("ts", 0.0)
+    if cached_cc is not None and cached_name == device_name and (now - cached_ts) < _CC_TTL_S:
+        return cached_cc
+
+    import pychromecast
+
+    log.info("cast: discovering %r on LAN", device_name)
+    chromecasts, browser = pychromecast.get_listed_chromecasts(
+        friendly_names=[device_name], timeout=10
+    )
+    if not chromecasts:
+        pychromecast.discovery.stop_discovery(browser)
+        log.warning("cast: device %r not found on LAN", device_name)
+        return None
+
+    cc = chromecasts[0]
+    cc.wait()
+    pychromecast.discovery.stop_discovery(browser)
+    _cc_cache["device_name"] = device_name
+    _cc_cache["cc"] = cc
+    _cc_cache["ts"] = now
+    return cc
 
 
 def render_display_image(aircraft: dict) -> bytes:
@@ -557,20 +631,9 @@ def _cast(lan_url: str, device_name: str, display_seconds: int,
         return
 
     display_url = f"{lan_url.rstrip('/')}/api/cast/display/{token}"
-    log.info("cast: discovering %r on LAN", device_name)
-
-    chromecasts, browser = pychromecast.get_listed_chromecasts(
-        friendly_names=[device_name], timeout=10
-    )
-
-    if not chromecasts:
-        pychromecast.discovery.stop_discovery(browser)
-        log.warning("cast: device %r not found on LAN", device_name)
+    cc = _get_chromecast(device_name)
+    if cc is None:
         return
-
-    cc = chromecasts[0]
-    cc.wait()  # resolve service info — zeroconf must still be running
-    pychromecast.discovery.stop_discovery(browser)
 
     mc = cc.media_controller
     log.info("cast: sending to %r — %s", device_name, display_url)
@@ -598,7 +661,13 @@ def _cast(lan_url: str, device_name: str, display_seconds: int,
             log.info("cast: %s left snapshot after %ds — ending display", icao, elapsed)
             break
 
-    cc.quit_app()
+    try:
+        cc.quit_app()
+    except Exception:
+        # If the cached cast handle is stale, force rediscovery next time.
+        _cc_cache["cc"] = None
+        _cc_cache["ts"] = 0.0
+        raise
     log.info("cast: display ended for %s after %ds", icao, elapsed)
 
 
