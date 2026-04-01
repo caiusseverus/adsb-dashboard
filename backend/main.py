@@ -184,7 +184,12 @@ async def _mlat_runner(name: str, host: str, port: int) -> None:
 
 async def _db_update_checker() -> None:
     await asyncio.sleep(10)
-    await asyncio.to_thread(enrichment.db.check_for_updates)
+    mirror_completed = await asyncio.to_thread(enrichment.db.check_for_updates)
+    if mirror_completed:
+        # Cold-start: tar1090 mirror just finished.  Re-enqueue every live aircraft
+        # so _hexdb_task gives them a tar1090 lookup now that the shards are on disk.
+        state.seed_hexdb_queue(list(state.get_icaos()))
+        log.info("tar1090 mirror cold-start complete — re-enqueued %d aircraft", len(state.get_icaos()))
     while True:
         await asyncio.sleep(86400)
         await asyncio.to_thread(enrichment.db.check_for_updates)
@@ -232,129 +237,124 @@ async def _adsbx_task() -> None:
         await asyncio.sleep(0.5)
 
 
+def _pick_first(*values) -> str | None:
+    """Return the first non-empty string value; strips whitespace from str values."""
+    for value in values:
+        text = (value or "").strip() if isinstance(value, str) else value
+        if text:
+            return text
+    return None
+
+
+async def _enrich_live_icao(icao: str) -> None:
+    """Fetch enrichment for one queued ICAO (adsbx → tar1090 → hexdb) and apply it."""
+    cache = {
+        "adsbx":   enrichment.db.get_adsbx_cached(icao) is not None,
+        "tar1090": enrichment.db.get_tar1090_cached(icao) is not None,
+        "hexdb":   enrichment.db.get_hexdb_cached(icao) is not None,
+    }
+    adsbx   = await asyncio.to_thread(enrichment.db.get_adsbx, icao)
+    tar1090 = await asyncio.to_thread(enrichment.db.get_tar1090, icao)
+
+    registration = _pick_first(
+        adsbx.get("reg") if adsbx else None,
+        tar1090.get("Registration") if tar1090 else None,
+    )
+    type_code = _pick_first(
+        adsbx.get("icaotype") if adsbx else None,
+        tar1090.get("ICAOTypeCode") if tar1090 else None,
+    )
+    operator = _pick_first(
+        adsbx.get("ownop") if adsbx else None,
+        tar1090.get("RegisteredOwners") if tar1090 else None,
+    )
+    manufacturer = _pick_first(
+        adsbx.get("manufacturer") if adsbx else None,
+        tar1090.get("Manufacturer") if tar1090 else None,
+    )
+
+    hexdb = None
+    if not registration or not type_code or not operator or not manufacturer:
+        hexdb = await asyncio.to_thread(enrichment.db.lookup_hexdb, icao)
+
+    if tar1090:
+        state.apply_hexdb(icao, tar1090)
+    if hexdb:
+        state.apply_hexdb(icao, hexdb)
+
+    # Re-resolve with hexdb so offline aircraft registry also gets updated.
+    registration  = _pick_first(registration, hexdb.get("Registration") if hexdb else None)
+    type_code     = _pick_first(type_code, hexdb.get("ICAOTypeCode") if hexdb else None)
+    manufacturer  = _pick_first(manufacturer, hexdb.get("Manufacturer") if hexdb else None)
+    type_category = None
+    if type_code:
+        ti = enrichment.db.get_type_info(type_code)
+        if ti:
+            type_category = ti.get("desc") or None
+
+    if not operator and hexdb:
+        flag_code = (hexdb.get("OperatorFlagCode") or "").strip()
+        if flag_code:
+            op = enrichment.db.get_operator(flag_code)
+            if op:
+                operator = op.get("n")
+        if not operator:
+            operator = (hexdb.get("RegisteredOwners") or "").strip() or None
+
+    pending = not all([registration, type_code, operator, manufacturer])
+    resolved_sources = {
+        "registration": (
+            "adsbx" if adsbx and registration == _pick_first(adsbx.get("reg")) else
+            "tar1090" if tar1090 and registration == _pick_first(tar1090.get("Registration")) else
+            "hexdb" if hexdb and registration == _pick_first(hexdb.get("Registration")) else "—"
+        ),
+        "type_code": (
+            "adsbx" if adsbx and type_code == _pick_first(adsbx.get("icaotype")) else
+            "tar1090" if tar1090 and type_code == _pick_first(tar1090.get("ICAOTypeCode")) else
+            "hexdb" if hexdb and type_code == _pick_first(hexdb.get("ICAOTypeCode")) else "—"
+        ),
+        "operator": (
+            "adsbx" if adsbx and operator == _pick_first(adsbx.get("ownop")) else
+            "tar1090" if tar1090 and operator == _pick_first(tar1090.get("RegisteredOwners")) else
+            "hexdb" if hexdb and operator == _pick_first(hexdb.get("RegisteredOwners")) else
+            "hexdb_flag" if hexdb and operator else "—"
+        ),
+        "manufacturer": (
+            "adsbx" if adsbx and manufacturer == _pick_first(adsbx.get("manufacturer")) else
+            "tar1090" if tar1090 and manufacturer == _pick_first(tar1090.get("Manufacturer")) else
+            "hexdb" if hexdb and manufacturer == _pick_first(hexdb.get("Manufacturer")) else "—"
+        ),
+        "year":    "adsbx" if adsbx and _pick_first(adsbx.get("year")) else "—",
+        "military": "adsbx" if adsbx else "—",
+    }
+    enrichment.log_enrichment_trace(
+        icao, "live:queued",
+        cache=cache, adsbx=adsbx, tar1090=tar1090, hexdb=hexdb,
+        final={
+            "registration": registration, "type_code": type_code,
+            "operator": operator, "manufacturer": manufacturer,
+            "year": _pick_first(adsbx.get("year") if adsbx else None),
+            "military": "Y" if bool(adsbx and adsbx.get("mil")) else "N",
+            "type_category": type_category,
+        },
+        resolved_sources=resolved_sources,
+        pending=pending,
+    )
+
+    if registration or type_code or operator or manufacturer:
+        await asyncio.to_thread(
+            stats_db.update_aircraft_enrichment,
+            icao, registration, type_code, type_category, operator, manufacturer,
+        )
+
+
 async def _hexdb_task() -> None:
     """Process deferred live enrichment in order: ADSBx, tar1090, then hexdb for gaps."""
     await asyncio.sleep(5)  # brief startup delay
     while True:
         batch = state.pop_hexdb_queue(max_n=10)
-        batch.update(enrichment.db.pop_tar1090_pending(max_n=10))
         for icao in batch:
-            cache = {
-                "adsbx": enrichment.db.get_adsbx_cached(icao) is not None,
-                "tar1090": enrichment.db.get_tar1090_cached(icao) is not None,
-                "hexdb": enrichment.db.get_hexdb_cached(icao) is not None,
-            }
-            adsbx = await asyncio.to_thread(enrichment.db.get_adsbx, icao)
-            tar1090 = await asyncio.to_thread(enrichment.db.get_tar1090, icao)
-
-            def _pick(*values):
-                for value in values:
-                    text = (value or "").strip() if isinstance(value, str) else value
-                    if text:
-                        return text
-                return None
-
-            registration = _pick(
-                adsbx.get("reg") if adsbx else None,
-                tar1090.get("Registration") if tar1090 else None,
-            )
-            type_code = _pick(
-                adsbx.get("icaotype") if adsbx else None,
-                tar1090.get("ICAOTypeCode") if tar1090 else None,
-            )
-            operator = _pick(
-                adsbx.get("ownop") if adsbx else None,
-                tar1090.get("RegisteredOwners") if tar1090 else None,
-            )
-            manufacturer = _pick(
-                adsbx.get("manufacturer") if adsbx else None,
-                tar1090.get("Manufacturer") if tar1090 else None,
-            )
-
-            hexdb = None
-            if not registration or not type_code or not operator or not manufacturer:
-                hexdb = await asyncio.to_thread(enrichment.db.lookup_hexdb, icao)
-
-            if tar1090:
-                state.apply_hexdb(icao, tar1090)
-            if hexdb:
-                state.apply_hexdb(icao, hexdb)
-
-            # Also persist enrichment to DB so offline (historical) aircraft get updated.
-            registration = _pick(registration, hexdb.get("Registration") if hexdb else None)
-            type_code = _pick(type_code, hexdb.get("ICAOTypeCode") if hexdb else None)
-            manufacturer = _pick(
-                manufacturer,
-                hexdb.get("Manufacturer") if hexdb else None,
-            )
-            type_category = None
-            if type_code:
-                ti = enrichment.db.get_type_info(type_code)
-                if ti:
-                    type_category = ti.get("desc") or None
-
-            if not operator and hexdb:
-                flag_code = (hexdb.get("OperatorFlagCode") or "").strip()
-                if flag_code:
-                    op = enrichment.db.get_operator(flag_code)
-                    if op:
-                        operator = op.get("n")
-                if not operator:
-                    operator = (hexdb.get("RegisteredOwners") or "").strip() or None
-
-            pending = not all([registration, type_code, operator, manufacturer])
-            resolved_sources = {
-                "registration": (
-                    "adsbx" if adsbx and registration == _pick(adsbx.get("reg")) else
-                    "tar1090" if tar1090 and registration == _pick(tar1090.get("Registration")) else
-                    "hexdb" if hexdb and registration == _pick(hexdb.get("Registration")) else "—"
-                ),
-                "type_code": (
-                    "adsbx" if adsbx and type_code == _pick(adsbx.get("icaotype")) else
-                    "tar1090" if tar1090 and type_code == _pick(tar1090.get("ICAOTypeCode")) else
-                    "hexdb" if hexdb and type_code == _pick(hexdb.get("ICAOTypeCode")) else "—"
-                ),
-                "operator": (
-                    "adsbx" if adsbx and operator == _pick(adsbx.get("ownop")) else
-                    "tar1090" if tar1090 and operator == _pick(tar1090.get("RegisteredOwners")) else
-                    "hexdb" if hexdb and operator == _pick(hexdb.get("RegisteredOwners")) else
-                    "hexdb_flag" if hexdb and operator else "—"
-                ),
-                "manufacturer": (
-                    "adsbx" if adsbx and manufacturer == _pick(adsbx.get("manufacturer")) else
-                    "tar1090" if tar1090 and manufacturer == _pick(tar1090.get("Manufacturer")) else
-                    "hexdb" if hexdb and manufacturer == _pick(hexdb.get("Manufacturer")) else "—"
-                ),
-                "year": (
-                    "adsbx" if adsbx and _pick(adsbx.get("year")) else "—"
-                ),
-                "military": "adsbx" if adsbx else "—",
-            }
-            enrichment.log_enrichment_trace(
-                icao,
-                "live:queued",
-                cache=cache,
-                adsbx=adsbx,
-                tar1090=tar1090,
-                hexdb=hexdb,
-                final={
-                    "registration": registration,
-                    "type_code": type_code,
-                    "operator": operator,
-                    "manufacturer": manufacturer,
-                    "year": _pick(adsbx.get("year") if adsbx else None),
-                    "military": "Y" if bool(adsbx and adsbx.get("mil")) else "N",
-                    "type_category": type_category,
-                },
-                resolved_sources=resolved_sources,
-                pending=pending,
-            )
-
-            if registration or type_code or operator or manufacturer:
-                await asyncio.to_thread(
-                    stats_db.update_aircraft_enrichment,
-                    icao, registration, type_code, type_category, operator, manufacturer,
-                )
+            await _enrich_live_icao(icao)
             await asyncio.sleep(1)  # 1 req/sec rate limit
         await asyncio.sleep(5)
 
@@ -399,6 +399,64 @@ def _credible_aircraft(ac) -> bool:
 def _ghost_credible(ac: dict) -> bool:
     """Return True if this aircraft (dict snapshot) is likely real and should be persisted."""
     return _is_credible(ac["icao"], ac.get("msg_count", 0), bool(ac.get("mlat")))
+
+
+async def _process_emergency_squawks(snapshot: dict, now_ts: int) -> None:
+    """Update the in-memory emergency-squawk state machine and write confirmed events to DB.
+
+    A squawk must be observed ≥5 times across snapshots AND sustained for ≥120 s before
+    it is written to DB and a notification is fired — this dual gate filters both
+    transient code scrolling (clears in seconds) and noisy-receiver bursts (many obs,
+    short-lived).  Cleared squawks are finalized in place.
+    """
+    squawking_icaos: set[str] = set()
+    for ac in snapshot["aircraft"]:
+        sq = ac.get("squawk") or ""
+        if sq not in EMERGENCY_SQUAWKS:
+            continue
+        icao = ac["icao"]
+        squawking_icaos.add(icao)
+        if icao in _active_squawks and _active_squawks[icao]["squawk"] == sq:
+            entry = _active_squawks[icao]
+            entry["obs_count"] += 1
+            if entry["db_id"] is None:
+                if entry["obs_count"] >= 5 and now_ts - entry["first_seen"] >= 120:
+                    db_id = await asyncio.to_thread(
+                        stats_db.write_squawk_event,
+                        icao, sq, ac.get("callsign"), ac.get("altitude"),
+                        entry["first_seen"], now_ts,
+                    )
+                    entry["db_id"] = db_id
+                    entry["last_update"] = now_ts
+                    log.info("Emergency squawk %s from %s confirmed", sq, icao)
+                    await asyncio.to_thread(
+                        notifications.notify_emergency_squawk,
+                        icao, sq, ac.get("callsign"), ac.get("altitude"), ac.get("operator"),
+                    )
+            else:
+                # Ongoing confirmed event — update ts_last every 30s
+                if now_ts - entry["last_update"] >= 30:
+                    await asyncio.to_thread(
+                        stats_db.update_squawk_event_last,
+                        entry["db_id"], now_ts, ac.get("altitude"),
+                    )
+                    entry["last_update"] = now_ts
+        else:
+            # New event (or squawk code changed) — pending, not yet written to DB
+            _active_squawks[icao] = {
+                "squawk": sq, "db_id": None,
+                "first_seen": now_ts, "last_update": now_ts,
+                "obs_count": 1,
+            }
+    # Close out events for aircraft no longer squawking emergency
+    for icao in list(_active_squawks.keys()):
+        if icao not in squawking_icaos:
+            entry = _active_squawks.pop(icao)
+            if entry["db_id"] is not None:
+                await asyncio.to_thread(
+                    stats_db.update_squawk_event_last,
+                    entry["db_id"], now_ts, None,
+                )
 
 
 async def _db_writer() -> None:
@@ -464,60 +522,7 @@ async def _db_writer() -> None:
                 )
 
         # Detect emergency squawk start/continuation/end
-        now_ts = int(time.time())
-        squawking_icaos: set[str] = set()
-        for ac in snapshot["aircraft"]:
-            sq = ac.get("squawk") or ""
-            if sq not in EMERGENCY_SQUAWKS:
-                continue
-            icao = ac["icao"]
-            squawking_icaos.add(icao)
-            if icao in _active_squawks and _active_squawks[icao]["squawk"] == sq:
-                entry = _active_squawks[icao]
-                entry["obs_count"] += 1
-                if entry["db_id"] is None:
-                    # Pending confirmation — require ≥5 separate snapshot observations
-                    # AND ≥120s sustained squawk before writing to DB.
-                    # The dual gate catches both transient code scrolling (clears in
-                    # seconds) and noisy-receiver bursts (many obs but short-lived).
-                    if entry["obs_count"] >= 5 and now_ts - entry["first_seen"] >= 120:
-                        db_id = await asyncio.to_thread(
-                            stats_db.write_squawk_event,
-                            icao, sq, ac.get("callsign"), ac.get("altitude"),
-                            entry["first_seen"], now_ts,   # ts=first_seen, ts_last=now
-                        )
-                        entry["db_id"] = db_id
-                        entry["last_update"] = now_ts
-                        log.info("Emergency squawk %s from %s confirmed", sq, icao)
-                        await asyncio.to_thread(
-                            notifications.notify_emergency_squawk,
-                            icao, sq, ac.get("callsign"), ac.get("altitude"), ac.get("operator"),
-                        )
-                else:
-                    # Ongoing confirmed event — update ts_last every 30s
-                    if now_ts - entry["last_update"] >= 30:
-                        await asyncio.to_thread(
-                            stats_db.update_squawk_event_last,
-                            entry["db_id"], now_ts, ac.get("altitude"),
-                        )
-                        entry["last_update"] = now_ts
-            else:
-                # New event (or squawk code changed) — pending, not yet written to DB
-                _active_squawks[icao] = {
-                    "squawk": sq, "db_id": None,
-                    "first_seen": now_ts, "last_update": now_ts,
-                    "obs_count": 1,
-                }
-        # Close out events for aircraft no longer squawking emergency
-        for icao in list(_active_squawks.keys()):
-            if icao not in squawking_icaos:
-                entry = _active_squawks.pop(icao)
-                # Record final timestamp if the event was confirmed and written to DB
-                if entry["db_id"] is not None:
-                    await asyncio.to_thread(
-                        stats_db.update_squawk_event_last,
-                        entry["db_id"], now_ts, None,
-                    )
+        await _process_emergency_squawks(snapshot, int(time.time()))
 
 
 async def _route_enricher() -> None:
@@ -592,6 +597,30 @@ async def _close_expired_visits(expired: list) -> None:
             _route_queue.append((vid, ac.callsign))
 
 
+def _record_track_point(ac: dict, now: float) -> None:
+    """Record a track point if the aircraft has a reliable position."""
+    if (
+        ac.get("bearing_deg") is not None
+        and ac.get("range_nm") is not None
+        and ac.get("lat") is not None
+        and ac.get("pos_confident")
+    ):
+        track_store.record(
+            icao=ac["icao"],
+            bearing_deg=ac["bearing_deg"],
+            range_nm=ac["range_nm"],
+            altitude_ft=ac.get("altitude"),
+            lat=ac["lat"],
+            lon=ac["lon"],
+            military=bool(ac.get("military")),
+            mlat=bool(ac.get("mlat")),
+            interesting=bool(ac.get("interesting")),
+            acas_ra_active=bool(ac.get("acas_ra_active")),
+            mlat_source=ac.get("mlat_source"),
+            now=now,
+        )
+
+
 async def _housekeeping_loop() -> None:
     """Keep unattended collection healthy without building broadcast snapshots."""
     global _trail_housekeeping_last_ts
@@ -613,26 +642,7 @@ async def _housekeeping_loop() -> None:
                 _trail_housekeeping_last_ts = now_ts
                 _trail_snap = _get_cycle_snapshot("full")
                 for _ac in _trail_snap["aircraft"]:
-                    if (
-                        _ac.get("bearing_deg") is not None
-                        and _ac.get("range_nm") is not None
-                        and _ac.get("lat") is not None
-                        and _ac.get("pos_confident")
-                    ):
-                        track_store.record(
-                            icao=_ac["icao"],
-                            bearing_deg=_ac["bearing_deg"],
-                            range_nm=_ac["range_nm"],
-                            altitude_ft=_ac.get("altitude"),
-                            lat=_ac["lat"],
-                            lon=_ac["lon"],
-                            military=bool(_ac.get("military")),
-                            mlat=bool(_ac.get("mlat")),
-                            interesting=bool(_ac.get("interesting")),
-                            acas_ra_active=bool(_ac.get("acas_ra_active")),
-                            mlat_source=_ac.get("mlat_source"),
-                            now=now_ts,
-                        )
+                    _record_track_point(_ac, now_ts)
 
             # Sample queue depth (Beast mode only — queue unused in readsb/hybrid).
             if config.INGEST_MODE == "beast":
@@ -655,7 +665,14 @@ async def _notify_cast_loop() -> None:
             if not _notify_enabled and not _cast_on:
                 continue
 
-            snapshot = _get_cycle_snapshot("full")
+            # Use the same snapshot mode as _broadcast_loop so the cycle cache is shared.
+            if config.SNAPSHOT_MODE_OVERRIDE:
+                _notify_snap_mode = config.SNAPSHOT_MODE_OVERRIDE
+            elif config.MEMORY_POLICY_ENABLED:
+                _notify_snap_mode = memory_policy.get_policy()["snapshot_mode"]
+            else:
+                _notify_snap_mode = "full"
+            snapshot = _get_cycle_snapshot(_notify_snap_mode)
             now = time.time()
 
             # Refresh watchlist cache from DB every 30s
@@ -676,27 +693,28 @@ async def _notify_cast_loop() -> None:
             _int_batch: list[dict] = []
             _wl_batch:  list[dict] = []
             for ac in snapshot["aircraft"]:
+                if not _notify_enabled:
+                    break  # cast-only cycle: no notifications to collect
                 icao = ac["icao"]
-                if _notify_enabled:
-                    if icao in _watchlist_cache and not notifications.already_notified(f"watchlist:{icao}"):
-                        _wl_batch.append({
-                            "icao": icao, "callsign": ac.get("callsign"),
-                            "registration": ac.get("registration"), "operator": ac.get("operator"),
-                            "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
-                            "max_range_nm": _watchlist_cache[icao],
-                        })
-                    if _mil_on and ac.get("military") and not notifications.already_notified(f"military:{icao}"):
-                        _mil_batch.append({
-                            "icao": icao, "callsign": ac.get("callsign"),
-                            "operator": ac.get("operator"), "country": ac.get("country"),
-                            "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
-                        })
-                    if _int_on and ac.get("interesting") and not notifications.already_notified(f"interesting:{icao}"):
-                        _int_batch.append({
-                            "icao": icao, "callsign": ac.get("callsign"),
-                            "type_code": ac.get("type_code"), "operator": ac.get("operator"),
-                            "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
-                        })
+                if icao in _watchlist_cache and not notifications.already_notified(f"watchlist:{icao}"):
+                    _wl_batch.append({
+                        "icao": icao, "callsign": ac.get("callsign"),
+                        "registration": ac.get("registration"), "operator": ac.get("operator"),
+                        "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
+                        "max_range_nm": _watchlist_cache[icao],
+                    })
+                if _mil_on and ac.get("military") and not notifications.already_notified(f"military:{icao}"):
+                    _mil_batch.append({
+                        "icao": icao, "callsign": ac.get("callsign"),
+                        "operator": ac.get("operator"), "country": ac.get("country"),
+                        "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
+                    })
+                if _int_on and ac.get("interesting") and not notifications.already_notified(f"interesting:{icao}"):
+                    _int_batch.append({
+                        "icao": icao, "callsign": ac.get("callsign"),
+                        "type_code": ac.get("type_code"), "operator": ac.get("operator"),
+                        "altitude": ac.get("altitude"), "range_nm": ac.get("range_nm"),
+                    })
             if _mil_batch:
                 notify_tasks.append(asyncio.to_thread(notifications.notify_military_batch, _mil_batch))
             if _int_batch:
@@ -736,31 +754,12 @@ async def _broadcast_loop() -> None:
             snapshot_ms = (time.perf_counter() - t_snap) * 1000
 
             # Record track points (rate-limited to 1/5s per aircraft inside TrackStore)
+            # pos_confident = _pos_reliable() in snapshot; requires a global CPR decode
+            # or MLAT fix before a point is accepted.
             now = time.time()
             t_loop_start = time.perf_counter()
             for ac in snapshot["aircraft"]:
-                # Only record once the position is confirmed reliable:
-                # - pos_global=True: a global CPR decode (even+odd pair) has succeeded,
-                #   guaranteeing the position is not from the potentially-wrong local
-                #   decode fallback that runs before the first pair is available.
-                # - mlat=True: position established by multilateration, also reliable.
-                if (ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
-                        and ac.get("lat") is not None
-                        and ac.get("pos_confident")):  # pos_confident = _pos_reliable() in snapshot
-                    track_store.record(
-                        icao=ac["icao"],
-                        bearing_deg=ac["bearing_deg"],
-                        range_nm=ac["range_nm"],
-                        altitude_ft=ac.get("altitude"),
-                        lat=ac["lat"],
-                        lon=ac["lon"],
-                        military=bool(ac.get("military")),
-                        mlat=bool(ac.get("mlat")),
-                        interesting=bool(ac.get("interesting")),
-                        acas_ra_active=bool(ac.get("acas_ra_active")),
-                        mlat_source=ac.get("mlat_source"),
-                        now=now,
-                    )
+                _record_track_point(ac, now)
             t_sync_end = time.perf_counter()
 
             t_ser = time.perf_counter()

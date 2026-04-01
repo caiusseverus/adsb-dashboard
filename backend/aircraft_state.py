@@ -300,6 +300,25 @@ def _penalise_alt_reliable(ac: "Aircraft", good_crc: int = 0) -> None:
         ac._alt_source = None
 
 
+def _compute_vrate_window(ac: "Aircraft", now: float) -> tuple[float, float]:
+    """Return (min_fpm, max_fpm) tolerance window from the freshest vrate reading.
+
+    Prefers geometric vrate over baro when it is fresher; adds an age-based slop
+    allowance so the window widens as the reading gets older.
+    """
+    geom_age_ms = (now - ac._vrate_geom_ts) * 1000 if ac._vrate_geom_fpm is not None else float('inf')
+    baro_age_ms = (now - ac._vrate_baro_ts) * 1000 if ac._vrate_baro_fpm is not None else float('inf')
+    if ac._vrate_geom_fpm is not None and geom_age_ms < baro_age_ms:
+        vrate = ac._vrate_geom_fpm
+        slop = min(_ALT_RATE_AGE_SLOP_MAX, int(geom_age_ms / 2))
+    elif ac._vrate_baro_fpm is not None:
+        vrate = ac._vrate_baro_fpm
+        slop = min(_ALT_RATE_AGE_SLOP_MAX, int(baro_age_ms / 2))
+    else:
+        return _ALT_DEFAULT_MIN_FPM, _ALT_DEFAULT_MAX_FPM
+    return vrate - _ALT_RATE_TOLERANCE_FPM - slop, vrate + _ALT_RATE_TOLERANCE_FPM + slop
+
+
 def _accept_altitude(ac: "Aircraft", alt: int, source: "MsgSource",
                      crc_clean: bool, now: float) -> bool:
     """Update ac.altitude if alt passes the readsb-equivalent 8-layer filter.
@@ -352,21 +371,11 @@ def _accept_altitude(ac: "Aircraft", alt: int, source: "MsgSource",
             ac.alt_reliable = min(ac.alt_reliable, _ALT_RELIABLE_PUBLISH)
 
     # Layer 5: dynamic vertical rate window
-    min_fpm = _ALT_DEFAULT_MIN_FPM
-    max_fpm = _ALT_DEFAULT_MAX_FPM
-    if abs(delta) >= _ALT_LOW_DELTA_FT:
-        geom_age_ms = (now - ac._vrate_geom_ts) * 1000 if ac._vrate_geom_fpm is not None else float('inf')
-        baro_age_ms = (now - ac._vrate_baro_ts) * 1000 if ac._vrate_baro_fpm is not None else float('inf')
-        vrate = None
-        if ac._vrate_geom_fpm is not None and geom_age_ms < baro_age_ms:
-            vrate = ac._vrate_geom_fpm
-            slop = min(_ALT_RATE_AGE_SLOP_MAX, int(geom_age_ms / 2))
-        elif ac._vrate_baro_fpm is not None:
-            vrate = ac._vrate_baro_fpm
-            slop = min(_ALT_RATE_AGE_SLOP_MAX, int(baro_age_ms / 2))
-        if vrate is not None:
-            min_fpm = vrate - _ALT_RATE_TOLERANCE_FPM - slop
-            max_fpm = vrate + _ALT_RATE_TOLERANCE_FPM + slop
+    min_fpm, max_fpm = (
+        _compute_vrate_window(ac, now)
+        if abs(delta) >= _ALT_LOW_DELTA_FT
+        else (_ALT_DEFAULT_MIN_FPM, _ALT_DEFAULT_MAX_FPM)
+    )
 
     # Layer 6: accept/reject decision (four paths)
     accept = False
@@ -491,6 +500,56 @@ def _add_to_discard_cache(ac: "Aircraft", lat: float, lon: float, now: float) ->
         ac._discard_cache.pop(0)
 
 
+def _reset_cpr_state(ac: "Aircraft") -> None:
+    """Clear CPR pairing state so the aircraft must re-establish from a fresh pair."""
+    ac.pos_reliable_odd  = 0.0
+    ac.pos_reliable_even = 0.0
+    ac.cpr_even   = None
+    ac.cpr_odd    = None
+    ac.pos_global = False
+    ac.pos_by_ref = False
+
+
+def _apply_position_gate(ac: "Aircraft", lat: float, lon: float, now: float) -> bool:
+    """Speed-gate and stale-timeout check for an incoming CPR position.
+
+    Returns True if the position should be accepted, False if it should be
+    discarded.  Mutates reliability scores and CPR state as a side effect.
+    """
+    # Stale timeout: bypass speed check; reset CPR state and begin fresh
+    # (mirrors readsb POS_RELIABLE_TIMEOUT)
+    if ac.last_pos_ts > 0 and (now - ac.last_pos_ts) > _POS_RELIABLE_RESET_TIMEOUT_S:
+        _reset_cpr_state(ac)
+        return True
+
+    # No reference point yet — accept unconditionally
+    if ac.lat is None or ac.lon is None or ac.last_pos_ts == 0:
+        return True
+    if not (ac.pos_global or ac.pos_by_ref):
+        return True
+
+    elapsed_s = now - ac.last_pos_ts
+    if elapsed_s <= 0:
+        return True
+
+    dist_nm = _haversine_nm(ac.lat, ac.lon, lat, lon)
+    # Ceiling widens with time to account for position uncertainty (+3 kt/s)
+    ceiling_kt = _ADSB_MAX_SPEED_KT + _SPEED_UNCERTAINTY_KT_PER_S * elapsed_s
+    implied_kt = (dist_nm / elapsed_s) * 3600
+    if implied_kt <= ceiling_kt:
+        return True
+
+    # Speed exceeded — penalise reliability unless this position is already cached
+    if _in_discard_cache(ac, lat, lon, now):
+        return False
+    ac.pos_reliable_odd  = max(0.0, ac.pos_reliable_odd  - _POS_RELIABLE_DECAY)
+    ac.pos_reliable_even = max(0.0, ac.pos_reliable_even - _POS_RELIABLE_DECAY)
+    if ac.pos_reliable_odd < _POS_RELIABLE_DECAY or ac.pos_reliable_even < _POS_RELIABLE_DECAY:
+        _reset_cpr_state(ac)  # sustained failures: force fresh pair
+    _add_to_discard_cache(ac, lat, lon, now)
+    return False
+
+
 def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
                           pos_from_global: bool, cpr_odd: bool, now: float) -> None:
     """Write a validated ADS-B CPR position to the aircraft record.
@@ -502,37 +561,8 @@ def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
     stored (needed as reference for local CPR decode) but suppressed in snapshot
     output until pos_reliable reaches _POS_RELIABLE_PUBLISH.
     """
-    # Timeout override: if position is very stale, bypass speed check entirely
-    # (mirrors readsb POS_RELIABLE_TIMEOUT — aircraft must re-establish from scratch)
-    if ac.last_pos_ts > 0 and (now - ac.last_pos_ts) > _POS_RELIABLE_RESET_TIMEOUT_S:
-        ac.pos_reliable_odd  = 0.0
-        ac.pos_reliable_even = 0.0
-        ac.cpr_even  = None
-        ac.cpr_odd   = None
-        ac.pos_global = False
-        ac.pos_by_ref = False
-        # Fall through — no speed check; accept position and begin fresh
-    elif ac.lat is not None and ac.lon is not None and ac.last_pos_ts > 0 and (ac.pos_global or ac.pos_by_ref):
-        elapsed_s = now - ac.last_pos_ts
-        if elapsed_s > 0:
-            dist_nm = _haversine_nm(ac.lat, ac.lon, lat, lon)
-            # Ceiling widens with time to account for position uncertainty (+3 kt/s)
-            ceiling_kt = _ADSB_MAX_SPEED_KT + _SPEED_UNCERTAINTY_KT_PER_S * elapsed_s
-            implied_kt = (dist_nm / elapsed_s) * 3600
-            if implied_kt > ceiling_kt:
-                if not _in_discard_cache(ac, lat, lon, now):
-                    ac.pos_reliable_odd  = max(0.0, ac.pos_reliable_odd  - _POS_RELIABLE_DECAY)
-                    ac.pos_reliable_even = max(0.0, ac.pos_reliable_even - _POS_RELIABLE_DECAY)
-                    if ac.pos_reliable_odd < _POS_RELIABLE_DECAY or ac.pos_reliable_even < _POS_RELIABLE_DECAY:
-                        # Sustained failures: reset CPR state
-                        ac.pos_reliable_odd  = 0.0
-                        ac.pos_reliable_even = 0.0
-                        ac.cpr_even  = None
-                        ac.cpr_odd   = None
-                        ac.pos_global = False
-                        ac.pos_by_ref = False
-                    _add_to_discard_cache(ac, lat, lon, now)
-                return  # discard this position
+    if not _apply_position_gate(ac, lat, lon, now):
+        return
 
     # Fast-track: if within ~27 nm (50 km) of last known position, promote
     # directly to publish threshold (mirrors readsb incrementReliable fast-path)
@@ -792,6 +822,17 @@ def _log_enrichment(icao: str, ac, adsbx: dict | None, op_source: str) -> None:
     )
 
 
+def _apply_type_info(ac, type_code: str) -> None:
+    """Fill type_full_name, type_category, and wtc from the type database (in-place).
+    No-ops if type_info is not found or fields are already set."""
+    ti = enrichment.db.get_type_info(type_code)
+    if not ti:
+        return
+    ac.type_full_name = ti.get("name") or ac.type_full_name
+    ac.type_category  = ti.get("desc") or ac.type_category
+    ac.wtc            = ti.get("wtc")  or ac.wtc
+
+
 def _apply_hexdb_data(ac, data: dict) -> None:
     """Apply a hexdb.io response to an Aircraft object (call while holding state lock).
     Fills any fields that are still missing — registration, type, type_desc, and operator."""
@@ -802,11 +843,7 @@ def _apply_hexdb_data(ac, data: dict) -> None:
     if not ac.type_code:
         ac.type_code = (data.get("ICAOTypeCode") or "").strip() or None
         if ac.type_code:
-            ti = enrichment.db.get_type_info(ac.type_code)
-            if ti:
-                ac.type_full_name = ti.get("name") or ac.type_full_name
-                ac.type_category  = ti.get("desc") or ac.type_category
-                ac.wtc            = ti.get("wtc")  or ac.wtc
+            _apply_type_info(ac, ac.type_code)
     if not ac.type_desc:
         mfr  = (data.get("Manufacturer") or "").strip()
         typ  = (data.get("Type") or "").strip()
@@ -1373,11 +1410,7 @@ class AircraftState:
                 if not ac.type_code:
                     ac.type_code = (adsbx.get("icaotype") or "").strip() or None
                 if ac.type_code and not ac.type_full_name:
-                    ti = enrichment.db.get_type_info(ac.type_code)
-                    if ti:
-                        ac.type_full_name = ti.get("name") or None
-                        ac.type_category  = ti.get("desc") or None
-                        ac.wtc            = ti.get("wtc")  or None
+                    _apply_type_info(ac, ac.type_code)
                 if not ac.type_desc:
                     mfr   = (adsbx.get("manufacturer") or "").strip()
                     model = (adsbx.get("model") or "").strip()
@@ -1670,7 +1703,8 @@ class AircraftState:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _tick(self, now: float, mlat: bool = False) -> None:
+    def _roll_sec_if_needed(self, now: float) -> None:
+        """Rotate the current-second bucket if the wall-clock second has advanced."""
         sec = int(now)
         if sec != self._cur_sec:
             self._sec_counts.append((self._cur_sec, self._cur_sec_count))
@@ -1679,10 +1713,9 @@ class AircraftState:
             self._cur_sec = sec
             self._cur_sec_count = 0
             self._cur_sec_mlat_count = 0
-        self._cur_sec_count += 1
-        if mlat:
-            self._cur_sec_mlat_count += 1
 
+    def _roll_minute_if_needed(self, now: float) -> None:
+        """Flush accumulated per-minute stats when the wall-clock minute advances."""
         minute = int(now // 60)
         if minute != self._cur_min:
             secs = self._cur_min_sec_counts
@@ -1709,6 +1742,13 @@ class AircraftState:
             self._cur_min_signals = []
             self._cur_min_df_counts = {}
             self._cur_min_mlat_count = 0
+
+    def _tick(self, now: float, mlat: bool = False) -> None:
+        self._roll_sec_if_needed(now)
+        self._cur_sec_count += 1
+        if mlat:
+            self._cur_sec_mlat_count += 1
+        self._roll_minute_if_needed(now)
         if mlat:
             self._cur_min_mlat_count += 1
 
@@ -2421,44 +2461,10 @@ class AircraftState:
             self._readsb_last_total = total_messages
         self._total += delta
 
-        # Replicate _tick() logic: accumulate per-second count; roll minute.
-        # We treat the entire poll-period delta as a single second-bucket entry.
-        sec = int(now)
-        if sec != self._cur_sec:
-            self._sec_counts.append((self._cur_sec, self._cur_sec_count))
-            self._mlat_sec_counts.append((self._cur_sec, self._cur_sec_mlat_count))
-            self._cur_min_sec_counts.append(self._cur_sec_count)
-            self._cur_sec = sec
-            self._cur_sec_count = 0
-            self._cur_sec_mlat_count = 0
+        # Accumulate per-second count (as a batch delta); roll second and minute buckets.
+        self._roll_sec_if_needed(now)
         self._cur_sec_count += delta
-
-        minute = int(now // 60)
-        if minute != self._cur_min:
-            secs = self._cur_min_sec_counts
-            if secs:
-                mn, mx, me = min(secs), max(secs), round(sum(secs) / len(secs), 1)
-            else:
-                mn = mx = me = 0.0
-            total_ac = len(self._aircraft)
-            mil      = sum(1 for ac in self._aircraft.values() if ac.military)
-            with_pos = sum(1 for ac in self._aircraft.values() if _pos_reliable(ac))
-            mlat_pos = sum(1 for ac in self._aircraft.values() if ac.mlat and _pos_reliable(ac))
-            sigs     = self._cur_min_signals
-            sig_avg  = round(sum(sigs) / len(sigs), 1) if sigs else None
-            sig_min  = min(sigs) if sigs else None
-            sig_max  = max(sigs) if sigs else None
-            self._min_stats.append(
-                (self._cur_min, mn, mx, me, total_ac, total_ac - mil, mil,
-                 sig_avg, sig_min, sig_max, with_pos, mlat_pos)
-            )
-            self._min_df_stats.append((self._cur_min, dict(self._cur_min_df_counts)))
-            self._min_mlat_counts.append((self._cur_min, self._cur_min_mlat_count))
-            self._cur_min = minute
-            self._cur_min_sec_counts = []
-            self._cur_min_signals = []
-            self._cur_min_df_counts = {}
-            self._cur_min_mlat_count = 0
+        self._roll_minute_if_needed(now)
 
         # Midnight rollover (mirrors process_message path)
         today = date.today().isoformat()

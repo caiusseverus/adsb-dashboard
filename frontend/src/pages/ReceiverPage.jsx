@@ -1,8 +1,9 @@
-import { useState, useEffect, useMemo, useRef } from 'react'
+import { useState, useMemo, useRef } from 'react'
 import {
   ScatterChart, Scatter, XAxis, YAxis, ZAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, BarChart, Bar, Cell, AreaChart, Area, Legend,
 } from 'recharts'
+import { useFetch } from '../utils/useFetch'
 import DFHeatmap from '../components/DFHeatmap'
 import SignalHeatmap from '../components/SignalHeatmap'
 import styles from './ReceiverPage.module.css'
@@ -42,19 +43,6 @@ function normalizePercentTriplet(adsbRaw, mlatRaw, noPosRaw) {
   return values.map(v => Math.max(0, Math.min(100, Math.round(v * scale * 10) / 10)))
 }
 
-function useFetch(url) {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(true)
-  useEffect(() => {
-    setLoading(true)
-    setData(null)
-    fetch(url)
-      .then(r => r.ok ? r.json() : null)
-      .then(d => { setData(d); setLoading(false) })
-      .catch(() => setLoading(false))
-  }, [url])
-  return { data, loading }
-}
 
 function Card({ title, children, controls }) {
   return (
@@ -516,16 +504,27 @@ function PolarCoverage({ days, onDaysChange }) {
 // ---------------------------------------------------------------------------
 // 7. Performance distribution box plots (msgs, aircraft, range, signal)
 // ---------------------------------------------------------------------------
-function BoxPlotSVG({ data, formatVal, minZero = true }) {
-  const WINDOWS = ['1d', '7d', '30d', '365d']
-  const W = 300, H = 160
-  const ML = 50, MR = 12, MT = 14, MB = 28
-  const plotW = W - ML - MR
-  const plotH = H - MT - MB
-  const colW  = plotW / WINDOWS.length
-  const BOX_H = colW * 0.22
+const BP_WINDOWS = ['1d', '7d', '30d', '365d']
+const BP_W = 300, BP_H = 160
+const BP_ML = 50, BP_MR = 12, BP_MT = 14, BP_MB = 28
+const BP_PLOT_W = BP_W - BP_ML - BP_MR
+const BP_PLOT_H = BP_H - BP_MT - BP_MB
+const BP_COL_W  = BP_PLOT_W / BP_WINDOWS.length
+const BP_BOX_H  = BP_COL_W * 0.22
 
-  const allVals = WINDOWS.flatMap(w => {
+// Returns nice rounded tick values between lo and hi (1/2/5 × power-of-10 steps)
+function niceTicks(lo, hi) {
+  const rawStep = (hi - lo) / 4
+  const mag = Math.pow(10, Math.floor(Math.log10(rawStep || 1)))
+  const norm = rawStep / mag
+  const step = norm <= 1.5 ? mag : norm <= 3.5 ? 2 * mag : norm <= 7.5 ? 5 * mag : 10 * mag
+  const ticks = []
+  for (let t = Math.ceil(lo / step) * step; t <= hi + step * 0.01; t += step) ticks.push(t)
+  return ticks
+}
+
+function BoxPlotSVG({ data, formatVal, minZero = true }) {
+  const allVals = BP_WINDOWS.flatMap(w => {
     const d = data?.[w]
     return d ? [d.p5, d.p95].filter(v => v != null) : []
   })
@@ -534,36 +533,28 @@ function BoxPlotSVG({ data, formatVal, minZero = true }) {
   const lo = Math.min(...allVals), hi = Math.max(...allVals)
   const pad = (hi - lo) * 0.15 || 1
   const yLo = (minZero ? Math.max(0, lo - pad) : lo - pad), yHi = hi + pad
-  const sy = v => MT + plotH - ((v - yLo) / (yHi - yLo)) * plotH
-
-  // Compute nice rounded tick intervals (1/2/5 × power-of-10 steps)
-  const rawStep = (yHi - yLo) / 4
-  const mag = Math.pow(10, Math.floor(Math.log10(rawStep || 1)))
-  const norm = rawStep / mag
-  const niceStep = norm <= 1.5 ? mag : norm <= 3.5 ? 2 * mag : norm <= 7.5 ? 5 * mag : 10 * mag
-  const tickStart = Math.ceil(yLo / niceStep) * niceStep
-  const ticks = []
-  for (let t = tickStart; t <= yHi + niceStep * 0.01; t += niceStep) ticks.push(t)
+  const sy = v => BP_MT + BP_PLOT_H - ((v - yLo) / (yHi - yLo)) * BP_PLOT_H
+  const ticks = niceTicks(yLo, yHi)
 
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: H }}>
+    <svg viewBox={`0 0 ${BP_W} ${BP_H}`} style={{ width: '100%', height: BP_H }}>
       {ticks.map((t, i) => (
         <g key={i}>
-          <line x1={ML} x2={ML + plotW} y1={sy(t)} y2={sy(t)} stroke="#21262d" strokeWidth={1} />
-          <text x={ML - 5} y={sy(t)} fill="#484f58" fontSize={9} textAnchor="end" dominantBaseline="middle">
+          <line x1={BP_ML} x2={BP_ML + BP_PLOT_W} y1={sy(t)} y2={sy(t)} stroke="#21262d" strokeWidth={1} />
+          <text x={BP_ML - 5} y={sy(t)} fill="#484f58" fontSize={9} textAnchor="end" dominantBaseline="middle">
             {formatVal(t)}
           </text>
         </g>
       ))}
-      {WINDOWS.map((w, i) => {
+      {BP_WINDOWS.map((w, i) => {
         const d = data?.[w]
-        const cx = ML + (i + 0.5) * colW
+        const cx = BP_ML + (i + 0.5) * BP_COL_W
         if (!d || d.p50 == null) return (
-          <text key={w} x={cx} y={MT + plotH / 2} fill="#484f58" fontSize={10}
+          <text key={w} x={cx} y={BP_MT + BP_PLOT_H / 2} fill="#484f58" fontSize={10}
             textAnchor="middle" dominantBaseline="middle">—</text>
         )
-        const x1 = cx - BOX_H, x2 = cx + BOX_H
-        const cap1 = cx - BOX_H * 0.5, cap2 = cx + BOX_H * 0.5
+        const x1 = cx - BP_BOX_H, x2 = cx + BP_BOX_H
+        const cap1 = cx - BP_BOX_H * 0.5, cap2 = cx + BP_BOX_H * 0.5
         return (
           <g key={w}>
             {/* Whiskers p5–p25 and p75–p95 */}
@@ -572,7 +563,7 @@ function BoxPlotSVG({ data, formatVal, minZero = true }) {
             <line x1={cx} x2={cx} y1={sy(d.p75)} y2={sy(d.p95)} stroke="#484f58" strokeWidth={1.5} />
             <line x1={cap1} x2={cap2} y1={sy(d.p95)} y2={sy(d.p95)} stroke="#484f58" strokeWidth={1} />
             {/* IQR box p25–p75 */}
-            <rect x={x1} y={sy(d.p75)} width={BOX_H * 2}
+            <rect x={x1} y={sy(d.p75)} width={BP_BOX_H * 2}
               height={Math.max(1, sy(d.p25) - sy(d.p75))}
               fill="#1c2128" stroke="#388bfd" strokeWidth={1.5} rx={2} />
             {/* Median */}
@@ -580,7 +571,7 @@ function BoxPlotSVG({ data, formatVal, minZero = true }) {
             {/* Mean dot */}
             {d.mean != null && <circle cx={cx} cy={sy(d.mean)} r={3} fill="#d29922" />}
             {/* Window label */}
-            <text x={cx} y={H - 6} fill="#8b949e" fontSize={11} textAnchor="middle">{w}</text>
+            <text x={cx} y={BP_H - 6} fill="#8b949e" fontSize={11} textAnchor="middle">{w}</text>
           </g>
         )
       })}

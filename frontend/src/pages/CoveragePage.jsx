@@ -137,6 +137,14 @@ function makeAltAxis(altScale) {
   return new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0x484f58 }))
 }
 
+// Construct a BufferGeometry from pre-filled typed arrays; colors is optional.
+function makeGeo(positions, colors) {
+  const geo = new THREE.BufferGeometry()
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  if (colors) geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+  return geo
+}
+
 // Build a Points object from (already-filtered) raw point data + colour mode
 function buildPoints(points, colorMode, altScale, curveMode) {
   const n = points.length
@@ -170,12 +178,8 @@ function buildPoints(points, colorMode, altScale, curveMode) {
     colors[i * 3 + 2] = col.b
   }
 
-  const geo = new THREE.BufferGeometry()
-  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
-  geo.setAttribute('color',    new THREE.BufferAttribute(colors,    3))
-
   const pointSize = n < 500 ? 4 : n < 3000 ? 2.5 : 1.5
-  return new THREE.Points(geo, new THREE.PointsMaterial({
+  return new THREE.Points(makeGeo(positions, colors), new THREE.PointsMaterial({
     size:            pointSize,
     vertexColors:    true,
     sizeAttenuation: false,
@@ -254,10 +258,7 @@ function buildTrails(trails, colorMode, operators, typeCodes, altScale, curveMod
     }
   }
 
-  const geo = new THREE.BufferGeometry()
-  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
-  geo.setAttribute('color',    new THREE.BufferAttribute(colors,    3))
-  return new THREE.LineSegments(geo, new THREE.LineBasicMaterial({
+  return new THREE.LineSegments(makeGeo(positions, colors), new THREE.LineBasicMaterial({
     vertexColors: true,
     transparent:  true,
     opacity:      0.75,
@@ -286,10 +287,7 @@ function buildLiveDots(trails, colorMode, operators, typeCodes, altScale, curveM
     colors[i * 3 + 2] = col.b
   })
 
-  const geo = new THREE.BufferGeometry()
-  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
-  geo.setAttribute('color',    new THREE.BufferAttribute(colors,    3))
-  return new THREE.Points(geo, new THREE.PointsMaterial({
+  return new THREE.Points(makeGeo(positions, colors), new THREE.PointsMaterial({
     size:            5,
     vertexColors:    true,
     sizeAttenuation: false,
@@ -385,9 +383,7 @@ function buildCoastline(segments, altScale, curveMode) {
     positions[idx++] = x0; positions[idx++] = y0; positions[idx++] = z0
     positions[idx++] = x1; positions[idx++] = y1; positions[idx++] = z1
   }
-  const geo = new THREE.BufferGeometry()
-  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
-  return new THREE.LineSegments(geo, new THREE.LineBasicMaterial({
+  return new THREE.LineSegments(makeGeo(positions), new THREE.LineBasicMaterial({
     color: 0x445566,
     transparent: true,
     opacity: 0.75,
@@ -417,9 +413,7 @@ function buildAirports(airports, altScale, curveMode) {
     positions[i * 3 + 1] = y + 0.5  // slightly above surface (curved or flat)
     positions[i * 3 + 2] = z
   })
-  const geo = new THREE.BufferGeometry()
-  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
-  group.add(new THREE.Points(geo, new THREE.PointsMaterial({
+  group.add(new THREE.Points(makeGeo(positions), new THREE.PointsMaterial({
     color: 0xf0a000,
     size: 7,
     sizeAttenuation: false,
@@ -459,6 +453,17 @@ const TL_SPEEDS          = [60, 120, 300, 600]
 const TL_GAP_S           = 180             // gap > 3 min → stop trail, hide aircraft
 // Background colour to fade trail dots toward (matches scene background #0b0c10)
 const TL_BG_R = 11 / 255, TL_BG_G = 12 / 255, TL_BG_B = 16 / 255
+
+function tlTrackMatchesFilter(track, filterOp, filterTc, filterTg, filterMlat) {
+  if (filterMlat && !track.mlat) return false
+  if (filterOp  && track.operator  !== filterOp)  return false
+  if (filterTc  && track.type_code !== filterTc)  return false
+  if (filterTg) {
+    const tgIdx = TYPE_GROUPS.findIndex(g => g.value === filterTg)
+    if (tgIdx >= 0 && track.tg_idx !== tgIdx) return false
+  }
+  return true
+}
 
 function lerpBearing(b0, b1, alpha) {
   let d = b1 - b0
@@ -983,14 +988,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
     const filterMlat = tlFilterMlatRef.current
 
     for (const track of data.tracks) {
-      // Apply active filter — skip non-matching tracks
-      if (filterMlat && !track.mlat) continue
-      if (filterOp && track.operator !== filterOp) continue
-      if (filterTc && track.type_code !== filterTc) continue
-      if (filterTg) {
-        const tgIdx = TYPE_GROUPS.findIndex(g => g.value === filterTg)
-        if (tgIdx >= 0 && track.tg_idx !== tgIdx) continue
-      }
+      if (!tlTrackMatchesFilter(track, filterOp, filterTc, filterTg, filterMlat)) continue
 
       const pts    = track.points
       const lastPt = pts[pts.length - 1]

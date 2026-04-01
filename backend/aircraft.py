@@ -94,8 +94,10 @@ async def aircraft_detail(icao: str) -> dict:
     result["type_desc"] = (live and live.get("type_desc")) or (f"{mfr} {model}".strip()) or None
 
     # --- Operator / owner ---
+    # Prefer live/row (already resolved via apply_adsbx/apply_hexdb) over raw sources.
     result["operator"] = (
         (live and live.get("operator"))
+        or (row and row.get("operator"))
         or (adsbx and adsbx.get("ownop"))
         or (hexdb and hexdb.get("RegisteredOwners"))
         or None
@@ -129,7 +131,7 @@ async def aircraft_detail(icao: str) -> dict:
         )
 
     # --- Year ---
-    result["year"] = (live and live.get("year")) or (adsbx and adsbx.get("year")) or None
+    result["year"] = (live and live.get("year")) or (row and row.get("year")) or (adsbx and adsbx.get("year")) or None
 
     # --- Registry history ---
     if row:
@@ -208,6 +210,69 @@ def _fetch_route_blocking(callsign: str) -> dict | None:
     }
 
 
+def _resolve_enrichment_fields(
+    icao: str,
+    hexdb: dict | None,
+    tar1090: dict | None,
+    adsbx: dict | None,
+) -> dict | None:
+    """Merge hexdb / tar1090 / adsbx into a single resolved enrichment dict.
+
+    Priority order: hexdb > tar1090 > adsbx.
+    Returns None if all sources are empty.
+    """
+    if not (hexdb or tar1090 or adsbx):
+        return None
+
+    # Registration: hexdb is the live register; tar1090 then adsbx as fallbacks
+    registration = (
+        (hexdb and (hexdb.get("Registration") or "").strip() or None)
+        or (tar1090 and (tar1090.get("Registration") or "").strip() or None)
+        or (adsbx and adsbx.get("reg"))
+        or None
+    )
+
+    # Type code: hexdb ICAOTypeCode preferred, tar1090 then adsbx as fallbacks
+    type_code = (
+        (hexdb and (hexdb.get("ICAOTypeCode") or "").strip() or None)
+        or (tar1090 and (tar1090.get("ICAOTypeCode") or "").strip() or None)
+        or (adsbx and adsbx.get("icaotype"))
+        or None
+    )
+    type_category = None
+    if type_code:
+        ti = enrichment.db.get_type_info(type_code)
+        if ti:
+            type_category = ti.get("desc") or None
+
+    # Manufacturer/year: adsbx tends to be more complete for these
+    mfr  = (hexdb and (hexdb.get("Manufacturer") or "").strip() or None) or (adsbx and adsbx.get("manufacturer")) or None
+    year = (adsbx and adsbx.get("year")) or None
+
+    # Operator: hexdb OperatorFlagCode → clean airline name, then RegisteredOwners,
+    # then tar1090 owner, then adsbx ownop as final fallback
+    operator = None
+    if hexdb:
+        flag_code = (hexdb.get("OperatorFlagCode") or "").strip()
+        if flag_code:
+            op = enrichment.db.get_operator(flag_code)
+            if op:
+                operator = op.get("n")
+        if not operator:
+            operator = (hexdb.get("RegisteredOwners") or "").strip() or None
+    if not operator:
+        operator = (tar1090 and (tar1090.get("RegisteredOwners") or "").strip() or None)
+    if not operator:
+        operator = (adsbx and adsbx.get("ownop")) or None
+
+    country = country_from_registration(registration) or enrichment.db.get_country_by_icao(icao)
+
+    return dict(
+        registration=registration, type_code=type_code, type_category=type_category,
+        operator=operator, manufacturer=mfr, year=year, country=country,
+    )
+
+
 @router.post("/{icao}/refresh")
 async def aircraft_refresh(icao: str) -> dict:
     """Force a fresh hexdb lookup, merge with ADSBex, write all resolved fields to
@@ -220,55 +285,13 @@ async def aircraft_refresh(icao: str) -> dict:
     tar1090 = await asyncio.to_thread(enrichment.db.get_tar1090, icao)
     adsbx = enrichment.db.get_adsbx(icao)
 
-    if hexdb or tar1090 or adsbx:
-        # Priority: hexdb > tar1090 > adsbx
-        # Registration: hexdb is the live register; tar1090 then adsbx as fallbacks
-        registration = (
-            (hexdb and (hexdb.get("Registration") or "").strip() or None)
-            or (tar1090 and (tar1090.get("Registration") or "").strip() or None)
-            or (adsbx and adsbx.get("reg"))
-            or None
-        )
-
-        # Type code: hexdb ICAOTypeCode preferred, tar1090 then adsbx as fallbacks
-        type_code = (
-            (hexdb and (hexdb.get("ICAOTypeCode") or "").strip() or None)
-            or (tar1090 and (tar1090.get("ICAOTypeCode") or "").strip() or None)
-            or (adsbx and adsbx.get("icaotype"))
-            or None
-        )
-        type_category = None
-        if type_code:
-            ti = enrichment.db.get_type_info(type_code)
-            if ti:
-                type_category = ti.get("desc") or None
-
-        # Manufacturer/year: adsbx tends to be more complete for these
-        mfr  = (hexdb and (hexdb.get("Manufacturer") or "").strip() or None) or (adsbx and adsbx.get("manufacturer")) or None
-        year = (adsbx and adsbx.get("year")) or None
-
-        # Operator: hexdb OperatorFlagCode → clean airline name, then RegisteredOwners,
-        # then tar1090 owner, then adsbx ownop as final fallback
-        operator = None
-        if hexdb:
-            flag_code = (hexdb.get("OperatorFlagCode") or "").strip()
-            if flag_code:
-                op = enrichment.db.get_operator(flag_code)
-                if op:
-                    operator = op.get("n")
-            if not operator:
-                operator = (hexdb.get("RegisteredOwners") or "").strip() or None
-        if not operator:
-            operator = (tar1090 and (tar1090.get("RegisteredOwners") or "").strip() or None)
-        if not operator:
-            operator = (adsbx and adsbx.get("ownop")) or None
-
-        country = country_from_registration(registration) or enrichment.db.get_country_by_icao(icao)
-
+    resolved = _resolve_enrichment_fields(icao, hexdb, tar1090, adsbx)
+    if resolved:
         await asyncio.to_thread(
             stats_db.force_update_aircraft_enrichment,
-            icao, registration, type_code, type_category,
-            operator, mfr, year, country,
+            icao,
+            resolved["registration"], resolved["type_code"], resolved["type_category"],
+            resolved["operator"], resolved["manufacturer"], resolved["year"], resolved["country"],
         )
 
     return await aircraft_detail(icao)

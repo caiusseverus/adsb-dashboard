@@ -1,9 +1,10 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useMemo } from 'react'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Cell,
 } from 'recharts'
 import { formatOperator } from '../utils/formatOperator'
+import { useFetch } from '../utils/useFetch'
 import styles from './FleetPage.module.css'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
@@ -16,19 +17,6 @@ const SINCE_OPTIONS = [
   { value: 1,    label: '24h' },
 ]
 
-function useFetch(url) {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(true)
-  useEffect(() => {
-    setLoading(true)
-    setData(null)
-    fetch(url)
-      .then(r => r.ok ? r.json() : null)
-      .then(d => { setData(d); setLoading(false) })
-      .catch(() => setLoading(false))
-  }, [url])
-  return { data, loading }
-}
 
 function Card({ title, children, controls }) {
   return (

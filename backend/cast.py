@@ -426,62 +426,44 @@ def _get_chromecast(device_name: str):
     return cc
 
 
-def render_display_image(aircraft: dict) -> bytes:
+def _load_font_bold(size: int):
+    """Load a bold TTF font; falls back to PIL default if none is installed."""
+    from PIL import ImageFont
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def _load_font_regular(size: int):
+    """Load a regular TTF font; falls back to PIL default if none is installed."""
+    from PIL import ImageFont
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def _compose_display_background(icao: str, W: int, H: int, BG: tuple):
+    """Return a 1280×720 RGBA Image with full-bleed photo and dark gradient bands.
+
+    Photo is fetched, scaled to fill the frame, and composited over a solid BG.
+    Gradient bands at the top and bottom fade to BG so text is always readable.
     """
-    Generate a 1280×720 JPEG for display on the Chromecast.
-    Full-bleed photo with dark gradient bands at top and bottom.
-    Top band: registration, aircraft type, operator.
-    Bottom band: callsign, route (if known).
-    Returns raw JPEG bytes.
-    """
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 
-    W, H = 1280, 720
-    PAD  = 32
-
-    BG        = (11, 12, 16)
-    TEXT      = (201, 209, 217)
-    SUBTEXT   = (110, 118, 129)
-    WHITE     = (255, 255, 255)
-    MILITARY  = (188, 140, 255)
-    EMERGENCY = (218, 54, 51)
-
-    def _bold(size: int):
-        for path in (
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        ):
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                pass
-        return ImageFont.load_default()
-
-    def _regular(size: int):
-        for path in (
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        ):
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                pass
-        return ImageFont.load_default()
-
-    f_reg      = _bold(48)
-    f_type_sm  = _regular(40)
-    f_op       = _regular(32)
-    f_call     = _bold(52)
-    f_route    = _bold(28)
-    f_rname    = _bold(44)
-    f_badge    = _bold(13)
-    f_ts       = _regular(13)
-    f_sightings = _bold(18)
-
-    # --- base: dark BG, then full-bleed photo ---
     img = Image.new("RGBA", (W, H), (*BG, 255))
 
-    icao = aircraft.get("icao", "").upper()
     photo_bytes = _fetch_photo(icao)
     if photo_bytes:
         try:
@@ -497,7 +479,6 @@ def render_display_image(aircraft: dict) -> bytes:
         except Exception as exc:
             log.debug("cast: photo render failed: %s", exc)
 
-    # --- gradient bands: top and bottom darken toward BG ---
     BAND = 210
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw_ov = ImageDraw.Draw(overlay)
@@ -506,8 +487,41 @@ def render_display_image(aircraft: dict) -> bytes:
         draw_ov.line([(0, i), (W - 1, i)], fill=(*BG, top_alpha))
         bot_alpha = int(230 * i / BAND)
         draw_ov.line([(0, H - BAND + i), (W - 1, H - BAND + i)], fill=(*BG, bot_alpha))
-    img = Image.alpha_composite(img, overlay)
+    return Image.alpha_composite(img, overlay)
 
+
+def render_display_image(aircraft: dict) -> bytes:
+    """
+    Generate a 1280×720 JPEG for display on the Chromecast.
+    Full-bleed photo with dark gradient bands at top and bottom.
+    Top band: registration, aircraft type, operator.
+    Bottom band: callsign, route (if known).
+    Returns raw JPEG bytes.
+    """
+    from PIL import Image, ImageDraw
+
+    W, H = 1280, 720
+    PAD  = 32
+
+    BG        = (11, 12, 16)
+    TEXT      = (201, 209, 217)
+    SUBTEXT   = (110, 118, 129)
+    WHITE     = (255, 255, 255)
+    MILITARY  = (188, 140, 255)
+    EMERGENCY = (218, 54, 51)
+
+    f_reg       = _load_font_bold(48)
+    f_type_sm   = _load_font_regular(40)
+    f_op        = _load_font_regular(32)
+    f_call      = _load_font_bold(52)
+    f_route     = _load_font_bold(28)
+    f_rname     = _load_font_bold(44)
+    f_badge     = _load_font_bold(13)
+    f_ts        = _load_font_regular(13)
+    f_sightings = _load_font_bold(18)
+
+    icao = aircraft.get("icao", "").upper()
+    img  = _compose_display_background(icao, W, H, BG)
     draw = ImageDraw.Draw(img)
 
     def trunc(text: str, font, max_w: int) -> str:
@@ -709,21 +723,33 @@ def check(aircraft_list: list[dict]) -> None:
 
     log.debug("cast: checking %d aircraft against %d rules", len(aircraft_list), len(rules))
     for ac in aircraft_list:
-        icao = ac.get("icao", "")
-        if not icao:
-            continue
-        if _on_cooldown(icao, cooldown_minutes):
-            continue
-        for rule in rules:
-            if _rule_matches(rule, ac):
-                _mark_cast(icao)
-                log.info(
-                    "cast: triggered for %s (%s) by rule %s:%s",
-                    icao, ac.get("callsign") or "-",
-                    rule["match_type"], rule.get("match_value") or "*",
-                )
-                _enqueue(ac, lan_url, device_name, display_seconds)
-                break  # one trigger per aircraft per cycle
+        _try_cast_aircraft(ac, rules, cooldown_minutes, lan_url, device_name, display_seconds)
+
+
+def _try_cast_aircraft(
+    ac: dict,
+    rules: list,
+    cooldown_minutes: int,
+    lan_url: str,
+    device_name: str,
+    display_seconds: int,
+) -> None:
+    """Check one aircraft against all rules; enqueue if a rule matches and not on cooldown."""
+    icao = ac.get("icao", "")
+    if not icao:
+        return
+    if _on_cooldown(icao, cooldown_minutes):
+        return
+    for rule in rules:
+        if _rule_matches(rule, ac):
+            _mark_cast(icao)
+            log.info(
+                "cast: triggered for %s (%s) by rule %s:%s",
+                icao, ac.get("callsign") or "-",
+                rule["match_type"], rule.get("match_value") or "*",
+            )
+            _enqueue(ac, lan_url, device_name, display_seconds)
+            return  # one trigger per aircraft per cycle
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import styles from './SettingsPage.module.css'
 import { fmtBytes } from '../utils/format'
+import { useReloadableFetch } from '../utils/useFetch'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 
@@ -98,22 +99,11 @@ function TriggersSection() {
 // Watchlist section
 // ---------------------------------------------------------------------------
 function WatchlistSection() {
-  const [list, setList]       = useState([])
-  const [loading, setLoading] = useState(true)
+  const { data: list, loading, reload: load } = useReloadableFetch(`${API_BASE}/api/notify/watchlist`, [])
   const [adding, setAdding]   = useState(false)
   const [newIcao, setNewIcao] = useState('')
   const [newRange, setNewRange] = useState('')
   const [error, setError]     = useState(null)
-
-  const load = useCallback(() => {
-    setLoading(true)
-    fetch(`${API_BASE}/api/notify/watchlist`)
-      .then(r => r.ok ? r.json() : [])
-      .then(d => { setList(d); setLoading(false) })
-      .catch(() => setLoading(false))
-  }, [])
-
-  useEffect(load, [load])
 
   const add = async () => {
     const icao = newIcao.trim().toUpperCase()
@@ -477,15 +467,7 @@ const MATCH_TYPE_LABELS = {
 }
 const MATCH_TYPES = Object.keys(MATCH_TYPE_LABELS)
 
-function CastSection() {
-  const [cfg, setCfg] = useState({
-    device_name: '', lan_url: '', display_seconds: 30,
-    cooldown_minutes: 30, active_hours_start: '', active_hours_end: '',
-  })
-  const [devices,   setDevices]   = useState([])
-  const [scanning,  setScanning]  = useState(false)
-  const [cfgSaving, setCfgSaving] = useState(false)
-  const [cfgMsg,    setCfgMsg]    = useState(null)
+function CastRulesManager({ inputSt, selectSt }) {
   const [rules,     setRules]     = useState([])
   const [newRule,   setNewRule]   = useState({ match_type: 'military', match_value: '', max_range_nm: '', max_altitude_ft: '' })
   const [addingRule, setAddingRule] = useState(false)
@@ -498,50 +480,7 @@ function CastSection() {
       .catch(() => {})
   }, [])
 
-  useEffect(() => {
-    fetch(`${API_BASE}/api/cast/config`)
-      .then(r => r.ok ? r.json() : {})
-      .then(d => setCfg(c => ({ ...c, ...d })))
-      .catch(() => {})
-    loadRules()
-  }, [loadRules])
-
-  const scan = async () => {
-    setScanning(true)
-    try {
-      const r = await fetch(`${API_BASE}/api/cast/devices`)
-      const d = r.ok ? await r.json() : { devices: [] }
-      setDevices(d.devices || [])
-    } finally {
-      setScanning(false)
-    }
-  }
-
-  const saveConfig = async () => {
-    setCfgSaving(true); setCfgMsg(null)
-    try {
-      const r = await fetch(`${API_BASE}/api/cast/config`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...cfg,
-          display_seconds:  Number(cfg.display_seconds),
-          cooldown_minutes: Number(cfg.cooldown_minutes),
-        }),
-      })
-      if (!r.ok) {
-        const d = await r.json().catch(() => ({}))
-        setCfgMsg({ ok: false, text: d.detail || `Error ${r.status}` })
-      } else {
-        setCfgMsg({ ok: true, text: 'Saved' })
-        setTimeout(() => setCfgMsg(null), 2000)
-      }
-    } catch (e) {
-      setCfgMsg({ ok: false, text: String(e) })
-    } finally {
-      setCfgSaving(false)
-    }
-  }
+  useEffect(loadRules, [loadRules])
 
   const addRule = async () => {
     setAddingRule(true); setRulesErr(null)
@@ -582,6 +521,142 @@ function CastSection() {
   const deleteRule = async (id) => {
     await fetch(`${API_BASE}/api/cast/rules/${id}`, { method: 'DELETE' })
     loadRules()
+  }
+
+  return (
+    <>
+      <div className={styles.cardHeader}
+        style={{ borderTop: '1px solid #21262d', paddingTop: '0.75rem', marginTop: '0.25rem' }}>
+        <span className={styles.cardTitle}>Cast rules</span>
+        <span className={styles.count}>{rules.length}</span>
+      </div>
+      <p className={styles.hint}>
+        Aircraft matching any enabled rule will trigger a cast. Leave range blank to match at any distance.
+      </p>
+
+      <div className={styles.addRow}>
+        <select style={selectSt}
+          value={newRule.match_type}
+          onChange={e => setNewRule(r => ({ ...r, match_type: e.target.value, match_value: '' }))}
+        >
+          {MATCH_TYPES.map(t => <option key={t} value={t}>{MATCH_TYPE_LABELS[t]}</option>)}
+        </select>
+        {newRule.match_type === 'icao' && (
+          <input className={styles.icaoInput}
+            placeholder="ICAO hex"
+            value={newRule.match_value}
+            onChange={e => setNewRule(r => ({ ...r, match_value: e.target.value.toUpperCase().slice(0, 6) }))}
+            maxLength={6} spellCheck={false}
+          />
+        )}
+        <input type="number" className={styles.rangeInput}
+          placeholder="range (nm)" min={0} step={1}
+          value={newRule.max_range_nm}
+          onChange={e => setNewRule(r => ({ ...r, max_range_nm: e.target.value }))}
+        />
+        <span className={styles.rangeUnit}>nm</span>
+        <input type="number" className={styles.rangeInput}
+          placeholder="max alt (ft)" min={0} step={500}
+          value={newRule.max_altitude_ft}
+          onChange={e => setNewRule(r => ({ ...r, max_altitude_ft: e.target.value }))}
+        />
+        <span className={styles.rangeUnit}>ft</span>
+        <button className={styles.addBtn} onClick={addRule} disabled={addingRule}>
+          {addingRule ? 'Adding…' : 'Add rule'}
+        </button>
+        {rulesErr && <span className={styles.errorMsg}>{rulesErr}</span>}
+      </div>
+
+      {rules.length === 0 ? (
+        <div className={styles.empty}>No cast rules configured.</div>
+      ) : (
+        <table className={styles.table}>
+          <thead>
+            <tr>
+              <th>Match</th>
+              <th>Value</th>
+              <th className={styles.num}>Max range</th>
+              <th className={styles.num}>Max alt</th>
+              <th>On</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {rules.map(rule => (
+              <tr key={rule.id}>
+                <td>{MATCH_TYPE_LABELS[rule.match_type] ?? rule.match_type}</td>
+                <td className={styles.icao}>{rule.match_value || '—'}</td>
+                <td className={styles.num}>{rule.max_range_nm != null ? `${rule.max_range_nm} nm` : 'any'}</td>
+                <td className={styles.num}>{rule.max_altitude_ft != null ? `${rule.max_altitude_ft.toLocaleString()} ft` : 'any'}</td>
+                <td>
+                  <label className={styles.toggle}>
+                    <input type="checkbox" checked={!!rule.enabled} onChange={() => toggleRule(rule)} />
+                  </label>
+                </td>
+                <td>
+                  <button className={styles.removeBtn} onClick={() => deleteRule(rule.id)}>Remove</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </>
+  )
+}
+
+function CastSection() {
+  const [cfg, setCfg] = useState({
+    device_name: '', lan_url: '', display_seconds: 30,
+    cooldown_minutes: 30, active_hours_start: '', active_hours_end: '',
+  })
+  const [devices,   setDevices]   = useState([])
+  const [scanning,  setScanning]  = useState(false)
+  const [cfgSaving, setCfgSaving] = useState(false)
+  const [cfgMsg,    setCfgMsg]    = useState(null)
+
+  useEffect(() => {
+    fetch(`${API_BASE}/api/cast/config`)
+      .then(r => r.ok ? r.json() : {})
+      .then(d => setCfg(c => ({ ...c, ...d })))
+      .catch(() => {})
+  }, [])
+
+  const scan = async () => {
+    setScanning(true)
+    try {
+      const r = await fetch(`${API_BASE}/api/cast/devices`)
+      const d = r.ok ? await r.json() : { devices: [] }
+      setDevices(d.devices || [])
+    } finally {
+      setScanning(false)
+    }
+  }
+
+  const saveConfig = async () => {
+    setCfgSaving(true); setCfgMsg(null)
+    try {
+      const r = await fetch(`${API_BASE}/api/cast/config`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...cfg,
+          display_seconds:  Number(cfg.display_seconds),
+          cooldown_minutes: Number(cfg.cooldown_minutes),
+        }),
+      })
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}))
+        setCfgMsg({ ok: false, text: d.detail || `Error ${r.status}` })
+      } else {
+        setCfgMsg({ ok: true, text: 'Saved' })
+        setTimeout(() => setCfgMsg(null), 2000)
+      }
+    } catch (e) {
+      setCfgMsg({ ok: false, text: String(e) })
+    } finally {
+      setCfgSaving(false)
+    }
   }
 
   const inputSt  = { background: '#0b0c10', border: '1px solid #30363d', borderRadius: 6, color: '#c9d1d9', fontSize: '0.82rem', padding: '0.35rem 0.6rem' }
@@ -676,83 +751,7 @@ function CastSection() {
         </div>
       </div>
 
-      {/* Rules */}
-      <div className={styles.cardHeader}
-        style={{ borderTop: '1px solid #21262d', paddingTop: '0.75rem', marginTop: '0.25rem' }}>
-        <span className={styles.cardTitle}>Cast rules</span>
-        <span className={styles.count}>{rules.length}</span>
-      </div>
-      <p className={styles.hint}>
-        Aircraft matching any enabled rule will trigger a cast. Leave range blank to match at any distance.
-      </p>
-
-      <div className={styles.addRow}>
-        <select style={selectSt}
-          value={newRule.match_type}
-          onChange={e => setNewRule(r => ({ ...r, match_type: e.target.value, match_value: '' }))}
-        >
-          {MATCH_TYPES.map(t => <option key={t} value={t}>{MATCH_TYPE_LABELS[t]}</option>)}
-        </select>
-        {newRule.match_type === 'icao' && (
-          <input className={styles.icaoInput}
-            placeholder="ICAO hex"
-            value={newRule.match_value}
-            onChange={e => setNewRule(r => ({ ...r, match_value: e.target.value.toUpperCase().slice(0, 6) }))}
-            maxLength={6} spellCheck={false}
-          />
-        )}
-        <input type="number" className={styles.rangeInput}
-          placeholder="range (nm)" min={0} step={1}
-          value={newRule.max_range_nm}
-          onChange={e => setNewRule(r => ({ ...r, max_range_nm: e.target.value }))}
-        />
-        <span className={styles.rangeUnit}>nm</span>
-        <input type="number" className={styles.rangeInput}
-          placeholder="max alt (ft)" min={0} step={500}
-          value={newRule.max_altitude_ft}
-          onChange={e => setNewRule(r => ({ ...r, max_altitude_ft: e.target.value }))}
-        />
-        <span className={styles.rangeUnit}>ft</span>
-        <button className={styles.addBtn} onClick={addRule} disabled={addingRule}>
-          {addingRule ? 'Adding…' : 'Add rule'}
-        </button>
-        {rulesErr && <span className={styles.errorMsg}>{rulesErr}</span>}
-      </div>
-
-      {rules.length === 0 ? (
-        <div className={styles.empty}>No cast rules configured.</div>
-      ) : (
-        <table className={styles.table}>
-          <thead>
-            <tr>
-              <th>Match</th>
-              <th>Value</th>
-              <th className={styles.num}>Max range</th>
-              <th className={styles.num}>Max alt</th>
-              <th>On</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {rules.map(rule => (
-              <tr key={rule.id}>
-                <td>{MATCH_TYPE_LABELS[rule.match_type] ?? rule.match_type}</td>
-                <td className={styles.icao}>{rule.match_value || '—'}</td>
-                <td className={styles.num}>{rule.max_range_nm != null ? `${rule.max_range_nm} nm` : 'any'}</td>
-                <td className={styles.num}>{rule.max_altitude_ft != null ? `${rule.max_altitude_ft.toLocaleString()} ft` : 'any'}</td>
-                <td>
-                  <label className={styles.toggle}>
-                    <input type="checkbox" checked={!!rule.enabled} onChange={() => toggleRule(rule)} />
-                  </label>
-                </td>
-                <td>
-                  <button className={styles.removeBtn} onClick={() => deleteRule(rule.id)}>Remove</button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
+      <CastRulesManager inputSt={inputSt} selectSt={selectSt} />
     </div>
   )
 }

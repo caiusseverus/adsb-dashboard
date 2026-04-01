@@ -176,6 +176,74 @@ INTERESTING_TYPE_CODES: frozenset[str] = frozenset({
 })
 
 
+def _build_coverage_top10_indices(rows) -> tuple[list, list, dict, dict]:
+    """Count operators and type codes across coverage rows and return top-10 index maps.
+
+    Returns (top_ops, top_tcs, op_idx_map, tc_idx_map).
+    op_idx_map/tc_idx_map map each top-10 name to its 0-based index; anything
+    outside the top 10 maps to index 10 ("other") in the caller.
+    """
+    op_counts: dict[str, int] = {}
+    tc_counts: dict[str, int] = {}
+    for r in rows:
+        if r["operator"]:
+            op_counts[r["operator"]] = op_counts.get(r["operator"], 0) + 1
+        if r["type_code"]:
+            tc_counts[r["type_code"]] = tc_counts.get(r["type_code"], 0) + 1
+    top_ops = [op for op, _ in sorted(op_counts.items(), key=lambda x: -x[1])[:10]]
+    top_tcs = [tc for tc, _ in sorted(tc_counts.items(), key=lambda x: -x[1])[:10]]
+    return top_ops, top_tcs, {op: i for i, op in enumerate(top_ops)}, {tc: i for i, tc in enumerate(top_tcs)}
+
+
+def _collect_visit_merges(
+    by_icao: dict,
+    max_gap_secs: int,
+) -> tuple[list[tuple], list[int]]:
+    """Walk each ICAO's chronologically-sorted visits and collect merge operations.
+
+    Returns (updates, deletes):
+      updates — list of positional tuples for the UPDATE visits SQL
+      deletes — list of visit IDs absorbed into their predecessor
+
+    A pair (a, b) is merged when the gap is within max_gap_secs and the
+    callsigns are compatible (same, or at least one is absent).
+    """
+    updates: list[tuple] = []
+    deletes: list[int] = []
+    for visits in by_icao.values():
+        i = 0
+        while i < len(visits) - 1:
+            a, b = visits[i], visits[i + 1]
+            gap = b["start_ts"] - a["end_ts"]
+            cs_a = (a["callsign"] or "").strip().rstrip("_")
+            cs_b = (b["callsign"] or "").strip().rstrip("_")
+            compatible = (not cs_a) or (not cs_b) or (cs_a == cs_b)
+            if gap < max_gap_secs and compatible:
+                alts = [x for x in (a["max_altitude"], b["max_altitude"]) if x is not None]
+                merged: dict = {
+                    "id":           a["id"],
+                    "end_ts":       b["end_ts"],
+                    "callsign":     cs_a or cs_b or None,
+                    "squawk":       a["squawk"] or b["squawk"],
+                    "max_altitude": max(alts) if alts else None,
+                    "msg_count":    (a["msg_count"] or 0) + (b["msg_count"] or 0),
+                    "origin_icao":  a["origin_icao"] or b["origin_icao"],
+                    "dest_icao":    b["dest_icao"] or a["dest_icao"],
+                }
+                updates.append((
+                    merged["end_ts"], merged["callsign"], merged["squawk"],
+                    merged["max_altitude"], merged["msg_count"],
+                    merged["origin_icao"], merged["dest_icao"], merged["id"],
+                ))
+                deletes.append(b["id"])
+                # Replace a in-place so it can absorb further neighbours
+                visits[i] = {**a, **{k: v for k, v in merged.items() if k != "id"}}
+                visits.pop(i + 1)
+            else:
+                i += 1
+    return updates, deletes
+
+
 class StatsDB:
     def __init__(self) -> None:
         self._last_written_ts: int = 0
@@ -343,7 +411,16 @@ class StatsDB:
                     year             TEXT
                 );
             """)
-        # Migrate existing databases that predate first_seen_flag
+        self._run_migrations()
+        log.info("DB: schema ready at %s", config.DB_PATH)
+
+    def _run_migrations(self) -> None:
+        """Apply incremental ALTER TABLE and CREATE TABLE migrations.
+
+        Each block is idempotent (try/except on already-existing columns/tables).
+        New migrations should be appended at the end.
+        """
+        # first_seen_flag added after initial schema
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -353,16 +430,16 @@ class StatsDB:
         except Exception:
             pass  # column already exists
 
-        # Migrate existing databases that predate signal columns in minute_stats
+        # Signal columns in minute_stats
         with self._connect() as conn:
             for col in ("signal_avg REAL", "signal_min REAL", "signal_max REAL",
                         "ac_with_pos INTEGER", "ac_mlat INTEGER"):
                 try:
                     conn.execute(f"ALTER TABLE minute_stats ADD COLUMN {col}")
                 except Exception:
-                    pass  # column already exists
+                    pass
 
-        # Migrate: add readsb-sourced SDR/CPR health columns to minute_stats
+        # readsb-sourced SDR/CPR health columns
         with self._connect() as conn:
             for col in (
                 "noise_dbfs REAL", "blocks_dropped INTEGER",
@@ -372,17 +449,17 @@ class StatsDB:
                 try:
                     conn.execute(f"ALTER TABLE minute_stats ADD COLUMN {col}")
                 except Exception:
-                    pass  # column already exists
+                    pass
 
-        # Migrate: add lat/lon/operator/manufacturer/year to aircraft_registry
+        # lat/lon/operator/manufacturer/year in aircraft_registry
         with self._connect() as conn:
             for col in ("lat REAL", "lon REAL", "operator TEXT", "manufacturer TEXT", "year TEXT"):
                 try:
                     conn.execute(f"ALTER TABLE aircraft_registry ADD COLUMN {col}")
                 except Exception:
-                    pass  # column already exists
+                    pass
 
-        # acas_events table (new — added for ACAS/TCAS RA logging)
+        # acas_events table (added for ACAS/TCAS RA logging)
         with self._connect() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS acas_events (
@@ -431,7 +508,7 @@ class StatsDB:
                     ON squawk_events(icao);
             """)
 
-        # notify_watchlist + notify_prefs tables — notification settings
+        # notify_watchlist, notify_prefs, cast_config, cast_rules
         with self._connect() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS notify_watchlist (
@@ -458,29 +535,27 @@ class StatsDB:
                 );
             """)
 
-        # Migrate: add mlat/had_pos columns to daily_aircraft_seen
+        # mlat/had_pos columns in daily_aircraft_seen
         with self._connect() as conn:
             for col in ("mlat INTEGER NOT NULL DEFAULT 0", "had_pos INTEGER NOT NULL DEFAULT 0"):
                 try:
                     conn.execute(f"ALTER TABLE daily_aircraft_seen ADD COLUMN {col}")
                 except Exception:
-                    pass  # column already exists
+                    pass
 
-        # Migrate: add mlat column to coverage_samples
+        # mlat column in coverage_samples
         with self._connect() as conn:
             try:
                 conn.execute("ALTER TABLE coverage_samples ADD COLUMN mlat INTEGER NOT NULL DEFAULT 0")
             except Exception:
-                pass  # column already exists
+                pass
 
-        # Migrate: add max_altitude_ft to cast_rules if missing
+        # max_altitude_ft in cast_rules
         with self._connect() as conn:
             try:
                 conn.execute("ALTER TABLE cast_rules ADD COLUMN max_altitude_ft INTEGER")
             except Exception:
-                pass  # column already exists
-
-        log.info("DB: schema ready at %s", config.DB_PATH)
+                pass
 
     # ------------------------------------------------------------------
     # Write path (called every minute via asyncio.to_thread)
@@ -1691,6 +1766,58 @@ class StatsDB:
             return "ar.last_seen DESC"
         return "type_rarity DESC, ar.last_seen DESC"
 
+    def _query_aircraft_registry_paged(
+        self,
+        where: str,
+        params: list,
+        order: str,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict], int]:
+        """Execute the shared aircraft_registry paged query with type-rarity CTE.
+        Returns (items, total_count)."""
+        with self._connect() as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM aircraft_registry ar WHERE {where}", params
+            ).fetchone()[0]
+            rows = conn.execute(f"""
+                WITH type_counts AS (
+                    SELECT type_code, COUNT(*) AS tc
+                    FROM aircraft_registry
+                    WHERE type_code IS NOT NULL AND type_code != ''
+                    GROUP BY type_code
+                )
+                SELECT ar.icao, ar.registration, ar.type_code, ar.type_category,
+                       ar.military, ar.country, ar.operator, ar.manufacturer, ar.year,
+                       ar.foreign_military, ar.interesting, ar.rare, ar.first_seen_flag,
+                       ar.first_seen, ar.last_seen, ar.sighting_count,
+                       COALESCE(tc.tc, 1)         AS type_count,
+                       1.0 / COALESCE(tc.tc, 1)  AS type_rarity
+                FROM aircraft_registry ar
+                LEFT JOIN type_counts tc ON ar.type_code = tc.type_code
+                WHERE {where}
+                ORDER BY {order}
+                LIMIT ? OFFSET ?
+            """, params + [limit, offset]).fetchall()
+        return [dict(r) for r in rows], total
+
+    def _apply_date_type_filters(
+        self,
+        where: str,
+        params: list,
+        days: int | None,
+        type_code: str | None,
+    ) -> tuple[str, list]:
+        """Append optional date and type_code WHERE clauses; returns updated (where, params)."""
+        if days is not None:
+            cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+            where += " AND ar.last_seen >= ?"
+            params.append(cutoff_ts)
+        if type_code:
+            where += " AND ar.type_code = ?"
+            params.append(type_code)
+        return where, params
+
     def query_notable(self, flag: str, limit: int = 100, offset: int = 0,
                       days: int | None = None, type_code: str | None = None,
                       sort_col: str | None = None, sort_dir: str = "desc",
@@ -1714,41 +1841,9 @@ class StatsDB:
             where += (" AND (ar.registration IS NOT NULL OR ar.type_code IS NOT NULL"
                       " OR ar.operator IS NOT NULL OR ar.military = 1)")
 
-        if days is not None:
-            cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
-            where += " AND ar.last_seen >= ?"
-            params.append(cutoff_ts)
-
-        if type_code:
-            where += " AND ar.type_code = ?"
-            params.append(type_code)
-
+        where, params = self._apply_date_type_filters(where, params, days, type_code)
         order = self._notable_order(flag, sort_col, sort_dir)
-
-        with self._connect() as conn:
-            total = conn.execute(
-                f"SELECT COUNT(*) FROM aircraft_registry ar WHERE {where}", params
-            ).fetchone()[0]
-            rows = conn.execute(f"""
-                WITH type_counts AS (
-                    SELECT type_code, COUNT(*) AS tc
-                    FROM aircraft_registry
-                    WHERE type_code IS NOT NULL AND type_code != ''
-                    GROUP BY type_code
-                )
-                SELECT ar.icao, ar.registration, ar.type_code, ar.type_category,
-                       ar.military, ar.country, ar.operator, ar.manufacturer, ar.year,
-                       ar.foreign_military, ar.interesting, ar.rare, ar.first_seen_flag,
-                       ar.first_seen, ar.last_seen, ar.sighting_count,
-                       COALESCE(tc.tc, 1)         AS type_count,
-                       1.0 / COALESCE(tc.tc, 1)  AS type_rarity
-                FROM aircraft_registry ar
-                LEFT JOIN type_counts tc ON ar.type_code = tc.type_code
-                WHERE {where}
-                ORDER BY {order}
-                LIMIT ? OFFSET ?
-            """, params + [limit, offset]).fetchall()
-        return [dict(r) for r in rows], total
+        return self._query_aircraft_registry_paged(where, params, order, limit, offset)
 
     def query_unique_sightings(self, limit: int = 100, offset: int = 0,
                                days: int | None = None, type_code: str | None = None,
@@ -1759,38 +1854,9 @@ class StatsDB:
         where = ("ar.sighting_count = 1"
                  " AND (ar.registration IS NOT NULL OR ar.type_code IS NOT NULL"
                  " OR ar.operator IS NOT NULL OR ar.military = 1)")
-        if days is not None:
-            cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
-            where += " AND ar.last_seen >= ?"
-            params.append(cutoff_ts)
-        if type_code:
-            where += " AND ar.type_code = ?"
-            params.append(type_code)
+        where, params = self._apply_date_type_filters(where, params, days, type_code)
         order = self._notable_order("unique_sighting", sort_col, sort_dir)
-        with self._connect() as conn:
-            total = conn.execute(
-                f"SELECT COUNT(*) FROM aircraft_registry ar WHERE {where}", params
-            ).fetchone()[0]
-            rows = conn.execute(f"""
-                WITH type_counts AS (
-                    SELECT type_code, COUNT(*) AS tc
-                    FROM aircraft_registry
-                    WHERE type_code IS NOT NULL AND type_code != ''
-                    GROUP BY type_code
-                )
-                SELECT ar.icao, ar.registration, ar.type_code, ar.type_category,
-                       ar.military, ar.country, ar.operator, ar.manufacturer, ar.year,
-                       ar.foreign_military, ar.interesting, ar.rare, ar.first_seen_flag,
-                       ar.first_seen, ar.last_seen, ar.sighting_count,
-                       COALESCE(tc.tc, 1)         AS type_count,
-                       1.0 / COALESCE(tc.tc, 1)  AS type_rarity
-                FROM aircraft_registry ar
-                LEFT JOIN type_counts tc ON ar.type_code = tc.type_code
-                WHERE {where}
-                ORDER BY {order}
-                LIMIT ? OFFSET ?
-            """, params + [limit, offset]).fetchall()
-        return [dict(r) for r in rows], total
+        return self._query_aircraft_registry_paged(where, params, order, limit, offset)
 
     def query_calendar_group(
         self, months: int,
@@ -2450,18 +2516,7 @@ class StatsDB:
                   AND (cs.rowid % ?) = 0
             """, params).fetchall()
 
-        # Top-10 operators and top-10 type codes by point count for compact colour indices
-        op_counts: dict[str, int] = {}
-        tc_counts: dict[str, int] = {}
-        for r in rows:
-            if r["operator"]:
-                op_counts[r["operator"]] = op_counts.get(r["operator"], 0) + 1
-            if r["type_code"]:
-                tc_counts[r["type_code"]] = tc_counts.get(r["type_code"], 0) + 1
-        top_ops  = [op for op, _ in sorted(op_counts.items(), key=lambda x: -x[1])[:10]]
-        top_tcs  = [tc for tc, _ in sorted(tc_counts.items(), key=lambda x: -x[1])[:10]]
-        op_idx_map = {op: i for i, op in enumerate(top_ops)}
-        tc_idx_map = {tc: i for i, tc in enumerate(top_tcs)}
+        top_ops, top_tcs, op_idx_map, tc_idx_map = _build_coverage_top10_indices(rows)
 
         TYPE_GROUP_LABELS = [
             'Widebody', 'Narrowbody', 'Regional', 'Biz Jet',
@@ -3092,42 +3147,7 @@ class StatsDB:
         for row in rows:
             by_icao.setdefault(row["icao"], []).append(dict(row))
 
-        updates: list[tuple] = []  # (end_ts, callsign, squawk, max_alt, msg_count, orig, dest, id)
-        deletes: list[int] = []
-
-        for visits in by_icao.values():
-            i = 0
-            while i < len(visits) - 1:
-                a, b = visits[i], visits[i + 1]
-                gap = b["start_ts"] - a["end_ts"]
-
-                cs_a = (a["callsign"] or "").strip().rstrip("_")
-                cs_b = (b["callsign"] or "").strip().rstrip("_")
-                compatible = (not cs_a) or (not cs_b) or (cs_a == cs_b)
-
-                if gap < max_gap_secs and compatible:
-                    alts = [x for x in (a["max_altitude"], b["max_altitude"]) if x is not None]
-                    merged: dict = {
-                        "id":          a["id"],
-                        "end_ts":      b["end_ts"],
-                        "callsign":    cs_a or cs_b or None,
-                        "squawk":      a["squawk"] or b["squawk"],
-                        "max_altitude": max(alts) if alts else None,
-                        "msg_count":   (a["msg_count"] or 0) + (b["msg_count"] or 0),
-                        "origin_icao": a["origin_icao"] or b["origin_icao"],
-                        "dest_icao":   b["dest_icao"] or a["dest_icao"],
-                    }
-                    updates.append((
-                        merged["end_ts"], merged["callsign"], merged["squawk"],
-                        merged["max_altitude"], merged["msg_count"],
-                        merged["origin_icao"], merged["dest_icao"], merged["id"],
-                    ))
-                    deletes.append(b["id"])
-                    # Replace a in-place so it can absorb further neighbours
-                    visits[i] = {**a, **{k: v for k, v in merged.items() if k != "id"}}
-                    visits.pop(i + 1)
-                else:
-                    i += 1
+        updates, deletes = _collect_visit_merges(by_icao, max_gap_secs)
 
         if updates or deletes:
             with self._connect() as conn:

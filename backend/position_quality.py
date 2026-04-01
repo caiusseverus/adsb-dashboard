@@ -69,11 +69,47 @@ class PositionQualityChecker:
             by_icao[icao] = item
         return by_icao
 
+    @staticmethod
+    def _build_comparison_row(
+        ac: dict, readsb: dict, readsb_source: str | None, now: float
+    ) -> dict | None:
+        """Compute horizontal/altitude error between internal and readsb positions.
+
+        Returns a comparison row dict, or None if either source lacks coordinates.
+        """
+        ilat, ilon = ac.get("lat"), ac.get("lon")
+        rlat, rlon = readsb.get("lat"), readsb.get("lon")
+        if ilat is None or ilon is None or rlat is None or rlon is None:
+            return None
+
+        horiz_err_m = round(_haversine_nm(ilat, ilon, rlat, rlon) * 1852, 1)
+        ialt = ac.get("altitude")
+        ralt = readsb.get("alt_baro")
+        if ralt == "ground":
+            ralt = 0
+        if ralt is None:
+            ralt = readsb.get("alt_geom")
+        alt_delta_ft = None
+        if isinstance(ialt, (int, float)) and isinstance(ralt, (int, float)):
+            alt_delta_ft = int(round(ialt - ralt))
+
+        return {
+            "icao":     (ac.get("icao") or "").upper(),
+            "callsign": (ac.get("callsign") or readsb.get("flight") or "").strip(),
+            "internal": {"lat": ilat, "lon": ilon, "altitude": ialt, "source": "internal"},
+            "readsb":   {"lat": rlat, "lon": rlon, "altitude": ralt,
+                         "seen": readsb.get("seen"), "source": readsb_source},
+            "horizontal_error_m": horiz_err_m,
+            "altitude_delta_ft":  alt_delta_ft,
+            "updated_at": now,
+        }
+
     def tick(self) -> None:
         readsb_payload = self._read_readsb_json()
         if readsb_payload is None:
             return
         readsb_by_icao = self._index_readsb(readsb_payload)
+        readsb_source = readsb_payload.get("_source")
         snapshot = self.state.get_snapshot()
         now = time.time()
 
@@ -87,57 +123,21 @@ class PositionQualityChecker:
             if not readsb:
                 continue
 
-            ilat, ilon = ac.get("lat"), ac.get("lon")
-            rlat, rlon = readsb.get("lat"), readsb.get("lon")
-            if ilat is None or ilon is None or rlat is None or rlon is None:
+            row = self._build_comparison_row(ac, readsb, readsb_source, now)
+            if row is None:
                 continue
 
-            horiz_err_m = round(_haversine_nm(ilat, ilon, rlat, rlon) * 1852, 1)
-            ialt = ac.get("altitude")
-            ralt = readsb.get("alt_baro")
-            if ralt == "ground":
-                ralt = 0
-            if ralt is None:
-                ralt = readsb.get("alt_geom")
-            alt_delta_ft = None
-            if isinstance(ialt, (int, float)) and isinstance(ralt, (int, float)):
-                alt_delta_ft = int(round(ialt - ralt))
-
-            row = {
-                "icao": icao,
-                "callsign": (ac.get("callsign") or readsb.get("flight") or "").strip(),
-                "internal": {
-                    "lat": ilat,
-                    "lon": ilon,
-                    "altitude": ialt,
-                    "source": "internal",
-                },
-                "readsb": {
-                    "lat": rlat,
-                    "lon": rlon,
-                    "altitude": ralt,
-                    "seen": readsb.get("seen"),
-                    "source": readsb_payload.get("_source"),
-                },
-                "horizontal_error_m": horiz_err_m,
-                "altitude_delta_ft": alt_delta_ft,
-                "updated_at": now,
-            }
             next_rows[icao] = row
             hist = self._history.setdefault(icao, deque(maxlen=300))
-            hist.append(
-                {
-                    "ts": now,
-                    "internal_altitude": ialt,
-                    "readsb_altitude": ralt,
-                    "internal_lat": ilat,
-                    "internal_lon": ilon,
-                    "readsb_lat": rlat,
-                    "readsb_lon": rlon,
-                    "horizontal_error_m": horiz_err_m,
-                    "altitude_delta_ft": alt_delta_ft,
-                }
-            )
+            hist.append({
+                "ts": now,
+                "internal_altitude": ac.get("altitude"),
+                "readsb_altitude":   row["readsb"]["altitude"],
+                "internal_lat": ac.get("lat"), "internal_lon": ac.get("lon"),
+                "readsb_lat":   readsb.get("lat"), "readsb_lon": readsb.get("lon"),
+                "horizontal_error_m": row["horizontal_error_m"],
+                "altitude_delta_ft":  row["altitude_delta_ft"],
+            })
             next_history_seen.add(icao)
 
         with self._lock:

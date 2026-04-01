@@ -232,19 +232,15 @@ async def override_aircraft_field(icao: str, req: OverrideRequest) -> dict:
     if row is None:
         raise HTTPException(status_code=404, detail=f"Aircraft {icao} not in registry")
 
-    await asyncio.to_thread(
-        stats_db.force_update_aircraft_enrichment,
-        icao,
-        req.value if req.field == "registration" else None,
-        req.value if req.field == "type_code"     else None,
-        None,
-        req.value if req.field == "operator"      else None,
-        req.value if req.field == "manufacturer"  else None,
-        req.value if req.field == "year"          else None,
-        req.value if req.field == "country"       else None,
-    )
-
-    if req.field == "military" and req.value is not None:
-        await asyncio.to_thread(stats_db.set_military_flag, icao, bool(req.value))
+    if req.field == "military":
+        if req.value is not None:
+            await asyncio.to_thread(stats_db.set_military_flag, icao, bool(req.value))
+    else:
+        # Build a sparse update: only the requested field is non-None; the rest
+        # pass through COALESCE in force_update_aircraft_enrichment unchanged.
+        kwargs: dict = dict(registration=None, type_code=None, type_category=None,
+                            operator=None, manufacturer=None, year=None, country=None)
+        kwargs[req.field] = req.value
+        await asyncio.to_thread(stats_db.force_update_aircraft_enrichment, icao, **kwargs)
 
     return {"status": "ok", "icao": icao, "field": req.field, "value": req.value}

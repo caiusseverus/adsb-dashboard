@@ -343,19 +343,42 @@ def _build(receiver_lat: float, receiver_lon: float, radius_nm: float,
         return gzip.decompress(cache.read_bytes()), metadata
 
     # Migrate legacy uncompressed .bin → .bin.gz (cache.stem strips the .gz suffix)
-    legacy = cache.with_name(cache.stem)
-    if legacy.exists():
-        log.info("Compressing terrain cache %s", legacy.name)
-        raw = legacy.read_bytes()
-        tmp = cache.with_suffix('.tmp')
-        tmp.write_bytes(gzip.compress(raw))
-        os.replace(tmp, cache)
-        legacy.unlink()
-        log.info("Compressed terrain cache: %s (%.0f KB on disk)", cache.name, cache.stat().st_size / 1024)
+    raw = _migrate_legacy_terrain_cache(cache)
+    if raw is not None:
         return raw, metadata
 
     log.info("Building terrain grid %dx%d r=%.0fnm — result will be cached", grid_n, grid_n, radius_nm)
+    elev_bytes = _build_and_cache_terrain(
+        receiver_lat, receiver_lon, radius_nm, grid_n, min_radius_nm, cache
+    )
+    return elev_bytes, metadata
 
+
+def _migrate_legacy_terrain_cache(cache) -> bytes | None:
+    """Compress a legacy uncompressed .bin cache file to .bin.gz in place.
+
+    Returns the raw elevation bytes if migration occurred, or None if no legacy file exists.
+    The .bin.gz path is derived from the .bin.gz cache path (cache.stem strips the .gz suffix).
+    """
+    legacy = cache.with_name(cache.stem)
+    if not legacy.exists():
+        return None
+    log.info("Compressing terrain cache %s", legacy.name)
+    raw = legacy.read_bytes()
+    tmp = cache.with_suffix('.tmp')
+    tmp.write_bytes(gzip.compress(raw))
+    os.replace(tmp, cache)
+    legacy.unlink()
+    log.info("Compressed terrain cache: %s (%.0f KB on disk)", cache.name, cache.stat().st_size / 1024)
+    return raw
+
+
+def _build_and_cache_terrain(
+    receiver_lat: float, receiver_lon: float,
+    radius_nm: float, grid_n: int, min_radius_nm: float,
+    cache,
+) -> bytes:
+    """Build an elevation grid, compress it, persist to cache, and return the raw bytes."""
     if _HAS_NUMPY:
         arr = _build_grid_np(receiver_lat, receiver_lon, radius_nm, grid_n, min_radius_nm)
         # astype('<i2') is a no-op on LE hosts (Pi, x86) — one copy via tobytes()
@@ -374,8 +397,7 @@ def _build(receiver_lat: float, receiver_lon: float, radius_nm: float,
         log.info("Terrain cache saved: %s (%.0f KB on disk)", cache.name, cache.stat().st_size / 1024)
     except OSError as exc:
         log.warning("Could not write terrain cache %s: %s", cache.name, exc)
-
-    return elev_bytes, metadata
+    return elev_bytes
 
 
 @router.get("/api/terrain/grid")
