@@ -464,6 +464,108 @@ def _published_position(ac: "Aircraft") -> tuple[float | None, float | None, flo
     return ac.lat, ac.lon, ac.range_nm, ac.bearing_deg
 
 
+def _aircraft_to_dict(ac: "Aircraft", now: float) -> tuple[dict, bool, bool]:
+    """Serialise one Aircraft to a snapshot dict.
+
+    Returns (entry_dict, has_pos, is_mlat) so the caller can accumulate
+    live counters without calling _pos_reliable() a second time.
+    """
+    pub_lat, pub_lon, pub_range_nm, pub_bearing_deg = _published_position(ac)
+    has_pos = pub_lat is not None  # _published_position already called _pos_reliable
+
+    try:
+        mlat_sources = {
+            src: {
+                "fixes":        len(buf),
+                "spikes":       sum(ac.mlat_spike_counts.get(src, {}).values()),
+                "spike_detail": dict(ac.mlat_spike_counts.get(src, {})),
+                "median_residual": (
+                    round(sorted(ac.mlat_residuals[src])[len(ac.mlat_residuals[src]) // 2], 3)
+                    if src in ac.mlat_residuals and len(ac.mlat_residuals[src]) >= 3
+                    else None
+                ),
+            }
+            for src, buf in ac.mlat_fixes.items()
+        }
+    except RuntimeError:
+        mlat_sources = {}
+
+    entry = {
+        "icao":              ac.icao,
+        "callsign":          ac.callsign,
+        "altitude":          ac.altitude if _alt_baro_reliable(ac) else None,
+        "squawk":            ac.squawk,
+        "signal":            ac.signal,
+        "msg_count":         ac.msg_count,
+        "age":               round(now - ac.last_seen, 1),
+        "registration":      ac.registration,
+        "type_code":         ac.type_code,
+        "type_desc":         ac.type_desc,
+        "type_full_name":    ac.type_full_name,
+        "type_category":     ac.type_category,
+        "wtc":               ac.wtc,
+        "military":          ac.military,
+        "operator":          ac.operator,
+        "country":           ac.country,
+        "year":              ac.year,
+        "manufacturer":      ac.manufacturer,
+        "lat":               pub_lat,
+        "lon":               pub_lon,
+        "range_nm":          pub_range_nm,
+        "bearing_deg":       pub_bearing_deg,
+        "airspeed_kts":      ac.airspeed_kts,
+        "airspeed_type":     ac.airspeed_type,
+        "heading_deg":       ac.heading_deg,
+        "vertical_rate_fpm": ac.vertical_rate_fpm,
+        "mach":              ac.mach,
+        "selected_alt":      ac.selected_alt,
+        "interesting":       bool(ac.type_code and ac.type_code.upper() in INTERESTING_TYPE_CODES),
+        "sighting_count":    ac.sighting_count,
+        "mlat":              ac.mlat,
+        "mlat_source":       ac.mlat_source,
+        "mlat_msg_count":    ac.mlat_msg_count,
+        "last_pos_age":      round(now - ac.last_pos_ts, 1) if ac.last_pos_ts > 0 else None,
+        "last_alt_age":      round(now - ac.last_alt_ts, 1) if ac.last_alt_ts > 0 else None,
+        "mlat_quality":      dict(ac.mlat_quality_scores),
+        "mlat_sources":      mlat_sources,
+        "acas_ra_active":    ac.acas_ra_ts is not None and (now - ac.acas_ra_ts) < 60,
+        "acas_ra_desc":      ac.acas_ra_desc,
+        "acas_ra_corrective": ac.acas_ra_corrective,
+        "acas_threat_icao":  ac.acas_threat_icao,
+        "acas_sensitivity":  ac.acas_sensitivity,
+        "pos_global":        ac.pos_global,
+        "pos_reliable_odd":  ac.pos_reliable_odd,
+        "pos_reliable_even": ac.pos_reliable_even,
+        "pos_confident":     has_pos,
+        # readsb-only fields (None when in Beast mode)
+        "alt_geom":          ac.alt_geom,
+        "gs":                ac.gs,
+        "track":             ac.track,
+        "track_rate":        ac.track_rate,
+        "roll":              ac.roll,
+        "true_heading":      ac.true_heading,
+        "geom_rate":         ac.geom_rate,
+        "emergency":         ac.emergency,
+        "nav_qnh":           ac.nav_qnh,
+        "nav_altitude_fms":  ac.nav_altitude_fms,
+        "nav_heading":       ac.nav_heading,
+        "nav_modes":         ac.nav_modes,
+        "nic":               ac.nic,
+        "rc":                ac.rc,
+        "nac_p":             ac.nac_p,
+        "nac_v":             ac.nac_v,
+        "sil":               ac.sil,
+        "gva":               ac.gva,
+        "sda":               ac.sda,
+        "adsb_version":      ac.adsb_version,
+        "wind_dir":          ac.wind_dir,
+        "wind_speed":        ac.wind_speed,
+        "oat":               ac.oat,
+        "tat":               ac.tat,
+    }
+    return entry, has_pos, ac.mlat
+
+
 def _try_fix_df17(raw_bytes: bytes) -> Optional[bytes]:
     """Attempt single-bit DF field correction to DF17.
 
@@ -1869,110 +1971,16 @@ class AircraftState:
         aircraft_list = []
 
         for ac in aircraft_refs:
-            pub_lat, pub_lon, pub_range_nm, pub_bearing_deg = _published_position(ac)
-            has_pos = _pos_reliable(ac)
-
+            entry, has_pos, is_mlat = _aircraft_to_dict(ac, now)
             if ac.military:
                 cur_mil += 1
             if has_pos:
                 cur_with_pos += 1
-            if ac.mlat:
+            if is_mlat:
                 mlat_aircraft_count += 1
                 if has_pos:
                     cur_mlat_pos += 1
-
-            # mlat_sources iterates container attributes that the decode
-            # thread can mutate; wrap defensively.
-            try:
-                mlat_sources = {
-                    src: {
-                        "fixes":        len(buf),
-                        "spikes":       sum(ac.mlat_spike_counts.get(src, {}).values()),
-                        "spike_detail": dict(ac.mlat_spike_counts.get(src, {})),
-                        "median_residual": (
-                            round(sorted(ac.mlat_residuals[src])[len(ac.mlat_residuals[src]) // 2], 3)
-                            if src in ac.mlat_residuals and len(ac.mlat_residuals[src]) >= 3
-                            else None
-                        ),
-                    }
-                    for src, buf in ac.mlat_fixes.items()
-                }
-            except RuntimeError:
-                mlat_sources = {}
-
-            aircraft_list.append({
-                "icao":              ac.icao,
-                "callsign":          ac.callsign,
-                "altitude":          ac.altitude if _alt_baro_reliable(ac) else None,
-                "squawk":            ac.squawk,
-                "signal":            ac.signal,
-                "msg_count":         ac.msg_count,
-                "age":               round(now - ac.last_seen, 1),
-                "registration":      ac.registration,
-                "type_code":         ac.type_code,
-                "type_desc":         ac.type_desc,
-                "type_full_name":    ac.type_full_name,
-                "type_category":     ac.type_category,
-                "wtc":               ac.wtc,
-                "military":          ac.military,
-                "operator":          ac.operator,
-                "country":           ac.country,
-                "year":              ac.year,
-                "manufacturer":      ac.manufacturer,
-                "lat":               pub_lat,
-                "lon":               pub_lon,
-                "range_nm":          pub_range_nm,
-                "bearing_deg":       pub_bearing_deg,
-                "airspeed_kts":      ac.airspeed_kts,
-                "airspeed_type":     ac.airspeed_type,
-                "heading_deg":       ac.heading_deg,
-                "vertical_rate_fpm": ac.vertical_rate_fpm,
-                "mach":              ac.mach,
-                "selected_alt":      ac.selected_alt,
-                "interesting":       bool(ac.type_code and ac.type_code.upper() in INTERESTING_TYPE_CODES),
-                "sighting_count":    ac.sighting_count,
-                "mlat":              ac.mlat,
-                "mlat_source":       ac.mlat_source,
-                "mlat_msg_count":    ac.mlat_msg_count,
-                "last_pos_age":      round(now - ac.last_pos_ts, 1) if ac.last_pos_ts > 0 else None,
-                "last_alt_age":      round(now - ac.last_alt_ts, 1) if ac.last_alt_ts > 0 else None,
-                "mlat_quality":      dict(ac.mlat_quality_scores),
-                "mlat_sources":      mlat_sources,
-                "acas_ra_active":    ac.acas_ra_ts is not None and (now - ac.acas_ra_ts) < 60,
-                "acas_ra_desc":      ac.acas_ra_desc,
-                "acas_ra_corrective": ac.acas_ra_corrective,
-                "acas_threat_icao":  ac.acas_threat_icao,
-                "acas_sensitivity":  ac.acas_sensitivity,
-                "pos_global":        ac.pos_global,
-                "pos_reliable_odd":  ac.pos_reliable_odd,
-                "pos_reliable_even": ac.pos_reliable_even,
-                "pos_confident":     has_pos,
-                # readsb-only fields (None when in Beast mode)
-                "alt_geom":          ac.alt_geom,
-                "gs":                ac.gs,
-                "track":             ac.track,
-                "track_rate":        ac.track_rate,
-                "roll":              ac.roll,
-                "true_heading":      ac.true_heading,
-                "geom_rate":         ac.geom_rate,
-                "emergency":         ac.emergency,
-                "nav_qnh":           ac.nav_qnh,
-                "nav_altitude_fms":  ac.nav_altitude_fms,
-                "nav_heading":       ac.nav_heading,
-                "nav_modes":         ac.nav_modes,
-                "nic":               ac.nic,
-                "rc":                ac.rc,
-                "nac_p":             ac.nac_p,
-                "nac_v":             ac.nac_v,
-                "sil":               ac.sil,
-                "gva":               ac.gva,
-                "sda":               ac.sda,
-                "adsb_version":      ac.adsb_version,
-                "wind_dir":          ac.wind_dir,
-                "wind_speed":        ac.wind_speed,
-                "oat":               ac.oat,
-                "tat":               ac.tat,
-            })
+            aircraft_list.append(entry)
 
         live_military = cur_mil
         cur_stats = (cur_min, cur_mn, cur_mx, cur_me,

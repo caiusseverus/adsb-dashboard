@@ -863,8 +863,8 @@ async def _memory_guard() -> None:
 # App lifespan
 # ---------------------------------------------------------------------------
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+async def _seed_startup_state() -> None:
+    """Run DB rollups and seed in-memory state from the database at startup."""
     await asyncio.to_thread(enrichment.db.load_or_download)
     await asyncio.to_thread(stats_db.rollup_missed_days)
     await asyncio.to_thread(stats_db.prune)
@@ -901,6 +901,49 @@ async def lifespan(app: FastAPI):
         if enrichment.db.get_country_by_icao(icao)
     }
     await asyncio.to_thread(stats_db.fix_military_countries, corrections, config.HOME_COUNTRY)
+
+
+async def _graceful_shutdown(bg_tasks: list) -> None:
+    """Cancel background tasks and flush all state to disk."""
+    log.info("Shutdown: cancelling background tasks…")
+    for t in bg_tasks:
+        t.cancel()
+    await asyncio.gather(*bg_tasks, return_exceptions=True)
+
+    # Stop the decoder thread before the final DB write so it can't be
+    # holding _lock when we call get_snapshot() below.
+    log.info("Shutdown: stopping decoder thread…")
+    _msg_queue.put(_DECODE_SENTINEL)
+    if _decoder_thread is not None:
+        _decoder_thread.join(timeout=2.0)
+
+    log.info("Shutdown: flushing state to disk…")
+    try:
+        final_snapshot = state.get_snapshot()
+        await asyncio.to_thread(stats_db.write_minute, final_snapshot)
+        # write_minute() may not flush the registry buffer if the interval hasn't
+        # elapsed — force a final flush so no aircraft data is lost on clean shutdown.
+        await asyncio.to_thread(stats_db.flush_registry_now)
+    except Exception:
+        log.exception("Shutdown: final DB write failed")
+
+    try:
+        enrichment.db.flush_hexdb_cache_if_dirty()
+    except Exception:
+        log.exception("Shutdown: hexdb cache flush failed")
+
+    # Checkpoint the WAL so next startup opens a clean DB without recovery.
+    try:
+        with stats_db._connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        log.info("Shutdown: WAL checkpoint complete")
+    except Exception:
+        log.exception("Shutdown: WAL checkpoint failed")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await _seed_startup_state()
 
     _bg_tasks: list[asyncio.Task] = []
     def _bg(coro):
@@ -964,43 +1007,9 @@ async def lifespan(app: FastAPI):
     yield
 
     # --- Graceful shutdown ---
-    # Cancel background tasks first; the explicit final DB write below
-    # handles persistence — we don't need _push_updates or _db_writer to
-    # finish their current cycle.
-    log.info("Shutdown: cancelling background tasks…")
-    for t in _bg_tasks:
-        t.cancel()
-    await asyncio.gather(*_bg_tasks, return_exceptions=True)
-
-    # Stop the decoder thread before the final DB write so it can't be
-    # holding _lock when we call get_snapshot() below.
-    log.info("Shutdown: stopping decoder thread…")
-    _msg_queue.put(_DECODE_SENTINEL)
-    if _decoder_thread is not None:
-        _decoder_thread.join(timeout=2.0)
-
-    log.info("Shutdown: flushing state to disk…")
-    try:
-        final_snapshot = state.get_snapshot()
-        await asyncio.to_thread(stats_db.write_minute, final_snapshot)
-        # write_minute() may not flush the registry buffer if the interval hasn't
-        # elapsed — force a final flush so no aircraft data is lost on clean shutdown.
-        await asyncio.to_thread(stats_db.flush_registry_now)
-    except Exception:
-        log.exception("Shutdown: final DB write failed")
-
-    try:
-        enrichment.db.flush_hexdb_cache_if_dirty()
-    except Exception:
-        log.exception("Shutdown: hexdb cache flush failed")
-
-    # Checkpoint the WAL so next startup opens a clean DB without recovery.
-    try:
-        with stats_db._connect() as conn:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        log.info("Shutdown: WAL checkpoint complete")
-    except Exception:
-        log.exception("Shutdown: WAL checkpoint failed")
+    # Cancel background tasks first; the explicit final DB write inside
+    # _graceful_shutdown handles persistence — no need for _db_writer to finish.
+    await _graceful_shutdown(_bg_tasks)
 
 
 app = FastAPI(title="ADS-B Dashboard", lifespan=lifespan)
