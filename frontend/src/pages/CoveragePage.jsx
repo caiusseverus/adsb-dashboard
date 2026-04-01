@@ -499,6 +499,126 @@ function tlDefaultDate() {
   return d.toISOString().slice(0, 10)
 }
 
+// Filter live trails dict to the active filter set.
+// ICAO is the most specific filter and takes precedence over all others.
+// Returns a new object (does not mutate trails).
+function _filterTrails(trails, { selectedIcao, mlatOnly, militaryOnly, selectedOperator, selectedTypeCode, selectedTypeGroup }) {
+  if (selectedIcao) {
+    return Object.fromEntries(Object.entries(trails).filter(([icao]) => icao === selectedIcao))
+  }
+  let filtered = trails
+  if (mlatOnly) {
+    filtered = Object.fromEntries(Object.entries(filtered).filter(([, pts]) =>
+      pts.length > 0 && pts[pts.length - 1].mlat))
+  }
+  if (militaryOnly) {
+    filtered = Object.fromEntries(Object.entries(filtered).filter(([, pts]) =>
+      pts.length > 0 && pts[pts.length - 1].military))
+  }
+  if (selectedOperator) {
+    filtered = Object.fromEntries(Object.entries(trails).filter(([, pts]) =>
+      pts.length > 0 && pts[pts.length - 1].operator === selectedOperator))
+  } else if (selectedTypeCode) {
+    filtered = Object.fromEntries(Object.entries(trails).filter(([, pts]) =>
+      pts.length > 0 && pts[pts.length - 1].type_code === selectedTypeCode))
+  } else if (selectedTypeGroup) {
+    const grp = TYPE_GROUPS.find(g => g.value === selectedTypeGroup)
+    if (grp) {
+      filtered = Object.fromEntries(Object.entries(trails).filter(([, pts]) => {
+        if (!pts.length) return false
+        const last = pts[pts.length - 1]
+        return grp.category
+          ? last.type_category?.startsWith(grp.category)
+          : grp.types.includes(last.type_code)
+      }))
+    }
+  }
+  return filtered
+}
+
+function CoverageLegend({ colorMode, isTgMode, isTagMode, isOpMode, operators, typeCodes,
+                          selectedOperator, selectedTypeGroup, selectedTypeCode,
+                          militaryOnly, mlatOnly, altScale, curveMode }) {
+  return (
+    <div className={styles.legend}>
+      {isTgMode && !(selectedTypeGroup || selectedTypeCode) && !(militaryOnly || mlatOnly) ? (
+        <>
+          {TYPE_GROUPS.map((g) => (
+            <span key={g.value} className={styles.legendItem}>
+              <span className={styles.dot} style={{ background: g.color }} />{g.label}
+            </span>
+          ))}
+          <span className={styles.legendItem}><span className={styles.dot} style={{ background: TYPE_GROUP_OTHER_COLOR }} />Other</span>
+        </>
+      ) : isTgMode && (militaryOnly || mlatOnly) && !(selectedTypeGroup || selectedTypeCode) ? (
+        <>
+          {typeCodes.map((tc, i) => (
+            <span key={tc} className={styles.legendItem}>
+              <span className={styles.dot} style={{ background: NAMED_PALETTE[i] }} />{tc}
+            </span>
+          ))}
+          {typeCodes.length > 0 && (
+            <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#484f58' }} />Other</span>
+          )}
+        </>
+      ) : isTgMode && (selectedTypeGroup || selectedTypeCode) ? (
+        <>
+          {operators.map((op, i) => (
+            <span key={op} className={styles.legendItem}>
+              <span className={styles.dot} style={{ background: NAMED_PALETTE[i] }} />{op}
+            </span>
+          ))}
+          {operators.length > 0 && (
+            <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#484f58' }} />Other</span>
+          )}
+        </>
+      ) : isTagMode ? (
+        <>
+          <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#bc8cff' }} />Military</span>
+          <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#d29922' }} />Interesting</span>
+          <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#3fb950' }} />Standard</span>
+        </>
+      ) : isOpMode ? (
+        <>
+          {selectedOperator ? (
+            <>
+              {typeCodes.map((tc, i) => (
+                <span key={tc} className={styles.legendItem}>
+                  <span className={styles.dot} style={{ background: NAMED_PALETTE[i] }} />{tc}
+                </span>
+              ))}
+              {typeCodes.length > 0 && (
+                <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#484f58' }} />Other</span>
+              )}
+            </>
+          ) : (
+            <>
+              {operators.map((op, i) => (
+                <span key={op} className={styles.legendItem}>
+                  <span className={styles.dot} style={{ background: NAMED_PALETTE[i] }} />{op}
+                </span>
+              ))}
+              {operators.length > 0 && (
+                <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#484f58' }} />Other</span>
+              )}
+            </>
+          )}
+        </>
+      ) : (
+        <>
+          <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#3fb950' }} />Low ({`<${ALT_SCALE_FT / 3000 | 0}k ft`})</span>
+          <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#d29922' }} />Mid</span>
+          <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#388bfd' }} />High</span>
+          <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#bc8cff' }} />{`>${Math.round(ALT_SCALE_FT * 0.67 / 1000)}k ft`}</span>
+        </>
+      )}
+      <span className={styles.legendItem} style={{ marginLeft: 'auto', color: '#484f58' }}>
+        rings = 50 nm · vertical ×{altScale}{curveMode ? ' · curved' : ''} · trails = live aircraft
+      </span>
+    </div>
+  )
+}
+
 const DAY_OPTIONS      = [{ label: '24h', value: 1 }, { label: '7d', value: 7 }, { label: '30d', value: 30 }, { label: '90d', value: 90 }]
 const MAX_POINT_OPTIONS = [50000, 100000, 200000, 500000]
 const DEFAULT_MAX_POINTS = 50000
@@ -1478,39 +1598,9 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
       if (trail.length > MAX_TRAIL_PTS) trail.splice(0, trail.length - MAX_TRAIL_PTS)
     }
 
-    // Filter live trails to match active filters. ICAO is most specific — takes precedence.
-    let filteredTrails = trails
-    if (selectedIcao) {
-      filteredTrails = Object.fromEntries(Object.entries(trails).filter(([icao]) =>
-        icao === selectedIcao))
-    } else {
-    if (mlatOnly) {
-      filteredTrails = Object.fromEntries(Object.entries(trails).filter(([, pts]) =>
-        pts.length > 0 && pts[pts.length - 1].mlat))
-    }
-    if (militaryOnly) {
-      filteredTrails = Object.fromEntries(Object.entries(filteredTrails).filter(([, pts]) =>
-        pts.length > 0 && pts[pts.length - 1].military))
-    }
-    if (selectedOperator) {
-      filteredTrails = Object.fromEntries(Object.entries(trails).filter(([, pts]) =>
-        pts.length > 0 && pts[pts.length - 1].operator === selectedOperator))
-    } else if (selectedTypeCode) {
-      filteredTrails = Object.fromEntries(Object.entries(trails).filter(([, pts]) =>
-        pts.length > 0 && pts[pts.length - 1].type_code === selectedTypeCode))
-    } else if (selectedTypeGroup) {
-      const grp = TYPE_GROUPS.find(g => g.value === selectedTypeGroup)
-      if (grp) {
-        filteredTrails = Object.fromEntries(Object.entries(trails).filter(([, pts]) => {
-          if (!pts.length) return false
-          const last = pts[pts.length - 1]
-          return grp.category
-            ? last.type_category?.startsWith(grp.category)
-            : grp.types.includes(last.type_code)
-        }))
-      }
-    }
-    }  // end else (non-ICAO filters)
+    const filteredTrails = _filterTrails(trails, {
+      selectedIcao, mlatOnly, militaryOnly, selectedOperator, selectedTypeCode, selectedTypeGroup,
+    })
 
     // Compute top-10 operators and type codes from visible live aircraft for colouring.
     const opCounts = {}, tcCounts = {}
@@ -1856,86 +1946,13 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
         </div>
       </div>
 
-      <div className={styles.legend}>
-        {isTgMode && !(selectedTypeGroup || selectedTypeCode) && !(militaryOnly || mlatOnly) ? (
-          <>
-            {TYPE_GROUPS.map((g) => (
-              <span key={g.value} className={styles.legendItem}>
-                <span className={styles.dot} style={{ background: g.color }} />{g.label}
-              </span>
-            ))}
-            <span className={styles.legendItem}><span className={styles.dot} style={{ background: TYPE_GROUP_OTHER_COLOR }} />Other</span>
-          </>
-        ) : isTgMode && (militaryOnly || mlatOnly) && !(selectedTypeGroup || selectedTypeCode) ? (
-          // Military/MLAT filter active — legend shows type codes (effectiveColorMode = 'type_code')
-          <>
-            {typeCodes.map((tc, i) => (
-              <span key={tc} className={styles.legendItem}>
-                <span className={styles.dot} style={{ background: NAMED_PALETTE[i] }} />{tc}
-              </span>
-            ))}
-            {typeCodes.length > 0 && (
-              <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#484f58' }} />Other</span>
-            )}
-          </>
-        ) : isTgMode && (selectedTypeGroup || selectedTypeCode) ? (
-          // Type filter active — legend shows operators (effectiveColorMode = 'operator')
-          <>
-            {operators.map((op, i) => (
-              <span key={op} className={styles.legendItem}>
-                <span className={styles.dot} style={{ background: NAMED_PALETTE[i] }} />{op}
-              </span>
-            ))}
-            {operators.length > 0 && (
-              <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#484f58' }} />Other</span>
-            )}
-          </>
-        ) : isTagMode ? (
-          <>
-            <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#bc8cff' }} />Military</span>
-            <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#d29922' }} />Interesting</span>
-            <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#3fb950' }} />Standard</span>
-          </>
-        ) : isOpMode ? (
-          <>
-            {selectedOperator ? (
-              // Operator selected → legend shows type codes (fleet composition)
-              <>
-                {typeCodes.map((tc, i) => (
-                  <span key={tc} className={styles.legendItem}>
-                    <span className={styles.dot} style={{ background: NAMED_PALETTE[i] }} />{tc}
-                  </span>
-                ))}
-                {typeCodes.length > 0 && (
-                  <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#484f58' }} />Other</span>
-                )}
-              </>
-            ) : (
-              // No operator selected → legend shows operator names
-              <>
-                {operators.map((op, i) => (
-                  <span key={op} className={styles.legendItem}>
-                    <span className={styles.dot} style={{ background: NAMED_PALETTE[i] }} />{op}
-                  </span>
-                ))}
-                {operators.length > 0 && (
-                  <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#484f58' }} />Other</span>
-                )}
-              </>
-            )}
-          </>
-        ) : (
-          <>
-            <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#3fb950' }} />Low ({`<${ALT_SCALE_FT / 3000 | 0}k ft`})</span>
-            <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#d29922' }} />Mid</span>
-            <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#388bfd' }} />High</span>
-            <span className={styles.legendItem}><span className={styles.dot} style={{ background: '#bc8cff' }} />{`>${Math.round(ALT_SCALE_FT * 0.67 / 1000)}k ft`}</span>
-          </>
-        )}
-        <span className={styles.legendItem} style={{ marginLeft: 'auto', color: '#484f58' }}>
-          rings = 50 nm · vertical ×{altScale}{curveMode ? ' · curved' : ''} · trails = live aircraft
-        </span>
-      </div>
+      <CoverageLegend
+        colorMode={colorMode} isTgMode={isTgMode} isTagMode={isTagMode} isOpMode={isOpMode}
+        operators={operators} typeCodes={typeCodes}
+        selectedOperator={selectedOperator} selectedTypeGroup={selectedTypeGroup} selectedTypeCode={selectedTypeCode}
+        militaryOnly={militaryOnly} mlatOnly={mlatOnly}
+        altScale={altScale} curveMode={curveMode}
+      />
     </div>
   )
 }
