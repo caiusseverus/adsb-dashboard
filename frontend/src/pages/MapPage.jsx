@@ -206,7 +206,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
         .then(d => {
           const lat = d?.config?.receiver_lat
           const lon = d?.config?.receiver_lon
-          if (lat && lon) placeMarker(lat, lon)
+          if (lat != null && lon != null) placeMarker(lat, lon)
         })
         .catch(() => {})
     }

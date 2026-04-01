@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import styles from './SettingsPage.module.css'
+import { fmtBytes } from '../utils/format'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 
@@ -8,12 +9,6 @@ function fmtTs(ts) {
   if (!ts) return '—'
   return new Date(ts * 1000).toLocaleDateString('en-GB', DATE_FMT)
 }
-function fmtBytes(n) {
-  if (n == null) return '—'
-  if (n < 1024 ** 2) return `${(n / 1024).toFixed(0)} KB`
-  return `${(n / 1024 ** 2).toFixed(1)} MB`
-}
-
 // ---------------------------------------------------------------------------
 // Notification trigger row
 // ---------------------------------------------------------------------------

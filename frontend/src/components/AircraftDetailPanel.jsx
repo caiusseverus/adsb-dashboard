@@ -111,19 +111,6 @@ function MiniMap({ icao, visitId }) {
   return <div ref={containerRef} className={styles.miniMap} />
 }
 
-function RouteDisplay({ visits, visitId }) {
-  if (!visits?.length) return null
-  const v = visitId ? visits.find(x => x.id === visitId) : null
-  const visit = v || visits[0]
-  if (!visit?.origin_icao && !visit?.dest_icao) return null
-  return (
-    <div className={styles.routeInline}>
-      <span className={styles.routeCode}>{visit.origin_icao ?? '?'}</span>
-      <span className={styles.routeArrow}>→</span>
-      <span className={styles.routeCode}>{visit.dest_icao ?? '?'}</span>
-    </div>
-  )
-}
 
 export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefreshed, initialVisitTs, onOpenCoverage }) {
   const [data, setData] = useState(null)
@@ -178,7 +165,7 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
     fetch(`${API_BASE}/api/notify/watchlist/${icao}`)
       .then(r => r.ok ? r.json() : { watched: false })
       .then(d => setWatched(d.watched))
-      .catch(() => {})
+      .catch(() => setWatched(false))
   }, [icao])
 
   useEffect(() => {

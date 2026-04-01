@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import styles from './StatusPage.module.css'
 import BenchmarkPanel from './BenchmarkPanel'
+import { fmtBytes } from '../utils/format'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 
@@ -15,14 +16,6 @@ const TABLE_DESCRIPTIONS = {
   coverage_samples:       { label: 'Coverage samples',      desc: 'Per-minute range/bearing/altitude samples; used for polar plot and range charts' },
   acas_events:            { label: 'ACAS events',           desc: 'Decoded TCAS/ACAS Resolution Advisory events' },
   squawk_events:          { label: 'Emergency squawks',     desc: 'Emergency squawk observations (7700/7600/7500); 90-day retention' },
-}
-
-function fmtBytes(n) {
-  if (n == null) return '—'
-  if (n < 1024) return `${n} B`
-  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`
-  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`
-  return `${(n / 1024 ** 3).toFixed(2)} GB`
 }
 
 function fmtRows(n) {
@@ -58,7 +51,7 @@ export default function StatusPage() {
     fetch(`${API_BASE}/api/status`)
       .then(r => r.ok ? r.json() : null)
       .then(d => setStatus(d))
-      .catch(() => {})
+      .catch(() => setStatus({}))
   }, [])
 
   useEffect(() => {

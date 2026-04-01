@@ -34,7 +34,6 @@ def _load_coastline() -> list:
 
 
 def _project_coastline(range_nm: float) -> dict:
-    import config
     if config.RECEIVER_LAT is None or config.RECEIVER_LON is None:
         return {"segments": []}
     rlat, rlon = config.RECEIVER_LAT, config.RECEIVER_LON
@@ -72,7 +71,6 @@ def _load_airports() -> list:
 
 
 def _project_airports(range_nm: float, types: str) -> dict:
-    import config
     if config.RECEIVER_LAT is None or config.RECEIVER_LON is None:
         return {"airports": []}
     rlat, rlon = config.RECEIVER_LAT, config.RECEIVER_LON

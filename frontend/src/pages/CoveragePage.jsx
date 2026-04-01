@@ -1109,7 +1109,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
               .then(r => r.json())
               .then(freshData => {
                 const minDt = freshData.tracks.length > 0
-                  ? Math.min(...freshData.tracks.map(t => t.points[0]?.[0] ?? 0))
+                  ? freshData.tracks.reduce((m, t) => Math.min(m, t.points[0]?.[0] ?? 0), Infinity)
                   : tlStartDtRef.current
                 tlDataRef.current = freshData
                 doRestart(minDt, freshData)
