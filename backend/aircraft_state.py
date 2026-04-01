@@ -992,6 +992,333 @@ class Aircraft:
     tat:              Optional[int]   = None  # total air temperature °C
 
 
+def _decode_df17_18(
+    ac: "Aircraft",
+    df: int,
+    raw: bytes,
+    raw_len: int,
+    _nd: "dict | None",
+    crc_clean: bool,
+    source: "MsgSource",
+    mlat: bool,
+    mlat_source: "Optional[str]",
+    now: float,
+) -> None:
+    """Decode callsign, altitude, and CPR position from a DF17/18 ADS-B frame.
+
+    Supports both the native C decode path (_nd is not None) and the pyModeS
+    fallback (_nd is None).  Mutates *ac* in place; no return value.
+    """
+    if _nd is not None:
+        # ── Native C path ───────────────────────────────────────────────────
+        nd_callsign    = _nd.get('callsign')
+        nd_baro_alt    = _nd.get('baro_alt')
+        nd_cpr_odd     = _nd.get('cpr_odd')
+        nd_heading_type = _nd.get('heading_type')
+        nd_heading     = _nd.get('heading')
+        nd_ias         = _nd.get('ias')
+        nd_tas         = _nd.get('tas')
+        nd_mach        = _nd.get('mach')
+        nd_baro_rate   = _nd.get('baro_rate')
+
+        # Callsign (type codes 1-4)
+        if nd_callsign:
+            ac.callsign = nd_callsign.strip().rstrip('_')
+            if ac.callsign and not ac.operator:
+                op = enrichment.db.get_operator(ac.callsign[:3])
+                if op:
+                    ac.operator = op.get("n")
+                    if not ac.country:
+                        ac.country = op.get("c")
+
+        # Altitude (type codes 9-18, 20-22)
+        if nd_baro_alt is not None:
+            _accept_altitude(ac, nd_baro_alt, source, crc_clean, now)
+
+        # CPR position (type codes 9-22)
+        if nd_cpr_odd is not None:
+            _cpr_oe = 1 if nd_cpr_odd else 0
+            if not _is_cpr_duplicate(ac, raw, _cpr_oe, now):
+                _cpr_lat_int = _nd['cpr_lat']
+                _cpr_lon_int = _nd['cpr_lon']
+                # ADS-B and MLAT frames maintain independent CPR pairs to avoid
+                # cross-source contamination that produces garbage positions.
+                if mlat:
+                    _msrc = mlat_source or "mlat"
+                    if _cpr_oe == 0:
+                        ac.mlat_cpr_even[_msrc] = (_cpr_lat_int, _cpr_lon_int, now)
+                    else:
+                        ac.mlat_cpr_odd[_msrc]  = (_cpr_lat_int, _cpr_lon_int, now)
+                else:
+                    if _cpr_oe == 0:
+                        ac.cpr_even = (_cpr_lat_int, _cpr_lon_int, now)
+                    else:
+                        ac.cpr_odd  = (_cpr_lat_int, _cpr_lon_int, now)
+
+                pos = None
+                pos_from_global = False
+                global_bad = False
+                if (not mlat
+                        and ac.cpr_even and ac.cpr_odd
+                        and abs(ac.cpr_even[2] - ac.cpr_odd[2]) < 10):
+                    pos = _decode_cffi.solve_cpr_airborne(
+                        ac.cpr_even[0], ac.cpr_even[1],
+                        ac.cpr_odd[0],  ac.cpr_odd[1],
+                        _cpr_oe,
+                    )
+                    if pos is not None:
+                        pos_from_global = True
+                    elif ac.pos_global:
+                        global_bad = True
+                elif (mlat
+                        and _msrc in ac.mlat_cpr_even and _msrc in ac.mlat_cpr_odd
+                        and abs(ac.mlat_cpr_even[_msrc][2] - ac.mlat_cpr_odd[_msrc][2]) < 10):
+                    pos = _decode_cffi.solve_cpr_airborne(
+                        ac.mlat_cpr_even[_msrc][0], ac.mlat_cpr_even[_msrc][1],
+                        ac.mlat_cpr_odd[_msrc][0],  ac.mlat_cpr_odd[_msrc][1],
+                        _cpr_oe,
+                    )
+                    if pos is not None:
+                        pos_from_global = True
+                    elif ac.pos_global:
+                        global_bad = True
+
+                if not pos_from_global and not global_bad:
+                    ref_lat = ac.lat if ac.lat is not None else config.RECEIVER_LAT
+                    ref_lon = ac.lon if ac.lon is not None else config.RECEIVER_LON
+                    if ref_lat is not None and ref_lon is not None:
+                        pos = _decode_cffi.solve_cpr_relative(
+                            ref_lat, ref_lon, _cpr_lat_int, _cpr_lon_int, _cpr_oe,
+                        )
+
+                if pos:
+                    lat, lon = pos
+                    if -90 <= lat <= 90 and -180 <= lon <= 180:
+                        if (config.RECEIVER_LAT is not None
+                                and config.RECEIVER_LON is not None
+                                and _haversine_nm(
+                                    config.RECEIVER_LAT, config.RECEIVER_LON,
+                                    lat, lon) > config.MAX_RANGE_NM):
+                            pass
+                        elif mlat:
+                            if (ac.has_adsb
+                                    and ac.lat is not None
+                                    and now - ac._last_mlat_force_ts > _MLAT_FORCE_INTERVAL_S
+                                    and _haversine_nm(ac.lat, ac.lon, lat, lon) > _MLAT_FORCE_DISTANCE_NM):
+                                ac._last_mlat_force_ts = now
+                                ac.pos_reliable_odd  = _POS_RELIABLE_PUBLISH
+                                ac.pos_reliable_even = _POS_RELIABLE_PUBLISH
+                            _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
+                        elif not mlat and config.INGEST_MODE != "hybrid":
+                            _accept_adsb_position(ac, lat, lon, pos_from_global, _cpr_oe == 1, now)
+    else:
+        # ── pyModeS fallback ─────────────────────────────────────────────────
+        raw_hex = raw.hex().upper()
+        try:
+            tc = pms.adsb.typecode(raw_hex)
+        except Exception:
+            return
+        if tc is None:
+            return
+
+        # Identification (callsign)
+        if 1 <= tc <= 4:
+            try:
+                cs = pms.adsb.callsign(raw_hex)
+                if cs:
+                    ac.callsign = cs.strip().rstrip('_')
+                    if ac.callsign and not ac.operator:
+                        op = enrichment.db.get_operator(ac.callsign[:3])
+                        if op:
+                            ac.operator = op.get("n")
+                            if not ac.country:
+                                ac.country = op.get("c")
+            except Exception:
+                pass
+
+        # Airborne position — altitude + CPR lat/lon
+        elif 9 <= tc <= 18 or 20 <= tc <= 22:
+            try:
+                alt = pms.adsb.altitude(raw_hex)
+                if alt is not None:
+                    _accept_altitude(ac, int(alt), source, crc_clean, now)
+            except Exception:
+                pass
+            try:
+                oe = pms.adsb.oe_flag(raw_hex)
+                if not _is_cpr_duplicate(ac, raw, oe, now):
+                    if mlat:
+                        _msrc = mlat_source or "mlat"
+                        if oe == 0:
+                            ac.mlat_cpr_even[_msrc] = (raw, now)
+                        else:
+                            ac.mlat_cpr_odd[_msrc] = (raw, now)
+                    else:
+                        if oe == 0:
+                            ac.cpr_even = (raw, now)
+                        else:
+                            ac.cpr_odd = (raw, now)
+
+                    pos = None
+                    pos_from_global = False
+                    global_bad = False
+                    if (not mlat
+                            and ac.cpr_even and ac.cpr_odd
+                            and abs(ac.cpr_even[1] - ac.cpr_odd[1]) < 10):
+                        pos = pms.adsb.position(
+                            ac.cpr_even[0], ac.cpr_odd[0],
+                            ac.cpr_even[1], ac.cpr_odd[1],
+                        )
+                        if pos is not None:
+                            pos_from_global = True
+                        elif ac.pos_global:
+                            global_bad = True
+                    elif (mlat
+                            and _msrc in ac.mlat_cpr_even and _msrc in ac.mlat_cpr_odd
+                            and abs(ac.mlat_cpr_even[_msrc][1] - ac.mlat_cpr_odd[_msrc][1]) < 10):
+                        pos = pms.adsb.position(
+                            ac.mlat_cpr_even[_msrc][0], ac.mlat_cpr_odd[_msrc][0],
+                            ac.mlat_cpr_even[_msrc][1], ac.mlat_cpr_odd[_msrc][1],
+                        )
+                        if pos is not None:
+                            pos_from_global = True
+                        elif ac.pos_global:
+                            global_bad = True
+
+                    if not pos_from_global and not global_bad:
+                        ref_lat = ac.lat if ac.lat is not None else config.RECEIVER_LAT
+                        ref_lon = ac.lon if ac.lon is not None else config.RECEIVER_LON
+                        if ref_lat is not None and ref_lon is not None:
+                            pos = pms.adsb.position_with_ref(raw_hex, ref_lat, ref_lon)
+
+                    if pos:
+                        lat, lon = pos
+                        if -90 <= lat <= 90 and -180 <= lon <= 180:
+                            if (config.RECEIVER_LAT is not None
+                                    and config.RECEIVER_LON is not None
+                                    and _haversine_nm(
+                                        config.RECEIVER_LAT, config.RECEIVER_LON,
+                                        lat, lon) > config.MAX_RANGE_NM):
+                                pass
+                            elif mlat:
+                                if (ac.has_adsb
+                                        and ac.lat is not None
+                                        and now - ac._last_mlat_force_ts > _MLAT_FORCE_INTERVAL_S
+                                        and _haversine_nm(ac.lat, ac.lon, lat, lon) > _MLAT_FORCE_DISTANCE_NM):
+                                    ac._last_mlat_force_ts = now
+                                    ac.pos_reliable_odd  = _POS_RELIABLE_PUBLISH
+                                    ac.pos_reliable_even = _POS_RELIABLE_PUBLISH
+                                _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
+                            elif not mlat and config.INGEST_MODE != "hybrid":
+                                _accept_adsb_position(ac, lat, lon, pos_from_global, oe == 1, now)
+            except Exception:
+                pass
+
+
+def _decode_ehs(
+    ac: "Aircraft",
+    raw: bytes,
+    _nd: "dict | None",
+    mlat: bool,
+    now: float,
+) -> None:
+    """Apply EHS (Enhanced Surveillance) BDS 4.0/5.0/6.0 data from a DF20/21 frame.
+
+    Supports both native C (_nd is not None) and pyModeS fallback paths.
+    Mutates *ac* in place; no return value.
+    """
+    if _nd is not None:
+        nd_tas              = _nd.get('tas')
+        nd_heading_type     = _nd.get('heading_type')
+        nd_heading          = _nd.get('heading')
+        nd_ias              = _nd.get('ias')
+        nd_mach             = _nd.get('mach')
+        nd_baro_rate        = _nd.get('baro_rate')
+        nd_nav_altitude_mcp = _nd.get('nav_altitude_mcp')
+
+        # BDS 4.0: selected altitude
+        if not mlat and nd_nav_altitude_mcp is not None:
+            ac.selected_alt = nd_nav_altitude_mcp
+
+        # BDS 5.0: TAS + ground track
+        if nd_tas is not None:
+            ac.airspeed_kts  = nd_tas
+            ac.airspeed_type = "TAS"
+        # heading_type 1 = HEADING_GROUND_TRACK (BDS 5.0)
+        if nd_heading_type == 1 and nd_heading is not None:
+            ac.heading_deg = round(float(nd_heading), 1)
+
+        # BDS 6.0: IAS + Mach + magnetic heading + baro vertical rate
+        if nd_ias is not None:
+            ac.airspeed_kts  = nd_ias
+            ac.airspeed_type = "IAS"
+        if nd_mach is not None:
+            ac.mach = round(float(nd_mach), 3)
+        # heading_type 3 = HEADING_MAGNETIC (BDS 6.0)
+        if nd_heading_type == 3 and nd_heading is not None:
+            ac.heading_deg = round(float(nd_heading), 1)
+        if not mlat and nd_baro_rate is not None:
+            ac.vertical_rate_fpm = nd_baro_rate
+            ac._vrate_baro_fpm   = nd_baro_rate
+            ac._vrate_baro_ts    = now
+    else:
+        # pyModeS EHS fallback — BDS register detection + field extraction
+        raw_hex = raw.hex().upper()
+        if _bds40.is40(raw):
+            if not mlat:
+                try:
+                    sel = pms.commb.selalt40mcp(raw_hex)
+                    if sel is not None:
+                        ac.selected_alt = int(sel)
+                except Exception:
+                    pass
+
+        elif _bds50.is50(raw):
+            try:
+                tas = pms.commb.tas50(raw_hex)
+                if tas is not None:
+                    ac.airspeed_kts  = int(round(tas))
+                    ac.airspeed_type = "TAS"
+            except Exception:
+                pass
+            try:
+                trk = pms.commb.trk50(raw_hex)
+                if trk is not None:
+                    ac.heading_deg = round(float(trk), 1)
+            except Exception:
+                pass
+
+        elif _bds60.is60(raw):
+            try:
+                ias = pms.commb.ias60(raw_hex)
+                if ias is not None:
+                    ac.airspeed_kts  = int(round(ias))
+                    ac.airspeed_type = "IAS"
+            except Exception:
+                pass
+            try:
+                mach = pms.commb.mach60(raw_hex)
+                if mach is not None:
+                    ac.mach = round(float(mach), 3)
+            except Exception:
+                pass
+            try:
+                hdg = pms.commb.hdg60(raw_hex)
+                if hdg is not None:
+                    ac.heading_deg = round(float(hdg), 1)
+            except Exception:
+                pass
+            if not mlat:
+                try:
+                    vr = pms.commb.vr60baro(raw_hex)
+                    if vr is not None:
+                        ac.vertical_rate_fpm = int(round(vr))
+                        ac._vrate_baro_fpm   = int(round(vr))
+                        ac._vrate_baro_ts    = now
+                except Exception:
+                    pass
+
+
 class AircraftState:
     def __init__(self, aircraft_timeout: int = 60):
         self._timeout = aircraft_timeout
@@ -1929,222 +2256,7 @@ class AircraftState:
         # DF17: Extended Squitter with true 24-bit CRC — highest integrity source.
         # DF18: TIS-B / ADS-R rebroadcast — same message structure, same altitude quality.
         if df in (17, 18) and raw_len == 14:
-            if _nd is not None:
-                # Native path: C library decoded all fields.
-                nd_callsign = _nd.get('callsign')
-                nd_baro_alt = _nd.get('baro_alt')
-                nd_cpr_odd = _nd.get('cpr_odd')
-                nd_heading_type = _nd.get('heading_type')
-                nd_heading = _nd.get('heading')
-                nd_ias = _nd.get('ias')
-                nd_tas = _nd.get('tas')
-                nd_mach = _nd.get('mach')
-                nd_baro_rate = _nd.get('baro_rate')
-
-                # Callsign (type codes 1-4)
-                if nd_callsign:
-                    cs = nd_callsign
-                    ac.callsign = cs.strip().rstrip('_')
-                    if ac.callsign and not ac.operator:
-                        op = enrichment.db.get_operator(ac.callsign[:3])
-                        if op:
-                            ac.operator = op.get("n")
-                            if not ac.country:
-                                ac.country = op.get("c")
-
-                # Altitude (type codes 9-18, 20-22)
-                if nd_baro_alt is not None:
-                    _accept_altitude(ac, nd_baro_alt, source, crc_clean, now)
-
-                # CPR position (type codes 9-22)
-                # decode_cffi omits cpr_valid key; presence of cpr_odd signals valid CPR
-                if nd_cpr_odd is not None:
-                    _cpr_oe = 1 if nd_cpr_odd else 0
-                    # Dup detection uses raw hex; pairing stores decoded CPR integers
-                    if not _is_cpr_duplicate(ac, raw, _cpr_oe, now):
-                        _cpr_lat_int = _nd['cpr_lat']
-                        _cpr_lon_int = _nd['cpr_lon']
-                        # ADS-B and MLAT frames maintain independent even/odd CPR pairs.
-                        # Mixing a frame from one source with a half-pair from the other
-                        # in the global solver produces garbage positions → speed spikes.
-                        if mlat:
-                            _msrc = mlat_source or "mlat"
-                            if _cpr_oe == 0:
-                                ac.mlat_cpr_even[_msrc] = (_cpr_lat_int, _cpr_lon_int, now)
-                            else:
-                                ac.mlat_cpr_odd[_msrc]  = (_cpr_lat_int, _cpr_lon_int, now)
-                        else:
-                            if _cpr_oe == 0:
-                                ac.cpr_even = (_cpr_lat_int, _cpr_lon_int, now)
-                            else:
-                                ac.cpr_odd  = (_cpr_lat_int, _cpr_lon_int, now)
-
-                        pos = None
-                        pos_from_global = False
-                        global_bad = False
-                        # Global CPR: use source-matched pair (ADS-B vs MLAT) so frames
-                        # are never cross-paired.  timestamp is at index 2.
-                        if (not mlat
-                                and ac.cpr_even and ac.cpr_odd
-                                and abs(ac.cpr_even[2] - ac.cpr_odd[2]) < 10):
-                            pos = _decode_cffi.solve_cpr_airborne(
-                                ac.cpr_even[0], ac.cpr_even[1],
-                                ac.cpr_odd[0],  ac.cpr_odd[1],
-                                _cpr_oe,
-                            )
-                            if pos is not None:
-                                pos_from_global = True
-                            elif ac.pos_global:
-                                global_bad = True
-                        elif (mlat
-                                and _msrc in ac.mlat_cpr_even and _msrc in ac.mlat_cpr_odd
-                                and abs(ac.mlat_cpr_even[_msrc][2] - ac.mlat_cpr_odd[_msrc][2]) < 10):
-                            pos = _decode_cffi.solve_cpr_airborne(
-                                ac.mlat_cpr_even[_msrc][0], ac.mlat_cpr_even[_msrc][1],
-                                ac.mlat_cpr_odd[_msrc][0],  ac.mlat_cpr_odd[_msrc][1],
-                                _cpr_oe,
-                            )
-                            if pos is not None:
-                                pos_from_global = True
-                            elif ac.pos_global:
-                                global_bad = True
-
-                        if not pos_from_global and not global_bad:
-                            ref_lat = ac.lat if ac.lat is not None else config.RECEIVER_LAT
-                            ref_lon = ac.lon if ac.lon is not None else config.RECEIVER_LON
-                            if ref_lat is not None and ref_lon is not None:
-                                pos = _decode_cffi.solve_cpr_relative(
-                                    ref_lat, ref_lon, _cpr_lat_int, _cpr_lon_int, _cpr_oe,
-                                )
-
-                        if pos:
-                            lat, lon = pos
-                            if -90 <= lat <= 90 and -180 <= lon <= 180:
-                                if (config.RECEIVER_LAT is not None
-                                        and config.RECEIVER_LON is not None
-                                        and _haversine_nm(
-                                            config.RECEIVER_LAT, config.RECEIVER_LON,
-                                            lat, lon) > config.MAX_RANGE_NM):
-                                    pass
-                                elif mlat:
-                                    if (ac.has_adsb
-                                            and ac.lat is not None
-                                            and now - ac._last_mlat_force_ts > _MLAT_FORCE_INTERVAL_S
-                                            and _haversine_nm(ac.lat, ac.lon, lat, lon) > _MLAT_FORCE_DISTANCE_NM):
-                                        ac._last_mlat_force_ts = now
-                                        ac.pos_reliable_odd  = _POS_RELIABLE_PUBLISH
-                                        ac.pos_reliable_even = _POS_RELIABLE_PUBLISH
-                                    _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
-                                elif not mlat and config.INGEST_MODE != "hybrid":
-                                    _accept_adsb_position(ac, lat, lon, pos_from_global, _cpr_oe == 1, now)
-            else:
-                # pyModeS fallback path
-                try:
-                    raw_hex_value = _raw_hex()
-                    tc = pms.adsb.typecode(raw_hex_value)
-                except Exception:
-                    return
-                if tc is None:
-                    return
-
-                # Identification (callsign)
-                if 1 <= tc <= 4:
-                    try:
-                        cs = pms.adsb.callsign(raw_hex_value)
-                        if cs:
-                            ac.callsign = cs.strip().rstrip('_')
-                            if ac.callsign and not ac.operator:
-                                op = enrichment.db.get_operator(ac.callsign[:3])
-                                if op:
-                                    ac.operator = op.get("n")
-                                    if not ac.country:
-                                        ac.country = op.get("c")
-                    except Exception:
-                        pass
-
-                # Airborne position – altitude + CPR lat/lon
-                elif 9 <= tc <= 18 or 20 <= tc <= 22:
-                    try:
-                        alt = pms.adsb.altitude(raw_hex_value)
-                        if alt is not None:
-                            _accept_altitude(ac, int(alt), source, crc_clean, now)
-                    except Exception:
-                        pass
-                    try:
-                        oe = pms.adsb.oe_flag(raw_hex_value)
-
-                        # Duplicate check: same raw frame within _CPR_DUP_WINDOW_S means
-                        # multiple receivers forwarded the same transponder transmission.
-                        if not _is_cpr_duplicate(ac, raw, oe, now):
-                            # ADS-B and MLAT frames maintain independent even/odd CPR pairs.
-                            # Per-source keying prevents cross-network CPR contamination.
-                            if mlat:
-                                _msrc = mlat_source or "mlat"
-                                if oe == 0:
-                                    ac.mlat_cpr_even[_msrc] = (raw, now)
-                                else:
-                                    ac.mlat_cpr_odd[_msrc] = (raw, now)
-                            else:
-                                if oe == 0:
-                                    ac.cpr_even = (raw, now)
-                                else:
-                                    ac.cpr_odd = (raw, now)
-
-                            pos = None
-                            pos_from_global = False
-                            global_bad = False
-                            # Global CPR: use source-matched pair so frames are never cross-paired.
-                            if (not mlat
-                                    and ac.cpr_even and ac.cpr_odd
-                                    and abs(ac.cpr_even[1] - ac.cpr_odd[1]) < 10):
-                                pos = pms.adsb.position(
-                                    ac.cpr_even[0], ac.cpr_odd[0],
-                                    ac.cpr_even[1], ac.cpr_odd[1],
-                                )
-                                if pos is not None:
-                                    pos_from_global = True
-                                elif ac.pos_global:
-                                    global_bad = True
-                            elif (mlat
-                                    and _msrc in ac.mlat_cpr_even and _msrc in ac.mlat_cpr_odd
-                                    and abs(ac.mlat_cpr_even[_msrc][1] - ac.mlat_cpr_odd[_msrc][1]) < 10):
-                                pos = pms.adsb.position(
-                                    ac.mlat_cpr_even[_msrc][0], ac.mlat_cpr_odd[_msrc][0],
-                                    ac.mlat_cpr_even[_msrc][1], ac.mlat_cpr_odd[_msrc][1],
-                                )
-                                if pos is not None:
-                                    pos_from_global = True
-                                elif ac.pos_global:
-                                    global_bad = True
-
-                            if not pos_from_global and not global_bad:
-                                ref_lat = ac.lat if ac.lat is not None else config.RECEIVER_LAT
-                                ref_lon = ac.lon if ac.lon is not None else config.RECEIVER_LON
-                                if ref_lat is not None and ref_lon is not None:
-                                    pos = pms.adsb.position_with_ref(raw_hex_value, ref_lat, ref_lon)
-
-                            if pos:
-                                lat, lon = pos
-                                if -90 <= lat <= 90 and -180 <= lon <= 180:
-                                    if (config.RECEIVER_LAT is not None
-                                            and config.RECEIVER_LON is not None
-                                            and _haversine_nm(
-                                                config.RECEIVER_LAT, config.RECEIVER_LON,
-                                                lat, lon) > config.MAX_RANGE_NM):
-                                        pass  # discard — beyond ADS-B range
-                                    elif mlat:
-                                        if (ac.has_adsb
-                                                and ac.lat is not None
-                                                and now - ac._last_mlat_force_ts > _MLAT_FORCE_INTERVAL_S
-                                                and _haversine_nm(ac.lat, ac.lon, lat, lon) > _MLAT_FORCE_DISTANCE_NM):
-                                            ac._last_mlat_force_ts = now
-                                            ac.pos_reliable_odd  = _POS_RELIABLE_PUBLISH
-                                            ac.pos_reliable_even = _POS_RELIABLE_PUBLISH
-                                        _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
-                                    elif not mlat and config.INGEST_MODE != "hybrid":
-                                        _accept_adsb_position(ac, lat, lon, pos_from_global, oe == 1, now)
-                    except Exception:
-                        pass
+            _decode_df17_18(ac, df, raw, raw_len, _nd, crc_clean, source, mlat, mlat_source, now)
 
         # --- Altitude from surveillance altitude reply (DF 4) ---
         # Lower integrity than ADS-B: parity is XOR-masked with aircraft address.
@@ -2177,97 +2289,7 @@ class AircraftState:
                 except Exception:
                     pass
 
-            # EHS decode — C library decodes BDS 4.0/5.0/6.0 in one call;
-            # pyModeS fallback uses direct is40/is50/is60 checks.
-            if _nd is not None:
-                nd_tas = _nd.get('tas')
-                nd_heading_type = _nd.get('heading_type')
-                nd_heading = _nd.get('heading')
-                nd_ias = _nd.get('ias')
-                nd_mach = _nd.get('mach')
-                nd_baro_rate = _nd.get('baro_rate')
-                nd_nav_altitude_mcp = _nd.get('nav_altitude_mcp')
-                # BDS 4.0: selected altitude
-                if not mlat and nd_nav_altitude_mcp is not None:
-                    ac.selected_alt = nd_nav_altitude_mcp
-
-                # BDS 5.0: TAS + ground track
-                if nd_tas is not None:
-                    ac.airspeed_kts = nd_tas
-                    ac.airspeed_type = "TAS"
-                # heading_type 1 = HEADING_GROUND_TRACK (BDS 5.0 track)
-                # decode_cffi omits heading_valid; presence of heading_type is sufficient
-                if nd_heading_type == 1 and nd_heading is not None:
-                    ac.heading_deg = round(float(nd_heading), 1)
-
-                # BDS 6.0: IAS + Mach + magnetic heading + baro vertical rate
-                if nd_ias is not None:
-                    ac.airspeed_kts = nd_ias
-                    ac.airspeed_type = "IAS"
-                if nd_mach is not None:
-                    ac.mach = round(float(nd_mach), 3)
-                # heading_type 3 = HEADING_MAGNETIC (BDS 6.0 heading)
-                if nd_heading_type == 3 and nd_heading is not None:
-                    ac.heading_deg = round(float(nd_heading), 1)
-                if not mlat and nd_baro_rate is not None:
-                        ac.vertical_rate_fpm = nd_baro_rate
-                        ac._vrate_baro_fpm = nd_baro_rate
-                        ac._vrate_baro_ts  = now
-            else:
-                # pyModeS EHS fallback
-                if _bds40.is40(raw):
-                    if not mlat:
-                        try:
-                            sel = pms.commb.selalt40mcp(_raw_hex())
-                            if sel is not None:
-                                ac.selected_alt = int(sel)
-                        except Exception:
-                            pass
-
-                elif _bds50.is50(raw):
-                    try:
-                        tas = pms.commb.tas50(_raw_hex())
-                        if tas is not None:
-                            ac.airspeed_kts = int(round(tas))
-                            ac.airspeed_type = "TAS"
-                    except Exception:
-                        pass
-                    try:
-                        trk = pms.commb.trk50(_raw_hex())
-                        if trk is not None:
-                            ac.heading_deg = round(float(trk), 1)
-                    except Exception:
-                        pass
-
-                elif _bds60.is60(raw):
-                    try:
-                        ias = pms.commb.ias60(_raw_hex())
-                        if ias is not None:
-                            ac.airspeed_kts = int(round(ias))
-                            ac.airspeed_type = "IAS"
-                    except Exception:
-                        pass
-                    try:
-                        mach = pms.commb.mach60(_raw_hex())
-                        if mach is not None:
-                            ac.mach = round(float(mach), 3)
-                    except Exception:
-                        pass
-                    try:
-                        hdg = pms.commb.hdg60(_raw_hex())
-                        if hdg is not None:
-                            ac.heading_deg = round(float(hdg), 1)
-                    except Exception:
-                        pass
-                    if not mlat:
-                        try:
-                            vr = pms.commb.vr60baro(_raw_hex())
-                            if vr is not None:
-                                ac.vertical_rate_fpm = int(round(vr))
-                                ac._vrate_baro_fpm = int(round(vr))
-                                ac._vrate_baro_ts  = now
-                        except Exception:
-                            pass
+            _decode_ehs(ac, raw, _nd, mlat, now)
 
         # --- DF16: Long Air-Air Surveillance (ACAS RA in MV field) ---
         # Altitude from DF16 is intentionally not used — DF16 is an ACAS air-to-air
