@@ -22,6 +22,67 @@
   color: #484f58;
 }
 
+/* ── Filter bar ─────────────────────────────────────────────────────── */
+
+.filterBar {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.filterRow {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.btn {
+  padding: 0.2rem 0.65rem;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  background: transparent;
+  color: #8b949e;
+  font-size: 0.76rem;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.btn:hover {
+  border-color: #8b949e;
+  color: #c9d1d9;
+}
+
+.btnActive {
+  padding: 0.2rem 0.65rem;
+  border: 1px solid #388bfd;
+  border-radius: 4px;
+  background: rgba(56, 139, 253, 0.1);
+  color: #388bfd;
+  font-size: 0.76rem;
+  cursor: pointer;
+}
+
+.btnSmall {
+  padding: 0.15rem 0.5rem;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  background: transparent;
+  color: #8b949e;
+  font-size: 0.72rem;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.btnSmall:hover {
+  border-color: #8b949e;
+  color: #c9d1d9;
+}
+
+/* ── Canvas wrappers ─────────────────────────────────────────────────── */
+
 .canvasWrap {
   position: relative;
   display: inline-block;
@@ -37,6 +98,38 @@
 .canvas:active {
   cursor: pointer;
 }
+
+/* ── Horizon section ─────────────────────────────────────────────────── */
+
+.horizonSection {
+  width: 100%;
+  max-width: 900px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.horizonHeader {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.horizonCanvas {
+  display: block;
+  max-width: 100%;
+  cursor: crosshair;
+  border-radius: 4px;
+}
+
+.horizonCanvas:active {
+  cursor: pointer;
+}
+
+/* ── Tooltip ─────────────────────────────────────────────────────────── */
 
 .tooltip {
   position: absolute;
@@ -68,6 +161,8 @@
   font-size: 0.72rem;
   margin-top: 2px;
 }
+
+/* ── Legend ──────────────────────────────────────────────────────────── */
 
 .legend {
   display: flex;

@@ -34,9 +34,10 @@ except ImportError:
     _HAS_NUMPY = False
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 import config
+from utils_geo import destination_point
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)  # terrain build progress always visible regardless of DEBUG_LOG
@@ -433,6 +434,83 @@ async def terrain_grid(
             "X-Receiver-Lon":  str(meta["receiver_lon"]),
         },
     )
+
+
+def _get_elevation_m(lat: float, lon: float) -> int:
+    """Sample SRTM elevation at a single point. Returns metres; 0 for ocean/void/missing."""
+    tile_lat = int(math.floor(lat))
+    tile_lon = int(math.floor(lon))
+    shorts, n = _get_tile(tile_lat, tile_lon)
+    if shorts is None or n is None:
+        return 0
+    v = _sample_elev(shorts, n, tile_lat, tile_lon, lat, lon)
+    return max(0, v)  # treat ocean/void (-1) as 0
+
+
+def _horizon_cache_path(lat: float, lon: float) -> Path:
+    return _TERRAIN_DIR / f"horizon_{lat:.6f}_{lon:.6f}.json"
+
+
+def _compute_horizon(
+    receiver_lat: float,
+    receiver_lon: float,
+    max_dist_nm: float = 100.0,
+    step_nm: float = 0.5,
+) -> dict:
+    """Walk radially outward in 1° azimuth steps and find the maximum terrain elevation
+    angle for each azimuth. Returns dict with 'elevations' (360 floats, degrees) and
+    'receiver_elev_m'. Result is cached to disk keyed by receiver location."""
+    import json
+    cache = _horizon_cache_path(receiver_lat, receiver_lon)
+    if cache.exists():
+        try:
+            return json.loads(cache.read_text())
+        except Exception:
+            pass  # corrupt cache — recompute
+
+    receiver_elev = _get_elevation_m(receiver_lat, receiver_lon)
+    elevations: list[float] = []
+
+    steps = int(max_dist_nm / step_nm)
+    distances = [(i + 1) * step_nm for i in range(steps)]
+
+    for az in range(360):
+        max_angle = 0.0
+        for dist_nm in distances:
+            lat2, lon2 = destination_point(receiver_lat, receiver_lon, az, dist_nm)
+            terrain_m = _get_elevation_m(lat2, lon2)
+            delta_m = terrain_m - receiver_elev
+            dist_m = dist_nm * 1852.0
+            angle = math.degrees(math.atan2(delta_m, dist_m))
+            if angle > max_angle:
+                max_angle = angle
+        elevations.append(round(max_angle, 3))
+
+    result = {"elevations": elevations, "receiver_elev_m": receiver_elev}
+    try:
+        cache.write_text(json.dumps(result))
+        log.info("Terrain horizon cached: %s", cache.name)
+    except OSError as exc:
+        log.warning("Could not write horizon cache: %s", exc)
+    return result
+
+
+@router.get("/api/terrain/horizon")
+async def terrain_horizon():
+    """Terrain horizon elevation angle for each azimuth degree (0–359°).
+    Returns {elevations: [float×360], receiver_elev_m: float}.
+    Computed from SRTM data and cached to disk."""
+    if not config.TERRAIN_ENABLED:
+        raise HTTPException(status_code=503, detail="Terrain disabled (TERRAIN_ENABLED=false)")
+    if config.RECEIVER_LAT is None or config.RECEIVER_LON is None:
+        raise HTTPException(status_code=400, detail="RECEIVER_LAT/LON not configured")
+
+    data = await asyncio.to_thread(
+        _compute_horizon,
+        config.RECEIVER_LAT,
+        config.RECEIVER_LON,
+    )
+    return JSONResponse(data)
 
 
 def prewarm_cache(receiver_lat: float, receiver_lon: float,

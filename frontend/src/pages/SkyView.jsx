@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import styles from './SkyView.module.css'
 import { EMERGENCY_SQUAWKS } from '../utils/squawks'
+import { TYPE_GROUPS, TYPE_GROUP_OTHER_COLOR, getTypeGroup, buildNameColorMap } from '../utils/typeGroups'
 
 const FEET_PER_NM      = 6076.115
 const TRACK_POLL_MS    = 5000
@@ -8,8 +9,40 @@ const CANVAS_SIZE      = 600
 const MARGIN           = 44    // pixels around the polar disc for labels
 const HOVER_RADIUS_PX  = 15   // max distance to register a hover/click
 // Break a trail segment if consecutive points are more than this many seconds apart
-// (catches gaps from aircraft going off-screen then returning, or CPR glitches)
 const MAX_TRAIL_GAP_S  = 20
+
+const HORIZON_W  = 900
+const HORIZON_H  = 380   // 340px plot area + 40px bottom label zone
+const HORIZON_ML = 38    // left margin for elevation labels
+const HORIZON_MB = 24    // bottom margin for compass labels
+
+// Y-axis scale functions: map elevation fraction [0,1] → display fraction [0,1]
+// Fraction 0 = horizon, 1 = maxElev (top of plot)
+const SCALES = {
+  linear: f => f,
+  sqrt:   f => Math.sqrt(f),
+  log:    f => f <= 0 ? 0 : Math.log1p(f * Math.E) / Math.log1p(Math.E),
+}
+
+const SCALE_OPTIONS = [
+  { value: 'linear', label: 'Linear' },
+  { value: 'sqrt',   label: '√ Scale' },
+  { value: 'log',    label: 'Log Scale' },
+]
+
+const FILTERS = [
+  { value: 'all',         label: 'All' },
+  { value: 'military',    label: 'Military' },
+  { value: 'mlat',        label: 'MLAT' },
+  { value: 'interesting', label: 'Interesting' },
+  { value: 'emergency',   label: 'Emergency' },
+]
+
+const COLOR_MODES = [
+  { value: 'classification', label: 'Classification' },
+  { value: 'type_group',     label: 'Type' },
+  { value: 'operator',       label: 'Operator' },
+]
 
 // Elevation angle in degrees above horizon. Returns null if inputs missing.
 function elevDeg(altitude_ft, range_nm) {
@@ -17,24 +50,66 @@ function elevDeg(altitude_ft, range_nm) {
   return Math.atan2(altitude_ft, range_nm * FEET_PER_NM) * (180 / Math.PI)
 }
 
-// Colours match the live table badge/row scheme exactly.
-// Priority: emergency > military > MLAT > interesting > standard ADS-B
-function acColor(ac) {
-  if (ac.squawk && EMERGENCY_SQUAWKS[ac.squawk]) return '#f85149'  // red
-  if (ac.military)    return '#bc8cff'  // purple  (milBadge)
-  if (ac.mlat)        return '#388bfd'  // blue    (mlatBadge)
-  if (ac.interesting) return '#d29922'  // orange  (intBadge)
-  return '#3fb950'                      // soft green — standard ADS-B
+// Aircraft colour based on active colour mode.
+function acColor(ac, colorMode, operatorMap) {
+  if (colorMode === 'type_group') {
+    const g = getTypeGroup(ac.type_code, ac.type_category)
+    return g ? g.color : TYPE_GROUP_OTHER_COLOR
+  }
+  if (colorMode === 'operator') {
+    return (ac.operator && operatorMap[ac.operator]) ? operatorMap[ac.operator] : TYPE_GROUP_OTHER_COLOR
+  }
+  // classification (default)
+  if (ac.squawk && EMERGENCY_SQUAWKS[ac.squawk]) return '#f85149'
+  if (ac.military)    return '#bc8cff'
+  if (ac.mlat)        return '#388bfd'
+  if (ac.interesting) return '#d29922'
+  return '#3fb950'
+}
+
+// Trail colour uses the last point's metadata
+function trailColor(trailObj, colorMode, operatorMap) {
+  return acColor(trailObj, colorMode, operatorMap)
+}
+
+function findNearestInList(list, mx, my) {
+  let best = null, bestDist = HOVER_RADIUS_PX
+  for (const h of list) {
+    const d = Math.hypot(h.x - mx, h.y - my)
+    if (d < bestDist) { best = h; bestDist = d }
+  }
+  return best
 }
 
 export default function SkyView({ snapshot, onSelectIcao }) {
-  const canvasRef   = useRef(null)
-  const tracksRef   = useRef({})
-  const hoverRef    = useRef(null)       // { x, y } in canvas coordinate space
-  const hitboxesRef = useRef([])
-  const [hoveredAc, setHoveredAc] = useState(null)
+  // ── Canvas refs ─────────────────────────────────────────────────────
+  const canvasRef         = useRef(null)
+  const horizonCanvasRef  = useRef(null)
 
-  // Poll track history every 5 s
+  // ── Track / hit data ────────────────────────────────────────────────
+  const tracksRef          = useRef({})
+  const hoverRef           = useRef(null)
+  const hitboxesRef        = useRef([])
+  const horizonHoverRef    = useRef(null)
+  const horizonHitboxesRef = useRef([])
+
+  // ── Component state ─────────────────────────────────────────────────
+  const [hoveredAc,      setHoveredAc]      = useState(null)
+  const [filter,         setFilter]         = useState('all')
+  const [colorMode,      setColorMode]      = useState('classification')
+  const [maxElev,        setMaxElev]        = useState(30)
+  const [horizonScale,   setHorizonScale]   = useState('sqrt')
+  const [terrainHorizon, setTerrainHorizon] = useState(null)
+
+  // ── Fetch terrain horizon once on mount ─────────────────────────────
+  useEffect(() => {
+    fetch('/api/terrain/horizon')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d?.elevations) setTerrainHorizon(d.elevations) })
+      .catch(() => {})
+  }, [])
+
+  // ── Poll track history every 5 s ────────────────────────────────────
   useEffect(() => {
     let cancelled = false
     const fetchTracks = async () => {
@@ -48,7 +123,37 @@ export default function SkyView({ snapshot, onSelectIcao }) {
     return () => { cancelled = true; clearInterval(id) }
   }, [])
 
-  // Draw — re-runs on every WebSocket snapshot (~1 s)
+  // ── Filtered aircraft & operator colour map ──────────────────────────
+  const baseAircraft = snapshot?.aircraft ?? []
+  const aircraft = useMemo(() => {
+    if (filter === 'military')    return baseAircraft.filter(ac => ac.military)
+    if (filter === 'mlat')        return baseAircraft.filter(ac => ac.mlat)
+    if (filter === 'interesting') return baseAircraft.filter(ac => ac.interesting)
+    if (filter === 'emergency')   return baseAircraft.filter(ac => ac.squawk && EMERGENCY_SQUAWKS[ac.squawk])
+    return baseAircraft
+  }, [snapshot, filter])
+
+  const operatorMap = useMemo(
+    () => buildNameColorMap(baseAircraft, 'operator').map,
+    [snapshot]
+  )
+  // Top operators for legend
+  const topOperators = useMemo(
+    () => buildNameColorMap(baseAircraft, 'operator').top,
+    [snapshot]
+  )
+
+  // ── Helper: should we draw this trail given the current filter? ──────
+  function trailPassesFilter(trailObj) {
+    if (filter === 'all')         return true
+    if (filter === 'military')    return !!trailObj.military
+    if (filter === 'mlat')        return !!trailObj.mlat
+    if (filter === 'interesting') return !!trailObj.interesting
+    if (filter === 'emergency')   return !!(trailObj.squawk && EMERGENCY_SQUAWKS[trailObj.squawk])
+    return true
+  }
+
+  // ── Polar canvas draw ────────────────────────────────────────────────
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -58,12 +163,10 @@ export default function SkyView({ snapshot, onSelectIcao }) {
     const cy = CANVAS_SIZE / 2
     const R  = CANVAS_SIZE / 2 - MARGIN
 
-    // ── Background ──────────────────────────────────────────────────
     ctx.fillStyle = '#0b0c10'
     ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE)
 
-    // ── Elevation rings ──────────────────────────────────────────────
-    // 0° ring = horizon (edge), labels show elevation above horizon
+    // Elevation rings
     ;[0, 15, 30, 45, 60, 75].forEach(elev => {
       const r = (90 - elev) / 90 * R
       ctx.beginPath()
@@ -80,7 +183,7 @@ export default function SkyView({ snapshot, onSelectIcao }) {
       }
     })
 
-    // ── Azimuth spokes & compass labels ─────────────────────────────
+    // Azimuth spokes & compass labels
     const spokes = [
       { deg: 0,   label: 'N',  cardinal: true  },
       { deg: 45,  label: 'NE', cardinal: false },
@@ -108,32 +211,29 @@ export default function SkyView({ snapshot, onSelectIcao }) {
     })
     ctx.textBaseline = 'alphabetic'
 
-    // ── Shared mapping: (bearing, range, altitude) → canvas (x, y) ──
     const toXY = (bearing_deg, range_nm, altitude_ft) => {
       const elev = elevDeg(altitude_ft, range_nm)
       if (elev === null) return null
       const rad   = (bearing_deg - 90) * Math.PI / 180
-      const rFrac = (90 - Math.max(0, elev)) / 90   // clamp to horizon
+      const rFrac = (90 - Math.max(0, elev)) / 90
       return {
         x: cx + Math.cos(rad) * R * rFrac,
         y: cy + Math.sin(rad) * R * rFrac,
       }
     }
 
-    // ── Trails ───────────────────────────────────────────────────────
-    // Break the path whenever the time gap between consecutive points exceeds
-    // MAX_TRAIL_GAP_S — prevents long diagonal lines when an aircraft
-    // disappears then reappears (or from CPR position glitches).
+    // Trails
     const tracks = tracksRef.current
     Object.values(tracks).forEach(points => {
       if (points.length < 2) return
-      const color = acColor(points[points.length - 1])
+      const last = points[points.length - 1]
+      if (!trailPassesFilter(last)) return
+      const color = trailColor(last, colorMode, operatorMap)
       ctx.beginPath()
       let penDown = false
       for (let i = 0; i < points.length; i++) {
         const p   = points[i]
         const pos = toXY(p.bearing_deg, p.range_nm, p.altitude_ft)
-        // Break pen on missing position or time gap to previous point
         if (!pos || (i > 0 && p.ts - points[i - 1].ts > MAX_TRAIL_GAP_S)) {
           penDown = false
           continue
@@ -148,19 +248,16 @@ export default function SkyView({ snapshot, onSelectIcao }) {
       ctx.globalAlpha = 1
     })
 
-    // ── Live dots ────────────────────────────────────────────────────
+    // Live dots
     const hitboxes = []
-    const aircraft = snapshot?.aircraft ?? []
-
     aircraft.forEach(ac => {
       if (ac.bearing_deg == null || ac.range_nm == null) return
       const pos = toXY(ac.bearing_deg, ac.range_nm, ac.altitude)
       if (!pos) return
 
-      const color = acColor(ac)
+      const color = acColor(ac, colorMode, operatorMap)
       const dotR  = 4
 
-      // Hover ring
       const hover = hoverRef.current
       if (hover && Math.hypot(hover.x - pos.x, hover.y - pos.y) < HOVER_RADIUS_PX) {
         ctx.beginPath()
@@ -177,37 +274,192 @@ export default function SkyView({ snapshot, onSelectIcao }) {
 
       hitboxes.push({ icao: ac.icao, x: pos.x, y: pos.y, ac })
     })
-
     hitboxesRef.current = hitboxes
-  }, [snapshot])
+  }, [snapshot, filter, colorMode])
+
+  // ── Horizon canvas draw ──────────────────────────────────────────────
+  useEffect(() => {
+    const canvas = horizonCanvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+
+    const plotW   = HORIZON_W - HORIZON_ML
+    const plotH   = HORIZON_H - HORIZON_MB
+    const scaleFn = SCALES[horizonScale]
+
+    // Convert elevation (degrees) to y pixel — 0° at bottom, maxElev at top
+    const elevToY = elev => plotH * (1 - scaleFn(Math.max(0, Math.min(elev, maxElev)) / maxElev))
+
+    ctx.fillStyle = '#0b0c10'
+    ctx.fillRect(0, 0, HORIZON_W, HORIZON_H)
+
+    // Map (bearing, range, altitude) → horizon canvas (x, y)
+    const toHXY = (bearing_deg, range_nm, altitude_ft) => {
+      const elev = elevDeg(altitude_ft, range_nm)
+      if (elev === null || elev < 0) return null
+      if (elev > maxElev) return null
+      return {
+        x: HORIZON_ML + (bearing_deg / 360) * plotW,
+        y: elevToY(elev),
+      }
+    }
+
+    // ── Terrain silhouette ─────────────────────────────────────────────
+    if (terrainHorizon && terrainHorizon.length === 360) {
+      ctx.beginPath()
+      ctx.moveTo(HORIZON_ML, plotH)
+      for (let az = 0; az < 360; az++) {
+        const x = HORIZON_ML + (az / 360) * plotW
+        const y = elevToY(terrainHorizon[az])
+        ctx.lineTo(x, y)
+      }
+      ctx.lineTo(HORIZON_ML + plotW, plotH)
+      ctx.closePath()
+      ctx.fillStyle = '#1c1814'
+      ctx.fill()
+      // Outline
+      ctx.beginPath()
+      for (let az = 0; az < 360; az++) {
+        const x = HORIZON_ML + (az / 360) * plotW
+        const y = elevToY(terrainHorizon[az])
+        if (az === 0) ctx.moveTo(x, y)
+        else          ctx.lineTo(x, y)
+      }
+      ctx.lineTo(HORIZON_ML + plotW, elevToY(terrainHorizon[0]))
+      ctx.strokeStyle = '#4a3728'
+      ctx.lineWidth   = 1
+      ctx.stroke()
+    }
+
+    // ── Elevation grid lines ───────────────────────────────────────────
+    // Draw at natural degree values regardless of scale
+    const step = maxElev <= 30 ? 5 : 15
+    for (let e = 0; e <= maxElev; e += step) {
+      const y = elevToY(e)
+      ctx.beginPath()
+      ctx.moveTo(HORIZON_ML, y)
+      ctx.lineTo(HORIZON_ML + plotW, y)
+      ctx.strokeStyle = e === 0 ? '#30363d' : '#1c2128'
+      ctx.lineWidth   = e === 0 ? 1.5 : 1
+      ctx.stroke()
+      ctx.fillStyle    = '#484f58'
+      ctx.font         = '10px monospace'
+      ctx.textAlign    = 'right'
+      ctx.textBaseline = 'middle'
+      ctx.fillText(`${e}°`, HORIZON_ML - 4, y)
+    }
+
+    // ── Azimuth vertical lines & compass labels ────────────────────────
+    const compassPoints = [
+      { az: 0,   label: 'N' },
+      { az: 45,  label: 'NE' },
+      { az: 90,  label: 'E' },
+      { az: 135, label: 'SE' },
+      { az: 180, label: 'S' },
+      { az: 225, label: 'SW' },
+      { az: 270, label: 'W' },
+      { az: 315, label: 'NW' },
+    ]
+    compassPoints.forEach(({ az, label }) => {
+      const x       = HORIZON_ML + (az / 360) * plotW
+      const cardinal = label.length === 1
+      ctx.beginPath()
+      ctx.setLineDash([4, 4])
+      ctx.moveTo(x, 0)
+      ctx.lineTo(x, plotH)
+      ctx.strokeStyle = cardinal ? '#30363d' : '#1c2128'
+      ctx.lineWidth   = 1
+      ctx.stroke()
+      ctx.setLineDash([])
+      ctx.fillStyle    = cardinal ? '#8b949e' : '#484f58'
+      ctx.font         = cardinal ? 'bold 11px monospace' : '10px monospace'
+      ctx.textAlign    = 'center'
+      ctx.textBaseline = 'top'
+      ctx.fillText(label, x, plotH + 4)
+    })
+    // N label also at right edge (360°)
+    ctx.fillStyle    = '#8b949e'
+    ctx.font         = 'bold 11px monospace'
+    ctx.textAlign    = 'center'
+    ctx.textBaseline = 'top'
+    ctx.fillText('N', HORIZON_ML + plotW, plotH + 4)
+    ctx.textBaseline = 'alphabetic'
+
+    // ── Trails ─────────────────────────────────────────────────────────
+    const tracks = tracksRef.current
+    Object.values(tracks).forEach(points => {
+      if (points.length < 2) return
+      const last = points[points.length - 1]
+      if (!trailPassesFilter(last)) return
+      const color = trailColor(last, colorMode, operatorMap)
+      ctx.beginPath()
+      let penDown = false
+      for (let i = 0; i < points.length; i++) {
+        const p   = points[i]
+        const pos = toHXY(p.bearing_deg, p.range_nm, p.altitude_ft)
+        // Break on time gap or azimuth wrap (crossing 0°/360°)
+        const timeGap = i > 0 && p.ts - points[i - 1].ts > MAX_TRAIL_GAP_S
+        const azWrap  = i > 0 && Math.abs(p.bearing_deg - points[i - 1].bearing_deg) > 180
+        if (!pos || timeGap || azWrap) {
+          penDown = false
+          continue
+        }
+        if (!penDown) { ctx.moveTo(pos.x, pos.y); penDown = true }
+        else            ctx.lineTo(pos.x, pos.y)
+      }
+      ctx.globalAlpha = 0.35
+      ctx.strokeStyle = color
+      ctx.lineWidth   = 1.5
+      ctx.stroke()
+      ctx.globalAlpha = 1
+    })
+
+    // ── Live dots ──────────────────────────────────────────────────────
+    const hitboxes = []
+    aircraft.forEach(ac => {
+      if (ac.bearing_deg == null || ac.range_nm == null) return
+      const pos = toHXY(ac.bearing_deg, ac.range_nm, ac.altitude)
+      if (!pos) return
+
+      const color = acColor(ac, colorMode, operatorMap)
+      const dotR  = 4
+
+      const hover = horizonHoverRef.current
+      if (hover && Math.hypot(hover.x - pos.x, hover.y - pos.y) < HOVER_RADIUS_PX) {
+        ctx.beginPath()
+        ctx.arc(pos.x, pos.y, dotR + 4, 0, Math.PI * 2)
+        ctx.strokeStyle = color
+        ctx.lineWidth   = 1.5
+        ctx.stroke()
+      }
+
+      ctx.beginPath()
+      ctx.arc(pos.x, pos.y, dotR, 0, Math.PI * 2)
+      ctx.fillStyle = color
+      ctx.fill()
+
+      hitboxes.push({ icao: ac.icao, x: pos.x, y: pos.y, ac })
+    })
+    horizonHitboxesRef.current = hitboxes
+  }, [snapshot, maxElev, horizonScale, filter, colorMode, terrainHorizon])
 
   // ── Pointer helpers ──────────────────────────────────────────────────
-  const canvasCoords = (e) => {
-    const canvas = canvasRef.current
-    if (!canvas) return null
-    const rect   = canvas.getBoundingClientRect()
-    const scaleX = CANVAS_SIZE / rect.width
-    const scaleY = CANVAS_SIZE / rect.height
+  const canvasCoords = (e, canvasEl) => {
+    if (!canvasEl) return null
+    const rect   = canvasEl.getBoundingClientRect()
+    const w      = canvasEl.width
+    const h      = canvasEl.height
     return {
-      x: (e.clientX - rect.left) * scaleX,
-      y: (e.clientY - rect.top)  * scaleY,
+      x: (e.clientX - rect.left) * (w / rect.width),
+      y: (e.clientY - rect.top)  * (h / rect.height),
     }
-  }
-
-  const findNearest = (mx, my) => {
-    let best = null, bestDist = HOVER_RADIUS_PX
-    for (const h of hitboxesRef.current) {
-      const d = Math.hypot(h.x - mx, h.y - my)
-      if (d < bestDist) { best = h; bestDist = d }
-    }
-    return best
   }
 
   const handleMouseMove = useCallback((e) => {
-    const pos = canvasCoords(e)
+    const pos = canvasCoords(e, canvasRef.current)
     if (!pos) return
     hoverRef.current = pos
-    setHoveredAc(findNearest(pos.x, pos.y)?.ac ?? null)
+    setHoveredAc(findNearestInList(hitboxesRef.current, pos.x, pos.y)?.ac ?? null)
   }, [])
 
   const handleMouseLeave = useCallback(() => {
@@ -216,15 +468,58 @@ export default function SkyView({ snapshot, onSelectIcao }) {
   }, [])
 
   const handleClick = useCallback((e) => {
-    const pos = canvasCoords(e)
+    const pos = canvasCoords(e, canvasRef.current)
     if (!pos) return
-    const hit = findNearest(pos.x, pos.y)
+    const hit = findNearestInList(hitboxesRef.current, pos.x, pos.y)
     if (hit && onSelectIcao) onSelectIcao(hit.icao)
   }, [onSelectIcao])
 
-  // Aircraft count with a valid sky position
-  const aircraft = snapshot?.aircraft ?? []
-  const visible  = aircraft.filter(
+  const handleHorizonMouseMove = useCallback((e) => {
+    const pos = canvasCoords(e, horizonCanvasRef.current)
+    if (!pos) return
+    horizonHoverRef.current = pos
+    setHoveredAc(findNearestInList(horizonHitboxesRef.current, pos.x, pos.y)?.ac ?? null)
+  }, [])
+
+  const handleHorizonMouseLeave = useCallback(() => {
+    horizonHoverRef.current = null
+    setHoveredAc(null)
+  }, [])
+
+  const handleHorizonClick = useCallback((e) => {
+    const pos = canvasCoords(e, horizonCanvasRef.current)
+    if (!pos) return
+    const hit = findNearestInList(horizonHitboxesRef.current, pos.x, pos.y)
+    if (hit && onSelectIcao) onSelectIcao(hit.icao)
+  }, [onSelectIcao])
+
+  // Tooltip renderer (shared between both canvases)
+  const renderTooltip = (hRef, canvasEl, canvasW, canvasH) => {
+    if (!hoveredAc || !hRef.current || !canvasEl) return null
+    const rect   = canvasEl.getBoundingClientRect()
+    const scaleX = rect.width  / canvasW
+    const scaleY = rect.height / canvasH
+    const elev   = elevDeg(hoveredAc.altitude, hoveredAc.range_nm)
+    return (
+      <div
+        className={styles.tooltip}
+        style={{
+          left: `${hRef.current.x * scaleX + 14}px`,
+          top:  `${hRef.current.y * scaleY - 8}px`,
+        }}
+      >
+        <div className={styles.tooltipIcao}>{hoveredAc.icao}</div>
+        {hoveredAc.callsign   && <div>{hoveredAc.callsign}</div>}
+        {hoveredAc.altitude  != null && <div>{hoveredAc.altitude.toLocaleString()} ft</div>}
+        {hoveredAc.range_nm  != null && <div>{hoveredAc.range_nm} nm</div>}
+        {elev                != null && <div>Elev {elev.toFixed(1)}°</div>}
+        {hoveredAc.type_desc && <div className={styles.tooltipMeta}>{hoveredAc.type_desc}</div>}
+        <div className={styles.tooltipHint}>click to open</div>
+      </div>
+    )
+  }
+
+  const visible = aircraft.filter(
     ac => ac.bearing_deg != null && ac.range_nm != null && ac.altitude != null
   ).length
 
@@ -233,11 +528,33 @@ export default function SkyView({ snapshot, onSelectIcao }) {
       <div className={styles.header}>
         <h2 className={styles.title}>Sky View</h2>
         <p className={styles.subtitle}>
-          Azimuth (compass) × Elevation — centre = directly overhead, edge = horizon
-          {visible > 0 && <> · {visible} aircraft with position</>}
+          {visible > 0 ? `${visible} aircraft with position` : 'No aircraft with position data'}
         </p>
       </div>
 
+      {/* Filter bar */}
+      <div className={styles.filterBar}>
+        <div className={styles.filterRow}>
+          {COLOR_MODES.map(m => (
+            <button
+              key={m.value}
+              className={colorMode === m.value ? styles.btnActive : styles.btn}
+              onClick={() => setColorMode(m.value)}
+            >{m.label}</button>
+          ))}
+        </div>
+        <div className={styles.filterRow}>
+          {FILTERS.map(f => (
+            <button
+              key={f.value}
+              className={filter === f.value ? styles.btnActive : styles.btn}
+              onClick={() => setFilter(f.value)}
+            >{f.label}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Polar canvas */}
       <div className={styles.canvasWrap}>
         <canvas
           ref={canvasRef}
@@ -248,40 +565,70 @@ export default function SkyView({ snapshot, onSelectIcao }) {
           onMouseLeave={handleMouseLeave}
           onClick={handleClick}
         />
-
-        {hoveredAc && hoverRef.current && (() => {
-          const canvas = canvasRef.current
-          const rect   = canvas?.getBoundingClientRect()
-          const scaleX = rect ? rect.width  / CANVAS_SIZE : 1
-          const scaleY = rect ? rect.height / CANVAS_SIZE : 1
-          const elev   = elevDeg(hoveredAc.altitude, hoveredAc.range_nm)
-          return (
-            <div
-              className={styles.tooltip}
-              style={{
-                left: `${hoverRef.current.x * scaleX + 14}px`,
-                top:  `${hoverRef.current.y * scaleY - 8}px`,
-              }}
-            >
-              <div className={styles.tooltipIcao}>{hoveredAc.icao}</div>
-              {hoveredAc.callsign   && <div>{hoveredAc.callsign}</div>}
-              {hoveredAc.altitude  != null && <div>{hoveredAc.altitude.toLocaleString()} ft</div>}
-              {hoveredAc.range_nm  != null && <div>{hoveredAc.range_nm} nm</div>}
-              {elev                != null && <div>Elev {elev.toFixed(1)}°</div>}
-              {hoveredAc.type_desc && <div className={styles.tooltipMeta}>{hoveredAc.type_desc}</div>}
-              <div className={styles.tooltipHint}>click to open</div>
-            </div>
-          )
-        })()}
+        {renderTooltip(hoverRef, canvasRef.current, CANVAS_SIZE, CANVAS_SIZE)}
       </div>
 
-      <div className={styles.legend}>
-        <span className={styles.legendItem} style={{ color: '#f85149' }}>● Emergency</span>
-        <span className={styles.legendItem} style={{ color: '#bc8cff' }}>● Military</span>
-        <span className={styles.legendItem} style={{ color: '#388bfd' }}>● MLAT</span>
-        <span className={styles.legendItem} style={{ color: '#d29922' }}>● Interesting</span>
-        <span className={styles.legendItem} style={{ color: '#3fb950' }}>● ADS-B</span>
+      {/* Horizon canvas */}
+      <div className={styles.horizonSection}>
+        <div className={styles.horizonHeader}>
+          <span className={styles.subtitle}>
+            Azimuth (compass) × Elevation — N at both edges, S at centre
+            {terrainHorizon && <> · terrain</>}
+          </span>
+          <div className={styles.filterRow}>
+            {SCALE_OPTIONS.map(s => (
+              <button
+                key={s.value}
+                className={horizonScale === s.value ? styles.btnActive : styles.btnSmall}
+                onClick={() => setHorizonScale(s.value)}
+              >{s.label}</button>
+            ))}
+          </div>
+          <button
+            className={styles.btnSmall}
+            onClick={() => setMaxElev(v => v === 30 ? 90 : 30)}
+          >{maxElev === 30 ? 'Expand to 90°' : 'Zoom to 30°'}</button>
+        </div>
+        <div className={styles.canvasWrap}>
+          <canvas
+            ref={horizonCanvasRef}
+            width={HORIZON_W}
+            height={HORIZON_H}
+            className={styles.horizonCanvas}
+            onMouseMove={handleHorizonMouseMove}
+            onMouseLeave={handleHorizonMouseLeave}
+            onClick={handleHorizonClick}
+          />
+          {renderTooltip(horizonHoverRef, horizonCanvasRef.current, HORIZON_W, HORIZON_H)}
+        </div>
       </div>
+
+      {/* Legend — dynamic by colour mode */}
+      {colorMode === 'classification' && (
+        <div className={styles.legend}>
+          <span className={styles.legendItem} style={{ color: '#f85149' }}>● Emergency</span>
+          <span className={styles.legendItem} style={{ color: '#bc8cff' }}>● Military</span>
+          <span className={styles.legendItem} style={{ color: '#388bfd' }}>● MLAT</span>
+          <span className={styles.legendItem} style={{ color: '#d29922' }}>● Interesting</span>
+          <span className={styles.legendItem} style={{ color: '#3fb950' }}>● ADS-B</span>
+        </div>
+      )}
+      {colorMode === 'type_group' && (
+        <div className={styles.legend}>
+          {TYPE_GROUPS.map(g => (
+            <span key={g.value} className={styles.legendItem} style={{ color: g.color }}>● {g.label}</span>
+          ))}
+          <span className={styles.legendItem} style={{ color: TYPE_GROUP_OTHER_COLOR }}>● Other</span>
+        </div>
+      )}
+      {colorMode === 'operator' && topOperators.length > 0 && (
+        <div className={styles.legend}>
+          {topOperators.map(op => (
+            <span key={op.name} className={styles.legendItem} style={{ color: op.color }}>● {op.name}</span>
+          ))}
+          <span className={styles.legendItem} style={{ color: TYPE_GROUP_OTHER_COLOR }}>● Other</span>
+        </div>
+      )}
     </div>
   )
 }
