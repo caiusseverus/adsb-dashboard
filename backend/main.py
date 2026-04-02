@@ -120,6 +120,8 @@ _SNAPSHOT_CACHE_TTL_S: float = 0.5   # half a cycle — enough to cover both loo
 # TrackStore rate limiter makes these calls no-ops, so there is no double work.
 _TRAIL_HOUSEKEEPING_INTERVAL_S: float = 10.0
 _trail_housekeeping_last_ts: float = 0.0
+_VISIT_MERGE_INTERVAL_S: float = 86400.0  # once per day
+_visit_merge_last_ts: float = 0.0
 
 
 def _start_msg_processor() -> threading.Thread:
@@ -623,7 +625,7 @@ def _record_track_point(ac: dict, now: float) -> None:
 
 async def _housekeeping_loop() -> None:
     """Keep unattended collection healthy without building broadcast snapshots."""
-    global _trail_housekeeping_last_ts
+    global _trail_housekeeping_last_ts, _visit_merge_last_ts
     while True:
         await asyncio.sleep(config.PUSH_INTERVAL_S)
         try:
@@ -643,6 +645,12 @@ async def _housekeeping_loop() -> None:
                 _trail_snap = _get_cycle_snapshot("full")
                 for _ac in _trail_snap["aircraft"]:
                     _record_track_point(_ac, now_ts)
+
+            if now_ts - _visit_merge_last_ts >= _VISIT_MERGE_INTERVAL_S:
+                _visit_merge_last_ts = now_ts
+                merged = await asyncio.to_thread(stats_db.merge_short_visits)
+                if merged:
+                    log.info("Daily visit merge: consolidated %d split visit(s)", merged)
 
             # Sample queue depth (Beast mode only — queue unused in readsb/hybrid).
             if config.INGEST_MODE == "beast":
@@ -870,6 +878,11 @@ async def _seed_startup_state() -> None:
     await asyncio.to_thread(stats_db.prune)
     await asyncio.to_thread(stats_db.backfill_daily_coverage)
     await asyncio.to_thread(stats_db.backfill_us_mil_years)
+
+    # Merge visits split by the previous restart before serving any data.
+    merged = await asyncio.to_thread(stats_db.merge_short_visits)
+    if merged:
+        log.info("Startup visit merge: consolidated %d split visit(s)", merged)
 
     # Seed today's unique-aircraft sets from DB so counts survive restarts
     today = date.today().isoformat()
