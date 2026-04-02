@@ -1938,21 +1938,25 @@ class StatsDB:
             return []
         placeholders = ",".join("?" * len(type_codes))
         mil_clause = "" if military is None else f"AND ar.military = {int(military)}"
-        params: list = list(type_codes)
-        since_clause = ""
+        visit_since_clause = ""
+        # SQLite binds positionally: each subquery ? needs its own value in params.
+        # 3 subqueries × 1 bind each, then 1 bind for the outer since_clause = 4 total if set.
         if since_ts is not None:
+            visit_since_clause = "AND start_ts >= ?"
+            params = list(type_codes) + [since_ts, since_ts, since_ts, since_ts, limit]
             since_clause = "AND ar.last_seen >= ?"
-            params.append(since_ts)
-        params.append(limit)
+        else:
+            params = list(type_codes) + [limit]
+            since_clause = ""
 
         with self._connect() as conn:
             rows = conn.execute(f"""
                 SELECT
                     ar.icao, ar.registration, ar.operator, ar.country, ar.year,
                     ar.military, ar.sighting_count, ar.last_seen, ar.type_code,
-                    (SELECT COUNT(*) FROM visits v WHERE v.icao = ar.icao) AS visit_count,
-                    (SELECT MAX(v.max_altitude) FROM visits v WHERE v.icao = ar.icao) AS max_altitude,
-                    (SELECT SUM(v.msg_count) FROM visits v WHERE v.icao = ar.icao) AS total_messages
+                    (SELECT COUNT(*) FROM visits v WHERE v.icao = ar.icao {visit_since_clause}) AS visit_count,
+                    (SELECT MAX(v.max_altitude) FROM visits v WHERE v.icao = ar.icao {visit_since_clause}) AS max_altitude,
+                    (SELECT SUM(v.msg_count) FROM visits v WHERE v.icao = ar.icao {visit_since_clause}) AS total_messages
                 FROM aircraft_registry ar
                 WHERE ar.type_code IN ({placeholders})
                   {mil_clause} {since_clause}
@@ -1964,6 +1968,11 @@ class StatsDB:
         routes_by_icao: dict[str, list[str]] = {icao: [] for icao in icaos}
         if icaos:
             route_placeholders = ",".join("?" * len(icaos))
+            route_params: list = list(icaos)
+            route_since_clause = ""
+            if since_ts is not None:
+                route_since_clause = "AND start_ts >= ?"
+                route_params.append(since_ts)
             with self._connect() as conn:
                 route_rows = conn.execute(f"""
                     SELECT icao, origin_icao, dest_icao, COUNT(*) AS cnt
@@ -1971,9 +1980,10 @@ class StatsDB:
                     WHERE icao IN ({route_placeholders})
                       AND origin_icao IS NOT NULL AND origin_icao != ''
                       AND dest_icao IS NOT NULL AND dest_icao != ''
+                      {route_since_clause}
                     GROUP BY icao, origin_icao, dest_icao
                     ORDER BY icao, cnt DESC
-                """, icaos).fetchall()
+                """, route_params).fetchall()
             for rr in route_rows:
                 lst = routes_by_icao.setdefault(rr["icao"], [])
                 if len(lst) < 3:

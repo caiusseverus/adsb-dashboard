@@ -330,7 +330,7 @@ async def fleet_types_table(
 
 @router.get("/type_airframes")
 async def fleet_type_airframes(
-    type_codes: str = Query(..., max_length=200),
+    type_codes: str = Query(..., max_length=2000),
     since: Optional[int] = Query(None, ge=1),
     military: Optional[int] = Query(None, ge=0, le=1),
 ) -> list[dict]:

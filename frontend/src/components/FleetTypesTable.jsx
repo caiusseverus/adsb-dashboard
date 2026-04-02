@@ -23,42 +23,53 @@ function WtcBadge({ wtc }) {
   return <span className={`${s.wtcBadge} ${cls}`}>{wtc}</span>
 }
 
-function AirframeRows({ typeCodes, since, milFilter, onSelectIcao }) {
+function AirframeRows({ typeCodes, since, milFilter, onSelectIcao, showTypeCol }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
 
   useEffect(() => {
     const ctrl = new AbortController()
     setLoading(true)
+    setError(null)
     const params = new URLSearchParams({ type_codes: typeCodes })
     if (since) params.set('since', since)
     if (milFilter === 'civil') params.set('military', 0)
     else if (milFilter === 'military') params.set('military', 1)
 
     fetch(`/api/fleet/type_airframes?${params}`, { signal: ctrl.signal })
-      .then(r => r.json())
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() })
       .then(d => { setData(d); setLoading(false) })
-      .catch(() => {})
+      .catch(e => { if (e.name !== 'AbortError') { setError(e.message); setLoading(false) } })
     return () => ctrl.abort()
   }, [typeCodes, since, milFilter])
 
+  const colSpan = 12 + (showTypeCol ? 1 : 0)
   if (loading) {
     return (
       <tr className={s.loadingRow}>
-        <td colSpan={12}>Loading…</td>
+        <td colSpan={colSpan}>Loading…</td>
+      </tr>
+    )
+  }
+  if (error) {
+    return (
+      <tr className={s.emptyRow}>
+        <td colSpan={colSpan}>Failed to load airframes ({error})</td>
       </tr>
     )
   }
   if (!data || data.length === 0) {
     return (
       <tr className={s.emptyRow}>
-        <td colSpan={12}>No airframes found.</td>
+        <td colSpan={colSpan}>No airframes found.</td>
       </tr>
     )
   }
   return data.map(af => (
     <tr key={af.icao} style={{ cursor: onSelectIcao ? 'pointer' : undefined }} onClick={() => onSelectIcao?.(af.icao)}>
       <td className={s.icao}>{af.icao}</td>
+      {showTypeCol && <td className={s.typeCode}>{af.type_code || '—'}</td>}
       <td>{af.registration || '—'}</td>
       <td className={s.operator}>{af.operator_display || af.operator || '—'}</td>
       <td>{af.country || '—'}</td>
@@ -269,6 +280,7 @@ export default function FleetTypesTable({ since, onSelectIcao }) {
                           <thead>
                             <tr>
                               <th>ICAO</th>
+                              {groupByMfr && <th>Type</th>}
                               <th>Registration</th>
                               <th>Operator</th>
                               <th>Country</th>
@@ -288,6 +300,7 @@ export default function FleetTypesTable({ since, onSelectIcao }) {
                               since={since}
                               milFilter={milFilter}
                               onSelectIcao={onSelectIcao}
+                              showTypeCol={groupByMfr}
                             />
                           </tbody>
                         </table>
