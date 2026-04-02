@@ -177,7 +177,7 @@ _photo_cache_lock = threading.Lock()
 _PHOTO_TTL_S = 3600.0
 _PHOTO_MISS_TTL_S = 300.0
 _ssl_context: ssl.SSLContext | None = None
-_cc_cache: dict[str, object] = {"device_name": None, "cc": None, "ts": 0.0}
+_cc_cache: dict[str, object] = {"device_name": None, "cc": None, "browser": None, "ts": 0.0}
 _CC_TTL_S = 300.0
 
 
@@ -196,7 +196,14 @@ def reset_config_cache() -> None:
     """Force next _get_config() call to re-read from DB. Call after a config save."""
     global _config_cache_ts, _cc_cache
     _config_cache_ts = 0.0
-    _cc_cache = {"device_name": None, "cc": None, "ts": 0.0}
+    old_browser = _cc_cache.get("browser")
+    if old_browser is not None:
+        try:
+            import pychromecast
+            pychromecast.discovery.stop_discovery(old_browser)
+        except Exception:
+            pass
+    _cc_cache = {"device_name": None, "cc": None, "browser": None, "ts": 0.0}
 
 
 def reset_rules_cache() -> None:
@@ -408,6 +415,16 @@ def _get_chromecast(device_name: str):
 
     import pychromecast
 
+    # Stop any previous browser before starting a new discovery session.
+    old_browser = _cc_cache.get("browser")
+    if old_browser is not None:
+        try:
+            pychromecast.discovery.stop_discovery(old_browser)
+        except Exception:
+            pass
+        _cc_cache["browser"] = None
+        _cc_cache["cc"] = None
+
     log.info("cast: discovering %r on LAN", device_name)
     chromecasts, browser = pychromecast.get_listed_chromecasts(
         friendly_names=[device_name], timeout=10
@@ -419,9 +436,11 @@ def _get_chromecast(device_name: str):
 
     cc = chromecasts[0]
     cc.wait()
-    pychromecast.discovery.stop_discovery(browser)
+    # Keep browser alive — the Chromecast socket client needs the zeroconf
+    # instance running to perform mDNS-based reconnection if the connection drops.
     _cc_cache["device_name"] = device_name
     _cc_cache["cc"] = cc
+    _cc_cache["browser"] = browser
     _cc_cache["ts"] = now
     return cc
 
@@ -679,7 +698,15 @@ def _cast(lan_url: str, device_name: str, display_seconds: int,
         cc.quit_app()
     except Exception:
         # If the cached cast handle is stale, force rediscovery next time.
+        try:
+            import pychromecast
+            old_browser = _cc_cache.get("browser")
+            if old_browser is not None:
+                pychromecast.discovery.stop_discovery(old_browser)
+        except Exception:
+            pass
         _cc_cache["cc"] = None
+        _cc_cache["browser"] = None
         _cc_cache["ts"] = 0.0
         raise
     log.info("cast: display ended for %s after %ds", icao, elapsed)
