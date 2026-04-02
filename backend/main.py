@@ -917,6 +917,12 @@ async def _graceful_shutdown(bg_tasks: list) -> None:
     if _decoder_thread is not None:
         _decoder_thread.join(timeout=2.0)
 
+    log.info("Shutdown: closing in-progress visits…")
+    try:
+        await _close_expired_visits(state.drain_all())
+    except Exception:
+        log.exception("Shutdown: visit close-out failed")
+
     log.info("Shutdown: flushing state to disk…")
     try:
         final_snapshot = state.get_snapshot()

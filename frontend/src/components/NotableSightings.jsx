@@ -76,6 +76,9 @@ function AircraftRow({ ac, onSelectIcao }) {
         {ac.type_count != null && (
           <span className={styles.typeCount}>×{ac.type_count}</span>
         )}
+        {ac.type_flights_count != null && ac.type_flights_count > 0 && (
+          <span className={styles.typeFlights}>({ac.type_flights_count})</span>
+        )}
       </td>
       <td className={styles.operator} title={formatOperator(ac.operator) ?? undefined}>{formatOperator(ac.operator) ?? '—'}</td>
       <td>{ac.year ?? '—'}</td>

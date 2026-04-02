@@ -1681,6 +1681,13 @@ class AircraftState:
                         ac.pos_reliable_even = 0.0
         return expired
 
+    def drain_all(self) -> list:
+        """Remove and return all currently tracked aircraft for visit close-out on shutdown."""
+        with self._lock:
+            drained = list(self._aircraft.values())
+            self._aircraft.clear()
+        return drained
+
     def get_icaos(self) -> set[str]:
         """Return the current set of tracked ICAO addresses (no snapshot build)."""
         with self._lock:

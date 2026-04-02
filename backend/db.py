@@ -1786,15 +1786,24 @@ class StatsDB:
                     FROM aircraft_registry
                     WHERE type_code IS NOT NULL AND type_code != ''
                     GROUP BY type_code
+                ),
+                type_flights AS (
+                    SELECT ar.type_code, COUNT(*) AS fc
+                    FROM visits v
+                    JOIN aircraft_registry ar ON v.icao = ar.icao
+                    WHERE ar.type_code IS NOT NULL AND ar.type_code != ''
+                    GROUP BY ar.type_code
                 )
                 SELECT ar.icao, ar.registration, ar.type_code, ar.type_category,
                        ar.military, ar.country, ar.operator, ar.manufacturer, ar.year,
                        ar.foreign_military, ar.interesting, ar.rare, ar.first_seen_flag,
                        ar.first_seen, ar.last_seen, ar.sighting_count,
                        COALESCE(tc.tc, 1)         AS type_count,
-                       1.0 / COALESCE(tc.tc, 1)  AS type_rarity
+                       1.0 / COALESCE(tc.tc, 1)  AS type_rarity,
+                       COALESCE(tf.fc, 0)         AS type_flights_count
                 FROM aircraft_registry ar
                 LEFT JOIN type_counts tc ON ar.type_code = tc.type_code
+                LEFT JOIN type_flights tf ON ar.type_code = tf.type_code
                 WHERE {where}
                 ORDER BY {order}
                 LIMIT ? OFFSET ?
