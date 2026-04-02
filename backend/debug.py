@@ -244,3 +244,53 @@ async def override_aircraft_field(icao: str, req: OverrideRequest) -> dict:
         await asyncio.to_thread(stats_db.force_update_aircraft_enrichment, icao, **kwargs)
 
     return {"status": "ok", "icao": icao, "field": req.field, "value": req.value}
+
+
+# ---------------------------------------------------------------------------
+# Type code manufacturer override
+# ---------------------------------------------------------------------------
+
+class ManufacturerRequest(BaseModel):
+    manufacturer: str
+
+
+@router.get("/type/{type_code}")
+async def debug_type(type_code: str) -> dict:
+    tc = type_code.strip().upper()
+    ti = enrichment_module.db.get_type_info(tc)
+    airframe_count, db_manufacturer = await asyncio.to_thread(_type_stats, tc)
+    overrides = await asyncio.to_thread(stats_db.get_all_type_manufacturer_overrides)
+    override = overrides.get(tc)
+    return {
+        "type_code":      tc,
+        "type_name":      ti.get("name") if ti else None,
+        "wtc":            ti.get("wtc")  if ti else None,
+        "airframe_count": airframe_count,
+        "db_manufacturer": db_manufacturer,
+        "override":       override,
+    }
+
+
+def _type_stats(type_code: str) -> tuple[int, str | None]:
+    return stats_db.get_type_code_stats(type_code)
+
+
+@router.post("/type/{type_code}/manufacturer")
+async def set_type_manufacturer(type_code: str, req: ManufacturerRequest) -> dict:
+    tc = type_code.strip().upper()
+    mfr = req.manufacturer.strip()
+    if not mfr:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="manufacturer must not be empty")
+    await asyncio.to_thread(stats_db.set_type_manufacturer_override, tc, mfr)
+    return {"status": "ok", "type_code": tc, "manufacturer": mfr}
+
+
+@router.delete("/type/{type_code}/manufacturer")
+async def delete_type_manufacturer(type_code: str) -> dict:
+    tc = type_code.strip().upper()
+    deleted = await asyncio.to_thread(stats_db.delete_type_manufacturer_override, tc)
+    if not deleted:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"No override for {tc}")
+    return {"status": "ok", "type_code": tc}

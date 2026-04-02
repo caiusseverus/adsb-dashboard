@@ -144,6 +144,9 @@ export default function StatusPage() {
       {/* Aircraft debug lookup */}
       <AircraftDebug />
 
+      {/* Type code manufacturer assignment */}
+      <TypeManufacturerDebug />
+
       <BenchmarkPanel />
 
       {/* Acknowledgements */}
@@ -377,6 +380,154 @@ function AircraftDebug() {
           <div style={{ marginTop: '0.6rem', fontSize: '0.72rem', color: '#484f58' }}>
             Click a value in any source column to write it to the registry.
           </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Type code manufacturer assignment
+// ---------------------------------------------------------------------------
+
+function TypeManufacturerDebug() {
+  const [input,    setInput]    = useState('')
+  const [result,   setResult]   = useState(null)
+  const [loading,  setLoading]  = useState(false)
+  const [error,    setError]    = useState(null)
+  const [mfrInput, setMfrInput] = useState('')
+  const [saveStatus, setSaveStatus] = useState(null)  // 'saving' | 'ok' | 'error' | 'deleted'
+
+  const lookup = useCallback(async () => {
+    const tc = input.trim().toUpperCase()
+    if (!tc) return
+    setLoading(true); setError(null); setResult(null); setSaveStatus(null)
+    try {
+      const r = await fetch(`${API_BASE}/api/debug/type/${tc}`)
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const data = await r.json()
+      setResult(data)
+      setMfrInput(data.override ?? '')
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [input])
+
+  const save = useCallback(async () => {
+    if (!result || !mfrInput.trim()) return
+    setSaveStatus('saving')
+    try {
+      const r = await fetch(`${API_BASE}/api/debug/type/${result.type_code}/manufacturer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ manufacturer: mfrInput.trim() }),
+      })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      setResult(prev => ({ ...prev, override: mfrInput.trim() }))
+      setSaveStatus('ok')
+    } catch (e) {
+      setSaveStatus('error')
+    }
+  }, [result, mfrInput])
+
+  const clear = useCallback(async () => {
+    if (!result) return
+    setSaveStatus('saving')
+    try {
+      const r = await fetch(`${API_BASE}/api/debug/type/${result.type_code}/manufacturer`, {
+        method: 'DELETE',
+      })
+      if (!r.ok && r.status !== 404) throw new Error(`HTTP ${r.status}`)
+      setResult(prev => ({ ...prev, override: null }))
+      setMfrInput('')
+      setSaveStatus('deleted')
+    } catch (e) {
+      setSaveStatus('error')
+    }
+  }, [result])
+
+  return (
+    <div className={styles.card}>
+      <div className={styles.cardHeader}>
+        <span className={styles.cardTitle}>Type code manufacturer assignment</span>
+      </div>
+      <div style={{ display: 'flex', gap: '0.6rem', marginBottom: '1.25rem', alignItems: 'center' }}>
+        <input
+          className={styles.icaoInput}
+          placeholder="Type code (e.g. B38M)"
+          value={input}
+          onChange={e => setInput(e.target.value.toUpperCase().slice(0, 8))}
+          onKeyDown={e => e.key === 'Enter' && lookup()}
+          spellCheck={false}
+        />
+        <button className={styles.lookupBtn} onClick={lookup} disabled={loading}>
+          {loading ? 'Looking up…' : 'Look up'}
+        </button>
+      </div>
+
+      {error && <div className={styles.debugError}>{error}</div>}
+
+      {result && (
+        <div>
+          <table className={styles.debugTable} style={{ marginBottom: '1rem' }}>
+            <tbody>
+              <tr>
+                <td className={styles.debugFieldName}>Type code</td>
+                <td><strong style={{ fontFamily: 'monospace' }}>{result.type_code}</strong></td>
+              </tr>
+              <tr>
+                <td className={styles.debugFieldName}>Type name</td>
+                <td>{result.type_name ?? <span className={styles.debugMissing}>—</span>}</td>
+              </tr>
+              <tr>
+                <td className={styles.debugFieldName}>WTC</td>
+                <td>{result.wtc ?? <span className={styles.debugMissing}>—</span>}</td>
+              </tr>
+              <tr>
+                <td className={styles.debugFieldName}>Airframes seen</td>
+                <td>{result.airframe_count}</td>
+              </tr>
+              <tr>
+                <td className={styles.debugFieldName}>DB manufacturer</td>
+                <td>{result.db_manufacturer ?? <span className={styles.debugMissing}>—</span>}</td>
+              </tr>
+              <tr>
+                <td className={styles.debugFieldName}>Current override</td>
+                <td>
+                  {result.override
+                    ? <><strong>{result.override}</strong> <span className={styles.debugApplyable}>(active)</span></>
+                    : <span className={styles.debugMissing}>none</span>
+                  }
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+            <input
+              className={styles.icaoInput}
+              style={{ width: 200 }}
+              placeholder="Manufacturer name"
+              value={mfrInput}
+              onChange={e => setMfrInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && save()}
+            />
+            <button className={styles.lookupBtn} onClick={save} disabled={saveStatus === 'saving' || !mfrInput.trim()}>
+              Save override
+            </button>
+            {result.override && (
+              <button className={styles.lookupBtn} onClick={clear} disabled={saveStatus === 'saving'}
+                style={{ background: 'transparent', borderColor: '#f85149', color: '#f85149' }}>
+                Clear override
+              </button>
+            )}
+          </div>
+
+          {saveStatus === 'ok'      && <div className={styles.debugOk} style={{ marginTop: '0.5rem' }}>Override saved.</div>}
+          {saveStatus === 'deleted' && <div className={styles.debugOk} style={{ marginTop: '0.5rem' }}>Override cleared.</div>}
+          {saveStatus === 'error'   && <div className={styles.debugError} style={{ marginTop: '0.5rem' }}>Save failed.</div>}
         </div>
       )}
     </div>

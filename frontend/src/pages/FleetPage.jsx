@@ -6,6 +6,7 @@ import {
 import { formatOperator } from '../utils/formatOperator'
 import { useFetch } from '../utils/useFetch'
 import styles from './FleetPage.module.css'
+import FleetTypesTable from '../components/FleetTypesTable'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 
@@ -537,6 +538,7 @@ export default function FleetPage({ onSelectIcao }) {
         ))}
       </div>
       <SummaryRow since={since} />
+      <FleetTypesTable since={since} onSelectIcao={onSelectIcao} />
       <div className={styles.row}>
         <TopTypes since={since} />
         <TopOperators since={since} />

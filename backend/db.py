@@ -508,6 +508,15 @@ class StatsDB:
                     ON squawk_events(icao);
             """)
 
+        # type_manufacturer_overrides — user-defined type_code → manufacturer mappings
+        with self._connect() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS type_manufacturer_overrides (
+                    type_code    TEXT PRIMARY KEY,
+                    manufacturer TEXT NOT NULL
+                );
+            """)
+
         # notify_watchlist, notify_prefs, cast_config, cast_rules
         with self._connect() as conn:
             conn.executescript("""
@@ -1570,6 +1579,44 @@ class StatsDB:
             """, params).fetchone()
         return dict(row) if row else {}
 
+    def get_all_type_manufacturer_overrides(self) -> dict[str, str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT type_code, manufacturer FROM type_manufacturer_overrides"
+            ).fetchall()
+        return {r["type_code"]: r["manufacturer"] for r in rows}
+
+    def set_type_manufacturer_override(self, type_code: str, manufacturer: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO type_manufacturer_overrides (type_code, manufacturer) VALUES (?, ?)"
+                " ON CONFLICT(type_code) DO UPDATE SET manufacturer = excluded.manufacturer",
+                (type_code.upper(), manufacturer.strip()),
+            )
+
+    def get_type_code_stats(self, type_code: str) -> tuple[int, str | None]:
+        """Return (airframe_count, most_common_db_manufacturer) for a type code."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) AS n,
+                          (SELECT manufacturer FROM aircraft_registry
+                           WHERE type_code = ? AND manufacturer IS NOT NULL AND manufacturer != ''
+                           GROUP BY manufacturer ORDER BY COUNT(*) DESC LIMIT 1) AS manufacturer
+                   FROM aircraft_registry WHERE type_code = ?""",
+                (type_code, type_code),
+            ).fetchone()
+        if row:
+            return row["n"], row["manufacturer"]
+        return 0, None
+
+    def delete_type_manufacturer_override(self, type_code: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM type_manufacturer_overrides WHERE type_code = ?",
+                (type_code.upper(),),
+            )
+        return cur.rowcount > 0
+
     def query_fleet_types(self, limit: int = 20, military: int | None = None,
                           since_ts: int | None = None) -> list[dict]:
         mil_clause = "" if military is None else f"AND military = {int(military)}"
@@ -1740,6 +1787,216 @@ class StatsDB:
                 LIMIT ?
             """, params).fetchall()
         return [{"airport": r["airport"], "count": r["count"]} for r in rows]
+
+    def query_fleet_all_type_codes(
+        self,
+        since_ts: int | None = None,
+        military: int | None = None,
+        search: str | None = None,
+    ) -> list[dict]:
+        """Return per-type_code aggregates without grouping; used for Python-side manufacturer grouping."""
+        mil_clause = "" if military is None else f"AND ar.military = {int(military)}"
+        params: list = []
+        since_clause = ""
+        if since_ts is not None:
+            since_clause = "AND ar.last_seen >= ?"
+            params.append(since_ts)
+        visit_since_clause = ""
+        visit_params: list = []
+        if since_ts is not None:
+            visit_since_clause = "WHERE start_ts >= ?"
+            visit_params.append(since_ts)
+        search_clause = ""
+        if search:
+            search_clause = "AND (ar.type_code LIKE ? OR ar.manufacturer LIKE ?)"
+            like = f"%{search}%"
+            params.extend([like, like])
+
+        with self._connect() as conn:
+            rows = conn.execute(f"""
+                SELECT
+                    ar.type_code,
+                    MAX(NULLIF(ar.manufacturer, '')) AS manufacturer,
+                    COUNT(DISTINCT ar.icao)          AS airframes,
+                    COALESCE(SUM(vc.flights), 0)     AS flights,
+                    MAX(ar.last_seen)                AS last_seen
+                FROM aircraft_registry ar
+                LEFT JOIN (
+                    SELECT icao, COUNT(*) AS flights FROM visits {visit_since_clause} GROUP BY icao
+                ) vc ON vc.icao = ar.icao
+                WHERE ar.type_code IS NOT NULL AND ar.type_code != ''
+                  {mil_clause} {since_clause} {search_clause}
+                GROUP BY ar.type_code
+            """, visit_params + params).fetchall()
+
+        return [
+            {
+                "type_code":    r["type_code"],
+                "manufacturer": r["manufacturer"],
+                "airframes":    r["airframes"],
+                "flights":      r["flights"],
+                "last_seen":    r["last_seen"],
+            }
+            for r in rows
+        ]
+
+    # Valid sort columns for fleet types table (whitelist — no user data in SQL)
+    _FLEET_TYPES_SORT_MAP = {
+        "type_code":  "group_key",
+        "airframes":  "airframes",
+        "flights":    "flights",
+        "last_seen":  "last_seen",
+    }
+
+    def query_fleet_types_table(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        since_ts: int | None = None,
+        military: int | None = None,
+        search: str | None = None,
+        sort_col: str = "airframes",
+        sort_dir: str = "desc",
+        group_by: str | None = None,
+    ) -> tuple[list[dict], int]:
+        sort_expr = self._FLEET_TYPES_SORT_MAP.get(sort_col, "airframes")
+        direction = "ASC" if sort_dir == "asc" else "DESC"
+
+        mil_clause = "" if military is None else f"AND ar.military = {int(military)}"
+        params: list = []
+        since_clause = ""
+        if since_ts is not None:
+            since_clause = "AND ar.last_seen >= ?"
+            params.append(since_ts)
+        # Visit subquery also filters by since if provided
+        visit_since_clause = ""
+        visit_params: list = []
+        if since_ts is not None:
+            visit_since_clause = "WHERE start_ts >= ?"
+            visit_params.append(since_ts)
+        search_clause = ""
+        if search:
+            search_clause = "AND (ar.type_code LIKE ? OR ar.manufacturer LIKE ?)"
+            like = f"%{search}%"
+            params.extend([like, like])
+
+        if group_by == "manufacturer":
+            group_expr = "COALESCE(NULLIF(ar.manufacturer, ''), ar.type_code)"
+            select_extra = f"GROUP_CONCAT(DISTINCT ar.type_code) AS type_codes, {group_expr} AS group_key"
+        else:
+            group_expr = "ar.type_code"
+            select_extra = "ar.type_code AS type_codes, ar.type_code AS group_key"
+
+        base_sql = f"""
+            FROM aircraft_registry ar
+            LEFT JOIN (
+                SELECT icao, COUNT(*) AS flights FROM visits {visit_since_clause} GROUP BY icao
+            ) vc ON vc.icao = ar.icao
+            WHERE ar.type_code IS NOT NULL AND ar.type_code != ''
+              {mil_clause} {since_clause} {search_clause}
+            GROUP BY {group_expr}
+        """
+
+        count_params = visit_params + params
+        with self._connect() as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM (SELECT {group_expr} AS gk {base_sql})", count_params
+            ).fetchone()[0]
+
+            rows = conn.execute(f"""
+                SELECT
+                    {select_extra},
+                    COUNT(DISTINCT ar.icao)         AS airframes,
+                    COALESCE(SUM(vc.flights), 0)    AS flights,
+                    MAX(ar.last_seen)               AS last_seen,
+                    ar.manufacturer                 AS sample_manufacturer
+                {base_sql}
+                ORDER BY {sort_expr} {direction}
+                LIMIT ? OFFSET ?
+            """, visit_params + params + [limit, offset]).fetchall()
+
+        items = []
+        for r in rows:
+            items.append({
+                "group_key":          r["group_key"],
+                "type_codes":         r["type_codes"] or "",
+                "airframes":          r["airframes"],
+                "flights":            r["flights"],
+                "last_seen":          r["last_seen"],
+                "sample_manufacturer": r["sample_manufacturer"],
+            })
+        return items, total
+
+    def query_fleet_type_airframes(
+        self,
+        type_codes: list[str],
+        since_ts: int | None = None,
+        military: int | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        if not type_codes:
+            return []
+        placeholders = ",".join("?" * len(type_codes))
+        mil_clause = "" if military is None else f"AND ar.military = {int(military)}"
+        params: list = list(type_codes)
+        since_clause = ""
+        if since_ts is not None:
+            since_clause = "AND ar.last_seen >= ?"
+            params.append(since_ts)
+        params.append(limit)
+
+        with self._connect() as conn:
+            rows = conn.execute(f"""
+                SELECT
+                    ar.icao, ar.registration, ar.operator, ar.country, ar.year,
+                    ar.military, ar.sighting_count, ar.last_seen, ar.type_code,
+                    (SELECT COUNT(*) FROM visits v WHERE v.icao = ar.icao) AS visit_count,
+                    (SELECT MAX(v.max_altitude) FROM visits v WHERE v.icao = ar.icao) AS max_altitude,
+                    (SELECT SUM(v.msg_count) FROM visits v WHERE v.icao = ar.icao) AS total_messages
+                FROM aircraft_registry ar
+                WHERE ar.type_code IN ({placeholders})
+                  {mil_clause} {since_clause}
+                ORDER BY ar.sighting_count DESC
+                LIMIT ?
+            """, params).fetchall()
+
+        icaos = [r["icao"] for r in rows]
+        routes_by_icao: dict[str, list[str]] = {icao: [] for icao in icaos}
+        if icaos:
+            route_placeholders = ",".join("?" * len(icaos))
+            with self._connect() as conn:
+                route_rows = conn.execute(f"""
+                    SELECT icao, origin_icao, dest_icao, COUNT(*) AS cnt
+                    FROM visits
+                    WHERE icao IN ({route_placeholders})
+                      AND origin_icao IS NOT NULL AND origin_icao != ''
+                      AND dest_icao IS NOT NULL AND dest_icao != ''
+                    GROUP BY icao, origin_icao, dest_icao
+                    ORDER BY icao, cnt DESC
+                """, icaos).fetchall()
+            for rr in route_rows:
+                lst = routes_by_icao.setdefault(rr["icao"], [])
+                if len(lst) < 3:
+                    lst.append(f"{rr['origin_icao']} → {rr['dest_icao']} ({rr['cnt']})")
+
+        return [
+            {
+                "icao":           r["icao"],
+                "registration":   r["registration"],
+                "operator":       r["operator"],
+                "country":        r["country"],
+                "year":           r["year"],
+                "military":       r["military"],
+                "type_code":      r["type_code"],
+                "sighting_count": r["sighting_count"],
+                "visit_count":    r["visit_count"] or 0,
+                "last_seen":      r["last_seen"],
+                "max_altitude":   r["max_altitude"],
+                "total_messages": r["total_messages"] or 0,
+                "top_routes":     routes_by_icao.get(r["icao"], []),
+            }
+            for r in rows
+        ]
 
     # Maps frontend sort key → SQL expression (no user data, all literals)
     _NOTABLE_SORT_MAP = {
