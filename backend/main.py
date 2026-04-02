@@ -880,7 +880,10 @@ async def _seed_startup_state() -> None:
     await asyncio.to_thread(stats_db.backfill_us_mil_years)
 
     # Merge visits split by the previous restart before serving any data.
+    # Reset the housekeeping timer so the daily task doesn't duplicate this run.
+    global _visit_merge_last_ts
     merged = await asyncio.to_thread(stats_db.merge_short_visits)
+    _visit_merge_last_ts = time.time()
     if merged:
         log.info("Startup visit merge: consolidated %d split visit(s)", merged)
 
