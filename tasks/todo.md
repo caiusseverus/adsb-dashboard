@@ -154,7 +154,7 @@ Addendum corrections are applied inline — see the "Corrections" section below 
   - Frontend: heatmap overlay mode toggle (Live / History); derive elevation angle from `arctan(alt_ft / (range_nm × 6076))`
   - Effort: ~3h backend + ~3h frontend
 
-- [ ] **4 — Terrain pseudo-3D (Sky View)** (`terrain.py`, `SkyView.jsx`)
+- [x] **4 — Terrain pseudo-3D (Sky View)** (`terrain.py`, `SkyView.jsx`)
   - Option A (range rings) — correct choice for ADS-B use
   - Backend: extend `/api/terrain/horizon` to accept fixed range set [25, 50, 75, 100 nm]; return array of elevation profiles; apply per-azimuth hidden-surface removal (max of nearer bands)
   - Frontend: layered filled areas with progressive shading

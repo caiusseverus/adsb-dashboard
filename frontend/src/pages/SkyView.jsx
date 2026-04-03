@@ -102,16 +102,16 @@ export default function SkyView({ snapshot, onSelectIcao }) {
   const [typeCode,       setTypeCode]       = useState('all')
   const [maxElev,        setMaxElev]        = useState(30)
   const [horizonScale,   setHorizonScale]   = useState('sqrt')
-  const [terrainHorizon, setTerrainHorizon] = useState(null)
+  const [terrainRanges,  setTerrainRanges]  = useState(null)  // {ranges, profiles} or null
   const [histMode,       setHistMode]       = useState(false)
   const [histData,       setHistData]       = useState(null)
   const [histHours,      setHistHours]      = useState(24)
 
-  // ── Fetch terrain horizon once on mount ─────────────────────────────
+  // ── Fetch multi-range terrain profiles once on mount ────────────────
   useEffect(() => {
-    fetch('/api/terrain/horizon')
+    fetch('/api/terrain/ranges')
       .then(r => r.ok ? r.json() : null)
-      .then(d => { if (d?.elevations) setTerrainHorizon(d.elevations) })
+      .then(d => { if (d?.profiles) setTerrainRanges(d) })
       .catch(() => {})
   }, [])
 
@@ -321,31 +321,46 @@ export default function SkyView({ snapshot, onSelectIcao }) {
       }
     }
 
-    // ── Terrain silhouette ─────────────────────────────────────────────
-    if (terrainHorizon && terrainHorizon.length === 360) {
-      ctx.beginPath()
-      ctx.moveTo(HORIZON_ML, plotH)
-      for (let az = 0; az < 360; az++) {
-        const x = HORIZON_ML + (az / 360) * plotW
-        const y = elevToY(terrainHorizon[az])
-        ctx.lineTo(x, y)
+    // ── Terrain pseudo-3D: layered range bands (back → front) ──────────
+    // profiles[0] = 0–25 nm cumulative max, profiles[3] = 0–100 nm.
+    // Drawing back-to-front (farthest first) lets closer, darker layers
+    // naturally occlude farther ones — correct hidden-surface removal.
+    if (terrainRanges?.profiles?.length === 4) {
+      const { profiles } = terrainRanges
+      // Colours: lightest (farthest, 100 nm) → darkest (closest, 25 nm)
+      const fills    = ['#19150f', '#1e190f', '#251f13', '#2e2416']
+      const outlines = ['#3a2f1e', '#3e3220', '#433524', '#4a3728']
+      // Draw farthest layer first, closest last
+      for (let i = profiles.length - 1; i >= 0; i--) {
+        const profile = profiles[i]
+        if (!profile || profile.length !== 360) continue
+
+        // Filled silhouette
+        ctx.beginPath()
+        ctx.moveTo(HORIZON_ML, plotH)
+        for (let az = 0; az < 360; az++) {
+          ctx.lineTo(HORIZON_ML + (az / 360) * plotW, elevToY(profile[az]))
+        }
+        ctx.lineTo(HORIZON_ML + plotW, plotH)
+        ctx.closePath()
+        ctx.fillStyle = fills[i]
+        ctx.fill()
+
+        // Ridge outline (only on the closest layer — would be invisible on others)
+        if (i === 0) {
+          ctx.beginPath()
+          for (let az = 0; az < 360; az++) {
+            const x = HORIZON_ML + (az / 360) * plotW
+            const y = elevToY(profile[az])
+            if (az === 0) ctx.moveTo(x, y)
+            else          ctx.lineTo(x, y)
+          }
+          ctx.lineTo(HORIZON_ML + plotW, elevToY(profile[0]))
+          ctx.strokeStyle = outlines[i]
+          ctx.lineWidth   = 1
+          ctx.stroke()
+        }
       }
-      ctx.lineTo(HORIZON_ML + plotW, plotH)
-      ctx.closePath()
-      ctx.fillStyle = '#1c1814'
-      ctx.fill()
-      // Outline
-      ctx.beginPath()
-      for (let az = 0; az < 360; az++) {
-        const x = HORIZON_ML + (az / 360) * plotW
-        const y = elevToY(terrainHorizon[az])
-        if (az === 0) ctx.moveTo(x, y)
-        else          ctx.lineTo(x, y)
-      }
-      ctx.lineTo(HORIZON_ML + plotW, elevToY(terrainHorizon[0]))
-      ctx.strokeStyle = '#4a3728'
-      ctx.lineWidth   = 1
-      ctx.stroke()
     }
 
     // ── Elevation grid lines ───────────────────────────────────────────
@@ -480,7 +495,7 @@ export default function SkyView({ snapshot, onSelectIcao }) {
       hitboxes.push({ icao: ac.icao, x: pos.x, y: pos.y, ac })
     })
     horizonHitboxesRef.current = hitboxes
-  }, [snapshot, maxElev, horizonScale, filter, colorMode, terrainHorizon, histData, typeGroup, typeCode])
+  }, [snapshot, maxElev, horizonScale, filter, colorMode, terrainRanges, histData, typeGroup, typeCode])
 
   // ── Pointer helpers ──────────────────────────────────────────────────
   const canvasCoords = (e, canvasEl) => {
@@ -620,7 +635,7 @@ export default function SkyView({ snapshot, onSelectIcao }) {
         <div className={styles.horizonHeader}>
           <span className={styles.subtitle}>
             Azimuth (compass) × Elevation — N at both edges, S at centre
-            {terrainHorizon && <> · terrain</>}
+            {terrainRanges && <> · terrain (25/50/75/100 nm)</>}
           </span>
           <div className={styles.filterRow}>
             {SCALE_OPTIONS.map(s => (

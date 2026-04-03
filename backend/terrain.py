@@ -495,6 +495,101 @@ def _compute_horizon(
     return result
 
 
+_RANGES_NM = [25, 50, 75, 100]
+
+
+def _ranges_cache_path(lat: float, lon: float) -> Path:
+    tag = "_".join(str(r) for r in _RANGES_NM)
+    return _TERRAIN_DIR / f"horizon_ranges_{tag}_{lat:.6f}_{lon:.6f}.json"
+
+
+def _compute_ranges_horizon(receiver_lat: float, receiver_lon: float) -> dict:
+    """Compute cumulative-max terrain elevation angle per azimuth for each range band.
+
+    Returns four 360-element profiles (one per entry in _RANGES_NM).  Each profile
+    contains the maximum elevation angle (degrees) seen from the receiver to that
+    range, for every 1° azimuth step.  Because the max is cumulative, each profile
+    is guaranteed to be >= all previous profiles — so back-to-front canvas rendering
+    produces the correct layered pseudo-3D silhouette.
+
+    Cached to disk; first run takes a few seconds.
+    """
+    import json
+    cache = _ranges_cache_path(receiver_lat, receiver_lon)
+    if cache.exists():
+        try:
+            return json.loads(cache.read_text())
+        except Exception:
+            pass
+
+    receiver_elev = _get_elevation_m(receiver_lat, receiver_lon)
+
+    # Walk from 0 to max range in 0.5 nm steps; record cumulative max at each
+    # range checkpoint.
+    max_range = _RANGES_NM[-1]
+    step_nm   = 0.5
+    steps     = int(max_range / step_nm)
+    distances = [(i + 1) * step_nm for i in range(steps)]
+
+    profiles: list[list[float]] = [[] for _ in _RANGES_NM]
+
+    for az in range(360):
+        running_max = 0.0
+        ring_idx    = 0
+        for dist_nm in distances:
+            lat2, lon2 = destination_point(receiver_lat, receiver_lon, az, dist_nm)
+            terrain_m  = _get_elevation_m(lat2, lon2)
+            delta_m    = terrain_m - receiver_elev
+            dist_m     = dist_nm * 1852.0
+            angle      = math.degrees(math.atan2(delta_m, dist_m))
+            if angle > running_max:
+                running_max = angle
+            # Record at each range checkpoint (may record multiple if step crosses)
+            while ring_idx < len(_RANGES_NM) and dist_nm >= _RANGES_NM[ring_idx]:
+                profiles[ring_idx].append(round(running_max, 3))
+                ring_idx += 1
+        # Fill any remaining rings with the final max (shouldn't happen normally)
+        while ring_idx < len(_RANGES_NM):
+            profiles[ring_idx].append(round(running_max, 3))
+            ring_idx += 1
+
+    result = {
+        "ranges":        _RANGES_NM,
+        "profiles":      profiles,
+        "receiver_elev_m": receiver_elev,
+    }
+    try:
+        cache.write_text(json.dumps(result))
+        log.info("Terrain ranges cached: %s", cache.name)
+    except OSError as exc:
+        log.warning("Could not write ranges cache: %s", exc)
+    return result
+
+
+@router.get("/api/terrain/ranges")
+async def terrain_ranges():
+    """Terrain horizon profiles for layered pseudo-3D rendering on Sky View.
+
+    Returns four 360-element elevation-angle profiles (one per range band in
+    _RANGES_NM = [25, 50, 75, 100] nm).  Each profile contains cumulative-max
+    elevation angles, so drawing them back-to-front on a canvas produces a
+    realistic pseudo-3D layered silhouette with hidden-surface removal.
+
+    Response: {ranges: [int×4], profiles: [[float×360]×4], receiver_elev_m: float}
+    """
+    if not config.TERRAIN_ENABLED:
+        raise HTTPException(status_code=503, detail="Terrain disabled")
+    if config.RECEIVER_LAT is None or config.RECEIVER_LON is None:
+        raise HTTPException(status_code=400, detail="RECEIVER_LAT/LON not configured")
+
+    data = await asyncio.to_thread(
+        _compute_ranges_horizon,
+        config.RECEIVER_LAT,
+        config.RECEIVER_LON,
+    )
+    return JSONResponse(data)
+
+
 @router.get("/api/terrain/horizon")
 async def terrain_horizon():
     """Terrain horizon elevation angle for each azimuth degree (0–359°).
