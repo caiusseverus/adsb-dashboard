@@ -98,6 +98,8 @@ export default function SkyView({ snapshot, onSelectIcao }) {
   const [hoveredAc,      setHoveredAc]      = useState(null)
   const { filter, setFilter, passesFilter } = useAircraftFilter('all')
   const [colorMode,      setColorMode]      = useState('classification')
+  const [typeGroup,      setTypeGroup]      = useState('all')
+  const [typeCode,       setTypeCode]       = useState('all')
   const [maxElev,        setMaxElev]        = useState(30)
   const [horizonScale,   setHorizonScale]   = useState('sqrt')
   const [terrainHorizon, setTerrainHorizon] = useState(null)
@@ -126,7 +128,16 @@ export default function SkyView({ snapshot, onSelectIcao }) {
 
   // ── Filtered aircraft & operator colour map ──────────────────────────
   const baseAircraft = snapshot?.aircraft ?? []
-  const aircraft = useMemo(() => baseAircraft.filter(ac => passesFilter(ac)), [snapshot, filter])
+  const aircraft = useMemo(() => baseAircraft
+    .filter(ac => passesFilter(ac))
+    .filter(ac => typeGroup === 'all' || getTypeGroup(ac.type_code, ac.type_category)?.value === typeGroup)
+    .filter(ac => typeCode === 'all' || ac.type_code === typeCode),
+  [snapshot, filter, typeGroup, typeCode])
+
+  // Unique type codes visible in current snapshot (for type code dropdown)
+  const visibleTypeCodes = useMemo(() =>
+    [...new Set(baseAircraft.map(ac => ac.type_code).filter(Boolean))].sort(),
+  [snapshot])
 
   const operatorMap = useMemo(
     () => buildNameColorMap(baseAircraft, 'operator').map,
@@ -539,6 +550,14 @@ export default function SkyView({ snapshot, onSelectIcao }) {
               onClick={() => setFilter(f.value)}
             >{f.label}</button>
           ))}
+          <select className={styles.select} value={typeGroup} onChange={e => { setTypeGroup(e.target.value); setTypeCode('all') }}>
+            <option value="all">All types</option>
+            {TYPE_GROUPS.map(g => <option key={g.value} value={g.value}>{g.label}</option>)}
+          </select>
+          <select className={styles.select} value={typeCode} onChange={e => setTypeCode(e.target.value)}>
+            <option value="all">All codes</option>
+            {visibleTypeCodes.map(tc => <option key={tc} value={tc}>{tc}</option>)}
+          </select>
         </div>
       </div>
 

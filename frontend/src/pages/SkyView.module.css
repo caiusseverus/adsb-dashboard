@@ -38,6 +38,17 @@
   justify-content: center;
 }
 
+.select {
+  background: #0b0c10;
+  border: 1px solid #30363d;
+  color: #8b949e;
+  font-size: 0.76rem;
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.select:focus { outline: none; border-color: #388bfd; }
+
 .btn {
   padding: 0.2rem 0.65rem;
   border: 1px solid #30363d;

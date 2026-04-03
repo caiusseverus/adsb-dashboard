@@ -34,6 +34,39 @@
   to   { transform: translateY(0);    opacity: 1; }
 }
 
+/* Drawer mode — slides in from the right, map remains interactive */
+.drawer {
+  position: fixed;
+  right: 0;
+  top: 0;
+  height: 100vh;
+  width: 380px;
+  z-index: 500;
+  background: #161b22;
+  border-left: 1px solid #30363d;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: slideIn 0.2s ease-out;
+}
+
+@keyframes slideIn {
+  from { transform: translateX(100%); opacity: 0; }
+  to   { transform: translateX(0);    opacity: 1; }
+}
+
+@media (max-width: 600px) {
+  .drawer {
+    width: 100vw;
+    top: auto;
+    bottom: 0;
+    height: 60vh;
+    border-left: none;
+    border-top: 1px solid #30363d;
+    animation: slideUp 0.2s ease-out;
+  }
+}
+
 /* Header */
 .header {
   display: flex;

@@ -219,6 +219,7 @@ export default function App() {
           onClose={() => { setSelectedIcao(null); setSelectedVisitTs(null) }}
           onRefreshed={() => setNotableRefreshKey(k => k + 1)}
           onOpenCoverage={handleOpenCoverage}
+          mode={tab === 'map' ? 'drawer' : 'modal'}
         />
       )}
     </div>

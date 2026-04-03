@@ -112,7 +112,7 @@ function MiniMap({ icao, visitId }) {
 }
 
 
-export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefreshed, initialVisitTs, onOpenCoverage }) {
+export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefreshed, initialVisitTs, onOpenCoverage, mode = 'modal' }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(false)
@@ -230,9 +230,10 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
     setActiveVisitId(prev => prev === visitId ? null : visitId)
   }
 
-  return (
-    <div className={styles.overlay} onMouseDown={e => { if (e.target === e.currentTarget) onClose() }}>
-      <div className={styles.modal}>
+  const panelClass = mode === 'drawer' ? styles.drawer : styles.modal
+
+  const panel = (
+    <div className={panelClass}>
 
         {/* Header */}
         <div className={styles.header}>
@@ -465,6 +466,14 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
         )}
 
       </div>
+    </div>
+  )
+
+  if (mode === 'drawer') return panel
+
+  return (
+    <div className={styles.overlay} onMouseDown={e => { if (e.target === e.currentTarget) onClose() }}>
+      {panel}
     </div>
   )
 }

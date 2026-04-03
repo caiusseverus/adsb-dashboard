@@ -64,12 +64,11 @@ Addendum corrections are applied inline — see the "Corrections" section below 
   - Add freshness guard in coverage writer (`main.py`): skip sample if `time() - ac.last_pos_ts > POS_FRESH_S`
   - Effort: ~3–4h
 
-- [ ] **10 — Signal distribution investigation**
-  - Check if `/api/history/signal_heatmap` already captures comparable data
-  - Confirm the minute-level avg vs per-message peak discrepancy vs graphs1090 (likely explanation)
-  - Verify `-(raw/2)` RSSI conversion is applied consistently in `aircraft_state.py` before storage
-  - Decision point: document if it's apples-to-oranges; fix if there's a conversion/sampling bug
-  - Effort: ~1h investigation; fix TBD
+- [x] **10 — Signal distribution investigation** — RESOLVED: apples-to-oranges, no fix needed
+  - `ac.signal` stored as raw Beast byte (0-255); conversion `-(raw/2)` applied correctly in both Beast decode path and readsb JSON path
+  - `signal_heatmap` uses coverage_samples (per-aircraft-per-minute) → distinct aircraft counts per signal bucket — fundamentally different from graphs1090 per-message peaks
+  - `minute_stats.signal_avg` is a per-minute average, not per-message peak distribution
+  - Conclusion: discrepancy vs graphs1090 is inherent in the sampling scope, not a bug
 
 ---
 
@@ -123,7 +122,7 @@ Addendum corrections are applied inline — see the "Corrections" section below 
   - Decide scope: option (b) is more robust for large histories
   - Effort: ~3h
 
-- [ ] **3 — Sky View filter alignment with Coverage page** (`SkyView.jsx`)
+- [x] **3 — Sky View filter alignment with Coverage page** (`SkyView.jsx`)
   - Implement **after Phase 0A** (shared filter hook) — do not copy Coverage filter logic by hand
   - Add Type Group dropdown and Type Code dropdown using shared hook
   - Client-side filtering against live aircraft array — no backend change
@@ -140,7 +139,7 @@ Addendum corrections are applied inline — see the "Corrections" section below 
 
 ## Phase 5 — Larger Features
 
-- [ ] **7a — Map side panel / drawer** (`App.jsx`, `AircraftDetailPanel`)
+- [x] **7a — Map side panel / drawer** (`App.jsx`, `AircraftDetailPanel`)
   - `AircraftDetailPanel` is a centred modal owned at app level in `App.jsx` — this is an app-wide UX change
   - Add `mode` prop to `AircraftDetailPanel`: `'modal' | 'drawer'`
   - Drawer: `position:fixed; right:0; top:0; height:100%; width:380px`; map content adjusts via `padding-right` or CSS grid
