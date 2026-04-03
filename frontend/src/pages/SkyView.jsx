@@ -103,6 +103,9 @@ export default function SkyView({ snapshot, onSelectIcao }) {
   const [maxElev,        setMaxElev]        = useState(30)
   const [horizonScale,   setHorizonScale]   = useState('sqrt')
   const [terrainHorizon, setTerrainHorizon] = useState(null)
+  const [histMode,       setHistMode]       = useState(false)
+  const [histData,       setHistData]       = useState(null)
+  const [histHours,      setHistHours]      = useState(24)
 
   // ── Fetch terrain horizon once on mount ─────────────────────────────
   useEffect(() => {
@@ -111,6 +114,16 @@ export default function SkyView({ snapshot, onSelectIcao }) {
       .then(d => { if (d?.elevations) setTerrainHorizon(d.elevations) })
       .catch(() => {})
   }, [])
+
+  // ── Fetch Sky View history heatmap when enabled ─────────────────────
+  useEffect(() => {
+    if (!histMode) { setHistData(null); return }
+    setHistData(null)
+    fetch(`/api/history/skyview?hours=${histHours}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d?.cells) setHistData(d) })
+      .catch(() => {})
+  }, [histMode, histHours])
 
   // ── Poll track history every 5 s ────────────────────────────────────
   useEffect(() => {
@@ -384,6 +397,28 @@ export default function SkyView({ snapshot, onSelectIcao }) {
     ctx.fillText('N', HORIZON_ML + plotW, plotH + 4)
     ctx.textBaseline = 'alphabetic'
 
+    // ── History heatmap (azimuth × elevation density) ─────────────────
+    if (histData?.cells?.length) {
+      const cellW = (2 / 360) * plotW  // 2° azimuth bin width in canvas px
+      let maxCount = 0
+      for (const [,, count] of histData.cells) if (count > maxCount) maxCount = count
+      for (const [az, el, count, sigRaw] of histData.cells) {
+        if (el > maxElev) continue
+        const x = HORIZON_ML + (az / 360) * plotW
+        const yTop = elevToY(el + 1)
+        const yBot = elevToY(el)
+        const h = Math.max(1, yBot - yTop)
+        const intensity = Math.sqrt(count / maxCount)  // sqrt for perceptual scaling
+        // Map signal raw byte to hue: 0 (strongest) = green, 128 = amber, 255 = red
+        const pct = Math.max(0, Math.min(255, sigRaw)) / 255
+        const r = Math.round(60 + 180 * pct)
+        const g = Math.round(180 - 120 * pct)
+        const b = 50
+        ctx.fillStyle = `rgba(${r},${g},${b},${(intensity * 0.7).toFixed(2)})`
+        ctx.fillRect(x, yTop, cellW + 0.5, h)
+      }
+    }
+
     // ── Trails ─────────────────────────────────────────────────────────
     const tracks = tracksRef.current
     Object.values(tracks).forEach(points => {
@@ -440,7 +475,7 @@ export default function SkyView({ snapshot, onSelectIcao }) {
       hitboxes.push({ icao: ac.icao, x: pos.x, y: pos.y, ac })
     })
     horizonHitboxesRef.current = hitboxes
-  }, [snapshot, maxElev, horizonScale, filter, colorMode, terrainHorizon])
+  }, [snapshot, maxElev, horizonScale, filter, colorMode, terrainHorizon, histData])
 
   // ── Pointer helpers ──────────────────────────────────────────────────
   const canvasCoords = (e, canvasEl) => {
@@ -595,6 +630,15 @@ export default function SkyView({ snapshot, onSelectIcao }) {
             className={styles.btnSmall}
             onClick={() => setMaxElev(v => v === 30 ? 90 : 30)}
           >{maxElev === 30 ? 'Expand to 90°' : 'Zoom to 30°'}</button>
+          <button
+            className={histMode ? styles.btnActive : styles.btnSmall}
+            onClick={() => setHistMode(v => !v)}
+          >{histMode ? 'History on' : 'History'}</button>
+          {histMode && (
+            <select className={styles.select} value={histHours} onChange={e => setHistHours(Number(e.target.value))}>
+              {[6, 12, 24, 48, 72].map(h => <option key={h} value={h}>{h}h</option>)}
+            </select>
+          )}
         </div>
         <div className={styles.canvasWrap}>
           <canvas

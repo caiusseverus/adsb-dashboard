@@ -3077,6 +3077,60 @@ class StatsDB:
         ]
         return {"min_ts": min_ts, "minutes": minutes, "cells": cells, "max_dbfs_bucket": max_dbfs_bucket}
 
+    def query_skyview_history(self, hours: int = 24) -> dict:
+        """Aggregate coverage_samples into azimuth × elevation bins for the Sky View heatmap.
+
+        Returns cells as [az_bin_deg, el_bin_deg, count, avg_signal_raw] sorted by az then el.
+        az_bin is the start of a 2° azimuth sector (0–358).
+        el_bin is the integer elevation degree (derived from altitude and range).
+        """
+        import math
+        FEET_PER_NM = 6076.115
+        cutoff = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp())
+        with self._connect() as conn:
+            # Pre-aggregate in SQL to avoid fetching millions of individual rows.
+            # Group by 2° azimuth bins and coarse altitude/range buckets first.
+            rows = conn.execute("""
+                SELECT
+                    CAST(bearing_deg / 2 AS INTEGER) * 2 AS az_bin,
+                    CAST(COALESCE(altitude, 0) / 1000 AS INTEGER) * 1000 AS alt_bin,
+                    CAST(range_nm / 5 AS INTEGER) * 5 AS range_bin,
+                    AVG(signal) AS avg_signal,
+                    COUNT(*) AS cnt
+                FROM coverage_samples
+                WHERE ts >= ?
+                  AND bearing_deg IS NOT NULL
+                  AND range_nm IS NOT NULL
+                  AND altitude IS NOT NULL
+                  AND altitude > 0
+                  AND range_nm > 0
+                GROUP BY az_bin, alt_bin, range_bin
+            """, (cutoff,)).fetchall()
+
+        bins: dict[tuple[int, int], list[int, float]] = {}
+        for row in rows:
+            az_bin = int(row["az_bin"])
+            alt_ft = float(row["alt_bin"])
+            range_nm = float(row["range_bin"]) + 2.5   # use midpoint of range bucket
+            elev_deg = math.degrees(math.atan2(alt_ft, range_nm * FEET_PER_NM))
+            if elev_deg < 0:
+                continue
+            el_bin = int(elev_deg)
+            key = (az_bin, el_bin)
+            cnt = int(row["cnt"])
+            sig = float(row["avg_signal"]) if row["avg_signal"] is not None else 128.0
+            if key in bins:
+                prev_cnt, prev_sig = bins[key]
+                bins[key] = [prev_cnt + cnt, prev_sig + sig * cnt]
+            else:
+                bins[key] = [cnt, sig * cnt]
+
+        cells = [
+            [az, el, data[0], round(data[1] / data[0]) if data[0] else 128]
+            for (az, el), data in sorted(bins.items())
+        ]
+        return {"hours": hours, "cells": cells}
+
     def backup(self, dest_dir: "Path") -> "Path":
         """Hot-backup the database to dest_dir/adsb_backup_YYYY-MM-DD.db.
 

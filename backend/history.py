@@ -215,6 +215,12 @@ async def signal_heatmap(hours: int = Query(24, ge=1, le=168)) -> dict:
     return await asyncio.to_thread(stats_db.query_signal_heatmap, hours)
 
 
+@router.get("/skyview")
+async def skyview_history(hours: int = Query(24, ge=1, le=168)) -> dict:
+    """Azimuth × elevation heatmap from coverage_samples for Sky View history mode."""
+    return await asyncio.to_thread(stats_db.query_skyview_history, hours)
+
+
 @router.get("/notable")
 async def notable(
     limit: int = Query(100, ge=1, le=500),

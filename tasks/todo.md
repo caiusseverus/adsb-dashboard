@@ -147,7 +147,7 @@ Addendum corrections are applied inline — see the "Corrections" section below 
   - Handle mobile/narrow viewports: drawer should collapse or overlay on small screens
   - Effort: ~4–5h
 
-- [ ] **6 — Sky View historical dots** (`SkyView.jsx`)
+- [x] **6 — Sky View historical dots** (`SkyView.jsx`)
   - Implement **after Phase 0A + 0B**
   - Needs server-side aggregation: backend bins `coverage_samples` into 2°az × 1°el cells, returns density + avg signal per bin
   - New backend endpoint: `/api/skyview/history?hours=N`
