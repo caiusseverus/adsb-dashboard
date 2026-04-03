@@ -204,4 +204,16 @@ Addendum corrections are applied inline — see the "Corrections" section below 
 
 ## Review / Status
 
-_To be filled in as phases complete._
+**Completed 2026-04-03** — Phases 0–6 + Phase 7 item 17 all done.
+
+- Phase 0A: shared filter hook
+- Phase 0B: useFetchState + LoadingState component
+- Phase 1: compact notation, dot size, msgs/sec axis
+- Phase 2: position leak fix, signal investigation (resolved)
+- Phase 3: age colouring, horizon envelope, trail slider, hi-res retry, terrain tile
+- Phase 4: airport names detail panel + visit history, Sky View filters, per-segment trail
+- Phase 5: map side drawer, Sky View history heatmap, terrain pseudo-3D
+- Phase 6: source badge system, DF11 interrogator codes + panel
+- Phase 7: interrogator timing lanes
+
+**Remaining:** Item 16 (message timing scroll plot) — advanced diagnostics, separate milestone.
