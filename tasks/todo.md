@@ -185,7 +185,7 @@ Addendum corrections are applied inline — see the "Corrections" section below 
 
 ## Phase 7 — Advanced / Deferred
 
-- [ ] **16 — Message timing scroll plot** (advanced observability)
+- [x] **16 — Message timing scroll plot** (advanced observability)
   - New ring buffer in `beast_client.py`/`aircraft_state.py`: last 5s of `(timestamp_us, df_type, msg_len)` tuples
   - New SSE or WebSocket sub-channel at ~10 Hz
   - Canvas-based frontend (not SVG): scrolling X=time, Y=DF type lanes, coloured bars
@@ -216,4 +216,4 @@ Addendum corrections are applied inline — see the "Corrections" section below 
 - Phase 6: source badge system, DF11 interrogator codes + panel
 - Phase 7: interrogator timing lanes
 
-**Remaining:** Item 16 (message timing scroll plot) — advanced diagnostics, separate milestone.
+**All items complete.**

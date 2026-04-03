@@ -989,6 +989,169 @@ function InterrogatorTimeline() {
 }
 
 // ---------------------------------------------------------------------------
+// Message timing scroll plot (canvas)
+// ---------------------------------------------------------------------------
+
+// DF type colour map — consistent with DFHeatmap colours
+const DF_COLOURS = {
+  17: '#388bfd',   // ADS-B — blue
+  18: '#57a6ff',   // TIS-B — lighter blue
+  11: '#3fb950',   // All-Call — green
+   4: '#d29922',   // Surv Alt — amber
+   5: '#e3b341',   // Surv ID  — amber-yellow
+  20: '#bc8cff',   // Comm-B Alt — purple
+  21: '#d2a8ff',   // Comm-B ID  — lighter purple
+   0: '#f85149',   // Short ACAS — red
+  16: '#ff6b6b',   // Long ACAS  — lighter red
+  24: '#6e7681',   // Comm-D     — gray
+}
+// Short labels for the timing canvas (compact)
+const DF_SHORT = {
+  17:'DF17 ADS-B', 18:'DF18 TIS-B', 11:'DF11 All-Call',
+   4:'DF4 Alt',     5:'DF5 ID',     20:'DF20 Comm-B',
+  21:'DF21 Comm-B', 0:'DF0 ACAS',  16:'DF16 ACAS', 24:'DF24 Comm-D',
+}
+const PLOT_WIN_S   = 5     // seconds of history shown
+const TLANE_H      = 20    // px per DF lane
+const TLABEL_W     = 88    // px label column
+const TTICK_W      = 2     // tick bar width
+const POLL_MS      = 200   // fetch interval
+const MAX_BUF      = 15000 // client-side event cap
+
+function MessageTimingPlot() {
+  const canvasRef  = useRef(null)
+  const bufRef     = useRef([])     // [{ts, df}] rolling buffer
+  const sinceRef   = useRef(0)      // last ts received
+  const rafRef     = useRef(null)
+  const activeRef  = useRef(true)   // Page Visibility guard
+  const [laneOrder, setLaneOrder] = useState([])  // ordered DF types (by count)
+
+  // Polling — only when tab is visible
+  useEffect(() => {
+    const onVisibility = () => { activeRef.current = !document.hidden }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [])
+
+  useEffect(() => {
+    let timerId
+    const poll = () => {
+      if (!activeRef.current) { timerId = setTimeout(poll, POLL_MS); return }
+      fetch(`${API_BASE}/api/timing/events?since_ts=${sinceRef.current}`)
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+          if (!d?.events?.length) return
+          const now = d.now
+          const cutoff = now - PLOT_WIN_S - 0.5  // small grace window
+          const newEvents = d.events.map(([ts, df]) => ({ ts, df }))
+          if (newEvents.length) {
+            sinceRef.current = newEvents[newEvents.length - 1].ts
+          }
+          // Append new events, drop old
+          const merged = [...bufRef.current, ...newEvents]
+            .filter(e => e.ts > cutoff)
+          if (merged.length > MAX_BUF) merged.splice(0, merged.length - MAX_BUF)
+          bufRef.current = merged
+
+          // Recompute lane order by count
+          const counts = {}
+          for (const e of merged) counts[e.df] = (counts[e.df] ?? 0) + 1
+          const ordered = Object.keys(counts)
+            .map(Number)
+            .sort((a, b) => counts[b] - counts[a])
+          setLaneOrder(ordered)
+        })
+        .catch(() => {})
+        .finally(() => { timerId = setTimeout(poll, POLL_MS) })
+    }
+    poll()
+    return () => clearTimeout(timerId)
+  }, [])
+
+  // rAF-driven canvas draw
+  useEffect(() => {
+    const draw = () => {
+      rafRef.current = requestAnimationFrame(draw)
+      const canvas = canvasRef.current
+      if (!canvas || !activeRef.current || laneOrder.length === 0) return
+
+      const now    = Date.now() / 1000
+      const cutoff = now - PLOT_WIN_S
+      const buf    = bufRef.current
+      const w = canvas.offsetWidth
+      const h = TLANE_H * laneOrder.length
+      if (!w || !h) return
+      canvas.width  = w
+      canvas.height = h
+
+      const ctx = canvas.getContext('2d')
+      ctx.fillStyle = '#0b0c10'
+      ctx.fillRect(0, 0, w, h)
+
+      const plotW  = w - TLABEL_W
+      const tToX   = ts => TLABEL_W + ((ts - cutoff) / PLOT_WIN_S) * plotW
+
+      laneOrder.forEach((df, row) => {
+        const colour = DF_COLOURS[df] ?? '#484f58'
+        const y0 = row * TLANE_H
+
+        // Row background
+        ctx.fillStyle = row % 2 === 0 ? '#0f1117' : '#0b0c10'
+        ctx.fillRect(0, y0, w, TLANE_H)
+
+        // Label
+        ctx.fillStyle = colour
+        ctx.font = '10px monospace'
+        ctx.textAlign = 'right'
+        ctx.textBaseline = 'middle'
+        ctx.fillText(DF_SHORT[df] ?? `DF${df}`, TLABEL_W - 4, y0 + TLANE_H / 2)
+
+        // Tick marks
+        const tickY = y0 + 3
+        const tickH = TLANE_H - 6
+        ctx.fillStyle = colour
+        for (const ev of buf) {
+          if (ev.df !== df) continue
+          const x = tToX(ev.ts)
+          if (x < TLABEL_W || x > w) continue
+          ctx.fillRect(x - TTICK_W / 2, tickY, TTICK_W, tickH)
+        }
+      })
+
+      // Time ruler ticks every 1s
+      ctx.strokeStyle = '#21262d'
+      ctx.lineWidth = 1
+      for (let t = Math.ceil(cutoff); t <= now; t++) {
+        const x = tToX(t)
+        ctx.beginPath()
+        ctx.moveTo(x, 0)
+        ctx.lineTo(x, h)
+        ctx.stroke()
+      }
+    }
+    rafRef.current = requestAnimationFrame(draw)
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }
+  }, [laneOrder])
+
+  const canvasH = Math.max(TLANE_H * laneOrder.length, TLANE_H)
+
+  return (
+    <Card title="Message Timing Scroll Plot">
+      <p style={{ fontSize: '0.72rem', color: '#484f58', margin: '0 0 0.4rem' }}>
+        Live scroll — last {PLOT_WIN_S} s · one lane per DF type · ticks = individual messages
+      </p>
+      {laneOrder.length === 0
+        ? <p style={{ fontSize: '0.8rem', color: '#484f58' }}>Waiting for messages…</p>
+        : <canvas
+            ref={canvasRef}
+            style={{ width: '100%', height: canvasH, display: 'block', borderRadius: 4 }}
+          />
+      }
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Page layout
 // ---------------------------------------------------------------------------
 export default function ReceiverPage({ snapshot }) {
@@ -1029,6 +1192,7 @@ export default function ReceiverPage({ snapshot }) {
         <InterrogatorCodes />
         <InterrogatorTimeline />
       </div>
+      <MessageTimingPlot />
     </main>
   )
 }

@@ -55,6 +55,7 @@ from position_quality import router as position_quality_router, PositionQualityC
 
 from benchmark import make_pause_aware_decoder
 from interrogators import router as interrogators_router
+from timing import router as timing_router
 
 
 
@@ -1067,6 +1068,8 @@ app.include_router(position_quality_router)
 app.include_router(health_router)
 interrogators_router._state = state  # type: ignore[attr-defined]
 app.include_router(interrogators_router)
+timing_router._state = state  # type: ignore[attr-defined]
+app.include_router(timing_router)
 if config.DEBUG_ENRICHMENT:
     log.info("Debug router mounted (DEBUG_ENRICHMENT=%s)", config.DEBUG_ENRICHMENT)
 

@@ -1495,6 +1495,11 @@ class AircraftState:
         # Unbounded but pruned on read; keeps ~10 min of data at typical rates.
         self._iid_events: deque[tuple[float, int]] = deque(maxlen=50_000)
 
+        # Message timing buffer for the real-time scroll plot.
+        # Stores (wall_ts, df) for every decoded message.
+        # At 2000 msg/s × 10s = 20,000 entries; each is two small numbers.
+        self._timing_events: deque[tuple[float, int]] = deque(maxlen=20_000)
+
         # readsb ingest tracking — not used in Beast mode
         # Cumulative message total from the last aircraft.json poll (for delta computation).
         # Initialised to -1 so the first poll is detected and its delta suppressed
@@ -1611,6 +1616,15 @@ class AircraftState:
             decode_timings.append(per_decode)
 
     # ── DF11 interrogator helpers ────────────────────────────────────────────
+
+    def get_timing_events(self, since_ts: float) -> list[tuple[float, int]]:
+        """Return (ts, df) tuples for all messages with ts > since_ts.
+
+        Lock-free read; safe under CPython GIL for single-writer append + iteration.
+        Caller supplies the timestamp of the last event it received so only new
+        events are returned, keeping response sizes small (~200 msg / 100 ms poll).
+        """
+        return [(ts, df) for ts, df in self._timing_events if ts > since_ts]
 
     def get_iid_timeline(self, window_s: float = 10.0) -> dict[int, list[float]]:
         """Return per-IID lists of message timestamps within the last window_s seconds.
@@ -2161,6 +2175,8 @@ class AircraftState:
                 return   # bad CRC or unknown DF — discard
 
             df = _nd['df']
+            # Record timing event for the real-time scroll plot (lock-free append)
+            self._timing_events.append((now, df))
             # correctedbits>0 covers both DF-field and CRC-bit corrections.
             # Treat corrected DF17 frames as lower-confidence (crc_clean=False).
             df17_corrected = (df == 17 and _nd['correctedbits'] > 0)
