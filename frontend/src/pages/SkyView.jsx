@@ -147,6 +147,11 @@ export default function SkyView({ snapshot, onSelectIcao }) {
     .filter(ac => typeCode === 'all' || ac.type_code === typeCode),
   [snapshot, filter, typeGroup, typeCode])
 
+  function matchesTypeFilter(ac) {
+    return (typeGroup === 'all' || getTypeGroup(ac.type_code, ac.type_category)?.value === typeGroup)
+      && (typeCode === 'all' || ac.type_code === typeCode)
+  }
+
   // Unique type codes visible in current snapshot (for type code dropdown)
   const visibleTypeCodes = useMemo(() =>
     [...new Set(baseAircraft.map(ac => ac.type_code).filter(Boolean))].sort(),
@@ -163,7 +168,7 @@ export default function SkyView({ snapshot, onSelectIcao }) {
   )
 
   // ── Helper: should we draw this trail given the current filter? ──────
-  const trailPassesFilter = trailObj => passesFilter(trailObj)
+  const trailPassesFilter = trailObj => passesFilter(trailObj) && matchesTypeFilter(trailObj)
 
   // ── Polar canvas draw ────────────────────────────────────────────────
   useEffect(() => {
@@ -287,7 +292,7 @@ export default function SkyView({ snapshot, onSelectIcao }) {
       hitboxes.push({ icao: ac.icao, x: pos.x, y: pos.y, ac })
     })
     hitboxesRef.current = hitboxes
-  }, [snapshot, filter, colorMode])
+  }, [snapshot, filter, colorMode, typeGroup, typeCode])
 
   // ── Horizon canvas draw ──────────────────────────────────────────────
   useEffect(() => {
@@ -475,7 +480,7 @@ export default function SkyView({ snapshot, onSelectIcao }) {
       hitboxes.push({ icao: ac.icao, x: pos.x, y: pos.y, ac })
     })
     horizonHitboxesRef.current = hitboxes
-  }, [snapshot, maxElev, horizonScale, filter, colorMode, terrainHorizon, histData])
+  }, [snapshot, maxElev, horizonScale, filter, colorMode, terrainHorizon, histData, typeGroup, typeCode])
 
   // ── Pointer helpers ──────────────────────────────────────────────────
   const canvasCoords = (e, canvasEl) => {

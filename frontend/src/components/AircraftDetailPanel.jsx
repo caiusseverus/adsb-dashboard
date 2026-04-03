@@ -466,7 +466,6 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
         )}
 
       </div>
-    </div>
   )
 
   if (mode === 'drawer') return panel

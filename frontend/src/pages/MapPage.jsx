@@ -292,6 +292,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos, selectedI
   // Renders N-1 two-point polylines for the selected aircraft, each coloured by
   // the segment's altitude. Capped at 200 segments (downsamples older points).
   useEffect(() => {
+    let cancelled = false
     const clearSelected = () => {
       selectedTrailRef.current.forEach(seg => seg.remove())
       selectedTrailRef.current = []
@@ -303,7 +304,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos, selectedI
       .then(r => r.ok ? r.json() : {})
       .then(data => {
         const map = mapRef.current
-        if (!map) return
+        if (!map || cancelled) return
         const points = (data[selectedIcao] || []).filter(p => p.lat != null && p.lon != null)
         if (points.length < 2) return
         // Downsample to ≤200 segments
@@ -321,11 +322,18 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos, selectedI
           }).addTo(map)
           segments.push(seg)
         }
+        if (cancelled) {
+          segments.forEach(seg => seg.remove())
+          return
+        }
         selectedTrailRef.current = segments
       })
       .catch(() => {})
 
-    return clearSelected
+    return () => {
+      cancelled = true
+      clearSelected()
+    }
   }, [selectedIcao])
 
   // ── MLAT source dots: poll bulk fixes endpoint, accumulate dots ───────────
