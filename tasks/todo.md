@@ -117,7 +117,7 @@ Addendum corrections are applied inline — see the "Corrections" section below 
   - Inline format: `EGLL (Heathrow) → KJFK (Kennedy)`
   - Effort: ~1h
 
-- [ ] **2B — Airport names in visit history** (separate from 2A)
+- [x] **2B — Airport names in visit history** (separate from 2A)
   - Options: (a) on-demand hexdb lookup per visit with module-level cache, or (b) persist airport names to SQLite at route-write time
   - Decide scope: option (b) is more robust for large histories
   - Effort: ~3h
@@ -165,7 +165,7 @@ Addendum corrections are applied inline — see the "Corrections" section below 
 
 ## Phase 6 — New Features
 
-- [ ] **Source / confidence badge system**
+- [x] **Source / confidence badge system**
   - `pos_confident`, `mlat`, `has_adsb` already tracked in backend
   - Add `<SourceBadge type="ADS-B|MLAT|EST" />` component
   - Apply to: live table, map markers (subtle), detail panel
@@ -173,7 +173,7 @@ Addendum corrections are applied inline — see the "Corrections" section below 
   - Effort: ~2h
   - *Implement after Item 14 (position correctness)*
 
-- [ ] **15 — DF11 II/SI interrogator codes**
+- [x] **15 — DF11 II/SI interrogator codes**
   - Start from `backend/native/mode_s.c` which already tracks `IID` for DF11 — expose via existing decode path (do NOT add parallel Python extraction)
   - Maintain rolling 60s counter `{ii_code: count}` in `aircraft_state.py`
   - Expose via `/api/interrogators` endpoint

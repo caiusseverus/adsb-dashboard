@@ -73,6 +73,9 @@ typedef struct {
     /* Emergency */
     bool     emergency_valid;
     int      emergency;       /* emergency_t cast to int */
+
+    /* DF11 interrogator identifier (IID) — lower 7 bits of CRC syndrome */
+    int      iid;             /* 0–127; only meaningful when df == 11 */
 } decode_result_t;
 
 typedef struct {

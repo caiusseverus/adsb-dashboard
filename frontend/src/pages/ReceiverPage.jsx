@@ -803,6 +803,72 @@ function PositionDecodeRate({ days, onDaysChange }) {
 }
 
 // ---------------------------------------------------------------------------
+// Interrogator codes panel
+// ---------------------------------------------------------------------------
+function InterrogatorCodes() {
+  const [windowS, setWindowS] = useState(600)
+  const { data, loading } = useFetch(`${API_BASE}/api/interrogators?window_s=${windowS}`)
+
+  const codes = data?.codes ?? []
+  const total = data?.total ?? 0
+  const maxCount = codes[0]?.count ?? 1
+
+  return (
+    <Card
+      title="DF11 Interrogator Codes (IID)"
+      controls={
+        <select className={styles.select} value={windowS} onChange={e => setWindowS(Number(e.target.value))}>
+          <option value={60}>1 min</option>
+          <option value={300}>5 min</option>
+          <option value={600}>10 min</option>
+          <option value={1800}>30 min</option>
+          <option value={3600}>1 hr</option>
+        </select>
+      }
+    >
+      {loading && <Empty loading />}
+      {!loading && codes.length === 0 && (
+        <Empty />
+      )}
+      {!loading && codes.length > 0 && (
+        <>
+          <p style={{ fontSize: '0.75rem', color: '#484f58', margin: '0 0 0.6rem' }}>
+            {total.toLocaleString()} DF11 replies · {codes.length} IID{codes.length !== 1 ? 's' : ''} active
+          </p>
+          <ResponsiveContainer width="100%" height={Math.min(codes.length * 28 + 24, 300)}>
+            <BarChart
+              data={codes.map(c => ({ name: `IID ${c.iid}`, count: c.count }))}
+              layout="vertical"
+              margin={{ top: 4, right: 40, bottom: 4, left: 52 }}
+            >
+              <CartesianGrid stroke="#21262d" horizontal={false} />
+              <XAxis type="number" tick={{ fill: '#484f58', fontSize: 10 }}
+                domain={[0, maxCount]}
+                tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(1)}k` : v}
+              />
+              <YAxis type="category" dataKey="name" width={52}
+                tick={{ fill: '#8b949e', fontSize: 11 }} />
+              <Tooltip
+                contentStyle={{ background: '#161b22', border: '1px solid #30363d', fontSize: 12 }}
+                formatter={v => [v.toLocaleString(), 'replies']}
+              />
+              <Bar dataKey="count" fill="#388bfd" radius={2} isAnimationActive={false}>
+                {codes.map(c => (
+                  <Cell key={c.iid} fill={c.iid === 0 ? '#3fb950' : '#388bfd'} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+          <p style={{ fontSize: '0.7rem', color: '#484f58', margin: '0.4rem 0 0' }}>
+            IID 0 (green) = no interrogator code / civil ATC · IID 1–127 = specific SSR interrogator
+          </p>
+        </>
+      )}
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Page layout
 // ---------------------------------------------------------------------------
 export default function ReceiverPage({ snapshot }) {
@@ -839,6 +905,9 @@ export default function ReceiverPage({ snapshot }) {
       </div>
       <DFHeatmap />
       <SignalHeatmap />
+      <div className={styles.row}>
+        <InterrogatorCodes />
+      </div>
     </main>
   )
 }

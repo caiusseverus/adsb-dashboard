@@ -215,6 +215,11 @@ int decode_message(const uint8_t *msg_bytes, int msg_len,
         result->emergency       = (int)mm.emergency;
     }
 
+    /* ── DF11 interrogator identifier ── */
+    if (mm.msgtype == 11) {
+        result->iid = (int)mm.IID;
+    }
+
     return 0;
 }
 

@@ -72,6 +72,8 @@ typedef struct {
 
     bool     emergency_valid;
     int      emergency;
+
+    int      iid;
 } decode_result_t;
 
 typedef struct {
@@ -246,6 +248,9 @@ def decode_message(msg_bytes: bytes, signal: int = 0,
 
     if r.emergency_valid:
         out["emergency"] = r.emergency
+
+    # DF11 interrogator identifier (0 for all other DFs)
+    out["iid"] = int(r.iid)
 
     return out
 

@@ -1491,6 +1491,10 @@ class AircraftState:
         self._snapshot_history_minute: int = -1
         self._snapshot_history_cache: tuple | None = None  # (rate_list, df_list, mlat_list)
 
+        # DF11 interrogator identifier events: deque of (ts, iid) tuples.
+        # Unbounded but pruned on read; keeps ~10 min of data at typical rates.
+        self._iid_events: deque[tuple[float, int]] = deque(maxlen=50_000)
+
         # readsb ingest tracking — not used in Beast mode
         # Cumulative message total from the last aircraft.json poll (for delta computation).
         # Initialised to -1 so the first poll is detected and its delta suppressed
@@ -1605,6 +1609,21 @@ class AircraftState:
             msg_timings.append(per_total)
             lock_wait_timings.append(per_wait)
             decode_timings.append(per_decode)
+
+    # ── DF11 interrogator helpers ────────────────────────────────────────────
+
+    def get_iid_counts(self, window_s: float = 600.0) -> dict[int, int]:
+        """Return {iid: count} for DF11 messages within the last window_s seconds.
+
+        Reads the shared _iid_events deque without acquiring the lock (the deque
+        is thread-safe for concurrent appends + iteration in CPython).
+        """
+        cutoff = time.time() - window_s
+        counts: dict[int, int] = {}
+        for ts, iid in self._iid_events:
+            if ts >= cutoff:
+                counts[iid] = counts.get(iid, 0) + 1
+        return counts
 
     # ── MLAT diagnostic helpers (used by mlat.py endpoints) ─────────────────
 
@@ -2147,6 +2166,8 @@ class AircraftState:
                 source = MsgSource.ADSR if df == 18 else MsgSource.ADSB
             elif df == 11:
                 source = MsgSource.MODE_S_CHECKED
+                # Record IID for interrogator tracking (native path only)
+                self._iid_events.append((now, int(_nd.get('iid', 0))))
             elif df in _AP_DFS:
                 if not icao or icao not in self._confirmed_icaos:
                     return
