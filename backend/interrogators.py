@@ -46,8 +46,8 @@ async def get_timeline(window_s: float = Query(10, ge=2, le=60)) -> dict:
     now = time.time()
     timeline = router._state.get_iid_timeline(window_s)
     lanes = sorted(
-        [{"iid": iid, "timestamps": timestamps}
-         for iid, timestamps in timeline.items()],
+        [{"iid": iid, "timestamps": entry["timestamps"], "latest_icao": entry.get("latest_icao", "")}
+         for iid, entry in timeline.items()],
         key=lambda x: len(x["timestamps"]),
         reverse=True,
     )

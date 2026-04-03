@@ -31,7 +31,7 @@ function sameDay(startTs, endTs) {
 
 function fmtAirport(icao, info) {
   if (!icao) return '?'
-  const name = info?.IATA || info?.Airport
+  const name = info?.Airport || info?.IATA
   return name ? `${icao} (${name})` : icao
 }
 
@@ -160,17 +160,18 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
       .catch(() => setVisits([]))
   }, [icao])
 
-  // Fetch route (airport names) — requires a callsign; use most-recent visit callsign
+  // Fetch route (airport names) — requires a callsign; prefer live callsign, fall back to visit
+  const liveCallsign = snapshot?.aircraft?.find(a => a.icao === icao)?.callsign
   useEffect(() => {
     if (!icao) return
     setRoute(null)
-    const callsign = visits[0]?.callsign
+    const callsign = liveCallsign || visits[0]?.callsign
     if (!callsign) return
     fetch(`${API_BASE}/api/aircraft/${icao}/route?callsign=${encodeURIComponent(callsign)}`)
       .then(r => r.ok ? r.json() : null)
       .then(d => { if (d?.origin?.icao || d?.destination?.icao) setRoute(d) })
       .catch(() => {})
-  }, [icao, visits])
+  }, [icao, liveCallsign, visits])
 
   useEffect(() => {
     if (!icao) return
@@ -361,34 +362,24 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
                     <Field label="Messages"   value={liveData.msg_count} />
                     <Field label="Last seen"  value={liveData.age != null ? `${liveData.age}s ago` : null} />
 
-                    {/* Route from most-recent visit */}
-                    {visits.length > 0 && (visits[0].origin_icao || visits[0].dest_icao) && (
+                    {/* Route from most-recent visit or live hexdb lookup */}
+                    {route && (
                       <div style={{ marginTop: '0.5rem' }}>
                         <div className={styles.sectionTitle} style={{ marginBottom: '0.3rem' }}>Route</div>
                         <div className={styles.routeInline}>
-                          {route ? (
-                            <>
-                              <span className={styles.routeCode}>
-                                {route.origin.icao}
-                                {route.origin.info?.Airport && (
-                                  <span className={styles.routeAirportName}> ({route.origin.info.IATA || route.origin.info.Airport})</span>
-                                )}
-                              </span>
-                              <span className={styles.routeArrow}>→</span>
-                              <span className={styles.routeCode}>
-                                {route.destination.icao}
-                                {route.destination.info?.Airport && (
-                                  <span className={styles.routeAirportName}> ({route.destination.info.IATA || route.destination.info.Airport})</span>
-                                )}
-                              </span>
-                            </>
-                          ) : (
-                            <>
-                              <span className={styles.routeCode}>{visits[0].origin_icao ?? '?'}</span>
-                              <span className={styles.routeArrow}>→</span>
-                              <span className={styles.routeCode}>{visits[0].dest_icao ?? '?'}</span>
-                            </>
-                          )}
+                          <span className={styles.routeCode}>
+                            {route.origin.icao}
+                            {route.origin.info?.Airport && (
+                              <span className={styles.routeAirportName}> ({route.origin.info.Airport || route.origin.info.IATA})</span>
+                            )}
+                          </span>
+                          <span className={styles.routeArrow}>→</span>
+                          <span className={styles.routeCode}>
+                            {route.destination.icao}
+                            {route.destination.info?.Airport && (
+                              <span className={styles.routeAirportName}> ({route.destination.info.Airport || route.destination.info.IATA})</span>
+                            )}
+                          </span>
                         </div>
                       </div>
                     )}

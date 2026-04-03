@@ -878,8 +878,9 @@ const LABEL_W   = 52   // px for IID label on the left
 const TICK_W    = 2    // px tick width
 const TICK_H    = LANE_H - LANE_PAD * 2  // tick height
 
-function InterrogatorTimeline() {
+function InterrogatorTimeline({ onSelectIcao }) {
   const canvasRef  = useRef(null)
+  const lanesRef   = useRef([])   // latest lanes — used by click handler
   const [windowS, setWindowS] = useState(10)
   const [data,    setData]    = useState(null)
 
@@ -903,6 +904,7 @@ function InterrogatorTimeline() {
     if (!canvas || !data?.lanes) return
 
     const lanes  = data.lanes.slice(0, 12)  // cap at 12 rows
+    lanesRef.current = lanes
     const now    = data.now
     const winS   = data.window_s
     const h      = Math.max(LANE_H * lanes.length, LANE_H)
@@ -982,7 +984,16 @@ function InterrogatorTimeline() {
       </p>
       <canvas
         ref={canvasRef}
-        style={{ width: '100%', height: canvasH, display: 'block', borderRadius: 4 }}
+        style={{ width: '100%', height: canvasH, display: 'block', borderRadius: 4, cursor: onSelectIcao ? 'pointer' : 'default' }}
+        onClick={onSelectIcao ? (e) => {
+          const canvas = canvasRef.current
+          if (!canvas) return
+          const rect = canvas.getBoundingClientRect()
+          const y = e.clientY - rect.top
+          const row = Math.floor(y / LANE_H)
+          const lane = lanesRef.current[row]
+          if (lane?.latest_icao) onSelectIcao(lane.latest_icao)
+        } : undefined}
       />
     </Card>
   )
@@ -1154,7 +1165,7 @@ function MessageTimingPlot() {
 // ---------------------------------------------------------------------------
 // Page layout
 // ---------------------------------------------------------------------------
-export default function ReceiverPage({ snapshot }) {
+export default function ReceiverPage({ snapshot, onSelectIcao }) {
   const [scatterDays, setScatterDays]   = useState(1)
   const [rangeTrendDays, setRangeTrendDays] = useState(90)
   const [polarDays,   setPolarDays]     = useState(30)
@@ -1190,7 +1201,7 @@ export default function ReceiverPage({ snapshot }) {
       <SignalHeatmap />
       <div className={styles.row}>
         <InterrogatorCodes />
-        <InterrogatorTimeline />
+        <InterrogatorTimeline onSelectIcao={onSelectIcao} />
       </div>
       <MessageTimingPlot />
     </main>

@@ -46,9 +46,27 @@
   color: #388bfd;
 }
 
+.mapArea {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+}
+
 .mapWrap {
   flex: 1;
   min-height: 0;
+}
+
+.drawerSpacer {
+  width: 500px;
+  flex-shrink: 0;
+}
+
+@media (max-width: 600px) {
+  .drawerSpacer {
+    display: none;
+  }
 }
 
 /* Override Leaflet's default font/attribution colour for dark theme */

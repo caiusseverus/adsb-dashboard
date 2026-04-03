@@ -115,13 +115,13 @@ export default function SkyView({ snapshot, onSelectIcao }) {
       .catch(() => {})
   }, [])
 
-  // ── Fetch Sky View history heatmap when enabled ─────────────────────
+  // ── Fetch Sky View history dots when enabled ─────────────────────────
   useEffect(() => {
     if (!histMode) { setHistData(null); return }
     setHistData(null)
-    fetch(`/api/history/skyview?hours=${histHours}`)
+    fetch(`/api/history/skyview/points?hours=${histHours}`)
       .then(r => r.ok ? r.json() : null)
-      .then(d => { if (d?.cells) setHistData(d) })
+      .then(d => { if (d?.points) setHistData(d) })
       .catch(() => {})
   }, [histMode, histHours])
 
@@ -417,25 +417,19 @@ export default function SkyView({ snapshot, onSelectIcao }) {
     ctx.fillText('N', HORIZON_ML + plotW, plotH + 4)
     ctx.textBaseline = 'alphabetic'
 
-    // ── History heatmap (azimuth × elevation density) ─────────────────
-    if (histData?.cells?.length) {
-      const cellW = (2 / 360) * plotW  // 2° azimuth bin width in canvas px
-      let maxCount = 0
-      for (const [,, count] of histData.cells) if (count > maxCount) maxCount = count
-      for (const [az, el, count, sigRaw] of histData.cells) {
-        if (el > maxElev) continue
-        const x = HORIZON_ML + (az / 360) * plotW
-        const yTop = elevToY(el + 1)
-        const yBot = elevToY(el)
-        const h = Math.max(1, yBot - yTop)
-        const intensity = Math.sqrt(count / maxCount)  // sqrt for perceptual scaling
-        // Map signal raw byte to hue: 0 (strongest) = green, 128 = amber, 255 = red
+    // ── History dots (individual coverage_samples points) ────────────
+    if (histData?.points?.length) {
+      for (const [bearing, range, alt, sigRaw] of histData.points) {
+        const pos = toHXY(bearing, range, alt)
+        if (!pos) continue
+        // Map signal raw byte to colour: 0 (strongest) = green, 255 (weakest) = red
         const pct = Math.max(0, Math.min(255, sigRaw)) / 255
         const r = Math.round(60 + 180 * pct)
         const g = Math.round(180 - 120 * pct)
-        const b = 50
-        ctx.fillStyle = `rgba(${r},${g},${b},${(intensity * 0.7).toFixed(2)})`
-        ctx.fillRect(x, yTop, cellW + 0.5, h)
+        ctx.fillStyle = `rgba(${r},${g},50,0.35)`
+        ctx.beginPath()
+        ctx.arc(pos.x, pos.y, 1.5, 0, Math.PI * 2)
+        ctx.fill()
       }
     }
 

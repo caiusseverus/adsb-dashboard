@@ -179,6 +179,31 @@ async def benchmark_status() -> dict:
 # Aircraft debug / override
 # ---------------------------------------------------------------------------
 
+@router.get("/aircraft/{icao}/live")
+async def debug_aircraft_live(icao: str) -> dict:
+    """Return live in-memory state for a single aircraft (position QA fields)."""
+    from main import state
+    icao = icao.upper()
+    with state._lock:
+        ac = state._aircraft.get(icao)
+        if ac is None:
+            raise HTTPException(status_code=404, detail="Aircraft not in live state")
+        return {
+            "icao":               ac.icao,
+            "pos_source":         ac._pos_source,
+            "pos_rejected_count": ac.pos_rejected_count,
+            "pos_reliable_odd":   round(ac.pos_reliable_odd, 3),
+            "pos_reliable_even":  round(ac.pos_reliable_even, 3),
+            "pos_global":         ac.pos_global,
+            "pos_confident":      _state_module._pos_reliable(ac),
+            "lat":                ac.lat,
+            "lon":                ac.lon,
+            "last_pos_age":       round(__import__('time').time() - ac.last_pos_ts, 1) if ac.last_pos_ts > 0 else None,
+            "mlat":               ac.mlat,
+            "mlat_source":        ac.mlat_source,
+        }
+
+
 @router.get("/aircraft/{icao}")
 async def debug_aircraft(icao: str) -> dict:
     icao = icao.upper()

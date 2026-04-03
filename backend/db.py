@@ -3131,6 +3131,34 @@ class StatsDB:
         ]
         return {"hours": hours, "cells": cells}
 
+    def query_skyview_points(self, hours: int = 24) -> dict:
+        """Return individual coverage_samples as [bearing_deg, range_nm, altitude_ft, signal_raw].
+
+        Downsampled to at most 20,000 rows using SQL LIMIT with a time-based ORDER
+        so the most recent points are preferred.
+        """
+        cutoff = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp())
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT bearing_deg, range_nm, altitude, signal
+                FROM coverage_samples
+                WHERE ts >= ?
+                  AND bearing_deg IS NOT NULL
+                  AND range_nm IS NOT NULL
+                  AND altitude IS NOT NULL
+                  AND altitude > 0
+                  AND range_nm > 0
+                ORDER BY ts DESC
+                LIMIT 20000
+            """, (cutoff,)).fetchall()
+        points = [[
+            round(float(r["bearing_deg"]), 1),
+            round(float(r["range_nm"]), 2),
+            int(r["altitude"]),
+            int(r["signal"]) if r["signal"] is not None else 128,
+        ] for r in rows]
+        return {"hours": hours, "points": points}
+
     def backup(self, dest_dir: "Path") -> "Path":
         """Hot-backup the database to dest_dir/adsb_backup_YYYY-MM-DD.db.
 

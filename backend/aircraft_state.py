@@ -537,6 +537,8 @@ def _aircraft_to_dict(ac: "Aircraft", now: float) -> tuple[dict, bool, bool]:
         "pos_reliable_odd":  ac.pos_reliable_odd,
         "pos_reliable_even": ac.pos_reliable_even,
         "pos_confident":     has_pos,
+        "pos_source":        ac._pos_source,
+        "pos_rejected_count": ac.pos_rejected_count,
         # readsb-only fields (None when in Beast mode)
         "alt_geom":          ac.alt_geom,
         "gs":                ac.gs,
@@ -642,6 +644,7 @@ def _apply_position_gate(ac: "Aircraft", lat: float, lon: float, now: float) -> 
         return True
 
     # Speed exceeded — penalise reliability unless this position is already cached
+    ac.pos_rejected_count += 1
     if _in_discard_cache(ac, lat, lon, now):
         return False
     ac.pos_reliable_odd  = max(0.0, ac.pos_reliable_odd  - _POS_RELIABLE_DECAY)
@@ -1031,6 +1034,8 @@ class Aircraft:
     _last_mlat_force_ts: float = field(default=0.0, repr=False)
     # Position source: "global_cpr", "local_cpr", or "mlat" — set on each accepted position
     _pos_source: Optional[str] = field(default=None, repr=False)
+    # Count of positions rejected by the speed gate
+    pos_rejected_count: int = field(default=0, repr=False)
     sighting_count: int = 1               # from aircraft_registry; 1 = unique (never seen before)
     max_altitude: Optional[int] = None    # highest altitude seen this visit
     # MLAT
@@ -1491,9 +1496,9 @@ class AircraftState:
         self._snapshot_history_minute: int = -1
         self._snapshot_history_cache: tuple | None = None  # (rate_list, df_list, mlat_list)
 
-        # DF11 interrogator identifier events: deque of (ts, iid) tuples.
+        # DF11 interrogator identifier events: deque of (ts, iid, icao) tuples.
         # Unbounded but pruned on read; keeps ~10 min of data at typical rates.
-        self._iid_events: deque[tuple[float, int]] = deque(maxlen=50_000)
+        self._iid_events: deque[tuple[float, int, str]] = deque(maxlen=50_000)
 
         # Message timing buffer for the real-time scroll plot.
         # Stores (wall_ts, df) for every decoded message.
@@ -1626,21 +1631,22 @@ class AircraftState:
         """
         return [(ts, df) for ts, df in self._timing_events if ts > since_ts]
 
-    def get_iid_timeline(self, window_s: float = 10.0) -> dict[int, list[float]]:
-        """Return per-IID lists of message timestamps within the last window_s seconds.
+    def get_iid_timeline(self, window_s: float = 10.0) -> dict[int, dict]:
+        """Return per-IID DF11 data within the last window_s seconds.
 
+        Returns a dict of {iid: {timestamps: [float], latest_icao: str}}.
         Reads the shared _iid_events deque lock-free (CPython GIL makes deque
         appends + iteration safe for single-writer / single-reader).
-        Timestamps are absolute Unix seconds; caller should also receive `now`
-        to correctly place them on a relative time axis.
         """
         cutoff = time.time() - window_s
-        timeline: dict[int, list[float]] = {}
-        for ts, iid in self._iid_events:
+        timeline: dict[int, dict] = {}
+        for ts, iid, icao in self._iid_events:
             if ts >= cutoff:
                 if iid not in timeline:
-                    timeline[iid] = []
-                timeline[iid].append(ts)
+                    timeline[iid] = {"timestamps": [], "latest_icao": icao}
+                timeline[iid]["timestamps"].append(ts)
+                if icao:
+                    timeline[iid]["latest_icao"] = icao
         return timeline
 
     def get_iid_counts(self, window_s: float = 600.0) -> dict[int, int]:
@@ -1651,7 +1657,7 @@ class AircraftState:
         """
         cutoff = time.time() - window_s
         counts: dict[int, int] = {}
-        for ts, iid in self._iid_events:
+        for ts, iid, _icao in self._iid_events:
             if ts >= cutoff:
                 counts[iid] = counts.get(iid, 0) + 1
         return counts
@@ -2200,7 +2206,7 @@ class AircraftState:
             elif df == 11:
                 source = MsgSource.MODE_S_CHECKED
                 # Record IID for interrogator tracking (native path only)
-                self._iid_events.append((now, int(_nd.get('iid', 0))))
+                self._iid_events.append((now, int(_nd.get('iid', 0)), icao or ''))
             elif df in _AP_DFS:
                 if not icao or icao not in self._confirmed_icaos:
                     return

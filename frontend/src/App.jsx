@@ -200,7 +200,7 @@ export default function App() {
         {tab === 'map' && <MapPage snapshot={snapshot} onSelectIcao={handleSelectIcao} selectedIcao={selectedIcao} receiverPos={receiverPos} />}
         {tab === 'history' && <HistoryPage snapshot={snapshot} />}
         {tab === 'sightings' && <SightingsPage onSelectIcao={handleSelectIcao} notableRefreshKey={notableRefreshKey} />}
-        {tab === 'receiver' && <ReceiverPage snapshot={snapshot} />}
+        {tab === 'receiver' && <ReceiverPage snapshot={snapshot} onSelectIcao={handleSelectIcao} />}
         {tab === 'coverage' && <CoveragePage aircraft={snapshot?.aircraft ?? []} initialIcao={coverageIcao} />}
         {tab === 'flow' && <FlowMapPage />}
         {tab === 'fleet' && <FleetPage onSelectIcao={handleSelectIcao} />}

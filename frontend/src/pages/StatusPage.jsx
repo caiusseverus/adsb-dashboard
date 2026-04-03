@@ -270,6 +270,7 @@ const SOURCES = [
 function AircraftDebug() {
   const [input,    setInput]    = useState('')
   const [result,   setResult]   = useState(null)
+  const [live,     setLive]     = useState(null)   // live in-memory state (pos QA)
   const [loading,  setLoading]  = useState(false)
   const [error,    setError]    = useState(null)
   const [override, setOverride] = useState(null)  // {field, value, status}
@@ -280,11 +281,15 @@ function AircraftDebug() {
       setError('Enter a 6-character hex ICAO (e.g. 3C6444)')
       return
     }
-    setLoading(true); setError(null); setResult(null); setOverride(null)
+    setLoading(true); setError(null); setResult(null); setLive(null); setOverride(null)
     try {
-      const r = await fetch(`${API_BASE}/api/debug/aircraft/${icao}`)
+      const [r, rl] = await Promise.all([
+        fetch(`${API_BASE}/api/debug/aircraft/${icao}`),
+        fetch(`${API_BASE}/api/debug/aircraft/${icao}/live`),
+      ])
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
       setResult(await r.json())
+      if (rl.ok) setLive(await rl.json())
     } catch (e) {
       setError(String(e))
     } finally {
@@ -340,6 +345,32 @@ function AircraftDebug() {
       )}
       {override?.status === 'error' && (
         <div className={styles.debugError}>Override failed: {override.msg}</div>
+      )}
+
+      {live && (
+        <div style={{ marginBottom: '1.25rem' }}>
+          <div className={styles.cardTitle} style={{ marginBottom: '0.5rem' }}>Live position state</div>
+          <table className={styles.debugTable}>
+            <tbody>
+              {[
+                ['Pos source',     live.pos_source ?? '—'],
+                ['Rejected count', live.pos_rejected_count],
+                ['Reliable odd',   live.pos_reliable_odd],
+                ['Reliable even',  live.pos_reliable_even],
+                ['Pos confident',  String(live.pos_confident)],
+                ['Pos global',     String(live.pos_global)],
+                ['MLAT',           String(live.mlat)],
+                ['MLAT source',    live.mlat_source ?? '—'],
+                ['Last pos age',   live.last_pos_age != null ? `${live.last_pos_age}s` : '—'],
+              ].map(([label, val]) => (
+                <tr key={label}>
+                  <td className={styles.debugFieldName}>{label}</td>
+                  <td className={styles.debugCell}>{String(val)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
 
       {result && (

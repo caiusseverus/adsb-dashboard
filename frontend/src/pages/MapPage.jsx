@@ -42,22 +42,34 @@ function tagColor(ac) {
 }
 
 // ── Aircraft marker icon ──────────────────────────────────────────────────
-// Cache keyed by "<color>-<roundedHeading|circle>" — heading quantised to 5°
-// so we create at most ~72 icons per colour rather than one per frame.
+// Cache keyed by "<color>-<roundedHeading|circle>-<srcType>" — heading quantised
+// to 5° so we create at most ~72 icons per colour rather than one per frame.
+// srcType: '' (ADS-B), 'mlat', or 'est' — adds a subtle ring for non-ADS-B sources.
 const _iconCache = new Map()
-function makeIcon(color, heading) {
+const SRC_RING = { mlat: '#388bfd', est: '#6e7681' }  // blue for MLAT, grey for EST
+function makeIcon(color, heading, srcType = '') {
   const headingKey = heading != null ? Math.round(heading / 5) * 5 : 'circle'
-  const cacheKey = `${color}-${headingKey}`
+  const cacheKey = `${color}-${headingKey}-${srcType}`
   if (_iconCache.has(cacheKey)) return _iconCache.get(cacheKey)
 
   const hasHeading = headingKey !== 'circle'
-  const html = hasHeading
+  const ringColor  = SRC_RING[srcType]
+  // Ring is rendered as a slightly larger circle behind the marker SVG
+  const ringHtml   = ringColor
+    ? `<svg viewBox="-7 -7 14 14" width="14" height="14" style="display:block;position:absolute;top:${hasHeading ? '-3' : '-2'}px;left:${hasHeading ? '0' : '-2'}px">
+         <circle cx="0" cy="0" r="6" fill="none" stroke="${ringColor}" stroke-width="1.5" opacity="0.85"/>
+       </svg>`
+    : ''
+  const markerHtml = hasHeading
     ? `<svg viewBox="-7 -9 14 18" width="14" height="18" style="display:block;transform:rotate(${headingKey}deg)">
          <path d="M0,-8 L5,7 L0,3 L-5,7 Z" fill="${color}" stroke="#0b0c10" stroke-width="1" stroke-linejoin="round"/>
        </svg>`
     : `<svg viewBox="-5 -5 10 10" width="10" height="10" style="display:block">
          <circle cx="0" cy="0" r="4" fill="${color}" stroke="#0b0c10" stroke-width="1"/>
        </svg>`
+  const html = ringHtml
+    ? `<div style="position:relative;display:inline-block">${ringHtml}${markerHtml}</div>`
+    : markerHtml
   const icon = L.divIcon({
     html,
     className: '',
@@ -137,6 +149,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos, selectedI
   const mlatSeenRef       = useRef(new Map())   // icao → Map<source, Set<"lat,lon">>
   const mlatPollRef       = useRef(null)
   const selectedTrailRef  = useRef([])    // L.Polyline[] — per-segment gradient for selected aircraft
+  const selectedLabelRef  = useRef(null)  // icao of the marker that currently has a pinned label
 
   const [colorMode,       setColorMode]       = useState('altitude')
   const [acCount,         setAcCount]         = useState(0)
@@ -224,8 +237,10 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos, selectedI
 
   // ── Hi-res trails: poll /api/tracks when enabled ──────────────────────
   useEffect(() => {
+    const MAX_SEGS = 200
+    const clearEntry = (entry) => entry.segments.forEach(s => s.remove())
     const clearTrails = () => {
-      hiresTrailsRef.current.forEach(({ line }) => line.remove())
+      hiresTrailsRef.current.forEach(clearEntry)
       hiresTrailsRef.current.clear()
     }
 
@@ -244,32 +259,34 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos, selectedI
       // Remove trails for aircraft no longer in track data
       for (const [icao, entry] of hiresTrailsRef.current) {
         if (!incoming.has(icao)) {
-          entry.line.remove()
+          clearEntry(entry)
           hiresTrailsRef.current.delete(icao)
         }
       }
 
       for (const [icao, points] of Object.entries(data)) {
-        const pts = points.filter(p => p.lat != null && p.lon != null).map(p => [p.lat, p.lon])
-        if (pts.length < 2) continue
-        // Color trail by the most recent point's altitude
-        const lastAlt = points[points.length - 1]?.altitude_ft
-        const color = altColor(lastAlt)
+        const valid = points.filter(p => p.lat != null && p.lon != null)
+        if (valid.length < 2) continue
+
+        // Downsample to ≤200 segments
+        const sampled = valid.length > MAX_SEGS + 1
+          ? [valid[0], ...valid.slice(-MAX_SEGS)]
+          : valid
+
+        // Remove old segments for this aircraft before redrawing
         const existing = hiresTrailsRef.current.get(icao)
-        if (existing) {
-          existing.line.setLatLngs(pts)
-          // Re-color if altitude band changed
-          if (existing.color !== color) {
-            existing.line.setStyle({ color })
-            existing.color = color
-          }
-        } else {
-          const line = L.polyline(pts, {
-            color, weight: 1.5, opacity: 0.55, smoothFactor: 1,
-            lineCap: 'round', lineJoin: 'round',
+        if (existing) clearEntry(existing)
+
+        const segments = []
+        for (let i = 0; i < sampled.length - 1; i++) {
+          const a = sampled[i], b = sampled[i + 1]
+          const seg = L.polyline([[a.lat, a.lon], [b.lat, b.lon]], {
+            color: altColor(b.altitude_ft), weight: 1.5, opacity: 0.55,
+            lineCap: 'round', lineJoin: 'round', smoothFactor: 1,
           }).addTo(map)
-          hiresTrailsRef.current.set(icao, { line, color })
+          segments.push(seg)
         }
+        hiresTrailsRef.current.set(icao, { segments })
       }
     }
 
@@ -334,6 +351,15 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos, selectedI
       cancelled = true
       clearSelected()
     }
+  }, [selectedIcao])
+
+  // ── Drawer layout: spacer added/removed, let Leaflet re-measure ──────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    // Defer one tick so React has committed the spacer DOM change
+    const t = setTimeout(() => map.invalidateSize(), 0)
+    return () => clearTimeout(t)
   }, [selectedIcao])
 
   // ── MLAT source dots: poll bulk fixes endpoint, accumulate dots ───────────
@@ -512,18 +538,37 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos, selectedI
 
     // ── Add/update markers ─────────────────────────────────────────────
     for (const ac of aircraft) {
-      const color = colorFn(ac)
-      const icon  = makeIcon(color, ac.heading_deg)
+      const color   = colorFn(ac)
+      const srcType = ac.mlat ? 'mlat' : (!ac.pos_confident ? 'est' : '')
+      const icon    = makeIcon(color, ac.heading_deg, srcType)
+      const isSelected = !showLabels && ac.icao === selectedIcao
+      const hoverLabel = [ac.callsign, ac.type_code, ac.operator].filter(Boolean).join(' · ') || ac.icao
       if (markersRef.current.has(ac.icao)) {
         const marker = markersRef.current.get(ac.icao)
         marker.setLatLng([ac.lat, ac.lon])
         marker.setIcon(icon)
+        // setIcon() closes open tooltips — rebind immediately after
+        marker.unbindTooltip()
+        if (isSelected) {
+          marker.bindTooltip(makeLabelContent(ac), {
+            permanent: true, direction: 'right', offset: [8, 0], className: 'ac-label',
+          })
+          selectedLabelRef.current = ac.icao
+        } else {
+          marker.bindTooltip(hoverLabel, { direction: 'top', offset: [0, -10] })
+        }
       } else {
-        const label = [ac.callsign, ac.type_code, ac.operator].filter(Boolean).join(' · ') || ac.icao
         const marker = L.marker([ac.lat, ac.lon], { icon })
-          .bindTooltip(label, { direction: 'top', offset: [0, -10] })
           .on('click', () => onSelectIcao?.(ac.icao))
           .addTo(map)
+        if (isSelected) {
+          marker.bindTooltip(makeLabelContent(ac), {
+            permanent: true, direction: 'right', offset: [8, 0], className: 'ac-label',
+          })
+          selectedLabelRef.current = ac.icao
+        } else {
+          marker.bindTooltip(hoverLabel, { direction: 'top', offset: [0, -10] })
+        }
         markersRef.current.set(ac.icao, marker)
       }
     }
@@ -569,7 +614,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos, selectedI
       map.fitBounds(bounds.pad(0.1))
       fittedRef.current = true
     }
-  }, [snapshot?.aircraft, colorFn, onSelectIcao, showMlatSources, showLabels])
+  }, [snapshot?.aircraft, colorFn, onSelectIcao, showMlatSources, showLabels, selectedIcao])
 
   return (
     <div className={styles.page}>
@@ -608,7 +653,10 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos, selectedI
         >MLAT residuals</button>
       </div>
 
-      <div className={styles.mapWrap} ref={mountRef} />
+      <div className={styles.mapArea}>
+        <div className={styles.mapWrap} ref={mountRef} />
+        {selectedIcao && <div className={styles.drawerSpacer} />}
+      </div>
 
       <div className={styles.legend}>
         {legendItems.map(({ label, color }) => (
