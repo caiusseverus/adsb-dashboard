@@ -3,6 +3,7 @@ import styles from './AircraftTable.module.css'
 import { formatOperator } from '../utils/formatOperator'
 import { EMERGENCY_SQUAWKS } from '../utils/squawks'
 import { useAircraftFilter, aircraftPassesFilter } from '../hooks/useAircraftFilter'
+import { SourceBadge } from './SourceBadge'
 
 const WTC_CLASS = { L: styles.wtcL, M: styles.wtcM, H: styles.wtcH, J: styles.wtcJ }
 
@@ -167,6 +168,7 @@ export default function AircraftTable({ aircraft, onSelectIcao, queueSize = 0 })
                     {ac.interesting    && <span className={styles.intBadge}>INT</span>}
                     {ac.sighting_count === 1 && <span className={styles.newBadge}>NEW</span>}
                     {ac.mlat           && <span className={styles.mlatBadge} title={[ac.mlat_source, `${ac.mlat_msg_count} msgs`].filter(Boolean).join(' · ')}>MLAT</span>}
+                    {!ac.mlat && !ac.pos_confident && ac.lat == null && <SourceBadge type="EST" />}
                     {ac.acas_ra_active && (
                       <span className={styles.acasBadge} title={ac.acas_ra_desc ?? 'ACAS RA active'}>ACAS</span>
                     )}

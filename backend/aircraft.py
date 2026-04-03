@@ -28,6 +28,11 @@ _route_cache: dict[str, tuple[float, dict | None]] = {}
 _ROUTE_CACHE_TTL  = 3600   # 1 hour
 _ROUTE_CACHE_MAX  = 2000   # prevent unbounded growth
 
+# Airport info cache: ICAO code → info dict (or None if not found)
+# Airport names are stable; no TTL needed, evict if too large.
+_airport_cache: dict[str, dict | None] = {}
+_AIRPORT_CACHE_MAX = 500
+
 
 # ---------------------------------------------------------------------------
 # Aircraft detail
@@ -189,6 +194,18 @@ def _get_json(url: str) -> dict | None:
     return None
 
 
+def _get_airport_info_blocking(ap_icao: str) -> dict | None:
+    """Fetch airport info from hexdb, using module-level cache."""
+    if ap_icao in _airport_cache:
+        return _airport_cache[ap_icao]
+    info = _get_json(f"https://hexdb.io/api/v1/airport/icao/{ap_icao}")
+    if len(_airport_cache) >= _AIRPORT_CACHE_MAX:
+        # Evict one entry (oldest key)
+        _airport_cache.pop(next(iter(_airport_cache)), None)
+    _airport_cache[ap_icao] = info
+    return info
+
+
 def _fetch_route_blocking(callsign: str) -> dict | None:
     # hexdb response: {"flight": "AIC117", "route": "VIAR-EGBB", "updatetime": ...}
     data = _get_json(f"https://hexdb.io/api/v1/route/icao/{callsign}")
@@ -300,7 +317,24 @@ async def aircraft_refresh(icao: str) -> dict:
 @router.get("/{icao}/visits")
 async def aircraft_visits(icao: str, limit: int = 30) -> list:
     icao = icao.upper()
-    return await asyncio.to_thread(stats_db.query_visits, icao, limit)
+    visits = await asyncio.to_thread(stats_db.query_visits, icao, limit)
+
+    # Resolve airport names for unique origin/dest ICAOs (concurrent, cached)
+    ap_icaos = {v[k] for v in visits for k in ("origin_icao", "dest_icao") if v.get(k)}
+    if ap_icaos:
+        infos = await asyncio.gather(
+            *[asyncio.to_thread(_get_airport_info_blocking, ap) for ap in ap_icaos],
+            return_exceptions=True,
+        )
+        airport_info = {ap: info for ap, info in zip(ap_icaos, infos)
+                        if not isinstance(info, Exception)}
+        for v in visits:
+            for src_key, dst_key in (("origin_icao", "origin_info"), ("dest_icao", "dest_info")):
+                ap = v.get(src_key)
+                if ap and ap in airport_info:
+                    v[dst_key] = airport_info[ap]
+
+    return visits
 
 
 @router.get("/{icao}/visits/{visit_id}/track")

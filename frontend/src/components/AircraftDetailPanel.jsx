@@ -5,6 +5,7 @@ import styles from './AircraftDetailPanel.module.css'
 import { formatOperator } from '../utils/formatOperator'
 import { EMERGENCY_SQUAWKS } from '../utils/squawks'
 import { fmtAlt } from '../utils/format'
+import { SourceBadge, posSourceType } from './SourceBadge'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 
@@ -27,6 +28,12 @@ function sameDay(startTs, endTs) {
   return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
 }
 
+
+function fmtAirport(icao, info) {
+  if (!icao) return '?'
+  const name = info?.IATA || info?.Airport
+  return name ? `${icao} (${name})` : icao
+}
 
 function fmtDuration(startTs, endTs) {
   if (!startTs || !endTs) return null
@@ -313,7 +320,11 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
 
               {/* Right: live state (if active) */}
               <div className={styles.col}>
-                <div className={styles.sectionTitle}>Now {!liveData && <span style={{ color: '#484f58', fontWeight: 400 }}>· not in range</span>}</div>
+                <div className={styles.sectionTitle} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                  Now
+                  {liveData && <SourceBadge type={posSourceType(liveData)} />}
+                  {!liveData && <span style={{ color: '#484f58', fontWeight: 400 }}>· not in range</span>}
+                </div>
                 {liveData ? (
                   <>
                     <Field label="Callsign"   value={liveData.callsign} />
@@ -416,7 +427,11 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
                           <td><span className={styles.visitCallsign}>{v.callsign || '—'}</span></td>
                           <td>
                             {(v.origin_icao || v.dest_icao)
-                              ? <span className={styles.visitRoute}>{v.origin_icao ?? '?'} → {v.dest_icao ?? '?'}</span>
+                              ? <span className={styles.visitRoute}>
+                                  {fmtAirport(v.origin_icao, v.origin_info)}
+                                  {' → '}
+                                  {fmtAirport(v.dest_icao, v.dest_info)}
+                                </span>
                               : <span className={styles.noData}>—</span>
                             }
                           </td>

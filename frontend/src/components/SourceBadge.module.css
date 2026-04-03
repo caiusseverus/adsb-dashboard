@@ -1,0 +1,27 @@
+.badge {
+  display: inline-block;
+  padding: 1px 5px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 3px;
+  vertical-align: middle;
+  letter-spacing: 0.03em;
+}
+
+/* ADS-B: green — confirmed ADS-B position */
+.adsb {
+  background: rgba(63, 185, 80, 0.18);
+  color: #3fb950;
+}
+
+/* MLAT: blue — multilateration position */
+.mlat {
+  background: rgba(56, 139, 253, 0.18);
+  color: #388bfd;
+}
+
+/* EST: gray — no reliable position fix */
+.est {
+  background: rgba(139, 148, 158, 0.18);
+  color: #8b949e;
+}
