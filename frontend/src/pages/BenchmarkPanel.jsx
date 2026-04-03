@@ -121,13 +121,15 @@ export default function BenchmarkPanel() {
   const [running,  setRunning]  = useState(false)
   const [error,    setError]    = useState(null)
   const [elapsed,  setElapsed]  = useState(0)
-  const pollRef   = useRef(null)
-  const timerRef  = useRef(null)
-  const startedAt = useRef(null)
+  const pollRef        = useRef(null)
+  const timerRef       = useRef(null)
+  const startTimeoutRef = useRef(null)
+  const startedAt      = useRef(null)
 
   const stopPolling = useCallback(() => {
     clearInterval(pollRef.current)
     clearInterval(timerRef.current)
+    clearTimeout(startTimeoutRef.current)
   }, [])
 
   const startPolling = useCallback(() => {
@@ -209,7 +211,8 @@ export default function BenchmarkPanel() {
 
       // Give the server ~300ms to accept the request and flip the running flag,
       // then start polling so the UI reflects the running state immediately.
-      setTimeout(startPolling, 300)
+      clearTimeout(startTimeoutRef.current)
+      startTimeoutRef.current = setTimeout(startPolling, 300)
     } catch (e) {
       setError(String(e))
     }

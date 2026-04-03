@@ -282,7 +282,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
   useEffect(() => {
     const clearAllDots = () => {
       mlatDotsRef.current.forEach(srcMap =>
-        srcMap.forEach(dots => dots.forEach(d => d.remove()))
+        srcMap.forEach(dots => dots.forEach(d => d.marker.remove()))
       )
       mlatDotsRef.current.clear()
       mlatSeenRef.current.clear()
@@ -319,17 +319,19 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
                   // Ring-buffer: evict oldest marker when cap reached
                   if (dots.length >= MLAT_DOT_CAP) {
                     const evicted = dots.shift()
-                    evicted.remove()
+                    seen.delete(evicted.key)
+                    evicted.marker.remove()
                   }
                   seen.add(key)
-                  dots.push(
-                    L.circleMarker([lat, lon], {
+                  dots.push({
+                    key,
+                    marker: L.circleMarker([lat, lon], {
                       radius: 3, color, fillColor: color, fillOpacity: 0.85,
                       weight: 0,
                     })
                       .bindTooltip(src, { direction: 'top' })
-                      .addTo(map)
-                  )
+                      .addTo(map),
+                  })
                 }
               }
             }
@@ -443,7 +445,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
         labelsRef.current.delete(icao)
         // Clear accumulated MLAT dots when aircraft leaves sight
         if (mlatDotsRef.current.has(icao)) {
-          mlatDotsRef.current.get(icao).forEach(dots => dots.forEach(d => d.remove()))
+          mlatDotsRef.current.get(icao).forEach(dots => dots.forEach(d => d.marker.remove()))
           mlatDotsRef.current.delete(icao)
           mlatSeenRef.current.delete(icao)
         }

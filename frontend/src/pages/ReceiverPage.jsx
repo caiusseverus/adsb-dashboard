@@ -189,7 +189,7 @@ function LiveDFBreakdown({ snapshot }) {
 
     // Seconds elapsed since current minute started
     const curMinStart = (cur?.minute ?? 0) * 60
-    const secsIntoCurMin = Math.min(59, Math.max(1, Math.floor(Date.now() / 1000) - curMinStart))
+    const secsIntoCurMin = Math.min(59, Math.max(0, Math.floor(Date.now() / 1000) - curMinStart))
     const prevWeight = (60 - secsIntoCurMin) / 60
 
     const allDfs = new Set([...Object.keys(curCounts), ...Object.keys(prevCounts)])

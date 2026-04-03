@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import styles from './SettingsPage.module.css'
 import { fmtBytes } from '../utils/format'
 import { useReloadableFetch } from '../utils/useFetch'
@@ -53,6 +53,7 @@ function TriggerRow({ label, prefKey, rangeKey, prefs, onChange }) {
 function TriggersSection() {
   const [prefs, setPrefs] = useState({})
   const [saving, setSaving] = useState(false)
+  const pendingRef = useRef({})
 
   useEffect(() => {
     fetch(`${API_BASE}/api/notify/prefs`)
@@ -64,12 +65,19 @@ function TriggersSection() {
   const handleChange = useCallback(async (key, value) => {
     setPrefs(p => ({ ...p, [key]: value }))
     setSaving(true)
+    // Abort any in-flight write for this key so the latest value wins.
+    pendingRef.current[key]?.abort()
+    const controller = new AbortController()
+    pendingRef.current[key] = controller
     try {
       await fetch(`${API_BASE}/api/notify/prefs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ key, value }),
+        signal: controller.signal,
       })
+    } catch (e) {
+      if (e.name === 'AbortError') return
     } finally {
       setSaving(false)
     }
@@ -284,7 +292,7 @@ function BackupSection() {
   const save = async () => {
     setSaving(true); setMsg(null)
     try {
-      await Promise.all([
+      const [r1, r2] = await Promise.all([
         fetch(`${API_BASE}/api/notify/prefs`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ key: 'backup_path', value: editPath.trim() }),
@@ -294,6 +302,7 @@ function BackupSection() {
           body: JSON.stringify({ key: 'backup_retain', value: editRetain.trim() || '7' }),
         }),
       ])
+      if (!r1.ok || !r2.ok) throw new Error(`Server error (${!r1.ok ? r1.status : r2.status})`)
       setDirty(false)
       setMsg({ ok: true, text: 'Settings saved.' })
     } catch (e) {

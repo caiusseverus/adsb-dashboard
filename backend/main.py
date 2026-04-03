@@ -444,7 +444,14 @@ async def _process_emergency_squawks(snapshot: dict, now_ts: int) -> None:
                     )
                     entry["last_update"] = now_ts
         else:
-            # New event (or squawk code changed) — pending, not yet written to DB
+            # New event or squawk code changed — finalize any existing confirmed
+            # event before opening a fresh one so the DB record isn't left open.
+            existing = _active_squawks.get(icao)
+            if existing is not None and existing["db_id"] is not None:
+                await asyncio.to_thread(
+                    stats_db.update_squawk_event_last,
+                    existing["db_id"], now_ts, None,
+                )
             _active_squawks[icao] = {
                 "squawk": sq, "db_id": None,
                 "first_seen": now_ts, "last_update": now_ts,

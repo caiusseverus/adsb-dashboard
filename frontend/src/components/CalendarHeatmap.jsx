@@ -38,7 +38,7 @@ function buildWeeks(dataByDate, months) {
   while (cur <= end) {
     const week = []
     for (let d = 0; d < 7; d++) {
-      const dateStr = cur.toISOString().slice(0, 10)
+      const dateStr = `${cur.getFullYear()}-${String(cur.getMonth() + 1).padStart(2, '0')}-${String(cur.getDate()).padStart(2, '0')}`
       week.push({
         date: dateStr,
         value: dataByDate[dateStr] ?? null,

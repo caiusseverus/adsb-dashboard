@@ -39,6 +39,7 @@ export default function App() {
   const [debugMode, setDebugMode] = useState(false)
   const wsRef = useRef(null)
   const retryRef = useRef(null)
+  const closingRef = useRef(false)
 
   function handleOpenCoverage(icao) {
     setCoverageIcao(icao)
@@ -76,16 +77,21 @@ export default function App() {
     }
     ws.onclose = () => {
       setConnected(false)
-      retryRef.current = setTimeout(connect, 3000)
+      // Skip reconnect if this close was triggered by our own cleanup
+      if (!closingRef.current && wsRef.current === ws) {
+        retryRef.current = setTimeout(connect, 3000)
+      }
     }
     ws.onerror = () => ws.close()
   }, [])
 
   useEffect(() => {
+    closingRef.current = false
     connect()
     return () => {
-      wsRef.current?.close()
+      closingRef.current = true
       clearTimeout(retryRef.current)
+      wsRef.current?.close()
     }
   }, [connect])
 

@@ -2554,6 +2554,11 @@ class AircraftState:
                 ac.altitude = int(alt_baro)
                 ac.alt_reliable = _ALT_RELIABLE_PUBLISH
                 ac.last_alt_ts = now
+            else:
+                # readsb stopped reporting altitude — withdraw it so stale data
+                # isn't published.
+                ac.altitude = None
+                ac.alt_reliable = 0
 
             # Signal: readsb rssi is dBFS; convert to Beast raw byte convention
             # (raw = -2 * dBFS, 0=strongest) used throughout the app.
@@ -2575,10 +2580,12 @@ class AircraftState:
             mlat_fields = ac_data.get("mlat", [])
             is_mlat = ac_type == "mlat" or "lat" in mlat_fields
             if is_mlat:
+                if not ac.mlat:
+                    # Only count the transition to MLAT, not every subsequent poll.
+                    self._mlat_total += 1
+                    self._cur_sec_mlat_count += 1
+                    self._cur_min_mlat_count += 1
                 ac.mlat = True
-                self._mlat_total += 1
-                self._cur_sec_mlat_count += 1
-                self._cur_min_mlat_count += 1
             elif ac_type.startswith("adsb"):
                 # Confirmed ADS-B — clear any prior MLAT tag
                 ac.mlat = False
@@ -2597,6 +2604,18 @@ class AircraftState:
                 ac.pos_reliable_even = _POS_RELIABLE_MAX
                 ac.pos_global = True
                 _update_range_bearing(ac)
+            else:
+                # readsb no longer has a position for this aircraft — withdraw
+                # it so stale coordinates aren't published.
+                ac.lat = None
+                ac.lon = None
+                ac.range_nm = None
+                ac.bearing_deg = None
+                ac.pos_reliable_odd  = 0.0
+                ac.pos_reliable_even = 0.0
+                ac.pos_global = False
+                ac.pos_by_ref = False
+                ac.last_pos_ts = 0
 
             # Squawk
             squawk = ac_data.get("squawk")
