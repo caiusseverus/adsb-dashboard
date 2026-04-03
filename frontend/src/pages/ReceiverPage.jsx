@@ -1,7 +1,8 @@
 import { useState, useMemo, useRef } from 'react'
 import {
-  ScatterChart, Scatter, XAxis, YAxis, ZAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, BarChart, Bar, Cell, AreaChart, Area, Legend,
+  ScatterChart, ComposedChart, Scatter, Line, XAxis, YAxis, ZAxis,
+  CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, Cell,
+  AreaChart, Area, Legend,
 } from 'recharts'
 import { useFetch } from '../utils/useFetch'
 import DFHeatmap from '../components/DFHeatmap'
@@ -72,21 +73,49 @@ function DaySelect({ value, onChange, options }) {
   )
 }
 
+const AGE_COLOURS = [
+  { maxAgeDays: 1,   colour: '#3fb950' }, // today     — green
+  { maxAgeDays: 2,   colour: '#388bfd' }, // yesterday — blue
+  { maxAgeDays: 7,   colour: '#d29922' }, // this week — amber
+  { maxAgeDays: 30,  colour: '#bc8cff' }, // this month — purple
+  { maxAgeDays: Infinity, colour: '#6e7681' }, // older — grey
+]
+function ageColour(ts) {
+  if (ts == null) return '#484f58'
+  const ageDays = (Date.now() / 1000 - ts) / 86400
+  return (AGE_COLOURS.find(b => ageDays < b.maxAgeDays) ?? AGE_COLOURS.at(-1)).colour
+}
+
 // ---------------------------------------------------------------------------
-// 1. Scatter: aircraft count vs messages/min, coloured by signal strength
+// 1. Scatter: aircraft count vs messages/sec, coloured by signal or age
 // ---------------------------------------------------------------------------
 function ScatterPlot({ days, onDaysChange }) {
   const { data, loading } = useFetch(`${API_BASE}/api/history/receiver/scatter?days=${days}`)
+  const [colourMode, setColourMode] = useState(
+    () => localStorage.getItem('scatter_colour_mode') || 'signal'
+  )
 
   const points = useMemo(() => (data || []).map(d => ({
-    ac: d.ac, msgs: d.msgs, signal: d.signal,
+    ac: d.ac, msgs: Math.round((d.msgs / 60) * 10) / 10, signal: d.signal, ts: d.ts,
   })), [data])
 
+  function toggleColour() {
+    const next = colourMode === 'signal' ? 'age' : 'signal'
+    setColourMode(next)
+    localStorage.setItem('scatter_colour_mode', next)
+  }
+
+  const controls = (
+    <>
+      <button className={styles.btn} onClick={toggleColour}>
+        {colourMode === 'signal' ? 'Colour: Signal' : 'Colour: Age'}
+      </button>
+      <DaySelect value={days} onChange={onDaysChange} options={[1, 3, 7, 14, 30]} />
+    </>
+  )
+
   return (
-    <Card
-      title="Aircraft count vs messages per minute"
-      controls={<DaySelect value={days} onChange={onDaysChange} options={[1, 3, 7, 14, 30]} />}
-    >
+    <Card title="Aircraft count vs messages/sec" controls={controls}>
       {!points.length ? <Empty loading={loading} /> : (
         <ResponsiveContainer width="100%" height={280}>
           <ScatterChart margin={{ top: 8, right: 16, bottom: 24, left: 0 }}>
@@ -94,25 +123,29 @@ function ScatterPlot({ days, onDaysChange }) {
             <XAxis dataKey="ac" name="Aircraft" type="number"
               label={{ value: 'Aircraft', position: 'insideBottom', offset: -12, fill: '#484f58', fontSize: 11 }}
               tick={{ fill: '#484f58', fontSize: 11 }} />
-            <YAxis dataKey="msgs" name="Messages/min" type="number"
+            <YAxis dataKey="msgs" name="Messages/sec" type="number"
               tick={{ fill: '#484f58', fontSize: 11 }} width={50} />
             <ZAxis range={[20, 20]} />
             <Tooltip cursor={{ stroke: '#30363d' }}
               content={({ payload }) => {
                 if (!payload?.length) return null
                 const d = payload[0].payload
+                const date = d.ts ? new Date(d.ts * 1000).toLocaleDateString() : '—'
                 return (
                   <div className={styles.tooltip}>
                     <div>Aircraft: {d.ac}</div>
-                    <div>Msgs/min: {d.msgs}</div>
+                    <div>Msgs/sec: {d.msgs}</div>
                     <div>Signal avg: {fmtDbfs(d.signal)}</div>
+                    <div>Date: {date}</div>
                   </div>
                 )
               }}
             />
             <Scatter data={points} isAnimationActive={false}>
               {points.map((p, i) => (
-                <Cell key={i} fill={signalColour(p.signal)} fillOpacity={0.7} />
+                <Cell key={i}
+                  fill={colourMode === 'age' ? ageColour(p.ts) : signalColour(p.signal)}
+                  fillOpacity={0.7} />
               ))}
             </Scatter>
           </ScatterChart>
@@ -230,12 +263,26 @@ const WTC_COLOUR = { L: '#3fb950', M: '#388bfd', H: '#d29922', J: '#f85149' }
 const WTC_LABEL  = { L: 'Light', M: 'Medium', H: 'Heavy', J: 'Super' }
 function wtcColour(wtc) { return WTC_COLOUR[wtc] ?? '#484f58' }
 
+// Radio horizon: range_nm = 1.23 × sqrt(alt_ft)  →  alt_ft = (range_nm / 1.23)²
+// Aircraft ABOVE this curve are in the expected visible zone; those BELOW flag
+// impossible reception geometry (likely bad decodes or ground reflections).
+function buildHorizonSeries(maxRange) {
+  const pts = []
+  for (let r = 0; r <= maxRange; r += 5) {
+    pts.push({ range: r, horizon: Math.round((r / 1.23) ** 2) })
+  }
+  return pts
+}
+
 function RangeAltScatter({ aircraft }) {
   const points = useMemo(() =>
     (aircraft || [])
       .filter(ac => ac.range_nm != null && ac.altitude != null)
       .map(ac => ({ range: ac.range_nm, alt: ac.altitude, wtc: ac.wtc, callsign: ac.callsign, type_code: ac.type_code })),
   [aircraft])
+
+  const maxRange = useMemo(() => Math.max(50, ...points.map(p => p.range)), [points])
+  const horizonSeries = useMemo(() => buildHorizonSeries(maxRange), [maxRange])
 
   return (
     <Card title="Range vs altitude — live (nm vs ft, coloured by WTC)">
@@ -248,12 +295,12 @@ function RangeAltScatter({ aircraft }) {
       ) : (
         <>
           <ResponsiveContainer width="100%" height={260}>
-            <ScatterChart margin={{ top: 8, right: 16, bottom: 24, left: 0 }}>
+            <ComposedChart margin={{ top: 8, right: 16, bottom: 24, left: 0 }}>
               <CartesianGrid stroke="#21262d" />
               <XAxis dataKey="range" name="Range" type="number"
                 label={{ value: 'Range (nm)', position: 'insideBottom', offset: -12, fill: '#484f58', fontSize: 11 }}
                 tick={{ fill: '#484f58', fontSize: 11 }} />
-              <YAxis dataKey="alt" name="Altitude" type="number"
+              <YAxis name="Altitude" type="number"
                 tick={{ fill: '#484f58', fontSize: 11 }} width={56}
                 tickFormatter={v => `${(v / 1000).toFixed(0)}k`} />
               <ZAxis range={[24, 24]} />
@@ -261,6 +308,7 @@ function RangeAltScatter({ aircraft }) {
                 content={({ payload }) => {
                   if (!payload?.length) return null
                   const d = payload[0].payload
+                  if (d.horizon != null) return null
                   return (
                     <div className={styles.tooltip}>
                       <div>Range: {d.range} nm</div>
@@ -271,12 +319,15 @@ function RangeAltScatter({ aircraft }) {
                   )
                 }}
               />
-              <Scatter data={points} isAnimationActive={false}>
+              <Line data={horizonSeries} dataKey="horizon" dot={false}
+                stroke="#484f58" strokeWidth={1} strokeDasharray="4 3"
+                isAnimationActive={false} legendType="none" />
+              <Scatter data={points} dataKey="alt" isAnimationActive={false}>
                 {points.map((p, i) => (
                   <Cell key={i} fill={wtcColour(p.wtc)} fillOpacity={0.75} />
                 ))}
               </Scatter>
-            </ScatterChart>
+            </ComposedChart>
           </ResponsiveContainer>
           <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center', marginTop: '0.5rem', flexWrap: 'wrap' }}>
             {Object.entries(WTC_LABEL).map(([k, v]) => (

@@ -120,7 +120,7 @@ function makeLabelContent(ac) {
 }
 
 
-export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
+export default function MapPage({ snapshot, onSelectIcao, receiverPos, selectedIcao }) {
   const mapRef            = useRef(null)
   const mountRef          = useRef(null)
   const markersRef        = useRef(new Map())   // icao → L.Marker
@@ -136,6 +136,7 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
   const mlatDotsRef       = useRef(new Map())   // icao → Map<source, L.CircleMarker[]>
   const mlatSeenRef       = useRef(new Map())   // icao → Map<source, Set<"lat,lon">>
   const mlatPollRef       = useRef(null)
+  const selectedTrailRef  = useRef([])    // L.Polyline[] — per-segment gradient for selected aircraft
 
   const [colorMode,       setColorMode]       = useState('altitude')
   const [acCount,         setAcCount]         = useState(0)
@@ -153,14 +154,23 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
     const initZoom   = receiverPos ? 9 : 8
     if (receiverPos) initCenteredRef.current = true
     const map = L.map(mountRef.current, { center: initCenter, zoom: initZoom, zoomControl: true })
-    // CartoDB Dark Matter — free, no API key, attribution required
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    // Base layers — CartoDB Dark Matter (default) + OpenTopoMap terrain option
+    const darkLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
       attribution:
         '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors ' +
         '&copy; <a href="https://carto.com/attributions">CARTO</a>',
       subdomains: 'abcd',
       maxZoom: 19,
-    }).addTo(map)
+    })
+    const topoLayer = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+      attribution:
+        '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors ' +
+        '&copy; <a href="https://opentopomap.org">OpenTopoMap</a>',
+      subdomains: 'abc',
+      maxZoom: 17,
+    })
+    darkLayer.addTo(map)
+    L.control.layers({ 'Dark': darkLayer, 'Terrain': topoLayer }, {}, { position: 'topleft' }).addTo(map)
     mapRef.current = map
     return () => {
       map.remove()
@@ -277,6 +287,46 @@ export default function MapPage({ snapshot, onSelectIcao, receiverPos }) {
       clearTrails()
     }
   }, [showTrails])
+
+  // ── Selected aircraft: per-segment gradient trail ─────────────────────────
+  // Renders N-1 two-point polylines for the selected aircraft, each coloured by
+  // the segment's altitude. Capped at 200 segments (downsamples older points).
+  useEffect(() => {
+    const clearSelected = () => {
+      selectedTrailRef.current.forEach(seg => seg.remove())
+      selectedTrailRef.current = []
+    }
+    clearSelected()
+    if (!selectedIcao || !mapRef.current) return
+
+    fetch(`${API_BASE}/api/tracks`)
+      .then(r => r.ok ? r.json() : {})
+      .then(data => {
+        const map = mapRef.current
+        if (!map) return
+        const points = (data[selectedIcao] || []).filter(p => p.lat != null && p.lon != null)
+        if (points.length < 2) return
+        // Downsample to ≤200 segments
+        const MAX_SEGS = 200
+        const sampled = points.length > MAX_SEGS + 1
+          ? [points[0], ...points.slice(-(MAX_SEGS))]
+          : points
+        const segments = []
+        for (let i = 0; i < sampled.length - 1; i++) {
+          const a = sampled[i], b = sampled[i + 1]
+          const color = altColor(b.altitude_ft)
+          const seg = L.polyline([[a.lat, a.lon], [b.lat, b.lon]], {
+            color, weight: 2.5, opacity: 0.85,
+            lineCap: 'round', lineJoin: 'round',
+          }).addTo(map)
+          segments.push(seg)
+        }
+        selectedTrailRef.current = segments
+      })
+      .catch(() => {})
+
+    return clearSelected
+  }, [selectedIcao])
 
   // ── MLAT source dots: poll bulk fixes endpoint, accumulate dots ───────────
   useEffect(() => {

@@ -290,6 +290,18 @@
 }
 .clearBtn:hover { background: rgba(248, 81, 73, 0.1); }
 
+/* Inline select controls in toolbar */
+.select {
+  background: #0b0c10;
+  border: 1px solid #30363d;
+  color: #8b949e;
+  font-size: 0.72rem;
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.select:focus { outline: none; border-color: #388bfd; }
+
 /* Scene parameter sliders (altitude scale, curvature) */
 .sliderLabel {
   font-size: 0.72rem;

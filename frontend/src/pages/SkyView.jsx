@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import styles from './SkyView.module.css'
 import { EMERGENCY_SQUAWKS } from '../utils/squawks'
+import { useAircraftFilter } from '../hooks/useAircraftFilter'
 import { TYPE_GROUPS, TYPE_GROUP_OTHER_COLOR, getTypeGroup, buildNameColorMap } from '../utils/typeGroups'
 
 const FEET_PER_NM      = 6076.115
@@ -95,7 +96,7 @@ export default function SkyView({ snapshot, onSelectIcao }) {
 
   // ── Component state ─────────────────────────────────────────────────
   const [hoveredAc,      setHoveredAc]      = useState(null)
-  const [filter,         setFilter]         = useState('all')
+  const { filter, setFilter, passesFilter } = useAircraftFilter('all')
   const [colorMode,      setColorMode]      = useState('classification')
   const [maxElev,        setMaxElev]        = useState(30)
   const [horizonScale,   setHorizonScale]   = useState('sqrt')
@@ -125,13 +126,7 @@ export default function SkyView({ snapshot, onSelectIcao }) {
 
   // ── Filtered aircraft & operator colour map ──────────────────────────
   const baseAircraft = snapshot?.aircraft ?? []
-  const aircraft = useMemo(() => {
-    if (filter === 'military')    return baseAircraft.filter(ac => ac.military)
-    if (filter === 'mlat')        return baseAircraft.filter(ac => ac.mlat)
-    if (filter === 'interesting') return baseAircraft.filter(ac => ac.interesting)
-    if (filter === 'emergency')   return baseAircraft.filter(ac => ac.squawk && EMERGENCY_SQUAWKS[ac.squawk])
-    return baseAircraft
-  }, [snapshot, filter])
+  const aircraft = useMemo(() => baseAircraft.filter(ac => passesFilter(ac)), [snapshot, filter])
 
   const operatorMap = useMemo(
     () => buildNameColorMap(baseAircraft, 'operator').map,
@@ -144,14 +139,7 @@ export default function SkyView({ snapshot, onSelectIcao }) {
   )
 
   // ── Helper: should we draw this trail given the current filter? ──────
-  function trailPassesFilter(trailObj) {
-    if (filter === 'all')         return true
-    if (filter === 'military')    return !!trailObj.military
-    if (filter === 'mlat')        return !!trailObj.mlat
-    if (filter === 'interesting') return !!trailObj.interesting
-    if (filter === 'emergency')   return !!(trailObj.squawk && EMERGENCY_SQUAWKS[trailObj.squawk])
-    return true
-  }
+  const trailPassesFilter = trailObj => passesFilter(trailObj)
 
   // ── Polar canvas draw ────────────────────────────────────────────────
   useEffect(() => {
@@ -256,7 +244,7 @@ export default function SkyView({ snapshot, onSelectIcao }) {
       if (!pos) return
 
       const color = acColor(ac, colorMode, operatorMap)
-      const dotR  = 4
+      const dotR  = 3
 
       const hover = hoverRef.current
       if (hover && Math.hypot(hover.x - pos.x, hover.y - pos.y) < HOVER_RADIUS_PX) {
@@ -422,7 +410,7 @@ export default function SkyView({ snapshot, onSelectIcao }) {
       if (!pos) return
 
       const color = acColor(ac, colorMode, operatorMap)
-      const dotR  = 4
+      const dotR  = 3
 
       const hover = horizonHoverRef.current
       if (hover && Math.hypot(hover.x - pos.x, hover.y - pos.y) < HOVER_RADIUS_PX) {

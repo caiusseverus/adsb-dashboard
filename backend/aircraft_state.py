@@ -687,11 +687,13 @@ def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
     if pos_from_global:
         ac.pos_global = True
         ac.pos_by_ref = False
+        ac._pos_source = "global_cpr"
     else:
         # Local-CPR decode (position_with_ref): still require even/odd reliability
         # before publish, but allow it to become publishable when global pairing is
         # temporarily unavailable (e.g. corrected frames in native decode path).
         ac.pos_by_ref = True
+        ac._pos_source = "local_cpr"
     _update_range_bearing(ac)
 
 
@@ -865,6 +867,7 @@ def _record_mlat_fix(ac: "Aircraft", source: str, lat: float, lon: float, now: f
         ac.lat = round(lat, 5)
         ac.lon = round(lon, 5)
         ac.last_pos_ts = now
+        ac._pos_source = "mlat"
         _update_range_bearing(ac)
     elif config.MLAT_FUSION == "kalman":
         if not is_spike:
@@ -878,6 +881,7 @@ def _record_mlat_fix(ac: "Aircraft", source: str, lat: float, lon: float, now: f
                 lat_k, lon_k = _kalman_update_position(ac, lat, lon, now, quality)
                 ac.lat, ac.lon = round(lat_k, 5), round(lon_k, 5)
             ac.last_pos_ts = now
+            ac._pos_source = "mlat"
             _update_range_bearing(ac)
     else:
         pos = _select_output_position(ac, lat, lon, is_spike, now)
@@ -885,6 +889,7 @@ def _record_mlat_fix(ac: "Aircraft", source: str, lat: float, lon: float, now: f
             ac.lat = round(pos[0], 5)
             ac.lon = round(pos[1], 5)
             ac.last_pos_ts = now
+            ac._pos_source = "mlat"
             _update_range_bearing(ac)
 
 
@@ -1024,6 +1029,8 @@ class Aircraft:
     _cpr_recent:         list  = field(default_factory=list, repr=False)
     # mlatForce: timestamp of last forced MLAT position accept (ADS-B→MLAT transition)
     _last_mlat_force_ts: float = field(default=0.0, repr=False)
+    # Position source: "global_cpr", "local_cpr", or "mlat" — set on each accepted position
+    _pos_source: Optional[str] = field(default=None, repr=False)
     sighting_count: int = 1               # from aircraft_registry; 1 = unique (never seen before)
     max_altitude: Optional[int] = None    # highest altitude seen this visit
     # MLAT

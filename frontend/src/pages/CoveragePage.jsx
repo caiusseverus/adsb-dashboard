@@ -13,8 +13,6 @@ const FEET_PER_NM   = 6076.115
 const R_NM          = 3440.065   // Earth radius in NM
 const ALT_SCALE_FT  = 45000   // fixed colour scale ceiling — not data-driven
 
-// Maximum trail points kept per aircraft (~10 min at 1 Hz)
-const MAX_TRAIL_PTS = 600
 // Break a trail segment on time gap (seconds) or position jump thresholds
 const MAX_TRAIL_GAP_S   = 20
 const MAX_BEARING_JUMP  = 45   // degrees — impossible in 1 s for any real aircraft
@@ -735,6 +733,14 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
   // without being captured in stale closures.
   const altScaleRef  = useRef(8)
   const curveModeRef = useRef(false)
+
+  // Trail length in points — user-adjustable, persisted in localStorage
+  const TRAIL_OPTS = [{ label: '1 min', pts: 60 }, { label: '3 min', pts: 180 }, { label: '5 min', pts: 300 }, { label: '10 min', pts: 600 }]
+  const [maxTrailPts, setMaxTrailPts] = useState(() => {
+    const saved = parseInt(localStorage.getItem('coverage_trail_pts'), 10)
+    return Number.isFinite(saved) ? saved : 180
+  })
+  const maxTrailPtsRef = useRef(maxTrailPts)
   // sceneVersion bumps to force a full redraw when coordinate params change
   const [sceneVersion, setSceneVersion] = useState(0)
 
@@ -1483,48 +1489,64 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
   // ── Backfill trailsRef from hires buffer on first load ──────────────
   // Pre-populates trails so the live view shows history from server start,
   // not just from when this browser tab was opened.
+  // Retries once after 5 s in case the buffer is still warming up at startup.
   useEffect(() => {
     if (showMode === 'history') return
-    const end   = Math.floor(Date.now() / 1000)
-    const start = end - 3600   // last hour
-    fetch(`/api/coverage/timelapse_hires?start_ts=${start}&end_ts=${end}`)
-      .then(r => r.ok ? r.json() : null)
-      .then(data => {
-        if (!data?.tracks?.length) return
-        const trails = trailsRef.current
-        for (const track of data.tracks) {
-          if (!track.points?.length) continue
-          const pts = track.points.map(([dt, bearing, range, alt]) => ({
-            bearing,
-            range,
-            alt,
-            ts:          start + dt,
-            military:    track.military,
-            mlat:        track.mlat,
-            interesting: track.interesting,
-            acas:        false,
-            type_code:   track.type_code,
-            type_category: null,
-            operator:    track.operator,
-            lat:         null,
-            lon:         null,
-          }))
-          // Prepend historical points; append any live points already collected
-          const live = trails[track.icao]
-          if (!live?.length) {
-            trails[track.icao] = pts.slice(-MAX_TRAIL_PTS)
-          } else {
-            // live already has some points — prepend history that predates them
-            const liveStart = live[0].ts
-            const historical = pts.filter(p => p.ts < liveStart)
-            if (historical.length) {
-              const merged = [...historical, ...live]
-              trails[track.icao] = merged.slice(-MAX_TRAIL_PTS)
-            }
+    let retryId = null
+
+    function applyHires(data, start) {
+      if (!data?.tracks?.length) return 0
+      const trails = trailsRef.current
+      let count = 0
+      for (const track of data.tracks) {
+        if (!track.points?.length) continue
+        count++
+        const pts = track.points.map(([dt, bearing, range, alt]) => ({
+          bearing,
+          range,
+          alt,
+          ts:          start + dt,
+          military:    track.military,
+          mlat:        track.mlat,
+          interesting: track.interesting,
+          acas:        false,
+          type_code:   track.type_code,
+          type_category: null,
+          operator:    track.operator,
+          lat:         null,
+          lon:         null,
+        }))
+        const live = trails[track.icao]
+        if (!live?.length) {
+          trails[track.icao] = pts.slice(-maxTrailPtsRef.current)
+        } else {
+          const liveStart = live[0].ts
+          const historical = pts.filter(p => p.ts < liveStart)
+          if (historical.length) {
+            const merged = [...historical, ...live]
+            trails[track.icao] = merged.slice(-maxTrailPtsRef.current)
           }
         }
-      })
-      .catch(() => {})  // backfill is best-effort
+      }
+      return count
+    }
+
+    function doFetch() {
+      const end   = Math.floor(Date.now() / 1000)
+      const start = end - 3600
+      return fetch(`/api/coverage/timelapse_hires?start_ts=${start}&end_ts=${end}`)
+        .then(r => r.ok ? r.json() : null)
+        .then(data => applyHires(data, start))
+        .catch(() => 0)
+    }
+
+    doFetch().then(count => {
+      if (count === 0) {
+        retryId = setTimeout(() => doFetch(), 5000)
+      }
+    })
+
+    return () => { if (retryId) clearTimeout(retryId) }
   }, [])  // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Accumulate live aircraft trails ─────────────────────────────────
@@ -1595,7 +1617,7 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
         type_category: ac.type_category,
         operator:      ac.operator,
       })
-      if (trail.length > MAX_TRAIL_PTS) trail.splice(0, trail.length - MAX_TRAIL_PTS)
+      if (trail.length > maxTrailPtsRef.current) trail.splice(0, trail.length - maxTrailPtsRef.current)
     }
 
     const filteredTrails = _filterTrails(trails, {
@@ -1857,6 +1879,19 @@ export default function CoveragePage({ aircraft = [], initialIcao = '' }) {
             setAltScale(v)
             bumpScene(v, curveModeRef.current)
           }} />
+
+        <div className={styles.sep} />
+
+        {/* Trail length */}
+        <span className={styles.sliderLabel}>Trail</span>
+        <select className={styles.select} value={maxTrailPts} onChange={e => {
+          const v = parseInt(e.target.value, 10)
+          setMaxTrailPts(v)
+          maxTrailPtsRef.current = v
+          localStorage.setItem('coverage_trail_pts', String(v))
+        }}>
+          {TRAIL_OPTS.map(o => <option key={o.pts} value={o.pts}>{o.label}</option>)}
+        </select>
 
         <div className={styles.sep} />
 

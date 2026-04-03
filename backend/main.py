@@ -515,7 +515,9 @@ async def _db_writer() -> None:
                  ac.get("signal"),
                  1 if ac.get("mlat") else 0)
                 for ac in snapshot.get("aircraft", [])
-                if ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
+                if (ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
+                        and ac.get("last_pos_age") is not None
+                        and ac.get("last_pos_age") <= config.POS_FRESH_S)
             )
             await asyncio.to_thread(stats_db.write_coverage_tuples, samples)
 

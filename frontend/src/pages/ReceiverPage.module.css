@@ -71,6 +71,17 @@
 }
 .select:focus { outline: none; border-color: #388bfd; }
 
+.btn {
+  background: #0b0c10;
+  border: 1px solid #30363d;
+  color: #8b949e;
+  font-size: 0.78rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.btn:hover { border-color: #388bfd; color: #c9d1d9; }
+
 /* Empty / loading */
 .empty {
   color: #484f58;

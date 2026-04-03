@@ -2,6 +2,7 @@ import { useState } from 'react'
 import styles from './AircraftTable.module.css'
 import { formatOperator } from '../utils/formatOperator'
 import { EMERGENCY_SQUAWKS } from '../utils/squawks'
+import { useAircraftFilter, aircraftPassesFilter } from '../hooks/useAircraftFilter'
 
 const WTC_CLASS = { L: styles.wtcL, M: styles.wtcM, H: styles.wtcH, J: styles.wtcJ }
 
@@ -90,7 +91,7 @@ const FILTERS = [
 export default function AircraftTable({ aircraft, onSelectIcao, queueSize = 0 }) {
   const [sortCol, setSortCol] = useState('icao')
   const [sortAsc, setSortAsc] = useState(true)
-  const [filter, setFilter] = useState('all')
+  const { filter, setFilter } = useAircraftFilter('all')
 
   function handleSort(key) {
     if (key === sortCol) {
@@ -103,11 +104,9 @@ export default function AircraftTable({ aircraft, onSelectIcao, queueSize = 0 })
 
   const threatSet = new Set(aircraft.filter(a => a.acas_threat_icao).map(a => a.acas_threat_icao))
 
-  const filtered = filter === 'mlat'        ? aircraft.filter(ac => ac.mlat)
-                 : filter === 'military'    ? aircraft.filter(ac => ac.military)
-                 : filter === 'interesting' ? aircraft.filter(ac => ac.interesting)
-                 : filter === 'acas'        ? aircraft.filter(ac => ac.acas_ra_active || threatSet.has(ac.icao))
-                 : aircraft
+  const filtered = filter === 'acas'
+    ? aircraft.filter(ac => ac.acas_ra_active || threatSet.has(ac.icao))
+    : aircraft.filter(ac => aircraftPassesFilter(ac, filter))
 
   const sorted = sortAircraft(filtered, sortCol, sortAsc)
 
