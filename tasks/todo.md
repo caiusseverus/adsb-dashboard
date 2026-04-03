@@ -26,7 +26,7 @@ Addendum corrections are applied inline — see the "Corrections" section below 
   - *Prerequisite for items 3, 6, 7a*
   - Effort: ~3h
 
-- [ ] **0B — Loading / empty / error state pattern for historical overlays**
+- [x] **0B — Loading / empty / error state pattern for historical overlays**
   - Define shared state shape: `{ status: 'idle'|'loading'|'empty'|'error', data, retry }`
   - Apply to: hi-res trail fetch, timelapse fetch, coverage history, route history
   - Add a small reusable loading/empty UI component
@@ -193,7 +193,7 @@ Addendum corrections are applied inline — see the "Corrections" section below 
   - Effort: ~4h backend + ~6h frontend
   - *Treat as advanced diagnostics milestone, not polish pass*
 
-- [ ] **17 — Interrogator timing lanes** (builds on item 15)
+- [x] **17 — Interrogator timing lanes** (builds on item 15)
   - Per-interrogator timestamp history: `/api/interrogators/timeline`
   - Canvas-based: per-row time lane, tick marks at arrival time, rotation period visible as regular spacing
   - Click row to highlight aircraft on map

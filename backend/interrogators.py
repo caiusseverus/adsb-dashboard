@@ -7,6 +7,8 @@ GET /api/interrogators?window_s=600
   syndrome for DF11, indicating which SSR interrogator triggered the reply).
 """
 
+import time
+
 from fastapi import APIRouter, Query
 
 router = APIRouter(prefix="/api/interrogators")
@@ -29,3 +31,24 @@ async def get_interrogators(window_s: float = Query(600, ge=60, le=3600)) -> dic
         reverse=True,
     )
     return {"window_s": window_s, "total": total, "codes": codes}
+
+
+@router.get("/timeline")
+async def get_timeline(window_s: float = Query(10, ge=2, le=60)) -> dict:
+    """Return per-IID DF11 message timestamps for the last window_s seconds.
+
+    Used to render timing-lane visualisations showing SSR interrogator rotation
+    periods.  Returns:
+        now:     current server time (Unix seconds, float)
+        window_s: the requested window
+        lanes:   list of {iid, timestamps: [float]} sorted by count descending
+    """
+    now = time.time()
+    timeline = router._state.get_iid_timeline(window_s)
+    lanes = sorted(
+        [{"iid": iid, "timestamps": timestamps}
+         for iid, timestamps in timeline.items()],
+        key=lambda x: len(x["timestamps"]),
+        reverse=True,
+    )
+    return {"now": now, "window_s": window_s, "lanes": lanes}

@@ -1612,6 +1612,23 @@ class AircraftState:
 
     # ── DF11 interrogator helpers ────────────────────────────────────────────
 
+    def get_iid_timeline(self, window_s: float = 10.0) -> dict[int, list[float]]:
+        """Return per-IID lists of message timestamps within the last window_s seconds.
+
+        Reads the shared _iid_events deque lock-free (CPython GIL makes deque
+        appends + iteration safe for single-writer / single-reader).
+        Timestamps are absolute Unix seconds; caller should also receive `now`
+        to correctly place them on a relative time axis.
+        """
+        cutoff = time.time() - window_s
+        timeline: dict[int, list[float]] = {}
+        for ts, iid in self._iid_events:
+            if ts >= cutoff:
+                if iid not in timeline:
+                    timeline[iid] = []
+                timeline[iid].append(ts)
+        return timeline
+
     def get_iid_counts(self, window_s: float = 600.0) -> dict[int, int]:
         """Return {iid: count} for DF11 messages within the last window_s seconds.
 

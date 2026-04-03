@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef } from 'react'
+import { useState, useMemo, useRef, useEffect, useCallback } from 'react'
 import {
   ScatterChart, ComposedChart, Scatter, Line, XAxis, YAxis, ZAxis,
   CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, Cell,
@@ -869,6 +869,126 @@ function InterrogatorCodes() {
 }
 
 // ---------------------------------------------------------------------------
+// Interrogator timing lanes (canvas)
+// ---------------------------------------------------------------------------
+
+const LANE_H    = 22   // px per IID lane
+const LANE_PAD  = 4    // top/bottom padding inside each lane
+const LABEL_W   = 52   // px for IID label on the left
+const TICK_W    = 2    // px tick width
+const TICK_H    = LANE_H - LANE_PAD * 2  // tick height
+
+function InterrogatorTimeline() {
+  const canvasRef  = useRef(null)
+  const [windowS, setWindowS] = useState(10)
+  const [data,    setData]    = useState(null)
+
+  // Poll every second
+  const fetchData = useCallback(() => {
+    fetch(`${API_BASE}/api/interrogators/timeline?window_s=${windowS}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d) setData(d) })
+      .catch(() => {})
+  }, [windowS])
+
+  useEffect(() => {
+    fetchData()
+    const id = setInterval(fetchData, 1000)
+    return () => clearInterval(id)
+  }, [fetchData])
+
+  // Draw canvas
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas || !data?.lanes) return
+
+    const lanes  = data.lanes.slice(0, 12)  // cap at 12 rows
+    const now    = data.now
+    const winS   = data.window_s
+    const h      = Math.max(LANE_H * lanes.length, LANE_H)
+    const w      = canvas.offsetWidth || 600
+    canvas.width  = w
+    canvas.height = h
+
+    const ctx = canvas.getContext('2d')
+    ctx.clearRect(0, 0, w, h)
+    ctx.fillStyle = '#0b0c10'
+    ctx.fillRect(0, 0, w, h)
+
+    const plotW = w - LABEL_W
+    const tToX = t => LABEL_W + ((t - (now - winS)) / winS) * plotW
+
+    lanes.forEach((lane, row) => {
+      const y0 = row * LANE_H
+      const yC = y0 + LANE_H / 2
+
+      // Row background (alternate)
+      ctx.fillStyle = row % 2 === 0 ? '#0f1117' : '#0b0c10'
+      ctx.fillRect(0, y0, w, LANE_H)
+
+      // Label
+      ctx.fillStyle = lane.iid === 0 ? '#3fb950' : '#388bfd'
+      ctx.font = '10px monospace'
+      ctx.textAlign = 'right'
+      ctx.textBaseline = 'middle'
+      ctx.fillText(`IID ${lane.iid}`, LABEL_W - 4, yC)
+
+      // Ticks
+      ctx.fillStyle = lane.iid === 0 ? 'rgba(63,185,80,0.75)' : 'rgba(56,139,253,0.75)'
+      for (const ts of lane.timestamps) {
+        const x = tToX(ts)
+        if (x < LABEL_W || x > w) continue
+        ctx.fillRect(x - TICK_W / 2, yC - TICK_H / 2, TICK_W, TICK_H)
+      }
+    })
+
+    // Time axis line at bottom
+    ctx.strokeStyle = '#21262d'
+    ctx.lineWidth = 1
+    ctx.beginPath()
+    ctx.moveTo(LABEL_W, h - 0.5)
+    ctx.lineTo(w, h - 0.5)
+    ctx.stroke()
+  }, [data])
+
+  if (!data) return null
+
+  const lanes = data.lanes ?? []
+  if (lanes.length === 0) return (
+    <Card title="Interrogator Timing Lanes">
+      <p style={{ fontSize: '0.8rem', color: '#484f58', padding: '0.5rem 0' }}>
+        No DF11 messages received yet
+      </p>
+    </Card>
+  )
+
+  const canvasH = Math.min(LANE_H * Math.min(lanes.length, 12), LANE_H * 12)
+
+  return (
+    <Card
+      title="Interrogator Timing Lanes"
+      controls={
+        <select className={styles.select} value={windowS} onChange={e => setWindowS(Number(e.target.value))}>
+          <option value={5}>5 s</option>
+          <option value={10}>10 s</option>
+          <option value={20}>20 s</option>
+          <option value={30}>30 s</option>
+          <option value={60}>60 s</option>
+        </select>
+      }
+    >
+      <p style={{ fontSize: '0.72rem', color: '#484f58', margin: '0 0 0.4rem' }}>
+        Each tick = one DF11 reply. Regular spacing reveals the SSR rotation period (~4 s for most sites).
+      </p>
+      <canvas
+        ref={canvasRef}
+        style={{ width: '100%', height: canvasH, display: 'block', borderRadius: 4 }}
+      />
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Page layout
 // ---------------------------------------------------------------------------
 export default function ReceiverPage({ snapshot }) {
@@ -907,6 +1027,7 @@ export default function ReceiverPage({ snapshot }) {
       <SignalHeatmap />
       <div className={styles.row}>
         <InterrogatorCodes />
+        <InterrogatorTimeline />
       </div>
     </main>
   )
