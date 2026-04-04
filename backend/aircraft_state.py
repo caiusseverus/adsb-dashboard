@@ -1577,10 +1577,11 @@ class AircraftState:
         self._iid_events: deque[tuple[float, int, int | None, int, str]] = deque(maxlen=50_000)
 
         # High-frequency message timing buffer for the timing page/stream.
-        # Stores (seq, arrival_us, df, msg_len) for primary-stream Beast messages.
+        # Stores (seq, arrival_us, df, msg_len, signal_raw, source_class, icao)
+        # for primary-stream Beast messages.
         # At 4000 msg/s (dense European airspace) × 15s = 60,000 entries.
         # Needs to cover timing_window_s (up to 10 s) + render holdback (0.65 s) + margin.
-        self._timing_events: deque[tuple[int, int, int, int]] = deque(maxlen=60_000)
+        self._timing_events: deque[tuple[int, int, int, int, int, int, str]] = deque(maxlen=60_000)
         self._timing_seq: int = 0
         self._timing_base_ticks: int | None = None
         self._timing_last_raw_ticks: int | None = None
@@ -1721,8 +1722,8 @@ class AircraftState:
 
     # ── DF11 interrogator helpers ────────────────────────────────────────────
 
-    def get_timing_events(self, since_seq: int) -> list[tuple[int, int, int, int]]:
-        """Return (seq, arrival_us, df, msg_len) tuples with seq > since_seq.
+    def get_timing_events(self, since_seq: int) -> list[tuple[int, int, int, int, int, int, str]]:
+        """Return (seq, arrival_us, df, msg_len, signal_raw, source_class, icao) tuples with seq > since_seq.
 
         Caller supplies the sequence id of the last event it received so only new
         events are returned, keeping response sizes small (~200 msg / 100 ms poll).
@@ -1733,8 +1734,8 @@ class AircraftState:
             events = tuple(self._timing_events)
         if events and since_seq > events[-1][0]:
             since_seq = 0
-        return [(seq, arrival_us, df, msg_len)
-                for seq, arrival_us, df, msg_len in events
+        return [(seq, arrival_us, df, msg_len, signal_raw, source_class, icao)
+                for seq, arrival_us, df, msg_len, signal_raw, source_class, icao in events
                 if seq > since_seq]
 
     def get_timing_now_us(self) -> int:
@@ -1743,8 +1744,8 @@ class AircraftState:
         delta_us = max(0, int((now_mono - self._timing_last_wall_monotonic) * 1_000_000))
         return self._timing_last_arrival_us + delta_us
 
-    def get_recent_timing_window(self, window_us: int) -> tuple[int, list[tuple[int, int, int]]]:
-        """Return recent timing events as (arrival_us, df, msg_len) for one window."""
+    def get_recent_timing_window(self, window_us: int) -> tuple[int, list[tuple[int, int, int, int, int, str]]]:
+        """Return recent timing events as (arrival_us, df, msg_len, signal_raw, source_class, icao)."""
         with self._lock:
             events = tuple(self._timing_events)
             now_mono = time.monotonic()
@@ -1752,8 +1753,8 @@ class AircraftState:
             now_us = self._timing_last_arrival_us + delta_us
         cutoff_us = max(0, now_us - window_us)
         recent = [
-            (arrival_us, df, msg_len)
-            for _seq, arrival_us, df, msg_len in events
+            (arrival_us, df, msg_len, signal_raw, source_class, icao)
+            for _seq, arrival_us, df, msg_len, signal_raw, source_class, icao in events
             if arrival_us >= cutoff_us
         ]
         return now_us, recent
@@ -2303,8 +2304,24 @@ class AircraftState:
         if mlat:
             self._cur_min_mlat_count += 1
 
-    def _record_timing_event(self, timestamp: int, df: int, raw_len: int, stream_name: Optional[str]) -> tuple[int, int] | None:
-        """Record a recent-message event in Beast-relative time for the primary stream.
+    def _classify_timing_source(self, df: int) -> int:
+        """Return a compact source classification for high-frequency timing events."""
+        if df == 17:
+            return int(MsgSource.ADSB)
+        if df == 18:
+            return int(MsgSource.ADSR)
+        if df == 11:
+            return int(MsgSource.MODE_S_CHECKED)
+        if df in _AP_DFS:
+            return int(MsgSource.MODE_S)
+        return int(MsgSource.INVALID)
+
+    def _timing_arrival_ref(
+        self,
+        timestamp: int,
+        stream_name: Optional[str],
+    ) -> tuple[int, int] | None:
+        """Compute a Beast-relative timing reference for the primary stream.
 
         High-frequency timing views rely on the primary Beast stream's native
         12 MHz counter. MLAT marker frames and auxiliary MLAT-side streams are
@@ -2337,11 +2354,33 @@ class AircraftState:
 
         base_ticks = self._timing_base_ticks if self._timing_base_ticks is not None else raw_ticks
         arrival_us = max(0, (unwrapped_ticks - base_ticks) // _BEAST_TICKS_PER_US)
-        self._timing_seq += 1
         self._timing_last_arrival_us = arrival_us
         self._timing_last_wall_monotonic = time.monotonic()
-        self._timing_events.append((self._timing_seq, arrival_us, df, raw_len))
         return self._timing_epoch, arrival_us
+
+    def _record_timing_event(
+        self,
+        timing_ref: tuple[int, int] | None,
+        df: int,
+        raw_len: int,
+        signal: int,
+        icao: str,
+    ) -> tuple[int, int] | None:
+        """Append a self-contained recent-message timing event for the primary stream."""
+        if timing_ref is None:
+            return None
+        timing_epoch, arrival_us = timing_ref
+        self._timing_seq += 1
+        self._timing_events.append((
+            self._timing_seq,
+            arrival_us,
+            df,
+            raw_len,
+            max(0, min(255, int(signal))),
+            self._classify_timing_source(df),
+            icao,
+        ))
+        return timing_epoch, arrival_us
 
     def _decode(self, raw: bytes, signal: int, now: float, timestamp: int,
                 mlat: bool = False, mlat_source: Optional[str] = None,
@@ -2369,7 +2408,7 @@ class AircraftState:
                 return   # bad CRC or unknown DF — discard
 
             df = _nd['df']
-            timing_ref = self._record_timing_event(timestamp, df, raw_len, stream_name)
+            timing_ref = self._timing_arrival_ref(timestamp, stream_name)
             # correctedbits>0 covers both DF-field and CRC-bit corrections.
             # Treat corrected DF17 frames as lower-confidence (crc_clean=False).
             df17_corrected = (df == 17 and _nd['correctedbits'] > 0)
@@ -2409,7 +2448,7 @@ class AircraftState:
             except Exception:
                 return
 
-            self._record_timing_event(timestamp, df, raw_len, stream_name)
+            timing_ref = self._timing_arrival_ref(timestamp, stream_name)
 
             # DF17 type fixup
             df17_corrected = False
@@ -2459,6 +2498,7 @@ class AircraftState:
         if not icao:
             return
         icao = icao.upper()
+        timing_ref = self._record_timing_event(timing_ref, df, raw_len, signal, icao)
 
         # MLAT-timestamp frame overrides source classification
         if mlat:

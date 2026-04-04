@@ -1,5 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { InterrogatorCodes, InterrogatorTimeline, MessageTimingPlot } from './ReceiverPage'
+import {
+  buildAirspaceMicroTimelineRows,
+  getMicroTimelineRankingWindowUs,
+  MICRO_TIMELINE_REFRESH_US,
+  MICRO_TIMELINE_ROW_LIMIT,
+} from '../utils/timingMicroTimeline'
 import styles from './ReceiverPage.module.css'
 
 const TIMING_PAGE_WS_URL = import.meta.env.PROD
@@ -16,10 +22,31 @@ const CADENCE_COLOURS = {
   'ACAS': '#f85149',
   'Other': '#6e7681',
 }
+const SOURCE_ORDER = [6, 5, 4, 3, 0]
+const SOURCE_LABELS = {
+  6: 'ADS-B',
+  5: 'ADS-R/TIS-B',
+  4: 'All-Call',
+  3: 'Mode S',
+  0: 'Other',
+}
+const SOURCE_COLOURS = {
+  6: '#58a6ff',
+  5: '#3fb950',
+  4: '#d29922',
+  3: '#f78166',
+  0: '#6e7681',
+}
 
 const RENDER_HOLDBACK_US = 650_000
 const TIMING_BUFFER_MAX = 60_000
 const TIMING_WINDOW_US = 5_000_000
+const SIGNAL_BUCKET_COUNT = 12
+const SIGNAL_BIN_US = 100_000
+const SOURCE_BIN_US = 100_000
+const MICRO_TIMELINE_LANE_H = 22
+const MICRO_TIMELINE_LABEL_W = 84
+const MICRO_TIMELINE_COUNT_W = 34
 
 function Panel({ title, controls, children }) {
   return (
@@ -111,17 +138,395 @@ function useTimingEventBuffer(timingPacket, windowUs = TIMING_WINDOW_US) {
     const nowUs = Number(timingPacket.now_us ?? 0)
     const cutoffUs = Math.max(0, nowUs - windowUs - 1_000_000)
     const newEvents = (timingPacket.events ?? []).map(ev => {
-      const [seq, arrival_us, df, msg_len] = ev
-      return { seq, arrival_us, df, msg_len }
+      const [seq, arrival_us, df, msg_len, signal_raw, source_class, icao] = ev
+      return { seq, arrival_us, df, msg_len, signal_raw, source_class, icao: `${icao ?? ''}`.toUpperCase() }
     })
-    const merged = [...bufRef.current, ...newEvents]
-      .filter(ev => ev.arrival_us >= cutoffUs)
+    const mergedMap = new Map()
+    for (const ev of bufRef.current) {
+      if (ev.arrival_us >= cutoffUs) mergedMap.set(ev.seq, ev)
+    }
+    for (const ev of newEvents) {
+      if (ev.arrival_us >= cutoffUs) mergedMap.set(ev.seq, ev)
+    }
+    const merged = [...mergedMap.values()].sort((a, b) => a.seq - b.seq)
     if (merged.length > TIMING_BUFFER_MAX) merged.splice(0, merged.length - TIMING_BUFFER_MAX)
     bufRef.current = merged
     setView({ nowUs, events: merged })
   }, [timingPacket, windowUs])
 
   return view
+}
+
+function SignalFloorShimmer({ timingView, timingWindowUs }) {
+  const canvasRef = useRef(null)
+  const rafRef = useRef(null)
+  const nowUsRef = useRef(0)
+  const nowUsWallRef = useRef(performance.now())
+  const timingViewRef = useRef(timingView)
+  timingViewRef.current = timingView
+
+  useEffect(() => {
+    nowUsRef.current = Number(timingView?.nowUs ?? 0)
+    nowUsWallRef.current = performance.now()
+  }, [timingView?.nowUs])
+
+  useEffect(() => {
+    const draw = () => {
+      rafRef.current = requestAnimationFrame(draw)
+      const canvas = canvasRef.current
+      const tv = timingViewRef.current
+      if (!canvas || !(tv?.events?.length)) return
+
+      const w = canvas.offsetWidth || 600
+      const h = 190
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      ctx.fillStyle = '#0b0c10'
+      ctx.fillRect(0, 0, w, h)
+
+      const left = 44
+      const top = 10
+      const plotW = w - left - 8
+      const plotH = h - top - 22
+      const interp = Math.max(0, performance.now() - nowUsWallRef.current) * 1000
+      const renderNowUs = Math.max(0, nowUsRef.current + interp - RENDER_HOLDBACK_US)
+      const cutoffUs = renderNowUs - timingWindowUs
+      const firstBin = Math.floor(cutoffUs / SIGNAL_BIN_US)
+      const lastBin = Math.floor(renderNowUs / SIGNAL_BIN_US)
+      const bucketRows = Array.from({ length: SIGNAL_BUCKET_COUNT }, () => new Map())
+
+      for (const ev of tv.events) {
+        if (ev.arrival_us <= cutoffUs || ev.arrival_us > renderNowUs) continue
+        const bin = Math.floor(ev.arrival_us / SIGNAL_BIN_US)
+        const bucket = Math.max(
+          0,
+          Math.min(SIGNAL_BUCKET_COUNT - 1, Math.floor(((ev.signal_raw ?? 0) / 256) * SIGNAL_BUCKET_COUNT)),
+        )
+        const row = bucketRows[bucket]
+        row.set(bin, (row.get(bin) ?? 0) + 1)
+      }
+
+      let maxCount = 0
+      for (const row of bucketRows) {
+        for (const count of row.values()) maxCount = Math.max(maxCount, count)
+      }
+      maxCount = Math.max(1, maxCount)
+
+      ctx.strokeStyle = '#21262d'
+      ctx.lineWidth = 1
+      for (let i = 0; i <= SIGNAL_BUCKET_COUNT; i++) {
+        const y = top + (plotH * i) / SIGNAL_BUCKET_COUNT
+        ctx.beginPath()
+        ctx.moveTo(left, y)
+        ctx.lineTo(left + plotW, y)
+        ctx.stroke()
+      }
+
+      const cellH = plotH / SIGNAL_BUCKET_COUNT
+      for (let bucket = 0; bucket < SIGNAL_BUCKET_COUNT; bucket++) {
+        const row = bucketRows[bucket]
+        for (let bin = firstBin; bin <= lastBin; bin++) {
+          const count = row.get(bin) ?? 0
+          if (!count) continue
+          const x = left + ((bin * SIGNAL_BIN_US - cutoffUs) / timingWindowUs) * plotW
+          const nextX = left + (((bin + 1) * SIGNAL_BIN_US - cutoffUs) / timingWindowUs) * plotW
+          const xClipped = Math.max(left, x)
+          const wClipped = Math.max(0, Math.min(w, nextX) - xClipped)
+          if (wClipped <= 0) continue
+          const alpha = 0.12 + (count / maxCount) * 0.88
+          const hue = 210 - (bucket / Math.max(1, SIGNAL_BUCKET_COUNT - 1)) * 165
+          const y = top + plotH - (bucket + 1) * cellH
+          ctx.fillStyle = `hsla(${hue}, 90%, 58%, ${alpha})`
+          ctx.fillRect(xClipped, y + 1, wClipped, Math.max(1, cellH - 2))
+        }
+      }
+
+      ctx.fillStyle = '#8b949e'
+      ctx.font = '10px monospace'
+      ctx.textAlign = 'right'
+      ctx.fillText('255', left - 6, top + 8)
+      ctx.fillText('0', left - 6, top + plotH)
+      ctx.textAlign = 'left'
+      ctx.fillText('raw RSSI', left, h - 6)
+      ctx.textAlign = 'right'
+      ctx.fillText(`${Math.round(timingWindowUs / 1_000_000)} s window`, w - 8, h - 6)
+    }
+
+    rafRef.current = requestAnimationFrame(draw)
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }
+  }, [timingWindowUs])
+
+  return (
+    <Panel title="Signal-Floor Shimmer">
+      <p style={{ fontSize: '0.72rem', color: '#484f58', margin: '0 0 0.4rem' }}>
+        Recent per-message signal distribution. Short-term shifts reveal desense, overload, attenuation, and traffic-mix changes that static minute summaries hide.
+      </p>
+      {!timingView?.events?.length
+        ? <p style={{ fontSize: '0.8rem', color: '#484f58' }}>Waiting for signal samples…</p>
+        : <canvas ref={canvasRef} style={{ width: '100%', height: 190, display: 'block', borderRadius: 4 }} />
+      }
+    </Panel>
+  )
+}
+
+function SourceMixPulseMonitor({ timingView, timingWindowUs }) {
+  const canvasRef = useRef(null)
+  const rafRef = useRef(null)
+  const nowUsRef = useRef(0)
+  const nowUsWallRef = useRef(performance.now())
+  const timingViewRef = useRef(timingView)
+  timingViewRef.current = timingView
+
+  useEffect(() => {
+    nowUsRef.current = Number(timingView?.nowUs ?? 0)
+    nowUsWallRef.current = performance.now()
+  }, [timingView?.nowUs])
+
+  useEffect(() => {
+    const draw = () => {
+      rafRef.current = requestAnimationFrame(draw)
+      const canvas = canvasRef.current
+      const tv = timingViewRef.current
+      if (!canvas || !(tv?.events?.length)) return
+
+      const w = canvas.offsetWidth || 600
+      const h = 190
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      ctx.fillStyle = '#0b0c10'
+      ctx.fillRect(0, 0, w, h)
+
+      const left = 34
+      const top = 10
+      const plotW = w - left - 8
+      const plotH = h - top - 34
+      const interp = Math.max(0, performance.now() - nowUsWallRef.current) * 1000
+      const renderNowUs = Math.max(0, nowUsRef.current + interp - RENDER_HOLDBACK_US)
+      const cutoffUs = renderNowUs - timingWindowUs
+      const firstBin = Math.floor(cutoffUs / SOURCE_BIN_US)
+      const lastBin = Math.floor(renderNowUs / SOURCE_BIN_US)
+      const byBin = new Map()
+      let peakTotal = 0
+
+      for (const ev of tv.events) {
+        if (ev.arrival_us <= cutoffUs || ev.arrival_us > renderNowUs) continue
+        const bin = Math.floor(ev.arrival_us / SOURCE_BIN_US)
+        const sourceClass = SOURCE_LABELS[ev.source_class] ? ev.source_class : 0
+        let counts = byBin.get(bin)
+        if (!counts) {
+          counts = new Map()
+          byBin.set(bin, counts)
+        }
+        counts.set(sourceClass, (counts.get(sourceClass) ?? 0) + 1)
+      }
+
+      for (const counts of byBin.values()) {
+        let total = 0
+        for (const count of counts.values()) total += count
+        peakTotal = Math.max(peakTotal, total)
+      }
+      peakTotal = Math.max(1, peakTotal)
+
+      ctx.strokeStyle = '#21262d'
+      ctx.lineWidth = 1
+      for (let i = 0; i <= 4; i++) {
+        const y = top + (plotH * i) / 4
+        ctx.beginPath()
+        ctx.moveTo(left, y)
+        ctx.lineTo(left + plotW, y)
+        ctx.stroke()
+      }
+
+      for (let bin = firstBin; bin <= lastBin; bin++) {
+        const counts = byBin.get(bin)
+        if (!counts) continue
+        const total = SOURCE_ORDER.reduce((sum, sourceClass) => sum + (counts.get(sourceClass) ?? 0), 0)
+        if (!total) continue
+        const x = left + ((bin * SOURCE_BIN_US - cutoffUs) / timingWindowUs) * plotW
+        const nextX = left + (((bin + 1) * SOURCE_BIN_US - cutoffUs) / timingWindowUs) * plotW
+        const xClipped = Math.max(left, x)
+        const wClipped = Math.max(0, Math.min(w, nextX) - xClipped)
+        if (wClipped <= 0) continue
+        let y = top + plotH
+        const totalH = (total / peakTotal) * plotH
+        for (const sourceClass of SOURCE_ORDER) {
+          const count = counts.get(sourceClass) ?? 0
+          if (!count) continue
+          const segH = totalH * (count / total)
+          y -= segH
+          ctx.fillStyle = SOURCE_COLOURS[sourceClass]
+          ctx.fillRect(xClipped, y, wClipped, Math.max(1, segH))
+        }
+      }
+
+      ctx.fillStyle = '#8b949e'
+      ctx.font = '10px monospace'
+      ctx.textAlign = 'right'
+      ctx.fillText(`${peakTotal}`, left - 4, top + 8)
+      ctx.fillText('0', left - 4, top + plotH)
+      ctx.textAlign = 'left'
+      ctx.fillText('100 ms bins', left, h - 6)
+      ctx.textAlign = 'right'
+      ctx.fillText(`${Math.round(timingWindowUs / 1_000_000)} s window`, w - 8, h - 6)
+    }
+
+    rafRef.current = requestAnimationFrame(draw)
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }
+  }, [timingWindowUs])
+
+  return (
+    <Panel title="Source-Mix Pulse Monitor">
+      <p style={{ fontSize: '0.72rem', color: '#484f58', margin: '0 0 0.35rem' }}>
+        Short-timescale source composition from the shared timing stream. This first pass tracks accepted primary-stream traffic classes only; rejected-frame accounting remains deferred.
+      </p>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.65rem', marginBottom: '0.45rem', fontSize: '0.68rem', color: '#6e7681' }}>
+        {SOURCE_ORDER.map(sourceClass => (
+          <span key={sourceClass} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
+            <span style={{ width: 8, height: 8, borderRadius: 999, background: SOURCE_COLOURS[sourceClass], display: 'inline-block' }} />
+            {SOURCE_LABELS[sourceClass]}
+          </span>
+        ))}
+      </div>
+      {!timingView?.events?.length
+        ? <p style={{ fontSize: '0.8rem', color: '#484f58' }}>Waiting for source activity…</p>
+        : <canvas ref={canvasRef} style={{ width: '100%', height: 190, display: 'block', borderRadius: 4 }} />
+      }
+    </Panel>
+  )
+}
+
+function AirspaceMicroTimeline({ timingView, timingWindowUs }) {
+  const canvasRef = useRef(null)
+  const rafRef = useRef(null)
+  const nowUsRef = useRef(0)
+  const nowUsWallRef = useRef(performance.now())
+  const timingViewRef = useRef(timingView)
+  const rankingStateRef = useRef({ rows: [], graceByIcao: {}, lastRefreshUs: 0 })
+  const [canvasH, setCanvasH] = useState(MICRO_TIMELINE_LANE_H * 4 + 22)
+  const canvasHRef = useRef(MICRO_TIMELINE_LANE_H * 4 + 22)
+  timingViewRef.current = timingView
+
+  useEffect(() => {
+    nowUsRef.current = Number(timingView?.nowUs ?? 0)
+    nowUsWallRef.current = performance.now()
+  }, [timingView?.nowUs])
+
+  useEffect(() => {
+    rankingStateRef.current = { rows: [], graceByIcao: {}, lastRefreshUs: 0 }
+  }, [timingWindowUs])
+
+  useEffect(() => {
+    const draw = () => {
+      rafRef.current = requestAnimationFrame(draw)
+      const canvas = canvasRef.current
+      const tv = timingViewRef.current
+      if (!canvas) return
+
+      const w = canvas.offsetWidth || 600
+      const interp = Math.max(0, performance.now() - nowUsWallRef.current) * 1000
+      const renderNowUs = Math.max(0, nowUsRef.current + interp - RENDER_HOLDBACK_US)
+      const { rows, state, meta } = buildAirspaceMicroTimelineRows({
+        events: tv?.events ?? [],
+        renderNowUs,
+        visibleWindowUs: timingWindowUs,
+        previousState: rankingStateRef.current,
+        rankingWindowUs: getMicroTimelineRankingWindowUs(timingWindowUs),
+        rowLimit: MICRO_TIMELINE_ROW_LIMIT,
+        refreshUs: MICRO_TIMELINE_REFRESH_US,
+      })
+      rankingStateRef.current = state
+
+      const rowCount = Math.max(1, rows.length)
+      const h = rowCount * MICRO_TIMELINE_LANE_H + 22
+      if (h !== canvasHRef.current) {
+        canvasHRef.current = h
+        setCanvasH(h)
+      }
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      ctx.fillStyle = '#0b0c10'
+      ctx.fillRect(0, 0, w, h)
+
+      if (!rows.length) return
+
+      const cutoffUs = Math.max(0, renderNowUs - timingWindowUs)
+      const plotX = MICRO_TIMELINE_LABEL_W
+      const plotW = Math.max(60, w - plotX - MICRO_TIMELINE_COUNT_W)
+
+      rows.forEach((row, index) => {
+        const y0 = index * MICRO_TIMELINE_LANE_H
+        const laneMidY = y0 + MICRO_TIMELINE_LANE_H / 2
+        const rowColour = SOURCE_COLOURS[row.dominantSourceClass] ?? SOURCE_COLOURS[0]
+        ctx.fillStyle = index % 2 === 0 ? '#0f1117' : '#0b0c10'
+        ctx.fillRect(0, y0, w, MICRO_TIMELINE_LANE_H)
+        ctx.fillStyle = '#11151b'
+        ctx.fillRect(plotX, y0 + 2, plotW, MICRO_TIMELINE_LANE_H - 4)
+        ctx.fillStyle = rowColour
+        ctx.font = '11px monospace'
+        ctx.textAlign = 'right'
+        ctx.textBaseline = 'middle'
+        ctx.fillText(row.icao, plotX - 8, laneMidY)
+        ctx.fillStyle = '#6e7681'
+        ctx.fillText(`${row.visibleCount}`, w - 6, laneMidY)
+
+        for (const ev of row.events) {
+          const x = plotX + ((ev.arrival_us - cutoffUs) / timingWindowUs) * plotW
+          if (x < plotX || x > plotX + plotW) continue
+          const tickW = ev.msg_len >= 14 ? 2.6 : 1.4
+          const sourceClass = SOURCE_LABELS[ev.source_class] ? ev.source_class : row.dominantSourceClass
+          ctx.fillStyle = SOURCE_COLOURS[sourceClass] ?? rowColour
+          ctx.fillRect(x, y0 + 3, tickW, MICRO_TIMELINE_LANE_H - 6)
+        }
+      })
+
+      ctx.strokeStyle = '#21262d'
+      ctx.lineWidth = 1
+      ctx.beginPath()
+      ctx.moveTo(plotX, h - 20.5)
+      ctx.lineTo(plotX + plotW, h - 20.5)
+      ctx.stroke()
+
+      ctx.fillStyle = '#8b949e'
+      ctx.font = '10px monospace'
+      ctx.textAlign = 'left'
+      ctx.textBaseline = 'alphabetic'
+      ctx.fillText(`${Math.round(timingWindowUs / 1_000_000)} s visible`, plotX, h - 6)
+      ctx.textAlign = 'right'
+      ctx.fillText(
+        `${Math.round(meta.rankingWindowUs / 1_000_000)} s rank / ${MICRO_TIMELINE_ROW_LIMIT} rows / ${Math.round(MICRO_TIMELINE_REFRESH_US / 1_000_000)} s refresh`,
+        w - 6,
+        h - 6,
+      )
+    }
+
+    rafRef.current = requestAnimationFrame(draw)
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }
+  }, [timingWindowUs])
+
+  const hasIdentityEvents = (timingView?.events ?? []).some(ev => ev.icao)
+
+  return (
+    <Panel title="Micro-timeline of Airspace Activity">
+      <p style={{ fontSize: '0.72rem', color: '#484f58', margin: '0 0 0.4rem' }}>
+        Recent per-aircraft activity from the shared timing stream. Rows follow a slower ranking window with sticky membership so dominant talkers surface without thrashing on every burst.
+      </p>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.65rem', marginBottom: '0.45rem', fontSize: '0.68rem', color: '#6e7681' }}>
+        {SOURCE_ORDER.map(sourceClass => (
+          <span key={sourceClass} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
+            <span style={{ width: 8, height: 8, borderRadius: 999, background: SOURCE_COLOURS[sourceClass], display: 'inline-block' }} />
+            {SOURCE_LABELS[sourceClass]}
+          </span>
+        ))}
+      </div>
+      {!hasIdentityEvents
+        ? <p style={{ fontSize: '0.8rem', color: '#484f58' }}>Waiting for aircraft-identified timing events…</p>
+        : <canvas ref={canvasRef} style={{ width: '100%', height: canvasH, display: 'block', borderRadius: 4 }} />
+      }
+    </Panel>
+  )
 }
 
 
@@ -400,6 +805,10 @@ export default function TimingPage({ onSelectIcao }) {
         />
       </div>
       <MessageTimingPlot streamPacket={pageStream?.timing ?? null} />
+      <AirspaceMicroTimeline
+        timingView={timingView}
+        timingWindowUs={timingWindowUs}
+      />
       <div className={styles.row}>
         <BurstRateStripChart
           timingView={timingView}
@@ -412,6 +821,16 @@ export default function TimingPage({ onSelectIcao }) {
           timingView={timingView}
           cadenceBinMs={cadenceBinMs}
           onCadenceBinMsChange={setCadenceBinMs}
+          timingWindowUs={timingWindowUs}
+        />
+      </div>
+      <div className={styles.row}>
+        <SignalFloorShimmer
+          timingView={timingView}
+          timingWindowUs={timingWindowUs}
+        />
+        <SourceMixPulseMonitor
+          timingView={timingView}
           timingWindowUs={timingWindowUs}
         />
       </div>
