@@ -1201,7 +1201,7 @@ const DEFAULT_DF_LANES = Object.keys(DF_SHORT).map(Number).sort((a, b) => a - b)
 const PLOT_WIN_US  = 5_000_000
 const TLANE_H      = 52    // px per DF lane — sized for 12-level stacking at 3px slot height
 const TLABEL_W     = 88    // px label column
-const MAX_BUF      = 15000 // client-side event cap
+const MAX_BUF      = 60_000 // client-side event cap — matches TimingPage buffer
 const TIMING_POLL_FALLBACK_MS = 250
 const STACK_LEVELS = 12
 
