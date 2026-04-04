@@ -1578,8 +1578,9 @@ class AircraftState:
 
         # High-frequency message timing buffer for the timing page/stream.
         # Stores (seq, arrival_us, df, msg_len) for primary-stream Beast messages.
-        # At 3000 msg/s × 5s = 15,000 entries; keep modest headroom beyond that.
-        self._timing_events: deque[tuple[int, int, int, int]] = deque(maxlen=20_000)
+        # At 4000 msg/s (dense European airspace) × 15s = 60,000 entries.
+        # Needs to cover timing_window_s (up to 10 s) + render holdback (0.65 s) + margin.
+        self._timing_events: deque[tuple[int, int, int, int]] = deque(maxlen=60_000)
         self._timing_seq: int = 0
         self._timing_base_ticks: int | None = None
         self._timing_last_raw_ticks: int | None = None

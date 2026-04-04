@@ -1381,8 +1381,8 @@ async def timing_page_websocket_endpoint(ws: WebSocket) -> None:
 
             now = time.time()
             events_raw = state.get_timing_events(since_seq)
-            if len(events_raw) > 5000:
-                events_raw = events_raw[-5000:]
+            if len(events_raw) > 60_000:
+                events_raw = events_raw[-60_000:]
             if events_raw:
                 since_seq = events_raw[-1][0]
 

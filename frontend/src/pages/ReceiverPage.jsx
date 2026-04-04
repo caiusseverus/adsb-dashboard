@@ -819,8 +819,10 @@ function PositionDecodeRate({ days, onDaysChange }) {
 // ---------------------------------------------------------------------------
 // Interrogator codes panel
 // ---------------------------------------------------------------------------
-export function InterrogatorCodes() {
-  const [windowS, setWindowS] = useState(600)
+export function InterrogatorCodes({ streamData = null, windowS: windowSProp = undefined, onWindowSChange = undefined }) {
+  const [windowSLocal, setWindowSLocal] = useState(600)
+  const windowS = windowSProp ?? windowSLocal
+  const handleWindowChange = (v) => { setWindowSLocal(v); onWindowSChange?.(v) }
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
 
@@ -836,31 +838,62 @@ export function InterrogatorCodes() {
   }, [windowS])
 
   useEffect(() => {
+    if (streamData !== null) { setLoading(false); return }
     setData(null)
     fetchData(true)
     const id = setInterval(() => fetchData(false), 1000)
     return () => clearInterval(id)
-  }, [fetchData])
+  }, [fetchData, streamData])
+
+  useEffect(() => {
+    if (!streamData) return
+    const lanes = streamData.lanes ?? []
+    const nowUs = Number(streamData.now_us ?? 0)
+    const wallNow = Date.now() / 1000
+    const codes = lanes
+      .filter(lane => lane.arrivals_us.length > 0)
+      .map(lane => {
+        const lastArrivalUs = lane.arrivals_us[lane.arrivals_us.length - 1]
+        const ageS = nowUs > 0 && lastArrivalUs ? (nowUs - lastArrivalUs) / 1e6 : 0
+        return { iid: lane.iid, count: lane.arrivals_us.length, last_seen: wallNow - ageS, latest_icao: lane.latest_icao }
+      })
+      .sort((a, b) => b.count - a.count)
+    const total = codes.reduce((s, c) => s + c.count, 0)
+    setData({ window_s: streamData.window_s, total, codes })
+    setLoading(false)
+  }, [streamData])
 
   const codes = data?.codes ?? []
-  const tableCodes = useMemo(
+  const sortedCodes = useMemo(
     () => [...codes].sort((a, b) => a.iid - b.iid),
     [codes]
   )
   const total = data?.total ?? 0
-  const maxCount = codes[0]?.count ?? 1
+  const maxCount = Math.max(1, ...codes.map(c => c.count))
   const now = Date.now() / 1000
 
   return (
     <Card
       title="DF11 Interrogator Codes (IID)"
       controls={
-        <select className={styles.select} value={windowS} onChange={e => setWindowS(Number(e.target.value))}>
-          <option value={60}>1 min</option>
-          <option value={300}>5 min</option>
-          <option value={600}>10 min</option>
-          <option value={1800}>30 min</option>
-          <option value={3600}>1 hr</option>
+        <select className={styles.select} value={windowS} onChange={e => handleWindowChange(Number(e.target.value))}>
+          {streamData !== null ? (
+            <>
+              <option value={5}>5 s</option>
+              <option value={10}>10 s</option>
+              <option value={20}>20 s</option>
+              <option value={30}>30 s</option>
+              <option value={60}>60 s</option>
+            </>
+          ) : (
+            <>
+              <option value={60}>1 min</option>
+              <option value={300}>5 min</option>
+              <option value={600}>10 min</option>
+              <option value={1800}>30 min</option>
+              <option value={3600}>1 hr</option>
+            </>
+          )}
         </select>
       }
     >
@@ -873,9 +906,9 @@ export function InterrogatorCodes() {
           <p style={{ fontSize: '0.75rem', color: '#484f58', margin: '0 0 0.6rem' }}>
             {total.toLocaleString()} DF11 replies · {codes.length} IID{codes.length !== 1 ? 's' : ''} active
           </p>
-          <ResponsiveContainer width="100%" height={Math.min(codes.length * 28 + 24, 300)}>
+          <ResponsiveContainer width="100%" height={Math.min(sortedCodes.length * 28 + 24, 300)}>
             <BarChart
-              data={codes.map(c => ({ name: `IID ${c.iid}`, count: c.count }))}
+              data={sortedCodes.map(c => ({ name: `IID ${c.iid}`, count: c.count }))}
               layout="vertical"
               margin={{ top: 4, right: 40, bottom: 4, left: 52 }}
             >
@@ -891,7 +924,7 @@ export function InterrogatorCodes() {
                 formatter={v => [v.toLocaleString(), 'replies']}
               />
               <Bar dataKey="count" fill="#388bfd" radius={2} isAnimationActive={false}>
-                {codes.map(c => (
+                {sortedCodes.map(c => (
                   <Cell key={c.iid} fill={c.iid === 0 ? '#3fb950' : '#388bfd'} />
                 ))}
               </Bar>
@@ -908,7 +941,7 @@ export function InterrogatorCodes() {
                 </tr>
               </thead>
               <tbody>
-                {tableCodes.map(code => (
+                {sortedCodes.map(code => (
                   <tr key={code.iid}>
                     <td>
                       <span
@@ -946,7 +979,7 @@ const TICK_W    = 2    // px tick width
 const TICK_H    = LANE_H - LANE_PAD * 2  // tick height
 const LIVE_RENDER_HOLDBACK_US = 650_000
 
-export function InterrogatorTimeline({ onSelectIcao, streamData = null }) {
+export function InterrogatorTimeline({ onSelectIcao, streamData = null, windowS: windowSProp = undefined, onWindowSChange = undefined }) {
   const canvasRef  = useRef(null)
   const lanesRef   = useRef(Array.from({ length: 128 }, (_, iid) => ({
     iid,
@@ -957,7 +990,9 @@ export function InterrogatorTimeline({ onSelectIcao, streamData = null }) {
   const nowUsRef   = useRef(0)
   const nowUsWallRef = useRef(performance.now())
   const rafRef     = useRef(null)
-  const [windowS, setWindowS] = useState(10)
+  const [windowSLocal, setWindowSLocal] = useState(10)
+  const windowS = windowSProp ?? windowSLocal
+  const handleWindowChange = (v) => { setWindowSLocal(v); onWindowSChange?.(v) }
   const [data,    setData]    = useState(null)
   const retryRef  = useRef(null)
 
@@ -966,7 +1001,7 @@ export function InterrogatorTimeline({ onSelectIcao, streamData = null }) {
     nowUsRef.current = nextNowUs
     nowUsWallRef.current = performance.now()
     const winUs = Number(d?.window_s ?? windowS) * 1_000_000
-    const cutoffUs = nextNowUs - winUs
+    const cutoffUs = nextNowUs - winUs - LIVE_RENDER_HOLDBACK_US - 500_000
     const nextByIid = new Map((d?.lanes ?? []).map(lane => [lane.iid, lane]))
     lanesRef.current = lanesRef.current.map(prev => {
       const incoming = nextByIid.get(prev.iid)
@@ -1093,18 +1128,6 @@ export function InterrogatorTimeline({ onSelectIcao, streamData = null }) {
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }
   }, [data])
 
-  useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas || !data?.lanes) return
-
-    const lanes  = lanesRef.current
-    lanesRef.current = lanes
-    const h      = Math.max(LANE_H * lanes.length, LANE_H)
-    const w      = canvas.offsetWidth || 600
-    canvas.width  = w
-    canvas.height = h
-  }, [data])
-
   if (!data) return null
 
   const activeCount = lanesRef.current.filter(lane => lane.arrivals_us.length > 0).length
@@ -1122,7 +1145,7 @@ export function InterrogatorTimeline({ onSelectIcao, streamData = null }) {
     <Card
       title="Interrogator Timing Lanes"
       controls={
-        <select className={styles.select} value={windowS} onChange={e => setWindowS(Number(e.target.value))}>
+        <select className={styles.select} value={windowS} onChange={e => handleWindowChange(Number(e.target.value))}>
           <option value={5}>5 s</option>
           <option value={10}>10 s</option>
           <option value={20}>20 s</option>
@@ -1176,11 +1199,11 @@ const DF_SHORT = {
 }
 const DEFAULT_DF_LANES = Object.keys(DF_SHORT).map(Number).sort((a, b) => a - b)
 const PLOT_WIN_US  = 5_000_000
-const TLANE_H      = 28    // px per DF lane
+const TLANE_H      = 52    // px per DF lane — sized for 12-level stacking at 3px slot height
 const TLABEL_W     = 88    // px label column
 const MAX_BUF      = 15000 // client-side event cap
 const TIMING_POLL_FALLBACK_MS = 250
-const STACK_LEVELS = 4
+const STACK_LEVELS = 12
 
 export function MessageTimingPlot({ streamPacket = null }) {
   const canvasRef  = useRef(null)
@@ -1205,7 +1228,7 @@ export function MessageTimingPlot({ streamPacket = null }) {
   const ingestTimingPacket = useCallback((d) => {
     nowUsRef.current = Number(d?.now_us ?? nowUsRef.current)
     nowUsWallRef.current = performance.now()
-    const cutoff = nowUsRef.current - PLOT_WIN_US - 500_000
+    const cutoff = nowUsRef.current - PLOT_WIN_US - LIVE_RENDER_HOLDBACK_US - 500_000
     const newEvents = (d?.events ?? []).map(ev => {
       const [seq, arrival_us, df, msg_len] = ev
       return { seq, arrival_us, df, msg_len: msg_len ?? null }
@@ -1310,7 +1333,6 @@ export function MessageTimingPlot({ streamPacket = null }) {
 
       const plotW  = w - TLABEL_W
       const tToX   = arrivalUs => TLABEL_W + ((arrivalUs - cutoff) / PLOT_WIN_US) * plotW
-      const pxPerUs = plotW / PLOT_WIN_US
 
       const laneEvents = {}
       for (const ev of buf) {
@@ -1346,9 +1368,7 @@ export function MessageTimingPlot({ streamPacket = null }) {
         for (const ev of events) {
           if (ev.arrival_us > renderNowUs) continue
           const x = tToX(ev.arrival_us)
-          const msgBits = (ev.msg_len ?? 14) * 8
-          const nominalWidth = Math.max(2, msgBits * pxPerUs * 8)
-          const barW = Math.min(18, nominalWidth)
+          const barW = (ev.msg_len ?? 14) <= 7 ? 1 : 2
           if (x + barW < TLABEL_W || x > w) continue
 
           let level = levelLastEnd.findIndex(endX => x > endX + 1)
