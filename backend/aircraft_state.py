@@ -46,6 +46,77 @@ lock_wait_timings: deque[float] = deque(maxlen=2000)
 decode_timings: deque[float] = deque(maxlen=2000)
 # Per-_push_updates invocation breakdown: {loop_ms, broadcast_ms, total_ms, ac_count}
 push_timings: deque[dict] = deque(maxlen=120)
+_perf_trace_lock = threading.Lock()
+_MSG_TRACE_INTERVAL_S = 0.05
+msg_perf_trace: deque[tuple[float, float, float, float]] = deque(maxlen=1200)
+push_perf_trace: deque[dict] = deque(maxlen=600)
+
+
+def record_msg_perf_sample(ts_s: float, total_ms: float, lock_wait_ms: float, decode_ms: float) -> None:
+    """Keep a low-rate moving waveform for the latency oscilloscope.
+
+    The decoder path is hot, so keep this extremely cheap: coalesce samples into
+    50 ms buckets and retain the max seen in the current bucket.
+    """
+    with _perf_trace_lock:
+        if msg_perf_trace and ts_s - msg_perf_trace[-1][0] < _MSG_TRACE_INTERVAL_S:
+            prev_ts, prev_total_ms, prev_wait_ms, prev_decode_ms = msg_perf_trace[-1]
+            msg_perf_trace[-1] = (
+                ts_s,
+                max(prev_total_ms, total_ms),
+                max(prev_wait_ms, lock_wait_ms),
+                max(prev_decode_ms, decode_ms),
+            )
+            return
+        msg_perf_trace.append((ts_s, total_ms, lock_wait_ms, decode_ms))
+
+
+def record_push_perf_sample(sample: dict) -> None:
+    with _perf_trace_lock:
+        push_perf_trace.append(sample)
+
+
+def get_latency_waveforms(window_s: float = 30.0, bin_ms: int = 250) -> dict:
+    """Return short-window latency traces rebinned for live waveform rendering."""
+    now_s = time.time()
+    cutoff_s = now_s - window_s
+    bin_s = max(0.05, bin_ms / 1000.0)
+    bin_count = max(1, int(math.ceil(window_s / bin_s)))
+    decode_ms = [0.0] * bin_count
+    lock_wait_ms = [0.0] * bin_count
+    snapshot_ms = [0.0] * bin_count
+    serialize_ms = [0.0] * bin_count
+    broadcast_ms = [0.0] * bin_count
+
+    with _perf_trace_lock:
+        msg_samples = tuple(msg_perf_trace)
+        push_samples = tuple(push_perf_trace)
+
+    for ts_s, total_ms, wait_ms, pure_decode_ms in msg_samples:
+        if ts_s < cutoff_s:
+            continue
+        idx = min(bin_count - 1, max(0, int((ts_s - cutoff_s) / bin_s)))
+        decode_ms[idx] = max(decode_ms[idx], pure_decode_ms)
+        lock_wait_ms[idx] = max(lock_wait_ms[idx], wait_ms)
+
+    for sample in push_samples:
+        ts_s = float(sample.get("ts_s", 0.0))
+        if ts_s < cutoff_s:
+            continue
+        idx = min(bin_count - 1, max(0, int((ts_s - cutoff_s) / bin_s)))
+        snapshot_ms[idx] = max(snapshot_ms[idx], float(sample.get("snapshot_ms", 0.0)))
+        serialize_ms[idx] = max(serialize_ms[idx], float(sample.get("serialize_ms", 0.0)))
+        broadcast_ms[idx] = max(broadcast_ms[idx], float(sample.get("broadcast_ms", 0.0)))
+
+    return {
+        "window_s": window_s,
+        "bin_ms": bin_ms,
+        "decode_ms": decode_ms,
+        "lock_wait_ms": lock_wait_ms,
+        "snapshot_ms": snapshot_ms,
+        "serialize_ms": serialize_ms,
+        "broadcast_ms": broadcast_ms,
+    }
 
 # Beast timestamp value used by mlat-client for all synthesized positions.
 # Bytes: FF 00 4D 4C 41 54  ("FF00" + "MLAT" in ASCII).
@@ -58,6 +129,9 @@ _ACAS_CONFIRM_WINDOW_S = 12
 _ACAS_MIN_CONFIRM_FRAMES = 2
 _HEXDB_QUEUE_MAX = 600      # hard ceiling: startup batch + live overflow
 _SIGHTING_LRU_MAX = 10_000  # ~800 KB worst case; evicts oldest on busy long-running sites
+_BEAST_TICKS_PER_US = 12
+_BEAST_TS_MODULUS = 1 << 48
+_BEAST_REBASE_GAP_TICKS = 12_000_000 * 30  # treat >30 s backward jump as stream reset/reconnect
 
 # ---------------------------------------------------------------------------
 # Message source classification (mirrors readsb SOURCE_* in track.h)
@@ -1496,14 +1570,23 @@ class AircraftState:
         self._snapshot_history_minute: int = -1
         self._snapshot_history_cache: tuple | None = None  # (rate_list, df_list, mlat_list)
 
-        # DF11 interrogator identifier events: deque of (ts, iid, icao) tuples.
-        # Unbounded but pruned on read; keeps ~10 min of data at typical rates.
-        self._iid_events: deque[tuple[float, int, str]] = deque(maxlen=50_000)
+        # DF11 interrogator identifier events:
+        # (wall_ts, timing_epoch, arrival_us, iid, icao)
+        # wall_ts is used for long-window counts/last-seen; timing_epoch+arrival_us
+        # are used for the high-frequency timing-lane view.
+        self._iid_events: deque[tuple[float, int, int | None, int, str]] = deque(maxlen=50_000)
 
-        # Message timing buffer for the real-time scroll plot.
-        # Stores (wall_ts, df) for every decoded message.
-        # At 2000 msg/s × 10s = 20,000 entries; each is two small numbers.
-        self._timing_events: deque[tuple[float, int]] = deque(maxlen=20_000)
+        # High-frequency message timing buffer for the timing page/stream.
+        # Stores (seq, arrival_us, df, msg_len) for primary-stream Beast messages.
+        # At 3000 msg/s × 5s = 15,000 entries; keep modest headroom beyond that.
+        self._timing_events: deque[tuple[int, int, int, int]] = deque(maxlen=20_000)
+        self._timing_seq: int = 0
+        self._timing_base_ticks: int | None = None
+        self._timing_last_raw_ticks: int | None = None
+        self._timing_wrap_offset_ticks: int = 0
+        self._timing_last_arrival_us: int = 0
+        self._timing_last_wall_monotonic: float = time.monotonic()
+        self._timing_epoch: int = 0
 
         # readsb ingest tracking — not used in Beast mode
         # Cumulative message total from the last aircraft.json poll (for delta computation).
@@ -1534,6 +1617,8 @@ class AircraftState:
         timestamp: int = msg.get("timestamp", 0)
         now = time.time()
 
+        stream_name = mlat_source
+
         # Timestamp-based MLAT detection: definitive regardless of stream.
         if timestamp == _MLAT_TS_MARKER:
             # Synthesized MLAT frame — keep the supplied source name, or fall back
@@ -1561,11 +1646,17 @@ class AircraftState:
             elif mlat:
                 self._mlat_total += 1
                 self._tick(now, mlat=True)
-            self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
+            self._decode(raw, signal, now, timestamp, mlat=mlat, mlat_source=mlat_source, stream_name=stream_name)
         t_done = time.perf_counter()
         msg_timings.append(t_done - t0)
         lock_wait_timings.append(t_locked - t0)
         decode_timings.append(t_done - t_locked)
+        record_msg_perf_sample(
+            now,
+            (t_done - t0) * 1000,
+            (t_locked - t0) * 1000,
+            (t_done - t_locked) * 1000,
+        )
 
     def process_messages_batch(self, batch: list[tuple[dict, "Optional[str]"]]) -> None:
         """Process a batch of decoded Beast messages under a single lock acquisition.
@@ -1580,22 +1671,23 @@ class AircraftState:
         now = time.time()
 
         # MLAT detection is pure computation — run outside the lock.
-        processed: list[tuple[str, int, bool, "Optional[str]"]] = []
+        processed: list[tuple[str, int, int, bool, "Optional[str]", "Optional[str]"]] = []
         for msg, mlat_source in batch:
             raw: bytes = msg["raw"]
             signal: int = msg.get("signal", 0)
             timestamp: int = msg.get("timestamp", 0)
+            stream_name = mlat_source
             if timestamp == _MLAT_TS_MARKER:
                 if mlat_source is None:
                     mlat_source = "mlat"
             else:
                 mlat_source = None
-            processed.append((raw, signal, mlat_source is not None, mlat_source))
+            processed.append((raw, signal, timestamp, mlat_source is not None, mlat_source, stream_name))
 
         t0 = time.perf_counter()
         with self._lock:
             t_locked = time.perf_counter()
-            for raw, signal, mlat, mlat_source in processed:
+            for raw, signal, timestamp, mlat, mlat_source, stream_name in processed:
                 # In hybrid mode readsb stats owns non-MLAT totals/rates.
                 # MLAT messages are not in readsb JSON so still count those via Beast.
                 if config.INGEST_MODE != "hybrid":
@@ -1606,7 +1698,7 @@ class AircraftState:
                 elif mlat:
                     self._mlat_total += 1
                     self._tick(now, mlat=True)
-                self._decode(raw, signal, now, mlat=mlat, mlat_source=mlat_source)
+                self._decode(raw, signal, now, timestamp, mlat=mlat, mlat_source=mlat_source, stream_name=stream_name)
         t_done = time.perf_counter()
 
         # Record per-message averages so timing deques remain comparable with
@@ -1619,48 +1711,101 @@ class AircraftState:
             msg_timings.append(per_total)
             lock_wait_timings.append(per_wait)
             decode_timings.append(per_decode)
+        record_msg_perf_sample(
+            now,
+            per_total * 1000,
+            per_wait * 1000,
+            per_decode * 1000,
+        )
 
     # ── DF11 interrogator helpers ────────────────────────────────────────────
 
-    def get_timing_events(self, since_ts: float) -> list[tuple[float, int]]:
-        """Return (ts, df) tuples for all messages with ts > since_ts.
+    def get_timing_events(self, since_seq: int) -> list[tuple[int, int, int, int]]:
+        """Return (seq, arrival_us, df, msg_len) tuples with seq > since_seq.
 
-        Lock-free read; safe under CPython GIL for single-writer append + iteration.
-        Caller supplies the timestamp of the last event it received so only new
+        Caller supplies the sequence id of the last event it received so only new
         events are returned, keeping response sizes small (~200 msg / 100 ms poll).
+        Snapshot under the state lock so concurrent decoder-thread appends cannot
+        mutate the deque during iteration.
         """
-        return [(ts, df) for ts, df in self._timing_events if ts > since_ts]
+        with self._lock:
+            events = tuple(self._timing_events)
+        if events and since_seq > events[-1][0]:
+            since_seq = 0
+        return [(seq, arrival_us, df, msg_len)
+                for seq, arrival_us, df, msg_len in events
+                if seq > since_seq]
 
-    def get_iid_timeline(self, window_s: float = 10.0) -> dict[int, dict]:
-        """Return per-IID DF11 data within the last window_s seconds.
+    def get_timing_now_us(self) -> int:
+        """Estimate current Beast-relative time from the last primary-stream frame."""
+        now_mono = time.monotonic()
+        delta_us = max(0, int((now_mono - self._timing_last_wall_monotonic) * 1_000_000))
+        return self._timing_last_arrival_us + delta_us
 
-        Returns a dict of {iid: {timestamps: [float], latest_icao: str}}.
-        Reads the shared _iid_events deque lock-free (CPython GIL makes deque
-        appends + iteration safe for single-writer / single-reader).
+    def get_recent_timing_window(self, window_us: int) -> tuple[int, list[tuple[int, int, int]]]:
+        """Return recent timing events as (arrival_us, df, msg_len) for one window."""
+        with self._lock:
+            events = tuple(self._timing_events)
+            now_mono = time.monotonic()
+            delta_us = max(0, int((now_mono - self._timing_last_wall_monotonic) * 1_000_000))
+            now_us = self._timing_last_arrival_us + delta_us
+        cutoff_us = max(0, now_us - window_us)
+        recent = [
+            (arrival_us, df, msg_len)
+            for _seq, arrival_us, df, msg_len in events
+            if arrival_us >= cutoff_us
+        ]
+        return now_us, recent
+
+    def get_iid_timeline(self, window_s: float = 10.0) -> tuple[int, dict[int, dict]]:
+        """Return per-IID DF11 data within the current Beast-time window.
+
+        Returns (now_us, {iid: {arrivals_us: [int], latest_icao: str}}).
+        Only events from the current Beast timing epoch are included so stream
+        resets do not mix incompatible relative clocks in one lane view.
         """
-        cutoff = time.time() - window_s
+        with self._lock:
+            iid_events = tuple(self._iid_events)
+            current_epoch = self._timing_epoch
+            now_mono = time.monotonic()
+            delta_us = max(0, int((now_mono - self._timing_last_wall_monotonic) * 1_000_000))
+            now_us = self._timing_last_arrival_us + delta_us
+        cutoff_us = max(0, now_us - int(window_s * 1_000_000))
         timeline: dict[int, dict] = {}
-        for ts, iid, icao in self._iid_events:
-            if ts >= cutoff:
-                if iid not in timeline:
-                    timeline[iid] = {"timestamps": [], "latest_icao": icao}
-                timeline[iid]["timestamps"].append(ts)
-                if icao:
-                    timeline[iid]["latest_icao"] = icao
-        return timeline
+        for _wall_ts, epoch, arrival_us, iid, icao in iid_events:
+            if epoch != current_epoch or arrival_us is None or arrival_us < cutoff_us:
+                continue
+            if iid not in timeline:
+                timeline[iid] = {"arrivals_us": [], "latest_icao": icao}
+            timeline[iid]["arrivals_us"].append(arrival_us)
+            if icao:
+                timeline[iid]["latest_icao"] = icao
+        return now_us, timeline
 
-    def get_iid_counts(self, window_s: float = 600.0) -> dict[int, int]:
-        """Return {iid: count} for DF11 messages within the last window_s seconds.
+    def get_iid_activity(self, window_s: float = 600.0) -> dict[int, dict]:
+        """Return per-IID activity within the last window_s seconds.
 
-        Reads the shared _iid_events deque without acquiring the lock (the deque
-        is thread-safe for concurrent appends + iteration in CPython).
+        Shape: {iid: {"count": int, "last_seen": float, "latest_icao": str}}.
+        Snapshot under the state lock so concurrent decoder-thread appends do not
+        mutate the deque during iteration.
         """
         cutoff = time.time() - window_s
-        counts: dict[int, int] = {}
-        for ts, iid, _icao in self._iid_events:
-            if ts >= cutoff:
-                counts[iid] = counts.get(iid, 0) + 1
-        return counts
+        with self._lock:
+            iid_events = tuple(self._iid_events)
+        activity: dict[int, dict] = {}
+        for ts, _epoch, _arrival_us, iid, icao in iid_events:
+            if ts < cutoff:
+                continue
+            entry = activity.get(iid)
+            if entry is None:
+                activity[iid] = {"count": 1, "last_seen": ts, "latest_icao": icao or ""}
+                continue
+            entry["count"] += 1
+            if ts >= entry["last_seen"]:
+                entry["last_seen"] = ts
+                if icao:
+                    entry["latest_icao"] = icao
+        return activity
 
     # ── MLAT diagnostic helpers (used by mlat.py endpoints) ─────────────────
 
@@ -2157,7 +2302,49 @@ class AircraftState:
         if mlat:
             self._cur_min_mlat_count += 1
 
-    def _decode(self, raw: bytes, signal: int, now: float, mlat: bool = False, mlat_source: Optional[str] = None) -> None:
+    def _record_timing_event(self, timestamp: int, df: int, raw_len: int, stream_name: Optional[str]) -> tuple[int, int] | None:
+        """Record a recent-message event in Beast-relative time for the primary stream.
+
+        High-frequency timing views rely on the primary Beast stream's native
+        12 MHz counter. MLAT marker frames and auxiliary MLAT-side streams are
+        excluded because their timestamps are not in the same receiver clock domain.
+        """
+        if stream_name is not None or timestamp == _MLAT_TS_MARKER:
+            return None
+
+        raw_ticks = int(timestamp) & (_BEAST_TS_MODULUS - 1)
+        last_raw = self._timing_last_raw_ticks
+        if last_raw is None:
+            self._timing_base_ticks = raw_ticks
+            self._timing_last_raw_ticks = raw_ticks
+            self._timing_wrap_offset_ticks = 0
+            unwrapped_ticks = raw_ticks
+        else:
+            if raw_ticks < last_raw:
+                backward = last_raw - raw_ticks
+                if backward > (_BEAST_TS_MODULUS // 2):
+                    self._timing_wrap_offset_ticks += _BEAST_TS_MODULUS
+                elif backward > _BEAST_REBASE_GAP_TICKS:
+                    # Stream restart / reconnect: drop old window rather than mixing clocks.
+                    self._timing_events.clear()
+                    self._timing_seq = 0
+                    self._timing_epoch += 1
+                    self._timing_base_ticks = raw_ticks
+                    self._timing_wrap_offset_ticks = 0
+            self._timing_last_raw_ticks = raw_ticks
+            unwrapped_ticks = raw_ticks + self._timing_wrap_offset_ticks
+
+        base_ticks = self._timing_base_ticks if self._timing_base_ticks is not None else raw_ticks
+        arrival_us = max(0, (unwrapped_ticks - base_ticks) // _BEAST_TICKS_PER_US)
+        self._timing_seq += 1
+        self._timing_last_arrival_us = arrival_us
+        self._timing_last_wall_monotonic = time.monotonic()
+        self._timing_events.append((self._timing_seq, arrival_us, df, raw_len))
+        return self._timing_epoch, arrival_us
+
+    def _decode(self, raw: bytes, signal: int, now: float, timestamp: int,
+                mlat: bool = False, mlat_source: Optional[str] = None,
+                stream_name: Optional[str] = None) -> None:
         raw_len = len(raw)
         if raw_len < 7:          # Too short to contain an ICAO address
             return
@@ -2181,8 +2368,7 @@ class AircraftState:
                 return   # bad CRC or unknown DF — discard
 
             df = _nd['df']
-            # Record timing event for the real-time scroll plot (lock-free append)
-            self._timing_events.append((now, df))
+            timing_ref = self._record_timing_event(timestamp, df, raw_len, stream_name)
             # correctedbits>0 covers both DF-field and CRC-bit corrections.
             # Treat corrected DF17 frames as lower-confidence (crc_clean=False).
             df17_corrected = (df == 17 and _nd['correctedbits'] > 0)
@@ -2206,7 +2392,8 @@ class AircraftState:
             elif df == 11:
                 source = MsgSource.MODE_S_CHECKED
                 # Record IID for interrogator tracking (native path only)
-                self._iid_events.append((now, int(_nd.get('iid', 0)), icao or ''))
+                timing_epoch, arrival_us = timing_ref if timing_ref is not None else (self._timing_epoch, None)
+                self._iid_events.append((now, timing_epoch, arrival_us, int(_nd.get('iid', 0)), icao or ''))
             elif df in _AP_DFS:
                 if not icao or icao not in self._confirmed_icaos:
                     return
@@ -2220,6 +2407,8 @@ class AircraftState:
                 df = pms.df(_raw_hex())
             except Exception:
                 return
+
+            self._record_timing_event(timestamp, df, raw_len, stream_name)
 
             # DF17 type fixup
             df17_corrected = False

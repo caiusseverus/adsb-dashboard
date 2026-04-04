@@ -10,6 +10,12 @@ import SignalHeatmap from '../components/SignalHeatmap'
 import styles from './ReceiverPage.module.css'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
+const TIMING_WS_URL = import.meta.env.PROD
+  ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/timing`
+  : 'ws://localhost:8000/ws/timing'
+const INTERROGATOR_WS_URL = import.meta.env.PROD
+  ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/interrogators`
+  : 'ws://localhost:8000/ws/interrogators'
 
 // Beast RSSI byte: 0=strongest (0 dBFS), 255=weakest (-127.5 dBFS)
 // airspy_adsb encodes as raw = -2 * dBFS, so dBFS = -(raw / 2)
@@ -32,6 +38,14 @@ function signalColour(raw) {
   if (pct > 66) return '#3fb950'
   if (pct > 33) return '#d29922'
   return '#f85149'
+}
+
+function formatAgeShort(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '—'
+  if (seconds < 1) return 'just now'
+  if (seconds < 60) return `${Math.round(seconds)}s ago`
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`
+  return `${Math.round(seconds / 3600)}h ago`
 }
 
 function normalizePercentTriplet(adsbRaw, mlatRaw, noPosRaw) {
@@ -805,13 +819,37 @@ function PositionDecodeRate({ days, onDaysChange }) {
 // ---------------------------------------------------------------------------
 // Interrogator codes panel
 // ---------------------------------------------------------------------------
-function InterrogatorCodes() {
+export function InterrogatorCodes() {
   const [windowS, setWindowS] = useState(600)
-  const { data, loading } = useFetch(`${API_BASE}/api/interrogators?window_s=${windowS}`)
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
+
+  const fetchData = useCallback((showLoading = false) => {
+    if (showLoading) setLoading(true)
+    fetch(`${API_BASE}/api/interrogators?window_s=${windowS}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (d) setData(d)
+        setLoading(false)
+      })
+      .catch(() => setLoading(false))
+  }, [windowS])
+
+  useEffect(() => {
+    setData(null)
+    fetchData(true)
+    const id = setInterval(() => fetchData(false), 1000)
+    return () => clearInterval(id)
+  }, [fetchData])
 
   const codes = data?.codes ?? []
+  const tableCodes = useMemo(
+    () => [...codes].sort((a, b) => a.iid - b.iid),
+    [codes]
+  )
   const total = data?.total ?? 0
   const maxCount = codes[0]?.count ?? 1
+  const now = Date.now() / 1000
 
   return (
     <Card
@@ -859,6 +897,35 @@ function InterrogatorCodes() {
               </Bar>
             </BarChart>
           </ResponsiveContainer>
+          <div className={styles.iidTableWrap}>
+            <table className={styles.iidTable}>
+              <thead>
+                <tr>
+                  <th>IID</th>
+                  <th>Replies</th>
+                  <th>Last seen</th>
+                  <th>Aircraft</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tableCodes.map(code => (
+                  <tr key={code.iid}>
+                    <td>
+                      <span
+                        className={styles.iidCode}
+                        style={{ color: code.iid === 0 ? '#3fb950' : '#58a6ff' }}
+                      >
+                        IID {code.iid}
+                      </span>
+                    </td>
+                    <td className={styles.iidNum}>{code.count.toLocaleString()}</td>
+                    <td>{formatAgeShort(now - Number(code.last_seen ?? 0))}</td>
+                    <td className={styles.iidCode}>{code.latest_icao || '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
           <p style={{ fontSize: '0.7rem', color: '#484f58', margin: '0.4rem 0 0' }}>
             IID 0 (green) = no interrogator code / civil ATC · IID 1–127 = specific SSR interrogator
           </p>
@@ -877,86 +944,171 @@ const LANE_PAD  = 4    // top/bottom padding inside each lane
 const LABEL_W   = 52   // px for IID label on the left
 const TICK_W    = 2    // px tick width
 const TICK_H    = LANE_H - LANE_PAD * 2  // tick height
+const LIVE_RENDER_HOLDBACK_US = 650_000
 
-function InterrogatorTimeline({ onSelectIcao }) {
+export function InterrogatorTimeline({ onSelectIcao, streamData = null }) {
   const canvasRef  = useRef(null)
-  const lanesRef   = useRef([])   // latest lanes — used by click handler
+  const lanesRef   = useRef(Array.from({ length: 128 }, (_, iid) => ({
+    iid,
+    latest_icao: '',
+    arrivals_us: [],
+    last_active_us: 0,
+  })))
+  const nowUsRef   = useRef(0)
+  const nowUsWallRef = useRef(performance.now())
+  const rafRef     = useRef(null)
   const [windowS, setWindowS] = useState(10)
   const [data,    setData]    = useState(null)
+  const retryRef  = useRef(null)
 
-  // Poll every second
-  const fetchData = useCallback(() => {
-    fetch(`${API_BASE}/api/interrogators/timeline?window_s=${windowS}`)
-      .then(r => r.ok ? r.json() : null)
-      .then(d => { if (d) setData(d) })
-      .catch(() => {})
+  const ingestInterrogatorPacket = useCallback((d) => {
+    const nextNowUs = Number(d?.now_us ?? nowUsRef.current)
+    nowUsRef.current = nextNowUs
+    nowUsWallRef.current = performance.now()
+    const winUs = Number(d?.window_s ?? windowS) * 1_000_000
+    const cutoffUs = nextNowUs - winUs
+    const nextByIid = new Map((d?.lanes ?? []).map(lane => [lane.iid, lane]))
+    lanesRef.current = lanesRef.current.map(prev => {
+      const incoming = nextByIid.get(prev.iid)
+      if (!incoming) {
+        const arrivals = prev.arrivals_us.filter(arrivalUs => arrivalUs >= cutoffUs)
+        return {
+          ...prev,
+          arrivals_us: arrivals,
+          latest_icao: arrivals.length ? prev.latest_icao : '',
+        }
+      }
+      const mergedArrivals = [...prev.arrivals_us, ...(incoming.arrivals_us ?? [])]
+      const dedupedArrivals = [...new Set(mergedArrivals)]
+        .filter(arrivalUs => arrivalUs >= cutoffUs)
+        .sort((a, b) => a - b)
+      return {
+        iid: prev.iid,
+        latest_icao: incoming.latest_icao || prev.latest_icao || '',
+        arrivals_us: dedupedArrivals,
+        last_active_us: dedupedArrivals.length ? dedupedArrivals[dedupedArrivals.length - 1] : prev.last_active_us,
+      }
+    })
+    setData(d)
   }, [windowS])
 
   useEffect(() => {
-    fetchData()
-    const id = setInterval(fetchData, 1000)
-    return () => clearInterval(id)
-  }, [fetchData])
+    if (streamData) return
+    let ws
+    let closed = false
+
+    const connect = () => {
+      if (closed) return
+      ws = new WebSocket(INTERROGATOR_WS_URL)
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ window_s: windowS }))
+      }
+
+      ws.onmessage = (event) => {
+        try {
+          ingestInterrogatorPacket(JSON.parse(event.data))
+        } catch {
+          // ignore malformed frames
+        }
+      }
+
+      ws.onclose = () => {
+        if (closed) return
+        retryRef.current = setTimeout(connect, 1000)
+      }
+
+      ws.onerror = () => ws.close()
+    }
+
+    connect()
+    return () => {
+      closed = true
+      clearTimeout(retryRef.current)
+      ws?.close()
+    }
+  }, [ingestInterrogatorPacket, streamData, windowS])
+
+  useEffect(() => {
+    if (!streamData) return
+    ingestInterrogatorPacket(streamData)
+  }, [ingestInterrogatorPacket, streamData])
 
   // Draw canvas
+  useEffect(() => {
+    const draw = () => {
+      rafRef.current = requestAnimationFrame(draw)
+      const canvas = canvasRef.current
+      if (!canvas || !data?.lanes) return
+
+      const lanes  = lanesRef.current
+      const nowUs  = nowUsRef.current + Math.max(0, performance.now() - nowUsWallRef.current) * 1000
+      const renderNowUs = Math.max(0, nowUs - LIVE_RENDER_HOLDBACK_US)
+      const winUs  = data.window_s * 1_000_000
+      const h      = Math.max(LANE_H * lanes.length, LANE_H)
+      const w      = canvas.offsetWidth || 600
+      canvas.width  = w
+      canvas.height = h
+
+      const ctx = canvas.getContext('2d')
+      ctx.clearRect(0, 0, w, h)
+      ctx.fillStyle = '#0b0c10'
+      ctx.fillRect(0, 0, w, h)
+
+      const plotW = w - LABEL_W
+      const tToX = arrivalUs => LABEL_W + ((arrivalUs - (renderNowUs - winUs)) / winUs) * plotW
+
+      lanes.forEach((lane, row) => {
+        const y0 = row * LANE_H
+        const yC = y0 + LANE_H / 2
+
+        ctx.fillStyle = row % 2 === 0 ? '#0f1117' : '#0b0c10'
+        ctx.fillRect(0, y0, w, LANE_H)
+
+        const active = lane.arrivals_us.length > 0
+        ctx.fillStyle = !active ? '#484f58' : lane.iid === 0 ? '#3fb950' : '#388bfd'
+        ctx.font = '10px monospace'
+        ctx.textAlign = 'right'
+        ctx.textBaseline = 'middle'
+        ctx.fillText(`IID ${lane.iid}`, LABEL_W - 4, yC)
+
+        ctx.fillStyle = lane.iid === 0 ? 'rgba(63,185,80,0.75)' : 'rgba(56,139,253,0.75)'
+        for (const arrivalUs of lane.arrivals_us) {
+          if (arrivalUs > renderNowUs) continue
+          const x = tToX(arrivalUs)
+          if (x < LABEL_W || x > w) continue
+          ctx.fillRect(x - TICK_W / 2, yC - TICK_H / 2, TICK_W, TICK_H)
+        }
+      })
+
+      ctx.strokeStyle = '#21262d'
+      ctx.lineWidth = 1
+      ctx.beginPath()
+      ctx.moveTo(LABEL_W, h - 0.5)
+      ctx.lineTo(w, h - 0.5)
+      ctx.stroke()
+    }
+
+    rafRef.current = requestAnimationFrame(draw)
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }
+  }, [data])
+
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas || !data?.lanes) return
 
-    const lanes  = data.lanes.slice(0, 12)  // cap at 12 rows
+    const lanes  = lanesRef.current
     lanesRef.current = lanes
-    const now    = data.now
-    const winS   = data.window_s
     const h      = Math.max(LANE_H * lanes.length, LANE_H)
     const w      = canvas.offsetWidth || 600
     canvas.width  = w
     canvas.height = h
-
-    const ctx = canvas.getContext('2d')
-    ctx.clearRect(0, 0, w, h)
-    ctx.fillStyle = '#0b0c10'
-    ctx.fillRect(0, 0, w, h)
-
-    const plotW = w - LABEL_W
-    const tToX = t => LABEL_W + ((t - (now - winS)) / winS) * plotW
-
-    lanes.forEach((lane, row) => {
-      const y0 = row * LANE_H
-      const yC = y0 + LANE_H / 2
-
-      // Row background (alternate)
-      ctx.fillStyle = row % 2 === 0 ? '#0f1117' : '#0b0c10'
-      ctx.fillRect(0, y0, w, LANE_H)
-
-      // Label
-      ctx.fillStyle = lane.iid === 0 ? '#3fb950' : '#388bfd'
-      ctx.font = '10px monospace'
-      ctx.textAlign = 'right'
-      ctx.textBaseline = 'middle'
-      ctx.fillText(`IID ${lane.iid}`, LABEL_W - 4, yC)
-
-      // Ticks
-      ctx.fillStyle = lane.iid === 0 ? 'rgba(63,185,80,0.75)' : 'rgba(56,139,253,0.75)'
-      for (const ts of lane.timestamps) {
-        const x = tToX(ts)
-        if (x < LABEL_W || x > w) continue
-        ctx.fillRect(x - TICK_W / 2, yC - TICK_H / 2, TICK_W, TICK_H)
-      }
-    })
-
-    // Time axis line at bottom
-    ctx.strokeStyle = '#21262d'
-    ctx.lineWidth = 1
-    ctx.beginPath()
-    ctx.moveTo(LABEL_W, h - 0.5)
-    ctx.lineTo(w, h - 0.5)
-    ctx.stroke()
   }, [data])
 
   if (!data) return null
 
-  const lanes = data.lanes ?? []
-  if (lanes.length === 0) return (
+  const activeCount = lanesRef.current.filter(lane => lane.arrivals_us.length > 0).length
+  if (activeCount === 0) return (
     <Card title="Interrogator Timing Lanes">
       <p style={{ fontSize: '0.8rem', color: '#484f58', padding: '0.5rem 0' }}>
         No DF11 messages received yet
@@ -964,7 +1116,7 @@ function InterrogatorTimeline({ onSelectIcao }) {
     </Card>
   )
 
-  const canvasH = Math.min(LANE_H * Math.min(lanes.length, 12), LANE_H * 12)
+  const canvasH = Math.max(LANE_H * lanesRef.current.length, LANE_H)
 
   return (
     <Card
@@ -1022,20 +1174,26 @@ const DF_SHORT = {
    4:'DF4 Alt',     5:'DF5 ID',     20:'DF20 Comm-B',
   21:'DF21 Comm-B', 0:'DF0 ACAS',  16:'DF16 ACAS', 24:'DF24 Comm-D',
 }
-const PLOT_WIN_S   = 5     // seconds of history shown
-const TLANE_H      = 20    // px per DF lane
+const DEFAULT_DF_LANES = Object.keys(DF_SHORT).map(Number).sort((a, b) => a - b)
+const PLOT_WIN_US  = 5_000_000
+const TLANE_H      = 28    // px per DF lane
 const TLABEL_W     = 88    // px label column
-const TTICK_W      = 2     // tick bar width
-const POLL_MS      = 200   // fetch interval
 const MAX_BUF      = 15000 // client-side event cap
+const TIMING_POLL_FALLBACK_MS = 250
+const STACK_LEVELS = 4
 
-function MessageTimingPlot() {
+export function MessageTimingPlot({ streamPacket = null }) {
   const canvasRef  = useRef(null)
-  const bufRef     = useRef([])     // [{ts, df}] rolling buffer
-  const sinceRef   = useRef(0)      // last ts received
+  const bufRef     = useRef([])     // [{seq, arrival_us, df, msg_len}] rolling buffer
   const rafRef     = useRef(null)
   const activeRef  = useRef(true)   // Page Visibility guard
-  const [laneOrder, setLaneOrder] = useState([])  // ordered DF types (by count)
+  const retryRef   = useRef(null)
+  const pollRef    = useRef(null)
+  const lastEventWallRef = useRef(0)
+  const sinceSeqRef = useRef(0)
+  const nowUsRef   = useRef(0)
+  const nowUsWallRef = useRef(performance.now())
+  const [laneOrder, setLaneOrder] = useState(DEFAULT_DF_LANES)
 
   // Polling — only when tab is visible
   useEffect(() => {
@@ -1044,40 +1202,90 @@ function MessageTimingPlot() {
     return () => document.removeEventListener('visibilitychange', onVisibility)
   }, [])
 
-  useEffect(() => {
-    let timerId
-    const poll = () => {
-      if (!activeRef.current) { timerId = setTimeout(poll, POLL_MS); return }
-      fetch(`${API_BASE}/api/timing/events?since_ts=${sinceRef.current}`)
-        .then(r => r.ok ? r.json() : null)
-        .then(d => {
-          if (!d?.events?.length) return
-          const now = d.now
-          const cutoff = now - PLOT_WIN_S - 0.5  // small grace window
-          const newEvents = d.events.map(([ts, df]) => ({ ts, df }))
-          if (newEvents.length) {
-            sinceRef.current = newEvents[newEvents.length - 1].ts
-          }
-          // Append new events, drop old
-          const merged = [...bufRef.current, ...newEvents]
-            .filter(e => e.ts > cutoff)
-          if (merged.length > MAX_BUF) merged.splice(0, merged.length - MAX_BUF)
-          bufRef.current = merged
-
-          // Recompute lane order by count
-          const counts = {}
-          for (const e of merged) counts[e.df] = (counts[e.df] ?? 0) + 1
-          const ordered = Object.keys(counts)
-            .map(Number)
-            .sort((a, b) => counts[b] - counts[a])
-          setLaneOrder(ordered)
-        })
-        .catch(() => {})
-        .finally(() => { timerId = setTimeout(poll, POLL_MS) })
+  const ingestTimingPacket = useCallback((d) => {
+    nowUsRef.current = Number(d?.now_us ?? nowUsRef.current)
+    nowUsWallRef.current = performance.now()
+    const cutoff = nowUsRef.current - PLOT_WIN_US - 500_000
+    const newEvents = (d?.events ?? []).map(ev => {
+      const [seq, arrival_us, df, msg_len] = ev
+      return { seq, arrival_us, df, msg_len: msg_len ?? null }
+    })
+    if (newEvents.length) {
+      sinceSeqRef.current = Math.max(sinceSeqRef.current, newEvents[newEvents.length - 1].seq)
+      lastEventWallRef.current = performance.now()
     }
-    poll()
-    return () => clearTimeout(timerId)
+    const mergedMap = new Map()
+    for (const ev of bufRef.current) {
+      if (ev.arrival_us > cutoff) mergedMap.set(ev.seq, ev)
+    }
+    for (const ev of newEvents) {
+      if (ev.arrival_us > cutoff) mergedMap.set(ev.seq, ev)
+    }
+    const merged = [...mergedMap.values()].sort((a, b) => a.seq - b.seq)
+    if (merged.length > MAX_BUF) merged.splice(0, merged.length - MAX_BUF)
+    bufRef.current = merged
+
+    const observed = new Set(DEFAULT_DF_LANES)
+    for (const e of merged) observed.add(e.df)
+    setLaneOrder([...observed].sort((a, b) => a - b))
   }, [])
+
+  useEffect(() => {
+    if (streamPacket) return
+    let ws
+    let closed = false
+
+    const pollOnce = () => {
+      if (closed || !activeRef.current) return
+      fetch(`${API_BASE}/api/timing/events?since_seq=${sinceSeqRef.current}`)
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (d) ingestTimingPacket(d) })
+        .catch(() => {})
+    }
+
+    pollOnce()
+    pollRef.current = setInterval(() => {
+      if (closed) return
+      if (performance.now() - lastEventWallRef.current > 1500) {
+        pollOnce()
+      }
+    }, TIMING_POLL_FALLBACK_MS)
+
+    const connect = () => {
+      if (closed) return
+      ws = new WebSocket(TIMING_WS_URL)
+
+      ws.onmessage = (event) => {
+        let d = null
+        try {
+          d = JSON.parse(event.data)
+        } catch {
+          return
+        }
+        ingestTimingPacket(d)
+      }
+
+      ws.onclose = () => {
+        if (closed) return
+        retryRef.current = setTimeout(connect, 1000)
+      }
+
+      ws.onerror = () => ws.close()
+    }
+
+    connect()
+    return () => {
+      closed = true
+      clearTimeout(retryRef.current)
+      clearInterval(pollRef.current)
+      ws?.close()
+    }
+  }, [ingestTimingPacket, streamPacket])
+
+  useEffect(() => {
+    if (!streamPacket) return
+    ingestTimingPacket(streamPacket)
+  }, [ingestTimingPacket, streamPacket])
 
   // rAF-driven canvas draw
   useEffect(() => {
@@ -1086,8 +1294,9 @@ function MessageTimingPlot() {
       const canvas = canvasRef.current
       if (!canvas || !activeRef.current || laneOrder.length === 0) return
 
-      const now    = Date.now() / 1000
-      const cutoff = now - PLOT_WIN_S
+      const nowUs  = nowUsRef.current + Math.max(0, performance.now() - nowUsWallRef.current) * 1000
+      const renderNowUs = Math.max(0, nowUs - LIVE_RENDER_HOLDBACK_US)
+      const cutoff = renderNowUs - PLOT_WIN_US
       const buf    = bufRef.current
       const w = canvas.offsetWidth
       const h = TLANE_H * laneOrder.length
@@ -1100,7 +1309,14 @@ function MessageTimingPlot() {
       ctx.fillRect(0, 0, w, h)
 
       const plotW  = w - TLABEL_W
-      const tToX   = ts => TLABEL_W + ((ts - cutoff) / PLOT_WIN_S) * plotW
+      const tToX   = arrivalUs => TLABEL_W + ((arrivalUs - cutoff) / PLOT_WIN_US) * plotW
+      const pxPerUs = plotW / PLOT_WIN_US
+
+      const laneEvents = {}
+      for (const ev of buf) {
+        if (!laneEvents[ev.df]) laneEvents[ev.df] = []
+        laneEvents[ev.df].push(ev)
+      }
 
       laneOrder.forEach((df, row) => {
         const colour = DF_COLOURS[df] ?? '#484f58'
@@ -1117,23 +1333,45 @@ function MessageTimingPlot() {
         ctx.textBaseline = 'middle'
         ctx.fillText(DF_SHORT[df] ?? `DF${df}`, TLABEL_W - 4, y0 + TLANE_H / 2)
 
-        // Tick marks
-        const tickY = y0 + 3
-        const tickH = TLANE_H - 6
-        ctx.fillStyle = colour
-        for (const ev of buf) {
-          if (ev.df !== df) continue
-          const x = tToX(ev.ts)
-          if (x < TLABEL_W || x > w) continue
-          ctx.fillRect(x - TTICK_W / 2, tickY, TTICK_W, tickH)
+        // Message bars with width derived from message length and simple overlap stacking.
+        const events = laneEvents[df] ?? []
+        const levelLastEnd = new Array(STACK_LEVELS).fill(-Infinity)
+        const slotGap = 1
+        const innerTop = y0 + 2
+        const innerHeight = TLANE_H - 4
+        const slotHeight = Math.max(2, Math.floor((innerHeight - (STACK_LEVELS - 1) * slotGap) / STACK_LEVELS))
+        const overflowY = innerTop + (STACK_LEVELS - 1) * (slotHeight + slotGap)
+        const overflowH = Math.max(2, slotHeight - 1)
+
+        for (const ev of events) {
+          if (ev.arrival_us > renderNowUs) continue
+          const x = tToX(ev.arrival_us)
+          const msgBits = (ev.msg_len ?? 14) * 8
+          const nominalWidth = Math.max(2, msgBits * pxPerUs * 8)
+          const barW = Math.min(18, nominalWidth)
+          if (x + barW < TLABEL_W || x > w) continue
+
+          let level = levelLastEnd.findIndex(endX => x > endX + 1)
+          if (level === -1) level = STACK_LEVELS - 1
+          levelLastEnd[level] = x + barW
+
+          const barY = level < STACK_LEVELS - 1
+            ? innerTop + level * (slotHeight + slotGap)
+            : overflowY
+          const barH = level < STACK_LEVELS - 1 ? slotHeight : overflowH
+
+          ctx.fillStyle = level < STACK_LEVELS - 1 ? colour : 'rgba(248,81,73,0.9)'
+          ctx.fillRect(x, barY, barW, barH)
         }
       })
 
       // Time ruler ticks every 1s
       ctx.strokeStyle = '#21262d'
       ctx.lineWidth = 1
-      for (let t = Math.ceil(cutoff); t <= now; t++) {
-        const x = tToX(t)
+      const startSec = Math.ceil(cutoff / 1_000_000)
+      const endSec = Math.floor(renderNowUs / 1_000_000)
+      for (let sec = startSec; sec <= endSec; sec++) {
+        const x = tToX(sec * 1_000_000)
         ctx.beginPath()
         ctx.moveTo(x, 0)
         ctx.lineTo(x, h)
@@ -1149,7 +1387,7 @@ function MessageTimingPlot() {
   return (
     <Card title="Message Timing Scroll Plot">
       <p style={{ fontSize: '0.72rem', color: '#484f58', margin: '0 0 0.4rem' }}>
-        Live scroll — last {PLOT_WIN_S} s · one lane per DF type · ticks = individual messages
+        Live scroll — last 5 s in Beast-relative time · one lane per DF type · ticks = individual messages
       </p>
       {laneOrder.length === 0
         ? <p style={{ fontSize: '0.8rem', color: '#484f58' }}>Waiting for messages…</p>
@@ -1199,11 +1437,6 @@ export default function ReceiverPage({ snapshot, onSelectIcao }) {
       </div>
       <DFHeatmap />
       <SignalHeatmap />
-      <div className={styles.row}>
-        <InterrogatorCodes />
-        <InterrogatorTimeline onSelectIcao={onSelectIcao} />
-      </div>
-      <MessageTimingPlot />
     </main>
   )
 }

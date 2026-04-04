@@ -7,8 +7,6 @@ GET /api/interrogators?window_s=600
   syndrome for DF11, indicating which SSR interrogator triggered the reply).
 """
 
-import time
-
 from fastapi import APIRouter, Query
 
 router = APIRouter(prefix="/api/interrogators")
@@ -21,13 +19,18 @@ async def get_interrogators(window_s: float = Query(600, ge=60, le=3600)) -> dic
     Returns:
         window_s: the requested window
         total: total DF11 messages in the window
-        codes: list of {iid, count} sorted by count descending
+        codes: list of {iid, count, last_seen, latest_icao} sorted by count descending
     """
-    counts = router._state.get_iid_counts(window_s)
-    total = sum(counts.values())
+    activity = router._state.get_iid_activity(window_s)
+    total = sum(entry["count"] for entry in activity.values())
     codes = sorted(
-        [{"iid": iid, "count": cnt} for iid, cnt in counts.items()],
-        key=lambda x: x["count"],
+        [{
+            "iid": iid,
+            "count": entry["count"],
+            "last_seen": round(entry["last_seen"], 3),
+            "latest_icao": entry.get("latest_icao", ""),
+        } for iid, entry in activity.items()],
+        key=lambda x: (x["count"], x["last_seen"]),
         reverse=True,
     )
     return {"window_s": window_s, "total": total, "codes": codes}
@@ -35,20 +38,18 @@ async def get_interrogators(window_s: float = Query(600, ge=60, le=3600)) -> dic
 
 @router.get("/timeline")
 async def get_timeline(window_s: float = Query(10, ge=2, le=60)) -> dict:
-    """Return per-IID DF11 message timestamps for the last window_s seconds.
+    """Return per-IID DF11 message timing for the last window_s seconds.
 
     Used to render timing-lane visualisations showing SSR interrogator rotation
     periods.  Returns:
-        now:     current server time (Unix seconds, float)
+        now_us:  current Beast-relative time estimate
         window_s: the requested window
-        lanes:   list of {iid, timestamps: [float]} sorted by count descending
+        lanes:   list of {iid, arrivals_us: [int]} sorted by IID ascending
     """
-    now = time.time()
-    timeline = router._state.get_iid_timeline(window_s)
+    now_us, timeline = router._state.get_iid_timeline(window_s)
     lanes = sorted(
-        [{"iid": iid, "timestamps": entry["timestamps"], "latest_icao": entry.get("latest_icao", "")}
+        [{"iid": iid, "arrivals_us": entry["arrivals_us"], "latest_icao": entry.get("latest_icao", "")}
          for iid, entry in timeline.items()],
-        key=lambda x: len(x["timestamps"]),
-        reverse=True,
+        key=lambda x: x["iid"],
     )
-    return {"now": now, "window_s": window_s, "lanes": lanes}
+    return {"now_us": now_us, "window_s": window_s, "lanes": lanes}

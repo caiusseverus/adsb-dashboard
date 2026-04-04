@@ -23,7 +23,12 @@ from fastapi.staticfiles import StaticFiles
 import config
 import enrichment
 from beast_client import BeastClient
-from aircraft_state import AircraftState, push_timings as _push_timings_store
+from aircraft_state import (
+    AircraftState,
+    get_latency_waveforms as _get_latency_waveforms,
+    push_timings as _push_timings_store,
+    record_push_perf_sample as _record_push_perf_sample,
+)
 import readsb_ingest
 import readsb_stats
 from collections import deque as _deque
@@ -797,7 +802,8 @@ async def _broadcast_loop() -> None:
                     ws_frames_dropped += 1
 
             t_done = time.perf_counter()
-            _push_timings_store.append({
+            push_sample = {
+                "ts_s":              now,
                 "sync_ms":           round((t_sync_end - t_loop_start) * 1000, 2),
                 "snapshot_ms":       round(snapshot_ms, 2),
                 "gather_ms":         0.0,
@@ -810,7 +816,9 @@ async def _broadcast_loop() -> None:
                 "ws_client_count":   len(_clients),
                 "ws_clients_dropped": ws_frames_dropped,
                 "ws_send_max_ms":    0.0,
-            })
+            }
+            _push_timings_store.append(push_sample)
+            _record_push_perf_sample(push_sample)
         except Exception:
             log.exception("_broadcast_loop: unhandled error in broadcast cycle — continuing")
 
@@ -1145,6 +1153,266 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         except (asyncio.CancelledError, Exception):
             pass
         log.info("WebSocket client disconnected (total: %d)", len(_clients))
+
+
+_HF_DF_FAMILIES = {
+    "ADS-B": frozenset({17}),
+    "TIS-B": frozenset({18}),
+    "All-Call": frozenset({11}),
+    "Comm-B": frozenset({20, 21}),
+    "Surveillance": frozenset({4, 5}),
+    "ACAS": frozenset({0, 16}),
+}
+
+
+def _bucket_counts(now_us: int, window_us: int, bin_ms: int, events: list[tuple[int, int, int]]) -> list[int]:
+    bin_us = max(1_000, int(bin_ms * 1000))
+    bucket_count = max(1, (window_us + bin_us - 1) // bin_us)
+    counts = [0] * bucket_count
+    cutoff_us = max(0, now_us - window_us)
+    for arrival_us, _df, _msg_len in events:
+        idx = (arrival_us - cutoff_us) // bin_us
+        if 0 <= idx < bucket_count:
+            counts[idx] += 1
+    return counts
+
+
+def _build_df_family_bins(now_us: int, window_us: int, bin_ms: int, events: list[tuple[int, int, int]]) -> dict[str, list[int]]:
+    bin_us = max(1_000, int(bin_ms * 1000))
+    bucket_count = max(1, (window_us + bin_us - 1) // bin_us)
+    cutoff_us = max(0, now_us - window_us)
+    lanes = {name: [0] * bucket_count for name in _HF_DF_FAMILIES}
+    other = [0] * bucket_count
+    for arrival_us, df, _msg_len in events:
+        idx = (arrival_us - cutoff_us) // bin_us
+        if idx < 0 or idx >= bucket_count:
+            continue
+        family_name = next((name for name, dfs in _HF_DF_FAMILIES.items() if df in dfs), None)
+        if family_name is None:
+            other[idx] += 1
+        else:
+            lanes[family_name][idx] += 1
+    if any(other):
+        lanes["Other"] = other
+    return lanes
+
+
+def _build_highfreq_payload(window_s: float, burst_bin_ms: int, cadence_bin_ms: int, latency_window_s: float) -> dict:
+    window_us = max(1_000_000, int(window_s * 1_000_000))
+    now_us, events = state.get_recent_timing_window(window_us)
+    return {
+        "now_us": now_us,
+        "window_s": window_s,
+        "burst": {
+            "bin_ms": burst_bin_ms,
+            "counts": _bucket_counts(now_us, window_us, burst_bin_ms, events),
+        },
+        "cadence": {
+            "bin_ms": cadence_bin_ms,
+            "families": _build_df_family_bins(now_us, window_us, cadence_bin_ms, events),
+        },
+        "latency": _get_latency_waveforms(window_s=latency_window_s, bin_ms=250),
+    }
+
+
+def _build_interrogator_payload(window_s: float) -> dict:
+    now_us, timeline = state.get_iid_timeline(window_s)
+    lanes = sorted(
+        [{"iid": iid, "arrivals_us": entry["arrivals_us"], "latest_icao": entry.get("latest_icao", "")}
+         for iid, entry in timeline.items()],
+        key=lambda x: x["iid"],
+    )
+    return {"now_us": now_us, "window_s": window_s, "lanes": lanes}
+
+
+@app.websocket("/ws/timing")
+async def timing_websocket_endpoint(ws: WebSocket) -> None:
+    """Dedicated timing-event stream for the receiver timing plot."""
+    await ws.accept()
+    since_seq = 0
+    last_heartbeat = 0.0
+    try:
+        while True:
+            now = time.time()
+            events_raw = state.get_timing_events(since_seq)
+            if events_raw:
+                if len(events_raw) > 5000:
+                    events_raw = events_raw[-5000:]
+                since_seq = events_raw[-1][0]
+                await ws.send_text(_json_dumps({
+                    "now_us": state.get_timing_now_us(),
+                    "events": [[seq, arrival_us, df, msg_len] for seq, arrival_us, df, msg_len in events_raw],
+                }))
+                last_heartbeat = now
+            elif now - last_heartbeat >= 1.0:
+                await ws.send_text(_json_dumps({"now_us": state.get_timing_now_us(), "events": []}))
+                last_heartbeat = now
+            await asyncio.sleep(0.1)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        log.debug("Timing WebSocket error: %s", exc)
+
+
+@app.websocket("/ws/highfreq")
+async def highfreq_websocket_endpoint(ws: WebSocket) -> None:
+    """Shared aggregate feed for high-frequency Timing-page panels."""
+    await ws.accept()
+    window_s = 5.0
+    burst_bin_ms = 20
+    cadence_bin_ms = 50
+    latency_window_s = 30.0
+    last_payload = None
+    last_heartbeat = 0.0
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=0.2)
+                try:
+                    payload = json.loads(msg)
+                    req_window_s = float(payload.get("window_s", window_s))
+                    req_burst_bin_ms = int(payload.get("burst_bin_ms", burst_bin_ms))
+                    req_cadence_bin_ms = int(payload.get("cadence_bin_ms", cadence_bin_ms))
+                    req_latency_window_s = float(payload.get("latency_window_s", latency_window_s))
+                    if 2 <= req_window_s <= 10:
+                        window_s = req_window_s
+                    if req_burst_bin_ms in (10, 20, 50):
+                        burst_bin_ms = req_burst_bin_ms
+                    if req_cadence_bin_ms in (20, 50):
+                        cadence_bin_ms = req_cadence_bin_ms
+                    if 10 <= req_latency_window_s <= 60:
+                        latency_window_s = req_latency_window_s
+                except Exception:
+                    pass
+            except asyncio.TimeoutError:
+                pass
+
+            now = time.time()
+            payload = _build_highfreq_payload(window_s, burst_bin_ms, cadence_bin_ms, latency_window_s)
+            if payload != last_payload:
+                await ws.send_text(_json_dumps(payload))
+                last_payload = payload
+                last_heartbeat = now
+            elif now - last_heartbeat >= 1.0:
+                await ws.send_text(_json_dumps(payload))
+                last_heartbeat = now
+            await asyncio.sleep(0.1)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        log.debug("High-frequency WebSocket error: %s", exc)
+
+
+@app.websocket("/ws/interrogators")
+async def interrogator_timing_websocket_endpoint(ws: WebSocket) -> None:
+    """Dedicated interrogator timing stream for the high-frequency timing page."""
+    await ws.accept()
+    window_s = 10.0
+    last_payload = None
+    last_heartbeat = 0.0
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=0.2)
+                try:
+                    payload = json.loads(msg)
+                    req_window = float(payload.get("window_s", window_s))
+                    if 2 <= req_window <= 60:
+                        window_s = req_window
+                except Exception:
+                    pass
+            except asyncio.TimeoutError:
+                pass
+
+            now = time.time()
+            payload = _build_interrogator_payload(window_s)
+            if payload != last_payload:
+                await ws.send_text(_json_dumps(payload))
+                last_payload = payload
+                last_heartbeat = now
+            elif now - last_heartbeat >= 1.0:
+                await ws.send_text(_json_dumps(payload))
+                last_heartbeat = now
+            await asyncio.sleep(0.1)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        log.debug("Interrogator WebSocket error: %s", exc)
+
+
+@app.websocket("/ws/timing-page")
+async def timing_page_websocket_endpoint(ws: WebSocket) -> None:
+    """Multiplexed Timing-page stream carrying message, interrogator, and aggregate panels."""
+    await ws.accept()
+    timing_window_s = 5.0
+    interrogator_window_s = 10.0
+    burst_bin_ms = 20
+    cadence_bin_ms = 50
+    latency_window_s = 30.0
+    since_seq = 0
+    last_interrogators = None
+    last_aggregates = None
+    last_heartbeat = 0.0
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=0.2)
+                try:
+                    payload = json.loads(msg)
+                    req_timing_window_s = float(payload.get("timing_window_s", timing_window_s))
+                    req_interrogator_window_s = float(payload.get("interrogator_window_s", interrogator_window_s))
+                    req_burst_bin_ms = int(payload.get("burst_bin_ms", burst_bin_ms))
+                    req_cadence_bin_ms = int(payload.get("cadence_bin_ms", cadence_bin_ms))
+                    req_latency_window_s = float(payload.get("latency_window_s", latency_window_s))
+                    if 2 <= req_timing_window_s <= 10:
+                        timing_window_s = req_timing_window_s
+                    if 2 <= req_interrogator_window_s <= 60:
+                        interrogator_window_s = req_interrogator_window_s
+                    if req_burst_bin_ms in (10, 20, 50):
+                        burst_bin_ms = req_burst_bin_ms
+                    if req_cadence_bin_ms in (20, 50):
+                        cadence_bin_ms = req_cadence_bin_ms
+                    if 10 <= req_latency_window_s <= 60:
+                        latency_window_s = req_latency_window_s
+                except Exception:
+                    pass
+            except asyncio.TimeoutError:
+                pass
+
+            now = time.time()
+            events_raw = state.get_timing_events(since_seq)
+            if len(events_raw) > 5000:
+                events_raw = events_raw[-5000:]
+            if events_raw:
+                since_seq = events_raw[-1][0]
+
+            timing_payload = {
+                "now_us": state.get_timing_now_us(),
+                "window_s": timing_window_s,
+                "events": [[seq, arrival_us, df, msg_len] for seq, arrival_us, df, msg_len in events_raw],
+            }
+            interrogator_payload = _build_interrogator_payload(interrogator_window_s)
+            aggregate_payload = _build_highfreq_payload(timing_window_s, burst_bin_ms, cadence_bin_ms, latency_window_s)
+
+            has_interrogator_change = interrogator_payload != last_interrogators
+            has_aggregate_change = aggregate_payload != last_aggregates
+            has_timing_events = bool(events_raw)
+
+            if has_timing_events or has_interrogator_change or has_aggregate_change or now - last_heartbeat >= 1.0:
+                await ws.send_text(_json_dumps({
+                    "type": "timing_page",
+                    "timing": timing_payload,
+                    "interrogators": interrogator_payload,
+                    "aggregates": aggregate_payload,
+                }))
+                last_interrogators = interrogator_payload
+                last_aggregates = aggregate_payload
+                last_heartbeat = now
+            await asyncio.sleep(0.1)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        log.debug("Timing page WebSocket error: %s", exc)
 
 
 @app.get("/api/stats")

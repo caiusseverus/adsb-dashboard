@@ -10,6 +10,7 @@ import styles from './App.module.css'
 // Recharts) are only fetched when the user first visits that tab.
 const HistoryPage        = lazy(() => import('./pages/HistoryPage'))
 const ReceiverPage       = lazy(() => import('./pages/ReceiverPage'))
+const TimingPage         = lazy(() => import('./pages/TimingPage'))
 const FleetPage          = lazy(() => import('./pages/FleetPage'))
 const CoveragePage       = lazy(() => import('./pages/CoveragePage'))
 const MapPage            = lazy(() => import('./pages/MapPage'))
@@ -138,6 +139,10 @@ export default function App() {
             onClick={() => setTab('receiver')}
           >Receiver</button>
           <button
+            className={tab === 'timing' ? styles.tabActive : styles.tab}
+            onClick={() => setTab('timing')}
+          >Timing</button>
+          <button
             className={tab === 'coverage' ? styles.tabActive : styles.tab}
             onClick={() => setTab('coverage')}
           >Coverage</button>
@@ -201,6 +206,7 @@ export default function App() {
         {tab === 'history' && <HistoryPage snapshot={snapshot} />}
         {tab === 'sightings' && <SightingsPage onSelectIcao={handleSelectIcao} notableRefreshKey={notableRefreshKey} />}
         {tab === 'receiver' && <ReceiverPage snapshot={snapshot} onSelectIcao={handleSelectIcao} />}
+        {tab === 'timing' && <TimingPage onSelectIcao={handleSelectIcao} />}
         {tab === 'coverage' && <CoveragePage aircraft={snapshot?.aircraft ?? []} initialIcao={coverageIcao} />}
         {tab === 'flow' && <FlowMapPage />}
         {tab === 'fleet' && <FleetPage onSelectIcao={handleSelectIcao} />}

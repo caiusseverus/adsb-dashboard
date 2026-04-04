@@ -90,6 +90,45 @@
   padding: 2rem 0;
 }
 
+.iidTableWrap {
+  margin-top: 0.85rem;
+  overflow-x: auto;
+}
+
+.iidTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+
+.iidTable th {
+  text-align: left;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #6e7681;
+  padding: 0.45rem 0.5rem;
+  border-bottom: 1px solid #30363d;
+}
+
+.iidTable td {
+  padding: 0.5rem;
+  border-bottom: 1px solid #21262d;
+  color: #c9d1d9;
+}
+
+.iidTable tbody tr:hover td {
+  background: #0f1117;
+}
+
+.iidCode {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.iidNum {
+  font-variant-numeric: tabular-nums;
+}
+
 /* Tooltip */
 .tooltip {
   background: #161b22;
