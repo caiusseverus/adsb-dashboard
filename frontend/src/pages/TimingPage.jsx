@@ -37,6 +37,23 @@ const SOURCE_COLOURS = {
   3: '#f78166',
   0: '#6e7681',
 }
+const RAW_BEARING_COLOUR_MODES = {
+  strength: 'Strength',
+  df: 'Message Type',
+  source: 'Source Class',
+}
+const DF_COLOURS = {
+  17: '#388bfd',
+  18: '#57a6ff',
+  11: '#3fb950',
+  4: '#d29922',
+  5: '#e3b341',
+  20: '#bc8cff',
+  21: '#d2a8ff',
+  0: '#f85149',
+  16: '#ff6b6b',
+  24: '#6e7681',
+}
 
 const RENDER_HOLDBACK_US = 650_000
 const TIMING_BUFFER_MAX = 60_000
@@ -44,9 +61,31 @@ const TIMING_WINDOW_US = 5_000_000
 const SIGNAL_BUCKET_COUNT = 12
 const SIGNAL_BIN_US = 100_000
 const SOURCE_BIN_US = 100_000
+const BEARING_BUCKET_COUNT = 36
+const BEARING_BIN_US = 125_000
+const RAW_BEARING_DEG_PER_PX = 0.5
+const RAW_BEARING_PLOT_H = 720
 const MICRO_TIMELINE_LANE_H = 22
 const MICRO_TIMELINE_LABEL_W = 84
 const MICRO_TIMELINE_COUNT_W = 34
+
+function signalColour(raw) {
+  if (raw == null) return '#484f58'
+  const pct = Math.max(0, Math.min(100, Math.round((255 - Number(raw)) / 2.55)))
+  if (pct > 66) return '#3fb950'
+  if (pct > 33) return '#d29922'
+  return '#f85149'
+}
+
+function rawBearingEventColour(ev, colourMode) {
+  if (colourMode === 'source') {
+    return SOURCE_COLOURS[SOURCE_LABELS[ev.source_class] ? ev.source_class : 0] ?? SOURCE_COLOURS[0]
+  }
+  if (colourMode === 'df') {
+    return DF_COLOURS[ev.df] ?? '#6e7681'
+  }
+  return signalColour(ev.signal_raw)
+}
 
 function Panel({ title, controls, children }) {
   return (
@@ -138,8 +177,17 @@ function useTimingEventBuffer(timingPacket, windowUs = TIMING_WINDOW_US) {
     const nowUs = Number(timingPacket.now_us ?? 0)
     const cutoffUs = Math.max(0, nowUs - windowUs - 1_000_000)
     const newEvents = (timingPacket.events ?? []).map(ev => {
-      const [seq, arrival_us, df, msg_len, signal_raw, source_class, icao] = ev
-      return { seq, arrival_us, df, msg_len, signal_raw, source_class, icao: `${icao ?? ''}`.toUpperCase() }
+      const [seq, arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg] = ev
+      return {
+        seq,
+        arrival_us,
+        df,
+        msg_len,
+        signal_raw,
+        source_class,
+        icao: `${icao ?? ''}`.toUpperCase(),
+        bearing_deg: Number.isFinite(Number(bearing_deg)) ? Number(bearing_deg) : null,
+      }
     })
     const mergedMap = new Map()
     for (const ev of bufRef.current) {
@@ -155,6 +203,241 @@ function useTimingEventBuffer(timingPacket, windowUs = TIMING_WINDOW_US) {
   }, [timingPacket, windowUs])
 
   return view
+}
+
+function BearingTimeSweepHeatmap({ timingView, timingWindowUs }) {
+  const canvasRef = useRef(null)
+  const rafRef = useRef(null)
+  const nowUsRef = useRef(0)
+  const nowUsWallRef = useRef(performance.now())
+  const timingViewRef = useRef(timingView)
+  timingViewRef.current = timingView
+
+  useEffect(() => {
+    nowUsRef.current = Number(timingView?.nowUs ?? 0)
+    nowUsWallRef.current = performance.now()
+  }, [timingView?.nowUs])
+
+  useEffect(() => {
+    const draw = () => {
+      rafRef.current = requestAnimationFrame(draw)
+      const canvas = canvasRef.current
+      const tv = timingViewRef.current
+      if (!canvas || !(tv?.events?.length)) return
+
+      const w = canvas.offsetWidth || 600
+      const h = 220
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      ctx.fillStyle = '#0b0c10'
+      ctx.fillRect(0, 0, w, h)
+
+      const left = 42
+      const top = 10
+      const plotW = w - left - 8
+      const plotH = h - top - 28
+      const interp = Math.max(0, performance.now() - nowUsWallRef.current) * 1000
+      const renderNowUs = Math.max(0, nowUsRef.current + interp - RENDER_HOLDBACK_US)
+      const cutoffUs = renderNowUs - timingWindowUs
+      const firstBin = Math.floor(cutoffUs / BEARING_BIN_US)
+      const lastBin = Math.floor(renderNowUs / BEARING_BIN_US)
+      const cells = Array.from({ length: BEARING_BUCKET_COUNT }, () => new Map())
+      let maxCount = 0
+      let attributedCount = 0
+
+      for (const ev of tv.events) {
+        if (ev.arrival_us <= cutoffUs || ev.arrival_us > renderNowUs) continue
+        if (!Number.isFinite(ev.bearing_deg)) continue
+        const bearingNorm = ((ev.bearing_deg % 360) + 360) % 360
+        const bucket = Math.max(0, Math.min(BEARING_BUCKET_COUNT - 1, Math.floor((bearingNorm / 360) * BEARING_BUCKET_COUNT)))
+        const bin = Math.floor(ev.arrival_us / BEARING_BIN_US)
+        const row = cells[bucket]
+        const nextCount = (row.get(bin) ?? 0) + 1
+        row.set(bin, nextCount)
+        maxCount = Math.max(maxCount, nextCount)
+        attributedCount += 1
+      }
+
+      ctx.strokeStyle = '#21262d'
+      ctx.lineWidth = 1
+      for (let i = 0; i <= 4; i++) {
+        const y = top + (plotH * i) / 4
+        ctx.beginPath()
+        ctx.moveTo(left, y)
+        ctx.lineTo(left + plotW, y)
+        ctx.stroke()
+      }
+
+      const cellH = plotH / BEARING_BUCKET_COUNT
+      maxCount = Math.max(1, maxCount)
+      for (let bucket = 0; bucket < BEARING_BUCKET_COUNT; bucket++) {
+        const row = cells[bucket]
+        for (let bin = firstBin; bin <= lastBin; bin++) {
+          const count = row.get(bin) ?? 0
+          if (!count) continue
+          const x = left + ((bin * BEARING_BIN_US - cutoffUs) / timingWindowUs) * plotW
+          const nextX = left + (((bin + 1) * BEARING_BIN_US - cutoffUs) / timingWindowUs) * plotW
+          const xClipped = Math.max(left, x)
+          const wClipped = Math.max(0, Math.min(w, nextX) - xClipped)
+          if (wClipped <= 0) continue
+          const y = top + plotH - (bucket + 1) * cellH
+          const intensity = count / maxCount
+          const alpha = 0.14 + intensity * 0.86
+          const lightness = 22 + intensity * 44
+          ctx.fillStyle = `hsla(194, 100%, ${lightness}%, ${alpha})`
+          ctx.fillRect(xClipped, y + 1, wClipped, Math.max(1, cellH - 2))
+        }
+      }
+
+      ctx.fillStyle = '#8b949e'
+      ctx.font = '10px monospace'
+      ctx.textAlign = 'right'
+      ctx.textBaseline = 'middle'
+      for (const [label, fraction] of [['360', 0], ['270', 0.25], ['180', 0.5], ['90', 0.75], ['0', 1]]) {
+        ctx.fillText(label, left - 6, top + plotH * fraction)
+      }
+      ctx.textBaseline = 'alphabetic'
+      ctx.textAlign = 'left'
+      ctx.fillText('bearing deg', left, h - 8)
+      ctx.textAlign = 'right'
+      ctx.fillText(`${attributedCount} attributed msgs`, w - 8, h - 8)
+    }
+
+    rafRef.current = requestAnimationFrame(draw)
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }
+  }, [timingWindowUs])
+
+  const hasBearingEvents = (timingView?.events ?? []).some(ev => Number.isFinite(ev.bearing_deg))
+
+  return (
+    <Panel title="Bearing-Time Sweep Heatmap">
+      <p style={{ fontSize: '0.72rem', color: '#484f58', margin: '0 0 0.4rem' }}>
+        Recent activity by receiver-relative azimuth over the shared timing window. Only events with inline bearing attribution are plotted; unattributed traffic remains visible in the other timing panels.
+      </p>
+      {!hasBearingEvents
+        ? <p style={{ fontSize: '0.8rem', color: '#484f58' }}>Waiting for bearing-attributed timing events…</p>
+        : <canvas ref={canvasRef} style={{ width: '100%', height: 220, display: 'block', borderRadius: 4 }} />
+      }
+    </Panel>
+  )
+}
+
+function RawBearingRaster({ timingView, timingWindowUs, colourMode, onColourModeChange, phosphor, onPhosphorChange }) {
+  const canvasRef = useRef(null)
+  const rafRef = useRef(null)
+  const nowUsRef = useRef(0)
+  const nowUsWallRef = useRef(performance.now())
+  const timingViewRef = useRef(timingView)
+  timingViewRef.current = timingView
+
+  useEffect(() => {
+    nowUsRef.current = Number(timingView?.nowUs ?? 0)
+    nowUsWallRef.current = performance.now()
+  }, [timingView?.nowUs])
+
+  useEffect(() => {
+    const draw = () => {
+      rafRef.current = requestAnimationFrame(draw)
+      const canvas = canvasRef.current
+      const tv = timingViewRef.current
+      if (!canvas || !(tv?.events?.length)) return
+
+      const w = canvas.offsetWidth || 600
+      const h = RAW_BEARING_PLOT_H + 30
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      ctx.fillStyle = '#0b0c10'
+      ctx.fillRect(0, 0, w, h)
+
+      const left = 42
+      const top = 10
+      const plotW = w - left - 8
+      const plotH = RAW_BEARING_PLOT_H
+      const interp = Math.max(0, performance.now() - nowUsWallRef.current) * 1000
+      const renderNowUs = Math.max(0, nowUsRef.current + interp - RENDER_HOLDBACK_US)
+      const cutoffUs = renderNowUs - timingWindowUs
+      let plottedCount = 0
+
+      ctx.strokeStyle = '#21262d'
+      ctx.lineWidth = 1
+      for (const deg of [360, 315, 270, 225, 180, 135, 90, 45, 0]) {
+        const y = top + ((360 - deg) / 360) * plotH
+        ctx.beginPath()
+        ctx.moveTo(left, y)
+        ctx.lineTo(left + plotW, y)
+        ctx.stroke()
+      }
+
+      for (const ev of tv.events) {
+        if (ev.arrival_us <= cutoffUs || ev.arrival_us > renderNowUs) continue
+        if (!Number.isFinite(ev.bearing_deg)) continue
+        const ageRatio = (renderNowUs - ev.arrival_us) / Math.max(1, timingWindowUs)
+        const x = left + ((ev.arrival_us - cutoffUs) / timingWindowUs) * plotW
+        const y = top + ((360 - ev.bearing_deg) / 360) * plotH
+        if (x < left || x > left + plotW || y < top || y > top + plotH) continue
+        const colour = rawBearingEventColour(ev, colourMode)
+        const alpha = phosphor
+          ? Math.max(0.05, 0.95 * (1 - ageRatio))
+          : 0.85
+        ctx.fillStyle = `${colour}${Math.round(alpha * 255).toString(16).padStart(2, '0')}`
+        const markW = ev.msg_len >= 14 ? 2 : 1
+        ctx.fillRect(Math.round(x), Math.round(y), markW, 1)
+        if (phosphor) {
+          ctx.fillStyle = `${colour}${Math.round(alpha * 90).toString(16).padStart(2, '0')}`
+          ctx.fillRect(Math.round(x), Math.max(top, Math.round(y) - 1), 1, 3)
+        }
+        plottedCount += 1
+      }
+
+      ctx.fillStyle = '#8b949e'
+      ctx.font = '10px monospace'
+      ctx.textAlign = 'right'
+      ctx.textBaseline = 'middle'
+      for (const deg of [360, 315, 270, 225, 180, 135, 90, 45, 0]) {
+        const y = top + ((360 - deg) / 360) * plotH
+        ctx.fillText(`${deg}`, left - 6, y)
+      }
+      ctx.textBaseline = 'alphabetic'
+      ctx.textAlign = 'left'
+      ctx.fillText('0.5° / px exact-bearing raster', left, h - 8)
+      ctx.textAlign = 'right'
+      ctx.fillText(`${plottedCount} plotted msgs`, w - 8, h - 8)
+    }
+
+    rafRef.current = requestAnimationFrame(draw)
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }
+  }, [timingWindowUs, colourMode, phosphor])
+
+  const hasBearingEvents = (timingView?.events ?? []).some(ev => Number.isFinite(ev.bearing_deg))
+
+  return (
+    <Panel
+      title="Raw Bearing Raster"
+      controls={
+        <>
+          <select className={styles.select} value={colourMode} onChange={e => onColourModeChange(e.target.value)}>
+            {Object.entries(RAW_BEARING_COLOUR_MODES).map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
+          </select>
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.75rem', color: '#8b949e' }}>
+            <input type="checkbox" checked={phosphor} onChange={e => onPhosphorChange(e.target.checked)} />
+            Phosphor
+          </label>
+        </>
+      }
+    >
+      <p style={{ fontSize: '0.72rem', color: '#484f58', margin: '0 0 0.4rem' }}>
+        Exact per-message bearing marks on a tall raster. With phosphor enabled, older points fade as they scroll left so repeated activity at the same azimuth builds brighter streaks instead of flat speckle.
+      </p>
+      {!hasBearingEvents
+        ? <p style={{ fontSize: '0.8rem', color: '#484f58' }}>Waiting for bearing-attributed timing events…</p>
+        : <canvas ref={canvasRef} style={{ width: '100%', height: RAW_BEARING_PLOT_H + 30, display: 'block', borderRadius: 4 }} />
+      }
+    </Panel>
+  )
 }
 
 function SignalFloorShimmer({ timingView, timingWindowUs }) {
@@ -785,6 +1068,8 @@ export default function TimingPage({ onSelectIcao }) {
   const [cadenceBinMs, setCadenceBinMs] = useState(50)
   const [interrogatorWindowS, setInterrogatorWindowS] = useState(10)
   const [timingWindowS, setTimingWindowS] = useState(5)
+  const [rawBearingColourMode, setRawBearingColourMode] = useState('strength')
+  const [rawBearingPhosphor, setRawBearingPhosphor] = useState(false)
   const timingWindowUs = timingWindowS * 1_000_000
   const pageStream = useTimingPageStream({ burstBinMs, cadenceBinMs, interrogatorWindowS, timingWindowS })
   const timingView = useTimingEventBuffer(pageStream?.timing ?? null, timingWindowUs)
@@ -808,6 +1093,18 @@ export default function TimingPage({ onSelectIcao }) {
       <AirspaceMicroTimeline
         timingView={timingView}
         timingWindowUs={timingWindowUs}
+      />
+      <BearingTimeSweepHeatmap
+        timingView={timingView}
+        timingWindowUs={timingWindowUs}
+      />
+      <RawBearingRaster
+        timingView={timingView}
+        timingWindowUs={timingWindowUs}
+        colourMode={rawBearingColourMode}
+        onColourModeChange={setRawBearingColourMode}
+        phosphor={rawBearingPhosphor}
+        onPhosphorChange={setRawBearingPhosphor}
       />
       <div className={styles.row}>
         <BurstRateStripChart

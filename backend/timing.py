@@ -8,7 +8,7 @@ GET /api/timing/events?since_seq=<int>
 Response:
   {
     "now_us": <int>,   # current Beast-relative time estimate
-    "events": [[seq, arrival_us, df, msg_len, signal_raw, source_class, icao], ...]  # sorted ascending
+    "events": [[seq, arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg], ...]  # sorted ascending
   }
 """
 
@@ -30,7 +30,7 @@ async def timing_events(
     return {
         "now_us": router._state.get_timing_now_us(),
         "events": [
-            [seq, arrival_us, df, msg_len, signal_raw, source_class, icao]
-            for seq, arrival_us, df, msg_len, signal_raw, source_class, icao in events_raw
+            [seq, arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg]
+            for seq, arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg in events_raw
         ],
     }

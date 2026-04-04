@@ -8,6 +8,18 @@ Source inputs:
 Prepared: 2026-04-04
 Updated: 2026-04-04
 
+## AGENTS.md Contributor Guide Task
+
+- [x] Inspect repository structure, manifests, and recent git history for contributor-facing conventions
+- [x] Draft root `AGENTS.md` titled `Repository Guidelines` with concise, repo-specific instructions
+- [x] Verify the guide against current commands/files and record the review result
+
+### Review
+
+- Verified repository structure against `README.md`, `frontend/package.json`, `backend/pyproject.toml`, `frontend/src/`, and `backend/tests/`.
+- Verified commit guidance against recent `git log` subjects.
+- Confirmed `AGENTS.md` is within the requested size target at `373` words and uses Markdown headings throughout.
+
 ## Current Assessment
 
 - Items `A` through `H` were already remediated in code.
@@ -226,6 +238,25 @@ Updated: 2026-04-04
     - `25` Message waterfall
     - `26` Polar pulse bloom
     - `27` Constellation drift view
+
+## OpenSpec Change: `add-high-frequency-airspace-micro-timeline`
+
+- [x] Review the existing timing-event ingest, websocket/API serialization, and Timing-page buffer contracts.
+- [x] Extend backend timing events to retain inline `icao` at ingest time and serialize the widened event shape on `/api/timing/events`, `/ws/timing`, and `/ws/timing-page`.
+- [x] Update the Timing-page client buffer to consume widened events without regressing existing panels that share the same stream.
+- [x] Add the `Micro-timeline of airspace activity` panel with a stable top-`N` row policy, sticky membership, and first-pass source-based coloring.
+- [x] Verify backend syntax/tests, frontend build, and a focused synthetic runtime check covering idle, multi-aircraft, and row-stability behavior.
+
+### Review
+
+- Plan verified against `openspec/changes/add-high-frequency-airspace-micro-timeline/{proposal,design,tasks}.md` and the two spec files before implementation.
+- Backend event retention now stores inline `icao` in the recent-message buffer and serializes the widened tuple consistently through the direct API, `/ws/timing`, and `/ws/timing-page`.
+- The Timing page now includes a full-width `Micro-timeline of airspace activity` panel backed by the existing shared timing buffer and a pure helper that applies slower ranking refreshes with sticky row membership.
+- Verification:
+  - `python3 -m py_compile backend/aircraft_state.py backend/main.py backend/timing.py`
+  - `env UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_timing_events.py`
+  - `npm run build` in `frontend/`
+  - `node --input-type=module` synthetic helper check confirmed `idleRows: 0`, stable initial rows `AAAAAA/BBBBBB/CCCCCC`, and admission of new entrant `DDDDDD` without reordering existing rows.
   - Exploration work required before implementation:
     - Confirm which additional fields are needed in the recent-message event model:
       - `signal_raw`
@@ -246,6 +277,55 @@ Updated: 2026-04-04
     - `HFV2.2` aircraft/bearing/spatial-data exploration for items `22`, `23`, `26`, and `27`
     - `HFV2.3` choose the first implementation subset based on value versus load
     - `HFV2.4` implement one item at a time with the same verify-before-next rule used for `V1`
+  - Investigation result on 2026-04-04:
+    - Proposed next implementation slice is `HFV2A` on the existing `Timing` page, centered on proposal items `20` and `21`.
+    - Chosen first-slice scope:
+      - widen the shared recent-message event model with per-message `signal_raw` and a compact `source_class`
+      - add `Signal-floor shimmer / RF health panel`
+      - add `Source-mix pulse monitor`
+    - Reasoning:
+      - these two panels add operator-facing value while reusing the current Beast-time ring buffer and multiplexed `/ws/timing-page` transport
+      - they de-risk the `V2` data model with lighter backend changes than the bearing/range-dependent views
+      - they keep the first `V2` slice within the existing load rule of one shared recent-message buffer and one page stream
+    - Deferred beyond `HFV2A`:
+      - `22` Micro-timeline of airspace activity after deciding whether per-message `icao` belongs in the same enriched event model
+      - `23`, `26`, and `27` until per-message spatial attribution is defined and profiled
+      - `25` until the enriched buffer is proven and a stronger visual grammar is chosen for the more decorative views
+    - OpenSpec change created for this next-stage proposal:
+      - `openspec/changes/plan-high-frequency-v2-visualizations/`
+  - Follow-on exploration result on 2026-04-04:
+    - Proposed next implementation slice after `HFV2A` is `HFV2B`: proposal item `22`, `Micro-timeline of airspace activity`.
+    - Chosen `HFV2B` direction:
+      - widen the shared recent-message event model with inline `icao`
+      - keep the panel on the existing `Timing` page
+      - use a stable top-`N` row policy driven by a slower ranking cadence rather than live per-frame sorting
+      - start with lightweight color semantics, preferably `source_class`, instead of widening the event model again for altitude or spatial color
+    - Reasoning:
+      - item `22` is the smallest remaining `V2` step that materially improves operator readability
+      - inline `icao` keeps the client event buffer self-contained and avoids fragile joins against mutable aircraft state
+      - this de-risks aircraft-centric high-frequency views before the much larger spatial-attribute work needed by `23`, `26`, and `27`
+    - OpenSpec change created for this follow-on proposal:
+      - `openspec/changes/add-high-frequency-airspace-micro-timeline/`
+
+## OpenSpec Change: `add-high-frequency-bearing-time-sweep`
+
+- [x] Review the current timing-event retention, websocket/API serialization, and Timing-page buffer contract for the next spatial slice.
+- [x] Extend backend timing events to retain optional inline `bearing_deg` at ingest time and serialize the widened shape on `/api/timing/events`, `/ws/timing`, and `/ws/timing-page`.
+- [x] Update the Timing-page client buffer to consume widened events without regressing the existing panels that share the same stream.
+- [x] Add the `Bearing-time sweep heatmap` panel to `frontend/src/pages/TimingPage.jsx`.
+- [x] Verify backend syntax/tests, frontend build, and a focused synthetic check covering empty state plus mixed bearing/no-bearing traffic.
+
+### Review
+
+- Plan verified against `openspec/changes/add-high-frequency-bearing-time-sweep/{proposal,design,tasks}.md` before implementation.
+- Backend timing events now carry optional inline `bearing_deg`, captured after the aircraft record has been updated so the shared event buffer stays self-contained without a later live-state join.
+- `/api/timing/events`, `/ws/timing`, and `/ws/timing-page` now serialize the widened event shape consistently for the Timing page and legacy timing consumers.
+- The Timing page now includes a full-width `Bearing-time sweep heatmap` panel driven by the existing shared event buffer; only bearing-attributed events are plotted, while unattributed traffic still appears in the other timing panels.
+- Verification:
+  - `python3 -m py_compile backend/aircraft_state.py backend/main.py backend/timing.py`
+  - `env UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_timing_events.py`
+  - `npm run build` in `frontend/`
+  - `node --input-type=module` synthetic heatmap-bucketing check confirmed `empty={attributedCount:0,occupiedCells:0,maxCount:0}` and `mixed={attributedCount:3,occupiedCells:2,maxCount:2}` for a shared-stream sample containing both bearing and no-bearing events.
 
 - [x] `Item I` — Documentation scope correction for Phase `0A`
   - Update `.docs/development/polish-and-features-proposal.md` to state that the delivered result is shared filter helpers/predicates, not shared global filter state.
@@ -412,3 +492,49 @@ Updated: 2026-04-04
   - Acceptance disposition:
     - User confirmed on 2026-04-04 that the page is acceptable for now.
     - Remaining smoothing/display imperfections are treated as future polish, not blocking defects.
+- `HFV2` investigated on 2026-04-04.
+  - Reviewed the deferred `HFV2` backlog in [tasks/todo.md](/home/keith/claude/adsb-dashboard/tasks/todo.md) against the original addendum in [polish-and-features-proposal.md](/home/keith/claude/adsb-dashboard/.docs/development/polish-and-features-proposal.md).
+  - Chosen next implementation slice is `HFV2A`: enrich the shared recent-message stream with `signal_raw` and `source_class`, then add the `Signal-floor shimmer` and `Source-mix pulse monitor` panels to [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx).
+  - Captured the implementation-ready proposal, design, specs, and task breakdown in [proposal.md](/home/keith/claude/adsb-dashboard/openspec/changes/plan-high-frequency-v2-visualizations/proposal.md), [design.md](/home/keith/claude/adsb-dashboard/openspec/changes/plan-high-frequency-v2-visualizations/design.md), and [tasks.md](/home/keith/claude/adsb-dashboard/openspec/changes/plan-high-frequency-v2-visualizations/tasks.md).
+  - Deferred `22`, `23`, `25`, `26`, and `27` remain intentionally out of the first slice until ICAO/spatial attribution and richer visual grammar are explored separately.
+- `HFV2A` implemented on 2026-04-04.
+  - Updated [aircraft_state.py](/home/keith/claude/adsb-dashboard/backend/aircraft_state.py) so the shared recent-message timing buffer now retains `signal_raw` and a compact `source_class` alongside `arrival_us`, `df`, and `msg_len`.
+  - Updated [main.py](/home/keith/claude/adsb-dashboard/backend/main.py) and [timing.py](/home/keith/claude/adsb-dashboard/backend/timing.py) so the widened six-field event tuples flow through the existing multiplexed Timing-page stream and the direct timing endpoint without introducing extra sockets or per-widget producers.
+  - Updated [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx) with `Signal-Floor Shimmer` and `Source-Mix Pulse Monitor`, both rendered from the existing incremental event buffer and current page timing window.
+  - Scope decision: optional per-message `icao` propagation stays deferred to the later aircraft-activity work, because the signal/source slice does not need it and widening the stream again is cheaper than mixing that concern into the first implementation.
+  - Scope decision: the first `Source-Mix` pass tracks accepted primary-stream timing traffic classes only. Rejected/ignored-frame accounting remains a follow-up because it does not have a clean existing low-risk hook in the current hot path.
+  - Verification completed with `python3 -m py_compile backend/aircraft_state.py backend/main.py backend/timing.py`, `npm run build` in `frontend/`, and a synthetic `uv run --directory backend python` smoke that exercised idle and busy Timing-page payload shapes from one shared envelope.
+
+## OpenSpec Change: `add-high-frequency-bearing-time-sweep-heatmap`
+
+- [x] Review the current timing-event ingest path, spatial publishability rules, and Timing-page buffer contract before widening the event shape again.
+- [x] Extend backend timing events so each retained message can carry an inline ingest-time spatial snapshot with `bearing_deg` when the aircraft has a publishable receiver-relative position.
+- [x] Update `/api/timing/events`, `/ws/timing`, and `/ws/timing-page` plus the Timing-page client buffer to preserve the widened event shape without adding any new transports.
+- [x] Add a `Bearing-time sweep heatmap` panel to [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx) using the shared incremental event buffer, absolute-time bins, and a clear empty state when spatially attributable events are absent.
+- [x] Verify backend syntax/tests, frontend build, and a focused synthetic/backend runtime check that proves the widened event shape stays self-contained and the heatmap can distinguish populated versus empty bearing bins.
+
+### Review
+
+- Plan verified on 2026-04-04 against the existing high-frequency event pipeline in [aircraft_state.py](/home/keith/claude/adsb-dashboard/backend/aircraft_state.py), [main.py](/home/keith/claude/adsb-dashboard/backend/main.py), [timing.py](/home/keith/claude/adsb-dashboard/backend/timing.py), and the current Timing-page consumer in [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx).
+- Chosen `HFV2C` cut line:
+  - widen the shared recent-message event model with ingest-time `bearing_deg`
+  - add only proposal item `23`, `Bearing-time sweep heatmap`
+  - keep `25`, `26`, and `27` deferred until the spatial event contract is proven under live load
+- Spatial attribution rule for this slice:
+  - snapshot receiver-relative bearing from the aircraft state at message ingest time
+  - only publish those fields when the aircraft position is already publishable under the existing high-confidence rules
+  - leave the fields empty for messages without trustworthy spatial attribution instead of backfilling later from mutable live state
+- Implementation result on 2026-04-04:
+  - [aircraft_state.py](/home/keith/claude/adsb-dashboard/backend/aircraft_state.py) now records `bearing_deg` inline in the recent timing-event buffer after decode/state updates, so position-bearing snapshots reflect message-time publishable state instead of a later live lookup.
+  - [main.py](/home/keith/claude/adsb-dashboard/backend/main.py) and [timing.py](/home/keith/claude/adsb-dashboard/backend/timing.py) now serialize the widened eight-field timing tuple consistently through `/api/timing/events`, `/ws/timing`, and `/ws/timing-page`.
+  - [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx) now consumes inline `bearing_deg` and renders a full-width `Bearing-Time Sweep Heatmap` from the existing shared incremental event buffer.
+  - Scope decision: this first spatial slice widens the event model with `bearing_deg` only. `range_nm` stays deferred because item `23` does not need it, and adding unused spatial fields would widen the hot-path payload without improving the shipped panel.
+- Verification:
+  - `python3 -m py_compile backend/aircraft_state.py backend/main.py backend/timing.py`
+  - `env UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_timing_events.py`
+  - `npm run build` in `frontend/`
+  - Focused synthetic backend check is covered by the updated timing-event tests: one assertion keeps `bearing_deg` empty when the aircraft position is not publishable, and another confirms the value is retained once the publishability gate is satisfied.
+- Follow-up display refinement on 2026-04-04:
+  - Increased the `Bearing-Time Sweep Heatmap` to `10°` sectors by moving from `18` to `36` angular buckets in [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx).
+  - Added a second full-width `Raw Bearing Raster` panel in [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx) that plots exact per-message bearings on a tall `0.5°/px` canvas.
+  - Added desktop-oriented raster controls for color mode (`strength`, `message type`, `source class`) plus an optional `phosphor` fade mode that dims older points as they scroll left.
