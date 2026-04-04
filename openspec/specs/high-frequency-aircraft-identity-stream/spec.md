@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Define the recent high-frequency timing-event stream contract used by Timing-page aircraft-centric panels.
+
+## Requirements
 
 ### Requirement: Timing page stream exposes aircraft identity on recent high-frequency events
 The system SHALL expose recent high-frequency timing events on the existing Timing-page stream with inline aircraft identity so aircraft-centric views can be built from the same self-contained incremental event buffer.

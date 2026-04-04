@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Define the Timing page's aircraft-activity micro-timeline behavior and stability rules.
+
+## Requirements
 
 ### Requirement: Timing page shows an airspace micro-timeline
 The Timing page SHALL render a short-window aircraft activity micro-timeline that shows when each visible aircraft was heard over the recent rolling window.
