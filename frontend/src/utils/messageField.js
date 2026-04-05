@@ -1,6 +1,25 @@
 export const MESSAGE_FIELD_RENDER_HOLDBACK_US = 650_000
 export const MESSAGE_FIELD_SIGNAL_MIN_DBFS = -45
 
+const TRAFFIC_FILTER_DF_MAP = {
+  df11: [11],
+  adsb: [17],
+  tisb: [18],
+  commb: [20, 21],
+  surveillance: [4, 5],
+  acas: [0, 16],
+}
+const KNOWN_FILTER_DFS = new Set(Object.values(TRAFFIC_FILTER_DF_MAP).flat())
+
+function matchesTrafficFilter(df, trafficFilter) {
+  if (trafficFilter === 'all') return true
+  if (trafficFilter === 'other') {
+    return !KNOWN_FILTER_DFS.has(df)
+  }
+  const allowed = TRAFFIC_FILTER_DF_MAP[trafficFilter]
+  return Array.isArray(allowed) ? allowed.includes(df) : true
+}
+
 export function selectMessageFieldEvents({
   events,
   renderNowUs,
@@ -11,8 +30,9 @@ export function selectMessageFieldEvents({
   const cutoffUs = Math.max(0, renderNowUs - persistenceUs)
   return (events ?? []).filter(ev => {
     if (ev.arrival_us < cutoffUs || ev.arrival_us > renderNowUs) return false
-    if (trafficFilter === 'df11' && ev.df !== 11) return false
-    if (iidFilter !== 'all' && ev.iid !== iidFilter) return false
+    if (!matchesTrafficFilter(ev.df, trafficFilter)) return false
+    if (iidFilter === 'exclude-zero' && ev.iid === 0) return false
+    if (iidFilter !== 'all' && iidFilter !== 'exclude-zero' && ev.iid !== iidFilter) return false
     return true
   })
 }

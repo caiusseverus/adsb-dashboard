@@ -12,11 +12,12 @@ import {
 import { formatSignalDbfs } from '../utils/signal'
 
 const PERSISTENCE_OPTIONS_S = [1, 3, 5, 10, 30]
+const MESSAGE_FIELD_BUFFER_MAX = 240_000
 const MODE_OPTIONS = [
-  { value: 'bearing-time', label: 'Bearing × Time' },
-  { value: 'bearing-range', label: 'Bearing × Range' },
-  { value: 'bearing-signal', label: 'Bearing × Signal' },
-  { value: 'range-signal', label: 'Range × Signal' },
+  { value: 'bearing-time', label: 'Bearing × Time', geometries: ['cartesian'], defaultGeometry: 'cartesian' },
+  { value: 'bearing-range', label: 'Bearing × Range', geometries: ['polar', 'cartesian'], defaultGeometry: 'polar' },
+  { value: 'bearing-signal', label: 'Bearing × Signal', geometries: ['cartesian', 'polar'], defaultGeometry: 'cartesian' },
+  { value: 'range-signal', label: 'Range × Signal', geometries: ['cartesian'], defaultGeometry: 'cartesian' },
 ]
 const GEOMETRY_OPTIONS = [
   { value: 'polar', label: 'Polar' },
@@ -27,6 +28,16 @@ const COLOUR_OPTIONS = [
   { value: 'source', label: 'Source' },
   { value: 'iid', label: 'IID' },
   { value: 'signal', label: 'Signal' },
+]
+const TRAFFIC_OPTIONS = [
+  { value: 'all', label: 'All traffic' },
+  { value: 'df11', label: 'DF11' },
+  { value: 'adsb', label: 'DF17 ADS-B' },
+  { value: 'tisb', label: 'DF18 TIS-B' },
+  { value: 'commb', label: 'DF20/21 Comm-B' },
+  { value: 'surveillance', label: 'DF4/5 Surveillance' },
+  { value: 'acas', label: 'DF0/16 ACAS' },
+  { value: 'other', label: 'Other DF' },
 ]
 const SOURCE_LABELS = {
   6: 'ADS-B',
@@ -51,6 +62,34 @@ const DF_LEGEND = [
 ]
 const MAX_PERSISTENCE_US = Math.max(...PERSISTENCE_OPTIONS_S) * 1_000_000
 const IID_OPTION_STICKY_US = 60_000_000
+const MODE_CONFIG = Object.fromEntries(MODE_OPTIONS.map(option => [option.value, option]))
+const AXIS_HEADROOM = 1.08
+const AXIS_SHRINK_HOLD_MS = 45_000
+const AXIS_SHRINK_TIME_CONSTANT_MS = 12_000
+
+function smoothAxisMax(nextTarget, axisState, nowMs) {
+  const safeTarget = Math.max(1, nextTarget)
+  if (!axisState || !Number.isFinite(axisState.value) || axisState.value <= 0) {
+    return { value: safeTarget, belowSinceMs: null, lastSampleMs: nowMs }
+  }
+
+  const previousValue = axisState.value
+  const lastSampleMs = Number.isFinite(axisState.lastSampleMs) ? axisState.lastSampleMs : nowMs
+
+  if (safeTarget >= previousValue) {
+    return { value: safeTarget, belowSinceMs: null, lastSampleMs: nowMs }
+  }
+
+  const belowSinceMs = Number.isFinite(axisState.belowSinceMs) ? axisState.belowSinceMs : nowMs
+  if (nowMs - belowSinceMs < AXIS_SHRINK_HOLD_MS) {
+    return { value: previousValue, belowSinceMs, lastSampleMs: nowMs }
+  }
+
+  const deltaMs = Math.max(0, nowMs - lastSampleMs)
+  const shrinkFraction = 1 - Math.exp(-deltaMs / AXIS_SHRINK_TIME_CONSTANT_MS)
+  const nextValue = previousValue - (previousValue - safeTarget) * shrinkFraction
+  return { value: nextValue, belowSinceMs, lastSampleMs: nowMs }
+}
 
 function formatAxisNumber(value, digits = 1) {
   const rounded = Number(value.toFixed(digits))
@@ -166,7 +205,8 @@ function drawPolarField({
     const alpha = constantAlpha ? 0.82 : 0.18 + (1 - Math.min(1, ageRatio)) * 0.8
     ctx.fillStyle = messageFieldPointColour(ev, colourMode)
     ctx.globalAlpha = alpha
-    ctx.fillRect(x - 1, y - 1, ev.msg_len >= 14 ? 3 : 2, ev.msg_len >= 14 ? 3 : 2)
+    const size = ev.msg_len >= 14 ? 2.6 : 1.8
+    ctx.fillRect(x - size / 2, y - size / 2, size, size)
     ctx.globalAlpha = 1
   }
 
@@ -188,15 +228,27 @@ function MessageFieldCanvas({
 }) {
   const canvasRef = useRef(null)
   const rafRef = useRef(null)
-  const nowUsRef = useRef(0)
-  const nowUsWallRef = useRef(performance.now())
+  const displayNowUsRef = useRef(0)
+  const displayNowWallRef = useRef(performance.now())
   const timingViewRef = useRef(timingView)
+  const rangeAxisMaxRef = useRef(null)
+  const signalPolarMaxRef = useRef(null)
   timingViewRef.current = timingView
 
   useEffect(() => {
-    nowUsRef.current = Number(timingView?.nowUs ?? 0)
-    nowUsWallRef.current = performance.now()
+    const packetNowUs = Number(timingView?.nowUs ?? 0)
+    const wallNowMs = performance.now()
+    const projectedDisplayNowUs = displayNowUsRef.current > 0
+      ? displayNowUsRef.current + Math.max(0, wallNowMs - displayNowWallRef.current) * 1000
+      : packetNowUs
+    displayNowUsRef.current = Math.max(projectedDisplayNowUs, packetNowUs)
+    displayNowWallRef.current = wallNowMs
   }, [timingView?.nowUs])
+
+  useEffect(() => {
+    rangeAxisMaxRef.current = null
+    signalPolarMaxRef.current = null
+  }, [geometry, mode, persistenceUs, trafficFilter, iidFilter])
 
   useEffect(() => {
     const draw = () => {
@@ -213,8 +265,10 @@ function MessageFieldCanvas({
       ctx.fillStyle = '#0b0c10'
       ctx.fillRect(0, 0, w, h)
 
-      const interpUs = Math.max(0, performance.now() - nowUsWallRef.current) * 1000
-      const renderNowUs = Math.max(0, nowUsRef.current + interpUs - MESSAGE_FIELD_RENDER_HOLDBACK_US)
+      const interpUs = Math.max(0, performance.now() - displayNowWallRef.current) * 1000
+      const frameNowMs = performance.now()
+      const renderClockUs = Math.max(0, displayNowUsRef.current + interpUs)
+      const renderNowUs = Math.max(0, renderClockUs - MESSAGE_FIELD_RENDER_HOLDBACK_US)
       const events = selectMessageFieldEvents({
         events: timing?.events ?? [],
         renderNowUs,
@@ -234,7 +288,10 @@ function MessageFieldCanvas({
       ctx.font = '10px monospace'
 
       if (mode === 'bearing-range' && geometry === 'polar') {
-        const maxRange = Math.max(1, ...events.map(ev => ev.range_nm ?? 0), 50)
+        const targetRangeMax = Math.max(50, Math.max(1, ...events.map(ev => ev.range_nm ?? 0)) * AXIS_HEADROOM)
+        const nextRangeState = smoothAxisMax(targetRangeMax, rangeAxisMaxRef.current, frameNowMs)
+        rangeAxisMaxRef.current = nextRangeState
+        const maxRange = nextRangeState.value
         drawPolarField({
           ctx,
           left,
@@ -256,6 +313,16 @@ function MessageFieldCanvas({
       }
 
       if (mode === 'bearing-signal' && geometry === 'polar') {
+        const targetSignalMax = Math.max(
+          10,
+          Math.max(
+            ...events.map(ev => Math.max(0, (Number(ev.signal_dbfs) || MESSAGE_FIELD_SIGNAL_MIN_DBFS) - MESSAGE_FIELD_SIGNAL_MIN_DBFS)),
+            10,
+          ) * AXIS_HEADROOM,
+        )
+        const nextSignalState = smoothAxisMax(targetSignalMax, signalPolarMaxRef.current, frameNowMs)
+        signalPolarMaxRef.current = nextSignalState
+        const signalRadiusMax = nextSignalState.value
         drawPolarField({
           ctx,
           left,
@@ -269,7 +336,7 @@ function MessageFieldCanvas({
           renderNowUs,
           persistenceUs,
           radiusValue: ev => Math.max(0, (Number(ev.signal_dbfs) || MESSAGE_FIELD_SIGNAL_MIN_DBFS) - MESSAGE_FIELD_SIGNAL_MIN_DBFS),
-          maxRadiusValue: Math.abs(MESSAGE_FIELD_SIGNAL_MIN_DBFS),
+          maxRadiusValue: signalRadiusMax,
           title: 'Polar bearing × signal',
           formatRingLabel: value => `${(MESSAGE_FIELD_SIGNAL_MIN_DBFS + value).toFixed(0)} dBFS`,
         })
@@ -306,7 +373,10 @@ function MessageFieldCanvas({
         xMin = 0
         xMax = 360
         yMin = 0
-        yMax = Math.max(1, ...events.map(ev => ev.range_nm ?? 0), 50)
+        const targetRangeMax = Math.max(50, Math.max(1, ...events.map(ev => ev.range_nm ?? 0)) * AXIS_HEADROOM)
+        const nextRangeState = smoothAxisMax(targetRangeMax, rangeAxisMaxRef.current, frameNowMs)
+        rangeAxisMaxRef.current = nextRangeState
+        yMax = nextRangeState.value
         xLabel = 'bearing deg'
         yLabel = 'range nm'
         xValue = ev => ev.bearing_deg
@@ -335,7 +405,10 @@ function MessageFieldCanvas({
         }
       } else {
         xMin = 0
-        xMax = Math.max(1, ...events.map(ev => ev.range_nm ?? 0), 50)
+        const targetRangeMax = Math.max(50, Math.max(1, ...events.map(ev => ev.range_nm ?? 0)) * AXIS_HEADROOM)
+        const nextRangeState = smoothAxisMax(targetRangeMax, rangeAxisMaxRef.current, frameNowMs)
+        rangeAxisMaxRef.current = nextRangeState
+        xMax = nextRangeState.value
         yMin = MESSAGE_FIELD_SIGNAL_MIN_DBFS
         yMax = 0
         xLabel = 'range nm'
@@ -379,11 +452,15 @@ function MessageFieldCanvas({
         const y = top + plotH - ((yRaw - yMin) / Math.max(1e-6, yMax - yMin)) * plotH
         const ageRatio = (renderNowUs - ev.arrival_us) / Math.max(1, persistenceUs)
         const alpha = mode === 'bearing-time'
-          ? 0.82
+          ? (persistenceUs <= 3_000_000 ? 0.96 : 0.9)
           : 0.12 + (1 - Math.min(1, ageRatio)) * 0.86
         ctx.fillStyle = messageFieldPointColour(ev, colourMode)
         ctx.globalAlpha = alpha
-        const size = ev.msg_len >= 14 ? 2.4 : 1.6
+        const size = mode === 'bearing-time'
+          ? (persistenceUs <= 3_000_000
+            ? (ev.msg_len >= 14 ? 2.5 : 1.8)
+            : (ev.msg_len >= 14 ? 2.2 : 1.5))
+          : (ev.msg_len >= 14 ? 2.2 : 1.5)
         ctx.fillRect(x - size / 2, y - size / 2, size, size)
         ctx.globalAlpha = 1
       }
@@ -401,15 +478,15 @@ function MessageFieldCanvas({
 
 export default function MessageFieldPage() {
   const [mode, setMode] = useState('bearing-time')
-  const [geometry, setGeometry] = useState('polar')
-  const [persistenceS, setPersistenceS] = useState(5)
+  const [geometry, setGeometry] = useState(MODE_CONFIG['bearing-time'].defaultGeometry)
+  const [persistenceS, setPersistenceS] = useState(3)
   const [colourMode, setColourMode] = useState('df')
   const [trafficFilter, setTrafficFilter] = useState('all')
   const [iidFilterRaw, setIidFilterRaw] = useState('all')
   const persistenceUs = persistenceS * 1_000_000
 
   const packet = useTimingEventStream()
-  const timingView = useTimingEventBuffer(packet, MAX_PERSISTENCE_US)
+  const timingView = useTimingEventBuffer(packet, MAX_PERSISTENCE_US, MESSAGE_FIELD_BUFFER_MAX)
   const iidSeenRef = useRef(new Map())
 
   const renderNowUs = useMemo(() => timingView.nowUs, [timingView.nowUs])
@@ -425,7 +502,9 @@ export default function MessageFieldPage() {
     renderNowUs,
     persistenceUs,
     trafficFilter,
-    iidFilter: iidFilterRaw === 'all' ? 'all' : Number(iidFilterRaw),
+    iidFilter: iidFilterRaw === 'all' || iidFilterRaw === 'exclude-zero'
+      ? iidFilterRaw
+      : Number(iidFilterRaw),
   }), [iidFilterRaw, persistenceUs, renderNowUs, timingView.events, trafficFilter])
   const activeIids = useMemo(() => {
     const seen = iidSeenRef.current
@@ -442,24 +521,24 @@ export default function MessageFieldPage() {
     }
     return [...seen.keys()].sort((a, b) => a - b)
   }, [eventsForIidOptions, renderNowUs])
-  const iidFilter = iidFilterRaw === 'all' ? 'all' : Number(iidFilterRaw)
+  const iidFilter = iidFilterRaw === 'all' || iidFilterRaw === 'exclude-zero'
+    ? iidFilterRaw
+    : Number(iidFilterRaw)
+  const availableGeometries = MODE_CONFIG[mode]?.geometries ?? GEOMETRY_OPTIONS.map(option => option.value)
+  const geometryOptions = GEOMETRY_OPTIONS.filter(option => availableGeometries.includes(option.value))
   const legend = useMemo(() => buildLegend(colourMode), [colourMode])
   const strongestSignal = useMemo(() => {
     const signals = filteredEvents.map(ev => ev.signal_dbfs).filter(value => Number.isFinite(value))
     return signals.length ? Math.max(...signals) : null
   }, [filteredEvents])
 
+  useEffect(() => {
+    if (availableGeometries.includes(geometry)) return
+    setGeometry(MODE_CONFIG[mode]?.defaultGeometry ?? availableGeometries[0] ?? 'cartesian')
+  }, [availableGeometries, geometry, mode])
+
   return (
     <main className={receiverStyles.main}>
-      <section className={styles.hero}>
-        <p className={styles.eyebrow}>Dedicated Exact-Point View</p>
-        <h1 className={styles.title}>Live Message Field</h1>
-        <p className={styles.description}>
-          Recent high-speed message points rendered directly from the shared timing stream. Change projection, persistence,
-          colour, and DF11/IID focus without reconnecting or switching to bucketed summary panels.
-        </p>
-      </section>
-
       <Panel title="Exact Message Field">
         <div className={styles.controlBar}>
           <label className={styles.controlGroup}>
@@ -469,9 +548,14 @@ export default function MessageFieldPage() {
             </select>
           </label>
           <label className={styles.controlGroup}>
-            <span className={styles.controlLabel}>Geometry</span>
-            <select className={receiverStyles.select} value={geometry} onChange={e => setGeometry(e.target.value)}>
-              {GEOMETRY_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+            <span className={styles.controlLabel}>Projection</span>
+            <select
+              className={receiverStyles.select}
+              value={geometry}
+              onChange={e => setGeometry(e.target.value)}
+              disabled={geometryOptions.length === 1}
+            >
+              {geometryOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
             </select>
           </label>
           <label className={styles.controlGroup}>
@@ -489,14 +573,14 @@ export default function MessageFieldPage() {
           <label className={styles.controlGroup}>
             <span className={styles.controlLabel}>Traffic</span>
             <select className={receiverStyles.select} value={trafficFilter} onChange={e => setTrafficFilter(e.target.value)}>
-              <option value="all">All traffic</option>
-              <option value="df11">DF11 only</option>
+              {TRAFFIC_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
             </select>
           </label>
           <label className={styles.controlGroup}>
             <span className={styles.controlLabel}>IID Filter</span>
             <select className={receiverStyles.select} value={iidFilterRaw} onChange={e => setIidFilterRaw(e.target.value)}>
               <option value="all">All IID</option>
+              <option value="exclude-zero">Exclude IID 0</option>
               {activeIids.map(iid => <option key={iid} value={iid}>IID {iid}</option>)}
             </select>
           </label>
@@ -506,7 +590,17 @@ export default function MessageFieldPage() {
           <span>{filteredEvents.length.toLocaleString()} visible points</span>
           <span>{timingView.events.length.toLocaleString()} buffered points</span>
           <span>Strongest visible signal: {formatSignalDbfs(strongestSignal)}</span>
-          <span>IID filter: {iidFilter === 'all' ? 'all active' : `IID ${iidFilter}`}</span>
+          <span>Projection: {geometryOptions.find(option => option.value === geometry)?.label ?? geometry}</span>
+          <span>
+            IID filter: {iidFilter === 'all'
+              ? 'all active'
+              : iidFilter === 'exclude-zero'
+                ? 'exclude IID 0'
+                : `IID ${iidFilter}`}
+          </span>
+          {geometryOptions.length === 1 && (
+            <span>{MODE_CONFIG[mode]?.label} stays on a fixed projection</span>
+          )}
           {filteredEvents.length === 0 && (
             <span style={{ marginLeft: 'auto' }}>No points in the active filter/window</span>
           )}
@@ -532,16 +626,6 @@ export default function MessageFieldPage() {
             </span>
           ))}
         </div>
-      </Panel>
-
-      <Panel title="Notes">
-        <p className={styles.note}>
-          `Bearing × time`, `bearing × signal`, and `range × signal` remain exact-point and persistence-based: points stay visible
-          until they age out of the selected window, then disappear cleanly. `Bearing × range` can be inspected in `polar` space or
-          as a Cartesian projection of the same buffered events. The page can currently colour by `df`, `source_class`, `iid`, or
-          display-grade `signal`; the retained event stream also carries `icao` and `msg_len`, so those are available for future
-          colouring modes without more backend work.
-        </p>
       </Panel>
     </main>
   )

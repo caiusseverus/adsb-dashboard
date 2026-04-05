@@ -8,6 +8,7 @@ import {
 } from '../utils/timingMicroTimeline'
 import { signalBucketIndex, signalColour } from '../utils/signal'
 import { buildDfWaterfallRows, WATERFALL_DF_BUCKETS } from '../utils/timingWaterfall'
+import { advanceMonotonicNowUs, getMonotonicRenderNowUs } from '../utils/monotonicClock'
 import styles from './ReceiverPage.module.css'
 
 const TIMING_PAGE_WS_URL = import.meta.env.PROD
@@ -127,8 +128,7 @@ function MessageWaterfall({ timingView, timingWindowUs, sliceMs, onSliceMsChange
   timingViewRef.current = timingView
 
   useEffect(() => {
-    nowUsRef.current = Number(timingView?.nowUs ?? 0)
-    nowUsWallRef.current = performance.now()
+    advanceMonotonicNowUs(nowUsRef, nowUsWallRef, Number(timingView?.nowUs ?? nowUsRef.current))
   }, [timingView?.nowUs])
 
   useEffect(() => {
@@ -162,8 +162,7 @@ function MessageWaterfall({ timingView, timingWindowUs, sliceMs, onSliceMsChange
       const bottom = 28
       const plotW = w - left - 8
       const plotH = h - top - bottom
-      const interp = Math.max(0, performance.now() - nowUsWallRef.current) * 1000
-      const renderNowUs = Math.max(0, nowUsRef.current + interp - RENDER_HOLDBACK_US)
+      const renderNowUs = getMonotonicRenderNowUs(nowUsRef, nowUsWallRef, RENDER_HOLDBACK_US)
       const rowCount = Math.max(1, Math.floor(timingWindowUs / sliceUs))
       const newestVisibleSliceIndex = Math.floor(renderNowUs / sliceUs) - 2
 
@@ -385,8 +384,7 @@ function BearingTimeSweepHeatmap({ timingView, timingWindowUs }) {
   timingViewRef.current = timingView
 
   useEffect(() => {
-    nowUsRef.current = Number(timingView?.nowUs ?? 0)
-    nowUsWallRef.current = performance.now()
+    advanceMonotonicNowUs(nowUsRef, nowUsWallRef, Number(timingView?.nowUs ?? nowUsRef.current))
   }, [timingView?.nowUs])
 
   useEffect(() => {
@@ -408,8 +406,7 @@ function BearingTimeSweepHeatmap({ timingView, timingWindowUs }) {
       const top = 10
       const plotW = w - left - 8
       const plotH = h - top - 28
-      const interp = Math.max(0, performance.now() - nowUsWallRef.current) * 1000
-      const renderNowUs = Math.max(0, nowUsRef.current + interp - RENDER_HOLDBACK_US)
+      const renderNowUs = getMonotonicRenderNowUs(nowUsRef, nowUsWallRef, RENDER_HOLDBACK_US)
       const cutoffUs = renderNowUs - timingWindowUs
       const firstBin = Math.floor(cutoffUs / BEARING_BIN_US)
       const lastBin = Math.floor(renderNowUs / BEARING_BIN_US)
@@ -503,8 +500,7 @@ function RawBearingRaster({ timingView, timingWindowUs, colourMode, onColourMode
   timingViewRef.current = timingView
 
   useEffect(() => {
-    nowUsRef.current = Number(timingView?.nowUs ?? 0)
-    nowUsWallRef.current = performance.now()
+    advanceMonotonicNowUs(nowUsRef, nowUsWallRef, Number(timingView?.nowUs ?? nowUsRef.current))
   }, [timingView?.nowUs])
 
   useEffect(() => {
@@ -526,8 +522,7 @@ function RawBearingRaster({ timingView, timingWindowUs, colourMode, onColourMode
       const top = 10
       const plotW = w - left - 8
       const plotH = RAW_BEARING_PLOT_H
-      const interp = Math.max(0, performance.now() - nowUsWallRef.current) * 1000
-      const renderNowUs = Math.max(0, nowUsRef.current + interp - RENDER_HOLDBACK_US)
+      const renderNowUs = getMonotonicRenderNowUs(nowUsRef, nowUsWallRef, RENDER_HOLDBACK_US)
       const cutoffUs = renderNowUs - timingWindowUs
       let plottedCount = 0
 
@@ -620,8 +615,7 @@ function SignalFloorShimmer({ timingView, timingWindowUs }) {
   timingViewRef.current = timingView
 
   useEffect(() => {
-    nowUsRef.current = Number(timingView?.nowUs ?? 0)
-    nowUsWallRef.current = performance.now()
+    advanceMonotonicNowUs(nowUsRef, nowUsWallRef, Number(timingView?.nowUs ?? nowUsRef.current))
   }, [timingView?.nowUs])
 
   useEffect(() => {
@@ -643,8 +637,7 @@ function SignalFloorShimmer({ timingView, timingWindowUs }) {
       const top = 10
       const plotW = w - left - 8
       const plotH = h - top - 22
-      const interp = Math.max(0, performance.now() - nowUsWallRef.current) * 1000
-      const renderNowUs = Math.max(0, nowUsRef.current + interp - RENDER_HOLDBACK_US)
+      const renderNowUs = getMonotonicRenderNowUs(nowUsRef, nowUsWallRef, RENDER_HOLDBACK_US)
       const cutoffUs = renderNowUs - timingWindowUs
       const firstBin = Math.floor(cutoffUs / SIGNAL_BIN_US)
       const lastBin = Math.floor(renderNowUs / SIGNAL_BIN_US)
@@ -687,7 +680,7 @@ function SignalFloorShimmer({ timingView, timingWindowUs }) {
           if (wClipped <= 0) continue
           const alpha = 0.12 + (count / maxCount) * 0.88
           const hue = 210 - (bucket / Math.max(1, SIGNAL_BUCKET_COUNT - 1)) * 165
-          const y = top + plotH - (bucket + 1) * cellH
+          const y = top + bucket * cellH
           ctx.fillStyle = `hsla(${hue}, 90%, 58%, ${alpha})`
           ctx.fillRect(xClipped, y + 1, wClipped, Math.max(1, cellH - 2))
         }
@@ -696,8 +689,8 @@ function SignalFloorShimmer({ timingView, timingWindowUs }) {
       ctx.fillStyle = '#8b949e'
       ctx.font = '10px monospace'
       ctx.textAlign = 'right'
-      ctx.fillText('-48', left - 6, top + 8)
-      ctx.fillText('0', left - 6, top + plotH)
+      ctx.fillText('0', left - 6, top + 8)
+      ctx.fillText('-48', left - 6, top + plotH)
       ctx.textAlign = 'left'
       ctx.fillText('signal dBFS', left, h - 6)
       ctx.textAlign = 'right'
@@ -730,8 +723,7 @@ function SourceMixPulseMonitor({ timingView, timingWindowUs }) {
   timingViewRef.current = timingView
 
   useEffect(() => {
-    nowUsRef.current = Number(timingView?.nowUs ?? 0)
-    nowUsWallRef.current = performance.now()
+    advanceMonotonicNowUs(nowUsRef, nowUsWallRef, Number(timingView?.nowUs ?? nowUsRef.current))
   }, [timingView?.nowUs])
 
   useEffect(() => {
@@ -753,8 +745,7 @@ function SourceMixPulseMonitor({ timingView, timingWindowUs }) {
       const top = 10
       const plotW = w - left - 8
       const plotH = h - top - 34
-      const interp = Math.max(0, performance.now() - nowUsWallRef.current) * 1000
-      const renderNowUs = Math.max(0, nowUsRef.current + interp - RENDER_HOLDBACK_US)
+      const renderNowUs = getMonotonicRenderNowUs(nowUsRef, nowUsWallRef, RENDER_HOLDBACK_US)
       const cutoffUs = renderNowUs - timingWindowUs
       const firstBin = Math.floor(cutoffUs / SOURCE_BIN_US)
       const lastBin = Math.floor(renderNowUs / SOURCE_BIN_US)
@@ -860,8 +851,7 @@ function AirspaceMicroTimeline({ timingView, timingWindowUs }) {
   timingViewRef.current = timingView
 
   useEffect(() => {
-    nowUsRef.current = Number(timingView?.nowUs ?? 0)
-    nowUsWallRef.current = performance.now()
+    advanceMonotonicNowUs(nowUsRef, nowUsWallRef, Number(timingView?.nowUs ?? nowUsRef.current))
   }, [timingView?.nowUs])
 
   useEffect(() => {
@@ -876,8 +866,7 @@ function AirspaceMicroTimeline({ timingView, timingWindowUs }) {
       if (!canvas) return
 
       const w = canvas.offsetWidth || 600
-      const interp = Math.max(0, performance.now() - nowUsWallRef.current) * 1000
-      const renderNowUs = Math.max(0, nowUsRef.current + interp - RENDER_HOLDBACK_US)
+      const renderNowUs = getMonotonicRenderNowUs(nowUsRef, nowUsWallRef, RENDER_HOLDBACK_US)
       const { rows, state, meta } = buildAirspaceMicroTimelineRows({
         events: tv?.events ?? [],
         renderNowUs,
@@ -990,8 +979,7 @@ function BurstRateStripChart({ timingView, burstBinMs, onBurstBinMsChange, timin
   timingViewRef.current = timingView
 
   useEffect(() => {
-    nowUsRef.current = Number(timingView?.nowUs ?? 0)
-    nowUsWallRef.current = performance.now()
+    advanceMonotonicNowUs(nowUsRef, nowUsWallRef, Number(timingView?.nowUs ?? nowUsRef.current))
   }, [timingView?.nowUs])
 
   useEffect(() => {
@@ -1014,8 +1002,7 @@ function BurstRateStripChart({ timingView, burstBinMs, onBurstBinMsChange, timin
       const plotW = w - left - 8
       const plotH = h - top - 22
       const binUs = burstBinMs * 1000
-      const interp = Math.max(0, performance.now() - nowUsWallRef.current) * 1000
-      const renderNowUs = Math.max(0, nowUsRef.current + interp - RENDER_HOLDBACK_US)
+      const renderNowUs = getMonotonicRenderNowUs(nowUsRef, nowUsWallRef, RENDER_HOLDBACK_US)
       const cutoffUs = renderNowUs - timingWindowUs
 
       // Bin events on absolute time grid — bin boundaries never move, events never jump
@@ -1110,8 +1097,7 @@ function DFCadenceLanes({ timingView, cadenceBinMs, onCadenceBinMsChange, timing
   const canvasHRef = useRef(22 * CADENCE_ORDER.length)
 
   useEffect(() => {
-    nowUsRef.current = Number(timingView?.nowUs ?? 0)
-    nowUsWallRef.current = performance.now()
+    advanceMonotonicNowUs(nowUsRef, nowUsWallRef, Number(timingView?.nowUs ?? nowUsRef.current))
   }, [timingView?.nowUs])
 
   useEffect(() => {
@@ -1130,8 +1116,7 @@ function DFCadenceLanes({ timingView, cadenceBinMs, onCadenceBinMsChange, timing
 
       const w = canvas.offsetWidth || 600
       const binUs = cadenceBinMs * 1000
-      const interp = Math.max(0, performance.now() - nowUsWallRef.current) * 1000
-      const renderNowUs = Math.max(0, nowUsRef.current + interp - RENDER_HOLDBACK_US)
+      const renderNowUs = getMonotonicRenderNowUs(nowUsRef, nowUsWallRef, RENDER_HOLDBACK_US)
       const cutoffUs = renderNowUs - timingWindowUs
 
       // Bin events on absolute time grid — boundaries fixed, no shimmer

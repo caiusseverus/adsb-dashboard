@@ -6,6 +6,7 @@ import {
 } from 'recharts'
 import { useFetch } from '../utils/useFetch'
 import { formatSignalDbfs, signalColour } from '../utils/signal'
+import { advanceMonotonicNowUs, getMonotonicRenderNowUs } from '../utils/monotonicClock'
 import DFHeatmap from '../components/DFHeatmap'
 import SignalHeatmap from '../components/SignalHeatmap'
 import styles from './ReceiverPage.module.css'
@@ -976,8 +977,7 @@ export function InterrogatorTimeline({ onSelectIcao, streamData = null, windowS:
 
   const ingestInterrogatorPacket = useCallback((d) => {
     const nextNowUs = Number(d?.now_us ?? nowUsRef.current)
-    nowUsRef.current = nextNowUs
-    nowUsWallRef.current = performance.now()
+    advanceMonotonicNowUs(nowUsRef, nowUsWallRef, nextNowUs)
     const winUs = Number(d?.window_s ?? windowS) * 1_000_000
     const cutoffUs = nextNowUs - winUs - LIVE_RENDER_HOLDBACK_US - 500_000
     const nextByIid = new Map((d?.lanes ?? []).map(lane => [lane.iid, lane]))
@@ -1055,8 +1055,7 @@ export function InterrogatorTimeline({ onSelectIcao, streamData = null, windowS:
       if (!canvas || !data?.lanes) return
 
       const lanes  = lanesRef.current
-      const nowUs  = nowUsRef.current + Math.max(0, performance.now() - nowUsWallRef.current) * 1000
-      const renderNowUs = Math.max(0, nowUs - LIVE_RENDER_HOLDBACK_US)
+      const renderNowUs = getMonotonicRenderNowUs(nowUsRef, nowUsWallRef, LIVE_RENDER_HOLDBACK_US)
       const winUs  = data.window_s * 1_000_000
       const h      = Math.max(LANE_H * lanes.length, LANE_H)
       const w      = canvas.offsetWidth || 600
@@ -1204,8 +1203,8 @@ export function MessageTimingPlot({ streamPacket = null }) {
   }, [])
 
   const ingestTimingPacket = useCallback((d) => {
-    nowUsRef.current = Number(d?.now_us ?? nowUsRef.current)
-    nowUsWallRef.current = performance.now()
+    const nextNowUs = Number(d?.now_us ?? nowUsRef.current)
+    advanceMonotonicNowUs(nowUsRef, nowUsWallRef, nextNowUs)
     const cutoff = nowUsRef.current - PLOT_WIN_US - LIVE_RENDER_HOLDBACK_US - 500_000
     const newEvents = (d?.events ?? []).map(ev => {
       const [seq, arrival_us, df, msg_len] = ev
@@ -1295,8 +1294,7 @@ export function MessageTimingPlot({ streamPacket = null }) {
       const canvas = canvasRef.current
       if (!canvas || !activeRef.current || laneOrder.length === 0) return
 
-      const nowUs  = nowUsRef.current + Math.max(0, performance.now() - nowUsWallRef.current) * 1000
-      const renderNowUs = Math.max(0, nowUs - LIVE_RENDER_HOLDBACK_US)
+      const renderNowUs = getMonotonicRenderNowUs(nowUsRef, nowUsWallRef, LIVE_RENDER_HOLDBACK_US)
       const cutoff = renderNowUs - PLOT_WIN_US
       const buf    = bufRef.current
       const w = canvas.offsetWidth

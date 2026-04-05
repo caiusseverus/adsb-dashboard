@@ -273,6 +273,20 @@ Updated: 2026-04-04
 - Treat the existing `raw_signal_to_dbfs()` path as the canonical readsb-aligned signal conversion unless code inspection or synthetic checks prove otherwise; do not ship a second signal formula.
 - Keep one shared recent-event transport contract across `/api/timing/events`, `/ws/timing`, and `/ws/timing-page`; page controls must operate from the local buffered stream instead of reconnecting per mode.
 - Move exact-point exploratory views off `Timing` rather than duplicating them. The dedicated page will own the large-format exact-point canvas and the associated mode/filter controls.
+- Finish the remaining tuning pass by tightening defaults and control behaviour around the shipped page, specifically:
+  - make the default mode/geometry pairing match the intended first-view workflow
+  - remove or reduce control states that imply a projection is active when the current mode is rendered cartesian anyway
+  - tune point sizing and empty-state chrome so dense DF11/DF17 traffic remains legible without covering the plotting frame
+- Follow up on live-traffic polish reported after the first tuning pass:
+  - slow auto-zoom-in reactions so intermittent traffic does not make range-based views breathe in and out
+  - make short-persistence `bearing × time` points slightly more prominent
+  - ensure `30 s` persistence is supported by the client buffer instead of truncating early under load
+  - widen the traffic filter beyond `all` and `DF11 only`
+  - add an IID filter mode that excludes `IID 0` squitters from SSR-focused analysis
+  - extend the auto-zoom shrink delay to a real operator-friendly hold window of roughly `30–60 s`, not just gentle frame-based damping
+  - remove superfluous explanatory chrome around the page and make the `bearing × time` viewport scroll from a monotonic local render clock instead of directly from each packet timestamp
+  - apply the same monotonic render-clock behavior consistently across the other live Timing/Receiver plots that still interpolate from `now_us`
+  - keep signal-axis orientation consistent so `0 dBFS` is the top/high end on shimmer-style plots too
 
 ### Verification
 
@@ -280,20 +294,36 @@ Updated: 2026-04-04
 - Frontend: `npm run build` after the new page, routing, and Timing-page cleanup land.
 - Synthetic/runtime: confirm points remain exact and persistence-based, aging out of the selected window rather than being bucketed or rescaled.
 - Signal semantics: compare the exposed dBFS values against the existing readsb-style conversion helpers before signing off on signal-based axes/colouring.
+- Tuning sign-off: document what was tuned locally and call out whether a real live-receiver pass was or was not possible in the current environment.
 
 ### Review
 
 - Plan verified against `openspec/changes/add-live-message-field-page/{proposal,design,tasks}.md` and the two spec files before implementation.
+- Polish/tuning follow-up plan for the remaining archive-signoff task:
+  - [x] Revisit the `Message Field` page defaults so the initial mode/projection combination matches the primary exact-point transient-use case.
+  - [x] Tighten geometry control behavior so unsupported or low-value projection combinations are not presented as equal defaults.
+  - [x] Re-run focused frontend verification after the tuning pass and record the result here.
+  - [x] Slow auto-zoom contraction in the frontend range-based projections and raise the message-field client buffer cap so `30 s` persistence is not clipped prematurely by the local event store.
+  - [x] Expand traffic/IID filtering so SSR-focused scans can exclude `IID 0` while still supporting other DF families.
 - Backend widened the shared recent timing-event contract by appending optional `range_nm` and `iid` while keeping `/api/timing/events`, `/ws/timing`, and `/ws/timing-page` on one transport shape.
 - Focused backend tests now cover inline range retention, `iid` retention including `IID 0`, and publishability gating for bearing/range fields.
 - Frontend added a new top-level `Message Field` page with one exact-point canvas, selectable modes, `polar`/`cartesian` projection handling, bounded persistence controls, and colour/filter controls backed by the existing shared timing stream.
 - `Timing` now points operators to the dedicated page for exact-point experimentation and no longer renders the shelved waterfall panel.
+- Tuning follow-up adjusted the `Message Field` page so the default `bearing × time` view now starts in its natural Cartesian projection, while the projection selector narrows itself to the geometries that actually make sense for the chosen mode instead of implying that every mode is equally polar/cartesian.
+- Second tuning follow-up widened the page’s traffic filters to include `DF17`, `DF18`, `DF20/21`, `DF4/5`, `DF0/16`, and `Other DF`, added an `Exclude IID 0` option for SSR-focused scans, increased the client timing buffer size used by the page so `30 s` persistence has room to survive heavier traffic, and changed range-based auto-scaling to expand immediately but contract gradually so intermittent points do not make the plot breathe.
+- `Bearing × time` now renders slightly brighter/larger points for `1 s` and `3 s` persistence so sparse intermittent traffic remains readable at short windows.
+- Latest cleanup pass removed the superfluous hero/notes panels and changed the Message Field render clock to extrapolate from a monotonic local timebase, so intermittent timing packets should no longer nudge the `bearing × time` viewport backward or forward.
+- Consistency pass applied the same monotonic render-clock helper across the Timing-page canvases and the Receiver-page timing/interrogator canvases so all live timing plots advance from the same no-backwards-scroll rule.
 - Verification:
   - `python3 -m py_compile backend/aircraft_state.py backend/main.py backend/timing.py backend/tests/test_timing_events.py`
   - `env UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_timing_events.py`
   - `npm run build` in `frontend/`
+  - `npm run build` in `frontend/` after the tuning follow-up
+  - `npm run build` in `frontend/` after the second tuning follow-up
+  - `npm run build` in `frontend/` after the monotonic-clock consistency pass
   - `node --input-type=module` synthetic check on `selectMessageFieldEvents()` returned visible sequence ids `[2, 3]` for a `3 s` window at `5.5 s`, confirming older exact points age out cleanly instead of being rebucketed.
   - Signal semantics check compared `raw_signal_to_dbfs()` against `20 * log10(raw / 255)` for raw samples `1, 12, 37, 128, 255`; all matched expected readsb-style dBFS values exactly.
+  - Live-receiver tuning pass is still pending. This environment allowed code inspection and build verification, but not a real DF11/DF17 traffic validation pass for the new zoom damping, short-window point prominence, or the `30 s` retention feel under real traffic bursts.
     - Confirm which additional fields are needed in the recent-message event model:
       - `signal_raw`
       - `source_class`

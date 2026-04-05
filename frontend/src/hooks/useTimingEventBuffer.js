@@ -34,7 +34,7 @@ function normalizeTimingEvent(ev) {
   }
 }
 
-export function useTimingEventBuffer(timingPacket, windowUs) {
+export function useTimingEventBuffer(timingPacket, windowUs, maxEvents = TIMING_BUFFER_MAX) {
   const [view, setView] = useState({ nowUs: 0, events: [] })
   const bufRef = useRef([])
 
@@ -53,10 +53,10 @@ export function useTimingEventBuffer(timingPacket, windowUs) {
     }
 
     const merged = [...mergedMap.values()].sort((a, b) => a.seq - b.seq)
-    if (merged.length > TIMING_BUFFER_MAX) merged.splice(0, merged.length - TIMING_BUFFER_MAX)
+    if (merged.length > maxEvents) merged.splice(0, merged.length - maxEvents)
     bufRef.current = merged
     setView({ nowUs, events: merged })
-  }, [timingPacket, windowUs])
+  }, [maxEvents, timingPacket, windowUs])
 
   return view
 }
