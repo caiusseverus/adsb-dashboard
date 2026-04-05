@@ -6,6 +6,8 @@ import {
   MICRO_TIMELINE_REFRESH_US,
   MICRO_TIMELINE_ROW_LIMIT,
 } from '../utils/timingMicroTimeline'
+import { signalBucketIndex, signalColour } from '../utils/signal'
+import { buildDfWaterfallRows, WATERFALL_DF_BUCKETS } from '../utils/timingWaterfall'
 import styles from './ReceiverPage.module.css'
 
 const TIMING_PAGE_WS_URL = import.meta.env.PROD
@@ -68,13 +70,23 @@ const RAW_BEARING_PLOT_H = 720
 const MICRO_TIMELINE_LANE_H = 22
 const MICRO_TIMELINE_LABEL_W = 84
 const MICRO_TIMELINE_COUNT_W = 34
+const MESSAGE_WATERFALL_SLICE_OPTIONS_MS = [20, 50, 100]
 
-function signalColour(raw) {
-  if (raw == null) return '#484f58'
-  const pct = Math.max(0, Math.min(100, Math.round((255 - Number(raw)) / 2.55)))
-  if (pct > 66) return '#3fb950'
-  if (pct > 33) return '#d29922'
-  return '#f85149'
+function withAlpha(hex, alpha) {
+  const safeAlpha = Math.max(0, Math.min(1, alpha))
+  return `${hex}${Math.round(safeAlpha * 255).toString(16).padStart(2, '0')}`
+}
+
+function waterfallCellAlpha(count, sliceMs) {
+  if (!count) return 0
+  const perSecondRate = count * (1000 / Math.max(1, sliceMs))
+  const normalized = Math.log1p(perSecondRate) / Math.log1p(180)
+  return 0.12 + Math.max(0, Math.min(1, normalized)) * 0.88
+}
+
+function waterfallBucketColour(bucketKey) {
+  if (bucketKey === 'other') return '#6e7681'
+  return DF_COLOURS[Number(bucketKey)] ?? '#6e7681'
 }
 
 function rawBearingEventColour(ev, colourMode) {
@@ -84,7 +96,7 @@ function rawBearingEventColour(ev, colourMode) {
   if (colourMode === 'df') {
     return DF_COLOURS[ev.df] ?? '#6e7681'
   }
-  return signalColour(ev.signal_raw)
+  return signalColour(ev.signal_dbfs)
 }
 
 function Panel({ title, controls, children }) {
@@ -96,6 +108,165 @@ function Panel({ title, controls, children }) {
       </div>
       {children}
     </div>
+  )
+}
+
+function MessageWaterfall({ timingView, timingWindowUs, sliceMs, onSliceMsChange }) {
+  const canvasRef = useRef(null)
+  const rafRef = useRef(null)
+  const nowUsRef = useRef(0)
+  const nowUsWallRef = useRef(performance.now())
+  const timingViewRef = useRef(timingView)
+  const cacheRef = useRef({
+    eventsRef: null,
+    newestVisibleSliceIndex: null,
+    rowCount: null,
+    sliceUs: null,
+    rows: [],
+  })
+  timingViewRef.current = timingView
+
+  useEffect(() => {
+    nowUsRef.current = Number(timingView?.nowUs ?? 0)
+    nowUsWallRef.current = performance.now()
+  }, [timingView?.nowUs])
+
+  useEffect(() => {
+    cacheRef.current = {
+      eventsRef: null,
+      newestVisibleSliceIndex: null,
+      rowCount: null,
+      sliceUs: null,
+      rows: [],
+    }
+  }, [timingWindowUs, sliceMs])
+
+  useEffect(() => {
+    const draw = () => {
+      rafRef.current = requestAnimationFrame(draw)
+      const canvas = canvasRef.current
+      const tv = timingViewRef.current
+      if (!canvas || !(tv?.events?.length)) return
+
+      const w = canvas.offsetWidth || 600
+      const h = 250
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      ctx.fillStyle = '#0b0c10'
+      ctx.fillRect(0, 0, w, h)
+
+      const sliceUs = sliceMs * 1000
+      const left = 60
+      const top = 12
+      const bottom = 28
+      const plotW = w - left - 8
+      const plotH = h - top - bottom
+      const interp = Math.max(0, performance.now() - nowUsWallRef.current) * 1000
+      const renderNowUs = Math.max(0, nowUsRef.current + interp - RENDER_HOLDBACK_US)
+      const rowCount = Math.max(1, Math.floor(timingWindowUs / sliceUs))
+      const newestVisibleSliceIndex = Math.floor(renderNowUs / sliceUs) - 2
+
+      if (
+        cacheRef.current.eventsRef !== tv.events
+        || cacheRef.current.newestVisibleSliceIndex !== newestVisibleSliceIndex
+        || cacheRef.current.rowCount !== rowCount
+        || cacheRef.current.sliceUs !== sliceUs
+      ) {
+        const next = buildDfWaterfallRows({
+          events: tv.events,
+          renderNowUs,
+          visibleWindowUs: timingWindowUs,
+          sliceUs,
+        })
+        cacheRef.current = {
+          eventsRef: tv.events,
+          newestVisibleSliceIndex,
+          rowCount: next.rowCount,
+          sliceUs,
+          rows: next.rows,
+        }
+      }
+
+      const { rows } = cacheRef.current
+      if (!rows.length) return
+
+      const cellW = plotW / WATERFALL_DF_BUCKETS.length
+      const cellH = plotH / rows.length
+
+      ctx.strokeStyle = '#21262d'
+      ctx.lineWidth = 1
+      for (let col = 0; col <= WATERFALL_DF_BUCKETS.length; col += 1) {
+        const x = left + col * cellW
+        ctx.beginPath()
+        ctx.moveTo(x, top)
+        ctx.lineTo(x, top + plotH)
+        ctx.stroke()
+      }
+
+      ctx.fillStyle = '#8b949e'
+      ctx.font = '10px monospace'
+      ctx.textAlign = 'right'
+      ctx.textBaseline = 'top'
+      ctx.fillText('newest', left - 8, top)
+      ctx.textBaseline = 'bottom'
+      ctx.fillText('older', left - 8, top + plotH)
+
+      for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+        const row = rows[rowIndex]
+        const y = top + rowIndex * cellH
+        ctx.fillStyle = '#0d1117'
+        ctx.fillRect(left, y, plotW, Math.max(1, cellH))
+
+        row.counts.forEach((count, familyIndex) => {
+          const x = left + familyIndex * cellW
+          if (!count) return
+          const bucket = WATERFALL_DF_BUCKETS[familyIndex]
+          const baseColour = waterfallBucketColour(bucket.key)
+          const alpha = waterfallCellAlpha(count, sliceMs)
+          ctx.fillStyle = withAlpha(baseColour, alpha)
+          ctx.fillRect(x + 1, y + 0.5, Math.max(1, cellW - 2), Math.max(1, cellH - 1))
+        })
+      }
+
+      ctx.fillStyle = '#8b949e'
+      ctx.font = '10px monospace'
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'alphabetic'
+      WATERFALL_DF_BUCKETS.forEach((bucket, familyIndex) => {
+        const x = left + familyIndex * cellW + cellW / 2
+        ctx.fillText(bucket.label, x, h - 8)
+      })
+
+      ctx.textAlign = 'left'
+      ctx.fillText(`${sliceMs} ms slices`, left, 10)
+      ctx.textAlign = 'right'
+      ctx.fillText(`${rows.length} completed rows`, w - 8, 10)
+    }
+
+    rafRef.current = requestAnimationFrame(draw)
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }
+  }, [sliceMs, timingWindowUs])
+
+  return (
+    <Panel
+      title="Message Waterfall"
+      controls={
+        <select className={styles.select} value={sliceMs} onChange={e => onSliceMsChange(Number(e.target.value))}>
+          {MESSAGE_WATERFALL_SLICE_OPTIONS_MS.map(value => (
+            <option key={value} value={value}>{value} ms</option>
+          ))}
+        </select>
+      }
+    >
+      <p style={{ fontSize: '0.72rem', color: '#484f58', margin: '0 0 0.4rem' }}>
+        Compact raw-DF texture from the shared timing stream. Each row is one completed short slice, so bursts and regime changes show up as stable vertical pattern shifts instead of another scrolling lane plot.
+      </p>
+      {!timingView?.events?.length
+        ? <p style={{ fontSize: '0.8rem', color: '#484f58' }}>Waiting for timing events…</p>
+        : <canvas ref={canvasRef} style={{ width: '100%', height: 250, display: 'block', borderRadius: 4 }} />
+      }
+    </Panel>
   )
 }
 
@@ -177,13 +348,13 @@ function useTimingEventBuffer(timingPacket, windowUs = TIMING_WINDOW_US) {
     const nowUs = Number(timingPacket.now_us ?? 0)
     const cutoffUs = Math.max(0, nowUs - windowUs - 1_000_000)
     const newEvents = (timingPacket.events ?? []).map(ev => {
-      const [seq, arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg] = ev
+      const [seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg] = ev
       return {
         seq,
         arrival_us,
         df,
         msg_len,
-        signal_raw,
+        signal_dbfs,
         source_class,
         icao: `${icao ?? ''}`.toUpperCase(),
         bearing_deg: Number.isFinite(Number(bearing_deg)) ? Number(bearing_deg) : null,
@@ -482,10 +653,7 @@ function SignalFloorShimmer({ timingView, timingWindowUs }) {
       for (const ev of tv.events) {
         if (ev.arrival_us <= cutoffUs || ev.arrival_us > renderNowUs) continue
         const bin = Math.floor(ev.arrival_us / SIGNAL_BIN_US)
-        const bucket = Math.max(
-          0,
-          Math.min(SIGNAL_BUCKET_COUNT - 1, Math.floor(((ev.signal_raw ?? 0) / 256) * SIGNAL_BUCKET_COUNT)),
-        )
+        const bucket = signalBucketIndex(ev.signal_dbfs, SIGNAL_BUCKET_COUNT)
         const row = bucketRows[bucket]
         row.set(bin, (row.get(bin) ?? 0) + 1)
       }
@@ -528,10 +696,10 @@ function SignalFloorShimmer({ timingView, timingWindowUs }) {
       ctx.fillStyle = '#8b949e'
       ctx.font = '10px monospace'
       ctx.textAlign = 'right'
-      ctx.fillText('255', left - 6, top + 8)
+      ctx.fillText('-48', left - 6, top + 8)
       ctx.fillText('0', left - 6, top + plotH)
       ctx.textAlign = 'left'
-      ctx.fillText('raw RSSI', left, h - 6)
+      ctx.fillText('signal dBFS', left, h - 6)
       ctx.textAlign = 'right'
       ctx.fillText(`${Math.round(timingWindowUs / 1_000_000)} s window`, w - 8, h - 6)
     }
@@ -543,7 +711,7 @@ function SignalFloorShimmer({ timingView, timingWindowUs }) {
   return (
     <Panel title="Signal-Floor Shimmer">
       <p style={{ fontSize: '0.72rem', color: '#484f58', margin: '0 0 0.4rem' }}>
-        Recent per-message signal distribution. Short-term shifts reveal desense, overload, attenuation, and traffic-mix changes that static minute summaries hide.
+        Recent per-message dBFS distribution. Short-term shifts reveal desense, overload, attenuation, and traffic-mix changes that static minute summaries hide.
       </p>
       {!timingView?.events?.length
         ? <p style={{ fontSize: '0.8rem', color: '#484f58' }}>Waiting for signal samples…</p>
@@ -1066,6 +1234,7 @@ function DFCadenceLanes({ timingView, cadenceBinMs, onCadenceBinMsChange, timing
 export default function TimingPage({ onSelectIcao }) {
   const [burstBinMs, setBurstBinMs] = useState(20)
   const [cadenceBinMs, setCadenceBinMs] = useState(50)
+  const [waterfallSliceMs, setWaterfallSliceMs] = useState(50)
   const [interrogatorWindowS, setInterrogatorWindowS] = useState(10)
   const [timingWindowS, setTimingWindowS] = useState(5)
   const [rawBearingColourMode, setRawBearingColourMode] = useState('strength')
@@ -1121,6 +1290,12 @@ export default function TimingPage({ onSelectIcao }) {
           timingWindowUs={timingWindowUs}
         />
       </div>
+      <MessageWaterfall
+        timingView={timingView}
+        timingWindowUs={timingWindowUs}
+        sliceMs={waterfallSliceMs}
+        onSliceMsChange={setWaterfallSliceMs}
+      />
       <div className={styles.row}>
         <SignalFloorShimmer
           timingView={timingView}

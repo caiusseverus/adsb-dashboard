@@ -122,7 +122,7 @@ void decode_cleanup(void);
  *
  * msg_bytes : raw Mode-S bytes (7 for short, 14 for long)
  * msg_len   : 7 or 14
- * signal    : Beast RSSI byte (0=strongest, 255=weakest) — stored for info only
+ * signal    : Beast amplitude byte (0=weakest, 255=strongest) — stored for info only
  * timestamp : 6-byte Beast timestamp (48-bit, 12 MHz clock)
  * result    : output struct; zeroed then populated on success
  *

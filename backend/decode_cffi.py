@@ -168,7 +168,7 @@ def decode_message(msg_bytes: bytes, signal: int = 0,
     Parameters
     ----------
     msg_bytes : raw bytes from Beast frame (after unescaping)
-    signal    : Beast RSSI byte (0 = strongest, 255 = weakest)
+    signal    : Beast amplitude byte (0 = weakest, 255 = strongest)
     timestamp : 48-bit Beast clock value
 
     Returns

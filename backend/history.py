@@ -225,7 +225,7 @@ async def skyview_history(hours: int = Query(24, ge=1, le=168)) -> dict:
 async def skyview_history_points(hours: int = Query(24, ge=1, le=168)) -> dict:
     """Individual coverage_samples points for Sky View history dot mode.
 
-    Returns points as [bearing_deg, range_nm, altitude_ft, signal_raw] for the
+    Returns points as [bearing_deg, range_nm, altitude_ft, signal_dbfs] for the
     last N hours. Downsampled to at most 20,000 points to keep payload manageable.
     """
     return await asyncio.to_thread(stats_db.query_skyview_points, hours)

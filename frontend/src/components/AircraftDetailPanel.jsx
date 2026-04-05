@@ -5,6 +5,7 @@ import styles from './AircraftDetailPanel.module.css'
 import { formatOperator } from '../utils/formatOperator'
 import { EMERGENCY_SQUAWKS } from '../utils/squawks'
 import { fmtAlt } from '../utils/format'
+import { formatSignalDbfs } from '../utils/signal'
 import { SourceBadge, posSourceType } from './SourceBadge'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
@@ -358,7 +359,7 @@ export default function AircraftDetailPanel({ icao, snapshot, onClose, onRefresh
                         ? `${liveData.squawk}${EMERGENCY_SQUAWKS[liveData.squawk] ? ` — ${EMERGENCY_SQUAWKS[liveData.squawk]}` : ''}`
                         : null
                     } />
-                    <Field label="Signal"     value={liveData.signal != null ? `${Math.round((255 - liveData.signal) / 2.55)}%` : null} />
+                    <Field label="Signal"     value={formatSignalDbfs(liveData.signal)} />
                     <Field label="Messages"   value={liveData.msg_count} />
                     <Field label="Last seen"  value={liveData.age != null ? `${liveData.age}s ago` : null} />
 

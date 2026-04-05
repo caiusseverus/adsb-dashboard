@@ -519,7 +519,7 @@ async def _db_writer() -> None:
                   if ((ac.get("last_pos_age") is not None and ac.get("last_pos_age") <= config.POS_FRESH_S)
                       and (ac.get("last_alt_age") is not None and ac.get("last_alt_age") <= config.ALT_FRESH_S))
                   else None),
-                 ac.get("signal"),
+                 ac.get("signal_raw"),
                  1 if ac.get("mlat") else 0)
                 for ac in snapshot.get("aircraft", [])
                 if (ac.get("bearing_deg") is not None and ac.get("range_nm") is not None
@@ -1165,25 +1165,25 @@ _HF_DF_FAMILIES = {
 }
 
 
-def _bucket_counts(now_us: int, window_us: int, bin_ms: int, events: list[tuple[int, int, int, int, int, str, float | None]]) -> list[int]:
+def _bucket_counts(now_us: int, window_us: int, bin_ms: int, events: list[tuple[int, int, int, float | None, int, str, float | None]]) -> list[int]:
     bin_us = max(1_000, int(bin_ms * 1000))
     bucket_count = max(1, (window_us + bin_us - 1) // bin_us)
     counts = [0] * bucket_count
     cutoff_us = max(0, now_us - window_us)
-    for arrival_us, _df, _msg_len, _signal_raw, _source_class, _icao, _bearing_deg in events:
+    for arrival_us, _df, _msg_len, _signal_dbfs, _source_class, _icao, _bearing_deg in events:
         idx = (arrival_us - cutoff_us) // bin_us
         if 0 <= idx < bucket_count:
             counts[idx] += 1
     return counts
 
 
-def _build_df_family_bins(now_us: int, window_us: int, bin_ms: int, events: list[tuple[int, int, int, int, int, str, float | None]]) -> dict[str, list[int]]:
+def _build_df_family_bins(now_us: int, window_us: int, bin_ms: int, events: list[tuple[int, int, int, float | None, int, str, float | None]]) -> dict[str, list[int]]:
     bin_us = max(1_000, int(bin_ms * 1000))
     bucket_count = max(1, (window_us + bin_us - 1) // bin_us)
     cutoff_us = max(0, now_us - window_us)
     lanes = {name: [0] * bucket_count for name in _HF_DF_FAMILIES}
     other = [0] * bucket_count
-    for arrival_us, df, _msg_len, _signal_raw, _source_class, _icao, _bearing_deg in events:
+    for arrival_us, df, _msg_len, _signal_dbfs, _source_class, _icao, _bearing_deg in events:
         idx = (arrival_us - cutoff_us) // bin_us
         if idx < 0 or idx >= bucket_count:
             continue
@@ -1242,8 +1242,8 @@ async def timing_websocket_endpoint(ws: WebSocket) -> None:
                 await ws.send_text(_json_dumps({
                     "now_us": state.get_timing_now_us(),
                     "events": [
-                        [seq, arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg]
-                        for seq, arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg in events_raw
+                        [seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg]
+                        for seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg in events_raw
                     ],
                 }))
                 last_heartbeat = now
@@ -1393,8 +1393,8 @@ async def timing_page_websocket_endpoint(ws: WebSocket) -> None:
                 "now_us": state.get_timing_now_us(),
                 "window_s": timing_window_s,
                 "events": [
-                    [seq, arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg]
-                    for seq, arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg in events_raw
+                    [seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg]
+                    for seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg in events_raw
                 ],
             }
             interrogator_payload = _build_interrogator_payload(interrogator_window_s)

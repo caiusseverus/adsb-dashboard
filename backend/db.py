@@ -16,20 +16,13 @@ from pathlib import Path
 
 import config
 import enrichment as _enrichment
+from signal_utils import raw_signal_to_dbfs
 
 log = logging.getLogger(__name__)
 
 
 def _raw_signal_to_dbfs(raw: float | int | None) -> float | None:
-    """Convert a Beast RSSI byte to dBFS.
-
-    Beast convention: 0 = strongest (0 dBFS), 255 = weakest (-127.5 dBFS).
-    airspy_adsb encodes as raw = -2 * dBFS, so dBFS = -(raw / 2).
-    """
-    if raw is None:
-        return None
-    raw = max(0.0, min(255.0, float(raw)))
-    return round(-(raw / 2.0), 1)
+    return raw_signal_to_dbfs(raw)
 
 
 def _raw_signal_to_dbfs_bucket(raw: float | int | None) -> int | None:
@@ -1320,15 +1313,15 @@ class StatsDB:
             """, (cutoff,)).fetchall()
         return [{"ts": r["ts"], "ac": r["ac_total"],
                  "msgs": round(r["msg_mean"] * 60),
-                 "signal": round(r["signal_avg"], 1)} for r in rows]
+                 "signal": _raw_signal_to_dbfs(r["signal_avg"])} for r in rows]
 
     def query_signal_percentiles(self, days: int) -> list[dict]:
         """Hourly signal strength percentiles (10th/50th/90th) over the last N days.
 
-        Beast/readsb signal bytes are stored raw (0=strongest, 255=weakest).
-        We sort them ascending per hour so that:
-          p10 raw → strongest 10% of signals → near 0 dBFS
-          p90 raw → weakest 10% of signals  → more negative dBFS
+        Beast/raw signal bytes are stored as amplitudes (0=weakest, 255=strongest).
+        Convert via the readsb formula and report:
+          strong → upper tail, near 0 dBFS
+          weak   → lower tail, more negative dBFS
         """
         cutoff = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
         with self._connect() as conn:
@@ -1352,12 +1345,12 @@ class StatsDB:
 
         result = []
         for hour in sorted(by_hour.keys()):
-            vals = by_hour[hour]  # sorted ascending: small raw = strong signal
+            vals = by_hour[hour]  # sorted ascending: small raw = weak signal
             result.append({
                 "ts":     hour,
-                "strong": percentile(vals, 10),  # p10 raw = strongest → near 0 dBFS
+                "strong": percentile(vals, 90),  # upper tail of raw amplitudes
                 "median": percentile(vals, 50),
-                "weak":   percentile(vals, 90),  # p90 raw = weakest → large negative dBFS
+                "weak":   percentile(vals, 10),  # lower tail of raw amplitudes
             })
         return result
 
@@ -3132,7 +3125,7 @@ class StatsDB:
         return {"hours": hours, "cells": cells}
 
     def query_skyview_points(self, hours: int = 24) -> dict:
-        """Return individual coverage_samples as [bearing_deg, range_nm, altitude_ft, signal_raw].
+        """Return individual coverage_samples as [bearing_deg, range_nm, altitude_ft, signal_dbfs].
 
         Downsampled to at most 20,000 rows using SQL LIMIT with a time-based ORDER
         so the most recent points are preferred.
@@ -3155,7 +3148,7 @@ class StatsDB:
             round(float(r["bearing_deg"]), 1),
             round(float(r["range_nm"]), 2),
             int(r["altitude"]),
-            int(r["signal"]) if r["signal"] is not None else 128,
+            _raw_signal_to_dbfs(r["signal"]) if r["signal"] is not None else None,
         ] for r in rows]
         return {"hours": hours, "points": points}
 

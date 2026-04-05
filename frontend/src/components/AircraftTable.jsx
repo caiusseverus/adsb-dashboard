@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import styles from './AircraftTable.module.css'
 import { formatOperator } from '../utils/formatOperator'
+import { formatSignalDbfs, signalColour, signalStrengthPercent } from '../utils/signal'
 import { EMERGENCY_SQUAWKS } from '../utils/squawks'
 import { useAircraftFilter, aircraftPassesFilter } from '../hooks/useAircraftFilter'
 import { SourceBadge } from './SourceBadge'
@@ -32,12 +33,10 @@ function fmtAge(age) {
 }
 
 function SignalBar({ value }) {
-  // Beast RSSI byte: 0=strongest, 255=weakest (log scale, -0.5*value dBFS)
-  // Convert to 0-100% for display (invert so higher = stronger)
-  const pct = value != null ? Math.max(0, Math.min(100, Math.round((255 - value) / 2.55))) : 0
-  const colour = pct > 66 ? '#3fb950' : pct > 33 ? '#d29922' : '#f85149'
+  const pct = signalStrengthPercent(value) ?? 0
+  const colour = signalColour(value)
   return (
-    <div className={styles.signalWrap} title={`${pct}%`}>
+    <div className={styles.signalWrap} title={formatSignalDbfs(value)}>
       <div className={styles.signalBar} style={{ width: `${pct}%`, background: colour }} />
     </div>
   )
@@ -74,7 +73,7 @@ function sortAircraft(aircraft, col, asc) {
     if (av == null && bv == null) return 0
     if (av == null) return 1
     if (bv == null) return -1
-    // signal: lower raw value = stronger, so invert for intuitive "best first"
+    // signal: less-negative dBFS is stronger, so invert for intuitive "best first"
     if (col === 'signal') { av = -av; bv = -bv }
     const cmp = typeof av === 'string' ? av.localeCompare(bv) : av - bv
     return asc ? cmp : -cmp

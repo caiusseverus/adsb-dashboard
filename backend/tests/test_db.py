@@ -200,3 +200,33 @@ class TestPositionDecodeRate:
         assert row["mlat_pct"] == 25.0
         assert row["no_pos_pct"] == 25.0
         assert round(row["adsb_pct"] + row["mlat_pct"] + row["no_pos_pct"], 1) == 100.0
+
+
+class TestSignalSemantics:
+    def test_query_scatter_returns_canonical_dbfs(self, db):
+        now_ts = int(datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc).timestamp())
+        with db._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO minute_stats
+                    (ts, msg_min, msg_max, msg_mean, ac_total, ac_civil, ac_military,
+                     signal_avg, signal_min, signal_max, ac_with_pos, ac_mlat)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (now_ts, 1, 2, 3.0, 4, 3, 1, 50.0, 20.0, 80.0, 2, 0),
+            )
+
+        rows = db.query_receiver_scatter(days=365)
+
+        assert rows == [{"ts": now_ts, "ac": 4, "msgs": 180, "signal": -14.2}]
+
+    def test_query_skyview_points_returns_canonical_dbfs(self, db):
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        db.write_coverage_tuples([
+            (now_ts, "ABC123", 123.4, 45.6, 12000, 84, 0),
+        ])
+
+        payload = db.query_skyview_points(hours=24)
+
+        assert payload["hours"] == 24
+        assert payload["points"] == [[123.4, 45.6, 12000, -9.6]]

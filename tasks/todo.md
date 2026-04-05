@@ -538,3 +538,73 @@ Updated: 2026-04-04
   - Increased the `Bearing-Time Sweep Heatmap` to `10°` sectors by moving from `18` to `36` angular buckets in [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx).
   - Added a second full-width `Raw Bearing Raster` panel in [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx) that plots exact per-message bearings on a tall `0.5°/px` canvas.
   - Added desktop-oriented raster controls for color mode (`strength`, `message type`, `source class`) plus an optional `phosphor` fade mode that dims older points as they scroll left.
+
+## OpenSpec Change: `add-high-frequency-message-waterfall`
+
+- [x] Review the current Timing-page high-frequency visuals and keep the waterfall scope distinct from the existing bearing heatmap and raw bearing raster.
+- [x] Implement a fixed-slice `DF-family` message waterfall in [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx) using the shared incremental timing-event buffer and completed absolute time slices only.
+- [x] Keep the panel on the existing shared Timing-page stream without widening the backend event model or adding a new transport.
+- [x] Verify the frontend build and perform a focused check that visible rows only advance on completed slice boundaries.
+
+### Review
+
+- Plan verified on 2026-04-05 against the existing Timing-page panels in [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx) and the narrowed OpenSpec artifacts under [openspec/changes/add-high-frequency-message-waterfall](/home/keith/claude/adsb-dashboard/openspec/changes/add-high-frequency-message-waterfall).
+- Scope decision:
+  - `HFV2D` is implemented as a `DF-family` waterfall first.
+  - `bearing` is intentionally excluded because the page already has both a bucketed bearing heatmap and an exact-message bearing raster.
+  - The first slice remains frontend-only and reuses the existing shared timing-event buffer.
+- Implementation result on 2026-04-05:
+  - Added [frontend/src/utils/timingWaterfall.js](/home/keith/claude/adsb-dashboard/frontend/src/utils/timingWaterfall.js) as a pure helper for fixed-slice `DF-family` aggregation from the shared timing-event buffer.
+  - Updated [frontend/src/pages/TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx) with a full-width `Message Waterfall` panel, a `50/100 ms` slice control, and a row-stable render path that only rebuilds visible rows when the displayed completed-slice window advances.
+  - Kept the panel distinct from the existing charts by using stacked slice rows with `DF-family` columns rather than another bearing plot or another lane-separated cadence chart.
+- Verification:
+  - `npm run build` in `frontend/`
+  - `node --input-type=module -e "import { buildDfWaterfallRows } from './frontend/src/utils/timingWaterfall.js'; const events=[{arrival_us:1100000,df:17},{arrival_us:1120000,df:17},{arrival_us:1180000,df:11},{arrival_us:1210000,df:18},{arrival_us:1260000,df:18},{arrival_us:1310000,df:20}]; const base=buildDfWaterfallRows({events,renderNowUs:1299999,visibleWindowUs:300000,sliceUs:50000}); const next=buildDfWaterfallRows({events,renderNowUs:1300000,visibleWindowUs:300000,sliceUs:50000}); console.log(JSON.stringify({baseNewest:base.newestVisibleSliceIndex,nextNewest:next.newestVisibleSliceIndex,baseTopCounts:base.rows[0]?.counts,nextTopCounts:next.rows[0]?.counts}, null, 2));"`
+  - The helper check confirmed that the newest visible row stayed on slice `23` just before the boundary and advanced to slice `24` only once the next slice was complete, matching the completed-slice display rule.
+- Follow-up correction on 2026-04-05:
+  - The first waterfall pass normalized cell brightness against the current visible-window peak, which made completed boxes change brightness as rows aged down the plot.
+  - [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx) now uses a fixed log-scaled count-to-alpha transfer curve based on per-family event rate rather than a moving window max, so completed rows should keep stable intensity.
+- Follow-up correction on 2026-04-05:
+  - The `DF-family` version was still too coarse and the alternating row backgrounds were creating artificial periodic bands that read like real traffic structure.
+  - [frontend/src/utils/timingWaterfall.js](/home/keith/claude/adsb-dashboard/frontend/src/utils/timingWaterfall.js) now buckets by concrete raw `DF` values (`17`, `18`, `11`, `20`, `21`, `4`, `5`, `16`, `0`, `other`) instead of broad families.
+  - [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx) now removes the zebra row striping and adds a `20 ms` slice option so the waterfall carries more genuine texture from the data itself.
+
+## OpenSpec Change: `fix-signal-dbfs-semantics`
+
+- [x] Review the current signal path across Beast ingest, readsb ingest, timing-event serialization, snapshot/history APIs, and frontend consumers.
+- [x] Define one canonical display contract for signal as readsb-style `dBFS`, while keeping any raw byte handling backend-internal only where it is still needed for storage or ingest.
+- [x] Update backend public payloads and shared timing-event serialization so frontend-facing signal values are emitted in canonical `dBFS` semantics across Beast and readsb paths.
+- [x] Update frontend signal-based displays, labels, and legends to consume canonical `dBFS` values instead of raw-byte assumptions.
+- [x] Verify the backend/frontend changes with focused tests, `npm run build`, and a distribution sanity check against the documented readsb/graphs1090 expectations.
+
+### Review
+
+- Plan verified on 2026-04-05 against the current signal flow in [backend/aircraft_state.py](/home/keith/claude/adsb-dashboard/backend/aircraft_state.py), [backend/main.py](/home/keith/claude/adsb-dashboard/backend/main.py), [backend/timing.py](/home/keith/claude/adsb-dashboard/backend/timing.py), [backend/db.py](/home/keith/claude/adsb-dashboard/backend/db.py), [frontend/src/pages/ReceiverPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/ReceiverPage.jsx), [frontend/src/pages/TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx), [frontend/src/components/AircraftTable.jsx](/home/keith/claude/adsb-dashboard/frontend/src/components/AircraftTable.jsx), [frontend/src/components/AircraftDetailPanel.jsx](/home/keith/claude/adsb-dashboard/frontend/src/components/AircraftDetailPanel.jsx), and [frontend/src/pages/SkyView.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/SkyView.jsx).
+- Contract decision for this change:
+  - public/frontend-facing signal values move to canonical `dBFS` semantics
+  - raw Beast/readsb byte equivalents stay backend-internal where persistence or ingest still needs them
+  - timing events should stop exposing `signal_raw` and instead expose display-grade `signal_dbfs`
+- Compatibility constraint:
+  - `coverage_samples` and minute aggregates can keep storing raw/internal values for now because existing history queries already convert those values server-side, but that raw form should no longer leak through public live APIs unless a dedicated debug need appears
+- Implementation result on 2026-04-05:
+  - Added [signal_utils.py](/home/keith/claude/adsb-dashboard/backend/signal_utils.py) so raw Beast bytes and canonical `dBFS` conversions are defined once and reused consistently.
+  - Updated [aircraft_state.py](/home/keith/claude/adsb-dashboard/backend/aircraft_state.py) so live aircraft snapshots now expose canonical `signal` in `dBFS`, retain explicit `signal_raw` only for internal/raw consumers, and store high-frequency timing events with `signal_dbfs` rather than raw bytes.
+  - Updated [timing.py](/home/keith/claude/adsb-dashboard/backend/timing.py), [main.py](/home/keith/claude/adsb-dashboard/backend/main.py), [db.py](/home/keith/claude/adsb-dashboard/backend/db.py), and [history.py](/home/keith/claude/adsb-dashboard/backend/history.py) so live timing payloads, receiver scatter data, and SkyView history points all expose canonical display-grade signal semantics, while minute/coverage persistence keeps using raw values internally.
+  - Added [frontend/src/utils/signal.js](/home/keith/claude/adsb-dashboard/frontend/src/utils/signal.js) and updated [ReceiverPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/ReceiverPage.jsx), [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx), [AircraftTable.jsx](/home/keith/claude/adsb-dashboard/frontend/src/components/AircraftTable.jsx), [AircraftDetailPanel.jsx](/home/keith/claude/adsb-dashboard/frontend/src/components/AircraftDetailPanel.jsx), and [SkyView.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/SkyView.jsx) so existing displays use one shared `dBFS` formatter/colour contract instead of local raw-byte assumptions.
+- Verification:
+  - `python3 -m py_compile backend/aircraft_state.py backend/db.py backend/history.py backend/main.py backend/signal_utils.py backend/timing.py`
+  - `env UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_timing_events.py tests/test_db.py`
+  - `npm run build` in `frontend/`
+  - Added backend assertions in [test_timing_events.py](/home/keith/claude/adsb-dashboard/backend/tests/test_timing_events.py) and [test_db.py](/home/keith/claude/adsb-dashboard/backend/tests/test_db.py) covering canonical `dBFS` event/API shapes and representative raw-to-`dBFS` conversions.
+- Distribution sanity check on 2026-04-05:
+  - Queried the last 24 hours of persisted `minute_stats` in [adsb.db](/home/keith/claude/adsb-dashboard/backend/data/adsb.db) using the same raw-to-`dBFS` conversion now used by the live APIs.
+  - Observed minute-average distribution: peak `-6.1 dBFS`, floor `-31.1 dBFS`, mean `-21.6 dBFS`, interquartile range `-24.3` to `-20.1 dBFS`.
+  - Interpretation:
+    - the mean and spread are now in the expected readsb-style negative-`dBFS` space rather than the old raw-byte/public-contract split
+    - persisted minute averages are narrower than the user’s per-message readsb/graphs1090 reference distribution, so they are only a sanity check, not a perfect acceptance proxy for live per-message extremes
+- Follow-up correction on 2026-04-05:
+  - The first implementation used the wrong Beast conversion model (`-(raw/2)`) and therefore produced live aircraft values that were far too strong compared with readsb.
+  - Updated [signal_utils.py](/home/keith/claude/adsb-dashboard/backend/signal_utils.py) to use readsb’s actual Beast amplitude pipeline: normalize amplitude, square to power, then convert with `10 * log10(...)`.
+  - Updated [aircraft_state.py](/home/keith/claude/adsb-dashboard/backend/aircraft_state.py) so Beast-fed aircraft signals now use readsb-style rolling 8-sample power averaging for the live aircraft value instead of exposing the last raw byte through an incorrect direct mapping.
+  - Updated [decode_api.c](/home/keith/claude/adsb-dashboard/backend/native/decode_api.c) and rebuilt `backend/native/libdecode.so` with `make` so the native decoder path uses the same Beast signal normalization as the Python path.
+  - Added focused formula/inverse tests in [test_signal_utils.py](/home/keith/claude/adsb-dashboard/backend/tests/test_signal_utils.py) and reran the backend signal test set successfully.

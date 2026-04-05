@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import styles from './SkyView.module.css'
 import { EMERGENCY_SQUAWKS } from '../utils/squawks'
 import { useAircraftFilter } from '../hooks/useAircraftFilter'
+import { signalColour } from '../utils/signal'
 import { TYPE_GROUPS, TYPE_GROUP_OTHER_COLOR, getTypeGroup, buildNameColorMap } from '../utils/typeGroups'
 
 const FEET_PER_NM      = 6076.115
@@ -419,14 +420,11 @@ export default function SkyView({ snapshot, onSelectIcao }) {
 
     // ── History dots (individual coverage_samples points) ────────────
     if (histData?.points?.length) {
-      for (const [bearing, range, alt, sigRaw] of histData.points) {
+      for (const [bearing, range, alt, signalDbfs] of histData.points) {
         const pos = toHXY(bearing, range, alt)
         if (!pos) continue
-        // Map signal raw byte to colour: 0 (strongest) = green, 255 (weakest) = red
-        const pct = Math.max(0, Math.min(255, sigRaw)) / 255
-        const r = Math.round(60 + 180 * pct)
-        const g = Math.round(180 - 120 * pct)
-        ctx.fillStyle = `rgba(${r},${g},50,0.35)`
+        const base = signalColour(signalDbfs)
+        ctx.fillStyle = `${base}59`
         ctx.beginPath()
         ctx.arc(pos.x, pos.y, 1.5, 0, Math.PI * 2)
         ctx.fill()

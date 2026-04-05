@@ -5,6 +5,7 @@ import {
   AreaChart, Area, Legend,
 } from 'recharts'
 import { useFetch } from '../utils/useFetch'
+import { formatSignalDbfs, signalColour } from '../utils/signal'
 import DFHeatmap from '../components/DFHeatmap'
 import SignalHeatmap from '../components/SignalHeatmap'
 import styles from './ReceiverPage.module.css'
@@ -16,29 +17,6 @@ const TIMING_WS_URL = import.meta.env.PROD
 const INTERROGATOR_WS_URL = import.meta.env.PROD
   ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/interrogators`
   : 'ws://localhost:8000/ws/interrogators'
-
-// Beast RSSI byte: 0=strongest (0 dBFS), 255=weakest (-127.5 dBFS)
-// airspy_adsb encodes as raw = -2 * dBFS, so dBFS = -(raw / 2)
-function rawToDbfs(raw) {
-  if (raw == null) return null
-  const clamped = Math.max(0, Math.min(255, Number(raw)))
-  return Math.round(-clamped / 2 * 10) / 10
-}
-function fmtDbfs(raw) {
-  const v = rawToDbfs(raw)
-  return v != null ? `${v.toFixed(1)} dBFS` : '—'
-}
-// Keep % for colour coding only
-function rssiByte(raw) {
-  return raw != null ? Math.max(0, Math.min(100, Math.round((255 - raw) / 2.55))) : null
-}
-function signalColour(raw) {
-  const pct = rssiByte(raw)
-  if (pct == null) return '#484f58'
-  if (pct > 66) return '#3fb950'
-  if (pct > 33) return '#d29922'
-  return '#f85149'
-}
 
 function formatAgeShort(seconds) {
   if (!Number.isFinite(seconds) || seconds < 0) return '—'
@@ -149,7 +127,7 @@ function ScatterPlot({ days, onDaysChange }) {
                   <div className={styles.tooltip}>
                     <div>Aircraft: {d.ac}</div>
                     <div>Msgs/sec: {d.msgs}</div>
-                    <div>Signal avg: {fmtDbfs(d.signal)}</div>
+                    <div>Signal avg: {formatSignalDbfs(d.signal)}</div>
                     <div>Date: {date}</div>
                   </div>
                 )

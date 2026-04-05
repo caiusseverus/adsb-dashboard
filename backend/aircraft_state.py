@@ -30,6 +30,13 @@ import acas as acas_decoder
 import config
 import enrichment
 from db import INTERESTING_TYPE_CODES
+from signal_utils import (
+    average_raw_signals_to_dbfs,
+    clamp_dbfs,
+    clamp_raw_signal,
+    dbfs_to_raw_signal,
+    raw_signal_to_dbfs,
+)
 from utils import country_from_registration
 
 log = logging.getLogger(__name__)
@@ -570,6 +577,7 @@ def _aircraft_to_dict(ac: "Aircraft", now: float) -> tuple[dict, bool, bool]:
         "altitude":          ac.altitude if _alt_baro_reliable(ac) else None,
         "squawk":            ac.squawk,
         "signal":            ac.signal,
+        "signal_raw":        ac.signal_raw,
         "msg_count":         ac.msg_count,
         "age":               round(now - ac.last_seen, 1),
         "registration":      ac.registration,
@@ -1063,7 +1071,9 @@ class Aircraft:
     callsign: Optional[str] = None
     altitude: Optional[int] = None
     squawk: Optional[str] = None
-    signal: Optional[int] = None   # last RSSI byte from Beast
+    signal: Optional[float] = None   # canonical readsb-style aircraft dBFS
+    signal_raw: Optional[int] = None
+    signal_recent_raws: deque[int] = field(default_factory=lambda: deque(maxlen=8), repr=False)
     msg_count: int = 0
     registration: Optional[str] = None
     type_code: Optional[str] = None
@@ -1577,11 +1587,11 @@ class AircraftState:
         self._iid_events: deque[tuple[float, int, int | None, int, str]] = deque(maxlen=50_000)
 
         # High-frequency message timing buffer for the timing page/stream.
-        # Stores (seq, arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg)
+        # Stores (seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg)
         # for primary-stream Beast messages.
         # At 4000 msg/s (dense European airspace) × 15s = 60,000 entries.
         # Needs to cover timing_window_s (up to 10 s) + render holdback (0.65 s) + margin.
-        self._timing_events: deque[tuple[int, int, int, int, int, int, str, float | None]] = deque(maxlen=60_000)
+        self._timing_events: deque[tuple[int, int, int, int, float | None, int, str, float | None]] = deque(maxlen=60_000)
         self._timing_seq: int = 0
         self._timing_base_ticks: int | None = None
         self._timing_last_raw_ticks: int | None = None
@@ -1722,8 +1732,8 @@ class AircraftState:
 
     # ── DF11 interrogator helpers ────────────────────────────────────────────
 
-    def get_timing_events(self, since_seq: int) -> list[tuple[int, int, int, int, int, int, str, float | None]]:
-        """Return (seq, arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg) tuples with seq > since_seq.
+    def get_timing_events(self, since_seq: int) -> list[tuple[int, int, int, int, float | None, int, str, float | None]]:
+        """Return (seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg) tuples with seq > since_seq.
 
         Caller supplies the sequence id of the last event it received so only new
         events are returned, keeping response sizes small (~200 msg / 100 ms poll).
@@ -1734,8 +1744,8 @@ class AircraftState:
             events = tuple(self._timing_events)
         if events and since_seq > events[-1][0]:
             since_seq = 0
-        return [(seq, arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg)
-                for seq, arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg in events
+        return [(seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg)
+                for seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg in events
                 if seq > since_seq]
 
     def get_timing_now_us(self) -> int:
@@ -1744,8 +1754,8 @@ class AircraftState:
         delta_us = max(0, int((now_mono - self._timing_last_wall_monotonic) * 1_000_000))
         return self._timing_last_arrival_us + delta_us
 
-    def get_recent_timing_window(self, window_us: int) -> tuple[int, list[tuple[int, int, int, int, int, str, float | None]]]:
-        """Return recent timing events as (arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg)."""
+    def get_recent_timing_window(self, window_us: int) -> tuple[int, list[tuple[int, int, int, float | None, int, str, float | None]]]:
+        """Return recent timing events as (arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg)."""
         with self._lock:
             events = tuple(self._timing_events)
             now_mono = time.monotonic()
@@ -1753,8 +1763,8 @@ class AircraftState:
             now_us = self._timing_last_arrival_us + delta_us
         cutoff_us = max(0, now_us - window_us)
         recent = [
-            (arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg)
-            for _seq, arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg in events
+            (arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg)
+            for _seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg in events
             if arrival_us >= cutoff_us
         ]
         return now_us, recent
@@ -1967,6 +1977,7 @@ class AircraftState:
                 "altitude":      ac.altitude if _alt_baro_reliable(ac) else None,
                 "squawk":        ac.squawk,
                 "signal":        ac.signal,
+                "signal_raw":    ac.signal_raw,
                 "msg_count":     ac.msg_count,
                 "age":           round(now - ac.last_seen, 1),
                 "registration":  ac.registration,
@@ -2377,7 +2388,7 @@ class AircraftState:
             arrival_us,
             df,
             raw_len,
-            max(0, min(255, int(signal))),
+            raw_signal_to_dbfs(signal),
             self._classify_timing_source(df),
             icao,
             bearing_deg,
@@ -2524,7 +2535,11 @@ class AircraftState:
         ac = self._aircraft[icao]
         ac.last_seen = now
         ac.msg_count += 1
-        ac.signal = signal
+        raw_signal = clamp_raw_signal(signal)
+        ac.signal_raw = raw_signal
+        if raw_signal is not None:
+            ac.signal_recent_raws.append(raw_signal)
+            ac.signal = average_raw_signals_to_dbfs(ac.signal_recent_raws)
         if mlat:
             # MLAT-timestamp frame.  Only tag if we haven't confirmed a real ADS-B
             # transponder: some clients stamp ALL forwarded messages (including genuine
@@ -2561,7 +2576,7 @@ class AircraftState:
 
         # Accumulate per-minute signal and DF stats
         if signal is not None:
-            self._cur_min_signals.append(signal)
+            self._cur_min_signals.append(clamp_raw_signal(signal))
         self._cur_min_df_counts[df] = self._cur_min_df_counts.get(df, 0) + 1
 
         # --- Decode ADS-B (DF 17 and DF 18) ---
@@ -2860,12 +2875,16 @@ class AircraftState:
                 ac.altitude = None
                 ac.alt_reliable = 0
 
-            # Signal: readsb rssi is dBFS; convert to Beast raw byte convention
-            # (raw = -2 * dBFS, 0=strongest) used throughout the app.
+            # readsb already reports aircraft RSSI in display-grade dBFS.
+            # Keep that as the live/public value, and derive a Beast-equivalent
+            # raw amplitude byte only for existing storage paths that still use it.
             rssi = ac_data.get("rssi")
             if rssi is not None:
-                ac.signal = max(0, min(255, int(round(-2.0 * float(rssi)))))
-                self._cur_min_signals.append(ac.signal)
+                ac.signal = clamp_dbfs(float(rssi))
+                ac.signal_raw = dbfs_to_raw_signal(ac.signal)
+                ac.signal_recent_raws.clear()
+                if ac.signal_raw is not None:
+                    self._cur_min_signals.append(ac.signal_raw)
 
             # Per-aircraft message delta (readsb gives cumulative from its start)
             readsb_msgs = ac_data.get("messages")

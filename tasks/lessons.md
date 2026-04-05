@@ -2,6 +2,9 @@
 
 ## 2026-04-04
 
+- When planning a new high-frequency panel, check it against every existing Timing-page visual first. Do not propose another bearing view if the page already has both bucketed and exact bearing displays; make the new panel's informational role distinct up front.
+- For fixed-slice waterfall panels, do not normalize cell brightness against the current visible-window peak. That makes completed rows change brightness as stronger or weaker slices enter and leave the window; use a fixed transfer curve instead.
+- For dense waterfall/raster panels, do not add alternating row backgrounds or other decorative striping. Operators will read that scaffolding as real periodic structure if the data itself is subtle.
 - Before carrying a deficiency forward into implementation, check whether a later review or user decision already resolved it as "no change needed" and record that disposition in `tasks/todo.md` instead of assuming the remediation doc is still authoritative.
 - Do not treat fast, low-value loading states as automatic wins. Verify whether the user actually wants the extra UI before planning or implementing it.
 - When adding live receiver diagnostics, do not use a one-shot fetch hook for panels that are expected to update continuously. Match the page's existing polling model and verify that the UI refreshes without requiring a control change.
@@ -20,3 +23,4 @@
 - For message-type timing lanes, do not derive the displayed lane set only from the active short window. Keep a stable default DF lane order and only append extra observed types, otherwise rows will appear and disappear during normal traffic variation.
 - On a multiplexed live page, display-control changes must not recreate the shared websocket unless the stream identity really changed. Reconnecting on cosmetic control changes can reset incremental cursors and leak duplicate history into unrelated panels.
 - Incremental timing buffers should deduplicate by sequence ID when merging, even if the transport is expected not to resend. That makes the UI robust against reconnects or config races.
+- When matching an external decoder or protocol implementation, do not substitute a “close enough” linear transform for a documented signal formula. Trace the exact amplitude/power/log pipeline from the upstream implementation, including any smoothing window or epsilon floor, before changing public semantics.

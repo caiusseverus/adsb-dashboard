@@ -108,7 +108,10 @@ int decode_message(const uint8_t *msg_bytes, int msg_len,
     memcpy(mm.verbatim, msg_bytes, (size_t)msg_len);
 
     mm.msgbits     = msg_len * 8;
-    mm.signalLevel = (double)(255 - signal) / 255.0; /* Beast RSSI→0–1 */
+    {
+        double amplitude = (double)signal / 255.0;
+        mm.signalLevel = amplitude * amplitude; /* Beast amplitude byte → normalized power */
+    }
     mm.timestamp   = (int64_t)timestamp;
     mm.remote      = 1;   /* treat as remote (network) frame — skips SDR bits */
 

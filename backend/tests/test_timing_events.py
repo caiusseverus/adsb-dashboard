@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import math
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -20,12 +21,12 @@ def test_timing_events_store_inline_icao_without_aircraft_lookup():
     events = state.get_timing_events(0)
 
     assert len(events) == 1
-    seq, arrival_us, df, msg_len, signal_raw, source_class, icao, bearing_deg = events[0]
+    seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg = events[0]
     assert seq == 1
     assert arrival_us == 0
     assert df == 17
     assert msg_len == 14
-    assert signal_raw == 37
+    assert math.isclose(signal_dbfs, -16.8)
     assert source_class == int(state._classify_timing_source(17))
     assert icao == "ABC123"
     assert bearing_deg == 123.4
@@ -39,7 +40,7 @@ def test_timing_events_store_none_when_bearing_is_unavailable():
 
     events = state.get_timing_events(0)
 
-    assert events == [(1, 0, 11, 7, 12, int(state._classify_timing_source(11)), "ABC123", None)]
+    assert events == [(1, 0, 11, 7, -26.5, int(state._classify_timing_source(11)), "ABC123", None)]
 
 
 def test_published_position_gates_bearing_before_timing_event_record():
@@ -63,7 +64,7 @@ def test_timing_events_endpoint_serializes_widened_shape():
     class FakeState:
         def get_timing_events(self, since_seq):
             assert since_seq == 0
-            return [(7, 12345, 17, 14, 21, 6, "ABC123", 278.6)]
+            return [(7, 12345, 17, 14, -10.5, 6, "ABC123", 278.6)]
 
         def get_timing_now_us(self):
             return 13000
@@ -74,5 +75,5 @@ def test_timing_events_endpoint_serializes_widened_shape():
 
     assert payload == {
         "now_us": 13000,
-        "events": [[7, 12345, 17, 14, 21, 6, "ABC123", 278.6]],
+        "events": [[7, 12345, 17, 14, -10.5, 6, "ABC123", 278.6]],
     }
