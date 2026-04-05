@@ -1587,11 +1587,12 @@ class AircraftState:
         self._iid_events: deque[tuple[float, int, int | None, int, str]] = deque(maxlen=50_000)
 
         # High-frequency message timing buffer for the timing page/stream.
-        # Stores (seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg)
+        # Stores
+        # (seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg, range_nm, iid)
         # for primary-stream Beast messages.
         # At 4000 msg/s (dense European airspace) × 15s = 60,000 entries.
         # Needs to cover timing_window_s (up to 10 s) + render holdback (0.65 s) + margin.
-        self._timing_events: deque[tuple[int, int, int, int, float | None, int, str, float | None]] = deque(maxlen=60_000)
+        self._timing_events: deque[tuple[int, int, int, int, float | None, int, str, float | None, float | None, int | None]] = deque(maxlen=60_000)
         self._timing_seq: int = 0
         self._timing_base_ticks: int | None = None
         self._timing_last_raw_ticks: int | None = None
@@ -1732,8 +1733,8 @@ class AircraftState:
 
     # ── DF11 interrogator helpers ────────────────────────────────────────────
 
-    def get_timing_events(self, since_seq: int) -> list[tuple[int, int, int, int, float | None, int, str, float | None]]:
-        """Return (seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg) tuples with seq > since_seq.
+    def get_timing_events(self, since_seq: int) -> list[tuple[int, int, int, int, float | None, int, str, float | None, float | None, int | None]]:
+        """Return widened timing-event tuples with seq > since_seq.
 
         Caller supplies the sequence id of the last event it received so only new
         events are returned, keeping response sizes small (~200 msg / 100 ms poll).
@@ -1744,8 +1745,8 @@ class AircraftState:
             events = tuple(self._timing_events)
         if events and since_seq > events[-1][0]:
             since_seq = 0
-        return [(seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg)
-                for seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg in events
+        return [(seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg, range_nm, iid)
+                for seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg, range_nm, iid in events
                 if seq > since_seq]
 
     def get_timing_now_us(self) -> int:
@@ -1754,8 +1755,8 @@ class AircraftState:
         delta_us = max(0, int((now_mono - self._timing_last_wall_monotonic) * 1_000_000))
         return self._timing_last_arrival_us + delta_us
 
-    def get_recent_timing_window(self, window_us: int) -> tuple[int, list[tuple[int, int, int, float | None, int, str, float | None]]]:
-        """Return recent timing events as (arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg)."""
+    def get_recent_timing_window(self, window_us: int) -> tuple[int, list[tuple[int, int, int, float | None, int, str, float | None, float | None, int | None]]]:
+        """Return recent widened timing events without the sequence id."""
         with self._lock:
             events = tuple(self._timing_events)
             now_mono = time.monotonic()
@@ -1763,8 +1764,8 @@ class AircraftState:
             now_us = self._timing_last_arrival_us + delta_us
         cutoff_us = max(0, now_us - window_us)
         recent = [
-            (arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg)
-            for _seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg in events
+            (arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg, range_nm, iid)
+            for _seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg, range_nm, iid in events
             if arrival_us >= cutoff_us
         ]
         return now_us, recent
@@ -2377,6 +2378,8 @@ class AircraftState:
         signal: int,
         icao: str,
         bearing_deg: float | None,
+        range_nm: float | None,
+        iid: int | None,
     ) -> tuple[int, int] | None:
         """Append a self-contained recent-message timing event for the primary stream."""
         if timing_ref is None:
@@ -2392,6 +2395,8 @@ class AircraftState:
             self._classify_timing_source(df),
             icao,
             bearing_deg,
+            range_nm,
+            iid,
         ))
         return timing_epoch, arrival_us
 
@@ -2650,8 +2655,9 @@ class AircraftState:
             except Exception:
                 pass
 
-        bearing_deg = _published_position(ac)[3]
-        self._record_timing_event(timing_ref, df, raw_len, signal, icao, bearing_deg)
+        _pub_lat, _pub_lon, range_nm, bearing_deg = _published_position(ac)
+        timing_iid = int(_nd.get('iid', 0)) if (_nd is not None and df == 11 and _nd.get('iid') is not None) else None
+        self._record_timing_event(timing_ref, df, raw_len, signal, icao, bearing_deg, range_nm, timing_iid)
 
     def _apply_acas(self, ac: "Aircraft", result: dict, now: float) -> None:
         """Apply a decoded ACAS RA to the aircraft and enqueue a DB event.

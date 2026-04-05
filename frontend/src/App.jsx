@@ -11,6 +11,7 @@ import styles from './App.module.css'
 const HistoryPage        = lazy(() => import('./pages/HistoryPage'))
 const ReceiverPage       = lazy(() => import('./pages/ReceiverPage'))
 const TimingPage         = lazy(() => import('./pages/TimingPage'))
+const MessageFieldPage   = lazy(() => import('./pages/MessageFieldPage'))
 const FleetPage          = lazy(() => import('./pages/FleetPage'))
 const CoveragePage       = lazy(() => import('./pages/CoveragePage'))
 const MapPage            = lazy(() => import('./pages/MapPage'))
@@ -143,6 +144,10 @@ export default function App() {
             onClick={() => setTab('timing')}
           >Timing</button>
           <button
+            className={tab === 'messagefield' ? styles.tabActive : styles.tab}
+            onClick={() => setTab('messagefield')}
+          >Message Field</button>
+          <button
             className={tab === 'coverage' ? styles.tabActive : styles.tab}
             onClick={() => setTab('coverage')}
           >Coverage</button>
@@ -207,6 +212,7 @@ export default function App() {
         {tab === 'sightings' && <SightingsPage onSelectIcao={handleSelectIcao} notableRefreshKey={notableRefreshKey} />}
         {tab === 'receiver' && <ReceiverPage snapshot={snapshot} onSelectIcao={handleSelectIcao} />}
         {tab === 'timing' && <TimingPage onSelectIcao={handleSelectIcao} />}
+        {tab === 'messagefield' && <MessageFieldPage />}
         {tab === 'coverage' && <CoveragePage aircraft={snapshot?.aircraft ?? []} initialIcao={coverageIcao} />}
         {tab === 'flow' && <FlowMapPage />}
         {tab === 'fleet' && <FleetPage onSelectIcao={handleSelectIcao} />}

@@ -1,0 +1,120 @@
+.hero {
+  background:
+    radial-gradient(circle at top right, rgba(56, 139, 253, 0.16), transparent 34%),
+    radial-gradient(circle at top left, rgba(63, 185, 80, 0.1), transparent 28%),
+    #161b22;
+  border: 1px solid #21262d;
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem;
+}
+
+.eyebrow {
+  margin: 0 0 0.35rem;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #6e7681;
+}
+
+.title {
+  margin: 0;
+  font-size: 1.35rem;
+  color: #e6edf3;
+}
+
+.description {
+  margin: 0.5rem 0 0;
+  max-width: 78ch;
+  font-size: 0.92rem;
+  line-height: 1.55;
+  color: #8b949e;
+}
+
+.controlBar {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 0.9rem;
+}
+
+.controlGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.controlLabel {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #6e7681;
+}
+
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  margin-top: 0.9rem;
+  font-size: 0.74rem;
+  color: #6e7681;
+}
+
+.canvasWrap {
+  position: relative;
+}
+
+.canvas {
+  width: 100%;
+  height: 860px;
+  display: block;
+  border-radius: 8px;
+  background: #0b0c10;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 0.85rem;
+  font-size: 0.72rem;
+  color: #8b949e;
+}
+
+.legendItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.legendSwatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  display: inline-block;
+}
+
+.note {
+  margin: 0;
+  font-size: 0.78rem;
+  color: #6e7681;
+  line-height: 1.5;
+}
+
+@media (max-width: 1200px) {
+  .controlBar {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .canvas {
+    height: 720px;
+  }
+}
+
+@media (max-width: 760px) {
+  .controlBar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .canvas {
+    height: 620px;
+  }
+}

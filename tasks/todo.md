@@ -258,6 +258,42 @@ Updated: 2026-04-04
   - `npm run build` in `frontend/`
   - `node --input-type=module` synthetic helper check confirmed `idleRows: 0`, stable initial rows `AAAAAA/BBBBBB/CCCCCC`, and admission of new entrant `DDDDDD` without reordering existing rows.
   - Exploration work required before implementation:
+
+## OpenSpec Change: `add-live-message-field-page`
+
+- [x] Review the current timing-event tuple, signal conversion helpers, and Timing-page exact-point panels before widening the event contract.
+- [x] Widen retained timing events and transports to carry optional `bearing_deg`, `range_nm`, `iid`, and trusted display-grade signal values without adding per-widget transports.
+- [x] Add focused backend coverage for the widened event shape, including publishability gates for `bearing_deg`/`range_nm` and availability rules for `iid`.
+- [x] Add a dedicated top-level `Message Field` page with one large exact-point plot, selectable geometry/mode, bounded persistence, and compact colour/filter controls.
+- [x] Remove the shelved waterfall panel from `Timing` and update related copy so `Timing` returns to timing/observability work while exact-point experimentation moves to the new page.
+- [x] Verify backend syntax/tests, run `npm run build`, perform a focused synthetic persistence check, and compare signal semantics against readsb expectations before closing the change.
+
+### Planned execution
+
+- Treat the existing `raw_signal_to_dbfs()` path as the canonical readsb-aligned signal conversion unless code inspection or synthetic checks prove otherwise; do not ship a second signal formula.
+- Keep one shared recent-event transport contract across `/api/timing/events`, `/ws/timing`, and `/ws/timing-page`; page controls must operate from the local buffered stream instead of reconnecting per mode.
+- Move exact-point exploratory views off `Timing` rather than duplicating them. The dedicated page will own the large-format exact-point canvas and the associated mode/filter controls.
+
+### Verification
+
+- Backend: focused syntax/tests around the widened timing-event contract and optional field gating.
+- Frontend: `npm run build` after the new page, routing, and Timing-page cleanup land.
+- Synthetic/runtime: confirm points remain exact and persistence-based, aging out of the selected window rather than being bucketed or rescaled.
+- Signal semantics: compare the exposed dBFS values against the existing readsb-style conversion helpers before signing off on signal-based axes/colouring.
+
+### Review
+
+- Plan verified against `openspec/changes/add-live-message-field-page/{proposal,design,tasks}.md` and the two spec files before implementation.
+- Backend widened the shared recent timing-event contract by appending optional `range_nm` and `iid` while keeping `/api/timing/events`, `/ws/timing`, and `/ws/timing-page` on one transport shape.
+- Focused backend tests now cover inline range retention, `iid` retention including `IID 0`, and publishability gating for bearing/range fields.
+- Frontend added a new top-level `Message Field` page with one exact-point canvas, selectable modes, `polar`/`cartesian` projection handling, bounded persistence controls, and colour/filter controls backed by the existing shared timing stream.
+- `Timing` now points operators to the dedicated page for exact-point experimentation and no longer renders the shelved waterfall panel.
+- Verification:
+  - `python3 -m py_compile backend/aircraft_state.py backend/main.py backend/timing.py backend/tests/test_timing_events.py`
+  - `env UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_timing_events.py`
+  - `npm run build` in `frontend/`
+  - `node --input-type=module` synthetic check on `selectMessageFieldEvents()` returned visible sequence ids `[2, 3]` for a `3 s` window at `5.5 s`, confirming older exact points age out cleanly instead of being rebucketed.
+  - Signal semantics check compared `raw_signal_to_dbfs()` against `20 * log10(raw / 255)` for raw samples `1, 12, 37, 128, 255`; all matched expected readsb-style dBFS values exactly.
     - Confirm which additional fields are needed in the recent-message event model:
       - `signal_raw`
       - `source_class`

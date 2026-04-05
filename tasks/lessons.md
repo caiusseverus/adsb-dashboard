@@ -24,3 +24,9 @@
 - On a multiplexed live page, display-control changes must not recreate the shared websocket unless the stream identity really changed. Reconnecting on cosmetic control changes can reset incremental cursors and leak duplicate history into unrelated panels.
 - Incremental timing buffers should deduplicate by sequence ID when merging, even if the transport is expected not to resend. That makes the UI robust against reconnects or config races.
 - When matching an external decoder or protocol implementation, do not substitute a “close enough” linear transform for a documented signal formula. Trace the exact amplitude/power/log pipeline from the upstream implementation, including any smoothing window or epsilon floor, before changing public semantics.
+
+## 2026-04-05
+
+- On live filter controls, do not derive the selectable identifier list only from the currently visible short persistence window, and do not auto-reset the user's selected filter just because traffic pauses. Keep a sticky option cache so operator intent survives quiet periods.
+- When rendering live canvas points with mixed colour formats, do not append hex alpha bytes blindly. If the palette can emit `hsl()` or named colours, apply opacity via canvas `globalAlpha` or a proper colour conversion so signal palettes do not collapse to one fallback colour.
+- For instrument-style plots, do not place empty-state notes inside the plotting area when the axes themselves are still useful. Put the status note in surrounding chrome so the canvas remains readable as a frame of reference.

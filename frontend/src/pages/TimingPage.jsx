@@ -1234,17 +1234,20 @@ function DFCadenceLanes({ timingView, cadenceBinMs, onCadenceBinMsChange, timing
 export default function TimingPage({ onSelectIcao }) {
   const [burstBinMs, setBurstBinMs] = useState(20)
   const [cadenceBinMs, setCadenceBinMs] = useState(50)
-  const [waterfallSliceMs, setWaterfallSliceMs] = useState(50)
   const [interrogatorWindowS, setInterrogatorWindowS] = useState(10)
   const [timingWindowS, setTimingWindowS] = useState(5)
-  const [rawBearingColourMode, setRawBearingColourMode] = useState('strength')
-  const [rawBearingPhosphor, setRawBearingPhosphor] = useState(false)
   const timingWindowUs = timingWindowS * 1_000_000
   const pageStream = useTimingPageStream({ burstBinMs, cadenceBinMs, interrogatorWindowS, timingWindowS })
   const timingView = useTimingEventBuffer(pageStream?.timing ?? null, timingWindowUs)
 
   return (
     <main className={styles.main}>
+      <div className={styles.card}>
+        <p style={{ fontSize: '0.9rem', color: '#8b949e', margin: 0, lineHeight: 1.5 }}>
+          Timing stays focused on cadence, interrogator rhythm, burst behaviour, and pipeline observability.
+          Exact-point message-field experimentation now lives on the dedicated <strong style={{ color: '#c9d1d9' }}>Message Field</strong> page.
+        </p>
+      </div>
       <div className={styles.row}>
         <InterrogatorCodes
           streamData={pageStream?.interrogators ?? null}
@@ -1263,18 +1266,6 @@ export default function TimingPage({ onSelectIcao }) {
         timingView={timingView}
         timingWindowUs={timingWindowUs}
       />
-      <BearingTimeSweepHeatmap
-        timingView={timingView}
-        timingWindowUs={timingWindowUs}
-      />
-      <RawBearingRaster
-        timingView={timingView}
-        timingWindowUs={timingWindowUs}
-        colourMode={rawBearingColourMode}
-        onColourModeChange={setRawBearingColourMode}
-        phosphor={rawBearingPhosphor}
-        onPhosphorChange={setRawBearingPhosphor}
-      />
       <div className={styles.row}>
         <BurstRateStripChart
           timingView={timingView}
@@ -1290,12 +1281,6 @@ export default function TimingPage({ onSelectIcao }) {
           timingWindowUs={timingWindowUs}
         />
       </div>
-      <MessageWaterfall
-        timingView={timingView}
-        timingWindowUs={timingWindowUs}
-        sliceMs={waterfallSliceMs}
-        onSliceMsChange={setWaterfallSliceMs}
-      />
       <div className={styles.row}>
         <SignalFloorShimmer
           timingView={timingView}
