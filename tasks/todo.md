@@ -638,6 +638,26 @@ Updated: 2026-04-04
   - Interpretation:
     - the mean and spread are now in the expected readsb-style negative-`dBFS` space rather than the old raw-byte/public-contract split
     - persisted minute averages are narrower than the user’s per-message readsb/graphs1090 reference distribution, so they are only a sanity check, not a perfect acceptance proxy for live per-message extremes
+
+## Live Build Fix: `timingWaterfall` import
+
+- [x] Reproduce the failing module path from [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx) and inspect the referenced utility path in [frontend/src/utils](/home/keith/claude/adsb-dashboard/frontend/src/utils).
+- [x] Confirm whether the failure is caused by a bad import path or by the referenced file being absent from the tracked source tree used on the live Pi.
+- [x] Make the minimal source change needed so the `Message Waterfall` helper is present in the repo/worktree used for deployment.
+- [x] Verify with `npm run build` in `frontend/` and record the result.
+
+### Review
+
+- Plan verified on 2026-04-05 against [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx), [frontend/src/utils/timingWaterfall.js](/home/keith/claude/adsb-dashboard/frontend/src/utils/timingWaterfall.js), and the current git worktree state.
+- Root cause:
+  - The import path in [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx) is correct.
+  - The referenced module file existed locally at [frontend/src/utils/timingWaterfall.js](/home/keith/claude/adsb-dashboard/frontend/src/utils/timingWaterfall.js) but was untracked, so it would be missing from any environment updated only from tracked repository contents, including the live Pi build tree.
+- Implementation result on 2026-04-05:
+  - Kept the existing import contract and ensured [frontend/src/utils/timingWaterfall.js](/home/keith/claude/adsb-dashboard/frontend/src/utils/timingWaterfall.js) is the explicit home for the waterfall aggregation logic rather than duplicating that logic inline inside [TimingPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/TimingPage.jsx).
+  - Added a short file-level comment to [frontend/src/utils/timingWaterfall.js](/home/keith/claude/adsb-dashboard/frontend/src/utils/timingWaterfall.js) so the helper has an intentional tracked edit associated with this build-fix pass.
+- Verification:
+  - `npm run build` in `frontend/`
+  - Result: Vite production build completed successfully on 2026-04-05, including the generated `TimingPage-*.js` bundle, so the `../utils/timingWaterfall` import now resolves correctly in the build tree.
 - Follow-up correction on 2026-04-05:
   - The first implementation used the wrong Beast conversion model (`-(raw/2)`) and therefore produced live aircraft values that were far too strong compared with readsb.
   - Updated [signal_utils.py](/home/keith/claude/adsb-dashboard/backend/signal_utils.py) to use readsb’s actual Beast amplitude pipeline: normalize amplitude, square to power, then convert with `10 * log10(...)`.
