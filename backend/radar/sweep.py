@@ -981,21 +981,6 @@ class RadarState:
             self._live_frames[iid] = None
             self._live_completed_frames[iid] = deque(maxlen=self._LIVE_FRAMES_MAX)
 
-    def _current_reference_is_recent(
-        self,
-        iid: int,
-        ref_icao: str | None,
-        now_us: float,
-        period_s: float,
-        recency_periods: float = 5.0,
-    ) -> bool:
-        if ref_icao is None or period_s <= 0:
-            return False
-        centroids = self._live_burst_centroids.get(iid, {}).get(ref_icao, [])
-        if not centroids:
-            return False
-        return now_us - centroids[-1] <= period_s * recency_periods * 1_000_000.0
-
     def _process_fired_bursts(self, iid: int, fired_bursts: list[dict]) -> dict:
         metrics = _new_fired_burst_phase_metrics()
         t_setup = time.perf_counter()
@@ -1026,6 +1011,7 @@ class RadarState:
 
         self._ensure_live_builder_state(iid)
         metrics["setup_ms"] += (time.perf_counter() - t_setup) * 1000
+        batch_ref_icao: str | None = None
 
         for fired_burst in fired_bursts:
             metrics["fired_burst_count"] += 1
@@ -1069,10 +1055,10 @@ class RadarState:
                             )
                     else:
                         current_ref_icao = model.reference_aircraft.ref_icao if model.reference_aircraft else None
-                        if self._current_reference_is_recent(iid, current_ref_icao, burst_centroid_us, period_s):
+                        if batch_ref_icao is not None:
                             metrics["reference_select_count"] += 1
                             metrics["reference_reuse_count"] += 1
-                            ref_icao = current_ref_icao
+                            ref_icao = batch_ref_icao
                         elif native_processor is not None:
                             metrics["reference_select_count"] += 1
                             metrics["reference_rescore_count"] += 1
@@ -1092,12 +1078,15 @@ class RadarState:
                                     ref_since_sweep=0,
                                     hysteresis_margin=0.25,
                                 )
+                                batch_ref_icao = ref_icao
                         else:
                             metrics["reference_select_count"] += 1
                             metrics["reference_rescore_count"] += 1
                             ref_icao = self._select_reference_from_live_bursts(
                                 iid, period_s, now_us=burst_centroid_us
                             )
+                            if ref_icao is not None:
+                                batch_ref_icao = ref_icao
                         if ref_icao is None:
                             continue
                 finally:

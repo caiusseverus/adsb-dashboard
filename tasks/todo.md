@@ -177,6 +177,28 @@ Updated: 2026-04-06
   - `npm run build`
   - Result: production build succeeded with the existing Vite large-chunk warning.
 
+## 2026-04-12 Sweep Frame Builder Regression
+
+- [x] Correct the reference-selection throttle so it does not suppress frame starts
+- [x] Add regression coverage for frame construction under batched fired bursts
+- [x] Run focused and full backend verification
+- [x] Commit the fix
+
+### Review
+
+- Investigation:
+  - The reference-selection throttle incorrectly reused the previous reference aircraft across batches while it was merely recent. Under live burst ordering, that can suppress frame starts when the old reference has not fired in the current batch.
+- Implementation:
+  - [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) now performs a normal reference selection once per `_process_fired_bursts()` call and reuses only that batch-local decision.
+  - [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) covers the one-rescore-per-batch path and verifies a selected fired burst can start a live sweep frame.
+  - [lessons.md](/home/keith/claude/adsb-dashboard/tasks/lessons.md) records the correction.
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_debug_perf.py`
+  - Result: `42 passed in 0.38s`
+  - `uv run --directory backend pytest`
+  - Result: `244 passed in 1.53s`
+
 ## 2026-04-11 FM Frame Geometry Diagnostics
 
 - [x] Inspect current SweepFrame and inscribed-angle evidence payloads
