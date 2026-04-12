@@ -61,6 +61,8 @@ from position_quality import router as position_quality_router, PositionQualityC
 from benchmark import make_pause_aware_decoder
 from interrogators import router as interrogators_router
 from timing import router as timing_router
+from radar.sweep import RadarState
+from radar import api as radar_api
 
 
 
@@ -76,6 +78,25 @@ log.setLevel(logging.INFO)  # main module always logs at INFO regardless of DEBU
 # ---------------------------------------------------------------------------
 state = AircraftState(aircraft_timeout=config.AIRCRAFT_TIMEOUT)
 track_store = TrackStore()
+radar_state = RadarState(aircraft_state=state, track_store=track_store)
+
+# Register per-frame FM solve callback — runs on the Beast decoder thread after each
+# completed sweep frame.  Called outside RadarState._lock, so safe to call ForwardModel.
+def _register_per_frame_fm_callback() -> None:
+    try:
+        from radar.api import _get_fm
+        def _cb(iid: int, frame, period_s: float) -> None:
+            _get_fm().on_new_frame(
+                iid, frame, period_s,
+                getattr(config, "RECEIVER_LAT", None),
+                getattr(config, "RECEIVER_LON", None),
+            )
+        radar_state.per_frame_solve_callback = _cb
+    except Exception:
+        log.exception("ForwardModel: failed to register per-frame callback")
+
+_register_per_frame_fm_callback()
+
 # Each connected WebSocket gets its own bounded send queue.
 # _push_updates enqueues the serialised payload and returns immediately;
 # a per-client sender coroutine drains the queue asynchronously.
@@ -112,6 +133,27 @@ _decoder_thread: threading.Thread | None = None
 _msg_drops: int = 0
 # Queue depth sampled once per push cycle (maxlen matches push_timings window)
 _queue_depth_samples: _deque[int] = _deque(maxlen=120)
+_RADAR_QUEUE_MAX = 5000
+_radar_queue: queue.Queue = queue.Queue(maxsize=_RADAR_QUEUE_MAX)
+_RADAR_SENTINEL = object()
+_radar_thread: threading.Thread | None = None
+_radar_drops: int = 0
+_radar_queue_depth_samples: _deque[int] = _deque(maxlen=120)
+_radar_worker_timings: _deque[dict] = _deque(maxlen=400)
+_TIMING_WS_BATCH_LIMIT = 5_000
+_TIMING_PAGE_BATCH_LIMIT = 60_000
+_AGGREGATE_REBUILD_INTERVAL_S = 0.25
+_RADAR_IID_REBUILD_INTERVAL_S = max(1.0, config.RADAR_IID_WS_REBUILD_INTERVAL_S)
+_radar_loop_timings: _deque[dict] = _deque(maxlen=240)
+_fm_run_timings: _deque[dict] = _deque(maxlen=240)
+_radar_ws_timings: _deque[dict] = _deque(maxlen=400)
+_timing_ws_timings: _deque[dict] = _deque(maxlen=400)
+_BACKGROUND_QUEUE_BACKLOG_SKIP = 100
+_FM_MAX_IIDS_PER_CYCLE = 1
+_CI_MAX_IIDS_PER_CYCLE = 1
+_RADAR_BATCH_SIZE = 16
+_RADAR_BATCH_SIZE_MAX = 128
+_RADAR_BATCH_BACKLOG_THRESHOLD = 32
 
 # Shared snapshot cache — _notify_cast_loop and _broadcast_loop run on the same
 # asyncio thread, so there is no race.  Both loops reuse a snapshot built within
@@ -134,8 +176,66 @@ _visit_merge_last_ts: float = 0.0
 def _start_msg_processor() -> threading.Thread:
     """Start the daemon thread that decodes Beast messages from _msg_queue.
     Uses make_pause_aware_decoder so the benchmark can pause it cleanly."""
-    _run = make_pause_aware_decoder(_msg_queue, state, _DECODE_SENTINEL)
+    _run = make_pause_aware_decoder(_msg_queue, state, _DECODE_SENTINEL, radar_event_sink=_enqueue_radar_event)
     t = threading.Thread(target=_run, daemon=True, name="beast-decoder")
+    t.start()
+    return t
+
+
+def _enqueue_radar_event(radar_event: tuple[int, int, str, float | None]) -> None:
+    global _radar_drops
+    try:
+        _radar_queue.put_nowait(radar_event)
+    except queue.Full:
+        _radar_drops += 1
+
+
+def _start_radar_processor() -> threading.Thread:
+    def _target_radar_batch_size(current_qsize: int) -> int:
+        if current_qsize < _RADAR_BATCH_BACKLOG_THRESHOLD:
+            return _RADAR_BATCH_SIZE
+        return min(_RADAR_BATCH_SIZE_MAX, max(_RADAR_BATCH_SIZE, current_qsize + 1))
+
+    def _run() -> None:
+        while True:
+            t_wait_start = time.perf_counter()
+            item = _radar_queue.get()
+            queue_wait_s = time.perf_counter() - t_wait_start
+            if item is _RADAR_SENTINEL:
+                return
+            try:
+                batch = [item]
+                target_batch_size = _target_radar_batch_size(_radar_queue.qsize())
+                t_batch_fill_start = time.perf_counter()
+                for _ in range(target_batch_size - 1):
+                    try:
+                        next_item = _radar_queue.get_nowait()
+                        if next_item is _RADAR_SENTINEL:
+                            break
+                        batch.append(next_item)
+                    except queue.Empty:
+                        break
+
+                batch_fill_s = time.perf_counter() - t_batch_fill_start
+                t_process_start = time.perf_counter()
+                t_process_cpu_start = time.thread_time()
+                radar_state.on_df11_batch(batch)
+                process_cpu_s = time.thread_time() - t_process_cpu_start
+                process_wall_s = time.perf_counter() - t_process_start
+                _radar_worker_timings.append({
+                    "ts_s": time.time(),
+                    "queue_wait_ms": round(queue_wait_s * 1000, 2),
+                    "batch_fill_ms": round(batch_fill_s * 1000, 2),
+                    "process_wall_ms": round(process_wall_s * 1000, 2),
+                    "process_cpu_ms": round(process_cpu_s * 1000, 2),
+                    "process_offcpu_ms": round(max(0.0, process_wall_s - process_cpu_s) * 1000, 2),
+                    "batch_size": len(batch),
+                    "batch_target": target_batch_size,
+                })
+            except Exception:
+                log.exception("radar-worker: unhandled error")
+
+    t = threading.Thread(target=_run, daemon=True, name="radar-worker")
     t.start()
     return t
 
@@ -819,6 +919,7 @@ async def _broadcast_loop() -> None:
             }
             _push_timings_store.append(push_sample)
             _record_push_perf_sample(push_sample)
+            _radar_queue_depth_samples.append(_radar_queue.qsize())
         except Exception:
             log.exception("_broadcast_loop: unhandled error in broadcast cycle — continuing")
 
@@ -951,6 +1052,10 @@ async def _graceful_shutdown(bg_tasks: list) -> None:
     _msg_queue.put(_DECODE_SENTINEL)
     if _decoder_thread is not None:
         _decoder_thread.join(timeout=2.0)
+    log.info("Shutdown: stopping radar thread…")
+    _radar_queue.put(_RADAR_SENTINEL)
+    if _radar_thread is not None:
+        _radar_thread.join(timeout=2.0)
 
     log.info("Shutdown: closing in-progress visits…")
     try:
@@ -982,6 +1087,301 @@ async def _graceful_shutdown(bg_tasks: list) -> None:
         log.exception("Shutdown: WAL checkpoint failed")
 
 
+async def _radar_loop() -> None:
+    """Background task: update radar rotation models every 30s, flush DB every 60s."""
+    # Load persisted models on startup
+    try:
+        db_models = await asyncio.to_thread(stats_db.load_radar_iids)
+        radar_state.load_from_db(db_models)
+    except Exception:
+        log.exception("Radar: failed to load persisted IID models")
+
+    iteration = 0
+    while True:
+        await asyncio.sleep(30)
+        update_ms = 0.0
+        flush_ms = 0.0
+        pair_generate_ms = 0.0
+        pair_flush_ms = 0.0
+        models_flushed = 0
+        pairs_generated = 0
+        pairs_flushed = 0
+        queue_backlog = _msg_queue.qsize()
+        if queue_backlog >= _BACKGROUND_QUEUE_BACKLOG_SKIP:
+            _radar_loop_timings.append({
+                "ts_s": time.time(),
+                "update_ms": 0.0,
+                "flush_ms": 0.0,
+                "pair_generate_ms": 0.0,
+                "pair_flush_ms": 0.0,
+                "models_flushed": 0,
+                "pairs_generated": 0,
+                "pairs_flushed": 0,
+                "msg_queue_depth": queue_backlog,
+                "skipped_for_backlog": True,
+            })
+            continue
+        try:
+            t_update = time.perf_counter()
+            await asyncio.to_thread(radar_state.update_rotation_models, config.RADAR_UPDATE_MAX_IIDS)
+            update_ms = (time.perf_counter() - t_update) * 1000
+        except Exception:
+            log.exception("Radar: update_rotation_models failed")
+
+        try:
+            t_pairs = time.perf_counter()
+            pairs_generated_now = await asyncio.to_thread(radar_state.update_calibration_pairs)
+            pair_generate_ms = (time.perf_counter() - t_pairs) * 1000
+            pairs_generated = len(pairs_generated_now)
+            if pairs_generated_now:
+                pending_pairs = await asyncio.to_thread(radar_state.pop_pending_pairs)
+                try:
+                    t_pair_flush = time.perf_counter()
+                    await asyncio.to_thread(stats_db.insert_calibration_pairs, pending_pairs)
+                    pair_flush_ms = (time.perf_counter() - t_pair_flush) * 1000
+                    pairs_flushed = len(pending_pairs)
+                except Exception:
+                    await asyncio.to_thread(radar_state.requeue_pending_pairs, pending_pairs)
+                    raise
+        except Exception:
+            log.exception("Radar: calibration pair update failed")
+
+        iteration += 1
+        if iteration % 2 == 0 and _msg_queue.qsize() < _BACKGROUND_QUEUE_BACKLOG_SKIP:  # every 60s: flush to DB
+            try:
+                t_flush = time.perf_counter()
+                models = radar_state.get_all_rotation_models()
+                await asyncio.to_thread(stats_db.upsert_radar_iids, list(models.values()))
+                models_flushed = len(models)
+                flush_ms = (time.perf_counter() - t_flush) * 1000
+            except Exception:
+                log.exception("Radar: DB flush failed")
+        _radar_loop_timings.append({
+            "ts_s": time.time(),
+            "update_ms": round(update_ms, 2),
+            "flush_ms": round(flush_ms, 2),
+            "pair_generate_ms": round(pair_generate_ms, 2),
+            "pair_flush_ms": round(pair_flush_ms, 2),
+            "models_flushed": models_flushed,
+            "pairs_generated": pairs_generated,
+            "pairs_flushed": pairs_flushed,
+            "msg_queue_depth": _msg_queue.qsize(),
+            "skipped_for_backlog": False,
+        })
+
+
+async def _fm_loop() -> None:
+    """Background task: commit per-frame position accumulation for eligible IIDs.
+
+    Wakes every 30 s and runs run_full_pipeline for each auto-mode IID that has
+    accumulated at least one new frame since the last run.  When ≥20 per-frame
+    estimates are in the buffer, the pipeline takes the fast path (weighted
+    centroid only — no expensive intersection solve).  The intersection solver
+    only runs as a bootstrap when the buffer is still too thin.
+    """
+    from radar.api import _get_fm
+
+    _last_frame_count: dict[int, int] = {}   # iid → frame count at last run
+    _iid_locks: dict[int, asyncio.Lock] = {}  # iid → lock
+
+    while True:
+        await asyncio.sleep(30)
+        if radar_state.is_update_active() or _msg_queue.qsize() >= _BACKGROUND_QUEUE_BACKLOG_SKIP:
+            continue
+        try:
+            models = radar_state.get_all_rotation_models()
+        except Exception:
+            log.exception("FM loop: get_all_rotation_models failed")
+            continue
+
+        candidates: list[tuple[int, int]] = []
+        for iid, model in models.items():
+            if model.resolution_mode == "locked_unresolvable":
+                continue
+            if model.period_s is None:
+                continue  # rotation model not ready
+
+            frames = radar_state.get_sweep_frames(iid)
+            completed = [f for f in frames if f.quality in ("good", "marginal")]
+            n_frames = len(completed)
+
+            if n_frames == 0:
+                continue
+            if n_frames == _last_frame_count.get(iid, 0):
+                continue  # no new frames since last run
+            candidates.append((iid, n_frames))
+
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        for iid, n_frames in candidates[:_FM_MAX_IIDS_PER_CYCLE]:
+            model = models.get(iid)
+            if model is None or model.period_s is None or model.resolution_mode != "auto":
+                continue
+
+            lock = _iid_locks.setdefault(iid, asyncio.Lock())
+            if lock.locked():
+                continue  # previous run still in progress — skip this cycle
+
+            async def _run_fm(iid=iid, lock=lock, n_frames=n_frames) -> None:
+                async with lock:
+                    try:
+                        t0 = time.perf_counter()
+                        result = await asyncio.to_thread(_get_fm().run_full_pipeline, iid, radar_state)
+                        elapsed_ms = (time.perf_counter() - t0) * 1000
+                        await asyncio.to_thread(radar_state.record_forward_model_attempt, iid, result, elapsed_ms)
+                    except Exception:
+                        log.exception("FM loop: pipeline failed for IID %d", iid)
+                        try:
+                            await asyncio.to_thread(
+                                radar_state.record_forward_model_attempt,
+                                iid,
+                                {"error": "pipeline exception", "stage": "exception"},
+                                0.0,
+                            )
+                        except Exception:
+                            pass
+                        return
+
+                    if result is None or "error" in result:
+                        # Update frame count even on failure so we don't retry
+                        # until enough new frames have accumulated.
+                        _last_frame_count[iid] = n_frames
+                        _fm_run_timings.append({
+                            "ts_s": time.time(),
+                            "iid": iid,
+                            "elapsed_ms": round(elapsed_ms, 2),
+                            "frame_count": n_frames,
+                            "stored": False,
+                            "ok": False,
+                        })
+                        log.info("FM loop: IID %d — failed in %.0f ms: %s", iid, elapsed_ms,
+                                 (result or {}).get("error", "unknown"))
+                        return
+
+                    _last_frame_count[iid] = n_frames
+                    stored = result.get("stored", True)
+                    _fm_run_timings.append({
+                        "ts_s": time.time(),
+                        "iid": iid,
+                        "elapsed_ms": round(elapsed_ms, 2),
+                        "frame_count": n_frames,
+                        "stored": bool(stored),
+                        "ok": True,
+                    })
+                    log.info(
+                        "FM loop: IID %d — (%.4f, %.4f) cep=%.0f m from %d frames in %.0f ms%s",
+                        iid, result["lat"], result["lon"], result.get("cep_m", 0),
+                        n_frames, elapsed_ms, "" if stored else " (not stored — regression guard)",
+                    )
+
+            if _msg_queue.qsize() >= _BACKGROUND_QUEUE_BACKLOG_SKIP:
+                break
+            await _run_fm()
+
+
+async def _coincident_loop() -> None:
+    """Background task: run coincident-illumination localisation on eligible IIDs."""
+    from radar.localiser import RadarLocaliser
+    from radar.models import CalibrationPair
+
+    _iid_locks: dict[int, asyncio.Lock] = {}
+
+    def _load_pairs(iid: int) -> list[CalibrationPair]:
+        rows = stats_db.load_calibration_pairs(iid)
+        return [
+            CalibrationPair(
+                iid=row["iid"],
+                ts=row["ts"],
+                icao_a=row["icao_a"],
+                icao_b=row["icao_b"],
+                lat_a=row["lat_a"],
+                lon_a=row["lon_a"],
+                lat_b=row["lat_b"],
+                lon_b=row["lon_b"],
+                tdoa_us=row["tdoa_us"],
+                receiver_lat=row["receiver_lat"],
+                receiver_lon=row["receiver_lon"],
+            )
+            for row in rows
+        ]
+
+    _last_attempted: dict[int, float] = {}  # iid → last attempt time (success or fail)
+
+    while True:
+        await asyncio.sleep(90)
+        if radar_state.is_update_active() or _msg_queue.qsize() >= _BACKGROUND_QUEUE_BACKLOG_SKIP:
+            continue
+        try:
+            models = radar_state.get_all_rotation_models()
+        except Exception:
+            log.exception("CI loop: get_all_rotation_models failed")
+            continue
+
+        candidates: list[tuple[int, float]] = []
+        for iid, model in models.items():
+            if model.resolution_mode != "auto":
+                continue
+            # Schedule by last attempt, not last success — prevents a perpetually
+            # failing IID from starving all others by keeping ci_last_updated = 0.
+            candidates.append((iid, _last_attempted.get(iid, 0.0)))
+
+        candidates.sort(key=lambda item: item[1])
+        for iid, _last_ts in candidates[:_CI_MAX_IIDS_PER_CYCLE]:
+            lock = _iid_locks.setdefault(iid, asyncio.Lock())
+            if lock.locked():
+                continue
+
+            async def _run_ci(iid=iid, lock=lock) -> None:
+                async with lock:
+                    try:
+                        pairs = await asyncio.to_thread(_load_pairs, iid)
+                        if not pairs:
+                            log.debug("CI loop IID %d: no pairs loaded", iid)
+                            return
+                        log.debug("CI loop IID %d: solving with %d pairs", iid, len(pairs))
+                        # CI requires an FM seed — without it the beam-line
+                        # intersections can cluster around a coherent but wrong
+                        # position.  FM is the primary solver; CI only refines.
+                        fm_model = radar_state.get_rotation_model(iid)
+                        seed_lat = fm_model.fm_lat if fm_model is not None else None
+                        seed_lon = fm_model.fm_lon if fm_model is not None else None
+                        if seed_lat is None or seed_lon is None:
+                            log.debug("CI loop IID %d: skipping — no FM solution to seed from", iid)
+                            return
+                        lat, lon, cep_m, n_pairs = await asyncio.to_thread(
+                            RadarLocaliser().solve_coincident,
+                            pairs,
+                            seed_lat,
+                            seed_lon,
+                        )
+                    except ValueError as exc:
+                        log.info("CI loop IID %d: solver rejected — %s", iid, exc)
+                        return
+                    except Exception:
+                        log.exception("CI loop IID %d: unexpected solver error", iid)
+                        return
+
+                    radar_state.update_coincident_location(
+                        iid=iid,
+                        lat=lat,
+                        lon=lon,
+                        cep_m=cep_m,
+                        n_pairs=n_pairs,
+                    )
+                    try:
+                        model = radar_state.get_rotation_model(iid)
+                        if model is not None:
+                            await asyncio.to_thread(stats_db.upsert_radar_iid, model)
+                    except Exception:
+                        log.exception("CI loop: failed to persist IID %d", iid)
+
+            qsize = _msg_queue.qsize()
+            if qsize >= _BACKGROUND_QUEUE_BACKLOG_SKIP:
+                log.info("CI loop: skipping IID %d — queue backlog %d", iid, qsize)
+                break
+            _last_attempted[iid] = time.time()
+            await _run_ci()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await _seed_startup_state()
@@ -992,9 +1392,10 @@ async def lifespan(app: FastAPI):
         _bg_tasks.append(t)
         return t
 
-    global _decoder_thread
+    global _decoder_thread, _radar_thread
     if config.INGEST_MODE == "beast":
         # Default: decode raw Beast TCP stream in Python
+        _radar_thread = _start_radar_processor()
         _decoder_thread = _start_msg_processor()
         _bg(_beast_runner())
         for name, host, port in config.MLAT_SERVERS:
@@ -1011,6 +1412,7 @@ async def lifespan(app: FastAPI):
         log.info("Ingest mode: hybrid (readsb JSON + Beast TCP for ACAS/MLAT)")
         _bg(readsb_ingest.readsb_poller(state))
         _bg(readsb_stats.readsb_stats_poller())
+        _radar_thread = _start_radar_processor()
         _decoder_thread = _start_msg_processor()
         _bg(_beast_runner())
         for name, host, port in config.MLAT_SERVERS:
@@ -1036,6 +1438,10 @@ async def lifespan(app: FastAPI):
         _bg(_terrain_prewarm())
     _bg(run_position_quality_checker(position_quality_module._checker))
     _bg(health_module.loop_lag_sampler())
+    _bg(_radar_loop())
+    if config.RADAR_COINCIDENT_BACKGROUND_ENABLED:
+        _bg(_coincident_loop())
+    _bg(_fm_loop())
     health_module.register_context(_msg_queue, _clients)
     register_runtime_stats(lambda: {
         "ws_clients":       len(_clients),
@@ -1078,6 +1484,8 @@ interrogators_router._state = state  # type: ignore[attr-defined]
 app.include_router(interrogators_router)
 timing_router._state = state  # type: ignore[attr-defined]
 app.include_router(timing_router)
+radar_api._state = radar_state  # type: ignore[attr-defined]
+app.include_router(radar_api.router)
 if config.DEBUG_ENRICHMENT:
     log.info("Debug router mounted (DEBUG_ENRICHMENT=%s)", config.DEBUG_ENRICHMENT)
 
@@ -1229,16 +1637,30 @@ def _build_interrogator_payload(window_s: float) -> dict:
 async def timing_websocket_endpoint(ws: WebSocket) -> None:
     """Dedicated timing-event stream for the receiver timing plot."""
     await ws.accept()
+    try:
+        timing_iid_filter = int(ws.query_params["iid"]) if "iid" in ws.query_params else None
+    except (TypeError, ValueError):
+        timing_iid_filter = None
+    timing_df11_only = str(ws.query_params.get("df11_only", "")).lower() in {"1", "true", "yes"}
     since_seq = 0
     last_heartbeat = 0.0
     try:
         while True:
             now = time.time()
-            events_raw = state.get_timing_events(since_seq)
+            loop_t0 = time.perf_counter()
+            events_raw = state.get_timing_events(since_seq, limit=_TIMING_WS_BATCH_LIMIT)
+            raw_event_count = len(events_raw)
             if events_raw:
-                if len(events_raw) > 5000:
-                    events_raw = events_raw[-5000:]
                 since_seq = events_raw[-1][0]
+                if timing_df11_only or timing_iid_filter is not None:
+                    events_raw = [
+                        event for event in events_raw
+                        if (
+                            (not timing_df11_only or event[2] == 11)
+                            and (timing_iid_filter is None or event[9] == timing_iid_filter)
+                        )
+                    ]
+            if events_raw:
                 await ws.send_text(_json_dumps({
                     "now_us": state.get_timing_now_us(),
                     "events": [
@@ -1250,6 +1672,13 @@ async def timing_websocket_endpoint(ws: WebSocket) -> None:
             elif now - last_heartbeat >= 1.0:
                 await ws.send_text(_json_dumps({"now_us": state.get_timing_now_us(), "events": []}))
                 last_heartbeat = now
+            _timing_ws_timings.append({
+                "ts_s": now,
+                "elapsed_ms": round((time.perf_counter() - loop_t0) * 1000, 2),
+                "event_count": len(events_raw),
+                "raw_event_count": raw_event_count,
+                "sent": bool(events_raw),
+            })
             await asyncio.sleep(0.1)
     except WebSocketDisconnect:
         pass
@@ -1267,6 +1696,7 @@ async def highfreq_websocket_endpoint(ws: WebSocket) -> None:
     latency_window_s = 30.0
     last_payload = None
     last_heartbeat = 0.0
+    last_rebuild = 0.0
     try:
         while True:
             try:
@@ -1291,7 +1721,11 @@ async def highfreq_websocket_endpoint(ws: WebSocket) -> None:
                 pass
 
             now = time.time()
-            payload = _build_highfreq_payload(window_s, burst_bin_ms, cadence_bin_ms, latency_window_s)
+            payload = last_payload
+            should_rebuild = payload is None or (now - last_rebuild) >= _AGGREGATE_REBUILD_INTERVAL_S
+            if should_rebuild:
+                payload = _build_highfreq_payload(window_s, burst_bin_ms, cadence_bin_ms, latency_window_s)
+                last_rebuild = now
             if payload != last_payload:
                 await ws.send_text(_json_dumps(payload))
                 last_payload = payload
@@ -1313,6 +1747,7 @@ async def interrogator_timing_websocket_endpoint(ws: WebSocket) -> None:
     window_s = 10.0
     last_payload = None
     last_heartbeat = 0.0
+    last_rebuild = 0.0
     try:
         while True:
             try:
@@ -1328,7 +1763,11 @@ async def interrogator_timing_websocket_endpoint(ws: WebSocket) -> None:
                 pass
 
             now = time.time()
-            payload = _build_interrogator_payload(window_s)
+            payload = last_payload
+            should_rebuild = payload is None or (now - last_rebuild) >= _AGGREGATE_REBUILD_INTERVAL_S
+            if should_rebuild:
+                payload = _build_interrogator_payload(window_s)
+                last_rebuild = now
             if payload != last_payload:
                 await ws.send_text(_json_dumps(payload))
                 last_payload = payload
@@ -1356,6 +1795,8 @@ async def timing_page_websocket_endpoint(ws: WebSocket) -> None:
     last_interrogators = None
     last_aggregates = None
     last_heartbeat = 0.0
+    last_aggregate_rebuild = 0.0
+    last_interrogator_rebuild = 0.0
     try:
         while True:
             try:
@@ -1383,9 +1824,7 @@ async def timing_page_websocket_endpoint(ws: WebSocket) -> None:
                 pass
 
             now = time.time()
-            events_raw = state.get_timing_events(since_seq)
-            if len(events_raw) > 60_000:
-                events_raw = events_raw[-60_000:]
+            events_raw = state.get_timing_events(since_seq, limit=_TIMING_PAGE_BATCH_LIMIT)
             if events_raw:
                 since_seq = events_raw[-1][0]
 
@@ -1397,8 +1836,15 @@ async def timing_page_websocket_endpoint(ws: WebSocket) -> None:
                     for seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg, range_nm, iid in events_raw
                 ],
             }
-            interrogator_payload = _build_interrogator_payload(interrogator_window_s)
-            aggregate_payload = _build_highfreq_payload(timing_window_s, burst_bin_ms, cadence_bin_ms, latency_window_s)
+            interrogator_payload = last_interrogators
+            if interrogator_payload is None or (now - last_interrogator_rebuild) >= _AGGREGATE_REBUILD_INTERVAL_S:
+                interrogator_payload = _build_interrogator_payload(interrogator_window_s)
+                last_interrogator_rebuild = now
+
+            aggregate_payload = last_aggregates
+            if aggregate_payload is None or (now - last_aggregate_rebuild) >= _AGGREGATE_REBUILD_INTERVAL_S:
+                aggregate_payload = _build_highfreq_payload(timing_window_s, burst_bin_ms, cadence_bin_ms, latency_window_s)
+                last_aggregate_rebuild = now
 
             has_interrogator_change = interrogator_payload != last_interrogators
             has_aggregate_change = aggregate_payload != last_aggregates
@@ -1419,6 +1865,82 @@ async def timing_page_websocket_endpoint(ws: WebSocket) -> None:
         pass
     except Exception as exc:
         log.debug("Timing page WebSocket error: %s", exc)
+
+
+@app.websocket("/ws/radar/iids/{iid}")
+async def radar_iid_websocket_endpoint(ws: WebSocket, iid: int) -> None:
+    """Selected-IID Stage 1 stream carrying live alignment timeline plus rotation summary."""
+    await ws.accept()
+    window_s = 90.0
+    last_payload = None
+    last_heartbeat = 0.0
+    last_rebuild = 0.0
+    last_signature = None
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=0.2)
+                try:
+                    payload = json.loads(msg)
+                    req_window_s = float(payload.get("window_s", window_s))
+                    if 10 <= req_window_s <= 300:
+                        window_s = req_window_s
+                except Exception:
+                    pass
+            except asyncio.TimeoutError:
+                pass
+
+            now = time.time()
+            loop_t0 = time.perf_counter()
+            payload = last_payload
+            rebuilt = False
+            model = radar_state.get_rotation_model(iid)
+            current_signature = (
+                radar_state.get_iid_latest_arrival_us(iid),
+                model.last_updated if model is not None else None,
+                model.period_s if model is not None else None,
+                model.status if model is not None else None,
+                model.reference_aircraft.ref_icao if model is not None and model.reference_aircraft else None,
+                window_s,
+            )
+            if (
+                payload is None
+                or (
+                    current_signature != last_signature
+                    and (now - last_rebuild) >= _RADAR_IID_REBUILD_INTERVAL_S
+                )
+            ):
+                payload = {
+                    "type": "radar_iid",
+                    "timeline": radar_api.build_iid_timeline_payload(radar_state, iid, window_s),
+                    "rotation": radar_api.build_iid_rotation_payload(radar_state, iid),
+                }
+                last_rebuild = now
+                last_signature = current_signature
+                rebuilt = True
+            if payload != last_payload:
+                await ws.send_text(_json_dumps(payload))
+                last_payload = payload
+                last_heartbeat = now
+                sent_kind = "full"
+            elif now - last_heartbeat >= 1.0:
+                await ws.send_text(_json_dumps({"type": "radar_iid_heartbeat", "iid": iid}))
+                last_heartbeat = now
+                sent_kind = "heartbeat"
+            else:
+                sent_kind = "none"
+            _radar_ws_timings.append({
+                "ts_s": now,
+                "elapsed_ms": round((time.perf_counter() - loop_t0) * 1000, 2),
+                "iid": iid,
+                "sent_kind": sent_kind,
+                "rebuilt": rebuilt,
+            })
+            await asyncio.sleep(0.1)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        log.debug("Radar IID WebSocket error: %s", exc)
 
 
 @app.get("/api/stats")

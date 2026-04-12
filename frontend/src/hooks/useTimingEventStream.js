@@ -7,7 +7,8 @@ const TIMING_WS_URL = import.meta.env.PROD
 
 const TIMING_POLL_FALLBACK_MS = 1000
 
-export function useTimingEventStream() {
+export function useTimingEventStream(options = {}) {
+  const { enabled = true, iid = null, df11Only = false } = options
   const [packet, setPacket] = useState(null)
   const retryRef = useRef(null)
   const pollRef = useRef(null)
@@ -32,12 +33,23 @@ export function useTimingEventStream() {
   }, [])
 
   useEffect(() => {
+    if (!enabled) {
+      setPacket(null)
+      return
+    }
+    sinceSeqRef.current = 0
     let ws
     let closed = false
+    const params = new URLSearchParams()
+    if (iid != null) params.set('iid', String(iid))
+    if (df11Only) params.set('df11_only', '1')
+    const query = params.toString()
+    const wsUrl = query ? `${TIMING_WS_URL}?${query}` : TIMING_WS_URL
+    const apiUrl = `${API_BASE}/api/timing/events${query ? `?${query}&` : '?'}since_seq=`
 
     const pollOnce = () => {
       if (closed || !activeRef.current) return
-      fetch(`${API_BASE}/api/timing/events?since_seq=${sinceSeqRef.current}`)
+      fetch(`${apiUrl}${sinceSeqRef.current}`)
         .then(r => r.ok ? r.json() : null)
         .then(payload => { if (payload) ingestPacket(payload) })
         .catch(() => {})
@@ -45,7 +57,7 @@ export function useTimingEventStream() {
 
     const connect = () => {
       if (closed) return
-      ws = new WebSocket(TIMING_WS_URL)
+      ws = new WebSocket(wsUrl)
 
       ws.onmessage = event => {
         try {
@@ -78,7 +90,7 @@ export function useTimingEventStream() {
       clearInterval(pollRef.current)
       ws?.close()
     }
-  }, [ingestPacket])
+  }, [df11Only, enabled, iid, ingestPacket])
 
   return packet
 }

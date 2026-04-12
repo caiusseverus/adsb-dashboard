@@ -209,11 +209,17 @@ PUSH_INTERVAL_S: float = float(os.getenv("PUSH_INTERVAL_S", "1.0"))
 # Valid values: full, reduced, thin.  Leave empty to use auto-detection (default).
 SNAPSHOT_MODE_OVERRIDE: str = os.getenv("SNAPSHOT_MODE_OVERRIDE", "").lower()
 
-# Decoder batch size: number of messages drained from the queue per lock
-# acquisition.  Higher values reduce lock/GIL overhead at the cost of longer
-# lock holds per batch.  Default 16 is tuned for Pi 4 at ~2500 msg/s.
-# Set to 1 to restore single-message-per-lock behaviour.
+# Decoder batch size: baseline number of messages drained from the queue per
+# lock acquisition. Under backlog the worker may adapt upward to the max below.
+# Higher values reduce queue/GIL overhead at the cost of longer per-batch
+# latency. Set to 1 to restore near single-message behaviour when adaptive
+# growth is also disabled.
 DECODE_BATCH_SIZE: int = int(os.getenv("DECODE_BATCH_SIZE", "16"))
+DECODE_BATCH_SIZE_MAX: int = int(os.getenv("DECODE_BATCH_SIZE_MAX", "128"))
+DECODE_BATCH_BACKLOG_THRESHOLD: int = int(os.getenv("DECODE_BATCH_BACKLOG_THRESHOLD", "64"))
+RADAR_UPDATE_MAX_IIDS: int = int(os.getenv("RADAR_UPDATE_MAX_IIDS", "8"))
+RADAR_IID_WS_REBUILD_INTERVAL_S: float = float(os.getenv("RADAR_IID_WS_REBUILD_INTERVAL_S", "5.0"))
+RADAR_COINCIDENT_BACKGROUND_ENABLED: bool = _bool("RADAR_COINCIDENT_BACKGROUND_ENABLED", False)
 
 # Queue-depth thresholds for CPU-pressure-triggered snapshot degradation.
 # When the median queue depth over a 6-cycle window exceeds a threshold the

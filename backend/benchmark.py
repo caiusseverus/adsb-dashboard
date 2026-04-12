@@ -39,6 +39,7 @@ from __future__ import annotations
 import statistics
 import threading
 import time
+from collections import deque
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -47,14 +48,34 @@ from typing import Any
 _decoder_paused = threading.Event()   # set   → decoder should pause
 _decoder_resume = threading.Event()   # set   → decoder may continue
 _decoder_resume.set()                 # starts in running state
+decoder_batch_timings: deque[dict[str, float | int]] = deque(maxlen=400)
 
 
-def make_pause_aware_decoder(msg_queue, state, sentinel):
+def _record_decoder_batch_sample(sample: dict[str, float | int]) -> None:
+    decoder_batch_timings.append(sample)
+
+
+def _target_decode_batch_size(current_qsize: int, *, base: int, max_size: int, backlog_threshold: int) -> int:
+    """Choose a larger drain target when backlog shows the decoder is behind."""
+    base = max(1, base)
+    max_size = max(base, max_size)
+    if backlog_threshold <= 0 or current_qsize < backlog_threshold:
+        return base
+    # Drain more aggressively once backlog builds, but cap growth to keep
+    # single-batch latency bounded.
+    return min(max_size, max(base, current_qsize + 1))
+
+
+def make_pause_aware_decoder(msg_queue, state, sentinel, radar_event_sink=None):
     """Return a _run() function for the decoder thread that honours pause events.
 
     Drains up to DECODE_BATCH_SIZE messages per lock acquisition to reduce
     per-message lock/GIL overhead at high message rates.  Set DECODE_BATCH_SIZE=1
     to restore single-message behaviour.
+
+    radar_event_sink: optional callback; if provided, receives each predecoded
+    DF11 radar event tuple so radar processing can be isolated from the main
+    decoder thread.
     """
     import logging
     import queue as _queue
@@ -63,7 +84,9 @@ def make_pause_aware_decoder(msg_queue, state, sentinel):
 
     def _run() -> None:
         while True:
+            t_wait_start = time.perf_counter()
             item = msg_queue.get()
+            queue_wait_s = time.perf_counter() - t_wait_start
             if item is sentinel:
                 log.debug("beast-decoder: shutdown sentinel received")
                 return
@@ -75,19 +98,62 @@ def make_pause_aware_decoder(msg_queue, state, sentinel):
                 log.debug("beast-decoder: resumed")
 
             batch = [item]
-            for _ in range(config.DECODE_BATCH_SIZE - 1):
+            target_batch_size = _target_decode_batch_size(
+                msg_queue.qsize(),
+                base=config.DECODE_BATCH_SIZE,
+                max_size=config.DECODE_BATCH_SIZE_MAX,
+                backlog_threshold=config.DECODE_BATCH_BACKLOG_THRESHOLD,
+            )
+            t_batch_fill_start = time.perf_counter()
+            for _ in range(target_batch_size - 1):
                 try:
                     next_item = msg_queue.get_nowait()
                     if next_item is sentinel:
                         # Process current batch then exit cleanly
-                        state.process_messages_batch(batch)
+                        batch_fill_s = time.perf_counter() - t_batch_fill_start
+                        t_process_start = time.perf_counter()
+                        t_process_cpu_start = time.thread_time()
+                        radar_events = state.process_messages_batch(batch)
+                        process_cpu_s = time.thread_time() - t_process_cpu_start
+                        process_wall_s = time.perf_counter() - t_process_start
+                        if radar_event_sink is not None:
+                            for radar_event in radar_events:
+                                radar_event_sink(radar_event)
+                        _record_decoder_batch_sample({
+                            "ts_s": time.time(),
+                            "queue_wait_ms": round(queue_wait_s * 1000, 2),
+                            "batch_fill_ms": round(batch_fill_s * 1000, 2),
+                            "process_wall_ms": round(process_wall_s * 1000, 2),
+                            "process_cpu_ms": round(process_cpu_s * 1000, 2),
+                            "process_offcpu_ms": round(max(0.0, process_wall_s - process_cpu_s) * 1000, 2),
+                            "batch_size": len(batch),
+                            "batch_target": target_batch_size,
+                        })
                         log.debug("beast-decoder: shutdown sentinel received mid-batch")
                         return
                     batch.append(next_item)
                 except _queue.Empty:
                     break
 
-            state.process_messages_batch(batch)
+            batch_fill_s = time.perf_counter() - t_batch_fill_start
+            t_process_start = time.perf_counter()
+            t_process_cpu_start = time.thread_time()
+            radar_events = state.process_messages_batch(batch)
+            process_cpu_s = time.thread_time() - t_process_cpu_start
+            process_wall_s = time.perf_counter() - t_process_start
+            if radar_event_sink is not None:
+                for radar_event in radar_events:
+                    radar_event_sink(radar_event)
+            _record_decoder_batch_sample({
+                "ts_s": time.time(),
+                "queue_wait_ms": round(queue_wait_s * 1000, 2),
+                "batch_fill_ms": round(batch_fill_s * 1000, 2),
+                "process_wall_ms": round(process_wall_s * 1000, 2),
+                "process_cpu_ms": round(process_cpu_s * 1000, 2),
+                "process_offcpu_ms": round(max(0.0, process_wall_s - process_cpu_s) * 1000, 2),
+                "batch_size": len(batch),
+                "batch_target": target_batch_size,
+            })
 
     return _run
 

@@ -91,6 +91,23 @@ typedef struct {
     uint32_t len;
 } beast_parser_t;
 
+typedef struct radar_burst_processor_t radar_burst_processor_t;
+
+typedef struct {
+    uint32_t icao;
+    double arrival_us;
+    double signal_dbfs;
+    bool has_signal;
+} radar_burst_event_t;
+
+typedef struct {
+    uint32_t icao;
+    double burst_centroid_us;
+    double burst_signal_dbfs;
+    bool has_signal;
+    double trigger_arrival_us;
+} radar_fired_burst_t;
+
 /* ── API ────────────────────────────────────────────────────────────────── */
 
 /* Call once at process start.  Thread-safe after initialisation. */
@@ -151,3 +168,40 @@ int  beast_parse_chunk(beast_parser_t *parser,
                        const uint8_t *chunk, uint32_t chunk_len,
                        beast_frame_t *out_frames, int max_frames,
                        uint32_t *malformed_bytes);
+
+radar_burst_processor_t *radar_burst_processor_create(void);
+void radar_burst_processor_destroy(radar_burst_processor_t *processor);
+int radar_burst_processor_process(
+    radar_burst_processor_t *processor,
+    const radar_burst_event_t *events,
+    int event_count,
+    double burst_gap_us,
+    radar_fired_burst_t *out_bursts,
+    int max_out_bursts
+);
+int radar_burst_processor_matches_dominant_period(
+    radar_burst_processor_t *processor,
+    uint32_t icao,
+    double period_s,
+    int min_bursts,
+    double tolerance
+);
+int radar_burst_processor_matches_phase_family(
+    radar_burst_processor_t *processor,
+    uint32_t ref_icao,
+    double ref_arrival_us,
+    uint32_t icao,
+    double burst_centroid_us,
+    double period_s,
+    int min_history,
+    double tolerance_us
+);
+uint32_t radar_burst_processor_select_reference(
+    radar_burst_processor_t *processor,
+    double period_s,
+    double now_us,
+    int min_bursts_for_ref,
+    double recency_periods,
+    double hysteresis,
+    uint32_t current_ref_icao
+);

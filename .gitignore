@@ -4,6 +4,7 @@ MEMORY.md
 CLAUDE.md
 docs/superpowers/
 docs/development/
+openspec/
 
 # Environment files
 .env

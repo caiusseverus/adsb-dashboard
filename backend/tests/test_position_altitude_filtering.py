@@ -6,7 +6,15 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-from aircraft_state import Aircraft, AircraftState, MsgSource, _pos_reliable, _accept_adsb_position, _accept_altitude
+from aircraft_state import (
+    Aircraft,
+    AircraftState,
+    AdsbPositionSample,
+    MsgSource,
+    _pos_reliable,
+    _accept_adsb_position,
+    _accept_altitude,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +164,48 @@ class TestAcceptAdsbPositionFastTrack:
                                cpr_odd=True, now=1000.0)
         # Fast-track must have promoted odd score to at least 2.0
         assert ac.pos_reliable_odd >= 2.0
+
+
+class TestAdsbPositionHistory:
+
+    def test_accept_adsb_position_records_timestamped_history(self):
+        ac = make_ac(
+            gs=240.0,
+            track=90.0,
+            airspeed_kts=230,
+            heading_deg=95.0,
+        )
+
+        _accept_adsb_position(ac, lat=51.5, lon=-0.1, pos_from_global=True,
+                               cpr_odd=False, now=1000.0)
+
+        assert len(ac.adsb_position_history) == 1
+        sample = ac.adsb_position_history[0]
+        assert sample.ts == pytest.approx(1000.0)
+        assert sample.lat == pytest.approx(51.5, abs=0.001)
+        assert sample.lon == pytest.approx(-0.1, abs=0.001)
+        assert sample.groundspeed_kts == pytest.approx(240.0)
+        assert sample.track_deg == pytest.approx(90.0)
+
+    def test_get_aircraft_position_history_returns_recent_samples(self):
+        state = AircraftState()
+        ac = make_ac()
+        now = 1000.0
+        ac.adsb_position_history.append(
+            AdsbPositionSample(now, 51.5, -0.1, 220.0, 100.0, 98.0, 210)
+        )
+        state._aircraft[ac.icao] = ac
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr("aircraft_state.time.time", lambda: now + 1.0)
+        try:
+            history = state.get_aircraft_position_history(ac.icao, window_s=3600.0)
+        finally:
+            monkeypatch.undo()
+
+        assert len(history) == 1
+        assert history[0]["ts"] == pytest.approx(now)
+        assert history[0]["groundspeed_kts"] == pytest.approx(220.0)
 
 
 class TestSnapshotPublication:

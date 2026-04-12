@@ -16,6 +16,8 @@ Any 0x1a byte *inside* the data (timestamp/signal/message) is escaped as
 
 import asyncio
 import logging
+import time
+from collections import deque
 from typing import Callable, Optional, Tuple, Union
 
 try:
@@ -31,6 +33,11 @@ _MSG_LEN = {0x31: 2, 0x32: 7, 0x33: 14}
 # stream (readsb: stats_current.remote_malformed_beast).  Exposed via /api/debug/perf.
 # All BeastClient instances (main + MLAT) aggregate into this single counter.
 malformed_bytes: int = 0
+chunk_timings: deque[dict[str, float | int | str]] = deque(maxlen=400)
+
+
+def _record_chunk_timing(sample: dict[str, float | int | str]) -> None:
+    chunk_timings.append(sample)
 
 class BeastClient:
     def __init__(self, host: str, port: int, on_message: Callable[[dict], None]):
@@ -73,15 +80,30 @@ class BeastClient:
                 chunk = await asyncio.wait_for(reader.read(4096), timeout=30)
                 if not chunk:
                     raise ConnectionError("Remote closed the connection")
+                t_parse_start = time.perf_counter()
+                t_parse_cpu_start = time.thread_time()
                 if self._native_parser is not None:
-                    self._parse_frames_native(chunk)
+                    frames_dispatched = self._parse_frames_native(chunk)
+                    parser_mode = "native"
                 else:
                     self._buf.extend(chunk)
                     if len(self._buf) > 65536:
                         # Buffer overflow — likely connected to a non-Beast endpoint or
                         # a pathological stream. Reconnect rather than exhaust memory.
                         raise ConnectionError("Beast buffer exceeded 64 KB — reconnecting")
-                    self._parse_frames()
+                    frames_dispatched = self._parse_frames()
+                    parser_mode = "python"
+                parse_cpu_s = time.thread_time() - t_parse_cpu_start
+                parse_wall_s = time.perf_counter() - t_parse_start
+                _record_chunk_timing({
+                    "ts_s": time.time(),
+                    "chunk_bytes": len(chunk),
+                    "frames": frames_dispatched,
+                    "parse_wall_ms": round(parse_wall_s * 1000, 2),
+                    "parse_cpu_ms": round(parse_cpu_s * 1000, 2),
+                    "parse_offcpu_ms": round(max(0.0, parse_wall_s - parse_cpu_s) * 1000, 2),
+                    "parser_mode": parser_mode,
+                })
         finally:
             writer.close()
             try:
@@ -89,18 +111,22 @@ class BeastClient:
             except Exception:
                 pass
 
-    def _parse_frames_native(self, chunk: bytes) -> None:
+    def _parse_frames_native(self, chunk: bytes) -> int:
         global malformed_bytes
         frames, malformed = self._native_parser.parse_chunk(chunk)
         malformed_bytes += malformed
+        dispatched = 0
         for frame in frames:
             if frame["type"] == 0x31:
                 continue
             self._dispatch_frame(frame)
+            dispatched += 1
+        return dispatched
 
-    def _parse_frames(self) -> None:
+    def _parse_frames(self) -> int:
         global malformed_bytes
         buf = self._buf
+        dispatched = 0
         while len(buf) >= 2:
             # Synchronize on 0x1a
             if buf[0] != 0x1A:
@@ -108,7 +134,7 @@ class BeastClient:
                 if idx == -1:
                     malformed_bytes += len(buf)
                     buf.clear()
-                    return
+                    return dispatched
                 malformed_bytes += idx
                 del buf[:idx]
                 continue
@@ -141,6 +167,8 @@ class BeastClient:
             if msg_type == 0x31:
                 continue
             self._dispatch(msg_type, data)
+            dispatched += 1
+        return dispatched
 
     def _unescape(self, buf: bytearray, start: int, needed: int) -> Tuple[Union[bytes, bool, None], Optional[int]]:
         """

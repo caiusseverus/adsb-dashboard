@@ -42,18 +42,32 @@ export function useTimingEventBuffer(timingPacket, windowUs, maxEvents = TIMING_
     if (!timingPacket) return
     const nowUs = Number(timingPacket.now_us ?? 0)
     const cutoffUs = Math.max(0, nowUs - windowUs - 1_000_000)
-    const newEvents = (timingPacket.events ?? []).map(normalizeTimingEvent)
-    const mergedMap = new Map()
+    const newEvents = timingPacket.events ?? []
+    const previous = bufRef.current
+    const pruned = previous.filter(ev => ev.arrival_us >= cutoffUs)
 
-    for (const ev of bufRef.current) {
-      if (ev.arrival_us >= cutoffUs) mergedMap.set(ev.seq, ev)
-    }
-    for (const ev of newEvents) {
-      if (ev.arrival_us >= cutoffUs) mergedMap.set(ev.seq, ev)
+    if (!newEvents.length) {
+      bufRef.current = pruned
+      setView({ nowUs, events: pruned })
+      return
     }
 
-    const merged = [...mergedMap.values()].sort((a, b) => a.seq - b.seq)
-    if (merged.length > maxEvents) merged.splice(0, merged.length - maxEvents)
+    const lastSeq = pruned.length ? pruned[pruned.length - 1].seq : -Infinity
+    const firstIncomingSeq = Number(newEvents[0]?.[0] ?? -Infinity)
+
+    let merged
+    if (firstIncomingSeq > lastSeq) {
+      merged = pruned.concat(newEvents.map(normalizeTimingEvent).filter(ev => ev.arrival_us >= cutoffUs))
+    } else {
+      const mergedMap = new Map()
+      for (const ev of pruned) mergedMap.set(ev.seq, ev)
+      for (const ev of newEvents.map(normalizeTimingEvent)) {
+        if (ev.arrival_us >= cutoffUs) mergedMap.set(ev.seq, ev)
+      }
+      merged = [...mergedMap.values()].sort((a, b) => a.seq - b.seq)
+    }
+
+    if (merged.length > maxEvents) merged = merged.slice(merged.length - maxEvents)
     bufRef.current = merged
     setView({ nowUs, events: merged })
   }, [maxEvents, timingPacket, windowUs])

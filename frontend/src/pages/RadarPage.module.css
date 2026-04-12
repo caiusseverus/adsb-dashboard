@@ -1,0 +1,376 @@
+.main {
+  flex: 1;
+  padding: 1.25rem 1.5rem;
+  max-width: 1500px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.card {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem;
+  overflow: auto;
+}
+
+.cardMap {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem 0;
+  overflow: hidden;
+}
+
+.cardHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+
+.cardTitle {
+  font-size: 0.75rem;
+  color: #484f58;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+}
+
+.cardSub {
+  font-size: 0.75rem;
+  color: #8b949e;
+}
+
+.sectionLead {
+  margin-top: 0.35rem;
+  color: #8b949e;
+  font-size: 0.92rem;
+  line-height: 1.45;
+  max-width: 58rem;
+}
+
+.metricRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.metricPill {
+  display: inline-flex;
+  gap: 0.45rem;
+  align-items: center;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid #30363d;
+  border-radius: 999px;
+  color: #8b949e;
+  font-size: 0.76rem;
+  background: #0f141b;
+}
+
+.legendChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid #30363d;
+  border-radius: 999px;
+  color: #8b949e;
+  font-size: 0.76rem;
+  background: #0f141b;
+}
+
+.resetButton {
+  appearance: none;
+  border: 1px solid #5a1e24;
+  background: #2a1115;
+  color: #ffb3ba;
+  border-radius: 999px;
+  padding: 0.42rem 0.75rem;
+  font-size: 0.76rem;
+  cursor: pointer;
+}
+
+.resetButton:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.resetButton:hover:not(:disabled) {
+  background: #351419;
+}
+
+.actionButton {
+  appearance: none;
+  border: 1px solid #2f81f7;
+  background: #132338;
+  color: #d2e4ff;
+  border-radius: 999px;
+  padding: 0.42rem 0.75rem;
+  font-size: 0.76rem;
+  cursor: pointer;
+}
+
+.actionButton:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.actionButton:hover:not(:disabled) {
+  background: #18304a;
+}
+
+.controlInput {
+  width: 100%;
+  background: #0f141b;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  color: #e6edf3;
+  padding: 0.55rem 0.7rem;
+  font-size: 0.84rem;
+}
+
+.legendDotPrimary,
+.legendDotHarmonic,
+.legendDotResidual {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 999px;
+  display: inline-block;
+}
+
+.legendDotPrimary { background: #58a6ff; }
+.legendDotHarmonic { background: #3fb950; }
+.legendDotResidual { background: #ff7b72; }
+
+.metricValue {
+  color: #e6edf3;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+}
+
+.tableWrap {
+  overflow-x: auto;
+  overflow-y: auto;
+  max-height: 340px;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.84rem;
+}
+
+.table th {
+  text-align: left;
+  padding: 0.45rem 0.6rem;
+  font-size: 0.72rem;
+  color: #484f58;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 500;
+  border-bottom: 1px solid #21262d;
+  white-space: nowrap;
+}
+
+.row {
+  cursor: pointer;
+}
+
+.row:hover td {
+  background: #21262d44;
+}
+
+.rowSelected td {
+  background: #388bfd18;
+}
+
+.table td {
+  padding: 0.45rem 0.6rem;
+  color: #c9d1d9;
+  border-bottom: 1px solid #21262d22;
+  white-space: nowrap;
+}
+
+.monoCell {
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 0.8rem;
+  color: #c9d1d9;
+}
+
+.statusBadge {
+  font-size: 0.7rem;
+  padding: 0.15rem 0.4rem;
+  border-radius: 3px;
+  border: 1px solid;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.alignmentWrap {
+  overflow: auto;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  background: linear-gradient(180deg, #0d131a 0%, #101820 100%);
+}
+
+.alignmentSvg {
+  display: block;
+  min-width: 100%;
+}
+
+.axisLabel {
+  font-size: 11px;
+  fill: #6e7681;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+}
+
+.alignmentLabel {
+  font-size: 11px;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  cursor: pointer;
+}
+
+.rowIndex {
+  font-size: 10px;
+  fill: #6e7681;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+}
+
+.mapFrame {
+  height: 380px;
+  width: 100%;
+  border-top: 1px solid #21262d;
+}
+
+.empty {
+  color: #484f58;
+  font-size: 0.9rem;
+  text-align: center;
+  padding: 2rem 0;
+}
+
+.evidenceLegend {
+  position: absolute;
+  right: 0.9rem;
+  bottom: 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  background: rgba(15, 20, 27, 0.92);
+  backdrop-filter: blur(8px);
+  color: #c9d1d9;
+  font-size: 0.76rem;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+}
+
+.evidenceLegendItem {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  white-space: nowrap;
+}
+
+.evidenceLegendCross,
+.evidenceLegendSquare,
+.evidenceLegendRing,
+.evidenceLegendDot {
+  display: inline-block;
+  flex: 0 0 auto;
+}
+
+.evidenceLegendCross {
+  position: relative;
+  width: 0.95rem;
+  height: 0.95rem;
+}
+
+.evidenceLegendCross::before,
+.evidenceLegendCross::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  background: #ffffff;
+  transform: translate(-50%, -50%);
+}
+
+.evidenceLegendCross::before {
+  width: 0.95rem;
+  height: 2px;
+}
+
+.evidenceLegendCross::after {
+  width: 2px;
+  height: 0.95rem;
+}
+
+.evidenceLegendSquare {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 2px;
+  background: #58a6ff;
+  box-shadow: 0 0 0 1px #0d131a inset;
+}
+
+.evidenceLegendRing {
+  width: 0.9rem;
+  height: 0.9rem;
+  border-radius: 999px;
+  border: 2px dashed rgba(255, 255, 255, 0.85);
+}
+
+.evidenceLegendDot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 999px;
+  background: #d29922;
+}
+
+@media (max-width: 900px) {
+  .main {
+    padding: 1rem;
+  }
+
+  .card,
+  .cardMap {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+
+  .sectionLead {
+    font-size: 0.88rem;
+  }
+
+  .evidenceLegend {
+    position: static;
+    margin: 0.75rem;
+  }
+}
+
+/* Leaflet ICAO labels on the Frame FM Geometry map */
+:global(.frame-geom-icao-label) {
+  background: rgba(22, 27, 34, 0.88);
+  border: 1px solid #30363d;
+  border-radius: 3px;
+  color: #c9d1d9;
+  font-size: 0.68rem;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  padding: 1px 4px;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: none;
+}
+:global(.frame-geom-icao-label::before) {
+  display: none;
+}

@@ -20,6 +20,9 @@ from signal_utils import raw_signal_to_dbfs
 
 log = logging.getLogger(__name__)
 
+_LOCK_RETRY_ATTEMPTS = 5
+_LOCK_RETRY_BASE_DELAY_S = 0.05
+
 
 def _raw_signal_to_dbfs(raw: float | int | None) -> float | None:
     return raw_signal_to_dbfs(raw)
@@ -266,12 +269,32 @@ class StatsDB:
         if conn is None:
             conn = sqlite3.connect(str(config.DB_PATH), timeout=10, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=10000")
             conn.execute(f"PRAGMA synchronous={config.SQLITE_SYNCHRONOUS}")
             conn.execute("PRAGMA cache_size=-8000")   # 8 MB page cache per thread
             conn.execute("PRAGMA temp_store=MEMORY")  # temp tables in RAM, not SD card
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
         return conn
+
+    def _run_with_lock_retry(self, op_name: str, fn):
+        """Retry transient SQLite lock failures with a short backoff."""
+        delay_s = _LOCK_RETRY_BASE_DELAY_S
+        for attempt in range(1, _LOCK_RETRY_ATTEMPTS + 1):
+            try:
+                return fn()
+            except sqlite3.OperationalError as exc:
+                if "database is locked" not in str(exc).lower() or attempt == _LOCK_RETRY_ATTEMPTS:
+                    raise
+                log.warning(
+                    "StatsDB: %s hit database lock (attempt %d/%d); retrying in %.2fs",
+                    op_name,
+                    attempt,
+                    _LOCK_RETRY_ATTEMPTS,
+                    delay_s,
+                )
+                time.sleep(delay_s)
+                delay_s *= 2.0
 
     # ------------------------------------------------------------------
     # Schema
@@ -558,6 +581,103 @@ class StatsDB:
                 conn.execute("ALTER TABLE cast_rules ADD COLUMN max_altitude_ft INTEGER")
             except Exception:
                 pass
+
+        # radar_iids and radar_calibration tables (passive radar positioning)
+        with self._connect() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS radar_iids (
+                    iid             INTEGER PRIMARY KEY,
+                    resolution_mode TEXT    NOT NULL DEFAULT 'auto',
+                    status          TEXT    NOT NULL DEFAULT 'UNKNOWN',
+                    period_s        REAL,
+                    secondary_period_s REAL,
+                    period_std_s    REAL,
+                    rpm             REAL,
+                    lat             REAL,
+                    lon             REAL,
+                    cep_m           REAL,
+                    n_pairs         INTEGER NOT NULL DEFAULT 0,
+                    last_updated    REAL    NOT NULL DEFAULT 0,
+                    multi_radar_flag INTEGER NOT NULL DEFAULT 0,
+                    primary_support_count INTEGER NOT NULL DEFAULT 0,
+                    secondary_support_count INTEGER NOT NULL DEFAULT 0,
+                    ci_lat          REAL,
+                    ci_lon          REAL,
+                    ci_cep_m        REAL,
+                    ci_source       TEXT,
+                    ci_n_pairs      INTEGER NOT NULL DEFAULT 0,
+                    ci_last_updated REAL,
+                    manual_lat      REAL,
+                    manual_lon      REAL,
+                    manual_note     TEXT,
+                    manual_updated_ts REAL,
+                    unresolvable_reason TEXT,
+                    unresolvable_updated_ts REAL
+                );
+
+                CREATE TABLE IF NOT EXISTS radar_calibration (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    iid          INTEGER NOT NULL,
+                    ts           REAL    NOT NULL,
+                    icao_a       TEXT    NOT NULL,
+                    icao_b       TEXT    NOT NULL,
+                    lat_a        REAL    NOT NULL,
+                    lon_a        REAL    NOT NULL,
+                    lat_b        REAL    NOT NULL,
+                    lon_b        REAL    NOT NULL,
+                    tdoa_us      REAL    NOT NULL,
+                    receiver_lat REAL    NOT NULL,
+                    receiver_lon REAL    NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS radar_calibration_iid
+                    ON radar_calibration(iid);
+                CREATE INDEX IF NOT EXISTS radar_calibration_ts
+                    ON radar_calibration(ts);
+                CREATE INDEX IF NOT EXISTS radar_calibration_iid_ts
+                    ON radar_calibration(iid, ts);
+
+                CREATE TABLE IF NOT EXISTS radar_frame_positions (
+                    iid                 INTEGER NOT NULL,
+                    frame_index         INTEGER NOT NULL,
+                    sweep_start_us      REAL    NOT NULL,
+                    lat                 REAL    NOT NULL,
+                    lon                 REAL    NOT NULL,
+                    cep_km              REAL    NOT NULL,
+                    n_contributing_arcs INTEGER NOT NULL,
+                    azimuth_spread_deg  REAL    NOT NULL,
+                    weight              REAL    NOT NULL,
+                    PRIMARY KEY (iid, sweep_start_us)
+                );
+                CREATE INDEX IF NOT EXISTS radar_frame_positions_iid
+                    ON radar_frame_positions(iid);
+            """)
+            for stmt in (
+                "ALTER TABLE radar_iids ADD COLUMN resolution_mode TEXT NOT NULL DEFAULT 'auto'",
+                "ALTER TABLE radar_iids ADD COLUMN secondary_period_s REAL",
+                "ALTER TABLE radar_iids ADD COLUMN primary_support_count INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE radar_iids ADD COLUMN secondary_support_count INTEGER NOT NULL DEFAULT 0",
+                # Forward model localisation columns
+                "ALTER TABLE radar_iids ADD COLUMN fm_lat REAL",
+                "ALTER TABLE radar_iids ADD COLUMN fm_lon REAL",
+                "ALTER TABLE radar_iids ADD COLUMN fm_cep_m REAL",
+                "ALTER TABLE radar_iids ADD COLUMN fm_source TEXT",
+                "ALTER TABLE radar_iids ADD COLUMN ci_lat REAL",
+                "ALTER TABLE radar_iids ADD COLUMN ci_lon REAL",
+                "ALTER TABLE radar_iids ADD COLUMN ci_cep_m REAL",
+                "ALTER TABLE radar_iids ADD COLUMN ci_source TEXT",
+                "ALTER TABLE radar_iids ADD COLUMN ci_n_pairs INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE radar_iids ADD COLUMN ci_last_updated REAL",
+                "ALTER TABLE radar_iids ADD COLUMN manual_lat REAL",
+                "ALTER TABLE radar_iids ADD COLUMN manual_lon REAL",
+                "ALTER TABLE radar_iids ADD COLUMN manual_note TEXT",
+                "ALTER TABLE radar_iids ADD COLUMN manual_updated_ts REAL",
+                "ALTER TABLE radar_iids ADD COLUMN unresolvable_reason TEXT",
+                "ALTER TABLE radar_iids ADD COLUMN unresolvable_updated_ts REAL",
+            ):
+                try:
+                    conn.execute(stmt)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Write path (called every minute via asyncio.to_thread)
@@ -928,6 +1048,7 @@ class StatsDB:
             conn.execute("DELETE FROM coverage_samples WHERE ts < ?", (coverage_cutoff_ts,))
             conn.execute("DELETE FROM acas_events WHERE ts < ?", (coverage_cutoff_ts,))
             conn.execute("DELETE FROM squawk_events WHERE ts < ?", (coverage_cutoff_ts,))
+            conn.execute("DELETE FROM radar_calibration WHERE ts < ?", (float(coverage_cutoff_ts),))
         log.info("DB: pruned data older than %s", cutoff_date)
 
     # ------------------------------------------------------------------
@@ -3450,17 +3571,21 @@ class StatsDB:
     def write_visits(self, visits: list[tuple]) -> list[int]:
         """Insert completed visit records. Each tuple: (icao, start_ts, end_ts,
         callsign, squawk, max_altitude, msg_count). Returns inserted row IDs."""
-        ids = []
-        with self._connect() as conn:
-            for v in visits:
-                cur = conn.execute(
+        def _write() -> list[int]:
+            with self._connect() as conn:
+                conn.executemany(
                     "INSERT INTO visits "
                     "(icao, start_ts, end_ts, callsign, squawk, max_altitude, msg_count) "
                     "VALUES (?,?,?,?,?,?,?)",
-                    v,
+                    visits,
                 )
-                ids.append(cur.lastrowid)
-        return ids
+                last_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                if last_id is None:
+                    return []
+                first_id = last_id - len(visits) + 1
+                return list(range(first_id, last_id + 1))
+
+        return self._run_with_lock_retry("write_visits", _write)
 
     def update_visit_route(self, visit_id: int, origin_icao: str | None,
                            dest_icao: str | None) -> None:
@@ -3564,6 +3689,227 @@ class StatsDB:
                 "altitude": row["altitude"],
             })
         return points
+
+
+    # ------------------------------------------------------------------
+    # Radar IID persistence
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _radar_iid_values(model) -> tuple:
+        return (
+            model.iid, model.resolution_mode, model.status, model.period_s, model.secondary_period_s, model.period_std_s, model.rpm,
+            model.lat, model.lon, model.cep_m, model.n_pairs,
+            model.last_updated, int(model.multi_radar_flag),
+            model.primary_support_count, model.secondary_support_count,
+            model.fm_lat, model.fm_lon, model.fm_cep_m, model.fm_source,
+            model.ci_lat, model.ci_lon, model.ci_cep_m, model.ci_source, model.ci_n_pairs, model.ci_last_updated,
+            model.manual_lat, model.manual_lon, model.manual_note, model.manual_updated_ts,
+            model.unresolvable_reason, model.unresolvable_updated_ts,
+        )
+
+    def upsert_radar_iid(self, model) -> None:
+        """Write or update a RadarIID model row."""
+        self.upsert_radar_iids([model])
+
+    def upsert_radar_iids(self, models) -> None:
+        """Write or update multiple RadarIID model rows in one transaction."""
+        if not models:
+            return
+        def _write() -> None:
+            with self._connect() as conn:
+                sql = """
+                INSERT INTO radar_iids
+                    (iid, resolution_mode, status, period_s, secondary_period_s, period_std_s, rpm,
+                     lat, lon, cep_m, n_pairs, last_updated, multi_radar_flag,
+                     primary_support_count, secondary_support_count,
+                     fm_lat, fm_lon, fm_cep_m, fm_source,
+                     ci_lat, ci_lon, ci_cep_m, ci_source, ci_n_pairs, ci_last_updated,
+                     manual_lat, manual_lon, manual_note, manual_updated_ts,
+                     unresolvable_reason, unresolvable_updated_ts)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(iid) DO UPDATE SET
+                    resolution_mode  = excluded.resolution_mode,
+                    status           = excluded.status,
+                    period_s         = excluded.period_s,
+                    secondary_period_s = excluded.secondary_period_s,
+                    period_std_s     = excluded.period_std_s,
+                    rpm              = excluded.rpm,
+                    lat              = excluded.lat,
+                    lon              = excluded.lon,
+                    cep_m            = excluded.cep_m,
+                    n_pairs          = excluded.n_pairs,
+                    last_updated     = excluded.last_updated,
+                    multi_radar_flag = excluded.multi_radar_flag,
+                    primary_support_count = excluded.primary_support_count,
+                    secondary_support_count = excluded.secondary_support_count,
+                    fm_lat           = excluded.fm_lat,
+                    fm_lon           = excluded.fm_lon,
+                    fm_cep_m         = excluded.fm_cep_m,
+                    fm_source        = excluded.fm_source,
+                    ci_lat           = excluded.ci_lat,
+                    ci_lon           = excluded.ci_lon,
+                    ci_cep_m         = excluded.ci_cep_m,
+                    ci_source        = excluded.ci_source,
+                    ci_n_pairs       = excluded.ci_n_pairs,
+                    ci_last_updated  = excluded.ci_last_updated,
+                    manual_lat       = excluded.manual_lat,
+                    manual_lon       = excluded.manual_lon,
+                    manual_note      = excluded.manual_note,
+                    manual_updated_ts = excluded.manual_updated_ts,
+                    unresolvable_reason = excluded.unresolvable_reason,
+                    unresolvable_updated_ts = excluded.unresolvable_updated_ts
+                """
+                values = [self._radar_iid_values(model) for model in models]
+                if len(values) == 1:
+                    conn.execute(sql, values[0])
+                else:
+                    conn.executemany(sql, values)
+
+        self._run_with_lock_retry("upsert_radar_iids", _write)
+
+    def load_radar_iids(self) -> list[dict]:
+        """Load all persisted RadarIID rows."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM radar_iids").fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_radar_learning(self) -> dict:
+        """Delete all persisted passive-radar models and calibration rows."""
+        with self._connect() as conn:
+            radar_iids_deleted = conn.execute("SELECT COUNT(*) FROM radar_iids").fetchone()[0]
+            calibration_deleted = conn.execute("SELECT COUNT(*) FROM radar_calibration").fetchone()[0]
+            conn.execute("DELETE FROM radar_iids")
+            conn.execute("DELETE FROM radar_calibration")
+        return {
+            "radar_iids_deleted": int(radar_iids_deleted),
+            "calibration_deleted": int(calibration_deleted),
+        }
+
+    def insert_calibration_pair(self, pair) -> None:
+        """Insert one co-sweep calibration observation."""
+        self.insert_calibration_pairs([pair])
+
+    def insert_calibration_pairs(self, pairs) -> None:
+        """Insert multiple co-sweep calibration observations in one transaction."""
+        if not pairs:
+            return
+        with self._connect() as conn:
+            conn.executemany("""
+                INSERT INTO radar_calibration
+                    (iid, ts, icao_a, icao_b, lat_a, lon_a, lat_b, lon_b,
+                     tdoa_us, receiver_lat, receiver_lon)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """, [
+                (
+                    pair.iid, pair.ts, pair.icao_a, pair.icao_b,
+                    pair.lat_a, pair.lon_a, pair.lat_b, pair.lon_b,
+                    pair.tdoa_us, pair.receiver_lat, pair.receiver_lon,
+                )
+                for pair in pairs
+            ])
+
+    def load_calibration_pairs(self, iid: int, limit: int = 2000) -> list[dict]:
+        """Load calibration pairs for one IID (90-day window).
+
+        limit caps unique rows returned after deduplication.  Callers that only
+        need a recent representative sample should pass a smaller value to bound
+        both DB I/O and downstream computation cost.
+        """
+        cutoff = time.time() - 90 * 86400
+        fetch_limit = min(limit * 3, 5000)  # over-fetch to absorb duplicates
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT iid, ts, icao_a, icao_b, lat_a, lon_a, lat_b, lon_b,
+                       tdoa_us, receiver_lat, receiver_lon
+                FROM radar_calibration
+                WHERE iid = ? AND ts > ?
+                ORDER BY ts DESC
+                LIMIT ?
+            """, (iid, cutoff, fetch_limit)).fetchall()
+        unique_rows: list[dict] = []
+        seen_keys: set[tuple] = set()
+        for row in rows:
+            record = dict(row)
+            key = (
+                record["iid"],
+                round(record["ts"], 1),
+                record["icao_a"],
+                record["icao_b"],
+                round(record["lat_a"], 5),
+                round(record["lon_a"], 5),
+                round(record["lat_b"], 5),
+                round(record["lon_b"], 5),
+                round(record["tdoa_us"], 3),
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            unique_rows.append(record)
+            if len(unique_rows) >= limit:
+                break
+        return unique_rows
+
+    def count_calibration_pairs(self, iid: int) -> int:
+        """Count recent calibration rows for one IID without loading pair payloads."""
+        cutoff = time.time() - 90 * 86400
+        with self._connect() as conn:
+            row = conn.execute("""
+                SELECT COUNT(*)
+                FROM radar_calibration
+                WHERE iid = ? AND ts > ?
+            """, (iid, cutoff)).fetchone()
+        return int(row[0] if row is not None else 0)
+
+    # ------------------------------------------------------------------
+    # Per-frame position estimates
+    # ------------------------------------------------------------------
+
+    def insert_frame_position(self, iid: int, estimate) -> None:
+        """Persist one FramePositionEstimate. Uses (iid, sweep_start_us) as PK."""
+        with self._connect() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO radar_frame_positions
+                    (iid, frame_index, sweep_start_us, lat, lon, cep_km,
+                     n_contributing_arcs, azimuth_spread_deg, weight)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (
+                iid, estimate.frame_index, estimate.sweep_start_us,
+                estimate.lat, estimate.lon, estimate.cep_km,
+                estimate.n_contributing_arcs, estimate.azimuth_spread_deg,
+                estimate.weight,
+            ))
+
+    def load_frame_positions(self, iid: int, limit: int = 5000) -> list[dict]:
+        """Load the most recent frame position estimates for one IID."""
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT frame_index, sweep_start_us, lat, lon, cep_km,
+                       n_contributing_arcs, azimuth_spread_deg, weight
+                FROM (
+                    SELECT * FROM radar_frame_positions
+                    WHERE iid = ?
+                    ORDER BY sweep_start_us DESC
+                    LIMIT ?
+                )
+                ORDER BY sweep_start_us ASC
+            """, (iid, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_frame_position(self, iid: int, sweep_start_us: float) -> None:
+        """Delete a single estimate identified by (iid, sweep_start_us)."""
+        with self._connect() as conn:
+            conn.execute("""
+                DELETE FROM radar_frame_positions
+                WHERE iid = ? AND sweep_start_us = ?
+            """, (iid, sweep_start_us))
+
+    def clear_frame_positions(self, iid: int) -> None:
+        """Delete all estimates for one IID."""
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM radar_frame_positions WHERE iid = ?", (iid,)
+            )
 
 
 # Module-level singleton

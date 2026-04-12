@@ -89,6 +89,23 @@ typedef struct {
     uint32_t len;
 } beast_parser_t;
 
+typedef struct radar_burst_processor_t radar_burst_processor_t;
+
+typedef struct {
+    uint32_t icao;
+    double arrival_us;
+    double signal_dbfs;
+    bool has_signal;
+} radar_burst_event_t;
+
+typedef struct {
+    uint32_t icao;
+    double burst_centroid_us;
+    double burst_signal_dbfs;
+    bool has_signal;
+    double trigger_arrival_us;
+} radar_fired_burst_t;
+
 void decode_init(void);
 void decode_cleanup(void);
 int  decode_message(const uint8_t *msg_bytes, int msg_len,
@@ -99,6 +116,34 @@ int  beast_parse_chunk(beast_parser_t *parser,
                        const uint8_t *chunk, uint32_t chunk_len,
                        beast_frame_t *out_frames, int max_frames,
                        uint32_t *malformed_bytes);
+radar_burst_processor_t *radar_burst_processor_create(void);
+void radar_burst_processor_destroy(radar_burst_processor_t *processor);
+int radar_burst_processor_process(radar_burst_processor_t *processor,
+                                  const radar_burst_event_t *events,
+                                  int event_count,
+                                  double burst_gap_us,
+                                  radar_fired_burst_t *out_bursts,
+                                  int max_out_bursts);
+int radar_burst_processor_matches_dominant_period(radar_burst_processor_t *processor,
+                                                  uint32_t icao,
+                                                  double period_s,
+                                                  int min_bursts,
+                                                  double tolerance);
+int radar_burst_processor_matches_phase_family(radar_burst_processor_t *processor,
+                                               uint32_t ref_icao,
+                                               double ref_arrival_us,
+                                               uint32_t icao,
+                                               double burst_centroid_us,
+                                               double period_s,
+                                               int min_history,
+                                               double tolerance_us);
+uint32_t radar_burst_processor_select_reference(radar_burst_processor_t *processor,
+                                                double period_s,
+                                                double now_us,
+                                                int min_bursts_for_ref,
+                                                double recency_periods,
+                                                double hysteresis,
+                                                uint32_t current_ref_icao);
 
 int solve_cpr_airborne(int even_cprlat, int even_cprlon,
                        int odd_cprlat,  int odd_cprlon,
@@ -326,3 +371,136 @@ class BeastParser:
                 "type": int(frame.msg_type),
             })
         return out, int(self._malformed[0])
+
+
+class RadarBurstProcessor:
+    """Stateful native helper for DF11 burst accumulation and firing."""
+
+    def __init__(self, max_events: int = 256, max_bursts: int = 4096):
+        if max_events <= 0 or max_bursts <= 0:
+            raise ValueError("max_events and max_bursts must be > 0")
+        self._processor = _get_lib().radar_burst_processor_create()
+        if self._processor == _ffi.NULL:
+            raise MemoryError("failed to allocate radar burst processor")
+        self._events = _ffi.new("radar_burst_event_t[]", max_events)
+        self._bursts = _ffi.new("radar_fired_burst_t[]", max_bursts)
+        self._max_events = max_events
+        self._max_bursts = max_bursts
+
+    def __del__(self):
+        processor = getattr(self, "_processor", None)
+        if processor not in (None, _ffi.NULL):
+            try:
+                _get_lib().radar_burst_processor_destroy(processor)
+            except Exception:
+                pass
+            self._processor = _ffi.NULL
+
+    def _ensure_capacity(self, event_count: int) -> None:
+        required_events = max(1, event_count)
+        required_bursts = max(self._max_bursts, required_events * 16, 4096)
+        if required_events <= self._max_events and required_bursts <= self._max_bursts:
+            return
+        new_max_events = max(required_events, self._max_events * 2)
+        new_max_bursts = max(required_bursts, self._max_bursts * 2)
+        self._events = _ffi.new("radar_burst_event_t[]", new_max_events)
+        self._bursts = _ffi.new("radar_fired_burst_t[]", new_max_bursts)
+        self._max_events = new_max_events
+        self._max_bursts = new_max_bursts
+
+    def process_batch(
+        self,
+        events: list[tuple[float, str, float | None]],
+        burst_gap_us: float,
+    ) -> list[dict]:
+        if not events:
+            return []
+        self._ensure_capacity(len(events))
+        for i, (arrival_us, icao_hex, signal_dbfs) in enumerate(events):
+            event = self._events[i]
+            event.icao = int(icao_hex, 16)
+            event.arrival_us = arrival_us
+            if signal_dbfs is None:
+                event.has_signal = False
+                event.signal_dbfs = 0.0
+            else:
+                event.has_signal = True
+                event.signal_dbfs = float(signal_dbfs)
+
+        count = _get_lib().radar_burst_processor_process(
+            self._processor,
+            self._events,
+            len(events),
+            float(burst_gap_us),
+            self._bursts,
+            self._max_bursts,
+        )
+        out: list[dict] = []
+        for i in range(count):
+            burst = self._bursts[i]
+            out.append({
+                "icao": f"{int(burst.icao):06X}",
+                "burst_centroid_us": float(burst.burst_centroid_us),
+                "burst_signal": float(burst.burst_signal_dbfs) if bool(burst.has_signal) else None,
+                "trigger_arrival_us": float(burst.trigger_arrival_us),
+            })
+        return out
+
+    def matches_dominant_period(
+        self,
+        icao_hex: str,
+        period_s: float,
+        min_bursts: int,
+        tolerance: float,
+    ) -> bool:
+        return bool(_get_lib().radar_burst_processor_matches_dominant_period(
+            self._processor,
+            int(icao_hex, 16),
+            float(period_s),
+            int(min_bursts),
+            float(tolerance),
+        ))
+
+    def matches_phase_family(
+        self,
+        ref_icao_hex: str,
+        ref_arrival_us: float,
+        icao_hex: str,
+        burst_centroid_us: float,
+        period_s: float,
+        min_history: int,
+        tolerance_us: float,
+    ) -> bool:
+        return bool(_get_lib().radar_burst_processor_matches_phase_family(
+            self._processor,
+            int(ref_icao_hex, 16),
+            float(ref_arrival_us),
+            int(icao_hex, 16),
+            float(burst_centroid_us),
+            float(period_s),
+            int(min_history),
+            float(tolerance_us),
+        ))
+
+    def select_reference(
+        self,
+        period_s: float,
+        now_us: float,
+        min_bursts_for_ref: int,
+        recency_periods: float,
+        hysteresis: float,
+        current_ref_icao: str | None,
+    ) -> str | None:
+        current_ref = int(current_ref_icao, 16) if current_ref_icao else 0
+        selected = int(_get_lib().radar_burst_processor_select_reference(
+            self._processor,
+            float(period_s),
+            float(now_us),
+            int(min_bursts_for_ref),
+            float(recency_periods),
+            float(hysteresis),
+            current_ref,
+        ))
+        if selected == 0:
+            return None
+        return f"{selected:06X}"

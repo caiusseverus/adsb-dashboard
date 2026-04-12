@@ -45,8 +45,10 @@ log = logging.getLogger(__name__)
 # Performance timing stores — written by process_message and _push_updates,
 # read by /api/debug/perf.  deques are thread-safe for single-writer appends.
 # ---------------------------------------------------------------------------
-# Per-message total processing time in seconds (includes lock acquisition + decode)
+# Per-message end-to-end processing time in seconds, including native predecode.
 msg_timings: deque[float] = deque(maxlen=2000)
+# Per-message time spent in native predecode before lock acquisition (seconds)
+predecode_timings: deque[float] = deque(maxlen=2000)
 # Per-message time spent waiting to acquire self._lock (seconds)
 lock_wait_timings: deque[float] = deque(maxlen=2000)
 # Per-message time spent doing actual work under the lock (seconds)
@@ -55,11 +57,17 @@ decode_timings: deque[float] = deque(maxlen=2000)
 push_timings: deque[dict] = deque(maxlen=120)
 _perf_trace_lock = threading.Lock()
 _MSG_TRACE_INTERVAL_S = 0.05
-msg_perf_trace: deque[tuple[float, float, float, float]] = deque(maxlen=1200)
+msg_perf_trace: deque[tuple[float, float, float, float, float]] = deque(maxlen=1200)
 push_perf_trace: deque[dict] = deque(maxlen=600)
 
 
-def record_msg_perf_sample(ts_s: float, total_ms: float, lock_wait_ms: float, decode_ms: float) -> None:
+def record_msg_perf_sample(
+    ts_s: float,
+    total_ms: float,
+    predecode_ms: float,
+    lock_wait_ms: float,
+    decode_ms: float,
+) -> None:
     """Keep a low-rate moving waveform for the latency oscilloscope.
 
     The decoder path is hot, so keep this extremely cheap: coalesce samples into
@@ -67,15 +75,16 @@ def record_msg_perf_sample(ts_s: float, total_ms: float, lock_wait_ms: float, de
     """
     with _perf_trace_lock:
         if msg_perf_trace and ts_s - msg_perf_trace[-1][0] < _MSG_TRACE_INTERVAL_S:
-            prev_ts, prev_total_ms, prev_wait_ms, prev_decode_ms = msg_perf_trace[-1]
+            prev_ts, prev_total_ms, prev_predecode_ms, prev_wait_ms, prev_decode_ms = msg_perf_trace[-1]
             msg_perf_trace[-1] = (
                 ts_s,
                 max(prev_total_ms, total_ms),
+                max(prev_predecode_ms, predecode_ms),
                 max(prev_wait_ms, lock_wait_ms),
                 max(prev_decode_ms, decode_ms),
             )
             return
-        msg_perf_trace.append((ts_s, total_ms, lock_wait_ms, decode_ms))
+        msg_perf_trace.append((ts_s, total_ms, predecode_ms, lock_wait_ms, decode_ms))
 
 
 def record_push_perf_sample(sample: dict) -> None:
@@ -89,6 +98,8 @@ def get_latency_waveforms(window_s: float = 30.0, bin_ms: int = 250) -> dict:
     cutoff_s = now_s - window_s
     bin_s = max(0.05, bin_ms / 1000.0)
     bin_count = max(1, int(math.ceil(window_s / bin_s)))
+    total_decode_ms = [0.0] * bin_count
+    predecode_ms = [0.0] * bin_count
     decode_ms = [0.0] * bin_count
     lock_wait_ms = [0.0] * bin_count
     snapshot_ms = [0.0] * bin_count
@@ -99,10 +110,12 @@ def get_latency_waveforms(window_s: float = 30.0, bin_ms: int = 250) -> dict:
         msg_samples = tuple(msg_perf_trace)
         push_samples = tuple(push_perf_trace)
 
-    for ts_s, total_ms, wait_ms, pure_decode_ms in msg_samples:
+    for ts_s, total_ms, pre_ms, wait_ms, pure_decode_ms in msg_samples:
         if ts_s < cutoff_s:
             continue
         idx = min(bin_count - 1, max(0, int((ts_s - cutoff_s) / bin_s)))
+        total_decode_ms[idx] = max(total_decode_ms[idx], total_ms)
+        predecode_ms[idx] = max(predecode_ms[idx], pre_ms)
         decode_ms[idx] = max(decode_ms[idx], pure_decode_ms)
         lock_wait_ms[idx] = max(lock_wait_ms[idx], wait_ms)
 
@@ -118,6 +131,8 @@ def get_latency_waveforms(window_s: float = 30.0, bin_ms: int = 250) -> dict:
     return {
         "window_s": window_s,
         "bin_ms": bin_ms,
+        "total_decode_ms": total_decode_ms,
+        "predecode_ms": predecode_ms,
         "decode_ms": decode_ms,
         "lock_wait_ms": lock_wait_ms,
         "snapshot_ms": snapshot_ms,
@@ -160,6 +175,11 @@ class MsgSource(IntEnum):
 _CONFIRMED_ICAO_MAX    = 20_000   # LRU cap (readsb: icaoFilterAdd)
 _ICAO_FILTER_EXPIRY_S  = 60.0     # evict if not refreshed within 60 s (readsb: icaoFilterExpire)
 _AP_DFS = frozenset({0, 4, 5, 16, 20, 21})
+# DF4/5 IID attribution: attribute a DF4/5 to the IID of the most recent DF11
+# from the same aircraft, provided it arrived within this window.  30 s is
+# generous enough that a DF4 arriving just before the paired DF11 (same dwell)
+# still gets attributed via the previous sweep's cached value.
+_DWELL_ATTRIBUTION_WINDOW_US = 30_000_000
 
 # DF values that can arise from a single-bit error corrupting a DF17 type field.
 # readsb: fixDF17msgtype() in mode_s.c — flips the DF field back to 17 and
@@ -199,6 +219,9 @@ _ADSB_MAX_SPEED_KT             = 1500   # hard ceiling for ADS-B speed check
 _SPEED_UNCERTAINTY_KT_PER_S    = 3.0    # ceiling widens +3 kt per second elapsed
 _MLAT_FORCE_INTERVAL_S         = 30.0   # mlatForce: min interval between force-accepts
 _MLAT_FORCE_DISTANCE_NM        = 13.5   # mlatForce: min distance from ADS-B pos (25 km)
+_ADSB_POSITION_HISTORY_MAX_AGE_S = 1800.0
+_ADSB_POSITION_HISTORY_MAXLEN = 3600
+_ADSB_POSITION_MIN_SAMPLE_INTERVAL_S = 0.4
 
 # CPR duplicate detection constants
 _CPR_DUP_WINDOW_S   = 2.0    # window for considering identical frames as duplicates
@@ -366,6 +389,18 @@ class MlatFix(NamedTuple):
     ts:  float   # time.time() when received
     lat: float
     lon: float
+
+
+class AdsbPositionSample(NamedTuple):
+    """Timestamped ADS-B position sample for sweep-time interpolation."""
+    ts: float
+    lat: float
+    lon: float
+    groundspeed_kts: float | None
+    track_deg: float | None
+    heading_deg: float | None
+    airspeed_kts: int | None
+    beast_ts_us: int = 0  # Beast clock in µs when this position was decoded (0 if unknown)
 
 
 def _alt_baro_reliable(ac: "Aircraft") -> bool:
@@ -738,7 +773,8 @@ def _apply_position_gate(ac: "Aircraft", lat: float, lon: float, now: float) -> 
 
 
 def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
-                          pos_from_global: bool, cpr_odd: bool, now: float) -> None:
+                          pos_from_global: bool, cpr_odd: bool, now: float,
+                          beast_ts_us: int = 0) -> None:
     """Write a validated ADS-B CPR position to the aircraft record.
 
     Applies a speed-check gate (readsb track.c speed_check) and maintains a
@@ -780,6 +816,39 @@ def _accept_adsb_position(ac: "Aircraft", lat: float, lon: float,
         ac.pos_by_ref = True
         ac._pos_source = "local_cpr"
     _update_range_bearing(ac)
+    _record_adsb_position_sample(ac, now, beast_ts_us)
+
+
+def _record_adsb_position_sample(ac: "Aircraft", now: float, beast_ts_us: int = 0) -> None:
+    """Append a compact ADS-B position sample for later sweep-time lookup."""
+    if ac.lat is None or ac.lon is None:
+        return
+    history = ac.adsb_position_history
+    if history:
+        last = history[-1]
+        if (
+            now - last.ts < _ADSB_POSITION_MIN_SAMPLE_INTERVAL_S
+            and abs(last.lat - ac.lat) < 1e-5
+            and abs(last.lon - ac.lon) < 1e-5
+        ):
+            return
+
+    history.append(
+        AdsbPositionSample(
+            ts=now,
+            lat=ac.lat,
+            lon=ac.lon,
+            groundspeed_kts=ac.gs,
+            track_deg=ac.track,
+            heading_deg=ac.heading_deg,
+            airspeed_kts=ac.airspeed_kts,
+            beast_ts_us=beast_ts_us,
+        )
+    )
+
+    cutoff = now - _ADSB_POSITION_HISTORY_MAX_AGE_S
+    while history and history[0].ts < cutoff:
+        history.popleft()
 
 
 def _fuse_ecef(candidates: list[tuple[float, float, float]]) -> tuple[float, float]:
@@ -1162,6 +1231,10 @@ class Aircraft:
     # Kalman filter state — populated on first MLAT fix when MLAT_FUSION=kalman
     # dict: {x, P, ref_lat, ref_lon, ts}  or None before first fix
     kalman_state:        Optional[dict] = None
+    adsb_position_history: deque[AdsbPositionSample] = field(
+        default_factory=lambda: deque(maxlen=_ADSB_POSITION_HISTORY_MAXLEN),
+        repr=False,
+    )
 
     # ── Fields available only from readsb JSON (None in Beast-only mode) ──────
     alt_geom:         Optional[int]   = None  # geometric (GNSS) altitude ft
@@ -1201,6 +1274,7 @@ def _decode_df17_18(
     mlat: bool,
     mlat_source: "Optional[str]",
     now: float,
+    beast_ts_us: int = 0,
 ) -> None:
     """Decode callsign, altitude, and CPR position from a DF17/18 ADS-B frame.
 
@@ -1308,7 +1382,8 @@ def _decode_df17_18(
                                 ac.pos_reliable_even = _POS_RELIABLE_PUBLISH
                             _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
                         elif not mlat and config.INGEST_MODE != "hybrid":
-                            _accept_adsb_position(ac, lat, lon, pos_from_global, _cpr_oe == 1, now)
+                            _accept_adsb_position(ac, lat, lon, pos_from_global, _cpr_oe == 1, now,
+                                                  beast_ts_us=beast_ts_us)
     else:
         # ── pyModeS fallback ─────────────────────────────────────────────────
         raw_hex = raw.hex().upper()
@@ -1408,7 +1483,8 @@ def _decode_df17_18(
                                     ac.pos_reliable_even = _POS_RELIABLE_PUBLISH
                                 _record_mlat_fix(ac, mlat_source or "mlat", lat, lon, now)
                             elif not mlat and config.INGEST_MODE != "hybrid":
-                                _accept_adsb_position(ac, lat, lon, pos_from_global, oe == 1, now)
+                                _accept_adsb_position(ac, lat, lon, pos_from_global, oe == 1, now,
+                                                      beast_ts_us=beast_ts_us)
             except Exception:
                 pass
 
@@ -1586,6 +1662,10 @@ class AircraftState:
         # are used for the high-frequency timing-lane view.
         self._iid_events: deque[tuple[float, int, int | None, int, str]] = deque(maxlen=50_000)
 
+        # IID recency cache for DF4/5 attribution: icao → (iid, arrival_us).
+        # Updated on every DF11; used to attribute DF4/5 in the same or previous dwell.
+        self._last_iid_by_icao: dict[str, tuple[int, float]] = {}
+
         # High-frequency message timing buffer for the timing page/stream.
         # Stores
         # (seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg, range_nm, iid)
@@ -1614,7 +1694,16 @@ class AircraftState:
     # Public API
     # ------------------------------------------------------------------
 
-    def process_message(self, msg: dict, mlat_source: Optional[str] = None) -> None:
+    def _predecode_native_message(self, raw: bytes, signal: int) -> dict | None:
+        """Run the native parser outside the state lock when available."""
+        if not _NATIVE_DECODE:
+            return None
+        try:
+            return _decode_cffi.decode_message(raw, signal)
+        except Exception:
+            return None
+
+    def process_message(self, msg: dict, mlat_source: Optional[str] = None) -> tuple[int, int, str, float | None] | None:
         """Process a decoded Beast message.
 
         mlat_source: name of the MLAT server this message came from, or None for
@@ -1645,13 +1734,16 @@ class AircraftState:
             mlat_source = None
 
         mlat = mlat_source is not None
-
         t0 = time.perf_counter()
+        native_decoded = self._predecode_native_message(raw, signal)
+        t_predecoded = time.perf_counter()
         with self._lock:
             t_locked = time.perf_counter()
-            # In hybrid mode readsb stats owns non-MLAT totals/rates.
-            # MLAT messages are not in readsb JSON so still count those via Beast.
-            if config.INGEST_MODE != "hybrid":
+            # Beast/MLAT ingest owns the live total/rate counters in both beast
+            # and hybrid modes. In hybrid, readsb JSON still supplies aircraft
+            # state, but its aggregate messages field can lag or differ from the
+            # raw Beast stream and should not drive the live page counters.
+            if config.INGEST_MODE != "readsb":
                 self._total += 1
                 if mlat:
                     self._mlat_total += 1
@@ -1659,19 +1751,31 @@ class AircraftState:
             elif mlat:
                 self._mlat_total += 1
                 self._tick(now, mlat=True)
-            self._decode(raw, signal, now, timestamp, mlat=mlat, mlat_source=mlat_source, stream_name=stream_name)
+            radar_event = self._decode(
+                raw,
+                signal,
+                now,
+                timestamp,
+                mlat=mlat,
+                mlat_source=mlat_source,
+                stream_name=stream_name,
+                native_decoded=native_decoded,
+            )
         t_done = time.perf_counter()
         msg_timings.append(t_done - t0)
-        lock_wait_timings.append(t_locked - t0)
+        predecode_timings.append(t_predecoded - t0)
+        lock_wait_timings.append(t_locked - t_predecoded)
         decode_timings.append(t_done - t_locked)
         record_msg_perf_sample(
             now,
             (t_done - t0) * 1000,
-            (t_locked - t0) * 1000,
+            (t_predecoded - t0) * 1000,
+            (t_locked - t_predecoded) * 1000,
             (t_done - t_locked) * 1000,
         )
+        return radar_event
 
-    def process_messages_batch(self, batch: list[tuple[dict, "Optional[str]"]]) -> None:
+    def process_messages_batch(self, batch: list[tuple[dict, "Optional[str]"]]) -> list[tuple[int, int, str, float | None]]:
         """Process a batch of decoded Beast messages under a single lock acquisition.
 
         Reduces per-message lock acquire/release overhead and GIL context-switch
@@ -1680,11 +1784,13 @@ class AircraftState:
         is <5 ms, which is negligible for rate counters and position freshness gates.
         """
         if not batch:
-            return
+            return []
         now = time.time()
+        radar_events: list[tuple[int, int, str, float | None]] = []
 
         # MLAT detection is pure computation — run outside the lock.
-        processed: list[tuple[str, int, int, bool, "Optional[str]", "Optional[str]"]] = []
+        processed: list[tuple[bytes, int, int, bool, "Optional[str]", "Optional[str]", dict | None]] = []
+        t0 = time.perf_counter()
         for msg, mlat_source in batch:
             raw: bytes = msg["raw"]
             signal: int = msg.get("signal", 0)
@@ -1695,15 +1801,19 @@ class AircraftState:
                     mlat_source = "mlat"
             else:
                 mlat_source = None
-            processed.append((raw, signal, timestamp, mlat_source is not None, mlat_source, stream_name))
+            native_decoded = self._predecode_native_message(raw, signal)
+            processed.append((raw, signal, timestamp, mlat_source is not None, mlat_source, stream_name, native_decoded))
+        if not processed:
+            return []
 
-        t0 = time.perf_counter()
+        t_predecoded = time.perf_counter()
         with self._lock:
             t_locked = time.perf_counter()
-            for raw, signal, timestamp, mlat, mlat_source, stream_name in processed:
-                # In hybrid mode readsb stats owns non-MLAT totals/rates.
-                # MLAT messages are not in readsb JSON so still count those via Beast.
-                if config.INGEST_MODE != "hybrid":
+            for raw, signal, timestamp, mlat, mlat_source, stream_name, native_decoded in processed:
+                # Beast/MLAT ingest owns the live total/rate counters in both
+                # beast and hybrid modes; readsb-only mode still derives totals
+                # from aircraft.json deltas.
+                if config.INGEST_MODE != "readsb":
                     self._total += 1
                     if mlat:
                         self._mlat_total += 1
@@ -1711,43 +1821,66 @@ class AircraftState:
                 elif mlat:
                     self._mlat_total += 1
                     self._tick(now, mlat=True)
-                self._decode(raw, signal, now, timestamp, mlat=mlat, mlat_source=mlat_source, stream_name=stream_name)
+                radar_event = self._decode(
+                    raw,
+                    signal,
+                    now,
+                    timestamp,
+                    mlat=mlat,
+                    mlat_source=mlat_source,
+                    stream_name=stream_name,
+                    native_decoded=native_decoded,
+                )
+                if radar_event is not None:
+                    radar_events.append(radar_event)
         t_done = time.perf_counter()
 
         # Record per-message averages so timing deques remain comparable with
         # single-message path (lock_wait is shared across the batch).
-        n = len(batch)
-        per_total  = (t_done - t0)      / n
-        per_wait   = (t_locked - t0)    / n
+        n = len(processed)
+        per_total = (t_done - t0) / n
+        per_predecode = (t_predecoded - t0) / n
+        per_wait = (t_locked - t_predecoded) / n
         per_decode = (t_done - t_locked) / n
         for _ in range(n):
             msg_timings.append(per_total)
+            predecode_timings.append(per_predecode)
             lock_wait_timings.append(per_wait)
             decode_timings.append(per_decode)
         record_msg_perf_sample(
             now,
             per_total * 1000,
+            per_predecode * 1000,
             per_wait * 1000,
             per_decode * 1000,
         )
+        return radar_events
 
     # ── DF11 interrogator helpers ────────────────────────────────────────────
 
-    def get_timing_events(self, since_seq: int) -> list[tuple[int, int, int, int, float | None, int, str, float | None, float | None, int | None]]:
+    def get_timing_events(self, since_seq: int, limit: int | None = None) -> list[tuple[int, int, int, int, float | None, int, str, float | None, float | None, int | None]]:
         """Return widened timing-event tuples with seq > since_seq.
 
         Caller supplies the sequence id of the last event it received so only new
         events are returned, keeping response sizes small (~200 msg / 100 ms poll).
-        Snapshot under the state lock so concurrent decoder-thread appends cannot
-        mutate the deque during iteration.
+        Iterate newest-first under the state lock and stop as soon as the caller's
+        last seen sequence is reached, so the hot websocket path does not rescan
+        the full timing deque on every tick.
         """
         with self._lock:
-            events = tuple(self._timing_events)
-        if events and since_seq > events[-1][0]:
-            since_seq = 0
-        return [(seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg, range_nm, iid)
-                for seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg, range_nm, iid in events
-                if seq > since_seq]
+            if self._timing_events and since_seq > self._timing_events[-1][0]:
+                since_seq = 0
+
+            events: list[tuple[int, int, int, int, float | None, int, str, float | None, float | None, int | None]] = []
+            for event in reversed(self._timing_events):
+                if event[0] <= since_seq:
+                    break
+                events.append(event)
+                if limit is not None and len(events) >= limit:
+                    break
+
+        events.reverse()
+        return events
 
     def get_timing_now_us(self) -> int:
         """Estimate current Beast-relative time from the last primary-stream frame."""
@@ -1758,16 +1891,16 @@ class AircraftState:
     def get_recent_timing_window(self, window_us: int) -> tuple[int, list[tuple[int, int, int, float | None, int, str, float | None, float | None, int | None]]]:
         """Return recent widened timing events without the sequence id."""
         with self._lock:
-            events = tuple(self._timing_events)
             now_mono = time.monotonic()
             delta_us = max(0, int((now_mono - self._timing_last_wall_monotonic) * 1_000_000))
             now_us = self._timing_last_arrival_us + delta_us
-        cutoff_us = max(0, now_us - window_us)
-        recent = [
-            (arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg, range_nm, iid)
-            for _seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg, range_nm, iid in events
-            if arrival_us >= cutoff_us
-        ]
+            cutoff_us = max(0, now_us - window_us)
+            recent: list[tuple[int, int, int, float | None, int, str, float | None, float | None, int | None]] = []
+            for _seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg, range_nm, iid in reversed(self._timing_events):
+                if arrival_us < cutoff_us:
+                    break
+                recent.append((arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg, range_nm, iid))
+        recent.reverse()
         return now_us, recent
 
     def get_iid_timeline(self, window_s: float = 10.0) -> tuple[int, dict[int, dict]]:
@@ -1778,21 +1911,24 @@ class AircraftState:
         resets do not mix incompatible relative clocks in one lane view.
         """
         with self._lock:
-            iid_events = tuple(self._iid_events)
             current_epoch = self._timing_epoch
             now_mono = time.monotonic()
             delta_us = max(0, int((now_mono - self._timing_last_wall_monotonic) * 1_000_000))
             now_us = self._timing_last_arrival_us + delta_us
-        cutoff_us = max(0, now_us - int(window_s * 1_000_000))
-        timeline: dict[int, dict] = {}
-        for _wall_ts, epoch, arrival_us, iid, icao in iid_events:
-            if epoch != current_epoch or arrival_us is None or arrival_us < cutoff_us:
-                continue
-            if iid not in timeline:
-                timeline[iid] = {"arrivals_us": [], "latest_icao": icao}
-            timeline[iid]["arrivals_us"].append(arrival_us)
-            if icao:
-                timeline[iid]["latest_icao"] = icao
+            cutoff_us = max(0, now_us - int(window_s * 1_000_000))
+            timeline: dict[int, dict] = {}
+            for _wall_ts, epoch, arrival_us, iid, icao in reversed(self._iid_events):
+                if epoch != current_epoch or arrival_us is None:
+                    continue
+                if arrival_us < cutoff_us:
+                    break
+                if iid not in timeline:
+                    timeline[iid] = {"arrivals_us": [], "latest_icao": icao}
+                timeline[iid]["arrivals_us"].append(arrival_us)
+                if icao and not timeline[iid]["latest_icao"]:
+                    timeline[iid]["latest_icao"] = icao
+        for entry in timeline.values():
+            entry["arrivals_us"].reverse()
         return now_us, timeline
 
     def get_iid_activity(self, window_s: float = 600.0) -> dict[int, dict]:
@@ -2043,6 +2179,74 @@ class AircraftState:
                 "oat":               ac.oat,
                 "tat":               ac.tat,
             }
+
+    def get_aircraft_position_history(self, icao: str, window_s: float = _ADSB_POSITION_HISTORY_MAX_AGE_S) -> list[dict]:
+        """Return recent ADS-B position samples for one aircraft."""
+        cutoff = time.time() - window_s
+        with self._lock:
+            ac = self._aircraft.get(icao)
+            if ac is None or not ac.adsb_position_history:
+                return []
+            return [
+                {
+                    "ts": sample.ts,
+                    "lat": sample.lat,
+                    "lon": sample.lon,
+                    "groundspeed_kts": sample.groundspeed_kts,
+                    "track_deg": sample.track_deg,
+                    "heading_deg": sample.heading_deg,
+                    "airspeed_kts": sample.airspeed_kts,
+                    "beast_ts_us": sample.beast_ts_us,
+                }
+                for sample in ac.adsb_position_history
+                if sample.ts >= cutoff
+            ]
+
+    def get_position_histories_bulk(
+        self, icaos: set[str], window_s: float = 300.0
+    ) -> dict[str, list[tuple]]:
+        """Return recent position samples for the specified ICAOs in one lock acquisition.
+
+        Returns {icao: [(beast_ts_us, ts, lat, lon, gs, track), ...]} sorted oldest-first.
+        Only ICAOs with at least one sample in the window are included.
+        Uses a single lock acquisition for all ICAOs — avoids per-ICAO lock overhead.
+        """
+        cutoff = time.time() - window_s
+        with self._lock:
+            result: dict[str, list[tuple]] = {}
+            for icao in icaos:
+                ac = self._aircraft.get(icao)
+                if ac is None or not ac.adsb_position_history:
+                    continue
+                samples = [
+                    (s.beast_ts_us, s.ts, s.lat, s.lon, s.groundspeed_kts, s.track_deg)
+                    for s in ac.adsb_position_history
+                    if s.ts >= cutoff
+                ]
+                if samples:
+                    result[icao] = samples
+            return result
+
+    def get_positions_snapshot(self) -> list[dict]:
+        """Return a lightweight list of current positions for all aircraft.
+
+        Only copies the 5-6 scalar fields needed to feed the radar position
+        tracker.  Holds _lock only for the brief O(N) scalar scan — far cheaper
+        than get_snapshot() which builds full per-aircraft dicts.
+        """
+        with self._lock:
+            result = []
+            for ac in self._aircraft.values():
+                if ac.lat is not None and ac.lon is not None:
+                    result.append({
+                        "icao": ac.icao,
+                        "lat": ac.lat,
+                        "lon": ac.lon,
+                        "gs": ac.gs,
+                        "track": ac.track,
+                        "last_pos_ts": ac.last_pos_ts if ac.last_pos_ts else None,
+                    })
+            return result
 
     def pop_adsbx_queue(self, max_n: int = 20) -> set[str]:
         """Return up to max_n ICAOs awaiting ADSBx enrichment; removes them from the queue."""
@@ -2402,10 +2606,11 @@ class AircraftState:
 
     def _decode(self, raw: bytes, signal: int, now: float, timestamp: int,
                 mlat: bool = False, mlat_source: Optional[str] = None,
-                stream_name: Optional[str] = None) -> None:
+                stream_name: Optional[str] = None,
+                native_decoded: dict | None = None) -> tuple[int, int, str, float | None] | None:
         raw_len = len(raw)
         if raw_len < 7:          # Too short to contain an ICAO address
-            return
+            return None
         raw_hex: str | None = None
 
         def _raw_hex() -> str:
@@ -2421,9 +2626,9 @@ class AircraftState:
         # exactly as readsb does, so _try_fix_df17 is no longer needed.
         if _NATIVE_DECODE:
             msg_bytes = raw
-            _nd = _decode_cffi.decode_message(msg_bytes, signal)
+            _nd = native_decoded if native_decoded is not None else _decode_cffi.decode_message(msg_bytes, signal)
             if _nd is None:
-                return   # bad CRC or unknown DF — discard
+                return None   # bad CRC or unknown DF — discard
 
             df = _nd['df']
             timing_ref = self._timing_arrival_ref(timestamp, stream_name)
@@ -2454,7 +2659,7 @@ class AircraftState:
                 self._iid_events.append((now, timing_epoch, arrival_us, int(_nd.get('iid', 0)), icao or ''))
             elif df in _AP_DFS:
                 if not icao or icao not in self._confirmed_icaos:
-                    return
+                    return None
                 self._confirmed_icaos[icao] = now
                 self._confirmed_icaos.move_to_end(icao)
                 source = MsgSource.MODE_S
@@ -2464,7 +2669,7 @@ class AircraftState:
             try:
                 df = pms.df(_raw_hex())
             except Exception:
-                return
+                return None
 
             timing_ref = self._timing_arrival_ref(timestamp, stream_name)
 
@@ -2504,7 +2709,7 @@ class AircraftState:
                 elif df in _AP_DFS:
                     icao = pms.icao(_raw_hex())
                     if not icao or icao.upper() not in self._confirmed_icaos:
-                        return
+                        return None
                     icao_up = icao.upper()
                     self._confirmed_icaos[icao_up] = now
                     self._confirmed_icaos.move_to_end(icao_up)
@@ -2514,7 +2719,7 @@ class AircraftState:
                 pass
 
         if not icao:
-            return
+            return None
         icao = icao.upper()
         # MLAT-timestamp frame overrides source classification
         if mlat:
@@ -2588,7 +2793,8 @@ class AircraftState:
         # DF17: Extended Squitter with true 24-bit CRC — highest integrity source.
         # DF18: TIS-B / ADS-R rebroadcast — same message structure, same altitude quality.
         if df in (17, 18) and raw_len == 14:
-            _decode_df17_18(ac, df, raw, raw_len, _nd, crc_clean, source, mlat, mlat_source, now)
+            _decode_df17_18(ac, df, raw, raw_len, _nd, crc_clean, source, mlat, mlat_source, now,
+                            beast_ts_us=timestamp // 12)
 
         # --- Altitude from surveillance altitude reply (DF 4) ---
         # Lower integrity than ADS-B: parity is XOR-masked with aircraft address.
@@ -2656,8 +2862,29 @@ class AircraftState:
                 pass
 
         _pub_lat, _pub_lon, range_nm, bearing_deg = _published_position(ac)
-        timing_iid = int(_nd.get('iid', 0)) if (_nd is not None and df == 11 and _nd.get('iid') is not None) else None
+        _timing_arrival = timing_ref[1] if timing_ref is not None else None
+        if _nd is not None and df == 11 and _nd.get('iid') is not None:
+            timing_iid: int | None = int(_nd.get('iid', 0))
+            # Cache IID so DF4/5 in the same or next dwell can be attributed
+            if timing_iid and icao and _timing_arrival is not None:
+                self._last_iid_by_icao[icao] = (timing_iid, _timing_arrival)
+        elif df in (4, 5) and icao:
+            _cached = self._last_iid_by_icao.get(icao)
+            if (
+                _cached is not None
+                and _timing_arrival is not None
+                and _timing_arrival - _cached[1] < _DWELL_ATTRIBUTION_WINDOW_US
+            ):
+                timing_iid = _cached[0]
+            else:
+                timing_iid = None
+        else:
+            timing_iid = None
         self._record_timing_event(timing_ref, df, raw_len, signal, icao, bearing_deg, range_nm, timing_iid)
+
+        if df == 11 and timing_iid not in (None, 0):
+            return (timestamp, timing_iid, icao, raw_signal_to_dbfs(signal))
+        return None
 
     def _apply_acas(self, ac: "Aircraft", result: dict, now: float) -> None:
         """Apply a decoded ACAS RA to the aircraft and enqueue a DB event.
@@ -2817,11 +3044,13 @@ class AircraftState:
         else:
             delta = max(0, total_messages - self._readsb_last_total)
             self._readsb_last_total = total_messages
-        self._total += delta
 
-        # Accumulate per-second count (as a batch delta); roll second and minute buckets.
-        self._roll_sec_if_needed(now)
-        self._cur_sec_count += delta
+        if config.INGEST_MODE != "hybrid":
+            self._total += delta
+
+            # Accumulate per-second count (as a batch delta); roll second and minute buckets.
+            self._roll_sec_if_needed(now)
+            self._cur_sec_count += delta
         self._roll_minute_if_needed(now)
 
         # Midnight rollover (mirrors process_message path)
@@ -3034,6 +3263,9 @@ class AircraftState:
             _maybe("ws",                "wind_speed",       int)
             _maybe("oat",               "oat",              int)
             _maybe("tat",               "tat",              int)
+
+            if lat is not None and lon is not None and not is_mlat:
+                _record_adsb_position_sample(ac, ac.last_pos_ts)
 
         # ── DF type breakdown from airspy_adsb (optional) ─────────────────
         # airspy_adsb stats.json provides per-period DF counts that map directly

@@ -1031,7 +1031,7 @@ export function InterrogatorTimeline({ onSelectIcao, streamData = null, windowS:
         retryRef.current = setTimeout(connect, 1000)
       }
 
-      ws.onerror = () => ws.close()
+      ws.onerror = () => {}
     }
 
     connect()
@@ -1270,7 +1270,7 @@ export function MessageTimingPlot({ streamPacket = null }) {
         retryRef.current = setTimeout(connect, 1000)
       }
 
-      ws.onerror = () => ws.close()
+      ws.onerror = () => {}
     }
 
     connect()

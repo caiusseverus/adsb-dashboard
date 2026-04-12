@@ -3,6 +3,7 @@ export const MESSAGE_FIELD_SIGNAL_MIN_DBFS = -45
 
 const TRAFFIC_FILTER_DF_MAP = {
   df11: [11],
+  df_surveillance: [11, 4, 5],
   adsb: [17],
   tisb: [18],
   commb: [20, 21],
@@ -20,6 +21,17 @@ function matchesTrafficFilter(df, trafficFilter) {
   return Array.isArray(allowed) ? allowed.includes(df) : true
 }
 
+function lowerBoundArrival(events, targetArrivalUs) {
+  let low = 0
+  let high = events.length
+  while (low < high) {
+    const mid = (low + high) >> 1
+    if ((events[mid]?.arrival_us ?? 0) < targetArrivalUs) low = mid + 1
+    else high = mid
+  }
+  return low
+}
+
 export function selectMessageFieldEvents({
   events,
   renderNowUs,
@@ -27,14 +39,23 @@ export function selectMessageFieldEvents({
   trafficFilter = 'all',
   iidFilter = 'all',
 }) {
+  const source = events ?? []
+  if (!source.length) return []
+
   const cutoffUs = Math.max(0, renderNowUs - persistenceUs)
-  return (events ?? []).filter(ev => {
-    if (ev.arrival_us < cutoffUs || ev.arrival_us > renderNowUs) return false
-    if (!matchesTrafficFilter(ev.df, trafficFilter)) return false
-    if (iidFilter === 'exclude-zero' && ev.iid === 0) return false
-    if (iidFilter !== 'all' && iidFilter !== 'exclude-zero' && ev.iid !== iidFilter) return false
-    return true
-  })
+  const startIndex = lowerBoundArrival(source, cutoffUs)
+  const selected = []
+
+  for (let index = startIndex; index < source.length; index += 1) {
+    const ev = source[index]
+    if (ev.arrival_us < cutoffUs || ev.arrival_us > renderNowUs) continue
+    if (!matchesTrafficFilter(ev.df, trafficFilter)) continue
+    if (iidFilter === 'exclude-zero' && ev.iid === 0) continue
+    if (iidFilter !== 'all' && iidFilter !== 'exclude-zero' && ev.iid !== iidFilter) continue
+    selected.push(ev)
+  }
+
+  return selected
 }
 
 export function buildActiveIids(events) {

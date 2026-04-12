@@ -16,6 +16,7 @@ LDFLAGS := -shared -lm
 TARGET  := libdecode.so
 
 SRCS := decode_api.c \
+        radar_burst.c \
         mode_s.c     \
         mode_ac.c    \
         crc.c        \

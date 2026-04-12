@@ -312,7 +312,7 @@ function useTimingPageStream({ burstBinMs, cadenceBinMs, interrogatorWindowS = 1
         retryRef.current = setTimeout(connect, 1000)
       }
 
-      ws.onerror = () => ws.close()
+      ws.onerror = () => {}
     }
 
     connect()
@@ -346,7 +346,10 @@ function useTimingEventBuffer(timingPacket, windowUs = TIMING_WINDOW_US) {
     if (!timingPacket) return
     const nowUs = Number(timingPacket.now_us ?? 0)
     const cutoffUs = Math.max(0, nowUs - windowUs - 1_000_000)
-    const newEvents = (timingPacket.events ?? []).map(ev => {
+    const previous = bufRef.current.filter(ev => ev.arrival_us >= cutoffUs)
+    const rawEvents = timingPacket.events ?? []
+
+    const normalize = ev => {
       const [seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg] = ev
       return {
         seq,
@@ -358,16 +361,30 @@ function useTimingEventBuffer(timingPacket, windowUs = TIMING_WINDOW_US) {
         icao: `${icao ?? ''}`.toUpperCase(),
         bearing_deg: Number.isFinite(Number(bearing_deg)) ? Number(bearing_deg) : null,
       }
-    })
-    const mergedMap = new Map()
-    for (const ev of bufRef.current) {
-      if (ev.arrival_us >= cutoffUs) mergedMap.set(ev.seq, ev)
     }
-    for (const ev of newEvents) {
-      if (ev.arrival_us >= cutoffUs) mergedMap.set(ev.seq, ev)
+
+    if (!rawEvents.length) {
+      bufRef.current = previous
+      setView({ nowUs, events: previous })
+      return
     }
-    const merged = [...mergedMap.values()].sort((a, b) => a.seq - b.seq)
-    if (merged.length > TIMING_BUFFER_MAX) merged.splice(0, merged.length - TIMING_BUFFER_MAX)
+
+    const lastSeq = previous.length ? previous[previous.length - 1].seq : -Infinity
+    const firstIncomingSeq = Number(rawEvents[0]?.[0] ?? -Infinity)
+    let merged
+
+    if (firstIncomingSeq > lastSeq) {
+      merged = previous.concat(rawEvents.map(normalize).filter(ev => ev.arrival_us >= cutoffUs))
+    } else {
+      const mergedMap = new Map()
+      for (const ev of previous) mergedMap.set(ev.seq, ev)
+      for (const ev of rawEvents.map(normalize)) {
+        if (ev.arrival_us >= cutoffUs) mergedMap.set(ev.seq, ev)
+      }
+      merged = [...mergedMap.values()].sort((a, b) => a.seq - b.seq)
+    }
+
+    if (merged.length > TIMING_BUFFER_MAX) merged = merged.slice(merged.length - TIMING_BUFFER_MAX)
     bufRef.current = merged
     setView({ nowUs, events: merged })
   }, [timingPacket, windowUs])

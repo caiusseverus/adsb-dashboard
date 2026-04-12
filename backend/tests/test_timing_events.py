@@ -77,6 +77,30 @@ def test_timing_events_allow_iid_zero_when_native_decoder_provides_it():
     assert state.get_timing_events(0)[0][-1] == 0
 
 
+def test_timing_events_limit_returns_latest_suffix_in_order():
+    state = AircraftState()
+
+    for offset in range(5):
+        timing_ref = state._timing_arrival_ref(12_000_000 + offset * 12, None)
+        state._record_timing_event(timing_ref, 11, 7, 18, f"ABC{offset:03d}", None, None, offset)
+
+    events = state.get_timing_events(0, limit=2)
+
+    assert [event[0] for event in events] == [4, 5]
+    assert [event[6] for event in events] == ["ABC003", "ABC004"]
+
+
+def test_timing_events_reset_since_seq_when_caller_is_ahead_of_buffer():
+    state = AircraftState()
+
+    timing_ref = state._timing_arrival_ref(12_000_000, None)
+    state._record_timing_event(timing_ref, 17, 14, 37, "ABC123", 123.4, 44.5, None)
+
+    events = state.get_timing_events(999)
+
+    assert [event[0] for event in events] == [1]
+
+
 def test_timing_events_endpoint_serializes_widened_shape():
     class FakeState:
         def get_timing_events(self, since_seq):

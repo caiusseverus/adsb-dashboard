@@ -22,6 +22,7 @@ const StatusPage         = lazy(() => import('./pages/StatusPage'))
 const SettingsPage       = lazy(() => import('./pages/SettingsPage'))
 const SkyView            = lazy(() => import('./pages/SkyView'))
 const PositionQualityPage = lazy(() => import('./pages/PositionQualityPage'))
+const RadarPage           = lazy(() => import('./pages/RadarPage'))
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 
@@ -84,7 +85,9 @@ export default function App() {
         retryRef.current = setTimeout(connect, 3000)
       }
     }
-    ws.onerror = () => ws.close()
+    ws.onerror = () => {
+      // Don't close — let onclose handle reconnection
+    }
   }, [])
 
   useEffect(() => {
@@ -178,6 +181,10 @@ export default function App() {
             onClick={() => setTab('status')}
           >Status</button>
           <button
+            className={tab === 'radar' ? styles.tabActive : styles.tab}
+            onClick={() => setTab('radar')}
+          >Radar</button>
+          <button
             className={tab === 'settings' ? styles.tabActive : styles.tab}
             onClick={() => setTab('settings')}
           >Settings</button>
@@ -219,6 +226,7 @@ export default function App() {
         {tab === 'events' && <EventsPage onSelectIcao={handleSelectIcao} />}
         {tab === 'sky' && <SkyView snapshot={snapshot} onSelectIcao={handleSelectIcao} />}
         {tab === 'positionqa' && debugMode && <PositionQualityPage />}
+        {tab === 'radar' && <RadarPage />}
         {tab === 'status' && <StatusPage />}
         {tab === 'settings' && <SettingsPage />}
       </Suspense>

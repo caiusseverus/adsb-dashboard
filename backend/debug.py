@@ -12,8 +12,11 @@ import logging
 import os
 
 import aircraft_state as _state_module
+import beast_client as _beast_client_module
 import benchmark as _benchmark_module
 import enrichment as enrichment_module
+import radar.api as _radar_api_module
+import radar.sweep as _radar_sweep_module
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -41,12 +44,36 @@ OVERRIDEABLE_FIELDS = {
 @router.get("/perf")
 async def get_perf() -> dict:
     """Return performance timing statistics for message decode and push-updates."""
-    from main import _msg_queue, _msg_drops, _queue_depth_samples
+    import main as _main_module
+    _fm_run_timings = getattr(_main_module, "_fm_run_timings", [])
+    _msg_drops = getattr(_main_module, "_msg_drops", 0)
+    _msg_queue = getattr(_main_module, "_msg_queue")
+    _queue_depth_samples = getattr(_main_module, "_queue_depth_samples", [])
+    _radar_drops = getattr(_main_module, "_radar_drops", 0)
+    _radar_loop_timings = getattr(_main_module, "_radar_loop_timings", [])
+    _radar_queue = getattr(_main_module, "_radar_queue")
+    _radar_queue_depth_samples = getattr(_main_module, "_radar_queue_depth_samples", [])
+    _radar_ws_timings = getattr(_main_module, "_radar_ws_timings", [])
+    _radar_worker_timings = getattr(_main_module, "_radar_worker_timings", [])
+    _timing_ws_timings = getattr(_main_module, "_timing_ws_timings", [])
     msg_t        = sorted(_state_module.msg_timings)
+    predecode_t  = sorted(_state_module.predecode_timings)
     lock_wait_t  = sorted(_state_module.lock_wait_timings)
     decode_t     = sorted(_state_module.decode_timings)
     push_t       = list(_state_module.push_timings)
     qdepth       = sorted(_queue_depth_samples)
+    radar_qdepth = sorted(_radar_queue_depth_samples)
+    radar_df11_t = sorted(_radar_sweep_module.df11_event_timings)
+    radar_builder_t = sorted(_radar_sweep_module.df11_builder_timings)
+    radar_rotation_t = list(_radar_sweep_module.rotation_update_timings)
+    radar_loop_t = list(_radar_loop_timings)
+    radar_worker_t = list(_radar_worker_timings)
+    radar_ws_t = list(_radar_ws_timings)
+    timing_ws_t = list(_timing_ws_timings)
+    fm_t = list(_fm_run_timings)
+    decoder_batch_t = list(_benchmark_module.decoder_batch_timings)
+    beast_chunk_t = list(_beast_client_module.chunk_timings)
+    radar_api_t = list(_radar_api_module.api_timings)
 
     def percentiles(data: list[float], scale: float = 1_000_000) -> dict:
         n = len(data)
@@ -77,13 +104,36 @@ async def get_perf() -> dict:
             return 0.0
         return round(sum(p.get(key, 0) for p in push_t) / len(push_t), 2)
 
+    def sample_avg(samples: list[dict], key: str) -> float:
+        if not samples:
+            return 0.0
+        return round(sum(float(sample.get(key, 0.0)) for sample in samples) / len(samples), 2)
+
+    def endpoint_summary(samples: list[dict]) -> dict:
+        by_name: dict[str, list[float]] = {}
+        for sample in samples:
+            name = str(sample.get("endpoint", "unknown"))
+            by_name.setdefault(name, []).append(float(sample.get("elapsed_ms", 0.0)))
+        return {
+            name: {
+                "samples": len(values),
+                "avg_ms": round(sum(values) / len(values), 2) if values else 0.0,
+                "max_ms": round(max(values), 2) if values else 0.0,
+            }
+            for name, values in sorted(by_name.items())
+        }
+
     return {
         "msg_decode_us":   percentiles(msg_t, scale=1_000_000),
+        "predecode_us":    percentiles(predecode_t, scale=1_000_000),
         "lock_wait_us":    percentiles(lock_wait_t, scale=1_000_000),
         "pure_decode_us":  percentiles(decode_t, scale=1_000_000),
         "msg_queue_depth": _msg_queue.qsize(),
         "msg_queue_stats": int_percentiles(qdepth),
         "msg_drops_total": _msg_drops,
+        "radar_queue_depth": _radar_queue.qsize(),
+        "radar_queue_stats": int_percentiles(radar_qdepth),
+        "radar_drops_total": _radar_drops,
         "push_updates_ms": {
             "samples":                len(push_t),
             "sync_avg":               push_avg("sync_ms"),
@@ -97,6 +147,84 @@ async def get_perf() -> dict:
             "ws_client_count_avg":    push_avg("ws_client_count"),
             "ws_clients_dropped_total": 0,
             "ws_send_max_avg":        push_avg("ws_send_max_ms"),
+        },
+        "radar_decoder_ms": {
+            "df11_event": percentiles(radar_df11_t, scale=1_000),
+            "df11_builder": percentiles(radar_builder_t, scale=1_000),
+        },
+        "radar_rotation_ms": {
+            "samples": len(radar_rotation_t),
+            "total_avg": sample_avg(radar_rotation_t, "total_ms"),
+            "snapshot_avg": sample_avg(radar_rotation_t, "snapshot_ms"),
+            "tracker_refresh_avg": sample_avg(radar_rotation_t, "tracker_refresh_ms"),
+            "history_fetch_avg": sample_avg(radar_rotation_t, "history_fetch_ms"),
+            "cache_build_avg": sample_avg(radar_rotation_t, "cache_build_ms"),
+            "sweep_build_avg": sample_avg(radar_rotation_t, "sweep_build_ms"),
+            "analyse_swap_avg": sample_avg(radar_rotation_t, "analyse_swap_ms"),
+            "iid_count_avg": sample_avg(radar_rotation_t, "iid_count"),
+            "event_count_avg": sample_avg(radar_rotation_t, "event_count"),
+        },
+        "radar_loop_ms": {
+            "samples": len(radar_loop_t),
+            "update_avg": sample_avg(radar_loop_t, "update_ms"),
+            "flush_avg": sample_avg(radar_loop_t, "flush_ms"),
+            "msg_queue_depth_avg": sample_avg(radar_loop_t, "msg_queue_depth"),
+            "skipped_for_backlog_count": sum(1 for sample in radar_loop_t if sample.get("skipped_for_backlog")),
+            "models_flushed_avg": sample_avg(radar_loop_t, "models_flushed"),
+        },
+        "radar_worker_ms": {
+            "samples": len(radar_worker_t),
+            "queue_wait_avg": sample_avg(radar_worker_t, "queue_wait_ms"),
+            "batch_fill_avg": sample_avg(radar_worker_t, "batch_fill_ms"),
+            "process_wall_avg": sample_avg(radar_worker_t, "process_wall_ms"),
+            "process_cpu_avg": sample_avg(radar_worker_t, "process_cpu_ms"),
+            "process_offcpu_avg": sample_avg(radar_worker_t, "process_offcpu_ms"),
+            "batch_size_avg": sample_avg(radar_worker_t, "batch_size"),
+            "batch_target_avg": sample_avg(radar_worker_t, "batch_target"),
+        },
+        "fm_run_ms": {
+            "samples": len(fm_t),
+            "elapsed_avg": sample_avg(fm_t, "elapsed_ms"),
+            "frame_count_avg": sample_avg(fm_t, "frame_count"),
+            "stored_avg": sample_avg(fm_t, "stored"),
+            "success_avg": sample_avg(fm_t, "ok"),
+        },
+        "radar_iid_ws_ms": {
+            "samples": len(radar_ws_t),
+            "elapsed_avg": sample_avg(radar_ws_t, "elapsed_ms"),
+            "full_send_count": sum(1 for sample in radar_ws_t if sample.get("sent_kind") == "full"),
+            "heartbeat_count": sum(1 for sample in radar_ws_t if sample.get("sent_kind") == "heartbeat"),
+            "rebuild_count": sum(1 for sample in radar_ws_t if sample.get("rebuilt")),
+        },
+        "timing_ws_ms": {
+            "samples": len(timing_ws_t),
+            "elapsed_avg": sample_avg(timing_ws_t, "elapsed_ms"),
+            "event_count_avg": sample_avg(timing_ws_t, "event_count"),
+            "raw_event_count_avg": sample_avg(timing_ws_t, "raw_event_count"),
+            "send_count": sum(1 for sample in timing_ws_t if sample.get("sent")),
+        },
+        "decoder_thread_ms": {
+            "samples": len(decoder_batch_t),
+            "queue_wait_avg": sample_avg(decoder_batch_t, "queue_wait_ms"),
+            "batch_fill_avg": sample_avg(decoder_batch_t, "batch_fill_ms"),
+            "process_wall_avg": sample_avg(decoder_batch_t, "process_wall_ms"),
+            "process_cpu_avg": sample_avg(decoder_batch_t, "process_cpu_ms"),
+            "process_offcpu_avg": sample_avg(decoder_batch_t, "process_offcpu_ms"),
+            "batch_size_avg": sample_avg(decoder_batch_t, "batch_size"),
+            "batch_target_avg": sample_avg(decoder_batch_t, "batch_target"),
+        },
+        "radar_api_ms": {
+            "samples": len(radar_api_t),
+            "elapsed_avg": sample_avg(radar_api_t, "elapsed_ms"),
+            "by_endpoint": endpoint_summary(radar_api_t),
+        },
+        "beast_ingest_ms": {
+            "samples": len(beast_chunk_t),
+            "chunk_bytes_avg": sample_avg(beast_chunk_t, "chunk_bytes"),
+            "frames_avg": sample_avg(beast_chunk_t, "frames"),
+            "parse_wall_avg": sample_avg(beast_chunk_t, "parse_wall_ms"),
+            "parse_cpu_avg": sample_avg(beast_chunk_t, "parse_cpu_ms"),
+            "parse_offcpu_avg": sample_avg(beast_chunk_t, "parse_offcpu_ms"),
         },
     }
 
