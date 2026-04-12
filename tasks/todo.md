@@ -60,6 +60,34 @@ Updated: 2026-04-06
   - `uv run --directory backend pytest tests/test_debug_perf.py tests/test_aircraft_state_counts.py tests/test_decoder_batching.py`
   - Result: `7 passed in 0.50s`
 
+## 2026-04-12 Native Batch Predecode
+
+- [x] Review the live `decoder_batch_phase_ms` sample and confirm the bottleneck is predecode wall/off-CPU time
+- [x] Add a native batch decode API that decodes one decoder batch in a single C call
+- [x] Add a reusable Python CFFI batch wrapper with fallback to the existing per-message decode path
+- [x] Wire `AircraftState.process_messages_batch()` to use the batch wrapper
+- [x] Add regression coverage for the batch wrapper and decoder batch integration
+- [x] Build native helpers and run focused/full backend verification
+
+### Review
+
+- Investigation:
+  - The live `decoder_batch_phase_ms` sample showed the decoder batch was dominated by predecode wall/off-CPU time: `predecode_wall_avg=19.71 ms`, `predecode_cpu_avg=0.69 ms`, and `predecode_offcpu_avg=19.02 ms` for about `65` messages per batch.
+  - Python state application was much smaller at `apply_wall_avg=2.36 ms`, so moving aircraft-state mutation native would be the wrong next target.
+- Implementation:
+  - [decode_api.h](/home/keith/claude/adsb-dashboard/backend/native/decode_api.h) and [decode_api.c](/home/keith/claude/adsb-dashboard/backend/native/decode_api.c) now expose `decode_messages_batch(...)`, a native batch wrapper over the existing `decode_message(...)` semantics.
+  - [decode_cffi.py](/home/keith/claude/adsb-dashboard/backend/decode_cffi.py) adds `DecodeBatcher`, which reuses CFFI frame/result/status arrays and falls back to per-message decode if the native batch symbol is unavailable.
+  - [aircraft_state.py](/home/keith/claude/adsb-dashboard/backend/aircraft_state.py) constructs one reusable batch decoder per `AircraftState` and uses it from `process_messages_batch()` while leaving single-message processing unchanged.
+  - [test_decode_cffi_batch.py](/home/keith/claude/adsb-dashboard/backend/tests/test_decode_cffi_batch.py) verifies batch decode matches single-message decode and the fallback path.
+  - [test_aircraft_state_counts.py](/home/keith/claude/adsb-dashboard/backend/tests/test_aircraft_state_counts.py) now patches the batch predecode hook in the decoder phase-timing test.
+- Verification:
+  - `make -C backend/native`
+  - `python3 -m py_compile backend/decode_cffi.py backend/aircraft_state.py backend/debug.py backend/tests/test_decode_cffi_batch.py backend/tests/test_aircraft_state_counts.py backend/tests/test_debug_perf.py`
+  - `uv run --directory backend pytest tests/test_decode_cffi_batch.py tests/test_aircraft_state_counts.py tests/test_debug_perf.py tests/test_decoder_batching.py`
+  - Result: `9 passed in 0.33s`
+  - `uv run --directory backend pytest`
+  - Result: `242 passed in 1.41s`
+
 ## 2026-04-11 FM Frame Geometry Diagnostics
 
 - [x] Inspect current SweepFrame and inscribed-angle evidence payloads

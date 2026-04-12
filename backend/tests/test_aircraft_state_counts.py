@@ -47,7 +47,11 @@ def test_process_messages_batch_records_phase_timing(monkeypatch):
 
     state_module.decoder_phase_timings.clear()
     state = AircraftState()
-    monkeypatch.setattr(state, "_predecode_native_message", lambda raw, signal: {"df": 17, "addr": 0xABC123, "correctedbits": 0})
+    monkeypatch.setattr(
+        state,
+        "_predecode_native_batch",
+        lambda messages: [{"df": 17, "addr": 0xABC123, "correctedbits": 0} for _ in messages],
+    )
     monkeypatch.setattr(state, "_decode", lambda *args, **kwargs: None)
 
     state.process_messages_batch([

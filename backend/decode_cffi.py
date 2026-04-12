@@ -111,6 +111,8 @@ void decode_cleanup(void);
 int  decode_message(const uint8_t *msg_bytes, int msg_len,
                     uint8_t signal, uint64_t timestamp,
                     decode_result_t *result);
+int decode_messages_batch(const beast_frame_t *frames, int frame_count,
+                          decode_result_t *results, int *statuses);
 void beast_parser_init(beast_parser_t *parser);
 int  beast_parse_chunk(beast_parser_t *parser,
                        const uint8_t *chunk, uint32_t chunk_len,
@@ -205,34 +207,7 @@ def has_beast_parser() -> bool:
 
 # ── Public API ─────────────────────────────────────────────────────────────
 
-def decode_message(msg_bytes: bytes, signal: int = 0,
-                   timestamp: int = 0) -> dict | None:
-    """
-    Decode one raw Mode-S payload (7 or 14 bytes).
-
-    Parameters
-    ----------
-    msg_bytes : raw bytes from Beast frame (after unescaping)
-    signal    : Beast amplitude byte (0 = weakest, 255 = strongest)
-    timestamp : 48-bit Beast clock value
-
-    Returns
-    -------
-    dict with decoded fields, or None if the message was rejected.
-    """
-    msg_len = len(msg_bytes)
-    if msg_len not in (7, 14):
-        return None
-
-    lib = _get_lib()
-    result = _ffi.new("decode_result_t *")
-    buf    = _ffi.from_buffer(msg_bytes)
-
-    rc = lib.decode_message(buf, msg_len, signal & 0xFF, timestamp & 0xFFFFFFFFFFFF, result)
-    if rc != 0:
-        return None
-
-    r = result
+def _decode_result_to_dict(r) -> dict:
     out: dict = {
         "df":           r.df,
         "addr":         r.addr,
@@ -298,6 +273,102 @@ def decode_message(msg_bytes: bytes, signal: int = 0,
     out["iid"] = int(r.iid)
 
     return out
+
+
+def decode_message(msg_bytes: bytes, signal: int = 0,
+                   timestamp: int = 0) -> dict | None:
+    """
+    Decode one raw Mode-S payload (7 or 14 bytes).
+
+    Parameters
+    ----------
+    msg_bytes : raw bytes from Beast frame (after unescaping)
+    signal    : Beast amplitude byte (0 = weakest, 255 = strongest)
+    timestamp : 48-bit Beast clock value
+
+    Returns
+    -------
+    dict with decoded fields, or None if the message was rejected.
+    """
+    msg_len = len(msg_bytes)
+    if msg_len not in (7, 14):
+        return None
+
+    lib = _get_lib()
+    result = _ffi.new("decode_result_t *")
+    buf    = _ffi.from_buffer(msg_bytes)
+
+    rc = lib.decode_message(buf, msg_len, signal & 0xFF, timestamp & 0xFFFFFFFFFFFF, result)
+    if rc != 0:
+        return None
+
+    return _decode_result_to_dict(result)
+
+
+class DecodeBatcher:
+    """Reusable native batch decoder for the hot Beast decoder thread."""
+
+    def __init__(self, max_messages: int = 128):
+        if max_messages <= 0:
+            raise ValueError("max_messages must be > 0")
+        self._max_messages = max_messages
+        self._frames = _ffi.new("beast_frame_t[]", max_messages)
+        self._results = _ffi.new("decode_result_t[]", max_messages)
+        self._statuses = _ffi.new("int[]", max_messages)
+        self._has_native_batch = hasattr(_get_lib(), "decode_messages_batch")
+
+    def _ensure_capacity(self, message_count: int) -> None:
+        required = max(1, message_count)
+        if required <= self._max_messages:
+            return
+        new_max = max(required, self._max_messages * 2)
+        self._frames = _ffi.new("beast_frame_t[]", new_max)
+        self._results = _ffi.new("decode_result_t[]", new_max)
+        self._statuses = _ffi.new("int[]", new_max)
+        self._max_messages = new_max
+
+    def decode_batch(self, messages: list[tuple[bytes, int, int]]) -> list[dict | None]:
+        if not messages:
+            return []
+
+        if not self._has_native_batch:
+            return [
+                decode_message(raw, signal=signal, timestamp=timestamp)
+                for raw, signal, timestamp in messages
+            ]
+
+        self._ensure_capacity(len(messages))
+        for i, (raw, signal, timestamp) in enumerate(messages):
+            msg_len = len(raw)
+            if msg_len not in (7, 14):
+                frame = self._frames[i]
+                frame.msg_type = 0
+                frame.timestamp = int(timestamp) & 0xFFFFFFFFFFFF
+                frame.signal = int(signal) & 0xFF
+                frame.msg_len = msg_len if 0 <= msg_len <= 255 else 0
+                self._statuses[i] = -1
+                continue
+            frame = self._frames[i]
+            frame.msg_type = 0x33 if msg_len == 14 else 0x32
+            frame.timestamp = int(timestamp) & 0xFFFFFFFFFFFF
+            frame.signal = int(signal) & 0xFF
+            frame.msg_len = msg_len
+            _ffi.memmove(frame.payload, raw, msg_len)
+
+        _get_lib().decode_messages_batch(
+            self._frames,
+            len(messages),
+            self._results,
+            self._statuses,
+        )
+
+        out: list[dict | None] = []
+        for i in range(len(messages)):
+            if self._statuses[i] != 0:
+                out.append(None)
+            else:
+                out.append(_decode_result_to_dict(self._results[i]))
+        return out
 
 
 def solve_cpr_airborne(even_cprlat: int, even_cprlon: int,

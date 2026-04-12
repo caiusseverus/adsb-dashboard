@@ -149,6 +149,8 @@ void decode_cleanup(void);
 int decode_message(const uint8_t *msg_bytes, int msg_len,
                    uint8_t signal, uint64_t timestamp,
                    decode_result_t *result);
+int decode_messages_batch(const beast_frame_t *frames, int frame_count,
+                          decode_result_t *results, int *statuses);
 
 /* Stateful Beast stream parser.
  *

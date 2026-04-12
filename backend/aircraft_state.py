@@ -1692,6 +1692,12 @@ class AircraftState:
         self._readsb_last_total: int = -1
         # Per-aircraft readsb cumulative message counts (for per-session delta tracking)
         self._readsb_msg_counts: dict[str, int] = {}
+        self._native_batch_decoder = None
+        if _NATIVE_DECODE:
+            try:
+                self._native_batch_decoder = _decode_cffi.DecodeBatcher()
+            except Exception:
+                self._native_batch_decoder = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -1705,6 +1711,20 @@ class AircraftState:
             return _decode_cffi.decode_message(raw, signal)
         except Exception:
             return None
+
+    def _predecode_native_batch(self, messages: list[tuple[bytes, int, int]]) -> list[dict | None]:
+        """Run native parser for a decoder batch when the batch API is available."""
+        if not _NATIVE_DECODE:
+            return [None] * len(messages)
+        try:
+            if self._native_batch_decoder is not None:
+                return self._native_batch_decoder.decode_batch(messages)
+        except Exception:
+            pass
+        return [
+            self._predecode_native_message(raw, signal)
+            for raw, signal, _timestamp in messages
+        ]
 
     def process_message(self, msg: dict, mlat_source: Optional[str] = None) -> tuple[int, int, str, float | None] | None:
         """Process a decoded Beast message.
@@ -1793,6 +1813,8 @@ class AircraftState:
 
         # MLAT detection is pure computation — run outside the lock.
         processed: list[tuple[bytes, int, int, bool, "Optional[str]", "Optional[str]", dict | None]] = []
+        predecode_inputs: list[tuple[bytes, int, int]] = []
+        metadata: list[tuple[bytes, int, int, bool, "Optional[str]", "Optional[str]"]] = []
         t0 = time.perf_counter()
         t_cpu0 = time.thread_time()
         t_predecode_cpu0 = time.thread_time()
@@ -1806,8 +1828,13 @@ class AircraftState:
                     mlat_source = "mlat"
             else:
                 mlat_source = None
-            native_decoded = self._predecode_native_message(raw, signal)
-            processed.append((raw, signal, timestamp, mlat_source is not None, mlat_source, stream_name, native_decoded))
+            predecode_inputs.append((raw, signal, timestamp))
+            metadata.append((raw, signal, timestamp, mlat_source is not None, mlat_source, stream_name))
+        native_decoded_batch = self._predecode_native_batch(predecode_inputs)
+        processed = [
+            (*meta, native_decoded)
+            for meta, native_decoded in zip(metadata, native_decoded_batch)
+        ]
         if not processed:
             return []
 

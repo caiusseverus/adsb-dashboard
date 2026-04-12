@@ -226,6 +226,28 @@ int decode_message(const uint8_t *msg_bytes, int msg_len,
     return 0;
 }
 
+int decode_messages_batch(const beast_frame_t *frames, int frame_count,
+                          decode_result_t *results, int *statuses)
+{
+    if (!frames || !results || !statuses || frame_count < 0) return -1;
+
+    int decoded_count = 0;
+    for (int i = 0; i < frame_count; i++) {
+        const beast_frame_t *frame = &frames[i];
+        int rc = decode_message(
+            frame->payload,
+            (int)frame->msg_len,
+            frame->signal,
+            frame->timestamp,
+            &results[i]
+        );
+        statuses[i] = rc;
+        if (rc == 0) decoded_count++;
+    }
+
+    return decoded_count;
+}
+
 void beast_parser_init(beast_parser_t *parser) {
     if (!parser) return;
     memset(parser, 0, sizeof(*parser));
