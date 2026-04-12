@@ -163,6 +163,7 @@ async def get_perf() -> dict:
             "analyse_swap_avg": sample_avg(radar_rotation_t, "analyse_swap_ms"),
             "iid_count_avg": sample_avg(radar_rotation_t, "iid_count"),
             "event_count_avg": sample_avg(radar_rotation_t, "event_count"),
+            "deferred_iid_count_avg": sample_avg(radar_rotation_t, "deferred_iid_count"),
         },
         "radar_loop_ms": {
             "samples": len(radar_loop_t),

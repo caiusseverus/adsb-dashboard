@@ -225,7 +225,14 @@ def detect_bursts(arrival_us_list: list[float]) -> list[dict]:
     if not arrival_us_list:
         return []
 
-    sorted_ts = sorted(arrival_us_list)
+    sorted_ts = (
+        arrival_us_list
+        if all(
+            arrival_us_list[i] <= arrival_us_list[i + 1]
+            for i in range(len(arrival_us_list) - 1)
+        )
+        else sorted(arrival_us_list)
+    )
     groups: list[list[float]] = []
     current = [sorted_ts[0]]
 
@@ -1594,7 +1601,11 @@ class RadarState:
     # Rotation models
     # ------------------------------------------------------------------
 
-    def update_rotation_models(self, max_iids_per_call: int | None = None) -> None:
+    def update_rotation_models(
+        self,
+        max_iids_per_call: int | None = None,
+        max_runtime_ms: float | None = None,
+    ) -> None:
         """Analyse accumulated IID events and update per-IID rotation models.
 
         Called periodically (every 30s) from a background task.
@@ -1607,8 +1618,13 @@ class RadarState:
         cache_build_s = 0.0
         sweep_build_s = 0.0
         analyse_swap_s = 0.0
-        iid_count = 0
         event_count = 0
+        deferred_count = 0
+        budget_s = (
+            max_runtime_ms / 1000.0
+            if max_runtime_ms is not None and max_runtime_ms > 0
+            else None
+        )
         self._update_active.set()
         try:
             now_us: int
@@ -1641,6 +1657,7 @@ class RadarState:
                     "analyse_swap_ms": 0.0,
                     "iid_count": 0,
                     "event_count": event_count,
+                    "deferred_iid_count": 0,
                 })
                 return
 
@@ -1672,6 +1689,7 @@ class RadarState:
                         "analyse_swap_ms": 0.0,
                         "iid_count": 0,
                         "event_count": 0,
+                        "deferred_iid_count": len(deferred_iids),
                     })
                     return
                 analysis_cutoff_us = now_us - int(ROTATION_ANALYSIS_MAX_AGE_S * 1_000_000)
@@ -1691,13 +1709,11 @@ class RadarState:
                     by_iid[ev[1]].append(ev)
             if max_iids_per_call is not None and max_iids_per_call > 0 and len(by_iid) > max_iids_per_call:
                 ranked_iids = sorted(by_iid, key=lambda iid: len(by_iid[iid]), reverse=True)
-                selected_iids = set(ranked_iids[:max_iids_per_call])
                 deferred_iids = set(ranked_iids[max_iids_per_call:])
                 by_iid = {iid: by_iid[iid] for iid in ranked_iids[:max_iids_per_call]}
                 with self._lock:
                     self._dirty_iids.update(deferred_iids)
 
-            iid_count = len(by_iid)
             if not by_iid:
                 record_rotation_update_timing({
                     "ts_s": time.time(),
@@ -1710,8 +1726,15 @@ class RadarState:
                     "analyse_swap_ms": 0.0,
                     "iid_count": 0,
                     "event_count": event_count,
+                    "deferred_iid_count": 0,
                 })
                 return
+
+            def _iid_priority(iid: int) -> tuple[float, int]:
+                model = self._models.get(iid)
+                return ((model.last_updated if model is not None else 0.0) or 0.0, iid)
+
+            ordered_iids = sorted(by_iid, key=_iid_priority)
 
             # Refresh the live-frame-builder tracker with current aircraft positions.
             # The live path (_on_df11_frame_builder) uses this for real-time burst
@@ -1738,9 +1761,18 @@ class RadarState:
             t_sweeps = time.perf_counter()
             history_fetch_s = 0.0
             cache_build_s = 0.0
-            for iid, evs in by_iid.items():
+            unprocessed_iids: set[int] = set()
+            for index, iid in enumerate(ordered_iids):
+                evs = by_iid[iid]
                 analysed_models[iid] = _analyse_iid_events(evs)
+                if budget_s is not None and (time.perf_counter() - t_sweeps) >= budget_s:
+                    unprocessed_iids.update(ordered_iids[index + 1:])
+                    break
             sweep_build_s = time.perf_counter() - t_sweeps
+            deferred_count = len(unprocessed_iids)
+            if unprocessed_iids:
+                with self._lock:
+                    self._dirty_iids.update(unprocessed_iids)
 
             # Fast pointer/state swap inside the lock only.
             t_analyse = time.perf_counter()
@@ -1763,11 +1795,12 @@ class RadarState:
                 "cache_build_ms": round(cache_build_s * 1000, 2),
                 "sweep_build_ms": round(sweep_build_s * 1000, 2),
                 "analyse_swap_ms": round(analyse_swap_s * 1000, 2),
-                "iid_count": iid_count,
+                "iid_count": len(analysed_models),
                 "event_count": event_count,
+                "deferred_iid_count": deferred_count,
             })
 
-            log.debug("RadarState: updated %d IID rotation models", len(by_iid))
+            log.debug("RadarState: updated %d IID rotation models", len(analysed_models))
         finally:
             self._update_active.clear()
 

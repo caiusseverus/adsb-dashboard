@@ -10,7 +10,7 @@ import config
 import pytest
 from radar.sweep import _analyse_iid_events
 from radar.models import LiveFrameState, RadarIID, RotationModel
-from radar.sweep import RadarState, _reinforce_radar_characteristics, detect_bursts_with_signals
+from radar.sweep import RadarState, _reinforce_radar_characteristics, detect_bursts, detect_bursts_with_signals
 
 
 def _make_events(iid: int, icao: str, arrivals_s: list[float]) -> list[tuple[int, int, str, None]]:
@@ -190,6 +190,13 @@ def test_detect_bursts_with_signals_refines_beam_center_toward_stronger_replies(
     assert burst["beam_center_us"] < 1_005_000
 
 
+def test_detect_bursts_preserves_order_insensitive_grouping():
+    sorted_bursts = detect_bursts([1_000_000, 1_010_000, 1_500_000, 1_510_000])
+    unsorted_bursts = detect_bursts([1_500_000, 1_000_000, 1_510_000, 1_010_000])
+
+    assert unsorted_bursts == sorted_bursts
+
+
 def test_detect_bursts_with_signals_preserves_fractional_microsecond_center():
     bursts = detect_bursts_with_signals([
         (1_000_000.0, -20.0),
@@ -311,6 +318,49 @@ def test_update_rotation_models_defers_recently_stable_iids(monkeypatch):
     state.update_rotation_models()
 
     assert 7 in state._dirty_iids
+
+
+def test_update_rotation_models_requeues_iids_left_outside_runtime_budget(monkeypatch):
+    import radar.sweep as sweep_module
+
+    state = RadarState()
+    state._iid_events = deque([
+        (1_000_000, 7, "AAAAAA", None),
+        (2_000_000, 8, "BBBBBB", None),
+        (3_000_000, 7, "AAAAAA", None),
+        (4_000_000, 8, "BBBBBB", None),
+    ])
+    state._dirty_iids = {7, 8}
+    state._models = {
+        7: RadarIID(iid=7, last_updated=100.0),
+        8: RadarIID(iid=8, last_updated=200.0),
+    }
+
+    analysed_iids = []
+
+    def fake_analyse(events):
+        analysed_iids.append(events[0][1])
+        return RotationModel(dominant_period_s=4.0, primary_direct_count=4, status="LIKELY_SINGLE")
+
+    perf_values = iter([
+        10.0,   # update start
+        10.001, # snapshot start
+        10.002, # snapshot done
+        10.003, # sweep start
+        11.000, # after first IID: budget exceeded
+        11.001, # sweep done
+        11.002, # analyse-swap start
+        11.003, # analyse-swap done
+        11.004, # record total
+    ])
+
+    monkeypatch.setattr(sweep_module, "_analyse_iid_events", fake_analyse)
+    monkeypatch.setattr(sweep_module.time, "perf_counter", lambda: next(perf_values))
+
+    state.update_rotation_models(max_runtime_ms=100.0)
+
+    assert analysed_iids == [7]
+    assert 8 in state._dirty_iids
 
 
 def test_live_frame_builder_uses_fixed_reference_window_and_period_family_admission(monkeypatch):

@@ -8,6 +8,34 @@ Source inputs:
 Prepared: 2026-04-04
 Updated: 2026-04-06
 
+## 2026-04-12 Pi 5 Radar Rotation Backlog
+
+- [x] Interpret the supplied Pi 5 debug sample and identify the active bottleneck
+- [x] Inspect the radar rotation maintenance path and existing throttling/deferral behavior
+- [x] Implement a bounded rotation-analysis pass that preserves dirty IID reprocessing without long Python CPU bursts
+- [x] Add focused regression coverage for deferred IID handling
+- [x] Run targeted backend tests and record the verification result
+
+### Review
+
+- Investigation:
+  - The supplied Pi 5 sample shows the main pressure around radar rotation maintenance rather than websocket broadcast or raw native predecode: `radar_rotation_ms.sweep_build_avg=3062.06 ms`, `radar_loop_ms.update_avg=3412.43 ms`, and about `13843` recent events per update.
+  - Decode and radar worker timings show high wall/off-CPU time while the queues are saturated, which is consistent with Python/GIL pressure from long background analysis bursts.
+- Implementation:
+  - [config.py](/home/keith/claude/adsb-dashboard/backend/config.py) adds `RADAR_UPDATE_BUDGET_MS`, defaulting to `750`.
+  - [main.py](/home/keith/claude/adsb-dashboard/backend/main.py) passes that budget into the 30 second radar maintenance loop.
+  - [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) now processes rotation analysis in oldest-last-updated IID order, stops after the runtime budget once at least one IID has been analysed, and requeues untouched dirty IIDs for later ticks.
+  - [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) also skips the redundant `sorted(...)` call in `detect_bursts()` when arrivals are already chronological, while preserving order-insensitive behavior for other callers.
+  - [debug.py](/home/keith/claude/adsb-dashboard/backend/debug.py) exposes `radar_rotation_ms.deferred_iid_count_avg` so live samples can show whether the budget is actively spreading work across ticks.
+  - [backend/.env.example](/home/keith/claude/adsb-dashboard/backend/.env.example) documents the new tuning knob.
+- Expected live impact:
+  - The next Pi 5 sample should show lower `radar_rotation_ms.sweep_build_avg` and lower `radar_loop_ms.update_avg` per maintenance tick, with a possible nonzero `deferred_iid_count_avg`.
+  - This does not hide radar work under backlog skips; it keeps dirty IIDs queued and spreads the analysis across ticks to reduce long GIL-heavy bursts.
+- Verification:
+  - `python3 -m py_compile backend/config.py backend/main.py backend/debug.py backend/radar/sweep.py backend/tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_debug_perf.py`
+  - Result: `72 passed in 0.38s`
+
 ## 2026-04-11 FM Frame Geometry Diagnostics
 
 - [x] Inspect current SweepFrame and inscribed-angle evidence payloads

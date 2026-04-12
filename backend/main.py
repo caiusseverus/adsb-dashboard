@@ -1123,7 +1123,11 @@ async def _radar_loop() -> None:
             continue
         try:
             t_update = time.perf_counter()
-            await asyncio.to_thread(radar_state.update_rotation_models, config.RADAR_UPDATE_MAX_IIDS)
+            await asyncio.to_thread(
+                radar_state.update_rotation_models,
+                config.RADAR_UPDATE_MAX_IIDS,
+                config.RADAR_UPDATE_BUDGET_MS,
+            )
             update_ms = (time.perf_counter() - t_update) * 1000
         except Exception:
             log.exception("Radar: update_rotation_models failed")
