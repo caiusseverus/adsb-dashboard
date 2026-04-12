@@ -207,6 +207,8 @@ async def get_perf() -> dict:
             "samples": len(radar_worker_phase_t),
             "fired_burst_count_avg": sample_avg(radar_worker_phase_t, "fired_burst_count"),
             "reference_select_count_avg": sample_avg(radar_worker_phase_t, "reference_select_count"),
+            "reference_reuse_count_avg": sample_avg(radar_worker_phase_t, "reference_reuse_count"),
+            "reference_rescore_count_avg": sample_avg(radar_worker_phase_t, "reference_rescore_count"),
             "position_lookup_count_avg": sample_avg(radar_worker_phase_t, "position_lookup_count"),
             "dominant_check_count_avg": sample_avg(radar_worker_phase_t, "dominant_check_count"),
             "phase_check_count_avg": sample_avg(radar_worker_phase_t, "phase_check_count"),

@@ -133,6 +133,31 @@ Updated: 2026-04-06
   - `uv run --directory backend pytest`
   - Result: `242 passed in 1.35s`
 
+## 2026-04-12 Radar Reference Selection Throttle
+
+- [x] Review the live fired-burst phase sample and identify the reference-selection hotspot
+- [x] Reuse a recent current reference instead of rescoring on every fired burst
+- [x] Add focused regression coverage for the reduced selection-call pattern
+- [x] Run backend verification and record the result
+- [x] Commit the change
+
+### Review
+
+- Investigation:
+  - The Pi 5 sample shows radar worker saturation while the main decoder is healthy: `radar_queue_depth=5000`, `radar_drops_total=21950`, `msg_queue_depth=0`, and `msg_drops_total=0`.
+  - The new fired-burst phase metrics isolate the hot path to reference selection: `radar_worker_phase_ms.process_burst_avg=49.77 ms` and `radar_fired_burst_phase_ms.reference_select_avg=47.79 ms`.
+- Implementation:
+  - [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) now reuses the current reference aircraft while its latest burst centroid is still within the same recency window used by the selector.
+  - [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) still forces a full rescore when there is no current reference or the current reference has gone stale.
+  - [debug.py](/home/keith/claude/adsb-dashboard/backend/debug.py) adds `reference_reuse_count_avg` and `reference_rescore_count_avg` to `radar_fired_burst_phase_ms` so the next live sample can show whether repeated native scans were eliminated.
+  - [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) covers the recent-reference reuse path and the stale-reference rescore path.
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/debug.py backend/tests/test_debug_perf.py backend/tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest tests/test_debug_perf.py tests/test_radar_sweep.py`
+  - Result: `42 passed in 0.46s`
+  - `uv run --directory backend pytest`
+  - Result: `244 passed in 1.36s`
+
 ## 2026-04-11 FM Frame Geometry Diagnostics
 
 - [x] Inspect current SweepFrame and inscribed-angle evidence payloads

@@ -71,6 +71,8 @@ def test_get_perf_reports_total_and_predecode_timings(monkeypatch):
             "total_cpu_ms": 7.0,
             "total_offcpu_ms": 11.0,
             "reference_select_count": 2,
+            "reference_reuse_count": 1,
+            "reference_rescore_count": 1,
             "position_lookup_count": 3,
             "dominant_check_count": 4,
             "phase_check_count": 5,
@@ -106,6 +108,8 @@ def test_get_perf_reports_total_and_predecode_timings(monkeypatch):
             "total_cpu_ms": 11.0,
             "total_offcpu_ms": 19.0,
             "reference_select_count": 4,
+            "reference_reuse_count": 3,
+            "reference_rescore_count": 1,
             "position_lookup_count": 9,
             "dominant_check_count": 10,
             "phase_check_count": 7,
@@ -235,6 +239,8 @@ def test_get_perf_reports_total_and_predecode_timings(monkeypatch):
     assert payload["radar_fired_burst_phase_ms"]["samples"] == 2
     assert payload["radar_fired_burst_phase_ms"]["fired_burst_count_avg"] == 6.0
     assert payload["radar_fired_burst_phase_ms"]["reference_select_count_avg"] == 3.0
+    assert payload["radar_fired_burst_phase_ms"]["reference_reuse_count_avg"] == 2.0
+    assert payload["radar_fired_burst_phase_ms"]["reference_rescore_count_avg"] == 1.0
     assert payload["radar_fired_burst_phase_ms"]["position_lookup_count_avg"] == 6.0
     assert payload["radar_fired_burst_phase_ms"]["dominant_check_count_avg"] == 7.0
     assert payload["radar_fired_burst_phase_ms"]["phase_check_count_avg"] == 6.0

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import config
 import pytest
 from radar.sweep import _analyse_iid_events
-from radar.models import LiveFrameState, RadarIID, RotationModel
+from radar.models import LiveFrameState, RadarIID, ReferenceAircraftInfo, RotationModel
 from radar.sweep import RadarState, _reinforce_radar_characteristics, detect_bursts, detect_bursts_with_signals
 
 
@@ -522,6 +522,91 @@ def test_native_reference_selection_matches_python_scoring():
 
     assert python_ref == "AAAAAA"
     assert native_ref == python_ref
+
+
+def test_fired_burst_processing_reuses_recent_reference_without_native_rescore():
+    class CountingNativeProcessor:
+        def __init__(self):
+            self.select_calls = 0
+
+        def select_reference(self, **kwargs):
+            self.select_calls += 1
+            return "AAAAAA"
+
+        def matches_dominant_period(self, *args, **kwargs):
+            return True
+
+        def matches_phase_family(self, *args, **kwargs):
+            return True
+
+    state = RadarState()
+    processor = CountingNativeProcessor()
+    state._models[23] = RadarIID(
+        iid=23,
+        period_s=4.0,
+        reference_aircraft=ReferenceAircraftInfo(ref_icao="AAAAAA"),
+    )
+    state._native_burst_processors[23] = processor
+    state._live_bursts[23] = {}
+    state._live_last_arrival[23] = {}
+    state._live_frames[23] = None
+    state._live_completed_frames[23] = deque(maxlen=state._LIVE_FRAMES_MAX)
+    state._live_burst_centroids[23] = {
+        "AAAAAA": [0.0, 4_000_000.0, 8_000_000.0],
+    }
+
+    metrics = state._process_fired_bursts(23, [
+        {"icao": "BBBBBB", "burst_centroid_us": 8_100_000.0, "burst_signal": None},
+        {"icao": "CCCCCC", "burst_centroid_us": 8_200_000.0, "burst_signal": None},
+    ])
+
+    assert processor.select_calls == 0
+    assert metrics["reference_select_count"] == 2
+    assert metrics["reference_reuse_count"] == 2
+    assert metrics["reference_rescore_count"] == 0
+
+
+def test_fired_burst_processing_rescores_stale_reference_once_then_reuses():
+    class CountingNativeProcessor:
+        def __init__(self):
+            self.select_calls = 0
+
+        def select_reference(self, **kwargs):
+            self.select_calls += 1
+            return "CCCCCC"
+
+        def matches_dominant_period(self, *args, **kwargs):
+            return True
+
+        def matches_phase_family(self, *args, **kwargs):
+            return True
+
+    state = RadarState()
+    processor = CountingNativeProcessor()
+    state._models[24] = RadarIID(
+        iid=24,
+        period_s=4.0,
+        reference_aircraft=ReferenceAircraftInfo(ref_icao="AAAAAA"),
+    )
+    state._native_burst_processors[24] = processor
+    state._live_bursts[24] = {}
+    state._live_last_arrival[24] = {}
+    state._live_frames[24] = None
+    state._live_completed_frames[24] = deque(maxlen=state._LIVE_FRAMES_MAX)
+    state._live_burst_centroids[24] = {
+        "AAAAAA": [0.0],
+        "BBBBBB": [0.0, 4_000_000.0, 8_000_000.0],
+    }
+
+    metrics = state._process_fired_bursts(24, [
+        {"icao": "CCCCCC", "burst_centroid_us": 40_100_000.0, "burst_signal": None},
+        {"icao": "DDDDDD", "burst_centroid_us": 40_200_000.0, "burst_signal": None},
+    ])
+
+    assert processor.select_calls == 1
+    assert metrics["reference_select_count"] == 2
+    assert metrics["reference_reuse_count"] == 1
+    assert metrics["reference_rescore_count"] == 1
 
 
 def test_live_frame_builder_ignores_duplicate_reference_bursts_within_open_window(monkeypatch):
