@@ -183,6 +183,8 @@ class FramePositionEstimate:
     n_contributing_arcs: int
     azimuth_spread_deg: float
     weight: float   # n_contributing_arcs / (cep_km + 0.5)**2
+    cluster_dominance_ratio: float = 0.0
+    interpolated_position_fraction: float = 0.0
 
 
 @dataclass
@@ -1446,6 +1448,8 @@ class ForwardModel:
             n_contributing_arcs=n_arcs,
             azimuth_spread_deg=azimuth_spread,
             weight=weight,
+            cluster_dominance_ratio=best.get("dominance_ratio", 0.0),
+            interpolated_position_fraction=best.get("interpolated_fraction", 0.0),
         )
 
     # ── Per-frame buffer helpers ─────────────────────────────────────────
@@ -1469,6 +1473,10 @@ class ForwardModel:
                     n_contributing_arcs=r["n_contributing_arcs"],
                     azimuth_spread_deg=r["azimuth_spread_deg"],
                     weight=r["weight"],
+                    # Legacy rows lack quality columns; use pass-through defaults
+                    # so Stage 1 Mahalanobis gate does the actual quality work.
+                    cluster_dominance_ratio=r.get("cluster_dominance_ratio") or 2.0,
+                    interpolated_position_fraction=r.get("interpolated_position_fraction") or 0.0,
                 ))
             self._frame_positions[iid] = buf
             log.info("ForwardModel: IID %d — loaded %d frame positions from DB", iid, len(buf))
@@ -1530,51 +1538,81 @@ class ForwardModel:
                 log.exception("ForwardModel: IID %d — failed to delete frame position from DB", iid)
         return True
 
-    def compute_weighted_centroid(self, iid: int) -> Optional[dict]:
+    def remove_frame_positions_bulk(self, iid: int, sweep_start_us_list: list[float]) -> int:
+        """Remove multiple per-frame estimates by sweep_start_us. Returns count removed."""
+        if not sweep_start_us_list:
+            return 0
+        to_remove = frozenset(sweep_start_us_list)
+        removed = 0
+        with self._frame_positions_lock:
+            buf = self._frame_positions.get(iid)
+            if not buf:
+                return 0
+            new_buf: deque = deque(
+                (e for e in buf if e.sweep_start_us not in to_remove),
+                maxlen=_PER_FRAME_BUFFER_MAX,
+            )
+            removed = len(buf) - len(new_buf)
+            if removed > 0:
+                self._frame_positions[iid] = new_buf
+        if removed > 0:
+            try:
+                from db import stats_db
+                stats_db.delete_frame_positions_bulk(iid, sweep_start_us_list)
+            except Exception:
+                log.exception("ForwardModel: IID %d — failed to bulk delete frame positions", iid)
+        return removed
+
+    def compute_weighted_centroid(
+        self,
+        iid: int,
+        receiver_lat: Optional[float] = None,
+        receiver_lon: Optional[float] = None,
+    ) -> Optional[dict]:
         """Weighted centroid of all per-frame position estimates for an IID.
 
-        Trims the outermost PER_FRAME_TRIM_FRACTION by distance from the median
-        before computing the weighted mean, to suppress outlier frames.
+        Uses the four-stage frame filter (quality pre-filter, per-frame Mahalanobis
+        gate, Huberized sample-covariance second pass, iterative refinement) to
+        reject outlier frames before computing the inverse-variance weighted mean.
+
+        Args:
+            iid: Interrogator ID.
+            receiver_lat: Receiver latitude.  Falls back to config if not given.
+            receiver_lon: Receiver longitude.  Falls back to config if not given.
+
+        Returns:
+            dict with lat, lon, cep_km, n_estimates, total_weight,
+            plus filter diagnostics (n_total, n_stage0_survivors, n_inliers,
+            rejection_counts) when available.  None if no estimates or < 2 inliers.
         """
         estimates = self.get_frame_positions(iid)
         if not estimates:
             return None
 
-        lats = sorted(e.lat for e in estimates)
-        lons = sorted(e.lon for e in estimates)
-        mid = len(lats) // 2
-        median_lat = lats[mid]
-        median_lon = lons[mid]
+        if receiver_lat is None or receiver_lon is None:
+            import config as _cfg
+            receiver_lat = getattr(_cfg, "RECEIVER_LAT", None)
+            receiver_lon = getattr(_cfg, "RECEIVER_LON", None)
 
-        # Distance from median for each estimate.
-        dists = [
-            _haversine_m(median_lat, median_lon, e.lat, e.lon) / 1000.0
-            for e in estimates
-        ]
-        n_trim = max(0, int(len(estimates) * _PER_FRAME_TRIM_FRACTION))
-        threshold = sorted(dists)[-(n_trim + 1)] if n_trim < len(estimates) else float("inf")
-        survivors = [e for e, d in zip(estimates, dists) if d <= threshold]
-        if not survivors:
-            survivors = estimates
-
-        total_w = sum(e.weight for e in survivors)
-        if total_w <= 0:
+        if receiver_lat is None or receiver_lon is None:
             return None
 
-        centroid_lat = sum(e.lat * e.weight for e in survivors) / total_w
-        centroid_lon = sum(e.lon * e.weight for e in survivors) / total_w
-        rms_km = math.sqrt(
-            sum(
-                e.weight * (_haversine_m(centroid_lat, centroid_lon, e.lat, e.lon) / 1000.0) ** 2
-                for e in survivors
-            ) / total_w
-        )
+        from .frame_filter import filter_frame_estimates
+        result = filter_frame_estimates(estimates, receiver_lat, receiver_lon)
+
+        if result.lat is None:
+            return None
+
         return {
-            "lat": centroid_lat,
-            "lon": centroid_lon,
-            "cep_km": rms_km,
-            "n_estimates": len(survivors),
-            "total_weight": total_w,
+            "lat": result.lat,
+            "lon": result.lon,
+            "cep_km": result.sigma_combined_m / 1000.0,
+            "n_estimates": result.n_inliers,
+            "total_weight": 0.0,  # weight sum not needed by callers
+            "n_total": result.n_total,
+            "n_stage0_survivors": result.n_stage0_survivors,
+            "n_inliers": result.n_inliers,
+            "rejection_counts": result.rejection_counts,
         }
 
     # ── Airport hypothesis test ──────────────────────────────────────────
@@ -2277,7 +2315,8 @@ class ForwardModel:
         # expensive intersection solver entirely.  The centroid integrates many
         # independent frames and is always more accurate than a single pool solve.
         n_raw = len(self.get_frame_positions(iid))
-        centroid = self.compute_weighted_centroid(iid) if n_raw >= 20 else None
+        filter_ran = n_raw >= 20
+        centroid = self.compute_weighted_centroid(iid) if filter_ran else None
         if centroid is not None:
             lat = centroid["lat"]
             lon = centroid["lon"]
@@ -2322,6 +2361,10 @@ class ForwardModel:
                 "period_s": period_s,
             }
 
+        if filter_ran:
+            reason = f"frame filter found no stable cluster ({n_raw} frames)"
+            log.debug("ForwardModel: IID %d — %s", iid, reason)
+            return {"error": reason, "stage": "no_cluster", "n_estimates": n_raw}
         reason = f"accumulating frame estimates ({n_raw}/20 needed)"
         log.debug("ForwardModel: IID %d — %s", iid, reason)
         return {"error": reason, "stage": "accumulating", "n_estimates": n_raw}

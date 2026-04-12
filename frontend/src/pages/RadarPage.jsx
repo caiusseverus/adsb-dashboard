@@ -733,7 +733,7 @@ function ReferenceAircraftPanel({ iid }) {
 }
 
 function googleMapsUrl(lat, lon) {
-  return `https://www.google.com/maps/@${lat},${lon},15z/data=!3m1!1e3`
+  return `https://www.google.com/maps?q=${lat},${lon}&t=k`
 }
 
 function formatMethodName(source) {
@@ -1275,10 +1275,17 @@ function formatDistance(distanceM) {
 function EvidenceMapPanel({ iid, refreshKey = 0 }) {
   const [autoKey, setAutoKey] = useState(0)
   const [deleteKey, setDeleteKey] = useState(0)
+  const [outlierResult, setOutlierResult] = useState(null)  // null | {outlierSet, n_outliers, n_inliers, n_total, rejection_counts}
+  const [analyseRunning, setAnalyseRunning] = useState(false)
+  const [deleteRunning, setDeleteRunning] = useState(false)
+
   useEffect(() => {
     const id = setInterval(() => setAutoKey(k => k + 1), 30_000)
     return () => clearInterval(id)
   }, [])
+
+  // Clear analysis whenever data refreshes (auto or after delete)
+  useEffect(() => { setOutlierResult(null) }, [autoKey])
 
   async function handleDeletePoint(frameIndex) {
     if (frameIndex == null) return
@@ -1286,6 +1293,37 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
       await fetch(`${API_BASE}/api/radar/iids/${iid}/frame-positions/${frameIndex}`, { method: 'DELETE' })
       setDeleteKey(k => k + 1)
     } catch {}
+  }
+
+  async function handleAnalyseOutliers() {
+    setAnalyseRunning(true)
+    try {
+      const res = await fetch(`${API_BASE}/api/radar/iids/${iid}/frame-positions/filter-analysis`)
+      const d = await res.json()
+      setOutlierResult({
+        outlierSet: new Set(d.outlier_sweep_start_us),
+        n_outliers: d.n_outliers,
+        n_inliers: d.n_inliers,
+        n_total: d.n_total,
+        rejection_counts: d.rejection_counts,
+      })
+    } catch {}
+    setAnalyseRunning(false)
+  }
+
+  async function handleDeleteOutliers() {
+    if (!outlierResult?.outlierSet?.size) return
+    setDeleteRunning(true)
+    try {
+      await fetch(`${API_BASE}/api/radar/iids/${iid}/frame-positions/bulk-delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sweep_start_us: [...outlierResult.outlierSet] }),
+      })
+      setOutlierResult(null)
+      setDeleteKey(k => k + 1)
+    } catch {}
+    setDeleteRunning(false)
   }
 
   const { data, loading } = useEvidenceMethods(iid, ['forward_model'], refreshKey + autoKey + deleteKey)
@@ -1406,6 +1444,58 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
           )
         })()}
       </div>
+      <div className={styles.metricRow} style={{ marginBottom: '0.75rem' }}>
+        <button
+          type="button"
+          className={styles.actionButton}
+          onClick={handleAnalyseOutliers}
+          disabled={analyseRunning || loading}
+        >
+          {analyseRunning ? 'Analysing…' : 'Analyse Outliers'}
+        </button>
+        {outlierResult && outlierResult.n_inliers >= 2 && outlierResult.n_outliers > 0 && (
+          <button
+            type="button"
+            className={styles.resetButton}
+            onClick={handleDeleteOutliers}
+            disabled={deleteRunning}
+          >
+            {deleteRunning ? 'Deleting…' : `Delete ${outlierResult.n_outliers} Outliers`}
+          </button>
+        )}
+        {outlierResult && (
+          <button
+            type="button"
+            className={styles.actionButton}
+            onClick={() => setOutlierResult(null)}
+          >
+            Clear
+          </button>
+        )}
+        {outlierResult && outlierResult.n_inliers >= 2 && (
+          <span className={styles.metricPill}>
+            Inliers <span className={styles.metricValue} style={{ color: '#3fb950' }}>{outlierResult.n_inliers}</span>
+          </span>
+        )}
+        {outlierResult && outlierResult.n_inliers >= 2 && outlierResult.n_outliers > 0 && (
+          <span className={styles.metricPill}>
+            Outliers <span className={styles.metricValue} style={{ color: '#ff7b72' }}>{outlierResult.n_outliers}</span>
+          </span>
+        )}
+        {outlierResult && outlierResult.rejection_counts && (
+          <span className={styles.metricPill} title="Frames rejected per filter stage">
+            Stage 0 <span className={styles.metricValue}>{outlierResult.rejection_counts.stage0 ?? 0}</span>
+            {' · '}Stage 1 <span className={styles.metricValue}>{outlierResult.rejection_counts.stage1 ?? 0}</span>
+            {' · '}Stage 2 <span className={styles.metricValue}>{outlierResult.rejection_counts.stage2 ?? 0}</span>
+          </span>
+        )}
+      </div>
+      {outlierResult && outlierResult.n_inliers < 2 && (
+        <div className={styles.sectionLead} style={{ color: '#d29922', marginBottom: '0.75rem' }}>
+          Filter could not find a reliable cluster — data may not have converged yet, or all frames are scattered.
+          Stage 0 rejected {outlierResult.rejection_counts?.stage0 ?? '?'} of {outlierResult.n_total} frames.
+        </div>
+      )}
       {loading || !bounds ? (
         <div className={styles.empty}>{loading ? 'Loading…' : 'No frame estimates yet.'}</div>
       ) : (
@@ -1429,7 +1519,7 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
               )
             })}
 
-            {/* Per-frame position estimate dots — click to remove an outlier */}
+            {/* Per-frame position estimate dots — outliers highlighted red when analysis is active */}
             {activeMethods.flatMap(method =>
               (method.layers ?? []).flatMap((layer, li) =>
                 (layer.features ?? []).map((feature, fi) => {
@@ -1439,6 +1529,11 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
                   const [lon, lat] = geometry.coordinates
                   const p = project(lat, lon, width, height)
                   const frameIndex = feature.properties.frame_index
+                  const sus = feature.properties.sweep_start_us
+                  const isOutlier = outlierResult != null && outlierResult.outlierSet.has(sus)
+                  const dotColor = isOutlier ? '#ff7b72' : '#58a6ff'
+                  const dotOpacity = isOutlier ? 0.75 : (outlierResult != null ? 0.2 : 0.3)
+                  const dotR = isOutlier ? 3 : 2
                   return (
                     <g
                       key={`${li}-${fi}`}
@@ -1446,7 +1541,7 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
                       style={{ cursor: 'pointer' }}
                     >
                       <circle cx={p.x} cy={p.y} r="7" fill="transparent" />
-                      <circle cx={p.x} cy={p.y} r="2" fill="#58a6ff" opacity="0.3" />
+                      <circle cx={p.x} cy={p.y} r={dotR} fill={dotColor} opacity={dotOpacity} />
                     </g>
                   )
                 })

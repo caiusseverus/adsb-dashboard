@@ -673,6 +673,9 @@ class StatsDB:
                 "ALTER TABLE radar_iids ADD COLUMN manual_updated_ts REAL",
                 "ALTER TABLE radar_iids ADD COLUMN unresolvable_reason TEXT",
                 "ALTER TABLE radar_iids ADD COLUMN unresolvable_updated_ts REAL",
+                # Frame position filter quality columns
+                "ALTER TABLE radar_frame_positions ADD COLUMN cluster_dominance_ratio REAL",
+                "ALTER TABLE radar_frame_positions ADD COLUMN interpolated_position_fraction REAL",
             ):
                 try:
                     conn.execute(stmt)
@@ -3871,13 +3874,16 @@ class StatsDB:
             conn.execute("""
                 INSERT OR REPLACE INTO radar_frame_positions
                     (iid, frame_index, sweep_start_us, lat, lon, cep_km,
-                     n_contributing_arcs, azimuth_spread_deg, weight)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                     n_contributing_arcs, azimuth_spread_deg, weight,
+                     cluster_dominance_ratio, interpolated_position_fraction)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 iid, estimate.frame_index, estimate.sweep_start_us,
                 estimate.lat, estimate.lon, estimate.cep_km,
                 estimate.n_contributing_arcs, estimate.azimuth_spread_deg,
                 estimate.weight,
+                estimate.cluster_dominance_ratio,
+                estimate.interpolated_position_fraction,
             ))
 
     def load_frame_positions(self, iid: int, limit: int = 5000) -> list[dict]:
@@ -3885,7 +3891,8 @@ class StatsDB:
         with self._connect() as conn:
             rows = conn.execute("""
                 SELECT frame_index, sweep_start_us, lat, lon, cep_km,
-                       n_contributing_arcs, azimuth_spread_deg, weight
+                       n_contributing_arcs, azimuth_spread_deg, weight,
+                       cluster_dominance_ratio, interpolated_position_fraction
                 FROM (
                     SELECT * FROM radar_frame_positions
                     WHERE iid = ?
@@ -3903,6 +3910,18 @@ class StatsDB:
                 DELETE FROM radar_frame_positions
                 WHERE iid = ? AND sweep_start_us = ?
             """, (iid, sweep_start_us))
+
+    def delete_frame_positions_bulk(self, iid: int, sweep_start_us_list: list[float]) -> int:
+        """Delete multiple estimates in one transaction. Returns count deleted."""
+        if not sweep_start_us_list:
+            return 0
+        with self._connect() as conn:
+            placeholders = ','.join('?' * len(sweep_start_us_list))
+            result = conn.execute(
+                f"DELETE FROM radar_frame_positions WHERE iid = ? AND sweep_start_us IN ({placeholders})",
+                [iid, *sweep_start_us_list],
+            )
+            return result.rowcount
 
     def clear_frame_positions(self, iid: int) -> None:
         """Delete all estimates for one IID."""

@@ -874,6 +874,7 @@ def _build_forward_model_evidence(iid: int, model) -> dict:
             fp.lat, fp.lon,
             role="frame_position_estimate",
             frame_index=fp.frame_index,
+            sweep_start_us=fp.sweep_start_us,
             n_contributing_arcs=fp.n_contributing_arcs,
             cep_km=round(fp.cep_km, 2),
             azimuth_spread_deg=round(fp.azimuth_spread_deg, 1),
@@ -2257,6 +2258,58 @@ async def reset_iid_fm(iid: int):
         # Reset was done in memory — return success anyway
 
     return {"iid": iid, "reset": True}
+
+
+@router.get("/iids/{iid}/frame-positions/filter-analysis")
+async def analyze_frame_position_filter(iid: int):
+    """Run the four-stage frame filter and classify each frame as inlier or outlier.
+
+    Returns the sweep_start_us values of frames rejected by the filter so the
+    caller can highlight or delete them.
+    """
+    import config as _cfg
+    fm = _get_fm()
+    estimates = fm.get_frame_positions(iid)
+    if not estimates:
+        return {
+            "iid": iid, "n_total": 0, "n_stage0_survivors": 0,
+            "n_inliers": 0, "n_outliers": 0,
+            "outlier_sweep_start_us": [], "rejection_counts": {},
+        }
+    receiver_lat = getattr(_cfg, "RECEIVER_LAT", None)
+    receiver_lon = getattr(_cfg, "RECEIVER_LON", None)
+    if receiver_lat is None or receiver_lon is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="RECEIVER_LAT/LON not configured")
+    from .frame_filter import filter_frame_estimates
+    result = filter_frame_estimates(estimates, receiver_lat, receiver_lon)
+    all_sus = {e.sweep_start_us for e in estimates}
+    outlier_sus = sorted(all_sus - result.inlier_sweep_start_us)
+    return {
+        "iid": iid,
+        "n_total": result.n_total,
+        "n_stage0_survivors": result.n_stage0_survivors,
+        "n_inliers": result.n_inliers,
+        "n_outliers": len(outlier_sus),
+        "outlier_sweep_start_us": outlier_sus,
+        "rejection_counts": result.rejection_counts,
+    }
+
+
+class _BulkDeleteBody(BaseModel):
+    sweep_start_us: list[float]
+
+
+@router.post("/iids/{iid}/frame-positions/bulk-delete")
+async def bulk_delete_frame_positions(iid: int, body: _BulkDeleteBody):
+    """Delete multiple per-frame position estimates and rerun FM pipeline."""
+    fm = _get_fm()
+    deleted = fm.remove_frame_positions_bulk(iid, body.sweep_start_us)
+    if deleted > 0 and _state is not None:
+        result = await asyncio.to_thread(fm.run_full_pipeline, iid, _state)
+        if result is not None:
+            _state.record_forward_model_attempt(iid, result, 0)
+    return {"iid": iid, "deleted": deleted}
 
 
 @router.delete("/iids/{iid}/frame-positions/{frame_index}")

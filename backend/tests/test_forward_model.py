@@ -587,6 +587,8 @@ def _make_frame_estimate(frame_index, lat, lon, cep_km=2.0, n_arcs=8):
         n_contributing_arcs=n_arcs,
         azimuth_spread_deg=180.0,
         weight=weight,
+        cluster_dominance_ratio=2.0,
+        interpolated_position_fraction=0.2,
     )
 
 
