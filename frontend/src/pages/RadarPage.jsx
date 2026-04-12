@@ -2012,11 +2012,6 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
   }) ?? [...frames].reverse().find(f => f.quality === 'good' || f.quality === 'marginal')
   const period_s = beamAnchorRef.current?.period_s ?? latestFrame?.period_s ?? selectedRow?.period_s ?? null
   const fmPos = fmLocationData?.status === 'LOCALISED' ? fmLocationData : null
-  const liveReferenceEvent = effectivePrefIcao == null
-    ? null
-    : [...radarFieldEvents]
-        .reverse()
-        .find(ev => ev.df === 11 && ev.iid === iid && ev.icao === effectivePrefIcao)
 
   // Track the most recent DF11 arrival_us per ICAO across the live event buffer.
   useEffect(() => {
@@ -2077,17 +2072,6 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
     latestFrame?.ref_lon,
     selectedRow?.period_s,
   ])
-
-  useEffect(() => {
-    const current = beamAnchorRef.current
-    if (current == null || liveReferenceEvent == null) return
-    if (current.ref_icao !== liveReferenceEvent.icao) return
-    if (!(liveReferenceEvent.arrival_us > current.ref_arrival_us)) return
-    beamAnchorRef.current = {
-      ...current,
-      ref_arrival_us: liveReferenceEvent.arrival_us,
-    }
-  }, [liveReferenceEvent?.arrival_us, liveReferenceEvent?.icao])
 
   function handleResetSync() {
     beamAnchorRef.current = null

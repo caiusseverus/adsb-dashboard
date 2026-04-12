@@ -158,6 +158,25 @@ Updated: 2026-04-06
   - `uv run --directory backend pytest`
   - Result: `244 passed in 1.36s`
 
+## 2026-04-12 Position Verification Sync Stability
+
+- [x] Review the live symptom and identify why the beam jumps while the sync ICAO label is stable
+- [x] Keep the beam phase anchored to sweep-frame reference centroids instead of raw DF11 messages
+- [x] Run frontend verification and record the result
+- [x] Commit the change
+
+### Review
+
+- Investigation:
+  - The new Pi 5 sample confirms the reference-selection throttle worked: radar queue and drop counters are healthy (`radar_queue_depth=0`, `radar_drops_total=0`), `reference_rescore_count_avg=0.06`, and `reference_select_avg=0.12 ms`.
+  - The position verification canvas still re-anchored beam phase from raw live DF11 timing events for the sync ICAO. Those are message arrivals, not completed sweep-frame reference centroids, so the beam phase could jump while the displayed sync ICAO stayed the same.
+- Implementation:
+  - [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) now keeps the beam phase anchored to the latest good/marginal sweep frame reference centroid.
+  - Live DF11 events are still used to decide whether a sync ICAO has gone stale, but no longer overwrite `beamAnchorRef.current.ref_arrival_us`.
+- Verification:
+  - `npm run build`
+  - Result: production build succeeded with the existing Vite large-chunk warning.
+
 ## 2026-04-11 FM Frame Geometry Diagnostics
 
 - [x] Inspect current SweepFrame and inscribed-angle evidence payloads
