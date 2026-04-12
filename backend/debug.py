@@ -66,6 +66,7 @@ async def get_perf() -> dict:
     radar_qdepth = sorted(_radar_queue_depth_samples)
     radar_df11_t = sorted(_radar_sweep_module.df11_event_timings)
     radar_builder_t = sorted(_radar_sweep_module.df11_builder_timings)
+    radar_worker_phase_t = list(getattr(_radar_sweep_module, "df11_batch_phase_timings", []))
     radar_rotation_t = list(_radar_sweep_module.rotation_update_timings)
     radar_loop_t = list(_radar_loop_timings)
     radar_worker_t = list(_radar_worker_timings)
@@ -183,6 +184,24 @@ async def get_perf() -> dict:
             "process_offcpu_avg": sample_avg(radar_worker_t, "process_offcpu_ms"),
             "batch_size_avg": sample_avg(radar_worker_t, "batch_size"),
             "batch_target_avg": sample_avg(radar_worker_t, "batch_target"),
+        },
+        "radar_worker_phase_ms": {
+            "samples": len(radar_worker_phase_t),
+            "input_count_avg": sample_avg(radar_worker_phase_t, "input_count"),
+            "processed_count_avg": sample_avg(radar_worker_phase_t, "processed_count"),
+            "active_iid_count_avg": sample_avg(radar_worker_phase_t, "active_iid_count"),
+            "fired_burst_count_avg": sample_avg(radar_worker_phase_t, "fired_burst_count"),
+            "prepare_avg": sample_avg(radar_worker_phase_t, "prepare_ms"),
+            "append_avg": sample_avg(radar_worker_phase_t, "append_ms"),
+            "group_avg": sample_avg(radar_worker_phase_t, "group_ms"),
+            "builder_wall_avg": sample_avg(radar_worker_phase_t, "builder_wall_ms"),
+            "builder_cpu_avg": sample_avg(radar_worker_phase_t, "builder_cpu_ms"),
+            "builder_offcpu_avg": sample_avg(radar_worker_phase_t, "builder_offcpu_ms"),
+            "native_burst_avg": sample_avg(radar_worker_phase_t, "native_burst_ms"),
+            "process_burst_avg": sample_avg(radar_worker_phase_t, "process_burst_ms"),
+            "total_wall_avg": sample_avg(radar_worker_phase_t, "total_wall_ms"),
+            "total_cpu_avg": sample_avg(radar_worker_phase_t, "total_cpu_ms"),
+            "total_offcpu_avg": sample_avg(radar_worker_phase_t, "total_offcpu_ms"),
         },
         "fm_run_ms": {
             "samples": len(fm_t),

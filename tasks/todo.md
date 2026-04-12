@@ -88,6 +88,28 @@ Updated: 2026-04-06
   - `uv run --directory backend pytest`
   - Result: `242 passed in 1.41s`
 
+## 2026-04-12 Radar Worker Phase Instrumentation
+
+- [x] Review the post-batch-predecode Pi 5 stats and confirm the bottleneck moved from the main decoder to the radar worker
+- [x] Add radar batch phase timings around DF11 preparation, state append, flash grouping, native burst processing, and Python burst/frame processing
+- [x] Expose the new radar worker phase metrics in `/api/debug/perf`
+- [x] Add focused regression coverage and run targeted backend verification
+- [ ] Commit the instrumentation change
+
+### Review
+
+- Investigation:
+  - After native batch predecode, the main decoder was healthy (`msg_queue_depth=0`, `msg_drops_total=0`), but the radar queue saturated: `radar_queue_depth=4872`, `radar_queue_stats.p95=4973`, and `radar_drops_total=13700`.
+  - The active unknown is now inside radar-worker batch processing: `radar_worker_ms.process_wall_avg=67.93 ms`, `process_cpu_avg=3.66 ms`, and `process_offcpu_avg=64.27 ms`.
+- Implementation:
+  - [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) now records per-batch `df11_batch_phase_timings` around event preparation, shared-state append, flash grouping, native burst processing, Python burst/frame processing, and total wall/cpu/off-CPU time.
+  - [debug.py](/home/keith/claude/adsb-dashboard/backend/debug.py) exposes these samples as `radar_worker_phase_ms` in `/api/debug/perf`.
+  - [test_debug_perf.py](/home/keith/claude/adsb-dashboard/backend/tests/test_debug_perf.py) covers the new debug payload fields.
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/debug.py backend/tests/test_debug_perf.py`
+  - `uv run --directory backend pytest tests/test_debug_perf.py tests/test_radar_sweep.py`
+  - Result: `40 passed in 0.45s`
+
 ## 2026-04-11 FM Frame Geometry Diagnostics
 
 - [x] Inspect current SweepFrame and inscribed-angle evidence payloads

@@ -19,6 +19,7 @@ def test_get_perf_reports_total_and_predecode_timings(monkeypatch):
     state_module.decode_timings.clear()
     state_module.push_timings.clear()
     state_module.decoder_phase_timings.clear()
+    debug_module._radar_sweep_module.df11_batch_phase_timings.clear()
 
     state_module.msg_timings.extend([0.001, 0.003])
     state_module.predecode_timings.extend([0.0004, 0.0006])
@@ -50,6 +51,42 @@ def test_get_perf_reports_total_and_predecode_timings(monkeypatch):
             "total_wall_ms": 21.0,
             "total_cpu_ms": 11.0,
             "total_offcpu_ms": 10.0,
+        },
+    ])
+    debug_module._radar_sweep_module.df11_batch_phase_timings.extend([
+        {
+            "input_count": 10,
+            "processed_count": 8,
+            "active_iid_count": 2,
+            "fired_burst_count": 3,
+            "prepare_ms": 1.0,
+            "append_ms": 2.0,
+            "group_ms": 3.0,
+            "builder_wall_ms": 12.0,
+            "builder_cpu_ms": 4.0,
+            "builder_offcpu_ms": 8.0,
+            "native_burst_ms": 5.0,
+            "process_burst_ms": 6.0,
+            "total_wall_ms": 18.0,
+            "total_cpu_ms": 7.0,
+            "total_offcpu_ms": 11.0,
+        },
+        {
+            "input_count": 20,
+            "processed_count": 16,
+            "active_iid_count": 4,
+            "fired_burst_count": 9,
+            "prepare_ms": 3.0,
+            "append_ms": 4.0,
+            "group_ms": 5.0,
+            "builder_wall_ms": 18.0,
+            "builder_cpu_ms": 8.0,
+            "builder_offcpu_ms": 10.0,
+            "native_burst_ms": 7.0,
+            "process_burst_ms": 8.0,
+            "total_wall_ms": 30.0,
+            "total_cpu_ms": 11.0,
+            "total_offcpu_ms": 19.0,
         },
     ])
     debug_module._benchmark_module.decoder_batch_timings.clear()
@@ -143,6 +180,22 @@ def test_get_perf_reports_total_and_predecode_timings(monkeypatch):
     assert payload["radar_worker_ms"]["process_offcpu_avg"] == 10.0
     assert payload["radar_worker_ms"]["batch_size_avg"] == 18.0
     assert payload["radar_worker_ms"]["batch_target_avg"] == 48.0
+    assert payload["radar_worker_phase_ms"]["samples"] == 2
+    assert payload["radar_worker_phase_ms"]["input_count_avg"] == 15.0
+    assert payload["radar_worker_phase_ms"]["processed_count_avg"] == 12.0
+    assert payload["radar_worker_phase_ms"]["active_iid_count_avg"] == 3.0
+    assert payload["radar_worker_phase_ms"]["fired_burst_count_avg"] == 6.0
+    assert payload["radar_worker_phase_ms"]["prepare_avg"] == 2.0
+    assert payload["radar_worker_phase_ms"]["append_avg"] == 3.0
+    assert payload["radar_worker_phase_ms"]["group_avg"] == 4.0
+    assert payload["radar_worker_phase_ms"]["builder_wall_avg"] == 15.0
+    assert payload["radar_worker_phase_ms"]["builder_cpu_avg"] == 6.0
+    assert payload["radar_worker_phase_ms"]["builder_offcpu_avg"] == 9.0
+    assert payload["radar_worker_phase_ms"]["native_burst_avg"] == 6.0
+    assert payload["radar_worker_phase_ms"]["process_burst_avg"] == 7.0
+    assert payload["radar_worker_phase_ms"]["total_wall_avg"] == 24.0
+    assert payload["radar_worker_phase_ms"]["total_cpu_avg"] == 9.0
+    assert payload["radar_worker_phase_ms"]["total_offcpu_avg"] == 15.0
     assert payload["decoder_thread_ms"]["samples"] == 2
     assert payload["decoder_thread_ms"]["queue_wait_avg"] == 3.0
     assert payload["decoder_thread_ms"]["batch_fill_avg"] == 1.0

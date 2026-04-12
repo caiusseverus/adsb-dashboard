@@ -32,6 +32,7 @@ log = logging.getLogger(__name__)
 _perf_lock = threading.Lock()
 df11_event_timings: deque[float] = deque(maxlen=4000)
 df11_builder_timings: deque[float] = deque(maxlen=4000)
+df11_batch_phase_timings: deque[dict] = deque(maxlen=400)
 rotation_update_timings: deque[dict] = deque(maxlen=240)
 
 
@@ -44,6 +45,11 @@ def record_df11_event_timing(total_s: float, builder_s: float) -> None:
 def record_rotation_update_timing(sample: dict) -> None:
     with _perf_lock:
         rotation_update_timings.append(sample)
+
+
+def record_df11_batch_phase_timing(sample: dict) -> None:
+    with _perf_lock:
+        df11_batch_phase_timings.append(sample)
 
 # Beast 12 MHz counter — 12 ticks per microsecond
 BEAST_TICKS_PER_US = 12
@@ -1113,11 +1119,21 @@ class RadarState:
     def on_df11_batch(self, events: list[tuple[int, int, str, float | None]]) -> None:
         """Process a batch of pre-decoded DF11 events from the radar worker."""
         t0 = time.perf_counter()
+        t_cpu0 = time.thread_time()
         builder_s = 0.0
+        prepare_s = 0.0
+        append_s = 0.0
+        group_s = 0.0
+        native_burst_s = 0.0
+        process_burst_s = 0.0
+        builder_cpu_s = 0.0
         processed_count = 0
+        fired_burst_count = 0
+        active_iid_count = 0
         try:
             if not events:
                 return
+            t_prepare = time.perf_counter()
             prepared: list[tuple[int, str, float | None, float]] = []
             for timestamp, iid, icao_hex, signal_dbfs in events:
                 if iid == 0:
@@ -1125,26 +1141,33 @@ class RadarState:
                 ticks = self._unwrap(timestamp)
                 arrival_us = ticks / BEAST_TICKS_PER_US
                 prepared.append((iid, icao_hex, signal_dbfs, arrival_us))
+            prepare_s = time.perf_counter() - t_prepare
             if not prepared:
                 return
+            t_append = time.perf_counter()
             with self._lock:
                 for iid, icao_hex, signal_dbfs, arrival_us in prepared:
                     self._iid_events.append((arrival_us, iid, icao_hex, signal_dbfs))
                     self._iid_latest_arrival_us[iid] = arrival_us
                     self._dirty_iids.add(iid)
+            append_s = time.perf_counter() - t_append
 
+            t_group = time.perf_counter()
             grouped_events: dict[int, list[tuple[float, str, float | None]]] = defaultdict(list)
             for iid, icao_hex, signal_dbfs, arrival_us in prepared:
                 self._flash_seq += 1
                 self._flash_events.append((self._flash_seq, iid, icao_hex, int(arrival_us)))
                 grouped_events[iid].append((arrival_us, icao_hex, signal_dbfs))
+            group_s = time.perf_counter() - t_group
 
             t_builder = time.perf_counter()
+            t_builder_cpu = time.thread_time()
             native_available = _decode_cffi is not None and hasattr(_decode_cffi, "RadarBurstProcessor")
             for iid, iid_events in grouped_events.items():
                 model = self._models.get(iid)
                 if model is None or model.period_s is None:
                     continue
+                active_iid_count += 1
                 self._ensure_live_builder_state(iid)
                 iid_events.sort(key=lambda event: event[0])
                 if native_available:
@@ -1152,22 +1175,50 @@ class RadarState:
                     if processor is None:
                         processor = _decode_cffi.RadarBurstProcessor()
                         self._native_burst_processors[iid] = processor
+                    t_native_burst = time.perf_counter()
                     fired_bursts = processor.process_batch(iid_events, BURST_GAP_US)
+                    native_burst_s += time.perf_counter() - t_native_burst
+                    fired_burst_count += len(fired_bursts)
+                    t_process_burst = time.perf_counter()
                     self._process_fired_bursts(iid, fired_bursts)
+                    process_burst_s += time.perf_counter() - t_process_burst
                 else:
+                    t_process_burst = time.perf_counter()
                     for arrival_us, icao_hex, signal_dbfs in iid_events:
                         self._on_df11_frame_builder(iid, icao_hex, arrival_us, signal_dbfs)
+                    process_burst_s += time.perf_counter() - t_process_burst
                 processed_count += len(iid_events)
             builder_s = time.perf_counter() - t_builder
+            builder_cpu_s = time.thread_time() - t_builder_cpu
         except Exception:
             pass
         finally:
             if processed_count <= 0:
                 processed_count = max(1, len(events))
-            per_total_s = (time.perf_counter() - t0) / processed_count
+            total_s = time.perf_counter() - t0
+            total_cpu_s = time.thread_time() - t_cpu0
+            per_total_s = total_s / processed_count
             per_builder_s = builder_s / processed_count if builder_s > 0 else 0.0
             for _ in range(processed_count):
                 record_df11_event_timing(per_total_s, per_builder_s)
+            record_df11_batch_phase_timing({
+                "ts_s": time.time(),
+                "input_count": len(events),
+                "processed_count": processed_count,
+                "active_iid_count": active_iid_count,
+                "fired_burst_count": fired_burst_count,
+                "prepare_ms": round(prepare_s * 1000, 2),
+                "append_ms": round(append_s * 1000, 2),
+                "group_ms": round(group_s * 1000, 2),
+                "builder_wall_ms": round(builder_s * 1000, 2),
+                "builder_cpu_ms": round(builder_cpu_s * 1000, 2),
+                "builder_offcpu_ms": round(max(0.0, builder_s - builder_cpu_s) * 1000, 2),
+                "native_burst_ms": round(native_burst_s * 1000, 2),
+                "process_burst_ms": round(process_burst_s * 1000, 2),
+                "total_wall_ms": round(total_s * 1000, 2),
+                "total_cpu_ms": round(total_cpu_s * 1000, 2),
+                "total_offcpu_ms": round(max(0.0, total_s - total_cpu_s) * 1000, 2),
+            })
 
     # ------------------------------------------------------------------
     # Live SweepFrame builder — called for every DF11 as it arrives.
