@@ -60,6 +60,7 @@ async def get_perf() -> dict:
     predecode_t  = sorted(_state_module.predecode_timings)
     lock_wait_t  = sorted(_state_module.lock_wait_timings)
     decode_t     = sorted(_state_module.decode_timings)
+    decoder_phase_t = list(getattr(_state_module, "decoder_phase_timings", []))
     push_t       = list(_state_module.push_timings)
     qdepth       = sorted(_queue_depth_samples)
     radar_qdepth = sorted(_radar_queue_depth_samples)
@@ -213,6 +214,20 @@ async def get_perf() -> dict:
             "process_offcpu_avg": sample_avg(decoder_batch_t, "process_offcpu_ms"),
             "batch_size_avg": sample_avg(decoder_batch_t, "batch_size"),
             "batch_target_avg": sample_avg(decoder_batch_t, "batch_target"),
+        },
+        "decoder_batch_phase_ms": {
+            "samples": len(decoder_phase_t),
+            "batch_size_avg": sample_avg(decoder_phase_t, "batch_size"),
+            "predecode_wall_avg": sample_avg(decoder_phase_t, "predecode_wall_ms"),
+            "predecode_cpu_avg": sample_avg(decoder_phase_t, "predecode_cpu_ms"),
+            "predecode_offcpu_avg": sample_avg(decoder_phase_t, "predecode_offcpu_ms"),
+            "lock_wait_avg": sample_avg(decoder_phase_t, "lock_wait_ms"),
+            "apply_wall_avg": sample_avg(decoder_phase_t, "apply_wall_ms"),
+            "apply_cpu_avg": sample_avg(decoder_phase_t, "apply_cpu_ms"),
+            "apply_offcpu_avg": sample_avg(decoder_phase_t, "apply_offcpu_ms"),
+            "total_wall_avg": sample_avg(decoder_phase_t, "total_wall_ms"),
+            "total_cpu_avg": sample_avg(decoder_phase_t, "total_cpu_ms"),
+            "total_offcpu_avg": sample_avg(decoder_phase_t, "total_offcpu_ms"),
         },
         "radar_api_ms": {
             "samples": len(radar_api_t),

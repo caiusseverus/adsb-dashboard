@@ -36,6 +36,30 @@ Updated: 2026-04-06
   - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_debug_perf.py`
   - Result: `72 passed in 0.38s`
 
+## 2026-04-12 Decoder Native Boundary Instrumentation
+
+- [x] Compare the updated Pi 5 stats against the radar maintenance fix
+- [x] Decide whether the next step should be instrumentation before a larger native rewrite
+- [x] Add batch decoder phase timings for native predecode wall/cpu, lock wait, locked state application, and total batch wall/cpu
+- [x] Expose the new timings in `/api/debug/perf`
+- [x] Add focused regression coverage and run targeted backend verification
+
+### Review
+
+- Investigation:
+  - The updated Pi 5 sample shows the radar maintenance fix helped, but the main message queue still spikes: `msg_queue_stats.p95=4888`, `msg_queue_depth=4515`, and `msg_drops_total=34625`.
+  - The strongest remaining signal is off-CPU decoder batch time: `decoder_thread_ms.process_wall_avg=38.16 ms` versus `process_cpu_avg=3.1 ms`, plus a high `predecode_us.p95=2893.8`.
+  - The current native path already decodes each message in C, but it still crosses the Python/CFFI boundary and allocates/converts a Python dict per message. Instrumentation is needed before deciding whether native batch predecode is the right larger change.
+- Implementation:
+  - [aircraft_state.py](/home/keith/claude/adsb-dashboard/backend/aircraft_state.py) now records `decoder_phase_timings` for each `process_messages_batch()` call, including batch size, predecode wall/cpu/off-CPU, lock wait, locked state-application wall/cpu/off-CPU, and total wall/cpu/off-CPU.
+  - [debug.py](/home/keith/claude/adsb-dashboard/backend/debug.py) exposes the new `decoder_batch_phase_ms` block from `/api/debug/perf`.
+  - [test_debug_perf.py](/home/keith/claude/adsb-dashboard/backend/tests/test_debug_perf.py) covers the new debug payload fields.
+  - [test_aircraft_state_counts.py](/home/keith/claude/adsb-dashboard/backend/tests/test_aircraft_state_counts.py) covers recording a decoder batch phase sample.
+- Verification:
+  - `python3 -m py_compile backend/aircraft_state.py backend/debug.py backend/tests/test_debug_perf.py backend/tests/test_aircraft_state_counts.py`
+  - `uv run --directory backend pytest tests/test_debug_perf.py tests/test_aircraft_state_counts.py tests/test_decoder_batching.py`
+  - Result: `7 passed in 0.50s`
+
 ## 2026-04-11 FM Frame Geometry Diagnostics
 
 - [x] Inspect current SweepFrame and inscribed-angle evidence payloads

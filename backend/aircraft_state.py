@@ -53,6 +53,9 @@ predecode_timings: deque[float] = deque(maxlen=2000)
 lock_wait_timings: deque[float] = deque(maxlen=2000)
 # Per-message time spent doing actual work under the lock (seconds)
 decode_timings: deque[float] = deque(maxlen=2000)
+# Per-batch decoder phase breakdown in milliseconds, written by
+# process_messages_batch() and read by /api/debug/perf.
+decoder_phase_timings: deque[dict] = deque(maxlen=400)
 # Per-_push_updates invocation breakdown: {loop_ms, broadcast_ms, total_ms, ac_count}
 push_timings: deque[dict] = deque(maxlen=120)
 _perf_trace_lock = threading.Lock()
@@ -1791,6 +1794,8 @@ class AircraftState:
         # MLAT detection is pure computation — run outside the lock.
         processed: list[tuple[bytes, int, int, bool, "Optional[str]", "Optional[str]", dict | None]] = []
         t0 = time.perf_counter()
+        t_cpu0 = time.thread_time()
+        t_predecode_cpu0 = time.thread_time()
         for msg, mlat_source in batch:
             raw: bytes = msg["raw"]
             signal: int = msg.get("signal", 0)
@@ -1807,8 +1812,10 @@ class AircraftState:
             return []
 
         t_predecoded = time.perf_counter()
+        predecode_cpu_s = time.thread_time() - t_predecode_cpu0
         with self._lock:
             t_locked = time.perf_counter()
+            t_apply_cpu0 = time.thread_time()
             for raw, signal, timestamp, mlat, mlat_source, stream_name, native_decoded in processed:
                 # Beast/MLAT ingest owns the live total/rate counters in both
                 # beast and hybrid modes; readsb-only mode still derives totals
@@ -1833,7 +1840,10 @@ class AircraftState:
                 )
                 if radar_event is not None:
                     radar_events.append(radar_event)
+            t_applied = time.perf_counter()
+            apply_cpu_s = time.thread_time() - t_apply_cpu0
         t_done = time.perf_counter()
+        total_cpu_s = time.thread_time() - t_cpu0
 
         # Record per-message averages so timing deques remain comparable with
         # single-message path (lock_wait is shared across the batch).
@@ -1854,6 +1864,20 @@ class AircraftState:
             per_wait * 1000,
             per_decode * 1000,
         )
+        decoder_phase_timings.append({
+            "ts_s": now,
+            "batch_size": n,
+            "predecode_wall_ms": round((t_predecoded - t0) * 1000, 2),
+            "predecode_cpu_ms": round(predecode_cpu_s * 1000, 2),
+            "predecode_offcpu_ms": round(max(0.0, (t_predecoded - t0) - predecode_cpu_s) * 1000, 2),
+            "lock_wait_ms": round((t_locked - t_predecoded) * 1000, 2),
+            "apply_wall_ms": round((t_applied - t_locked) * 1000, 2),
+            "apply_cpu_ms": round(apply_cpu_s * 1000, 2),
+            "apply_offcpu_ms": round(max(0.0, (t_applied - t_locked) - apply_cpu_s) * 1000, 2),
+            "total_wall_ms": round((t_done - t0) * 1000, 2),
+            "total_cpu_ms": round(total_cpu_s * 1000, 2),
+            "total_offcpu_ms": round(max(0.0, (t_done - t0) - total_cpu_s) * 1000, 2),
+        })
         return radar_events
 
     # ── DF11 interrogator helpers ────────────────────────────────────────────

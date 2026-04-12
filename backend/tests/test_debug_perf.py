@@ -18,11 +18,40 @@ def test_get_perf_reports_total_and_predecode_timings(monkeypatch):
     state_module.lock_wait_timings.clear()
     state_module.decode_timings.clear()
     state_module.push_timings.clear()
+    state_module.decoder_phase_timings.clear()
 
     state_module.msg_timings.extend([0.001, 0.003])
     state_module.predecode_timings.extend([0.0004, 0.0006])
     state_module.lock_wait_timings.extend([0.0001, 0.0002])
     state_module.decode_timings.extend([0.0005, 0.0022])
+    state_module.decoder_phase_timings.extend([
+        {
+            "batch_size": 4,
+            "predecode_wall_ms": 8.0,
+            "predecode_cpu_ms": 3.0,
+            "predecode_offcpu_ms": 5.0,
+            "lock_wait_ms": 1.0,
+            "apply_wall_ms": 4.0,
+            "apply_cpu_ms": 2.0,
+            "apply_offcpu_ms": 2.0,
+            "total_wall_ms": 13.0,
+            "total_cpu_ms": 5.0,
+            "total_offcpu_ms": 8.0,
+        },
+        {
+            "batch_size": 8,
+            "predecode_wall_ms": 12.0,
+            "predecode_cpu_ms": 7.0,
+            "predecode_offcpu_ms": 5.0,
+            "lock_wait_ms": 3.0,
+            "apply_wall_ms": 6.0,
+            "apply_cpu_ms": 4.0,
+            "apply_offcpu_ms": 2.0,
+            "total_wall_ms": 21.0,
+            "total_cpu_ms": 11.0,
+            "total_offcpu_ms": 10.0,
+        },
+    ])
     debug_module._benchmark_module.decoder_batch_timings.clear()
     beast_client_module.chunk_timings.clear()
     debug_module._benchmark_module.decoder_batch_timings.extend([
@@ -122,6 +151,18 @@ def test_get_perf_reports_total_and_predecode_timings(monkeypatch):
     assert payload["decoder_thread_ms"]["process_offcpu_avg"] == 5.0
     assert payload["decoder_thread_ms"]["batch_size_avg"] == 6.0
     assert payload["decoder_thread_ms"]["batch_target_avg"] == 48.0
+    assert payload["decoder_batch_phase_ms"]["samples"] == 2
+    assert payload["decoder_batch_phase_ms"]["batch_size_avg"] == 6.0
+    assert payload["decoder_batch_phase_ms"]["predecode_wall_avg"] == 10.0
+    assert payload["decoder_batch_phase_ms"]["predecode_cpu_avg"] == 5.0
+    assert payload["decoder_batch_phase_ms"]["predecode_offcpu_avg"] == 5.0
+    assert payload["decoder_batch_phase_ms"]["lock_wait_avg"] == 2.0
+    assert payload["decoder_batch_phase_ms"]["apply_wall_avg"] == 5.0
+    assert payload["decoder_batch_phase_ms"]["apply_cpu_avg"] == 3.0
+    assert payload["decoder_batch_phase_ms"]["apply_offcpu_avg"] == 2.0
+    assert payload["decoder_batch_phase_ms"]["total_wall_avg"] == 17.0
+    assert payload["decoder_batch_phase_ms"]["total_cpu_avg"] == 8.0
+    assert payload["decoder_batch_phase_ms"]["total_offcpu_avg"] == 9.0
     assert payload["beast_ingest_ms"]["samples"] == 2
     assert payload["beast_ingest_ms"]["chunk_bytes_avg"] == 1536.0
     assert payload["beast_ingest_ms"]["frames_avg"] == 16.0
