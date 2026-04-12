@@ -35,6 +35,28 @@ df11_builder_timings: deque[float] = deque(maxlen=4000)
 df11_batch_phase_timings: deque[dict] = deque(maxlen=400)
 rotation_update_timings: deque[dict] = deque(maxlen=240)
 
+_FIRED_BURST_PHASE_KEYS = (
+    "fired_burst_count",
+    "reference_select_count",
+    "position_lookup_count",
+    "dominant_check_count",
+    "phase_check_count",
+    "frame_start_count",
+    "observation_count",
+    "frame_finalized_count",
+    "fm_callback_count",
+    "setup_ms",
+    "centroid_ms",
+    "finalize_ms",
+    "reference_select_ms",
+    "position_lookup_ms",
+    "dominant_check_ms",
+    "suppression_ms",
+    "phase_check_ms",
+    "frame_mutation_ms",
+    "fm_callback_ms",
+)
+
 
 def record_df11_event_timing(total_s: float, builder_s: float) -> None:
     with _perf_lock:
@@ -50,6 +72,15 @@ def record_rotation_update_timing(sample: dict) -> None:
 def record_df11_batch_phase_timing(sample: dict) -> None:
     with _perf_lock:
         df11_batch_phase_timings.append(sample)
+
+
+def _new_fired_burst_phase_metrics() -> dict:
+    return {key: 0.0 for key in _FIRED_BURST_PHASE_KEYS}
+
+
+def _add_fired_burst_phase_metrics(target: dict, source: dict) -> None:
+    for key in _FIRED_BURST_PHASE_KEYS:
+        target[key] = target.get(key, 0.0) + source.get(key, 0.0)
 
 # Beast 12 MHz counter — 12 ticks per microsecond
 BEAST_TICKS_PER_US = 12
@@ -948,10 +979,12 @@ class RadarState:
             self._live_frames[iid] = None
             self._live_completed_frames[iid] = deque(maxlen=self._LIVE_FRAMES_MAX)
 
-    def _process_fired_bursts(self, iid: int, fired_bursts: list[dict]) -> None:
+    def _process_fired_bursts(self, iid: int, fired_bursts: list[dict]) -> dict:
+        metrics = _new_fired_burst_phase_metrics()
+        t_setup = time.perf_counter()
         model = self._models.get(iid)
         if model is None or model.period_s is None:
-            return
+            return metrics
         period_s = model.period_s
         period_us = period_s * 1_000_000.0
         native_processor = self._native_burst_processors.get(iid)
@@ -975,66 +1008,80 @@ class RadarState:
             return self._burst_matches_dominant_period_family(iid, icao, period_s)
 
         self._ensure_live_builder_state(iid)
+        metrics["setup_ms"] += (time.perf_counter() - t_setup) * 1000
 
         for fired_burst in fired_bursts:
+            metrics["fired_burst_count"] += 1
             fired_icao = fired_burst["icao"]
             burst_centroid_us = fired_burst["burst_centroid_us"]
             burst_signal = fired_burst["burst_signal"]
             trigger_arrival_us = fired_burst.get("trigger_arrival_us", burst_centroid_us)
 
+            t_centroid = time.perf_counter()
             centroid_hist = self._live_burst_centroids[iid].setdefault(fired_icao, [])
             centroid_hist.append(burst_centroid_us)
             if len(centroid_hist) > 30:
                 centroid_hist.pop(0)
+            metrics["centroid_ms"] += (time.perf_counter() - t_centroid) * 1000
 
             current_frame = self._live_frames.get(iid)
             if current_frame is not None and burst_centroid_us >= current_frame.ref_arrival_us + period_us:
-                self._finalize_live_frame(iid, period_s)
+                t_finalize = time.perf_counter()
+                finalize_metrics = self._finalize_live_frame(iid, period_s)
+                metrics["finalize_ms"] += (time.perf_counter() - t_finalize) * 1000
+                _add_fired_burst_phase_metrics(metrics, finalize_metrics)
                 current_frame = None
 
             if current_frame is not None:
                 ref_icao = current_frame.ref_icao
             else:
-                override = model.reference_aircraft_override
-                prev_ref_icao = model.reference_aircraft.ref_icao if model.reference_aircraft else None
-                if override is not None:
-                    ref_icao = override
-                    if prev_ref_icao != override:
-                        from .models import ReferenceAircraftInfo
-                        model.reference_aircraft = ReferenceAircraftInfo(
-                            ref_icao=override,
-                            ref_score=None,
-                            ref_since_sweep=0,
-                            hysteresis_margin=0.0,
-                        )
-                else:
-                    current_ref_icao = model.reference_aircraft.ref_icao if model.reference_aircraft else None
-                    if native_processor is not None:
-                        ref_icao = native_processor.select_reference(
-                            period_s=period_s,
-                            now_us=burst_centroid_us,
-                            min_bursts_for_ref=4,
-                            recency_periods=5.0,
-                            hysteresis=0.25,
-                            current_ref_icao=current_ref_icao,
-                        )
-                        if ref_icao is not None:
+                metrics["reference_select_count"] += 1
+                t_reference_select = time.perf_counter()
+                try:
+                    override = model.reference_aircraft_override
+                    prev_ref_icao = model.reference_aircraft.ref_icao if model.reference_aircraft else None
+                    if override is not None:
+                        ref_icao = override
+                        if prev_ref_icao != override:
                             from .models import ReferenceAircraftInfo
                             model.reference_aircraft = ReferenceAircraftInfo(
-                                ref_icao=ref_icao,
+                                ref_icao=override,
                                 ref_score=None,
                                 ref_since_sweep=0,
-                                hysteresis_margin=0.25,
+                                hysteresis_margin=0.0,
                             )
                     else:
-                        ref_icao = self._select_reference_from_live_bursts(
-                            iid, period_s, now_us=burst_centroid_us
-                        )
-                    if ref_icao is None:
-                        continue
+                        current_ref_icao = model.reference_aircraft.ref_icao if model.reference_aircraft else None
+                        if native_processor is not None:
+                            ref_icao = native_processor.select_reference(
+                                period_s=period_s,
+                                now_us=burst_centroid_us,
+                                min_bursts_for_ref=4,
+                                recency_periods=5.0,
+                                hysteresis=0.25,
+                                current_ref_icao=current_ref_icao,
+                            )
+                            if ref_icao is not None:
+                                from .models import ReferenceAircraftInfo
+                                model.reference_aircraft = ReferenceAircraftInfo(
+                                    ref_icao=ref_icao,
+                                    ref_score=None,
+                                    ref_since_sweep=0,
+                                    hysteresis_margin=0.25,
+                                )
+                        else:
+                            ref_icao = self._select_reference_from_live_bursts(
+                                iid, period_s, now_us=burst_centroid_us
+                            )
+                        if ref_icao is None:
+                            continue
+                finally:
+                    metrics["reference_select_ms"] += (time.perf_counter() - t_reference_select) * 1000
 
             lat = lon = None
             interpolated = False
+            metrics["position_lookup_count"] += 1
+            t_position_lookup = time.perf_counter()
             try:
                 wall_ts = self._estimate_wall_time_from_arrival_us(burst_centroid_us, trigger_arrival_us)
                 if wall_ts is not None:
@@ -1045,19 +1092,29 @@ class RadarState:
                         interpolated = pos.get("interpolated", False)
             except Exception:
                 pass
+            finally:
+                metrics["position_lookup_ms"] += (time.perf_counter() - t_position_lookup) * 1000
 
             from .models import SweepFrameObservation, LiveFrameState
 
             if fired_icao == ref_icao:
                 if current_frame is not None:
                     continue
-                if not _matches_dominant(fired_icao):
+                metrics["dominant_check_count"] += 1
+                t_dominant = time.perf_counter()
+                matches_dominant = _matches_dominant(fired_icao)
+                metrics["dominant_check_ms"] += (time.perf_counter() - t_dominant) * 1000
+                if not matches_dominant:
                     continue
-                if self._should_suppress_frame_start(iid, burst_centroid_us, period_s):
+                t_suppression = time.perf_counter()
+                suppress_frame_start = self._should_suppress_frame_start(iid, burst_centroid_us, period_s)
+                metrics["suppression_ms"] += (time.perf_counter() - t_suppression) * 1000
+                if suppress_frame_start:
                     continue
                 if lat is None or lon is None:
                     self._live_frames[iid] = None
                     continue
+                t_frame_mutation = time.perf_counter()
                 self._live_frames[iid] = LiveFrameState(
                     ref_icao=ref_icao,
                     ref_lat=lat,
@@ -1066,6 +1123,8 @@ class RadarState:
                     seen_icaos={ref_icao},
                 )
                 self._live_last_frame_start_us[iid] = burst_centroid_us
+                metrics["frame_start_count"] += 1
+                metrics["frame_mutation_ms"] += (time.perf_counter() - t_frame_mutation) * 1000
             else:
                 current_frame = self._live_frames.get(iid)
                 if current_frame is None:
@@ -1076,8 +1135,14 @@ class RadarState:
                     continue
                 if lat is None or lon is None:
                     continue
-                if not _matches_dominant(fired_icao):
+                metrics["dominant_check_count"] += 1
+                t_dominant = time.perf_counter()
+                matches_dominant = _matches_dominant(fired_icao)
+                metrics["dominant_check_ms"] += (time.perf_counter() - t_dominant) * 1000
+                if not matches_dominant:
                     continue
+                metrics["phase_check_count"] += 1
+                t_phase_check = time.perf_counter()
                 if native_processor is not None:
                     phase_tolerance_us = max(
                         CO_SWEEP_WINDOW_US,
@@ -1101,10 +1166,12 @@ class RadarState:
                         burst_centroid_us,
                         period_s,
                     )
+                metrics["phase_check_ms"] += (time.perf_counter() - t_phase_check) * 1000
                 if not matches_phase:
                     continue
                 if fired_icao in current_frame.seen_icaos:
                     continue
+                t_frame_mutation = time.perf_counter()
                 current_frame.observations.append(SweepFrameObservation(
                     icao=fired_icao,
                     lat=lat,
@@ -1115,6 +1182,9 @@ class RadarState:
                 ))
                 current_frame.seen_icaos.add(fired_icao)
                 current_frame.n_aircraft_seen += 1
+                metrics["observation_count"] += 1
+                metrics["frame_mutation_ms"] += (time.perf_counter() - t_frame_mutation) * 1000
+        return metrics
 
     def on_df11_batch(self, events: list[tuple[int, int, str, float | None]]) -> None:
         """Process a batch of pre-decoded DF11 events from the radar worker."""
@@ -1130,6 +1200,7 @@ class RadarState:
         processed_count = 0
         fired_burst_count = 0
         active_iid_count = 0
+        fired_phase_metrics = _new_fired_burst_phase_metrics()
         try:
             if not events:
                 return
@@ -1180,8 +1251,9 @@ class RadarState:
                     native_burst_s += time.perf_counter() - t_native_burst
                     fired_burst_count += len(fired_bursts)
                     t_process_burst = time.perf_counter()
-                    self._process_fired_bursts(iid, fired_bursts)
+                    iid_fired_phase_metrics = self._process_fired_bursts(iid, fired_bursts)
                     process_burst_s += time.perf_counter() - t_process_burst
+                    _add_fired_burst_phase_metrics(fired_phase_metrics, iid_fired_phase_metrics)
                 else:
                     t_process_burst = time.perf_counter()
                     for arrival_us, icao_hex, signal_dbfs in iid_events:
@@ -1201,7 +1273,7 @@ class RadarState:
             per_builder_s = builder_s / processed_count if builder_s > 0 else 0.0
             for _ in range(processed_count):
                 record_df11_event_timing(per_total_s, per_builder_s)
-            record_df11_batch_phase_timing({
+            sample = {
                 "ts_s": time.time(),
                 "input_count": len(events),
                 "processed_count": processed_count,
@@ -1218,20 +1290,26 @@ class RadarState:
                 "total_wall_ms": round(total_s * 1000, 2),
                 "total_cpu_ms": round(total_cpu_s * 1000, 2),
                 "total_offcpu_ms": round(max(0.0, total_s - total_cpu_s) * 1000, 2),
-            })
+            }
+            for key in _FIRED_BURST_PHASE_KEYS:
+                value = fired_phase_metrics.get(key, 0.0)
+                sample[key] = round(value, 2) if key.endswith("_ms") else value
+            record_df11_batch_phase_timing(sample)
 
     # ------------------------------------------------------------------
     # Live SweepFrame builder — called for every DF11 as it arrives.
     # ------------------------------------------------------------------
 
-    def _finalize_live_frame(self, iid: int, period_s: float) -> None:
+    def _finalize_live_frame(self, iid: int, period_s: float) -> dict:
+        metrics = _new_fired_burst_phase_metrics()
         current_frame = self._live_frames.get(iid)
         if current_frame is None:
-            return
+            return metrics
 
         n_obs = len(current_frame.observations)
         n_aircraft = n_obs + 1
         if n_aircraft >= 3:
+            metrics["frame_finalized_count"] += 1
             quality = "good" if n_aircraft >= 4 else "marginal"
             from .models import SweepFrame
             frame = SweepFrame(
@@ -1247,12 +1325,17 @@ class RadarState:
             )
             self._live_completed_frames[iid].append(frame)
             if self.per_frame_solve_callback is not None and quality in ("good", "marginal"):
+                metrics["fm_callback_count"] += 1
+                t_fm_callback = time.perf_counter()
                 try:
                     self.per_frame_solve_callback(iid, frame, period_s)
                 except Exception:
                     pass  # never let FM errors affect the sweep builder
+                finally:
+                    metrics["fm_callback_ms"] += (time.perf_counter() - t_fm_callback) * 1000
 
         self._live_frames[iid] = None
+        return metrics
 
     def _finalize_pending_burst(
         self,

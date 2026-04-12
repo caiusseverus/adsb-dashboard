@@ -94,7 +94,7 @@ Updated: 2026-04-06
 - [x] Add radar batch phase timings around DF11 preparation, state append, flash grouping, native burst processing, and Python burst/frame processing
 - [x] Expose the new radar worker phase metrics in `/api/debug/perf`
 - [x] Add focused regression coverage and run targeted backend verification
-- [ ] Commit the instrumentation change
+- [x] Commit the instrumentation change
 
 ### Review
 
@@ -109,6 +109,29 @@ Updated: 2026-04-06
   - `python3 -m py_compile backend/radar/sweep.py backend/debug.py backend/tests/test_debug_perf.py`
   - `uv run --directory backend pytest tests/test_debug_perf.py tests/test_radar_sweep.py`
   - Result: `40 passed in 0.45s`
+
+## 2026-04-12 Fired Burst Phase Instrumentation
+
+- [x] Add deeper timings inside `_process_fired_bursts()` to split the remaining `process_burst_avg` cost
+- [x] Expose the new per-burst phase metrics in `/api/debug/perf`
+- [x] Add focused regression coverage for the debug payload
+- [x] Run targeted backend verification and record the result
+- [x] Commit the instrumentation change
+
+### Review
+
+- Investigation:
+  - The previous `radar_worker_phase_ms.process_burst_avg` metric still wrapped all of `_process_fired_bursts()`, so it could show that Python burst/frame processing was expensive without separating reference selection, ADS-B position lookup, phase-family checks, frame mutation, and per-frame FM callbacks.
+- Implementation:
+  - [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) now accumulates fired-burst phase metrics while processing native-fired bursts, including reference selection, position lookup, dominant-period checks, suppression checks, phase-family checks, frame mutation, finalization, and FM callback time/counters.
+  - [debug.py](/home/keith/claude/adsb-dashboard/backend/debug.py) exposes these as `radar_fired_burst_phase_ms` in `/api/debug/perf`.
+  - [test_debug_perf.py](/home/keith/claude/adsb-dashboard/backend/tests/test_debug_perf.py) covers the new debug payload fields.
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/debug.py backend/tests/test_debug_perf.py`
+  - `uv run --directory backend pytest tests/test_debug_perf.py tests/test_radar_sweep.py`
+  - Result: `40 passed in 0.41s`
+  - `uv run --directory backend pytest`
+  - Result: `242 passed in 1.35s`
 
 ## 2026-04-11 FM Frame Geometry Diagnostics
 
