@@ -13,6 +13,8 @@ class SweepFrameObservation:
     arrival_us: float        # Beast-relative burst centroid timestamp (microseconds, fractional allowed)
     signal_dbfs: Optional[float] = None
     interpolated: bool = False
+    n_replies: int = 1       # Number of Mode S replies in the burst centroid
+    position_age_seconds: float = 0.0  # Seconds since the ADS-B position fix was received
 
 
 @dataclass

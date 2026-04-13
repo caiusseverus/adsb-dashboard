@@ -182,11 +182,12 @@ class AircraftPositionTracker:
         groundspeed_kts = entry.get("groundspeed_kts")
         track_deg = entry.get("track_deg")
 
-        # If within 1 second, use position directly
+        # If within 1 second, use position directly — direct (non-interpolated)
+        # positions get position_age_seconds = 0.0 per spec.
         if abs(age) <= 1.0:
-            return {"lat": lat, "lon": lon, "interpolated": False}
+            return {"lat": lat, "lon": lon, "interpolated": False, "position_age_seconds": 0.0}
 
-        # Try to project using velocity vector
+        # Try to project using velocity vector — this is interpolation, so report age
         if groundspeed_kts is not None and track_deg is not None and groundspeed_kts > 0:
             import math
             v_ms = groundspeed_kts * 0.514444
@@ -200,13 +201,15 @@ class AircraftPositionTracker:
                 "interpolated": True,
                 "groundspeed_kts": groundspeed_kts,
                 "track_deg": track_deg,
+                "position_age_seconds": abs(age),
             }
 
         # No velocity data — use position directly if reasonably fresh
         # Most aircraft don't transmit gs/track, so this is the common case
         # 5 seconds at 200m/s = ~1km position error, acceptable for radar localisation
+        # This is a direct (non-interpolated) use of the position — age = 0.0 per spec.
         if abs(age) <= 5.0:
-            return {"lat": lat, "lon": lon, "interpolated": False}
+            return {"lat": lat, "lon": lon, "interpolated": False, "position_age_seconds": 0.0}
 
         return None  # Stale with no velocity vector
 
@@ -1094,6 +1097,8 @@ class RadarState:
 
             lat = lon = None
             interpolated = False
+            position_age_seconds = 0.0
+            pos: dict | None = None
             metrics["position_lookup_count"] += 1
             t_position_lookup = time.perf_counter()
             try:
@@ -1104,6 +1109,7 @@ class RadarState:
                         lat = pos.get("lat")
                         lon = pos.get("lon")
                         interpolated = pos.get("interpolated", False)
+                        position_age_seconds = pos.get("position_age_seconds", 0.0)
             except Exception:
                 pass
             finally:
@@ -1193,6 +1199,8 @@ class RadarState:
                     arrival_us=burst_centroid_us,
                     signal_dbfs=burst_signal,
                     interpolated=interpolated,
+                    n_replies=fired_burst.get("n_replies", 1),
+                    position_age_seconds=position_age_seconds,
                 ))
                 current_frame.seen_icaos.add(fired_icao)
                 current_frame.n_aircraft_seen += 1
@@ -1382,6 +1390,7 @@ class RadarState:
             "icao": icao,
             "burst_centroid_us": burst_centroid_us,
             "burst_signal": burst_signal,
+            "n_replies": len(replies),
         }
 
     def _finalize_expired_pending_bursts(
@@ -1580,6 +1589,8 @@ class RadarState:
             # Look up position from the ADS-B tracker
             lat = lon = None
             interpolated = False
+            position_age_seconds = 0.0
+            pos: dict | None = None
             try:
                 wall_ts = self._estimate_wall_time_from_arrival_us(burst_centroid_us, arrival_us)
                 if wall_ts is not None:
@@ -1588,6 +1599,7 @@ class RadarState:
                         lat = pos.get("lat")
                         lon = pos.get("lon")
                         interpolated = pos.get("interpolated", False)
+                        position_age_seconds = pos.get("position_age_seconds", 0.0)
             except Exception:
                 pass
 
@@ -1649,13 +1661,13 @@ class RadarState:
                     arrival_us=burst_centroid_us,
                     signal_dbfs=burst_signal,
                     interpolated=interpolated,
+                    n_replies=fired_burst.get("n_replies", 1),
+                    position_age_seconds=position_age_seconds,
                 ))
                 current_frame.seen_icaos.add(fired_icao)
                 current_frame.n_aircraft_seen += 1
 
-    def _select_reference_from_live_bursts(
-        self, iid: int, period_s: float, now_us: float = 0.0
-    ) -> str | None:
+    def _select_reference_from_live_bursts(self, iid: int, period_s: float, now_us: float = 0.0) -> str | None:
         """Select (or re-evaluate) reference aircraft from completed burst centroid history.
 
         Picks the aircraft whose inter-burst timing best matches the aggregate rotation

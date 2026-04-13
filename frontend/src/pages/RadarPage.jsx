@@ -2917,7 +2917,19 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
         <div>
           <div className={styles.cardTitle}>Frame FM Geometry</div>
           <div className={styles.sectionLead}>
-            Frame #{data.frame_index + 1} · reference {data.ref_icao} · click an aircraft row to highlight its reference-pair circle.
+            Frame #{data.frame_index + 1} · reference {data.ref_icao}
+            {data.frame_cep_km != null && (
+              <> · CEP{' '}
+              <span style={{
+                color: data.frame_cep_km > 10 ? '#f85149' : data.frame_cep_km > 5 ? '#d29922' : '#3fb950',
+                fontWeight: 600,
+              }}>
+                {data.frame_cep_km.toFixed(1)} km
+              </span>
+              </>
+            )}
+            {data.frame_n_arcs != null && <> · {data.frame_n_arcs} arcs</>}
+            {' '}· click an aircraft row to highlight its reference-pair circle.
           </div>
         </div>
         <div className={styles.metricRow}>
@@ -2942,6 +2954,31 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
         <span className={styles.metricPill}>Low Quality <span className={styles.metricValue}>{selection.dropped_low_quality ?? 0}</span></span>
         <span className={styles.metricPill}>Az Bin Drops <span className={styles.metricValue}>{selection.dropped_same_azimuth_bin ?? 0}</span></span>
       </div>
+
+      {/* Frame CEP from intersection solve */}
+      {data.frame_cep_km != null && (
+        <div className={styles.metricRow} style={{ marginBottom: '0.75rem' }}>
+          <span className={styles.metricPill}>
+            Frame CEP{' '}
+            <span
+              className={styles.metricValue}
+              style={{
+                color: data.frame_cep_km > 10 ? '#f85149' : data.frame_cep_km > 5 ? '#d29922' : '#3fb950',
+              }}
+            >
+              {data.frame_cep_km.toFixed(1)} km
+            </span>
+          </span>
+          {data.frame_n_arcs != null && (
+            <span className={styles.metricPill}>Arcs <span className={styles.metricValue}>{data.frame_n_arcs}</span></span>
+          )}
+        </div>
+      )}
+      {data.frame_cep_km == null && (
+        <div className={styles.metricRow} style={{ marginBottom: '0.75rem' }}>
+          <span className={styles.metricPill}>Frame CEP <span className={styles.metricValue} style={{ color: '#d29922' }}>{data.frame_solve_reason ?? 'no solve'}</span></span>
+        </div>
+      )}
 
       <div
         ref={mapDivRef}

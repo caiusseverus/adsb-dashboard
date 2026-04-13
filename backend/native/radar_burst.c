@@ -128,6 +128,7 @@ static radar_fired_burst_t finalize_pending_burst(
     }
     burst.has_signal = has_signal;
     burst.burst_signal_dbfs = burst_signal;
+    burst.n_replies = pending->reply_count;
     return burst;
 }
 

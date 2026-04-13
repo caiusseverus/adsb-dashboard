@@ -116,6 +116,8 @@ class _ScoredObservation:
     baseline_km: float
     azimuth_from_ref_deg: float
     interpolated: bool
+    n_replies: int = 1
+    position_age_seconds: float = 0.0
 
 
 @dataclass
@@ -139,6 +141,8 @@ class _IntersectionObservation:
     quality_weight: float
     azimuth_from_ref_deg: float
     interpolated: bool
+    n_replies: int = 1
+    position_age_seconds: float = 0.0
 
 
 @dataclass
@@ -253,7 +257,11 @@ def _load_airports(airports_path: Path, receiver_lat: float, receiver_lon: float
     return candidates
 
 
-# ── Phase-difference scoring ────────────────────────────────────────────────
+# ── Phase-difference scoring (legacy: used by reference aircraft selection only)
+#     The main circle scoring pipeline has been replaced by circle_scorer.py.
+#     These functions remain for _select_intersection_observations_with_diagnostics
+#     which is used by _score_frame_reference_candidates().
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _baseline_leverage_weight(baseline_km: float) -> float:
     """Return a bounded leverage weight from aircraft-reference separation."""
@@ -305,6 +313,8 @@ def _preprocess_scoring_frames(
                 baseline_km=baseline_km,
                 azimuth_from_ref_deg=azimuth_from_ref_deg,
                 interpolated=getattr(obs, "interpolated", False),
+                n_replies=getattr(obs, "n_replies", 1),
+                position_age_seconds=getattr(obs, "position_age_seconds", 0.0),
             ))
 
         scored_frames.append(_ScoredFrame(
@@ -1026,6 +1036,8 @@ def _select_intersection_observations_with_diagnostics(
                 quality_weight=obs.quality_weight,
                 azimuth_from_ref_deg=obs.azimuth_from_ref_deg,
                 interpolated=obs.interpolated,
+                n_replies=getattr(obs, "n_replies", 1),
+                position_age_seconds=getattr(obs, "position_age_seconds", 0.0),
             ))
 
         candidates.sort(key=lambda obs: obs.quality_weight, reverse=True)
@@ -2035,6 +2047,7 @@ class ForwardModel:
         prior_rms_km: Optional[float] = None,
         max_per_frame: int = _INTERSECTION_MAX_OBS_PER_FRAME,
         max_per_icao: int = _INTERSECTION_MAX_OBS_PER_ICAO,
+        p_bar_enu_m: Optional[tuple[float, float]] = None,
     ) -> dict:
         """Run one intersection attempt and return result or detailed failure diagnostics."""
         R_KM = _R_EARTH / 1000.0
@@ -2060,20 +2073,12 @@ class ForwardModel:
         valid_frames = [f for f in sweep_frames if f.quality in ("good", "marginal")]
         frames_to_use = valid_frames[-_OPTIM_MAX_FRAMES:]
         scored_frames = _preprocess_scoring_frames(frames_to_use, period_s, sweep_direction=direction)
-        selected_observations, selection_diagnostics = _select_intersection_observations_with_diagnostics(
-            scored_frames,
-            min_sin_phi=min_sin_phi,
-            max_per_frame=max_per_frame,
-            max_per_icao=max_per_icao,
-        )
-        selection_summary = _summarize_selected_observations(
-            selected_observations,
-            origin_lat,
-            origin_lon,
-        )
+
+        # Build ALL circles from ALL valid observations (no pre-filtering).
+        # Scoring and selection happens after circle construction.
+        # Each circle dict carries metadata for the new scorer.
+        raw_circles: list[dict] = []
         detail = {
-            **selection_diagnostics,
-            **selection_summary,
             "n_frames_considered": len(frames_to_use),
             "n_valid_frames": len(valid_frames),
             "n_scored_frames": len(scored_frames),
@@ -2082,44 +2087,91 @@ class ForwardModel:
             "raw_candidate_count": 0,
             "plausible_candidate_count": 0,
             "receiver_distance_m": None,
+            "selection_diagnostics": {},
+            "high_quality_frames": 0,
+            "total_selected_weight": 0.0,
+            "azimuth_spread_deg": 0.0,
+            "interpolated_fraction": 0.0,
         }
 
-        for obs in selected_observations:
-            ax, ay = to_xy(obs.ref_lat, obs.ref_lon)
-            bx, by = to_xy(obs.obs_lat, obs.obs_lon)
+        for frame_idx, frame in enumerate(scored_frames):
+            for obs in frame.observations:
+                ax, ay = to_xy(frame.ref_lat, frame.ref_lon)
+                bx, by = to_xy(obs.lat, obs.lon)
 
-            phi_rad = math.radians(obs.observed_phase_deg)
-            sin_phi = math.sin(phi_rad)
+                # delta_phi: folded phase angle in radians [0, pi]
+                phase_deg = obs.observed_phase_deg % 360.0
+                delta_phi_deg = min(phase_deg, 360.0 - phase_deg)
+                delta_phi = math.radians(delta_phi_deg)
 
-            dx, dy = bx - ax, by - ay
-            d = math.hypot(dx, dy)
-            if d < 0.1:
-                detail["degenerate_baseline_pairs"] += 1
-                continue
+                dx, dy = bx - ax, by - ay
+                d = math.hypot(dx, dy)
+                if d < 0.1:
+                    detail["degenerate_baseline_pairs"] += 1
+                    continue
 
-            R = d / (2.0 * abs(sin_phi))
-            px, py = -(dy / d), dx / d
-            h = -(d / 2.0) * (math.cos(phi_rad) / sin_phi)
-            cx = (ax + bx) / 2.0 + h * px
-            cy = (ay + by) / 2.0 + h * py
+                sin_phi = math.sin(delta_phi)
+                R = d / (2.0 * abs(sin_phi)) if abs(sin_phi) > 1e-12 else float("inf")
+                px, py = -(dy / d), dx / d
+                cos_phi = math.cos(delta_phi)
+                h = -(d / 2.0) * (cos_phi / sin_phi) if abs(sin_phi) > 1e-12 else 0.0
+                cx = (ax + bx) / 2.0 + h * px
+                cy = (ay + by) / 2.0 + h * py
 
-            rx_bearing = _bearing_deg(origin_lat, origin_lon, obs.obs_lat, obs.obs_lon)
-            circles.append((cx, cy, R, obs.quality_weight, rx_bearing))
-            detail["n_pairs"] += 1
+                rx_bearing = _bearing_deg(origin_lat, origin_lon, obs.lat, obs.lon)
 
-        if len(circles) < 2:
+                # Circle metadata for the new scorer
+                raw_circles.append({
+                    "center_enu_m": (cx * 1000.0, cy * 1000.0),  # km → metres
+                    "radius_m": R * 1000.0,
+                    "delta_phi": delta_phi,
+                    "n_replies": getattr(obs, "n_replies", 1),
+                    "position_age_seconds": getattr(obs, "position_age_seconds", 0.0),
+                    "frame_index": frame.frame_index,
+                    "icao": obs.icao,
+                    # Legacy fields for intersection
+                    "cx_km": cx,
+                    "cy_km": cy,
+                    "R_km": R,
+                    "rx_bearing": rx_bearing,
+                })
+                detail["n_pairs"] += 1
+                detail["raw_candidate_count"] += 1
+
+        if len(raw_circles) < 2:
             return {
                 "success": False,
                 "reason": "too few qualifying pairs",
                 "detail": detail,
             }
 
-        # Vectorised circle-circle intersection using numpy.
-        # NumPy's C-level operations release the Python GIL, so the Beast
-        # decoder thread runs freely during this computation.
-        arr = np.array(circles, dtype=np.float64)  # (n, 5): cx, cy, R, w, rx_bearing_deg
-        cx_a = arr[:, 0]; cy_a = arr[:, 1]; R_a = arr[:, 2]; w_a = arr[:, 3]; brx_a = arr[:, 4]
+        # Score all circles using the new scoring pipeline
+        from .circle_scorer import compute_circle_scores, select_circles
+        omega = 2.0 * math.pi / period_s  # radar rotation rate in rad/s
+        scored = compute_circle_scores(raw_circles, p_bar_enu_m, omega)
+        selected = select_circles(scored)
+
+        # Populate selection diagnostics
+        detail["selection_diagnostics"] = {
+            "total_scored": len(scored),
+            "total_selected": len(selected),
+            "scores": [s.circle_score for s in selected],
+        }
+
+        # Build intersection input from selected circles
+        arr = np.array(
+            [(c["cx_km"], c["cy_km"], c["R_km"], s.circle_score, c["rx_bearing"])
+             for s, c in zip(selected, raw_circles) if s.selected],
+            dtype=np.float64,
+        )  # (n, 5): cx, cy, R, w, rx_bearing_deg
+        if len(arr) < 2:
+            return {
+                "success": False,
+                "reason": "too few circles after scoring and selection",
+                "detail": detail,
+            }
         n_c = len(arr)
+        cx_a = arr[:, 0]; cy_a = arr[:, 1]; R_a = arr[:, 2]; w_a = arr[:, 3]; brx_a = arr[:, 4]
         ii, jj = np.triu_indices(n_c, k=1)
 
         ddx = cx_a[jj] - cx_a[ii]
@@ -2243,6 +2295,23 @@ class ForwardModel:
         # σ_centroid ≈ RMS_scatter / √N_arcs: corrects for the correlation between
         # intersection points that share a common arc (not independent observations).
         centroid_uncertainty_km = best_cluster.rms_km / math.sqrt(max(1, n_contributing_arcs))
+
+        # Compute summary stats from selected circles
+        n_selected = len(selected)
+        total_weight = sum(s.circle_score for s in selected)
+        selected_icaos = set(s.icao for s in selected)
+        selected_frame_indices = set(s.frame_index for s in selected)
+        az_from_ref = []
+        interp_count = 0
+        for frame in scored_frames:
+            for obs in frame.observations:
+                if obs.icao in selected_icaos and frame.frame_index in selected_frame_indices:
+                    az_from_ref.append(obs.azimuth_from_ref_deg)
+                    if getattr(obs, "interpolated", False):
+                        interp_count += 1
+        az_spread = (max(az_from_ref) - min(az_from_ref)) if len(az_from_ref) >= 2 else 0.0
+        interp_frac = interp_count / n_selected if n_selected > 0 else 0.0
+
         return {
             "success": True,
             "result": {
@@ -2251,18 +2320,20 @@ class ForwardModel:
                 "rms_km": best_cluster.rms_km,
                 "centroid_uncertainty_km": centroid_uncertainty_km,
                 "n_contributing_arcs": n_contributing_arcs,
-                "n_pairs": len(circles),
-                "n_selected_observations": selection_summary["n_selected_observations"],
-                "interpolated_fraction": selection_summary["interpolated_fraction"],
-                "azimuth_spread_deg": selection_summary["azimuth_spread_deg"],
-                "high_quality_frames": selection_summary["high_quality_frames"],
-                "total_selected_weight": selection_summary["total_selected_weight"],
+                "n_pairs": len(arr),
+                "n_selected_observations": n_selected,
+                "interpolated_fraction": interp_frac,
+                "azimuth_spread_deg": az_spread,
+                "high_quality_frames": sum(
+                    1 for f in scored_frames if getattr(f, "quality", "") == "good"
+                ),
+                "total_selected_weight": total_weight,
                 "cluster_member_count": best_cluster.member_count,
                 "cluster_best_weight": best_cluster.total_weight,
                 "cluster_second_weight": second_cluster.total_weight if second_cluster is not None else 0.0,
                 "dominance_ratio": dominance_ratio,
                 "receiver_distance_m": receiver_distance_m,
-                "selection_diagnostics": selection_diagnostics,
+                "selection_diagnostics": detail["selection_diagnostics"],
                 "raw_candidate_count": detail["raw_candidate_count"],
                 "plausible_candidate_count": detail["plausible_candidate_count"],
                 "degenerate_baseline_pairs": detail["degenerate_baseline_pairs"],

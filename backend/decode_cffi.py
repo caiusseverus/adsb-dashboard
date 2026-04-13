@@ -100,10 +100,11 @@ typedef struct {
 
 typedef struct {
     uint32_t icao;
+    int n_replies;
     double burst_centroid_us;
     double burst_signal_dbfs;
-    bool has_signal;
     double trigger_arrival_us;
+    bool has_signal;
 } radar_fired_burst_t;
 
 void decode_init(void);
@@ -514,6 +515,7 @@ class RadarBurstProcessor:
                 "burst_centroid_us": float(burst.burst_centroid_us),
                 "burst_signal": float(burst.burst_signal_dbfs) if bool(burst.has_signal) else None,
                 "trigger_arrival_us": float(burst.trigger_arrival_us),
+                "n_replies": int(burst.n_replies),
             })
         return out
 

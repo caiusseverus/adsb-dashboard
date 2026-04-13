@@ -2522,6 +2522,45 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
             _layer("frame_fm_geometry", "Reference-Observation Pairs", "line", baselines, source_count=len(baselines)),
             _layer("frame_fm_geometry", "Inscribed-Angle Circles", "circle", circles, source_count=len(circles)),
         ]
+
+        # Run the intersection solve to get frame CEP for display
+        import config as _config
+        from .forward_model import _PER_FRAME_MIN_CONTRIBUTING_ARCS, _PER_FRAME_MAX_CEP_KM
+        recv_lat = getattr(_config, "RECEIVER_LAT", None)
+        recv_lon = getattr(_config, "RECEIVER_LON", None)
+        frame_cep_km = None
+        frame_n_arcs = None
+        frame_solve_reason = None
+        MIN_CEP_KM = 0.05  # solver artifact threshold, matches frame_filter.MIN_CEP_KM
+        if recv_lat is not None and recv_lon is not None:
+            from .forward_model import ForwardModel
+            solve_result = ForwardModel._solve_by_intersection_attempt(
+                [frame],
+                model.period_s,
+                recv_lat,
+                recv_lon,
+                direction=sweep_direction,
+                max_per_frame=50,
+                max_per_icao=50,
+            )
+            if not solve_result.get("success"):
+                frame_solve_reason = solve_result.get("reason", "unknown")
+            else:
+                raw_cep = solve_result["result"].get("centroid_uncertainty_km")
+                raw_arcs = solve_result["result"].get("n_contributing_arcs", 0)
+                # Apply the same quality gates the centroid accumulator uses.
+                # cep_km < 0.05 km is a solver artifact (perfectly coincident
+                # intersection points from degenerate geometry).
+                if raw_cep is not None and raw_cep >= MIN_CEP_KM and raw_arcs >= _PER_FRAME_MIN_CONTRIBUTING_ARCS and raw_cep < _PER_FRAME_MAX_CEP_KM:
+                    frame_cep_km = raw_cep
+                    frame_n_arcs = raw_arcs
+                else:
+                    frame_solve_reason = (
+                        "solver_artifact" if (raw_cep is not None and raw_cep < MIN_CEP_KM)
+                        else f"cep={raw_cep}km arcs={raw_arcs}" if raw_cep is not None
+                        else "no_result"
+                    )
+
         return {
             "iid": iid,
             "frame_index": frame.frame_index,
@@ -2534,6 +2573,9 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
             "selection_diagnostics": diagnostics,
             "observations": observations,
             "layers": layers,
+            "frame_cep_km": round(frame_cep_km, 2) if frame_cep_km is not None else None,
+            "frame_n_arcs": frame_n_arcs,
+            "frame_solve_reason": frame_solve_reason,
         }
     finally:
         _record_api_timing("iid_sweep_frame_fm_geometry", t0)

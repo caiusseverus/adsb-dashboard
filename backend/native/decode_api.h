@@ -102,10 +102,11 @@ typedef struct {
 
 typedef struct {
     uint32_t icao;
+    int n_replies;
     double burst_centroid_us;
     double burst_signal_dbfs;
-    bool has_signal;
     double trigger_arrival_us;
+    bool has_signal;
 } radar_fired_burst_t;
 
 /* ── API ────────────────────────────────────────────────────────────────── */
