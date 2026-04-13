@@ -2517,17 +2517,13 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
                 "interpolated": obs.interpolated,
             })
 
-        layers = [
-            _layer("frame_fm_geometry", "Frame Aircraft", "point", points, source_count=len(points)),
-            _layer("frame_fm_geometry", "Reference-Observation Pairs", "line", baselines, source_count=len(baselines)),
-            _layer("frame_fm_geometry", "Inscribed-Angle Circles", "circle", circles, source_count=len(circles)),
-        ]
-
         # Run the intersection solve to get frame CEP for display
         import config as _config
         from .forward_model import _PER_FRAME_MIN_CONTRIBUTING_ARCS, _PER_FRAME_MAX_CEP_KM
         recv_lat = getattr(_config, "RECEIVER_LAT", None)
         recv_lon = getattr(_config, "RECEIVER_LON", None)
+        frame_lat = None
+        frame_lon = None
         frame_cep_km = None
         frame_n_arcs = None
         frame_solve_reason = None
@@ -2552,14 +2548,41 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
                 # cep_km < 0.05 km is a solver artifact (perfectly coincident
                 # intersection points from degenerate geometry).
                 if raw_cep is not None and raw_cep >= MIN_CEP_KM and raw_arcs >= _PER_FRAME_MIN_CONTRIBUTING_ARCS and raw_cep < _PER_FRAME_MAX_CEP_KM:
+                    frame_lat = solve_result["result"].get("lat")
+                    frame_lon = solve_result["result"].get("lon")
                     frame_cep_km = raw_cep
                     frame_n_arcs = raw_arcs
+                    if frame_lat is not None and frame_lon is not None:
+                        points.append(_point_feature(
+                            frame_lat,
+                            frame_lon,
+                            role="frame_estimate",
+                            source="frame_fm",
+                            cep_km=round(frame_cep_km, 2),
+                            n_arcs=frame_n_arcs,
+                        ))
+                        circles.append(_circle_feature(
+                            frame_lat,
+                            frame_lon,
+                            frame_cep_km,
+                            circle_type="frame_cep",
+                            source="frame_fm",
+                            selected=True,
+                            cep_km=round(frame_cep_km, 2),
+                            n_arcs=frame_n_arcs,
+                        ))
                 else:
                     frame_solve_reason = (
                         "solver_artifact" if (raw_cep is not None and raw_cep < MIN_CEP_KM)
                         else f"cep={raw_cep}km arcs={raw_arcs}" if raw_cep is not None
                         else "no_result"
                     )
+
+        layers = [
+            _layer("frame_fm_geometry", "Frame Aircraft", "point", points, source_count=len(points)),
+            _layer("frame_fm_geometry", "Reference-Observation Pairs", "line", baselines, source_count=len(baselines)),
+            _layer("frame_fm_geometry", "Inscribed-Angle Circles", "circle", circles, source_count=len(circles)),
+        ]
 
         return {
             "iid": iid,
@@ -2573,6 +2596,8 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
             "selection_diagnostics": diagnostics,
             "observations": observations,
             "layers": layers,
+            "frame_lat": round(frame_lat, 6) if frame_lat is not None else None,
+            "frame_lon": round(frame_lon, 6) if frame_lon is not None else None,
             "frame_cep_km": round(frame_cep_km, 2) if frame_cep_km is not None else None,
             "frame_n_arcs": frame_n_arcs,
             "frame_solve_reason": frame_solve_reason,

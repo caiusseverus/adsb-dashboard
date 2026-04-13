@@ -8,6 +8,79 @@ Source inputs:
 Prepared: 2026-04-04
 Updated: 2026-04-06
 
+## 2026-04-13 Radar All-Pairs Circle Solver
+
+- [x] Inspect the current inscribed-angle circle scorer, selector, and forward-model solver path
+- [x] Refactor circle scoring to carry pair identities, pair quality weights, direct uncertainty penalties, and weak prior weighting
+- [x] Change `_solve_by_intersection_attempt()` to generate all unordered aircraft-pair circles per frame and map selected geometry by `circle_index`
+- [x] Replace greedy six-circle selection with capped pair admission and add selection diagnostics
+- [x] Rank clusters with robust support from all admitted circles and derive frame quality metrics from inlier circles
+- [x] Run focused backend tests and record the verification result
+
+## 2026-04-13 Sweep Frame Map Frame Estimate Overlay
+
+- [x] Inspect the sweep-frame geometry API payload and Leaflet renderer
+- [x] Add the per-frame determined position and CEP circle to the frame geometry payload
+- [x] Render the frame estimate point and CEP circle on the sweep frame map
+- [x] Add/update focused tests and run backend/frontend verification
+
+### Review
+
+- Implementation:
+  - Updated [api.py](/home/keith/claude/adsb-dashboard/backend/radar/api.py) so the sweep-frame FM geometry endpoint appends a `frame_estimate` point and a `frame_cep` circle feature when the per-frame solve passes the existing CEP/arcs gates.
+  - Updated [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) so the Leaflet sweep-frame map renders the frame estimate point and the CEP circle independently of the aircraft-row highlight filter.
+  - Updated [test_radar_api.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_api.py) to assert the new overlay payload features.
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_api.py::test_get_iid_sweep_frame_fm_geometry_returns_pair_circles tests/test_radar_api.py::test_get_iid_sweep_frame_fm_geometry_returns_frame_estimate_overlay`
+  - `uv run --directory backend pytest tests/test_radar_api.py`
+  - `npm run build`
+  - Result: backend `33 passed in 0.47s`; frontend build succeeded with the existing large-chunk warning.
+
+### Review
+
+- Implementation:
+  - Updated [circle_scorer.py](/home/keith/claude/adsb-dashboard/backend/radar/circle_scorer.py) so scored circles represent pair-derived constraints with stable `circle_index`, pair ICAOs, baseline, pair age/reply weights, direct uncertainty weighting, and weak prior weighting.
+  - Updated [forward_model.py](/home/keith/claude/adsb-dashboard/backend/radar/forward_model.py) so `_solve_by_intersection_attempt()` generates all unordered aircraft-pair circles per frame, uses signed phase for circle side selection while preserving folded `delta_phi` for scoring, maps admitted circles by `circle_index`, ranks supported clusters through the forward-model residual fit, and computes metrics from inlier circles.
+  - Added endpoint-intersection rejection for shared-aircraft circle intersections and kept the rest of the frame accumulation and residual-fit pipeline intact.
+  - Updated [test_circle_scorer.py](/home/keith/claude/adsb-dashboard/backend/tests/test_circle_scorer.py) for pair scoring and capped admission semantics.
+- Constants introduced or retuned:
+  - `SIGMA_BAND_REFERENCE_METRES = 3_000.0`
+  - `MAX_PAIRS_PER_AIRCRAFT_PER_FRAME = 8`
+  - `MAX_CIRCLES_PER_FRAME = 48`
+  - `_ENDPOINT_INTERSECTION_REJECT_KM = 1.0`
+  - `_INTERSECTION_SUPPORT_KEEP_FRACTION = 0.25`
+- Assumptions:
+  - The pair `sigma_band_metres` uses an unsigned timing-sensitivity approximation: `baseline * abs(delta_phi_uncertainty) / (2 * sin(delta_phi)^2)`, floored at `500 m`. This keeps the old geometric intent without the negative `cos(delta_phi)` behavior.
+  - Sweep-frame references do not currently carry explicit reply/age metadata, so reference pair records use a conservative available/default reply count and age `0.0` unless future frame fields provide those values.
+- Verification:
+  - `python3 -m py_compile backend/radar/circle_scorer.py backend/radar/forward_model.py`
+  - `uv run --directory backend pytest tests/test_circle_scorer.py tests/test_forward_model.py tests/test_forward_model_integration.py tests/test_forward_model_stage6.py`
+  - `uv run --directory backend pytest`
+  - Result: `285 passed in 1.56s`
+
+## 2026-04-13 Remove Qwen Co-author Trailer From Dev Tip
+
+- [x] Inspect the current `dev` tip and identify where the `qwencoder`/Qwen contributor reference is coming from
+- [x] Rewrite only the latest `dev` commit metadata/message to remove the Qwen co-author trailer while preserving the existing author and tree
+- [x] Verify the rewritten commit no longer contains the Qwen trailer and that the tree content is unchanged
+- [x] Force-update `origin/dev` with lease so GitHub stops attributing the tip commit to that contributor
+- [x] Add a review section with verification results
+
+### Review
+
+- Investigation:
+  - The contributor reference is in the latest `dev` commit message trailer: `Co-authored-by: Qwen-Coder <qwen-coder@alibabacloud.com>`.
+  - The author and committer are already `caiusseverus <7763268+caiusseverus@users.noreply.github.com>`.
+  - Local `dev` and `origin/dev` both currently point at `dea4fe426347199450d8ddf56addddc305e6f9cd`.
+- Implementation:
+  - Rewrote the `dev` tip as `5fdd0501d7a8661dd01b338e9a9d1d293ff3d833`, removing only the co-author trailer from the commit message.
+- Verification:
+  - The commit hook ran `uv run --directory backend pytest`; result: `295 passed in 2.00s`.
+  - The rewritten commit tree remains `f6fd3c0ce51ebbdbf68fd32994c5abcabf480203`, matching the original tree.
+  - `git log -1 --format=%B dev` no longer contains the Qwen co-author trailer.
+  - `git push --force-with-lease origin dev` updated GitHub from `dea4fe4` to `5fdd050`.
+  - `git ls-remote origin refs/heads/dev` now reports `5fdd0501d7a8661dd01b338e9a9d1d293ff3d833`.
+
 ## 2026-04-12 Pi 5 Radar Rotation Backlog
 
 - [x] Interpret the supplied Pi 5 debug sample and identify the active bottleneck

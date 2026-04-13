@@ -2839,15 +2839,17 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
     // pass through the chord endpoints (matching the backend's geometry)
     ;(circleLayer?.features ?? []).forEach(feature => {
       const props = feature.properties ?? {}
-      if (!activeIcaos.has(props.obs_icao)) return
+      const isFrameCep = props.circle_type === 'frame_cep'
+      if (!isFrameCep && !activeIcaos.has(props.obs_icao)) return
       const [lon, lat] = feature.geometry.center
       const radiusKm = feature.geometry.radius_km ?? 0
       const latlngs = flatProjectionCircleLatLngs(lat, lon, radiusKm, KM_PER_DEG_LAT, kmPerDegLon)
       L.polygon(latlngs, {
-        color: props.selected ? '#d29922' : '#b07000',
-        weight: props.selected ? 2.2 : 1.5,
+        color: isFrameCep ? '#ff7b72' : props.selected ? '#d29922' : '#b07000',
+        weight: isFrameCep ? 2.6 : props.selected ? 2.2 : 1.5,
         fill: false,
-        opacity: props.selected ? 0.92 : 0.6,
+        opacity: isFrameCep ? 0.95 : props.selected ? 0.92 : 0.6,
+        dashArray: isFrameCep ? '8 6' : null,
       }).addTo(lg)
     })
 
@@ -2869,17 +2871,21 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
       const props = feature.properties ?? {}
       const [lon, lat] = feature.geometry.coordinates
       const isRef = props.role === 'reference'
+      const isFrameEstimate = props.role === 'frame_estimate'
       const isActive = activeIcaos.has(props.icao)
-      const fillColor = isRef ? '#58a6ff' : isActive ? '#ffffff' : props.selected ? '#3fb950' : '#d29922'
+      const fillColor = isFrameEstimate ? '#ff7b72' : isRef ? '#58a6ff' : isActive ? '#ffffff' : props.selected ? '#3fb950' : '#d29922'
       const marker = L.circleMarker([lat, lon], {
-        radius: isRef ? 7 : isActive ? 6 : 4,
-        color: (isRef || isActive) ? '#ffffff' : 'transparent',
-        weight: (isRef || isActive) ? 1.2 : 0,
+        radius: isFrameEstimate ? 8 : isRef ? 7 : isActive ? 6 : 4,
+        color: (isFrameEstimate || isRef || isActive) ? '#ffffff' : 'transparent',
+        weight: (isFrameEstimate || isRef || isActive) ? 1.2 : 0,
         fillColor,
         fillOpacity: props.drop_reason ? 0.65 : 1.0,
       }).addTo(lg)
-      if (props.icao) {
-        marker.bindTooltip(props.icao, {
+      const label = isFrameEstimate
+        ? `Frame estimate${props.cep_km != null ? ` / CEP ${props.cep_km.toFixed(1)} km` : ''}`
+        : props.icao
+      if (label) {
+        marker.bindTooltip(label, {
           permanent: true,
           direction: 'right',
           offset: [4, 0],

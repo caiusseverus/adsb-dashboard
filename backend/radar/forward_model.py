@@ -68,6 +68,7 @@ _PER_FRAME_TRIM_FRACTION = 0.05   # drop outermost 5% by distance before centroi
 _INTERSECTION_CLUSTER_RADIUS_KM = 40.0       # bootstrap default; tightened adaptively once converged
 _ADAPTIVE_CLUSTER_RADIUS_K = 2.5             # cluster radius = K × prior_rms when converged
 _ADAPTIVE_CLUSTER_RADIUS_FLOOR_KM = 5.0
+_ENDPOINT_INTERSECTION_REJECT_KM = 1.0       # remove circle intersections at source aircraft endpoints
 _INTERSECTION_CLUSTER_DOMINANCE_RATIO = 1.25
 _MIN_INTERSECTION_AZ_SPREAD_DEG = 60.0
 _MIN_HIGH_QUALITY_FRAMES = 2
@@ -82,6 +83,7 @@ _MIN_STANDALONE_CCW_CONTRIBUTING_ARCS = 14   # stricter CCW standalone arc gate
 _MIN_STANDALONE_CCW_DOMINANCE_RATIO = 1.75
 _INTERSECTION_FIT_DOMINANCE_RATIO = 1.15
 _INTERSECTION_SECONDARY_WEIGHT_FRACTION = 0.75
+_INTERSECTION_SUPPORT_KEEP_FRACTION = 0.25
 _FRAME_REFERENCE_MAX_CANDIDATES = 4
 _FRAME_REFERENCE_REPAIR_MIN_IMPROVEMENT_RATIO = 1.15
 _GOOD_FRAME_REFERENCE_SIGMA_DEG = 70.0
@@ -1435,7 +1437,13 @@ class ForwardModel:
             if not result.get("success"):
                 continue
             r = result["result"]
-            if best is None or r["rms_km"] < best["rms_km"]:
+            if best is None or (
+                r.get("fit_score", float("inf")),
+                r["rms_km"],
+            ) < (
+                best.get("fit_score", float("inf")),
+                best["rms_km"],
+            ):
                 best = r
 
         if best is None:
@@ -2068,22 +2076,21 @@ class ForwardModel:
             lon = origin_lon + math.degrees(x / (R_KM * cos_orig))
             return lat, lon
 
-        # (cx, cy, R, w, rx_bearing_deg) — rx_bearing is from receiver to obs aircraft
-        circles: list[tuple[float, float, float, float, float]] = []
         valid_frames = [f for f in sweep_frames if f.quality in ("good", "marginal")]
         frames_to_use = valid_frames[-_OPTIM_MAX_FRAMES:]
         scored_frames = _preprocess_scoring_frames(frames_to_use, period_s, sweep_direction=direction)
 
-        # Build ALL circles from ALL valid observations (no pre-filtering).
-        # Scoring and selection happens after circle construction.
-        # Each circle dict carries metadata for the new scorer.
+        # Build all unordered pair-derived circles per frame. The scorer and
+        # selector decide which pair constraints are strong enough to admit.
         raw_circles: list[dict] = []
+        source_aircraft_xy_km: list[tuple[float, float]] = []
         detail = {
             "n_frames_considered": len(frames_to_use),
             "n_valid_frames": len(valid_frames),
             "n_scored_frames": len(scored_frames),
             "n_pairs": 0,
             "degenerate_baseline_pairs": 0,
+            "endpoint_candidate_rejections": 0,
             "raw_candidate_count": 0,
             "plausible_candidate_count": 0,
             "receiver_distance_m": None,
@@ -2094,49 +2101,87 @@ class ForwardModel:
             "interpolated_fraction": 0.0,
         }
 
-        for frame_idx, frame in enumerate(scored_frames):
+        for frame in frames_to_use:
+            ref_n_replies = max(2, max((getattr(obs, "n_replies", 1) for obs in frame.observations), default=2))
+            aircraft = [{
+                "icao": getattr(frame, "ref_icao", ""),
+                "lat": frame.ref_lat,
+                "lon": frame.ref_lon,
+                "arrival_us": frame.ref_arrival_us,
+                "interpolated": bool(getattr(frame, "ref_interpolated", False)),
+                "n_replies": int(getattr(frame, "ref_n_replies", ref_n_replies)),
+                "position_age_seconds": float(getattr(frame, "ref_position_age_seconds", 0.0)),
+            }]
             for obs in frame.observations:
-                ax, ay = to_xy(frame.ref_lat, frame.ref_lon)
-                bx, by = to_xy(obs.lat, obs.lon)
-
-                # delta_phi: folded phase angle in radians [0, pi]
-                phase_deg = obs.observed_phase_deg % 360.0
-                delta_phi_deg = min(phase_deg, 360.0 - phase_deg)
-                delta_phi = math.radians(delta_phi_deg)
-
-                dx, dy = bx - ax, by - ay
-                d = math.hypot(dx, dy)
-                if d < 0.1:
-                    detail["degenerate_baseline_pairs"] += 1
-                    continue
-
-                sin_phi = math.sin(delta_phi)
-                R = d / (2.0 * abs(sin_phi)) if abs(sin_phi) > 1e-12 else float("inf")
-                px, py = -(dy / d), dx / d
-                cos_phi = math.cos(delta_phi)
-                h = -(d / 2.0) * (cos_phi / sin_phi) if abs(sin_phi) > 1e-12 else 0.0
-                cx = (ax + bx) / 2.0 + h * px
-                cy = (ay + by) / 2.0 + h * py
-
-                rx_bearing = _bearing_deg(origin_lat, origin_lon, obs.lat, obs.lon)
-
-                # Circle metadata for the new scorer
-                raw_circles.append({
-                    "center_enu_m": (cx * 1000.0, cy * 1000.0),  # km → metres
-                    "radius_m": R * 1000.0,
-                    "delta_phi": delta_phi,
-                    "n_replies": getattr(obs, "n_replies", 1),
-                    "position_age_seconds": getattr(obs, "position_age_seconds", 0.0),
-                    "frame_index": frame.frame_index,
+                aircraft.append({
                     "icao": obs.icao,
-                    # Legacy fields for intersection
-                    "cx_km": cx,
-                    "cy_km": cy,
-                    "R_km": R,
-                    "rx_bearing": rx_bearing,
+                    "lat": obs.lat,
+                    "lon": obs.lon,
+                    "arrival_us": obs.arrival_us,
+                    "interpolated": bool(getattr(obs, "interpolated", False)),
+                    "n_replies": int(getattr(obs, "n_replies", 1)),
+                    "position_age_seconds": float(getattr(obs, "position_age_seconds", 0.0)),
                 })
-                detail["n_pairs"] += 1
-                detail["raw_candidate_count"] += 1
+
+            for aircraft_rec in aircraft:
+                source_aircraft_xy_km.append(to_xy(aircraft_rec["lat"], aircraft_rec["lon"]))
+
+            frame_index = int(getattr(frame, "frame_index", len(raw_circles)))
+            for i in range(len(aircraft)):
+                for j in range(i + 1, len(aircraft)):
+                    a_rec = aircraft[i]
+                    b_rec = aircraft[j]
+                    ax, ay = to_xy(a_rec["lat"], a_rec["lon"])
+                    bx, by = to_xy(b_rec["lat"], b_rec["lon"])
+
+                    dt_s = (b_rec["arrival_us"] - a_rec["arrival_us"]) / 1_000_000.0
+                    phase_deg = ((dt_s / period_s) * 360.0 * direction) % 360.0
+                    delta_phi_deg = min(phase_deg, 360.0 - phase_deg)
+                    delta_phi = math.radians(delta_phi_deg)
+                    signed_phase_deg = phase_deg if phase_deg <= 180.0 else phase_deg - 360.0
+                    signed_phi = math.radians(signed_phase_deg)
+
+                    dx, dy = bx - ax, by - ay
+                    d = math.hypot(dx, dy)
+                    if d < 0.1:
+                        detail["degenerate_baseline_pairs"] += 1
+                        continue
+
+                    sin_phi = math.sin(signed_phi)
+                    R = d / (2.0 * abs(sin_phi)) if abs(sin_phi) > 1e-12 else float("inf")
+                    px, py = -(dy / d), dx / d
+                    cos_phi = math.cos(signed_phi)
+                    h = -(d / 2.0) * (cos_phi / sin_phi) if abs(sin_phi) > 1e-12 else 0.0
+                    cx = (ax + bx) / 2.0 + h * px
+                    cy = (ay + by) / 2.0 + h * py
+
+                    mid_x = (ax + bx) / 2.0
+                    mid_y = (ay + by) / 2.0
+                    rx_bearing = (math.degrees(math.atan2(mid_x, mid_y)) + 360.0) % 360.0
+
+                    circle_index = len(raw_circles)
+                    raw_circles.append({
+                        "circle_index": circle_index,
+                        "center_enu_m": (cx * 1000.0, cy * 1000.0),
+                        "radius_m": R * 1000.0,
+                        "delta_phi": delta_phi,
+                        "icao_a": a_rec["icao"],
+                        "icao_b": b_rec["icao"],
+                        "pair_baseline_m": d * 1000.0,
+                        "interpolated_a": a_rec["interpolated"],
+                        "interpolated_b": b_rec["interpolated"],
+                        "n_replies_a": a_rec["n_replies"],
+                        "n_replies_b": b_rec["n_replies"],
+                        "position_age_a_seconds": a_rec["position_age_seconds"],
+                        "position_age_b_seconds": b_rec["position_age_seconds"],
+                        "frame_index": frame_index,
+                        "cx_km": cx,
+                        "cy_km": cy,
+                        "R_km": R,
+                        "rx_bearing": rx_bearing,
+                    })
+                    detail["n_pairs"] += 1
+                    detail["raw_candidate_count"] += 1
 
         if len(raw_circles) < 2:
             return {
@@ -2150,20 +2195,45 @@ class ForwardModel:
         omega = 2.0 * math.pi / period_s  # radar rotation rate in rad/s
         scored = compute_circle_scores(raw_circles, p_bar_enu_m, omega)
         selected = select_circles(scored)
+        raw_by_index = {int(c["circle_index"]): c for c in raw_circles}
+        gate_counts: dict[str, int] = {}
+        for sc in scored:
+            if sc.exclusion_reason:
+                gate_counts[sc.exclusion_reason] = gate_counts.get(sc.exclusion_reason, 0) + 1
 
         # Populate selection diagnostics
         detail["selection_diagnostics"] = {
+            "total_raw_pair_circles": len(raw_circles),
             "total_scored": len(scored),
+            "total_admitted": len(selected),
             "total_selected": len(selected),
+            "rejected_by_gate": gate_counts,
+            "per_aircraft_cap_rejections": gate_counts.get("aircraft_cap", 0),
+            "per_frame_cap_rejections": gate_counts.get("frame_cap", 0),
             "scores": [s.circle_score for s in selected],
         }
 
         # Build intersection input from selected circles
+        selected_rows = []
+        admitted_by_arr_index = []
+        for sc in selected:
+            raw = raw_by_index.get(sc.circle_index)
+            if raw is None:
+                continue
+            selected_rows.append((
+                raw["cx_km"],
+                raw["cy_km"],
+                raw["R_km"],
+                sc.circle_score,
+                raw["rx_bearing"],
+                sc.sigma_band_metres / 1000.0,
+                sc.circle_index,
+            ))
+            admitted_by_arr_index.append(sc)
         arr = np.array(
-            [(c["cx_km"], c["cy_km"], c["R_km"], s.circle_score, c["rx_bearing"])
-             for s, c in zip(selected, raw_circles) if s.selected],
+            selected_rows,
             dtype=np.float64,
-        )  # (n, 5): cx, cy, R, w, rx_bearing_deg
+        )  # (n, 7): cx, cy, R, w, pair_midpoint_bearing_deg, sigma_km, circle_index
         if len(arr) < 2:
             return {
                 "success": False,
@@ -2184,9 +2254,8 @@ class ForwardModel:
         ddx = ddx[valid]; ddy = ddy[valid]; dist = dist[valid]
         R1 = R1[valid]; R2 = R2[valid]
 
-        # Pair weight = w_i × w_j × sin(Δaz): down-weights pairs where both aircraft
-        # are at similar azimuth from the receiver, since their arcs are nearly parallel
-        # and intersect at a shallow angle (poor localisation).
+        # Pair weight = w_i x w_j x sin(Δaz): down-weights intersections whose
+        # pair midpoint bearings are similar and therefore geometrically shallow.
         # _angular_separation_deg vectorised: abs((a-b+180)%360-180) → [0, 180]
         delta_az = np.abs((brx_a[valid_ii] - brx_a[valid_jj] + 180.0) % 360.0 - 180.0)
         delta_az = np.minimum(delta_az, 90.0)  # sin is symmetric around 90°
@@ -2226,11 +2295,19 @@ class ForwardModel:
             }
 
         max_km = 700 * _NM_TO_M / 1000.0
-        plausible = [
-            candidate
-            for candidate in candidates
-            if math.hypot(candidate.x_km, candidate.y_km) <= max_km
-        ]
+        plausible = []
+        endpoint_rejections = 0
+        for candidate in candidates:
+            if math.hypot(candidate.x_km, candidate.y_km) > max_km:
+                continue
+            if any(
+                math.hypot(candidate.x_km - ax_km, candidate.y_km - ay_km) <= _ENDPOINT_INTERSECTION_REJECT_KM
+                for ax_km, ay_km in source_aircraft_xy_km
+            ):
+                endpoint_rejections += 1
+                continue
+            plausible.append(candidate)
+        detail["endpoint_candidate_rejections"] = endpoint_rejections
         detail["plausible_candidate_count"] = len(plausible)
         if not plausible:
             return {
@@ -2247,15 +2324,35 @@ class ForwardModel:
                 "reason": "candidate cloud was ambiguous",
                 "detail": detail,
             }
-        top_clusters = clusters[: min(3, len(clusters))]
-        ranked_clusters: list[tuple[float, _IntersectionCluster]] = []
+
+        def circle_support_at(x_km: float, y_km: float) -> tuple[float, list[float]]:
+            support_total = 0.0
+            residuals: list[float] = []
+            for sc, raw in zip(admitted_by_arr_index, selected_rows):
+                cx_km, cy_km, R_km, _w, _brg, sigma_km, _idx = raw
+                sigma_km = max(float(sigma_km), 1e-6)
+                normalized = abs(math.hypot(x_km - cx_km, y_km - cy_km) - R_km) / sigma_km
+                support = math.exp(-0.5 * min(normalized, 3.0) ** 2)
+                support_total += sc.circle_score * support
+                residuals.append(normalized)
+            return support_total, residuals
+
+        top_clusters = clusters[: min(8, len(clusters))]
+        ranked_clusters: list[tuple[float, float, _IntersectionCluster]] = []
         for cluster in top_clusters:
+            candidate_support, _support_residuals = circle_support_at(cluster.mean_x_km, cluster.mean_y_km)
             cand_lat, cand_lon = from_xy(cluster.mean_x_km, cluster.mean_y_km)
             fit_score, _, _, _ = _score_candidate_position_preprocessed(cand_lat, cand_lon, scored_frames)
-            ranked_clusters.append((fit_score, cluster))
+            ranked_clusters.append((candidate_support, fit_score, cluster))
 
-        ranked_clusters.sort(key=lambda item: item[0])
-        best_fit_score, best_cluster = ranked_clusters[0]
+        max_support_score = max((item[0] for item in ranked_clusters), default=0.0)
+        supported_clusters = [
+            item for item in ranked_clusters
+            if item[0] >= max_support_score * _INTERSECTION_SUPPORT_KEEP_FRACTION
+        ]
+        ranked_clusters = supported_clusters or ranked_clusters
+        ranked_clusters.sort(key=lambda item: (item[1], -item[0]))
+        best_support_score, best_fit_score, best_cluster = ranked_clusters[0]
         if not math.isfinite(best_fit_score):
             return {
                 "success": False,
@@ -2266,7 +2363,7 @@ class ForwardModel:
         second_fit_score = float("inf")
         second_cluster: Optional[_IntersectionCluster] = None
         if len(ranked_clusters) > 1:
-            second_fit_score, second_cluster = ranked_clusters[1]
+            _second_support_score, second_fit_score, second_cluster = ranked_clusters[1]
             fit_ratio = second_fit_score / best_fit_score if best_fit_score > 0 else float("inf")
             if (
                 second_cluster is not None
@@ -2291,26 +2388,59 @@ class ForwardModel:
             if best_fit_score > 0.0 and math.isfinite(second_fit_score)
             else float("inf")
         )
-        n_contributing_arcs = len(best_cluster.contributing_arc_indices)
-        # σ_centroid ≈ RMS_scatter / √N_arcs: corrects for the correlation between
-        # intersection points that share a common arc (not independent observations).
-        centroid_uncertainty_km = best_cluster.rms_km / math.sqrt(max(1, n_contributing_arcs))
+        _best_support_check, normalized_residuals = circle_support_at(best_cluster.mean_x_km, best_cluster.mean_y_km)
+        inlier_indices = {
+            idx for idx, residual in enumerate(normalized_residuals)
+            if residual <= 2.5
+        }
+        inlier_circles = [admitted_by_arr_index[idx] for idx in sorted(inlier_indices)]
+        inlier_candidates = [
+            candidate
+            for candidate in plausible
+            if candidate.arc_i in inlier_indices and candidate.arc_j in inlier_indices
+            and math.hypot(candidate.x_km - best_cluster.center_x_km, candidate.y_km - best_cluster.center_y_km) <= cluster_radius_km
+        ]
+        n_contributing_arcs = len(inlier_circles)
+        if inlier_candidates:
+            inlier_weight = sum(max(candidate.weight, 0.0) for candidate in inlier_candidates)
+            if inlier_weight > 0:
+                inlier_rms_km = math.sqrt(
+                    sum(
+                        candidate.weight * (
+                            (candidate.x_km - best_cluster.mean_x_km) ** 2
+                            + (candidate.y_km - best_cluster.mean_y_km) ** 2
+                        )
+                        for candidate in inlier_candidates
+                    ) / inlier_weight
+                )
+            else:
+                inlier_rms_km = best_cluster.rms_km
+        else:
+            inlier_rms_km = best_cluster.rms_km
+        centroid_uncertainty_km = inlier_rms_km / math.sqrt(max(1, n_contributing_arcs))
 
-        # Compute summary stats from selected circles
+        # Compute summary stats from inlier admitted circles.
         n_selected = len(selected)
         total_weight = sum(s.circle_score for s in selected)
-        selected_icaos = set(s.icao for s in selected)
-        selected_frame_indices = set(s.frame_index for s in selected)
-        az_from_ref = []
-        interp_count = 0
-        for frame in scored_frames:
-            for obs in frame.observations:
-                if obs.icao in selected_icaos and frame.frame_index in selected_frame_indices:
-                    az_from_ref.append(obs.azimuth_from_ref_deg)
-                    if getattr(obs, "interpolated", False):
-                        interp_count += 1
-        az_spread = (max(az_from_ref) - min(az_from_ref)) if len(az_from_ref) >= 2 else 0.0
-        interp_frac = interp_count / n_selected if n_selected > 0 else 0.0
+        inlier_bearings = [float(selected_rows[idx][4]) for idx in inlier_indices]
+        az_spread = _circular_spread_deg(inlier_bearings)
+        interp_frac = (
+            sum(1 for s in inlier_circles if s.interpolated_a or s.interpolated_b) / len(inlier_circles)
+            if inlier_circles else 1.0
+        )
+        inlier_residual_summary = {
+            "min": min((normalized_residuals[idx] for idx in inlier_indices), default=None),
+            "mean": (
+                sum(normalized_residuals[idx] for idx in inlier_indices) / len(inlier_indices)
+                if inlier_indices else None
+            ),
+            "max": max((normalized_residuals[idx] for idx in inlier_indices), default=None),
+        }
+        detail["selection_diagnostics"].update({
+            "best_cluster_support_score": best_support_score,
+            "inlier_circle_count": n_contributing_arcs,
+            "inlier_residual_summary": inlier_residual_summary,
+        })
 
         return {
             "success": True,
@@ -2325,7 +2455,7 @@ class ForwardModel:
                 "interpolated_fraction": interp_frac,
                 "azimuth_spread_deg": az_spread,
                 "high_quality_frames": sum(
-                    1 for f in scored_frames if getattr(f, "quality", "") == "good"
+                    1 for f in frames_to_use if getattr(f, "quality", "") == "good"
                 ),
                 "total_selected_weight": total_weight,
                 "cluster_member_count": best_cluster.member_count,
@@ -2337,8 +2467,11 @@ class ForwardModel:
                 "raw_candidate_count": detail["raw_candidate_count"],
                 "plausible_candidate_count": detail["plausible_candidate_count"],
                 "degenerate_baseline_pairs": detail["degenerate_baseline_pairs"],
+                "endpoint_candidate_rejections": detail["endpoint_candidate_rejections"],
                 "cluster_count": len(clusters),
                 "fit_score": best_fit_score,
+                "best_cluster_support_score": best_support_score,
+                "inlier_residual_summary": inlier_residual_summary,
                 "cluster_radius_km": cluster_radius_km,
             },
             "detail": detail,

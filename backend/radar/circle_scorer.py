@@ -1,15 +1,16 @@
-"""Circle scoring and selection pipeline for inscribed-angle radar localisation.
+"""Circle scoring and admission for inscribed-angle radar localisation.
 
 Scoring components
 ------------------
-1. phi_weight      — sin(delta_phi), subtended angle geometry quality
-2. sigma_band      — width of constraining corridor at solution point (metres)
-3. residual_score  — Gaussian penalty for circle missing P_bar (accumulator)
-4. age_weight      — exponential decay for stale ADS-B position fixes
+1. phi_weight          - sin(delta_phi) ** 1.5, inscribed-angle geometry quality
+2. age_weight          - decay from the worse ADS-B position age in the pair
+3. reply_weight        - confidence from the weaker reply count in the pair
+4. uncertainty_weight  - penalty for broad timing-derived circle corridors
+5. prior_weight        - weak consistency factor from the accumulator position
 
 Selection
 ---------
-Hard gates → greedy constraint-direction diversity → ICAO diversity post-filter.
+Hard gates -> score ordering -> per-frame and per-aircraft pair caps.
 
 All named constants are module-level; no magic numbers inline.
 """
@@ -21,445 +22,377 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-# ── Named constants ────────────────────────────────────────────────────────
+# -- Named constants ---------------------------------------------------------
 
 SIGMA_BAND_FLOOR_METRES: float = 500.0
 """Minimum sigma_band width in metres. Prevents over-confident circles."""
 
+SIGMA_BAND_REFERENCE_METRES: float = 3_000.0
+"""Low-kilometre scale where timing uncertainty starts to materially downweight a circle."""
+
 BURST_CENTROID_BASE_UNCERTAINTY_SEC: float = 0.030
-"""Base burst centroid timing uncertainty (30 ms). Divided by sqrt(n_replies)."""
+"""Base burst centroid timing uncertainty (30 ms), divided by sqrt(weakest replies)."""
 
 POSITION_AGE_TAU_SEC: float = 4.0
 """Time constant for ADS-B position staleness decay (seconds)."""
 
 MIN_REPLIES_PER_BURST: int = 2
-"""Minimum number of replies in a burst for the observation to qualify."""
+"""Minimum reply count for both burst centroids in a pair."""
 
 MAX_POSITION_AGE_SEC: float = 10.0
-"""Maximum age of ADS-B position fix (seconds). Older observations excluded."""
+"""Maximum ADS-B position age for both aircraft in a pair."""
 
 MIN_CIRCLE_SCORE: float = 0.05
-"""Minimum circle_score to survive hard gating."""
+"""Minimum final pair circle score to enter the admitted candidate set."""
 
-MAX_CIRCLES: int = 6
-"""Maximum number of circles selected for intersection solving."""
+MAX_PAIRS_PER_AIRCRAFT_PER_FRAME: int = 8
+"""Per-frame cap preventing one aircraft from dominating the all-pairs set."""
 
-MIN_CONSTRAINT_SEPARATION_DEG: float = 25.0
-"""Minimum angular separation (degrees) between constraint directions for diversity."""
-
-DIVERSITY_OVERRIDE_THRESHOLD: float = 0.85
-"""High-scoring circles bypass diversity requirement above this threshold."""
+MAX_CIRCLES_PER_FRAME: int = 48
+"""Per-frame cap on admitted circles; large enough for all-pairs geometry, bounded for solve cost."""
 
 
-# ── Data structures ────────────────────────────────────────────────────────
+# -- Data structures ---------------------------------------------------------
 
 @dataclass
 class ScoredCircle:
-    """A scored circle with full diagnostics."""
+    """A scored pair-derived circle with full diagnostics."""
+
+    # Stable identity and pair source
+    circle_index: int
+    icao_a: str
+    icao_b: str
+    frame_index: int
+
     # Circle geometry (ENU metres from receiver)
-    center_enu_m: tuple[float, float]   # (east, north)
+    center_enu_m: tuple[float, float]
     radius_m: float
+    pair_baseline_m: float
+    delta_phi: float
 
     # Score components (all in [0, 1])
     phi_weight: float
     residual_score: float
     age_weight: float
+    uncertainty_weight: float
+    reply_weight: float
+    prior_weight: float
+    intrinsic_weight: float
     circle_score: float
 
     # Diagnostics
     sigma_band_metres: float
-    residual_metres: Optional[float]    # None when P_bar unavailable
+    residual_metres: Optional[float]
     constraint_angle_deg: float
     selected: bool = False
     exclusion_reason: Optional[str] = None
 
-    # Source data (for ICAO diversity enforcement and hard gates)
-    frame_index: int = 0
-    icao: str = ""
-    n_replies: int = 0
-    position_age_seconds: float = 0.0
-    delta_phi: float = 0.0
+    # Pair data for gates and diagnostics
+    interpolated_a: bool = False
+    interpolated_b: bool = False
+    n_replies_a: int = 0
+    n_replies_b: int = 0
+    position_age_a_seconds: float = 0.0
+    position_age_b_seconds: float = 0.0
 
 
-# ── Public API ─────────────────────────────────────────────────────────────
+# -- Public API --------------------------------------------------------------
 
 def compute_circle_scores(
     circles: list[dict],
     p_bar_enu_m: Optional[tuple[float, float]],
     omega: float,
 ) -> list[ScoredCircle]:
-    """Score all candidate circles.
+    """Score all candidate pair circles.
 
-    Parameters
-    ----------
-    circles : list[dict]
-        Each dict must contain:
-        - center_enu_m: tuple[float, float] — circle centre in ENU metres
-        - radius_m: float — circle radius in metres
-        - delta_phi: float — subtended angle in radians [0, pi]
-        - n_replies: int — reply count for burst centroid timing
-        - position_age_seconds: float — seconds since ADS-B position fix
-        - frame_index: int — source frame index
-        - icao: str — observed aircraft ICAO
-    p_bar_enu_m : tuple[float, float] or None
-        Accumulator radar position in ENU metres. None on first solve.
-    omega : float
-        Radar rotation rate in radians/second. omega = 2*pi / period_s.
-
-    Returns
-    -------
-    list[ScoredCircle]
-        All circles scored, including excluded ones (with exclusion_reason set).
-
-    Scoring equations
-    -----------------
-    phi_weight = sin(delta_phi)
-        Subtended angle geometry quality. Replaces baseline_km/100.
-
-    delta_phi_uncertainty = delta_t_uncertainty * omega
-    delta_t_uncertainty = BURST_CENTROID_BASE_UNCERTAINTY_SEC / sqrt(n_replies)
-    sigma_band = (b * cos(delta_phi) * delta_phi_uncertainty) / (2 * sin(delta_phi)^2)
-        Width of constraining corridor at solution point (metres).
-        b = baseline = 2 * r * sin(delta_phi)  [from inscribed angle geometry]
-
-    If P_bar available:
-        dist_to_centre = norm(P_bar - C)
-        residual_metres = |dist_to_centre - r|
-        residual_score = exp(-0.5 * (residual_metres / sigma_band)^2)
-    Else:
-        residual_score = 1.0  # no penalty without prior
-
-    age_weight = exp(-position_age_seconds / POSITION_AGE_TAU_SEC)
-        Exponential decay for stale position data.
-
-    circle_score = phi_weight * residual_score * age_weight
+    ``p_bar_enu_m`` is deliberately only a weak prior. Poor prior consistency
+    can reduce a circle by at most 30%; intrinsic geometry, age, replies, and
+    uncertainty drive the admission ordering.
     """
     scored: list[ScoredCircle] = []
 
-    for circ in circles:
-        center_enu_m: tuple[float, float] = circ["center_enu_m"]
-        radius_m: float = circ["radius_m"]
-        delta_phi: float = circ["delta_phi"]
-        n_replies: int = circ["n_replies"]
-        position_age_seconds: float = circ["position_age_seconds"]
-        frame_index: int = circ["frame_index"]
-        icao: str = circ["icao"]
-
+    for fallback_index, circ in enumerate(circles):
         result = _score_single_circle(
-            center_enu_m=center_enu_m,
-            radius_m=radius_m,
-            delta_phi=delta_phi,
-            n_replies=n_replies,
-            position_age_seconds=position_age_seconds,
+            circle_index=int(circ.get("circle_index", fallback_index)),
+            center_enu_m=circ["center_enu_m"],
+            radius_m=float(circ["radius_m"]),
+            delta_phi=float(circ["delta_phi"]),
+            icao_a=str(circ.get("icao_a", "")),
+            icao_b=str(circ.get("icao_b", "")),
+            pair_baseline_m=float(circ.get("pair_baseline_m", 0.0)),
+            interpolated_a=bool(circ.get("interpolated_a", False)),
+            interpolated_b=bool(circ.get("interpolated_b", False)),
+            n_replies_a=int(circ.get("n_replies_a", circ.get("n_replies", 0))),
+            n_replies_b=int(circ.get("n_replies_b", circ.get("n_replies", 0))),
+            position_age_a_seconds=float(circ.get("position_age_a_seconds", circ.get("position_age_seconds", 0.0))),
+            position_age_b_seconds=float(circ.get("position_age_b_seconds", circ.get("position_age_seconds", 0.0))),
+            frame_index=int(circ.get("frame_index", 0)),
             p_bar_enu_m=p_bar_enu_m,
             omega=omega,
-            frame_index=frame_index,
-            icao=icao,
         )
         scored.append(result)
 
     return scored
 
 
-def select_circles(
-    scored: list[ScoredCircle],
-) -> list[ScoredCircle]:
-    """Apply hard gates and greedy diversity selection.
+def select_circles(scored: list[ScoredCircle]) -> list[ScoredCircle]:
+    """Return the admitted weighted set for candidate generation.
 
-    Steps
-    -----
-    1. Hard gates: delta_phi range, n_replies, position age, min score
-    2. Greedy diversity selection by constraint direction
-    3. ICAO diversity post-filter (max 4 per ICAO, no dup in frame)
-       with replacement from remaining pool.
-
-    Parameters
-    ----------
-    scored : list[ScoredCircle]
-        Output of compute_circle_scores().
-
-    Returns
-    -------
-    list[ScoredCircle]
-        Selected circles with ``selected=True`` set. Non-selected circles
-        are not included in the return list.
-
-    Invariants
-    ----------
-    - len(selected) <= MAX_CIRCLES
-    - No two selected circles from the same frame share an ICAO
-    - Each ICAO appears at most 4 times across all frames
+    The selector keeps all circles that pass hard gates and score threshold,
+    ordered by score, while enforcing per-frame participation caps. This avoids
+    collapsing all-pairs evidence back to a tiny greedy subset.
     """
-    # Step 1 — Hard gates
-    gated = []
     for sc in scored:
-        reason = _check_hard_gates(sc)
-        if reason is not None:
-            sc.exclusion_reason = reason
-            continue
-        gated.append(sc)
+        sc.selected = False
+        if sc.exclusion_reason is None:
+            sc.exclusion_reason = _check_hard_gates(sc)
 
-    # Step 2 — Greedy diversity selection
+    gated = [sc for sc in scored if sc.exclusion_reason is None]
     gated.sort(key=lambda s: s.circle_score, reverse=True)
-    selected: list[ScoredCircle] = []
-    remaining = list(gated)  # copy for potential replacement
 
-    for candidate in list(remaining):
-        if len(selected) >= MAX_CIRCLES:
-            break
-        remaining.remove(candidate)
-        if not selected:
-            selected.append(candidate)
-            candidate.selected = True
+    selected: list[ScoredCircle] = []
+    frame_counts: dict[int, int] = {}
+    aircraft_frame_counts: dict[tuple[int, str], int] = {}
+
+    for candidate in gated:
+        frame_count = frame_counts.get(candidate.frame_index, 0)
+        if frame_count >= MAX_CIRCLES_PER_FRAME:
+            candidate.exclusion_reason = "frame_cap"
             continue
 
-        angular_distances = [
-            circular_distance(
-                math.radians(candidate.constraint_angle_deg),
-                math.radians(s.constraint_angle_deg),
-            )
-            for s in selected
-        ]
-        min_angular_distance = min(angular_distances)
-        min_sep_rad = math.radians(MIN_CONSTRAINT_SEPARATION_DEG)
+        key_a = (candidate.frame_index, candidate.icao_a)
+        key_b = (candidate.frame_index, candidate.icao_b)
+        if (
+            aircraft_frame_counts.get(key_a, 0) >= MAX_PAIRS_PER_AIRCRAFT_PER_FRAME
+            or aircraft_frame_counts.get(key_b, 0) >= MAX_PAIRS_PER_AIRCRAFT_PER_FRAME
+        ):
+            candidate.exclusion_reason = "aircraft_cap"
+            continue
 
-        diversity_ok = min_angular_distance > min_sep_rad
-        score_justifies = candidate.circle_score > DIVERSITY_OVERRIDE_THRESHOLD
-
-        if diversity_ok or score_justifies:
-            selected.append(candidate)
-            candidate.selected = True
-
-    # Step 3 — ICAO diversity post-filter with replacement
-    selected = _apply_icao_diversity_with_replacement(selected, remaining)
+        candidate.selected = True
+        selected.append(candidate)
+        frame_counts[candidate.frame_index] = frame_count + 1
+        aircraft_frame_counts[key_a] = aircraft_frame_counts.get(key_a, 0) + 1
+        aircraft_frame_counts[key_b] = aircraft_frame_counts.get(key_b, 0) + 1
 
     return selected
 
 
 def circular_distance(angle1_rad: float, angle2_rad: float) -> float:
-    """Minimum angular distance between two angles, in [0, pi].
-
-    Handles wrap-around at 2*pi boundary.
-    """
+    """Minimum angular distance between two angles, in [0, pi]."""
     diff = abs(angle1_rad - angle2_rad) % (2.0 * math.pi)
     return min(diff, 2.0 * math.pi - diff)
 
 
-# ── Internal helpers ───────────────────────────────────────────────────────
+# -- Internal helpers --------------------------------------------------------
 
 def _score_single_circle(
+    *,
+    circle_index: int,
     center_enu_m: tuple[float, float],
     radius_m: float,
     delta_phi: float,
-    n_replies: int,
-    position_age_seconds: float,
+    icao_a: str,
+    icao_b: str,
+    pair_baseline_m: float,
+    interpolated_a: bool,
+    interpolated_b: bool,
+    n_replies_a: int,
+    n_replies_b: int,
+    position_age_a_seconds: float,
+    position_age_b_seconds: float,
+    frame_index: int,
     p_bar_enu_m: Optional[tuple[float, float]],
     omega: float,
-    frame_index: int,
-    icao: str,
 ) -> ScoredCircle:
-    """Compute all score components for one circle.
-
-    Returns a ScoredCircle with all fields populated.
-    If degenerate geometry, returns score 0.0 with exclusion_reason set.
-    """
-    # Hard gate: degenerate geometry
-    # Gate at 2° and 178° — near-degenerate inscribed angles
+    """Compute all score components for one pair circle."""
     degenerate_low = delta_phi < math.radians(2.0)
     degenerate_high = delta_phi > math.radians(178.0)
-    if degenerate_low or degenerate_high:
-        return ScoredCircle(
+    invalid_geometry = (
+        degenerate_low
+        or degenerate_high
+        or not math.isfinite(radius_m)
+        or radius_m <= 0.0
+        or pair_baseline_m <= 0.0
+    )
+
+    if invalid_geometry:
+        return _make_scored_circle(
+            circle_index=circle_index,
+            icao_a=icao_a,
+            icao_b=icao_b,
+            frame_index=frame_index,
             center_enu_m=center_enu_m,
             radius_m=radius_m,
+            pair_baseline_m=pair_baseline_m,
+            delta_phi=delta_phi,
             phi_weight=0.0,
             residual_score=0.0,
             age_weight=0.0,
+            uncertainty_weight=0.0,
+            reply_weight=0.0,
+            prior_weight=0.0,
+            intrinsic_weight=0.0,
             circle_score=0.0,
             sigma_band_metres=SIGMA_BAND_FLOOR_METRES,
             residual_metres=None,
             constraint_angle_deg=0.0,
-            frame_index=frame_index,
-            icao=icao,
-            n_replies=n_replies,
-            position_age_seconds=position_age_seconds,
-            delta_phi=delta_phi,
+            interpolated_a=interpolated_a,
+            interpolated_b=interpolated_b,
+            n_replies_a=n_replies_a,
+            n_replies_b=n_replies_b,
+            position_age_a_seconds=position_age_a_seconds,
+            position_age_b_seconds=position_age_b_seconds,
             exclusion_reason="degenerate_delta_phi",
         )
 
-    # Component 1: Subtended angle weight
-    # phi_weight = sin(delta_phi) — replaces baseline_km/100 leverage
-    # Replaces binary |sin(Δφ)| < sin(5°) gate — weight falls naturally
-    phi_weight = math.sin(delta_phi)
+    sin_phi = max(math.sin(delta_phi), 1e-12)
+    phi_weight = sin_phi ** 1.5
 
-    # Component 2: Uncertainty band width
-    # delta_phi_uncertainty = delta_t_uncertainty * omega
-    # delta_t_uncertainty = BURST_CENTROID_BASE_UNCERTAINTY_SEC / sqrt(n_replies)
-    # sigma_band = (b * cos(delta_phi) * delta_phi_uncertainty) / (2 * sin(delta_phi)^2)
-    # where b = baseline = 2 * r * sin(delta_phi)  [inscribed angle geometry]
-    delta_t_uncertainty = BURST_CENTROID_BASE_UNCERTAINTY_SEC / math.sqrt(max(n_replies, 1))
+    min_replies = max(1, min(n_replies_a, n_replies_b))
+    delta_t_uncertainty = BURST_CENTROID_BASE_UNCERTAINTY_SEC / math.sqrt(min_replies)
     delta_phi_uncertainty = delta_t_uncertainty * omega
-    baseline_m = 2.0 * radius_m * math.sin(delta_phi)  # b = 2r sin(Δφ)
-    sin_phi_sq = math.sin(delta_phi) ** 2
-    if sin_phi_sq < 1e-12:
-        sigma_band = SIGMA_BAND_FLOOR_METRES
-    else:
-        sigma_band = (
-            baseline_m * math.cos(delta_phi) * delta_phi_uncertainty
-        ) / (2.0 * sin_phi_sq)
-    sigma_band = max(sigma_band, SIGMA_BAND_FLOOR_METRES)
+    sigma_band = _compute_sigma_band_metres(pair_baseline_m, delta_phi_uncertainty, sin_phi)
+    uncertainty_weight = 1.0 / (1.0 + (sigma_band / SIGMA_BAND_REFERENCE_METRES) ** 2)
 
-    # Component 3: Residual against consensus position
     if p_bar_enu_m is not None:
-        # dist_to_centre = ||P_bar - C||
         dx = p_bar_enu_m[0] - center_enu_m[0]
         dy = p_bar_enu_m[1] - center_enu_m[1]
         dist_to_centre = math.hypot(dx, dy)
-        # residual_metres = |dist_to_centre - r|
         residual_metres = abs(dist_to_centre - radius_m)
-        # residual_score = exp(-0.5 * (residual / sigma_band)^2)
         residual_score = math.exp(-0.5 * (residual_metres / sigma_band) ** 2)
+        prior_weight = 0.7 + 0.3 * residual_score
+        constraint_angle = math.atan2(dy, dx)
     else:
         residual_metres = None
-        residual_score = 1.0  # no penalty without prior
-
-    # Component 4: Data quality — replaces binary interpolation penalty
-    # age_weight = exp(-position_age / POSITION_AGE_TAU_SEC)
-    # Replaces binary 1.0/0.7 direct/interpolated distinction
-    age_weight = math.exp(-position_age_seconds / POSITION_AGE_TAU_SEC)
-
-    # Final circle score — multiplicative combination
-    # circle_score = phi_weight * residual_score * age_weight
-    circle_score = phi_weight * residual_score * age_weight
-
-    # Clamp to [0, 1] — should be natural but guard against floating-point
-    circle_score = max(0.0, min(1.0, circle_score))
-
-    # Constraint direction for diversity selection
-    # constraint_dir = (P_bar - C) / ||P_bar - C||
-    # constraint_angle = atan2(constraint_dir[1], constraint_dir[0])
-    if p_bar_enu_m is not None:
-        dx_dir = p_bar_enu_m[0] - center_enu_m[0]
-        dy_dir = p_bar_enu_m[1] - center_enu_m[1]
-        constraint_angle = math.atan2(dy_dir, dx_dir)
-    else:
-        # Proxy: direction from receiver (origin) to circle midpoint
-        # Circle midpoint in ENU = center + offset along some direction.
-        # Use the circle center direction as proxy (receiver → circle centre).
+        residual_score = 1.0
+        prior_weight = 1.0
         constraint_angle = math.atan2(center_enu_m[1], center_enu_m[0])
 
-    constraint_angle_deg = math.degrees(constraint_angle)
+    worst_age = max(position_age_a_seconds, position_age_b_seconds)
+    age_weight = math.exp(-worst_age / POSITION_AGE_TAU_SEC)
+    reply_weight = min(1.0, math.sqrt(min_replies / 4.0))
+    intrinsic_weight = phi_weight * age_weight * reply_weight * uncertainty_weight
+    circle_score = _clamp01(intrinsic_weight * prior_weight)
 
-    return ScoredCircle(
+    return _make_scored_circle(
+        circle_index=circle_index,
+        icao_a=icao_a,
+        icao_b=icao_b,
+        frame_index=frame_index,
         center_enu_m=center_enu_m,
         radius_m=radius_m,
-        phi_weight=phi_weight,
-        residual_score=residual_score,
-        age_weight=age_weight,
+        pair_baseline_m=pair_baseline_m,
+        delta_phi=delta_phi,
+        phi_weight=_clamp01(phi_weight),
+        residual_score=_clamp01(residual_score),
+        age_weight=_clamp01(age_weight),
+        uncertainty_weight=_clamp01(uncertainty_weight),
+        reply_weight=_clamp01(reply_weight),
+        prior_weight=_clamp01(prior_weight),
+        intrinsic_weight=_clamp01(intrinsic_weight),
         circle_score=circle_score,
         sigma_band_metres=sigma_band,
         residual_metres=residual_metres,
-        constraint_angle_deg=constraint_angle_deg,
+        constraint_angle_deg=math.degrees(constraint_angle),
+        interpolated_a=interpolated_a,
+        interpolated_b=interpolated_b,
+        n_replies_a=n_replies_a,
+        n_replies_b=n_replies_b,
+        position_age_a_seconds=position_age_a_seconds,
+        position_age_b_seconds=position_age_b_seconds,
+    )
+
+
+def _compute_sigma_band_metres(
+    pair_baseline_m: float,
+    delta_phi_uncertainty: float,
+    sin_phi: float,
+) -> float:
+    """Return an unsigned timing-derived corridor width for the pair circle.
+
+    The old derivative used ``cos(delta_phi)`` directly, which changes sign
+    across the valid inscribed-angle range. This approximation keeps the same
+    intent, but uses an unsigned sensitivity that grows for weak small-angle
+    geometry and with centroid timing uncertainty.
+    """
+    sigma = pair_baseline_m * abs(delta_phi_uncertainty) / (2.0 * max(sin_phi * sin_phi, 1e-12))
+    return max(SIGMA_BAND_FLOOR_METRES, sigma)
+
+
+def _make_scored_circle(
+    *,
+    circle_index: int,
+    icao_a: str,
+    icao_b: str,
+    frame_index: int,
+    center_enu_m: tuple[float, float],
+    radius_m: float,
+    pair_baseline_m: float,
+    delta_phi: float,
+    phi_weight: float,
+    residual_score: float,
+    age_weight: float,
+    uncertainty_weight: float,
+    reply_weight: float,
+    prior_weight: float,
+    intrinsic_weight: float,
+    circle_score: float,
+    sigma_band_metres: float,
+    residual_metres: Optional[float],
+    constraint_angle_deg: float,
+    interpolated_a: bool,
+    interpolated_b: bool,
+    n_replies_a: int,
+    n_replies_b: int,
+    position_age_a_seconds: float,
+    position_age_b_seconds: float,
+    exclusion_reason: Optional[str] = None,
+) -> ScoredCircle:
+    return ScoredCircle(
+        circle_index=circle_index,
+        icao_a=icao_a,
+        icao_b=icao_b,
         frame_index=frame_index,
-        icao=icao,
-        n_replies=n_replies,
-        position_age_seconds=position_age_seconds,
+        center_enu_m=center_enu_m,
+        radius_m=radius_m,
+        pair_baseline_m=pair_baseline_m,
         delta_phi=delta_phi,
+        phi_weight=phi_weight,
+        residual_score=residual_score,
+        age_weight=age_weight,
+        uncertainty_weight=uncertainty_weight,
+        reply_weight=reply_weight,
+        prior_weight=prior_weight,
+        intrinsic_weight=intrinsic_weight,
+        circle_score=circle_score,
+        sigma_band_metres=sigma_band_metres,
+        residual_metres=residual_metres,
+        constraint_angle_deg=constraint_angle_deg,
+        interpolated_a=interpolated_a,
+        interpolated_b=interpolated_b,
+        n_replies_a=n_replies_a,
+        n_replies_b=n_replies_b,
+        position_age_a_seconds=position_age_a_seconds,
+        position_age_b_seconds=position_age_b_seconds,
+        exclusion_reason=exclusion_reason,
     )
 
 
 def _check_hard_gates(sc: ScoredCircle) -> Optional[str]:
-    """Check hard gates for a scored circle. Returns exclusion reason or None.
-
-    Gates (in order):
-    1. degenerate_delta_phi — delta_phi < 2° or > 178°
-    2. insufficient_replies — n_replies < MIN_REPLIES_PER_BURST
-    3. stale_position — position_age_seconds > MAX_POSITION_AGE_SEC
-    4. low_score — circle_score < MIN_CIRCLE_SCORE
-    """
+    """Check hard gates for a scored circle. Returns exclusion reason or None."""
     if sc.exclusion_reason == "degenerate_delta_phi":
         return "degenerate_delta_phi"
-    if sc.n_replies < MIN_REPLIES_PER_BURST:
+    if min(sc.n_replies_a, sc.n_replies_b) < MIN_REPLIES_PER_BURST:
         return "insufficient_replies"
-    if sc.position_age_seconds > MAX_POSITION_AGE_SEC:
+    if max(sc.position_age_a_seconds, sc.position_age_b_seconds) > MAX_POSITION_AGE_SEC:
         return "stale_position"
     if sc.circle_score < MIN_CIRCLE_SCORE:
         return "low_score"
     return None
 
 
-def _apply_icao_diversity_with_replacement(
-    selected: list[ScoredCircle],
-    remaining: list[ScoredCircle],
-) -> list[ScoredCircle]:
-    """Apply ICAO diversity constraints with replacement from remaining pool.
-
-    - Max 4 appearances per ICAO across all frames
-    - No duplicate ICAO within the same frame
-
-    Violators are removed and replaced from the remaining pool (sorted by
-    circle_score) if a suitable candidate exists.
-    """
-    icao_counts: dict[str, int] = {}
-    frame_icaos: dict[int, set[str]] = {}
-
-    # First pass: count ICAOs and track frame usage in current selection
-    for sc in selected:
-        frame_icaos.setdefault(sc.frame_index, set()).add(sc.icao)
-        icao_counts[sc.icao] = icao_counts.get(sc.icao, 0) + 1
-
-    # Find violators
-    valid: list[ScoredCircle] = []
-    for sc in selected:
-        # Check duplicate within frame (shouldn't happen from diversity selection,
-        # but guard anyway)
-        is_violator = False
-
-        # Check max 4 per ICAO — only the 5th+ instance is a violator
-        temp_counts: dict[str, int] = {}
-        for v in valid:
-            temp_counts[v.icao] = temp_counts.get(v.icao, 0) + 1
-        if temp_counts.get(sc.icao, 0) >= 4:
-            is_violator = True
-
-        # Check duplicate within frame
-        frame_set = set()
-        for v in valid:
-            if v.frame_index == sc.frame_index:
-                if v.icao == sc.icao:
-                    is_violator = True
-                frame_set.add(v.icao)
-        if sc.icao in frame_set:
-            is_violator = True
-
-        if not is_violator:
-            valid.append(sc)
-        else:
-            sc.selected = False
-
-    # Try to fill empty slots from remaining pool
-    remaining.sort(key=lambda s: s.circle_score, reverse=True)
-    for candidate in remaining:
-        if len(valid) >= MAX_CIRCLES:
-            break
-        if candidate.selected:
-            continue  # Already selected
-
-        # Check ICAO constraints
-        temp_counts: dict[str, int] = {}
-        for v in valid:
-            temp_counts[v.icao] = temp_counts.get(v.icao, 0) + 1
-
-        if temp_counts.get(candidate.icao, 0) >= 4:
-            continue  # Would violate ICAO cap
-
-        frame_set = set()
-        for v in valid:
-            if v.frame_index == candidate.frame_index:
-                frame_set.add(v.icao)
-        if candidate.icao in frame_set:
-            continue  # Would duplicate ICAO in frame
-
-        valid.append(candidate)
-        candidate.selected = True
-
-    return valid
+def _clamp01(value: float) -> float:
+    if not math.isfinite(value):
+        return 0.0
+    return max(0.0, min(1.0, value))
