@@ -2,9 +2,10 @@
 radar/forward_model.py — Forward model radar localisation via SSR beam phase fitting.
 
 Uses per-sweep phase-difference observations (not co-sweep TDOA) to determine
-radar position. Each SweepFrame provides one reference aircraft (phase=0) and
-N other aircraft with measured phase offsets. The radar position is the unique
-point where predicted bearing differences match observed phase differences.
+radar position. The all-pairs intersection path uses every unordered aircraft
+pair within each SweepFrame as a bearing-difference constraint. The radar
+position is the point where predicted pair bearing differences match observed
+pair phase differences.
 
 Method:
   1. Build SweepFrames from burst centroids (done in sweep.py)
@@ -201,6 +202,16 @@ class _ResidualFit:
     n_residuals: int
 
 
+@dataclass
+class _PairwiseResidualFit:
+    score: float
+    mean_residual_deg: float
+    residual_sigma_deg: float
+    weighted_rms_deg: float
+    n_residuals: int
+    residuals_deg: list[float]
+
+
 def _circular_spread_deg(angles_deg: list[float]) -> float:
     if len(angles_deg) < 2:
         return 0.0
@@ -362,6 +373,72 @@ def _score_candidate_position_preprocessed(
     mean_residual = sum(r * w for r, w in zip(all_residuals, all_weights)) / total_w
     score = sum(w * r * r for r, w in zip(all_residuals, all_weights))
     return (score, mean_residual, all_residuals, all_azimuths)
+
+
+def _score_candidate_position_pairwise(
+    r_lat: float,
+    r_lon: float,
+    scored_circles: list,
+    raw_by_index: dict[int, dict],
+    period_s: float,
+    direction: int,
+) -> _PairwiseResidualFit:
+    """Score a candidate radar position against unordered aircraft-pair phases."""
+    residuals: list[float] = []
+    weights: list[float] = []
+    weighted_sum = 0.0
+    weighted_sq = 0.0
+
+    for sc in scored_circles:
+        raw = raw_by_index.get(int(sc.circle_index))
+        if raw is None:
+            continue
+
+        weight = float(getattr(sc, "intrinsic_weight", 0.0))
+        if weight <= 0.0:
+            continue
+
+        bearing_a = _bearing_deg(r_lat, r_lon, raw["lat_a"], raw["lon_a"])
+        bearing_b = _bearing_deg(r_lat, r_lon, raw["lat_b"], raw["lon_b"])
+        predicted_phase_deg = (bearing_b - bearing_a) % 360.0
+        dt_s = (raw["arrival_us_b"] - raw["arrival_us_a"]) / 1_000_000.0
+        observed_phase_deg = ((dt_s / period_s) * 360.0 * direction) % 360.0
+        residual = (observed_phase_deg - predicted_phase_deg + 540.0) % 360.0 - 180.0
+
+        residuals.append(residual)
+        weights.append(weight)
+        weighted_sum += residual * weight
+        weighted_sq += residual * residual * weight
+
+    if not residuals:
+        return _PairwiseResidualFit(
+            score=float("inf"),
+            mean_residual_deg=0.0,
+            residual_sigma_deg=float("inf"),
+            weighted_rms_deg=float("inf"),
+            n_residuals=0,
+            residuals_deg=[],
+        )
+
+    total_weight = sum(weights)
+    if total_weight <= 0.0:
+        return _PairwiseResidualFit(
+            score=float("inf"),
+            mean_residual_deg=0.0,
+            residual_sigma_deg=float("inf"),
+            weighted_rms_deg=float("inf"),
+            n_residuals=0,
+            residuals_deg=residuals,
+        )
+
+    return _PairwiseResidualFit(
+        score=weighted_sq,
+        mean_residual_deg=weighted_sum / total_weight,
+        residual_sigma_deg=math.sqrt(sum(r * r for r in residuals) / len(residuals)),
+        weighted_rms_deg=math.sqrt(weighted_sq / total_weight),
+        n_residuals=len(residuals),
+        residuals_deg=residuals,
+    )
 
 
 def _summarize_residual_fit(
@@ -717,7 +794,7 @@ def _run_best_intersection_attempt(
     prior_rms_km: Optional[float] = None,
 ) -> tuple[Optional[dict], int, Optional[dict]]:
     best_intersection: Optional[dict] = None
-    best_rms = float("inf")
+    best_rank: Optional[tuple] = None
     best_direction = 1
     best_attempt_detail: Optional[dict] = None
     successful_attempts: dict[int, dict] = {}
@@ -757,9 +834,14 @@ def _run_best_intersection_attempt(
         if attempt["success"]:
             res = attempt["result"]
             successful_attempts[direction] = res
-            rms_km = res["rms_km"]
-            if rms_km < best_rms:
-                best_rms = rms_km
+            rank = (
+                res.get("best_cluster_support_score", 0.0),
+                res.get("n_inlier_pair_circles", res.get("n_contributing_arcs", 0)),
+                -res.get("pairwise_weighted_rms_deg", float("inf")),
+                -res.get("rms_km", float("inf")),
+            )
+            if best_rank is None or rank > best_rank:
+                best_rank = rank
                 best_intersection = res
                 best_direction = direction
 
@@ -1437,13 +1519,19 @@ class ForwardModel:
             if not result.get("success"):
                 continue
             r = result["result"]
-            if best is None or (
-                r.get("fit_score", float("inf")),
-                r["rms_km"],
-            ) < (
-                best.get("fit_score", float("inf")),
-                best["rms_km"],
-            ):
+            rank = (
+                r.get("best_cluster_support_score", 0.0),
+                r.get("n_inlier_pair_circles", r.get("n_contributing_arcs", 0)),
+                -r.get("pairwise_weighted_rms_deg", float("inf")),
+                -r.get("rms_km", float("inf")),
+            )
+            best_rank = (
+                best.get("best_cluster_support_score", 0.0),
+                best.get("n_inlier_pair_circles", best.get("n_contributing_arcs", 0)),
+                -best.get("pairwise_weighted_rms_deg", float("inf")),
+                -best.get("rms_km", float("inf")),
+            ) if best is not None else None
+            if best is None or best_rank is None or rank > best_rank:
                 best = r
 
         if best is None:
@@ -2078,16 +2166,14 @@ class ForwardModel:
 
         valid_frames = [f for f in sweep_frames if f.quality in ("good", "marginal")]
         frames_to_use = valid_frames[-_OPTIM_MAX_FRAMES:]
-        scored_frames = _preprocess_scoring_frames(frames_to_use, period_s, sweep_direction=direction)
 
         # Build all unordered pair-derived circles per frame. The scorer and
         # selector decide which pair constraints are strong enough to admit.
         raw_circles: list[dict] = []
-        source_aircraft_xy_km: list[tuple[float, float]] = []
         detail = {
             "n_frames_considered": len(frames_to_use),
             "n_valid_frames": len(valid_frames),
-            "n_scored_frames": len(scored_frames),
+            "n_scored_frames": len(frames_to_use),
             "n_pairs": 0,
             "degenerate_baseline_pairs": 0,
             "endpoint_candidate_rejections": 0,
@@ -2123,9 +2209,6 @@ class ForwardModel:
                     "position_age_seconds": float(getattr(obs, "position_age_seconds", 0.0)),
                 })
 
-            for aircraft_rec in aircraft:
-                source_aircraft_xy_km.append(to_xy(aircraft_rec["lat"], aircraft_rec["lon"]))
-
             frame_index = int(getattr(frame, "frame_index", len(raw_circles)))
             for i in range(len(aircraft)):
                 for j in range(i + 1, len(aircraft)):
@@ -2157,7 +2240,8 @@ class ForwardModel:
 
                     mid_x = (ax + bx) / 2.0
                     mid_y = (ay + by) / 2.0
-                    rx_bearing = (math.degrees(math.atan2(mid_x, mid_y)) + 360.0) % 360.0
+                    midpoint_lat, midpoint_lon = from_xy(mid_x, mid_y)
+                    rx_bearing = _bearing_deg(origin_lat, origin_lon, midpoint_lat, midpoint_lon)
 
                     circle_index = len(raw_circles)
                     raw_circles.append({
@@ -2167,7 +2251,14 @@ class ForwardModel:
                         "delta_phi": delta_phi,
                         "icao_a": a_rec["icao"],
                         "icao_b": b_rec["icao"],
+                        "lat_a": a_rec["lat"],
+                        "lon_a": a_rec["lon"],
+                        "lat_b": b_rec["lat"],
+                        "lon_b": b_rec["lon"],
+                        "arrival_us_a": a_rec["arrival_us"],
+                        "arrival_us_b": b_rec["arrival_us"],
                         "pair_baseline_m": d * 1000.0,
+                        "delta_phi_deg": delta_phi_deg,
                         "interpolated_a": a_rec["interpolated"],
                         "interpolated_b": b_rec["interpolated"],
                         "n_replies_a": a_rec["n_replies"],
@@ -2179,6 +2270,7 @@ class ForwardModel:
                         "cy_km": cy,
                         "R_km": R,
                         "rx_bearing": rx_bearing,
+                        "endpoints_xy_km": ((ax, ay), (bx, by)),
                     })
                     detail["n_pairs"] += 1
                     detail["raw_candidate_count"] += 1
@@ -2201,12 +2293,26 @@ class ForwardModel:
             if sc.exclusion_reason:
                 gate_counts[sc.exclusion_reason] = gate_counts.get(sc.exclusion_reason, 0) + 1
 
+        frame_ref_by_index = {
+            int(getattr(frame, "frame_index", -1)): getattr(frame, "ref_icao", "")
+            for frame in frames_to_use
+        }
+
+        def contains_reference(sc) -> bool:
+            frame_ref = frame_ref_by_index.get(int(sc.frame_index), "")
+            return bool(frame_ref and (sc.icao_a == frame_ref or sc.icao_b == frame_ref))
+
         # Populate selection diagnostics
         detail["selection_diagnostics"] = {
             "total_raw_pair_circles": len(raw_circles),
             "total_scored": len(scored),
             "total_admitted": len(selected),
             "total_selected": len(selected),
+            "total_raw_pairs_generated": len(raw_circles),
+            "total_scored_pair_circles": len(scored),
+            "total_admitted_pair_circles": len(selected),
+            "admitted_pairs_containing_reference": sum(1 for sc in selected if contains_reference(sc)),
+            "admitted_pairs_not_containing_reference": sum(1 for sc in selected if not contains_reference(sc)),
             "rejected_by_gate": gate_counts,
             "per_aircraft_cap_rejections": gate_counts.get("aircraft_cap", 0),
             "per_frame_cap_rejections": gate_counts.get("frame_cap", 0),
@@ -2216,6 +2322,7 @@ class ForwardModel:
         # Build intersection input from selected circles
         selected_rows = []
         admitted_by_arr_index = []
+        admitted_endpoints_by_arr_index = []
         for sc in selected:
             raw = raw_by_index.get(sc.circle_index)
             if raw is None:
@@ -2230,6 +2337,7 @@ class ForwardModel:
                 sc.circle_index,
             ))
             admitted_by_arr_index.append(sc)
+            admitted_endpoints_by_arr_index.append(raw["endpoints_xy_km"])
         arr = np.array(
             selected_rows,
             dtype=np.float64,
@@ -2300,9 +2408,13 @@ class ForwardModel:
         for candidate in candidates:
             if math.hypot(candidate.x_km, candidate.y_km) > max_km:
                 continue
+            relevant_endpoints = (
+                admitted_endpoints_by_arr_index[candidate.arc_i]
+                + admitted_endpoints_by_arr_index[candidate.arc_j]
+            )
             if any(
                 math.hypot(candidate.x_km - ax_km, candidate.y_km - ay_km) <= _ENDPOINT_INTERSECTION_REJECT_KM
-                for ax_km, ay_km in source_aircraft_xy_km
+                for ax_km, ay_km in relevant_endpoints
             ):
                 endpoint_rejections += 1
                 continue
@@ -2338,12 +2450,19 @@ class ForwardModel:
             return support_total, residuals
 
         top_clusters = clusters[: min(8, len(clusters))]
-        ranked_clusters: list[tuple[float, float, _IntersectionCluster]] = []
+        ranked_clusters: list[tuple[float, float, _PairwiseResidualFit, _IntersectionCluster]] = []
         for cluster in top_clusters:
             candidate_support, _support_residuals = circle_support_at(cluster.mean_x_km, cluster.mean_y_km)
             cand_lat, cand_lon = from_xy(cluster.mean_x_km, cluster.mean_y_km)
-            fit_score, _, _, _ = _score_candidate_position_preprocessed(cand_lat, cand_lon, scored_frames)
-            ranked_clusters.append((candidate_support, fit_score, cluster))
+            pairwise_fit = _score_candidate_position_pairwise(
+                cand_lat,
+                cand_lon,
+                scored,
+                raw_by_index,
+                period_s,
+                direction,
+            )
+            ranked_clusters.append((candidate_support, pairwise_fit.weighted_rms_deg, pairwise_fit, cluster))
 
         max_support_score = max((item[0] for item in ranked_clusters), default=0.0)
         supported_clusters = [
@@ -2351,23 +2470,27 @@ class ForwardModel:
             if item[0] >= max_support_score * _INTERSECTION_SUPPORT_KEEP_FRACTION
         ]
         ranked_clusters = supported_clusters or ranked_clusters
-        ranked_clusters.sort(key=lambda item: (item[1], -item[0]))
-        best_support_score, best_fit_score, best_cluster = ranked_clusters[0]
-        if not math.isfinite(best_fit_score):
+        ranked_clusters.sort(key=lambda item: (-item[0], item[1], item[3].rms_km))
+        best_support_score, _best_pairwise_rms_deg, best_pairwise_fit, best_cluster = ranked_clusters[0]
+        if not math.isfinite(best_pairwise_fit.score):
             return {
                 "success": False,
                 "reason": "candidate cloud was ambiguous",
                 "detail": detail,
             }
 
-        second_fit_score = float("inf")
+        second_support_score = 0.0
         second_cluster: Optional[_IntersectionCluster] = None
         if len(ranked_clusters) > 1:
-            _second_support_score, second_fit_score, second_cluster = ranked_clusters[1]
-            fit_ratio = second_fit_score / best_fit_score if best_fit_score > 0 else float("inf")
+            second_support_score, _second_pairwise_rms_deg, _second_pairwise_fit, second_cluster = ranked_clusters[1]
+            support_ratio = (
+                best_support_score / second_support_score
+                if second_support_score > 0.0
+                else float("inf")
+            )
             if (
                 second_cluster is not None
-                and fit_ratio < _INTERSECTION_FIT_DOMINANCE_RATIO
+                and support_ratio < _INTERSECTION_FIT_DOMINANCE_RATIO
                 and second_cluster.total_weight >= best_cluster.total_weight * _INTERSECTION_SECONDARY_WEIGHT_FRACTION
             ):
                 return {
@@ -2375,7 +2498,7 @@ class ForwardModel:
                     "reason": "candidate cloud was ambiguous",
                     "detail": {
                         **detail,
-                        "fit_dominance_ratio": fit_ratio,
+                        "support_dominance_ratio": support_ratio,
                         "cluster_count": len(clusters),
                     },
                 }
@@ -2384,8 +2507,8 @@ class ForwardModel:
         receiver_distance_m = _haversine_m(origin_lat, origin_lon, lat, lon)
         detail["receiver_distance_m"] = receiver_distance_m
         dominance_ratio = (
-            second_fit_score / best_fit_score
-            if best_fit_score > 0.0 and math.isfinite(second_fit_score)
+            best_support_score / second_support_score
+            if second_support_score > 0.0
             else float("inf")
         )
         _best_support_check, normalized_residuals = circle_support_at(best_cluster.mean_x_km, best_cluster.mean_y_km)
@@ -2436,10 +2559,61 @@ class ForwardModel:
             ),
             "max": max((normalized_residuals[idx] for idx in inlier_indices), default=None),
         }
+
+        def pairwise_residual_for_raw(raw: dict) -> float:
+            bearing_a = _bearing_deg(lat, lon, raw["lat_a"], raw["lon_a"])
+            bearing_b = _bearing_deg(lat, lon, raw["lat_b"], raw["lon_b"])
+            predicted_phase_deg = (bearing_b - bearing_a) % 360.0
+            dt_s = (raw["arrival_us_b"] - raw["arrival_us_a"]) / 1_000_000.0
+            observed_phase_deg = ((dt_s / period_s) * 360.0 * direction) % 360.0
+            return (observed_phase_deg - predicted_phase_deg + 540.0) % 360.0 - 180.0
+
+        def serialize_pair_circle(sc, admitted_idx: int, inlier: bool) -> dict:
+            raw = raw_by_index.get(int(sc.circle_index), {})
+            normalized = normalized_residuals[admitted_idx] if admitted_idx < len(normalized_residuals) else None
+            pair_residual_deg = pairwise_residual_for_raw(raw) if raw else None
+            return {
+                "circle_index": int(sc.circle_index),
+                "frame_index": int(sc.frame_index),
+                "icao_a": sc.icao_a,
+                "icao_b": sc.icao_b,
+                "circle_score": round(float(sc.circle_score), 6),
+                "intrinsic_weight": round(float(sc.intrinsic_weight), 6),
+                "prior_weight": round(float(sc.prior_weight), 6),
+                "sigma_band_metres": round(float(sc.sigma_band_metres), 3),
+                "pair_baseline_m": round(float(sc.pair_baseline_m), 3),
+                "delta_phi_deg": round(math.degrees(float(sc.delta_phi)), 3),
+                "interpolated_a": bool(sc.interpolated_a),
+                "interpolated_b": bool(sc.interpolated_b),
+                "n_replies_a": int(sc.n_replies_a),
+                "n_replies_b": int(sc.n_replies_b),
+                "position_age_a_seconds": round(float(sc.position_age_a_seconds), 3),
+                "position_age_b_seconds": round(float(sc.position_age_b_seconds), 3),
+                "pair_midpoint_bearing_deg": round(float(raw.get("rx_bearing", 0.0)), 3) if raw else None,
+                "inlier": inlier,
+                "normalized_residual": round(float(normalized), 6) if normalized is not None else None,
+                "pair_residual_deg": round(float(pair_residual_deg), 3) if pair_residual_deg is not None else None,
+                "cx_km": round(float(raw["cx_km"]), 6) if raw else None,
+                "cy_km": round(float(raw["cy_km"]), 6) if raw else None,
+                "R_km": round(float(raw["R_km"]), 6) if raw else None,
+            }
+
+        admitted_pair_circles = [
+            serialize_pair_circle(sc, idx, idx in inlier_indices)
+            for idx, sc in enumerate(admitted_by_arr_index)
+        ]
+        inlier_pair_circles = [
+            row for row in admitted_pair_circles if row["inlier"]
+        ]
+
         detail["selection_diagnostics"].update({
             "best_cluster_support_score": best_support_score,
             "inlier_circle_count": n_contributing_arcs,
+            "total_inlier_pair_circles": n_contributing_arcs,
             "inlier_residual_summary": inlier_residual_summary,
+            "pairwise_fit_score": best_pairwise_fit.score,
+            "pairwise_weighted_rms_deg": best_pairwise_fit.weighted_rms_deg,
+            "pairwise_residual_sigma_deg": best_pairwise_fit.residual_sigma_deg,
         })
 
         return {
@@ -2450,8 +2624,10 @@ class ForwardModel:
                 "rms_km": best_cluster.rms_km,
                 "centroid_uncertainty_km": centroid_uncertainty_km,
                 "n_contributing_arcs": n_contributing_arcs,
+                "n_inlier_pair_circles": n_contributing_arcs,
                 "n_pairs": len(arr),
                 "n_selected_observations": n_selected,
+                "n_admitted_pair_circles": n_selected,
                 "interpolated_fraction": interp_frac,
                 "azimuth_spread_deg": az_spread,
                 "high_quality_frames": sum(
@@ -2462,15 +2638,31 @@ class ForwardModel:
                 "cluster_best_weight": best_cluster.total_weight,
                 "cluster_second_weight": second_cluster.total_weight if second_cluster is not None else 0.0,
                 "dominance_ratio": dominance_ratio,
+                "support_dominance_ratio": dominance_ratio,
                 "receiver_distance_m": receiver_distance_m,
                 "selection_diagnostics": detail["selection_diagnostics"],
+                "admitted_pair_circles": admitted_pair_circles,
+                "inlier_pair_circles": inlier_pair_circles,
+                "pair_circle_summary": {
+                    "total_raw_pair_circles": len(raw_circles),
+                    "total_scored_pair_circles": len(scored),
+                    "total_admitted_pair_circles": len(admitted_pair_circles),
+                    "total_inlier_pair_circles": len(inlier_pair_circles),
+                    "admitted_pairs_containing_reference": detail["selection_diagnostics"]["admitted_pairs_containing_reference"],
+                    "admitted_pairs_not_containing_reference": detail["selection_diagnostics"]["admitted_pairs_not_containing_reference"],
+                },
                 "raw_candidate_count": detail["raw_candidate_count"],
                 "plausible_candidate_count": detail["plausible_candidate_count"],
                 "degenerate_baseline_pairs": detail["degenerate_baseline_pairs"],
                 "endpoint_candidate_rejections": detail["endpoint_candidate_rejections"],
                 "cluster_count": len(clusters),
-                "fit_score": best_fit_score,
+                "fit_score": best_pairwise_fit.score,
+                "pairwise_fit_score": best_pairwise_fit.score,
+                "pairwise_mean_residual_deg": best_pairwise_fit.mean_residual_deg,
+                "pairwise_residual_sigma_deg": best_pairwise_fit.residual_sigma_deg,
+                "pairwise_weighted_rms_deg": best_pairwise_fit.weighted_rms_deg,
                 "best_cluster_support_score": best_support_score,
+                "second_cluster_support_score": second_support_score,
                 "inlier_residual_summary": inlier_residual_summary,
                 "cluster_radius_km": cluster_radius_km,
             },

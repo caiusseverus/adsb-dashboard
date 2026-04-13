@@ -2743,42 +2743,94 @@ function flatProjectionCircleLatLngs(centerLat, centerLon, radiusKm, kmPerDegLat
   return pts
 }
 
+function pairKey(pair) {
+  return `${pair?.icao_a ?? ''}:${pair?.icao_b ?? ''}:${pair?.circle_index ?? ''}`
+}
+
+function pairLabel(pair) {
+  return `${pair?.icao_a ?? '-'} <-> ${pair?.icao_b ?? '-'}`
+}
+
+const FRAME_GEOMETRY_BASEMAPS = {
+  dark: {
+    label: 'Dark',
+    url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    subdomains: 'abcd',
+    maxZoom: 19,
+  },
+  light: {
+    label: 'Light',
+    url: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    subdomains: 'abcd',
+    maxZoom: 19,
+  },
+  voyager: {
+    label: 'Street',
+    url: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    subdomains: 'abcd',
+    maxZoom: 19,
+  },
+  osm: {
+    label: 'OSM',
+    url: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    maxZoom: 19,
+  },
+}
+
 function FrameGeometryDiagnostics({ iid, frameIndex }) {
   const [direction, setDirection] = useState('cw')
-  const [activeIcaos, setActiveIcaos] = useState(() => new Set())
+  const [basemapKey, setBasemapKey] = useState('dark')
+  const [activePairs, setActivePairs] = useState(() => new Set())
   const { data, loading } = useFrameFmGeometry(iid, frameIndex, direction)
-  const observations = data?.observations ?? []
+  const admittedPairs = data?.admitted_pair_circles ?? data?.observations ?? []
+  const pairSummary = data?.pair_circle_summary ?? {}
 
   // Leaflet map refs
   const leafletMapRef = useRef(null)
+  const tileLayerRef = useRef(null)
   const geomLayerRef = useRef(null)
   const [mapReady, setMapReady] = useState(false)
 
-  // Reset active ICAOs when frame/direction/data changes
+  // Reset active pair filters when frame/direction/data changes
   useEffect(() => {
-    const selected = (data?.observations ?? []).filter(obs => obs.selected).map(obs => obs.icao)
-    setActiveIcaos(new Set(selected.length > 0 ? selected : (data?.observations ?? []).slice(0, 1).map(obs => obs.icao)))
-  }, [iid, frameIndex, direction, data?.frame_index, data?.direction, data?.observations])
+    const pairs = data?.admitted_pair_circles ?? data?.observations ?? []
+    const selected = pairs.filter(pair => pair.inlier).map(pairKey)
+    setActivePairs(new Set(selected.length > 0 ? selected : pairs.slice(0, 3).map(pairKey)))
+  }, [iid, frameIndex, direction, data?.frame_index, data?.direction, data?.admitted_pair_circles, data?.observations])
 
   // Callback ref: initialise Leaflet when the container div mounts
   const mapDivRef = useCallback(node => {
     if (node && !leafletMapRef.current) {
       const map = L.map(node, { center: [51.5, 0], zoom: 9, zoomControl: true })
-      L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
-        subdomains: 'abcd',
-        maxZoom: 19,
-      }).addTo(map)
       geomLayerRef.current = L.layerGroup().addTo(map)
       leafletMapRef.current = map
       setMapReady(true)
     } else if (!node && leafletMapRef.current) {
       leafletMapRef.current.remove()
       leafletMapRef.current = null
+      tileLayerRef.current = null
       geomLayerRef.current = null
       setMapReady(false)
     }
   }, [])
+
+  useEffect(() => {
+    const map = leafletMapRef.current
+    if (!map || !mapReady) return
+    const basemap = FRAME_GEOMETRY_BASEMAPS[basemapKey] ?? FRAME_GEOMETRY_BASEMAPS.dark
+    if (tileLayerRef.current) {
+      tileLayerRef.current.remove()
+    }
+    tileLayerRef.current = L.tileLayer(basemap.url, {
+      attribution: basemap.attribution,
+      subdomains: basemap.subdomains,
+      maxZoom: basemap.maxZoom,
+    }).addTo(map)
+  }, [basemapKey, mapReady])
 
   // Fit bounds when data or map readiness changes
   useEffect(() => {
@@ -2815,7 +2867,7 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
     } catch (_) {}
   }, [data, mapReady])
 
-  // Redraw geometry layers when data, activeIcaos, or map readiness changes
+  // Redraw geometry layers when data, active pairs, or map readiness changes
   useEffect(() => {
     const map = leafletMapRef.current
     const lg = geomLayerRef.current
@@ -2840,29 +2892,31 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
     ;(circleLayer?.features ?? []).forEach(feature => {
       const props = feature.properties ?? {}
       const isFrameCep = props.circle_type === 'frame_cep'
-      if (!isFrameCep && !activeIcaos.has(props.obs_icao)) return
+      const key = `${props.icao_a ?? ''}:${props.icao_b ?? ''}:${props.circle_index ?? ''}`
+      if (!isFrameCep && !activePairs.has(key)) return
       const [lon, lat] = feature.geometry.center
       const radiusKm = feature.geometry.radius_km ?? 0
       const latlngs = flatProjectionCircleLatLngs(lat, lon, radiusKm, KM_PER_DEG_LAT, kmPerDegLon)
       L.polygon(latlngs, {
-        color: isFrameCep ? '#ff7b72' : props.selected ? '#d29922' : '#b07000',
-        weight: isFrameCep ? 2.6 : props.selected ? 2.2 : 1.5,
+        color: isFrameCep ? '#ff7b72' : props.inlier ? '#3fb950' : '#d29922',
+        weight: isFrameCep ? 2.6 : props.inlier ? 2.4 : 1.7,
         fill: false,
-        opacity: isFrameCep ? 0.95 : props.selected ? 0.92 : 0.6,
-        dashArray: isFrameCep ? '8 6' : null,
+        opacity: isFrameCep ? 0.95 : props.inlier ? 0.95 : 0.65,
+        dashArray: isFrameCep ? '8 6' : props.inlier ? null : '6 5',
       }).addTo(lg)
     })
 
-    // Chord lines — reference-to-observation baselines, kept dim
+    // Chord lines for admitted aircraft pairs, kept dim
     ;(lineLayer?.features ?? []).forEach(feature => {
       const props = feature.properties ?? {}
-      if (!activeIcaos.has(props.icao)) return
+      const key = `${props.icao_a ?? ''}:${props.icao_b ?? ''}:${props.circle_index ?? ''}`
+      if (!activePairs.has(key)) return
       const latlngs = feature.geometry.coordinates.map(([lon, lat]) => [lat, lon])
       L.polyline(latlngs, {
-        color: '#4d5566',
-        weight: 1.2,
-        opacity: 0.7,
-        dashArray: '5 5',
+        color: props.inlier ? '#3fb950' : '#4d5566',
+        weight: props.inlier ? 1.6 : 1.2,
+        opacity: props.inlier ? 0.85 : 0.6,
+        dashArray: props.inlier ? null : '5 5',
       }).addTo(lg)
     })
 
@@ -2870,9 +2924,11 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
     ;(pointLayer?.features ?? []).forEach(feature => {
       const props = feature.properties ?? {}
       const [lon, lat] = feature.geometry.coordinates
-      const isRef = props.role === 'reference'
+      const isRef = props.source_role === 'sweep_reference'
       const isFrameEstimate = props.role === 'frame_estimate'
-      const isActive = activeIcaos.has(props.icao)
+      const isActive = admittedPairs.some(pair => (
+        activePairs.has(pairKey(pair)) && (pair.icao_a === props.icao || pair.icao_b === props.icao)
+      ))
       const fillColor = isFrameEstimate ? '#ff7b72' : isRef ? '#58a6ff' : isActive ? '#ffffff' : props.selected ? '#3fb950' : '#d29922'
       const marker = L.circleMarker([lat, lon], {
         radius: isFrameEstimate ? 8 : isRef ? 7 : isActive ? 6 : 4,
@@ -2893,13 +2949,14 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
         })
       }
     })
-  }, [data, activeIcaos, mapReady])
+  }, [data, admittedPairs, activePairs, mapReady])
 
-  function toggleIcao(icao) {
-    setActiveIcaos(current => {
+  function togglePair(pair) {
+    const key = pairKey(pair)
+    setActivePairs(current => {
       const next = new Set(current)
-      if (next.has(icao)) next.delete(icao)
-      else next.add(icao)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
       return next
     })
   }
@@ -2914,7 +2971,7 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
     return <div className={styles.empty}>{data?.reason ?? 'No frame geometry available.'}</div>
   }
 
-  const enabledIcaos = activeIcaos
+  const enabledPairs = activePairs
   const selection = data.selection_diagnostics ?? {}
 
   return (
@@ -2923,7 +2980,7 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
         <div>
           <div className={styles.cardTitle}>Frame FM Geometry</div>
           <div className={styles.sectionLead}>
-            Frame #{data.frame_index + 1} · reference {data.ref_icao}
+            Frame #{data.frame_index + 1} · aircraft-pair circle diagnostics
             {data.frame_cep_km != null && (
               <> · CEP{' '}
               <span style={{
@@ -2934,11 +2991,23 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
               </span>
               </>
             )}
-            {data.frame_n_arcs != null && <> · {data.frame_n_arcs} arcs</>}
-            {' '}· click an aircraft row to highlight its reference-pair circle.
+            {data.frame_n_inlier_pair_circles != null && <> · {data.frame_n_inlier_pair_circles} inlier pair circles</>}
+            {' '}· click a pair row to highlight its admitted circle.
           </div>
         </div>
         <div className={styles.metricRow}>
+          <label className={styles.legendChip}>
+            Map
+            <select
+              value={basemapKey}
+              onChange={event => setBasemapKey(event.target.value)}
+              style={{ marginLeft: '0.35rem' }}
+            >
+              {Object.entries(FRAME_GEOMETRY_BASEMAPS).map(([key, basemap]) => (
+                <option key={key} value={key}>{basemap.label}</option>
+              ))}
+            </select>
+          </label>
           <label className={styles.legendChip}>
             <input type="radio" checked={direction === 'cw'} onChange={() => setDirection('cw')} />
             CW
@@ -2951,14 +3020,13 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
       </div>
 
       <div className={styles.metricRow} style={{ marginBottom: '0.75rem' }}>
-        <span className={styles.metricPill}>Reference <span className={styles.metricValue} style={{ color: '#58a6ff' }}>{data.ref_icao}</span></span>
-        <span className={styles.metricPill}>Enabled Pairs <span className={styles.metricValue}>{enabledIcaos.size}</span></span>
-        <span className={styles.metricPill}>Scored <span className={styles.metricValue}>{selection.total_scored_observations ?? 0}</span></span>
-        <span className={styles.metricPill}>Eligible <span className={styles.metricValue}>{selection.eligible_observations ?? 0}</span></span>
-        <span className={styles.metricPill}>Selected <span className={styles.metricValue}>{selection.selected_observations ?? 0}</span></span>
-        <span className={styles.metricPill}>Weak Angle <span className={styles.metricValue}>{selection.dropped_weak_angle ?? 0}</span></span>
-        <span className={styles.metricPill}>Low Quality <span className={styles.metricValue}>{selection.dropped_low_quality ?? 0}</span></span>
-        <span className={styles.metricPill}>Az Bin Drops <span className={styles.metricValue}>{selection.dropped_same_azimuth_bin ?? 0}</span></span>
+        <span className={styles.metricPill}>Enabled Pairs <span className={styles.metricValue}>{enabledPairs.size}</span></span>
+        <span className={styles.metricPill}>Raw Pairs <span className={styles.metricValue}>{pairSummary.total_raw_pair_circles ?? selection.total_raw_pair_circles ?? 0}</span></span>
+        <span className={styles.metricPill}>Scored Pairs <span className={styles.metricValue}>{pairSummary.total_scored_pair_circles ?? selection.total_scored_pair_circles ?? selection.total_scored ?? 0}</span></span>
+        <span className={styles.metricPill}>Admitted Pairs <span className={styles.metricValue}>{pairSummary.total_admitted_pair_circles ?? selection.total_admitted_pair_circles ?? admittedPairs.length}</span></span>
+        <span className={styles.metricPill}>Inlier Pairs <span className={styles.metricValue}>{pairSummary.total_inlier_pair_circles ?? selection.total_inlier_pair_circles ?? 0}</span></span>
+        <span className={styles.metricPill}>With Frame Ref <span className={styles.metricValue}>{pairSummary.admitted_pairs_containing_reference ?? selection.admitted_pairs_containing_reference ?? 0}</span></span>
+        <span className={styles.metricPill}>Without Frame Ref <span className={styles.metricValue}>{pairSummary.admitted_pairs_not_containing_reference ?? selection.admitted_pairs_not_containing_reference ?? 0}</span></span>
       </div>
 
       {/* Frame CEP from intersection solve */}
@@ -2976,7 +3044,7 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
             </span>
           </span>
           {data.frame_n_arcs != null && (
-            <span className={styles.metricPill}>Arcs <span className={styles.metricValue}>{data.frame_n_arcs}</span></span>
+            <span className={styles.metricPill}>Inlier Pair Circles <span className={styles.metricValue}>{data.frame_n_inlier_pair_circles ?? data.frame_n_arcs}</span></span>
           )}
         </div>
       )}
@@ -2994,33 +3062,41 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
       <div className={styles.tableWrap} style={{ marginTop: '0.75rem' }}>
         <table className={styles.table}>
           <thead>
-            <tr><th>ICAO</th><th>Show</th><th>Selected</th><th>Phase</th><th>Strength</th><th>Weight</th><th>Position</th><th>Drop Reason</th></tr>
+            <tr>
+              <th>Aircraft Pair</th><th>Show</th><th>Inlier</th><th>Circle Score</th>
+              <th>Intrinsic</th><th>Prior</th><th>Baseline</th><th>Delta Phi</th>
+              <th>Sigma</th><th>Residual</th><th>Replies</th><th>Position</th>
+            </tr>
           </thead>
           <tbody>
-            {observations.map(obs => (
+            {admittedPairs.map(pair => (
               <tr
-                key={obs.icao}
-                onClick={() => toggleIcao(obs.icao)}
+                key={pairKey(pair)}
+                onClick={() => togglePair(pair)}
                 style={{
                   cursor: 'pointer',
-                  background: enabledIcaos.has(obs.icao) ? '#388bfd12' : 'transparent',
+                  background: enabledPairs.has(pairKey(pair)) ? '#388bfd12' : 'transparent',
                 }}
               >
-                <td className={styles.monoCell}>{obs.icao}</td>
+                <td className={styles.monoCell}>{pairLabel(pair)}</td>
                 <td>
                   <input
                     type="checkbox"
-                    checked={enabledIcaos.has(obs.icao)}
-                    onChange={() => toggleIcao(obs.icao)}
+                    checked={enabledPairs.has(pairKey(pair))}
+                    onChange={() => togglePair(pair)}
                     onClick={event => event.stopPropagation()}
                   />
                 </td>
-                <td className={styles.monoCell} style={{ color: obs.selected ? '#3fb950' : '#d29922' }}>{obs.selected ? 'yes' : 'no'}</td>
-                <td className={styles.monoCell}>{obs.observed_phase_deg != null ? `${obs.observed_phase_deg.toFixed(1)} deg` : '-'}</td>
-                <td className={styles.monoCell}>{obs.phase_strength != null ? obs.phase_strength.toFixed(3) : '-'}</td>
-                <td className={styles.monoCell}>{obs.quality_weight != null ? obs.quality_weight.toFixed(3) : '-'}</td>
-                <td>{obs.interpolated ? 'interpolated' : 'direct'}</td>
-                <td className={styles.monoCell}>{obs.drop_reason ?? '-'}</td>
+                <td className={styles.monoCell} style={{ color: pair.inlier ? '#3fb950' : '#d29922' }}>{pair.inlier ? 'yes' : 'no'}</td>
+                <td className={styles.monoCell}>{pair.circle_score != null ? pair.circle_score.toFixed(3) : '-'}</td>
+                <td className={styles.monoCell}>{pair.intrinsic_weight != null ? pair.intrinsic_weight.toFixed(3) : '-'}</td>
+                <td className={styles.monoCell}>{pair.prior_weight != null ? pair.prior_weight.toFixed(3) : '-'}</td>
+                <td className={styles.monoCell}>{pair.pair_baseline_m != null ? `${(pair.pair_baseline_m / 1000).toFixed(1)} km` : '-'}</td>
+                <td className={styles.monoCell}>{pair.delta_phi_deg != null ? `${pair.delta_phi_deg.toFixed(1)} deg` : '-'}</td>
+                <td className={styles.monoCell}>{pair.sigma_band_metres != null ? `${pair.sigma_band_metres.toFixed(0)} m` : '-'}</td>
+                <td className={styles.monoCell}>{pair.normalized_residual != null ? pair.normalized_residual.toFixed(2) : '-'}</td>
+                <td className={styles.monoCell}>{pair.n_replies_a ?? '-'} / {pair.n_replies_b ?? '-'}</td>
+                <td>{pair.interpolated_a || pair.interpolated_b ? 'interpolated' : 'direct'}</td>
               </tr>
             ))}
           </tbody>

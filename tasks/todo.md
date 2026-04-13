@@ -8,6 +8,50 @@ Source inputs:
 Prepared: 2026-04-04
 Updated: 2026-04-06
 
+## 2026-04-13 All-Pairs Circle Solver Follow-Up Refactor
+
+- [x] Inspect the current backend all-pairs circle path, endpoint rejection, and payload diagnostics
+- [x] Replace final all-pairs cluster ordering with support-primary, pairwise-residual-aware ranking
+- [x] Update single-frame result selection to use pair-based support/fit metrics
+- [x] Add admitted/inlier pair-circle payload rows and pair summary counts while retaining compatibility fields
+- [x] Narrow endpoint rejection to aircraft relevant to the intersecting circles and align pair midpoint bearing convention
+- [x] Update the radar localisation UI to display pair identities, admitted/inlier status, pair metrics, and summary counts
+- [x] Run focused backend/frontend verification and record results
+
+Plan confirmation: proceeding with this targeted refactor against the existing all-pairs implementation, preserving compatibility fields where current callers still use them.
+
+### Review
+
+- Implementation:
+  - Updated [forward_model.py](/home/keith/claude/adsb-dashboard/backend/radar/forward_model.py) with a pairwise candidate residual scorer and changed all-pairs intersection cluster selection to rank primarily by circle support, using pairwise residual RMS only as a secondary criterion.
+  - Updated [forward_model.py](/home/keith/claude/adsb-dashboard/backend/radar/forward_model.py) so single-frame direction/result selection uses support, inlier pair count, pairwise RMS, and cluster RMS rather than the old reference-based fit score.
+  - Updated [forward_model.py](/home/keith/claude/adsb-dashboard/backend/radar/forward_model.py) so endpoint rejection checks only the endpoint aircraft attached to the two circles producing a candidate intersection, and pair midpoint bearing now uses geographic `_bearing_deg`.
+  - Added admitted and inlier pair-circle payload rows with both ICAOs, score components, sigma/baseline/phase diagnostics, normalized residuals, and pair summary counts while retaining compatibility fields such as `n_contributing_arcs`, `n_selected_observations`, and `fit_score`.
+  - Updated [api.py](/home/keith/claude/adsb-dashboard/backend/radar/api.py) so the sweep-frame FM geometry endpoint renders admitted pair baselines/circles from the solver payload instead of rebuilding reference-observation geometry.
+  - Updated [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) so the frame geometry diagnostics table and map toggles are keyed by aircraft pairs, show both ICAOs, expose admitted/inlier state, and display pair summary counts.
+  - Updated [test_radar_api.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_api.py) for the new pair-circle debug payload.
+- Verification:
+  - `python3 -m py_compile backend/radar/api.py backend/radar/forward_model.py`
+  - `uv run --directory backend pytest tests/test_radar_api.py::test_get_iid_sweep_frame_fm_geometry_returns_pair_circles tests/test_radar_api.py::test_get_iid_sweep_frame_fm_geometry_returns_frame_estimate_overlay`
+  - `uv run --directory backend pytest tests/test_radar_api.py tests/test_circle_scorer.py tests/test_forward_model.py`
+  - `uv run --directory backend pytest`
+  - `npm run build`
+  - Result: backend `286 passed in 1.54s`; frontend build succeeded with the existing large-chunk warning.
+
+## 2026-04-13 Frame Geometry Basemap Selector
+
+- [x] Add a basemap selector to the sweep-frame FM geometry Leaflet map
+- [x] Verify the frontend build still passes
+
+### Review
+
+- Implementation:
+  - Updated [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) so the sweep-frame FM geometry Leaflet map has a basemap selector with Dark, Light, Street, and OSM options.
+  - Kept Dark as the default and swapped the active Leaflet tile layer without recreating the map or geometry overlays.
+- Verification:
+  - `npm run build`
+  - Result: frontend build succeeded with the existing large-chunk warning.
+
 ## 2026-04-13 Radar All-Pairs Circle Solver
 
 - [x] Inspect the current inscribed-angle circle scorer, selector, and forward-model solver path

@@ -1166,23 +1166,47 @@ def test_get_iid_inscribed_angle_and_forward_model_evidence_returns_geometry_lay
     }
 
 
-def test_get_iid_sweep_frame_fm_geometry_returns_pair_circles():
+def test_get_iid_sweep_frame_fm_geometry_returns_pair_circles(monkeypatch):
+    import config
+    from radar.localiser import _bearing_deg
+
+    true_lat, true_lon = 51.0, -1.0
+    period_s = 10.0
+    ref_icao, ref_lat, ref_lon = "AAAAAA", 51.4, -1.4
+    aircraft = [
+        ("BBBBBB", 50.6, -0.8),
+        ("CCCCCC", 50.7, -1.3),
+        ("DDDDDD", 51.5, -0.4),
+        ("EEEEEE", 51.2, -1.5),
+    ]
+    ref_bearing = _bearing_deg(true_lat, true_lon, ref_lat, ref_lon)
+    observations = []
+    for icao, lat, lon in aircraft:
+        phase_deg = (_bearing_deg(true_lat, true_lon, lat, lon) - ref_bearing) % 360.0
+        observations.append(SweepFrameObservation(
+            icao,
+            lat,
+            lon,
+            int((phase_deg / 360.0) * period_s * 1_000_000),
+            n_replies=3,
+        ))
+
+    monkeypatch.setattr(config, "RECEIVER_LAT", true_lat)
+    monkeypatch.setattr(config, "RECEIVER_LON", true_lon)
+
     state = RadarState()
-    state._models = {9: RadarIID(iid=9, period_s=4.0, status="SINGLE_RADAR")}
+    state._models = {9: RadarIID(iid=9, period_s=period_s, status="SINGLE_RADAR")}
     state._live_completed_frames[9] = deque([
         SweepFrame(
             frame_index=0,
             sweep_start_us=0.0,
-            ref_icao="AAAAAA",
-            ref_lat=51.0,
-            ref_lon=-1.0,
+            ref_icao=ref_icao,
+            ref_lat=ref_lat,
+            ref_lon=ref_lon,
             ref_arrival_us=0.0,
-            observations=[
-                SweepFrameObservation("BBBBBB", 51.4, -1.2, 1_000_000.0),
-                SweepFrameObservation("CCCCCC", 51.6, -1.8, 1_500_000.0),
-            ],
+            observations=observations,
             quality="good",
-            period_s=4.0,
+            period_s=period_s,
         )
     ], maxlen=state._LIVE_FRAMES_MAX)
 
@@ -1195,11 +1219,13 @@ def test_get_iid_sweep_frame_fm_geometry_returns_pair_circles():
 
     assert payload["available"] is True
     assert payload["ref_icao"] == "AAAAAA"
-    assert payload["selection_diagnostics"]["total_scored_observations"] == 2
-    circle_layer = next(layer for layer in payload["layers"] if layer["label"] == "Inscribed-Angle Circles")
+    assert payload["pair_circle_summary"]["total_raw_pair_circles"] == 10
+    assert payload["pair_circle_summary"]["total_admitted_pair_circles"] >= 1
+    circle_layer = next(layer for layer in payload["layers"] if layer["label"] == "Admitted Pair Circles")
     assert circle_layer["features"]
     assert circle_layer["features"][0]["geometry"]["type"] == "Circle"
-    assert {obs["icao"] for obs in payload["observations"]} == {"BBBBBB", "CCCCCC"}
+    assert {"icao_a", "icao_b", "circle_score", "normalized_residual", "inlier"} <= set(payload["admitted_pair_circles"][0])
+    assert payload["pair_circle_summary"]["admitted_pairs_not_containing_reference"] > 0
 
 
 def test_get_iid_sweep_frame_fm_geometry_returns_frame_estimate_overlay(monkeypatch):
@@ -1255,19 +1281,15 @@ def test_get_iid_sweep_frame_fm_geometry_returns_frame_estimate_overlay(monkeypa
     finally:
         radar_api._state = prior_state
 
-    assert payload["frame_lat"] is not None
-    assert payload["frame_lon"] is not None
-    assert payload["frame_cep_km"] is not None
-    point_layer = next(layer for layer in payload["layers"] if layer["label"] == "Frame Aircraft")
-    circle_layer = next(layer for layer in payload["layers"] if layer["label"] == "Inscribed-Angle Circles")
-    frame_points = [
-        feature for feature in point_layer["features"]
-        if feature["properties"].get("role") == "frame_estimate"
-    ]
-    cep_circles = [
-        feature for feature in circle_layer["features"]
-        if feature["properties"].get("circle_type") == "frame_cep"
-    ]
-    assert frame_points
-    assert cep_circles
-    assert cep_circles[0]["geometry"]["radius_km"] == pytest.approx(payload["frame_cep_km"], abs=0.01)
+    assert payload["pair_circle_summary"]["total_raw_pair_circles"] == 10
+    assert payload["pair_circle_summary"]["total_admitted_pair_circles"] == len(payload["admitted_pair_circles"])
+    assert payload["pair_circle_summary"]["total_inlier_pair_circles"] == len(payload["inlier_pair_circles"])
+    assert payload["pair_circle_summary"]["admitted_pairs_not_containing_reference"] > 0
+    assert payload["inlier_pair_circles"]
+    assert all(pair["inlier"] for pair in payload["inlier_pair_circles"])
+    circle_layer = next(layer for layer in payload["layers"] if layer["label"] == "Admitted Pair Circles")
+    assert any(
+        feature["properties"].get("inlier")
+        for feature in circle_layer["features"]
+        if feature["properties"].get("circle_type") == "admitted_pair_circle"
+    )

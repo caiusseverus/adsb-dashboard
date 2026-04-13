@@ -2405,128 +2405,68 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
         if not frame.observations:
             return {"iid": iid, "frame_index": frame_index, "available": False, "reason": "frame has no observations"}
 
-        from .forward_model import (
-            _INTERSECTION_MIN_SIN_PHI,
-            _MIN_OBSERVATION_QUALITY,
-            _preprocess_scoring_frames,
-            _select_intersection_observations_with_diagnostics,
-        )
-
         sweep_direction = 1 if direction >= 0 else -1
-        scored_frames = _preprocess_scoring_frames([frame], model.period_s, sweep_direction=sweep_direction)
-        selected, diagnostics = _select_intersection_observations_with_diagnostics(
-            scored_frames,
-            min_sin_phi=_INTERSECTION_MIN_SIN_PHI,
-        )
-        selected_icaos = {obs.icao for obs in selected}
-
-        mean_lat = sum([frame.ref_lat] + [obs.lat for obs in frame.observations]) / (1 + len(frame.observations))
-        km_per_deg_lat = 111.32
-        km_per_deg_lon = max(111.32 * math.cos(math.radians(mean_lat)), 1e-6)
-
-        def to_xy(lat: float, lon: float) -> tuple[float, float]:
-            return lon * km_per_deg_lon, lat * km_per_deg_lat
-
-        def from_xy(x: float, y: float) -> tuple[float, float]:
-            return y / km_per_deg_lat, x / km_per_deg_lon
+        import config as _config
+        from .forward_model import _PER_FRAME_MIN_CONTRIBUTING_ARCS, _PER_FRAME_MAX_CEP_KM
+        recv_lat = getattr(_config, "RECEIVER_LAT", None)
+        recv_lon = getattr(_config, "RECEIVER_LON", None)
 
         points = [
             _point_feature(
                 frame.ref_lat,
                 frame.ref_lon,
                 icao=frame.ref_icao,
-                role="reference",
+                role="frame_aircraft",
+                source_role="sweep_reference",
                 arrival_us=frame.ref_arrival_us,
             )
         ]
-        baselines: list[dict] = []
-        circles: list[dict] = []
-        observations: list[dict] = []
-        scored_by_icao = {
-            obs.icao: obs
-            for sf in scored_frames
-            for obs in sf.observations
+        aircraft_by_icao = {
+            frame.ref_icao: {
+                "lat": frame.ref_lat,
+                "lon": frame.ref_lon,
+                "arrival_us": frame.ref_arrival_us,
+                "interpolated": False,
+            }
         }
-        for idx, obs in enumerate(frame.observations):
-            scored = scored_by_icao.get(obs.icao)
-            observed_phase = scored.observed_phase_deg if scored is not None else None
-            phase_strength = scored.phase_strength if scored is not None else None
-            quality_weight = scored.quality_weight if scored is not None else None
-            selected_for_intersection = obs.icao in selected_icaos
-            drop_reason = None
-            if quality_weight is not None and quality_weight < _MIN_OBSERVATION_QUALITY:
-                drop_reason = "low_quality"
-            elif phase_strength is not None and phase_strength < _INTERSECTION_MIN_SIN_PHI:
-                drop_reason = "weak_angle"
-            elif not selected_for_intersection:
-                drop_reason = "selection_cap_or_azimuth_bin"
-
+        for obs in frame.observations:
+            aircraft_by_icao[obs.icao] = {
+                "lat": obs.lat,
+                "lon": obs.lon,
+                "arrival_us": obs.arrival_us,
+                "interpolated": obs.interpolated,
+            }
             points.append(_point_feature(
                 obs.lat,
                 obs.lon,
                 icao=obs.icao,
-                role="observation",
-                selected=selected_for_intersection,
-                drop_reason=drop_reason,
-            ))
-            baselines.append(_line_feature(
-                [(frame.ref_lat, frame.ref_lon), (obs.lat, obs.lon)],
-                icao=obs.icao,
-                selected=selected_for_intersection,
-                observed_phase_deg=round(observed_phase, 2) if observed_phase is not None else None,
-                phase_strength=round(phase_strength, 4) if phase_strength is not None else None,
-                quality_weight=round(quality_weight, 4) if quality_weight is not None else None,
-                drop_reason=drop_reason,
-                line_type="frame_pair_baseline",
+                role="frame_aircraft",
+                arrival_us=obs.arrival_us,
+                interpolated=obs.interpolated,
             ))
 
-            if observed_phase is not None:
-                ax, ay = to_xy(frame.ref_lat, frame.ref_lon)
-                bx, by = to_xy(obs.lat, obs.lon)
-                phi_rad = math.radians(observed_phase)
-                sin_phi = math.sin(phi_rad)
-                d = math.hypot(bx - ax, by - ay)
-                if d >= 1e-6 and abs(sin_phi) >= 1e-6:
-                    radius_km = d / (2.0 * abs(sin_phi))
-                    px, py = -((by - ay) / d), (bx - ax) / d
-                    h = -(d / 2.0) * (math.cos(phi_rad) / sin_phi)
-                    cx = (ax + bx) / 2.0 + h * px
-                    cy = (ay + by) / 2.0 + h * py
-                    center_lat, center_lon = from_xy(cx, cy)
-                    circles.append(_circle_feature(
-                        center_lat,
-                        center_lon,
-                        radius_km,
-                        pair_index=idx,
-                        ref_icao=frame.ref_icao,
-                        obs_icao=obs.icao,
-                        selected=selected_for_intersection,
-                        observed_phase_deg=round(observed_phase, 2),
-                        phase_strength=round(abs(sin_phi), 4),
-                        quality_weight=round(quality_weight, 4) if quality_weight is not None else None,
-                        drop_reason=drop_reason,
-                    ))
-
-            observations.append({
-                "icao": obs.icao,
-                "selected": selected_for_intersection,
-                "drop_reason": drop_reason,
-                "observed_phase_deg": round(observed_phase, 2) if observed_phase is not None else None,
-                "phase_strength": round(phase_strength, 4) if phase_strength is not None else None,
-                "quality_weight": round(quality_weight, 4) if quality_weight is not None else None,
-                "interpolated": obs.interpolated,
-            })
-
-        # Run the intersection solve to get frame CEP for display
-        import config as _config
-        from .forward_model import _PER_FRAME_MIN_CONTRIBUTING_ARCS, _PER_FRAME_MAX_CEP_KM
-        recv_lat = getattr(_config, "RECEIVER_LAT", None)
-        recv_lon = getattr(_config, "RECEIVER_LON", None)
+        baselines: list[dict] = []
+        circles: list[dict] = []
+        admitted_pair_circles: list[dict] = []
+        inlier_pair_circles: list[dict] = []
+        pair_circle_summary: dict = {}
+        diagnostics: dict = {}
         frame_lat = None
         frame_lon = None
         frame_cep_km = None
         frame_n_arcs = None
         frame_solve_reason = None
+        solve_result = None
+
+        def from_receiver_xy(x_km: float, y_km: float) -> tuple[float, float]:
+            if recv_lat is None or recv_lon is None:
+                return frame.ref_lat, frame.ref_lon
+            r_km = 6371.0
+            cos_orig = max(math.cos(math.radians(recv_lat)), 1e-12)
+            lat = recv_lat + math.degrees(y_km / r_km)
+            lon = recv_lon + math.degrees(x_km / (r_km * cos_orig))
+            return lat, lon
+
         MIN_CEP_KM = 0.05  # solver artifact threshold, matches frame_filter.MIN_CEP_KM
         if recv_lat is not None and recv_lon is not None:
             from .forward_model import ForwardModel
@@ -2541,7 +2481,13 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
             )
             if not solve_result.get("success"):
                 frame_solve_reason = solve_result.get("reason", "unknown")
+                diagnostics = solve_result.get("detail", {}).get("selection_diagnostics", {})
             else:
+                result = solve_result["result"]
+                admitted_pair_circles = result.get("admitted_pair_circles", [])
+                inlier_pair_circles = result.get("inlier_pair_circles", [])
+                pair_circle_summary = result.get("pair_circle_summary", {})
+                diagnostics = result.get("selection_diagnostics", {})
                 raw_cep = solve_result["result"].get("centroid_uncertainty_km")
                 raw_arcs = solve_result["result"].get("n_contributing_arcs", 0)
                 # Apply the same quality gates the centroid accumulator uses.
@@ -2577,11 +2523,45 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
                         else f"cep={raw_cep}km arcs={raw_arcs}" if raw_cep is not None
                         else "no_result"
                     )
+        else:
+            frame_solve_reason = "receiver coordinates not configured"
+
+        for pair in admitted_pair_circles:
+            a = aircraft_by_icao.get(pair.get("icao_a"))
+            b = aircraft_by_icao.get(pair.get("icao_b"))
+            if a is not None and b is not None:
+                baselines.append(_line_feature(
+                    [(a["lat"], a["lon"]), (b["lat"], b["lon"])],
+                    icao_a=pair.get("icao_a"),
+                    icao_b=pair.get("icao_b"),
+                    pair_label=f"{pair.get('icao_a')} <-> {pair.get('icao_b')}",
+                    circle_index=pair.get("circle_index"),
+                    inlier=pair.get("inlier", False),
+                    selected=True,
+                    line_type="admitted_pair_baseline",
+                    normalized_residual=pair.get("normalized_residual"),
+                ))
+            if pair.get("cx_km") is not None and pair.get("cy_km") is not None and pair.get("R_km") is not None:
+                center_lat, center_lon = from_receiver_xy(pair["cx_km"], pair["cy_km"])
+                circles.append(_circle_feature(
+                    center_lat,
+                    center_lon,
+                    pair["R_km"],
+                    circle_type="admitted_pair_circle",
+                    circle_index=pair.get("circle_index"),
+                    icao_a=pair.get("icao_a"),
+                    icao_b=pair.get("icao_b"),
+                    pair_label=f"{pair.get('icao_a')} <-> {pair.get('icao_b')}",
+                    selected=True,
+                    inlier=pair.get("inlier", False),
+                    circle_score=pair.get("circle_score"),
+                    normalized_residual=pair.get("normalized_residual"),
+                ))
 
         layers = [
             _layer("frame_fm_geometry", "Frame Aircraft", "point", points, source_count=len(points)),
-            _layer("frame_fm_geometry", "Reference-Observation Pairs", "line", baselines, source_count=len(baselines)),
-            _layer("frame_fm_geometry", "Inscribed-Angle Circles", "circle", circles, source_count=len(circles)),
+            _layer("frame_fm_geometry", "Admitted Pair Baselines", "line", baselines, source_count=len(baselines)),
+            _layer("frame_fm_geometry", "Admitted Pair Circles", "circle", circles, source_count=len(circles)),
         ]
 
         return {
@@ -2594,12 +2574,16 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
             "ref_icao": frame.ref_icao,
             "n_aircraft": 1 + len(frame.observations),
             "selection_diagnostics": diagnostics,
-            "observations": observations,
+            "observations": admitted_pair_circles,
+            "admitted_pair_circles": admitted_pair_circles,
+            "inlier_pair_circles": inlier_pair_circles,
+            "pair_circle_summary": pair_circle_summary,
             "layers": layers,
             "frame_lat": round(frame_lat, 6) if frame_lat is not None else None,
             "frame_lon": round(frame_lon, 6) if frame_lon is not None else None,
             "frame_cep_km": round(frame_cep_km, 2) if frame_cep_km is not None else None,
             "frame_n_arcs": frame_n_arcs,
+            "frame_n_inlier_pair_circles": frame_n_arcs,
             "frame_solve_reason": frame_solve_reason,
         }
     finally:
