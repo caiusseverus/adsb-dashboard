@@ -59,11 +59,28 @@ MAX_CONDITION_NUMBER: float = 1e6  # guard against near-singular covariance
 # below anything achievable from TOA timing resolution so no real estimate is lost.
 MIN_CEP_KM: float = 0.05
 
+MAX_ACCUMULATION_CEP_KM_STAGE0: float = 20.0
+"""Hard maximum single-frame CEP for long-term accumulation.
+
+Frames above this can still be useful for manual geometry inspection, but they
+are too weak to let into the centroid buffer/filter because they dilute the
+long-term position rather than strengthening it.
+"""
+
 # Physical minimum 1-sigma used in the weighted centroid and Mahalanobis metric.
 # Frames claiming sub-500 m accuracy would dominate the centroid by orders of
 # magnitude over normal ~3-5 km frames, biasing P_bar and collapsing Stage-1
 # thresholds.  500 m is a conservative lower bound for single-frame TOA accuracy.
 MIN_SIGMA_M: float = 500.0
+
+STAGE1_SIGMA_FLOOR_M: float = 1_000.0
+"""Minimum shared uncertainty in Stage 1 so compact clusters do not over-tighten."""
+
+MAX_STAGE1_ABS_DISTANCE_KM: float = 30.0
+"""Absolute residual cap for Stage 1, regardless of a frame's claimed sigma."""
+
+STAGE1_CLUSTER_SIGMA_MULTIPLIER: float = 6.0
+"""Scale factor for robust cluster spread when forming the Stage 1 absolute cap."""
 
 
 # ── Result type ─────────────────────────────────────────────────────────
@@ -79,6 +96,8 @@ class FilterResult:
     n_inliers: int
     rejection_counts: dict[str, int]
     inlier_sweep_start_us: frozenset = field(default_factory=frozenset)
+    stage1_cluster_sigma_m: Optional[float] = None
+    stage1_abs_distance_cap_m: Optional[float] = None
 
 
 # ── ENU conversion helpers ─────────────────────────────────────────────
@@ -134,7 +153,13 @@ def filter_frame_estimates(
         Combined position, uncertainty, and diagnostic counts.
     """
     n_total = len(estimates)
-    rejection_counts = {"stage0": 0, "stage1": 0, "stage2": 0}
+    rejection_counts = {
+        "stage0": 0,
+        "stage0_excessive_cep": 0,
+        "stage1": 0,
+        "stage1_excessive_absolute_distance": 0,
+        "stage2": 0,
+    }
 
     if n_total == 0:
         return FilterResult(
@@ -176,6 +201,10 @@ def filter_frame_estimates(
         if est.cep_km < MIN_CEP_KM:
             rejection_counts["stage0"] += 1
             continue
+        if est.cep_km > MAX_ACCUMULATION_CEP_KM_STAGE0:
+            rejection_counts["stage0"] += 1
+            rejection_counts["stage0_excessive_cep"] += 1
+            continue
         if est.n_contributing_arcs < MIN_ARCS:
             rejection_counts["stage0"] += 1
             continue
@@ -211,6 +240,8 @@ def filter_frame_estimates(
     # Subsequent iterations switch to the weighted mean, which is now stable
     # because the small-σ outliers have been trimmed.
     use_median_seed = True
+    stage1_cluster_sigma_m: Optional[float] = None
+    stage1_abs_distance_cap_m: Optional[float] = None
 
     for _iteration in range(MAX_ITER):
         prev_inlier_count = len(inliers)
@@ -227,14 +258,47 @@ def filter_frame_estimates(
             inliers = []
             break
 
-        # Stage 1: per-frame predicted-covariance Mahalanobis gate.
-        #   d²ᵢ = (Pᵢ − P̄)ᵀ · inv(Σᵢ) · (Pᵢ − P̄)
-        #   Reject if d²ᵢ > CHI2_THRESHOLD_99
+        # Robust cluster scale for the mixed-uncertainty denominator.
+        # Use MAD of distances from p_bar, scaled to approximate 1-sigma.
+        distances_from_center = np.array([np.linalg.norm(fd.enu - p_bar) for fd in inliers])
+        median_dist = float(np.median(distances_from_center))
+        mad = float(np.median(np.abs(distances_from_center - median_dist)))
+        sigma_cluster = mad * 1.4826  # MAD → sigma for Gaussian
+        sigma_cluster = max(sigma_cluster, STAGE1_SIGMA_FLOOR_M)
+        stage1_cluster_sigma_m = sigma_cluster
+
+        # Absolute distance cap: reject frames beyond this regardless of sigma.
+        abs_distance_cap = max(
+            STAGE1_CLUSTER_SIGMA_MULTIPLIER * sigma_cluster,
+            MAX_STAGE1_ABS_DISTANCE_KM * 1000.0,
+        )
+        stage1_abs_distance_cap_m = abs_distance_cap
+
+        # Stage 1: per-frame Mahalanobis gate with MIXED uncertainty.
+        #   Old: d² = ||Pᵢ − P̄||² / σᵢ²
+        #   New: d² = ||Pᵢ − P̄||² / (σᵢ² + σ_cluster² + σ_floor²)
+        #
+        # This prevents large-CEP frames from getting an easy pass just because
+        # they claim high uncertainty. The gate tightens when the cluster is
+        # already compact.
+        sigma_floor = STAGE1_SIGMA_FLOOR_M
+        sigma_floor2 = sigma_floor * sigma_floor
+        sigma_cluster2 = sigma_cluster * sigma_cluster
+
         stage1_survivors: list[_FrameData] = []
         for fd in inliers:
             residual = fd.enu - p_bar
-            # For isotropic Σᵢ = σ²I: d² = ||residual||² / σ²
-            d2 = float(np.dot(residual, residual) / fd.sigma2)
+            dist_m = float(np.linalg.norm(residual))
+
+            # Absolute distance cap (before Mahalanobis check).
+            if dist_m > abs_distance_cap:
+                rejection_counts["stage1"] += 1
+                rejection_counts["stage1_excessive_absolute_distance"] += 1
+                continue
+
+            # Mixed-uncertainty Mahalanobis gate.
+            denom2 = fd.sigma2 + sigma_cluster2 + sigma_floor2
+            d2 = float(np.dot(residual, residual) / denom2)
             if d2 <= CHI2_THRESHOLD_99:
                 stage1_survivors.append(fd)
             else:
@@ -271,6 +335,8 @@ def filter_frame_estimates(
             n_total=n_total, n_stage0_survivors=n_stage0_survivors,
             n_inliers=n_inliers, rejection_counts=rejection_counts,
             inlier_sweep_start_us=inlier_sus,
+            stage1_cluster_sigma_m=round(stage1_cluster_sigma_m, 1) if stage1_cluster_sigma_m is not None else None,
+            stage1_abs_distance_cap_m=round(stage1_abs_distance_cap_m, 1) if stage1_abs_distance_cap_m is not None else None,
         )
 
     p_combined, sigma_combined = _final_weighted_mean(inliers)
@@ -282,6 +348,8 @@ def filter_frame_estimates(
         n_total=n_total, n_stage0_survivors=n_stage0_survivors,
         n_inliers=n_inliers, rejection_counts=rejection_counts,
         inlier_sweep_start_us=inlier_sus,
+        stage1_cluster_sigma_m=round(stage1_cluster_sigma_m, 1) if stage1_cluster_sigma_m is not None else None,
+        stage1_abs_distance_cap_m=round(stage1_abs_distance_cap_m, 1) if stage1_abs_distance_cap_m is not None else None,
     )
 
 

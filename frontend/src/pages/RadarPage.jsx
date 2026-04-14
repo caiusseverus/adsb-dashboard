@@ -2786,8 +2786,18 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
   const [basemapKey, setBasemapKey] = useState('dark')
   const [activePairs, setActivePairs] = useState(() => new Set())
   const { data, loading } = useFrameFmGeometry(iid, frameIndex, direction)
-  const admittedPairs = data?.admitted_pair_circles ?? data?.observations ?? []
+  // When the automatic solver rejects a frame, admitted_pair_circles may be empty.
+  // Fall back to scored_pair_circles (includes rejected pairs with exclusion_reason)
+  // so the user can still inspect the pair geometry for rejected frames.
+  const admittedPairs = (data?.admitted_pair_circles ?? data?.observations ?? [])
+  const scoredPairs = data?.scored_pair_circles ?? []
+  const displayPairs = admittedPairs.length > 0 ? admittedPairs : scoredPairs
   const pairSummary = data?.pair_circle_summary ?? {}
+  const candidateClusters = data?.candidate_clusters ?? []
+
+  // Manual preview state
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [previewResult, setPreviewResult] = useState(null)
 
   // Leaflet map refs
   const leafletMapRef = useRef(null)
@@ -2797,10 +2807,10 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
 
   // Reset active pair filters when frame/direction/data changes
   useEffect(() => {
-    const pairs = data?.admitted_pair_circles ?? data?.observations ?? []
+    const pairs = displayPairs
     const selected = pairs.filter(pair => pair.inlier).map(pairKey)
     setActivePairs(new Set(selected.length > 0 ? selected : pairs.slice(0, 3).map(pairKey)))
-  }, [iid, frameIndex, direction, data?.frame_index, data?.direction, data?.admitted_pair_circles, data?.observations])
+  }, [iid, frameIndex, direction, displayPairs])
 
   // Callback ref: initialise Leaflet when the container div mounts
   const mapDivRef = useCallback(node => {
@@ -2961,6 +2971,41 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
     })
   }
 
+  async function handlePreviewSolve() {
+    const selectedIndices = [...activePairs]
+      .map(key => {
+        // pairKey returns `${icao_a}:${icao_b}:${circle_index}`
+        const parts = key.split(':')
+        const idx = parts[parts.length - 1]
+        return idx !== '' ? parseInt(idx, 10) : null
+      })
+      .filter(n => n !== null && !isNaN(n))
+    if (selectedIndices.length === 0) return
+
+    setPreviewLoading(true)
+    setPreviewResult(null)
+    try {
+      const dir = direction === 'ccw' ? -1 : 1
+      const r = await fetch(`${API_BASE}/api/radar/iids/${iid}/sweep-frames/${frameIndex}/fm-geometry/manual-preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ direction: dir, selected_circle_indices: selectedIndices }),
+      })
+      if (r.ok) {
+        const d = await r.json()
+        setPreviewResult(d)
+      }
+    } catch {
+      // ignore cancelled requests
+    } finally {
+      setPreviewLoading(false)
+    }
+  }
+
+  function handleResetPreview() {
+    setPreviewResult(null)
+  }
+
   if (frameIndex == null) {
     return <div className={styles.empty}>Click a sweep frame to inspect its FM geometry.</div>
   }
@@ -2994,6 +3039,21 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
             {data.frame_n_inlier_pair_circles != null && <> · {data.frame_n_inlier_pair_circles} inlier pair circles</>}
             {' '}· click a pair row to highlight its admitted circle.
           </div>
+          {/* Automatic solver status */}
+          {data.frame_solve_reason && (
+            <div style={{ marginTop: '0.35rem' }}>
+              <span className={styles.metricPill} style={{
+                borderColor: data.frame_cep_km != null ? '#3fb950' : '#d29922',
+                borderWidth: '1px',
+                borderStyle: 'solid',
+              }}>
+                Automatic solver:{' '}
+                <span style={{ color: data.frame_cep_km != null ? '#3fb950' : '#d29922', fontWeight: 600 }}>
+                  {data.frame_cep_km != null ? 'accepted' : `rejected — ${data.frame_solve_reason}`}
+                </span>
+              </span>
+            </div>
+          )}
         </div>
         <div className={styles.metricRow}>
           <label className={styles.legendChip}>
@@ -3016,13 +3076,32 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
             <input type="radio" checked={direction === 'ccw'} onChange={() => setDirection('ccw')} />
             CCW
           </label>
+          {/* Manual preview controls */}
+          <button
+            type="button"
+            className={styles.actionButton}
+            onClick={handlePreviewSolve}
+            disabled={previewLoading || activePairs.size < 2}
+            title="Preview solve from selected pairs only"
+          >
+            {previewLoading ? 'Previewing…' : 'Preview Solve'}
+          </button>
+          {previewResult && (
+            <button
+              type="button"
+              className={styles.actionButton}
+              onClick={handleResetPreview}
+            >
+              Reset To Auto
+            </button>
+          )}
         </div>
       </div>
 
       <div className={styles.metricRow} style={{ marginBottom: '0.75rem' }}>
         <span className={styles.metricPill}>Enabled Pairs <span className={styles.metricValue}>{enabledPairs.size}</span></span>
         <span className={styles.metricPill}>Raw Pairs <span className={styles.metricValue}>{pairSummary.total_raw_pair_circles ?? selection.total_raw_pair_circles ?? 0}</span></span>
-        <span className={styles.metricPill}>Scored Pairs <span className={styles.metricValue}>{pairSummary.total_scored_pair_circles ?? selection.total_scored_pair_circles ?? selection.total_scored ?? 0}</span></span>
+        <span className={styles.metricPill}>Scored Pairs <span className={styles.metricValue}>{pairSummary.total_scored_pair_circles ?? selection.total_scored_pair_circles ?? scoredPairs.length}</span></span>
         <span className={styles.metricPill}>Admitted Pairs <span className={styles.metricValue}>{pairSummary.total_admitted_pair_circles ?? selection.total_admitted_pair_circles ?? admittedPairs.length}</span></span>
         <span className={styles.metricPill}>Inlier Pairs <span className={styles.metricValue}>{pairSummary.total_inlier_pair_circles ?? selection.total_inlier_pair_circles ?? 0}</span></span>
         <span className={styles.metricPill}>With Frame Ref <span className={styles.metricValue}>{pairSummary.admitted_pairs_containing_reference ?? selection.admitted_pairs_containing_reference ?? 0}</span></span>
@@ -3066,10 +3145,11 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
               <th>Aircraft Pair</th><th>Show</th><th>Inlier</th><th>Circle Score</th>
               <th>Intrinsic</th><th>Prior</th><th>Baseline</th><th>Delta Phi</th>
               <th>Sigma</th><th>Residual</th><th>Replies</th><th>Position</th>
+              <th>Exclusion</th>
             </tr>
           </thead>
           <tbody>
-            {admittedPairs.map(pair => (
+            {displayPairs.map(pair => (
               <tr
                 key={pairKey(pair)}
                 onClick={() => togglePair(pair)}
@@ -3097,11 +3177,98 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
                 <td className={styles.monoCell}>{pair.normalized_residual != null ? pair.normalized_residual.toFixed(2) : '-'}</td>
                 <td className={styles.monoCell}>{pair.n_replies_a ?? '-'} / {pair.n_replies_b ?? '-'}</td>
                 <td>{pair.interpolated_a || pair.interpolated_b ? 'interpolated' : 'direct'}</td>
+                <td className={styles.monoCell} style={{ color: pair.exclusion_reason ? '#f85149' : '#8b949e' }}>
+                  {pair.exclusion_reason ?? '-'}
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+
+      {/* Candidate clusters — shown even when the automatic solver rejected the frame */}
+      {candidateClusters.length > 0 && (
+        <div style={{ marginTop: '1rem' }}>
+          <h4 style={{ margin: '0 0 0.5rem', fontSize: '0.9rem', color: '#8b949e' }}>
+            Candidate Clusters ({candidateClusters.length})
+          </h4>
+          <div className={styles.tableWrap}>
+            <table className={styles.table}>
+              <thead>
+                <tr>
+                  <th>Rank</th><th>Lat</th><th>Lon</th><th>Support</th>
+                  <th>RMS (deg)</th><th>Members</th><th>RMS (km)</th>
+                  <th>Quality Score</th><th>Condition #</th>
+                  <th>Dominance</th><th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {candidateClusters.map(cluster => (
+                  <tr key={cluster.cluster_rank}>
+                    <td className={styles.monoCell}>{cluster.cluster_rank}</td>
+                    <td className={styles.monoCell}>{cluster.lat != null ? cluster.lat.toFixed(4) : '-'}</td>
+                    <td className={styles.monoCell}>{cluster.lon != null ? cluster.lon.toFixed(4) : '-'}</td>
+                    <td className={styles.monoCell}>{cluster.support_score != null ? cluster.support_score.toFixed(3) : cluster.cluster_support_score != null ? cluster.cluster_support_score.toFixed(3) : '-'}</td>
+                    <td className={styles.monoCell}>{cluster.pairwise_weighted_rms_deg != null ? cluster.pairwise_weighted_rms_deg.toFixed(1) : '-'}</td>
+                    <td className={styles.monoCell}>{cluster.member_count}</td>
+                    <td className={styles.monoCell}>{cluster.rms_km != null ? cluster.rms_km.toFixed(1) : '-'}</td>
+                    <td className={styles.monoCell}>{cluster.cluster_quality_score != null ? cluster.cluster_quality_score.toFixed(3) : '-'}</td>
+                    <td className={styles.monoCell}>{cluster.cluster_condition_number != null ? cluster.cluster_condition_number.toFixed(1) : '-'}</td>
+                    <td className={styles.monoCell}>{cluster.quality_dominance_ratio != null ? cluster.quality_dominance_ratio.toFixed(2) : cluster.support_dominance_ratio != null ? cluster.support_dominance_ratio.toFixed(2) : '-'}</td>
+                    <td>
+                      {cluster.is_selected_best ? (
+                        <span style={{ color: '#3fb950', fontWeight: 600 }}>best (auto)</span>
+                      ) : data.frame_solve_reason ? (
+                        <span style={{ color: '#d29922' }}>auto-rejected</span>
+                      ) : (
+                        <span style={{ color: '#8b949e' }}>alternative</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Manual preview result */}
+      {previewResult && (
+        <div style={{ marginTop: '1rem', padding: '0.75rem', border: '1px solid #d29922', borderRadius: '6px', background: '#d2992210' }}>
+          <div style={{ display: 'flex', alignItems: 'center', marginBottom: '0.5rem' }}>
+            <h4 style={{ margin: 0, fontSize: '0.9rem', color: '#d29922' }}>
+              Manual Preview Result
+            </h4>
+            {previewResult.automatic_acceptance_status === 'would_be_rejected_ambiguous' && (
+              <span className={styles.metricPill} style={{ marginLeft: '0.5rem', borderColor: '#d29922', borderWidth: '1px', borderStyle: 'solid', fontSize: '0.75rem' }}>
+                Would be rejected automatically
+              </span>
+            )}
+            {previewResult.automatic_acceptance_status === 'accepted' && (
+              <span className={styles.metricPill} style={{ marginLeft: '0.5rem', borderColor: '#3fb950', borderWidth: '1px', borderStyle: 'solid', fontSize: '0.75rem' }}>
+                Would be accepted automatically
+              </span>
+            )}
+          </div>
+          <div className={styles.metricRow}>
+            {previewResult.frame_lat != null && (
+              <span className={styles.metricPill}>Preview Lat <span className={styles.metricValue}>{previewResult.frame_lat.toFixed(4)}</span></span>
+            )}
+            {previewResult.frame_lon != null && (
+              <span className={styles.metricPill}>Preview Lon <span className={styles.metricValue}>{previewResult.frame_lon.toFixed(4)}</span></span>
+            )}
+            {previewResult.frame_cep_km != null && (
+              <span className={styles.metricPill}>Preview CEP <span className={styles.metricValue}>{previewResult.frame_cep_km.toFixed(1)} km</span></span>
+            )}
+            {previewResult.frame_n_arcs != null && (
+              <span className={styles.metricPill}>Inlier Pairs <span className={styles.metricValue}>{previewResult.frame_n_arcs}</span></span>
+            )}
+            {previewResult.frame_solve_reason && (
+              <span className={styles.metricPill}>Reason <span className={styles.metricValue} style={{ color: '#d29922' }}>{previewResult.frame_solve_reason}</span></span>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

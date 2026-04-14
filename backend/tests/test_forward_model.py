@@ -653,8 +653,10 @@ def test_run_full_pipeline_regression_guard_blocks_large_cep_increase(monkeypatc
     fm = _isolated_fm()
 
     # Add estimates with very high scatter → large cep_km
+    # Use per-frame cep_km that passes Stage 0 (< 20 km) but scatter
+    # across lat/lon so the combined centroid cep is huge, firing the regression guard.
     for i in range(25):
-        fm._add_frame_position(_TEST_IID, _make_frame_estimate(i, lat=51.0 + i * 0.5, lon=-1.0, cep_km=50.0, n_arcs=4))
+        fm._add_frame_position(_TEST_IID, _make_frame_estimate(i, lat=51.0 + i * 0.5, lon=-1.0, cep_km=10.0, n_arcs=4))
 
     result = fm.run_full_pipeline(_TEST_IID, state)
 

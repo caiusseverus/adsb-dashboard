@@ -64,6 +64,17 @@ _INTERSECTION_MAX_OBS_PER_ICAO = 4
 _PER_FRAME_MAX_OBS = 50           # relaxed cap for per-frame solving (each ICAO appears once per sweep)
 _PER_FRAME_MIN_CONTRIBUTING_ARCS = 4
 _PER_FRAME_MAX_CEP_KM = 100.0
+ACCUM_MAX_FRAME_CEP_KM = 20.0
+"""Maximum single-frame CEP admitted to long-term accumulation.
+
+This is deliberately much lower than the diagnostic per-frame display cap:
+high-CEP frame solves are useful to inspect, but should not dilute the
+long-term centroid merely because they claim large uncertainty.
+"""
+ACCUM_MIN_INLIER_PAIR_CIRCLES = 6
+ACCUM_MIN_SUPPORT_SCORE = 0.8
+ACCUM_MIN_SUPPORT_DOMINANCE_RATIO = 1.25
+ACCUM_MAX_PAIRWISE_WEIGHTED_RMS_DEG = 35.0
 _PER_FRAME_BUFFER_MAX = 5000
 _PER_FRAME_TRIM_FRACTION = 0.05   # drop outermost 5% by distance before centroid
 _INTERSECTION_CLUSTER_RADIUS_KM = 40.0       # bootstrap default; tightened adaptively once converged
@@ -90,6 +101,18 @@ _FRAME_REFERENCE_REPAIR_MIN_IMPROVEMENT_RATIO = 1.15
 _GOOD_FRAME_REFERENCE_SIGMA_DEG = 70.0
 _MAX_FRAME_REFERENCE_SIGMA_DEG = 105.0
 _MARGINAL_FRAME_WEIGHT_SCALE = 0.6
+_QUALITY_AMBIGUITY_THRESHOLD = 1.35
+_QUALITY_SUPPORT_SCALE = 1.0
+_QUALITY_COMPACTNESS_SCALE_KM = 15.0
+_QUALITY_COMPACTNESS_EXPONENT = 1.5
+_QUALITY_CONDITIONING_SCALE = 0.5
+_QUALITY_CONDITIONING_FLOOR = 0.01
+_QUALITY_DIVERSITY_SCALE = 0.3
+_QUALITY_MAX_REFINED_SUBSET = 30
+_QUALITY_GREEDY_MIN_EIGEN_GAIN = 0.005
+_QUALITY_NORMALIZED_RESIDUAL_INLIER = 2.5
+_QUALITY_DUPLICATE_BEARING_TOL_DEG = 3.0
+_QUALITY_PER_AIRCRAFT_CAP = 6
 _REFINE_MAX_MOVE_KM = 80.0
 _REFINE_MIN_IMPROVEMENT_RATIO = 1.05
 _MAX_FINAL_RESIDUAL_SIGMA_DEG = 35.0
@@ -192,6 +215,9 @@ class FramePositionEstimate:
     weight: float   # n_contributing_arcs / (cep_km + 0.5)**2
     cluster_dominance_ratio: float = 0.0
     interpolated_position_fraction: float = 0.0
+    best_cluster_support_score: float = 0.0
+    support_dominance_ratio: float = 0.0
+    pairwise_weighted_rms_deg: float = float("inf")
 
 
 @dataclass
@@ -210,6 +236,436 @@ class _PairwiseResidualFit:
     weighted_rms_deg: float
     n_residuals: int
     residuals_deg: list[float]
+
+
+def _cluster_inlier_circles(
+    cluster: _IntersectionCluster,
+    admitted_by_arr_index: list,
+    selected_rows: list[tuple],
+    cluster_radius_km: float,
+    max_normalized_residual: float = _QUALITY_NORMALIZED_RESIDUAL_INLIER,
+) -> tuple[list[int], list[float]]:
+    """Return indices of admitted circles consistent with a candidate cluster.
+
+    A circle is an inlier if:
+    - its normalized residual to the cluster centre is within threshold
+    - at least one of its intersection candidates lies within the cluster radius
+
+    Returns:
+        inlier_indices: admitted-array indices of inlier circles
+        all_residuals: normalized residuals for ALL admitted circles (indexed by admitted-array index)
+    """
+    inlier_indices: list[int] = []
+    residuals: list[float] = []
+
+    for idx, (sc, raw) in enumerate(zip(admitted_by_arr_index, selected_rows)):
+        cx_km, cy_km, R_km, _w, _brg, sigma_km, _idx = raw
+        sigma_km = max(float(sigma_km), 1e-6)
+        distance_to_centre = math.hypot(cluster.mean_x_km - cx_km, cluster.mean_y_km - cy_km)
+        normalized = abs(distance_to_centre - R_km) / sigma_km
+        residuals.append(normalized)
+        if normalized <= max_normalized_residual:
+            inlier_indices.append(idx)
+
+    return inlier_indices, residuals
+
+
+def _cluster_local_information_matrix(
+    candidate_x_km: float,
+    candidate_y_km: float,
+    inlier_indices: list[int],
+    admitted_by_arr_index: list,
+    selected_rows: list[tuple],
+    normalized_residuals: list[float],
+) -> tuple[np.ndarray, float, float, list[float]]:
+    """Build the 2x2 local information matrix from inlier circle normals.
+
+    For each inlier circle with centre C and candidate point P, the constraint
+    normal is the unit vector from C to P.  We accumulate weighted outer products:
+        J = sum_i w_i * n_i * n_i^T
+
+    Returns:
+        J: 2x2 numpy array
+        lambda_min: smallest eigenvalue
+        lambda_max: largest eigenvalue
+        weights: list of per-inlier weights
+    """
+    J = np.zeros((2, 2), dtype=np.float64)
+    weights: list[float] = []
+
+    for idx in inlier_indices:
+        sc = admitted_by_arr_index[idx]
+        raw = selected_rows[idx]
+        cx_km, cy_km = float(raw[0]), float(raw[1])
+        circle_score = float(sc.circle_score)
+
+        # Normal direction: from circle centre toward candidate point
+        dx = candidate_x_km - cx_km
+        dy = candidate_y_km - cy_km
+        norm = math.hypot(dx, dy)
+        if norm < 1e-9:
+            continue
+        nx, ny = dx / norm, dy / norm
+
+        # Weight combines circle score with residual consistency
+        residual = normalized_residuals[idx] if idx < len(normalized_residuals) else 3.0
+        residual_weight = math.exp(-0.5 * min(residual, 3.0) ** 2)
+        w = circle_score * residual_weight
+
+        weights.append(w)
+        # Accumulate outer product: w * n * n^T
+        J[0, 0] += w * nx * nx
+        J[0, 1] += w * nx * ny
+        J[1, 0] += w * ny * nx
+        J[1, 1] += w * ny * ny
+
+    # Eigenvalue analysis
+    if np.all(J == 0.0):
+        return J, 0.0, 0.0, weights
+
+    eigvals = np.linalg.eigvalsh(J)
+    lambda_min = float(eigvals[0])
+    lambda_max = float(eigvals[1])
+
+    return J, lambda_min, lambda_max, weights
+
+
+def _select_refined_cluster_subset(
+    candidate_x_km: float,
+    candidate_y_km: float,
+    inlier_indices: list[int],
+    admitted_by_arr_index: list,
+    selected_rows: list[tuple],
+    normalized_residuals: list[float],
+    max_subset_size: int = _QUALITY_MAX_REFINED_SUBSET,
+    min_eigen_gain: float = _QUALITY_GREEDY_MIN_EIGEN_GAIN,
+    per_aircraft_cap: int = _QUALITY_PER_AIRCRAFT_CAP,
+    duplicate_bearing_tol: float = _QUALITY_DUPLICATE_BEARING_TOL_DEG,
+) -> dict:
+    """Greedy marginal information gain selection for the best-supporting subset.
+
+    Start from the strongest inlier, then iteratively add the pair that maximizes
+    increase in lambda_min of the information matrix, subject to:
+    - normalized residual within threshold
+    - not a near-duplicate of already selected geometry
+    - per-aircraft redundancy control
+
+    Returns a dict with:
+        selected_indices: list of admitted indices in the refined subset
+        excluded_indices: list of inlier indices not selected
+        exclusion_reasons: dict mapping excluded index to reason
+        J_final: final 2x2 information matrix
+        lambda_min_final: final smallest eigenvalue
+        lambda_max_final: final largest eigenvalue
+    """
+    if not inlier_indices:
+        return {
+            "selected_indices": [],
+            "excluded_indices": [],
+            "exclusion_reasons": {},
+            "J_final": np.zeros((2, 2)),
+            "lambda_min_final": 0.0,
+            "lambda_max_final": 0.0,
+        }
+
+    # Sort inliers by circle score (descending) to seed from strongest
+    scored_inliers = sorted(
+        inlier_indices,
+        key=lambda idx: float(admitted_by_arr_index[idx].circle_score),
+        reverse=True,
+    )
+
+    selected_indices: list[int] = []
+    excluded_indices: list[int] = []
+    exclusion_reasons: dict[int, str] = {}
+    aircraft_counts: dict[str, int] = {}
+    selected_bearings: list[float] = []
+
+    # Track current information matrix incrementally
+    J = np.zeros((2, 2), dtype=np.float64)
+    lambda_min_current = 0.0
+
+    def _add_to_matrix(idx: int) -> None:
+        nonlocal J, lambda_min_current
+        sc = admitted_by_arr_index[idx]
+        raw = selected_rows[idx]
+        cx_km, cy_km = float(raw[0]), float(raw[1])
+
+        dx = candidate_x_km - cx_km
+        dy = candidate_y_km - cy_km
+        norm = math.hypot(dx, dy)
+        if norm < 1e-9:
+            return
+
+        nx, ny = dx / norm, dy / norm
+        residual = normalized_residuals[idx] if idx < len(normalized_residuals) else 3.0
+        residual_weight = math.exp(-0.5 * min(residual, 3.0) ** 2)
+        w = float(sc.circle_score) * residual_weight
+
+        J[0, 0] += w * nx * nx
+        J[0, 1] += w * nx * ny
+        J[1, 0] += w * ny * nx
+        J[1, 1] += w * ny * ny
+
+        eigvals = np.linalg.eigvalsh(J)
+        lambda_min_current = float(eigvals[0])
+
+    def _try_add(idx: int) -> tuple[bool, str]:
+        """Test whether adding idx would improve conditioning. Returns (ok, reason)."""
+        sc = admitted_by_arr_index[idx]
+        raw = selected_rows[idx]
+        cx_km, cy_km = float(raw[0]), float(raw[1])
+        residual = normalized_residuals[idx] if idx < len(normalized_residuals) else 3.0
+
+        # Check residual threshold
+        if residual > _QUALITY_NORMALIZED_RESIDUAL_INLIER:
+            return False, "high_residual"
+
+        # Check per-aircraft cap
+        icao_a = sc.icao_a
+        icao_b = sc.icao_b
+        if aircraft_counts.get(icao_a, 0) >= per_aircraft_cap:
+            return False, f"aircraft_cap_{icao_a}"
+        if aircraft_counts.get(icao_b, 0) >= per_aircraft_cap:
+            return False, f"aircraft_cap_{icao_b}"
+
+        # Check bearing diversity (not a near-duplicate)
+        midpoint_bearing = float(raw[4]) if len(raw) > 4 else 0.0
+        for sel_bearing in selected_bearings:
+            sep = abs((midpoint_bearing - sel_bearing + 180.0) % 360.0 - 180.0)
+            if sep < duplicate_bearing_tol:
+                return False, "duplicate_bearing"
+
+        # Check eigenvalue improvement
+        # Tentatively add and check gain
+        dx = candidate_x_km - cx_km
+        dy = candidate_y_km - cy_km
+        norm = math.hypot(dx, dy)
+        if norm < 1e-9:
+            return False, "degenerate_geometry"
+
+        nx, ny = dx / norm, dy / norm
+        residual_weight = math.exp(-0.5 * min(residual, 3.0) ** 2)
+        w = float(sc.circle_score) * residual_weight
+
+        J_test = J.copy()
+        J_test[0, 0] += w * nx * nx
+        J_test[0, 1] += w * nx * ny
+        J_test[1, 0] += w * ny * nx
+        J_test[1, 1] += w * ny * ny
+
+        eigvals = np.linalg.eigvalsh(J_test)
+        lambda_min_test = float(eigvals[0])
+        eigen_gain = lambda_min_test - lambda_min_current
+
+        if eigen_gain < min_eigen_gain and len(selected_indices) >= 2:
+            return False, "marginal_eigenvalue_gain"
+
+        return True, ""
+
+    def _commit_add(idx: int) -> None:
+        sc = admitted_by_arr_index[idx]
+        raw = selected_rows[idx]
+        aircraft_counts[sc.icao_a] = aircraft_counts.get(sc.icao_a, 0) + 1
+        aircraft_counts[sc.icao_b] = aircraft_counts.get(sc.icao_b, 0) + 1
+        midpoint_bearing = float(raw[4]) if len(raw) > 4 else 0.0
+        selected_bearings.append(midpoint_bearing)
+        selected_indices.append(idx)
+        _add_to_matrix(idx)
+
+    # Seed: start from the strongest inlier
+    if scored_inliers:
+        seed_idx = scored_inliers[0]
+        _commit_add(seed_idx)
+
+    # Greedy iteration
+    for candidate_idx in scored_inliers[1:]:
+        if len(selected_indices) >= max_subset_size:
+            # Remaining become excluded
+            remaining = [ci for ci in scored_inliers[scored_inliers.index(candidate_idx):] if ci not in {s for s in selected_indices}]
+            for ri in remaining:
+                excluded_indices.append(ri)
+                exclusion_reasons[ri] = "max_subset_size"
+            break
+
+        if candidate_idx in {s for s in selected_indices}:
+            continue
+
+        ok, reason = _try_add(candidate_idx)
+        if ok:
+            _commit_add(candidate_idx)
+        else:
+            excluded_indices.append(candidate_idx)
+            exclusion_reasons[candidate_idx] = reason
+
+    eigvals = np.linalg.eigvalsh(J)
+
+    return {
+        "selected_indices": selected_indices,
+        "excluded_indices": excluded_indices,
+        "exclusion_reasons": exclusion_reasons,
+        "J_final": J,
+        "lambda_min_final": float(eigvals[0]),
+        "lambda_max_final": float(eigvals[1]),
+    }
+
+
+def _score_cluster_quality(
+    candidate_x_km: float,
+    candidate_y_km: float,
+    inlier_indices: list[int],
+    normalized_residuals: list[float],
+    admitted_by_arr_index: list,
+    selected_rows: list[tuple],
+    plausible_candidates: list[_IntersectionCandidate],
+    cluster: _IntersectionCluster,
+) -> dict:
+    """Compute a combined cluster-quality score combining support, compactness,
+    conditioning, and diversity/independence.
+
+    Returns a dict with:
+        quality_score: combined quality score (higher is better)
+        support_score: circle support strength component
+        compactness_km: weighted RMS distance to cluster centre
+        conditioning_min_eigenvalue: lambda_min of information matrix
+        conditioning_max_eigenvalue: lambda_max
+        condition_number: lambda_max / lambda_min (lower is better)
+        inverse_condition_number: lambda_min / lambda_max (higher is better)
+        diversity_score: circular spread and independence measure
+        effective_aircraft_count: distinct aircraft in refined subset
+        effective_frame_count: distinct frames in refined subset
+        raw_inlier_count: number of raw inlier circles
+        refined_subset_count: number of refined subset circles
+        refined_subset: dict from _select_refined_cluster_subset
+    """
+    # A. Support: aggregate circle scores of inliers
+    support_total = 0.0
+    for idx in inlier_indices:
+        sc = admitted_by_arr_index[idx]
+        residual = normalized_residuals[idx] if idx < len(normalized_residuals) else 3.0
+        support = math.exp(-0.5 * min(residual, 3.0) ** 2)
+        support_total += float(sc.circle_score) * support
+
+    support_score = support_total
+
+    # B. Compactness: weighted RMS of intersection candidates to cluster centre
+    inlier_set = set(inlier_indices)
+    inlier_candidates = [
+        c for c in plausible_candidates
+        if c.arc_i in inlier_set and c.arc_j in inlier_set
+        and math.hypot(c.x_km - cluster.mean_x_km, c.y_km - cluster.mean_y_km) <= _INTERSECTION_CLUSTER_RADIUS_KM
+    ]
+
+    compactness_km = cluster.rms_km
+    if inlier_candidates:
+        total_w = sum(max(c.weight, 1e-9) for c in inlier_candidates)
+        weighted_sq = sum(
+            c.weight * ((c.x_km - cluster.mean_x_km) ** 2 + (c.y_km - cluster.mean_y_km) ** 2)
+            for c in inlier_candidates
+        )
+        compactness_km = math.sqrt(weighted_sq / total_w) if total_w > 0 else cluster.rms_km
+
+    # Compactness penalty: exp(-compactness / scale)^exponent
+    compactness_penalty = 1.0 - math.exp(
+        -(compactness_km / _QUALITY_COMPACTNESS_SCALE_KM) ** _QUALITY_COMPACTNESS_EXPONENT
+    )
+
+    # D. Diversity / independence: build refined subset first (needed for conditioning too)
+    refined = _select_refined_cluster_subset(
+        candidate_x_km, candidate_y_km,
+        inlier_indices, admitted_by_arr_index, selected_rows, normalized_residuals,
+    )
+
+    # C. Conditioning: from information matrix of the REFINED subset normals,
+    # not all raw inliers.  The spec requires the quality score to be based
+    # primarily on the refined supporting subset.
+    refined_indices = refined["selected_indices"]
+    if refined_indices:
+        _J_mat, lambda_min, lambda_max, _weights = _cluster_local_information_matrix(
+            candidate_x_km, candidate_y_km,
+            refined_indices, admitted_by_arr_index, selected_rows, normalized_residuals,
+        )
+    else:
+        # Fallback: no refined subset → use all inliers (degenerate case)
+        _J_mat, lambda_min, lambda_max, _weights = _cluster_local_information_matrix(
+            candidate_x_km, candidate_y_km,
+            inlier_indices, admitted_by_arr_index, selected_rows, normalized_residuals,
+        )
+
+    condition_number = lambda_max / lambda_min if lambda_min > _QUALITY_CONDITIONING_FLOOR else float("inf")
+    inverse_condition_number = lambda_min / lambda_max if lambda_max > 0 else 0.0
+
+    # Conditioning bonus: strong in both axes
+    conditioning_score = math.sqrt(max(0.0, lambda_min)) * (1.0 - 1.0 / (1.0 + inverse_condition_number))
+    conditioning_bonus = _QUALITY_CONDITIONING_SCALE * conditioning_score
+
+    # Diversity metrics from the refined subset
+    selected_idx_set = set(refined["selected_indices"])
+    distinct_aircraft: set[str] = set()
+    distinct_frames: set[int] = set()
+    bearings: list[float] = []
+
+    for idx in refined["selected_indices"]:
+        sc = admitted_by_arr_index[idx]
+        distinct_aircraft.add(sc.icao_a)
+        distinct_aircraft.add(sc.icao_b)
+        distinct_frames.add(int(sc.frame_index))
+        raw = selected_rows[idx]
+        if len(raw) > 4:
+            bearings.append(float(raw[4]))
+
+    effective_aircraft = len(distinct_aircraft)
+    effective_frames = len(distinct_frames)
+
+    # Diversity score: circular spread of bearings, normalized
+    bearing_spread = _circular_spread_deg(bearings) if bearings else 0.0
+    bearing_diversity = bearing_spread / 360.0
+
+    # Aircraft diversity bonus: more distinct aircraft = better
+    aircraft_diversity = min(1.0, effective_aircraft / 10.0)
+
+    diversity_score = 0.5 * bearing_diversity + 0.5 * aircraft_diversity
+    diversity_bonus = _QUALITY_DIVERSITY_SCALE * diversity_score
+
+    # E. Redundancy penalty: if refined subset is much smaller than raw inliers,
+    # it means many inliers were redundant
+    raw_inlier_count = len(inlier_indices)
+    refined_count = len(refined["selected_indices"])
+    redundancy_ratio = refined_count / raw_inlier_count if raw_inlier_count > 0 else 1.0
+
+    # Combined quality score
+    support_term = _QUALITY_SUPPORT_SCALE * (1.0 - math.exp(-support_score / 3.0))
+    compactness_term = 1.0 - compactness_penalty
+    quality_score = (
+        support_term
+        + compactness_term
+        + conditioning_bonus
+        + diversity_bonus
+    )
+
+    # Normalize to [0, ~4] range (each component contributes ~1 max)
+    return {
+        "quality_score": quality_score,
+        "support_score": support_score,
+        "compactness_km": compactness_km,
+        "compactness_penalty": compactness_penalty,
+        "conditioning_min_eigenvalue": lambda_min,
+        "conditioning_max_eigenvalue": lambda_max,
+        "condition_number": condition_number,
+        "inverse_condition_number": inverse_condition_number,
+        "conditioning_bonus": conditioning_bonus,
+        "diversity_score": diversity_score,
+        "bearing_spread_deg": bearing_spread,
+        "effective_aircraft_count": effective_aircraft,
+        "effective_frame_count": effective_frames,
+        "raw_inlier_count": raw_inlier_count,
+        "refined_subset_count": refined_count,
+        "refined_subset": refined,
+        "redundancy_ratio": redundancy_ratio,
+        "support_term": support_term,
+        "compactness_term": compactness_term,
+        "diversity_bonus": diversity_bonus,
+    }
 
 
 def _circular_spread_deg(angles_deg: list[float]) -> float:
@@ -835,7 +1291,7 @@ def _run_best_intersection_attempt(
             res = attempt["result"]
             successful_attempts[direction] = res
             rank = (
-                res.get("best_cluster_support_score", 0.0),
+                res.get("best_cluster_quality_score", 0.0),
                 res.get("n_inlier_pair_circles", res.get("n_contributing_arcs", 0)),
                 -res.get("pairwise_weighted_rms_deg", float("inf")),
                 -res.get("rms_km", float("inf")),
@@ -1301,29 +1757,6 @@ def _summarize_selected_observations(
     }
 
 
-def _passes_intersection_quality_gates(metrics: dict) -> tuple[bool, Optional[str]]:
-    if metrics.get("azimuth_spread_deg", 0.0) < _MIN_INTERSECTION_AZ_SPREAD_DEG:
-        return False, "azimuth_spread"
-    if metrics.get("high_quality_frames", 0) < _MIN_HIGH_QUALITY_FRAMES:
-        return False, "high_quality_frames"
-    if metrics.get("n_pairs", 0) < _MIN_INTERSECTION_PAIR_COUNT:
-        return False, "pair_count"
-    if metrics.get("interpolated_fraction", 1.0) > _MAX_INTERPOLATED_FRACTION:
-        return False, "interpolated_fraction"
-    if metrics.get("receiver_distance_m", 0.0) > (_MAX_INTERSECTION_RECEIVER_DISTANCE_NM * _NM_TO_M):
-        return False, "receiver_distance"
-    if (
-        metrics.get("intersection_direction") == "CCW"
-        and metrics.get("receiver_distance_m", 0.0) > (_MAX_CCW_INTERSECTION_RECEIVER_DISTANCE_NM * _NM_TO_M)
-    ):
-        return False, "ccw_receiver_distance"
-    if metrics.get("n_contributing_arcs", 0) < _MIN_CONTRIBUTING_ARCS:
-        return False, "n_contributing_arcs"
-    if metrics.get("dominance_ratio", 0.0) < _INTERSECTION_CLUSTER_DOMINANCE_RATIO:
-        return False, "cluster_dominance"
-    return True, None
-
-
 def score_candidate_position(
     r_lat: float,
     r_lon: float,
@@ -1463,6 +1896,27 @@ class ForwardModel:
         self._frame_positions_lock = threading.Lock()
         self._frame_positions_loaded: set[int] = set()  # IIDs whose DB rows have been loaded
 
+    @staticmethod
+    def _accumulation_rejection_reason(result: dict) -> Optional[str]:
+        """Return why a per-frame solve should not enter long-term accumulation."""
+        cep_km = float(result.get("centroid_uncertainty_km", float("inf")))
+        n_inliers = int(result.get("n_inlier_pair_circles", result.get("n_contributing_arcs", 0)))
+        support_score = float(result.get("best_cluster_support_score", 0.0))
+        dominance = float(result.get("support_dominance_ratio", result.get("dominance_ratio", 0.0)))
+        pairwise_rms = float(result.get("pairwise_weighted_rms_deg", float("inf")))
+
+        if n_inliers < ACCUM_MIN_INLIER_PAIR_CIRCLES:
+            return "too_few_inlier_pair_circles"
+        if not math.isfinite(cep_km) or cep_km >= ACCUM_MAX_FRAME_CEP_KM:
+            return "excessive_frame_cep"
+        if support_score < ACCUM_MIN_SUPPORT_SCORE:
+            return "poor_support_score"
+        if dominance < ACCUM_MIN_SUPPORT_DOMINANCE_RATIO:
+            return "poor_support_dominance"
+        if not math.isfinite(pairwise_rms) or pairwise_rms > ACCUM_MAX_PAIRWISE_WEIGHTED_RMS_DEG:
+            return "poor_pairwise_residual_rms"
+        return None
+
     def _ensure_airports(self, receiver_lat: float, receiver_lon: float) -> list[_AirportCandidate]:
         if self._airports_loaded:
             return self._airports
@@ -1520,13 +1974,13 @@ class ForwardModel:
                 continue
             r = result["result"]
             rank = (
-                r.get("best_cluster_support_score", 0.0),
+                r.get("best_cluster_quality_score", 0.0),
                 r.get("n_inlier_pair_circles", r.get("n_contributing_arcs", 0)),
                 -r.get("pairwise_weighted_rms_deg", float("inf")),
                 -r.get("rms_km", float("inf")),
             )
             best_rank = (
-                best.get("best_cluster_support_score", 0.0),
+                best.get("best_cluster_quality_score", 0.0),
                 best.get("n_inlier_pair_circles", best.get("n_contributing_arcs", 0)),
                 -best.get("pairwise_weighted_rms_deg", float("inf")),
                 -best.get("rms_km", float("inf")),
@@ -1556,8 +2010,11 @@ class ForwardModel:
             n_contributing_arcs=n_arcs,
             azimuth_spread_deg=azimuth_spread,
             weight=weight,
-            cluster_dominance_ratio=best.get("dominance_ratio", 0.0),
+            cluster_dominance_ratio=best.get("support_dominance_ratio", best.get("dominance_ratio", 0.0)),
             interpolated_position_fraction=best.get("interpolated_fraction", 0.0),
+            best_cluster_support_score=best.get("best_cluster_support_score", 0.0),
+            support_dominance_ratio=best.get("support_dominance_ratio", best.get("dominance_ratio", 0.0)),
+            pairwise_weighted_rms_deg=best.get("pairwise_weighted_rms_deg", float("inf")),
         )
 
     # ── Per-frame buffer helpers ─────────────────────────────────────────
@@ -1721,6 +2178,8 @@ class ForwardModel:
             "n_stage0_survivors": result.n_stage0_survivors,
             "n_inliers": result.n_inliers,
             "rejection_counts": result.rejection_counts,
+            "stage1_cluster_sigma_m": getattr(result, "stage1_cluster_sigma_m", None),
+            "stage1_abs_distance_cap_m": getattr(result, "stage1_abs_distance_cap_m", None),
         }
 
     # ── Airport hypothesis test ──────────────────────────────────────────
@@ -2144,6 +2603,8 @@ class ForwardModel:
         max_per_frame: int = _INTERSECTION_MAX_OBS_PER_FRAME,
         max_per_icao: int = _INTERSECTION_MAX_OBS_PER_ICAO,
         p_bar_enu_m: Optional[tuple[float, float]] = None,
+        manual_selected_circle_indices: Optional[set[int]] = None,
+        manually_forced_preview: bool = False,
     ) -> dict:
         """Run one intersection attempt and return result or detailed failure diagnostics."""
         R_KM = _R_EARTH / 1000.0
@@ -2275,18 +2736,14 @@ class ForwardModel:
                     detail["n_pairs"] += 1
                     detail["raw_candidate_count"] += 1
 
-        if len(raw_circles) < 2:
-            return {
-                "success": False,
-                "reason": "too few qualifying pairs",
-                "detail": detail,
-            }
-
         # Score all circles using the new scoring pipeline
         from .circle_scorer import compute_circle_scores, select_circles
         omega = 2.0 * math.pi / period_s  # radar rotation rate in rad/s
         scored = compute_circle_scores(raw_circles, p_bar_enu_m, omega)
         selected = select_circles(scored)
+        if manual_selected_circle_indices is not None:
+            requested = {int(idx) for idx in manual_selected_circle_indices}
+            selected = [sc for sc in selected if int(sc.circle_index) in requested]
         raw_by_index = {int(c["circle_index"]): c for c in raw_circles}
         gate_counts: dict[str, int] = {}
         for sc in scored:
@@ -2317,7 +2774,105 @@ class ForwardModel:
             "per_aircraft_cap_rejections": gate_counts.get("aircraft_cap", 0),
             "per_frame_cap_rejections": gate_counts.get("frame_cap", 0),
             "scores": [s.circle_score for s in selected],
+            "manual_selected_circle_indices": sorted(manual_selected_circle_indices) if manual_selected_circle_indices is not None else None,
+            "manually_forced_preview": bool(manually_forced_preview),
         }
+
+        def pairwise_residual_for_raw(raw: dict, lat: float, lon: float) -> float:
+            bearing_a = _bearing_deg(lat, lon, raw["lat_a"], raw["lon_a"])
+            bearing_b = _bearing_deg(lat, lon, raw["lat_b"], raw["lon_b"])
+            predicted_phase_deg = (bearing_b - bearing_a) % 360.0
+            dt_s = (raw["arrival_us_b"] - raw["arrival_us_a"]) / 1_000_000.0
+            observed_phase_deg = ((dt_s / period_s) * 360.0 * direction) % 360.0
+            return (observed_phase_deg - predicted_phase_deg + 540.0) % 360.0 - 180.0
+
+        def serialize_pair_circle(
+            sc,
+            *,
+            admitted_idx: Optional[int] = None,
+            inlier: bool = False,
+            normalized_residual: Optional[float] = None,
+            chosen_lat: Optional[float] = None,
+            chosen_lon: Optional[float] = None,
+        ) -> dict:
+            raw = raw_by_index.get(int(sc.circle_index), {})
+            pair_residual_deg = (
+                pairwise_residual_for_raw(raw, chosen_lat, chosen_lon)
+                if raw and chosen_lat is not None and chosen_lon is not None
+                else None
+            )
+            return {
+                "circle_index": int(sc.circle_index),
+                "admitted_index": admitted_idx,
+                "frame_index": int(sc.frame_index),
+                "icao_a": sc.icao_a,
+                "icao_b": sc.icao_b,
+                "circle_score": round(float(sc.circle_score), 6),
+                "intrinsic_weight": round(float(sc.intrinsic_weight), 6),
+                "prior_weight": round(float(sc.prior_weight), 6),
+                "phi_weight": round(float(sc.phi_weight), 6),
+                "uncertainty_weight": round(float(sc.uncertainty_weight), 6),
+                "reply_weight": round(float(sc.reply_weight), 6),
+                "age_weight": round(float(sc.age_weight), 6),
+                "sigma_band_metres": round(float(sc.sigma_band_metres), 3),
+                "pair_baseline_m": round(float(sc.pair_baseline_m), 3),
+                "delta_phi_deg": round(math.degrees(float(sc.delta_phi)), 3),
+                "interpolated_a": bool(sc.interpolated_a),
+                "interpolated_b": bool(sc.interpolated_b),
+                "n_replies_a": int(sc.n_replies_a),
+                "n_replies_b": int(sc.n_replies_b),
+                "position_age_a_seconds": round(float(sc.position_age_a_seconds), 3),
+                "position_age_b_seconds": round(float(sc.position_age_b_seconds), 3),
+                "pair_midpoint_bearing_deg": round(float(raw.get("rx_bearing", 0.0)), 3) if raw else None,
+                "selected": bool(sc.selected and (manual_selected_circle_indices is None or int(sc.circle_index) in manual_selected_circle_indices)),
+                "inlier": bool(inlier),
+                "normalized_residual": round(float(normalized_residual), 6) if normalized_residual is not None else None,
+                "pair_residual_deg": round(float(pair_residual_deg), 3) if pair_residual_deg is not None else None,
+                "exclusion_reason": sc.exclusion_reason,
+                "cx_km": round(float(raw["cx_km"]), 6) if raw else None,
+                "cy_km": round(float(raw["cy_km"]), 6) if raw else None,
+                "R_km": round(float(raw["R_km"]), 6) if raw else None,
+            }
+
+        def pair_circle_summary(inlier_count: int = 0) -> dict:
+            return {
+                "total_raw_pair_circles": len(raw_circles),
+                "total_scored_pair_circles": len(scored),
+                "total_admitted_pair_circles": len(selected),
+                "total_inlier_pair_circles": inlier_count,
+                "admitted_pairs_containing_reference": detail["selection_diagnostics"]["admitted_pairs_containing_reference"],
+                "admitted_pairs_not_containing_reference": detail["selection_diagnostics"]["admitted_pairs_not_containing_reference"],
+            }
+
+        def rejected_payload(status: str, reason: str, extra_detail: Optional[dict] = None) -> dict:
+            merged_detail = {**detail, **(extra_detail or {})}
+            return {
+                "success": False,
+                "available": True,
+                "solve_status": status,
+                "solve_reason": reason,
+                "reason": reason,
+                "admitted_pair_circles": [
+                    serialize_pair_circle(sc, admitted_idx=idx)
+                    for idx, sc in enumerate(selected)
+                ],
+                "scored_pair_circles": [
+                    serialize_pair_circle(sc)
+                    for sc in scored
+                ],
+                "candidate_intersections": merged_detail.get("candidate_intersections", []),
+                "candidate_clusters": merged_detail.get("candidate_clusters", []),
+                "pair_circle_summary": pair_circle_summary(),
+                "selection_diagnostics": detail["selection_diagnostics"],
+                "detail": merged_detail,
+            }
+
+        # Now that scoring and helpers are ready, check for early-rejection cases.
+        if len(selected) < 2:
+            return rejected_payload(
+                "rejected_too_few_admitted",
+                "too few circles after scoring and selection",
+            )
 
         # Build intersection input from selected circles
         selected_rows = []
@@ -2343,11 +2898,10 @@ class ForwardModel:
             dtype=np.float64,
         )  # (n, 7): cx, cy, R, w, pair_midpoint_bearing_deg, sigma_km, circle_index
         if len(arr) < 2:
-            return {
-                "success": False,
-                "reason": "too few circles after scoring and selection",
-                "detail": detail,
-            }
+            return rejected_payload(
+                "rejected_too_few_admitted",
+                "too few circles after scoring and selection",
+            )
         n_c = len(arr)
         cx_a = arr[:, 0]; cy_a = arr[:, 1]; R_a = arr[:, 2]; w_a = arr[:, 3]; brx_a = arr[:, 4]
         ii, jj = np.triu_indices(n_c, k=1)
@@ -2396,11 +2950,7 @@ class ForwardModel:
 
         detail["raw_candidate_count"] = len(candidates)
         if not candidates:
-            return {
-                "success": False,
-                "reason": "no circle intersections",
-                "detail": detail,
-            }
+            return rejected_payload("rejected_no_intersections", "no circle intersections")
 
         max_km = 700 * _NM_TO_M / 1000.0
         plausible = []
@@ -2421,21 +2971,26 @@ class ForwardModel:
             plausible.append(candidate)
         detail["endpoint_candidate_rejections"] = endpoint_rejections
         detail["plausible_candidate_count"] = len(plausible)
-        if not plausible:
-            return {
-                "success": False,
-                "reason": "all intersection candidates were implausibly distant",
-                "detail": detail,
+        detail["candidate_intersections"] = [
+            {
+                "x_km": round(candidate.x_km, 6),
+                "y_km": round(candidate.y_km, 6),
+                "weight": round(candidate.weight, 6),
+                "circle_index_a": int(selected_rows[candidate.arc_i][6]),
+                "circle_index_b": int(selected_rows[candidate.arc_j][6]),
             }
+            for candidate in plausible[:250]
+        ]
+        if not plausible:
+            return rejected_payload(
+                "rejected_all_candidates_implausible",
+                "all intersection candidates were implausibly distant",
+            )
 
         clusters = _build_intersection_clusters(plausible, cluster_radius_km=cluster_radius_km)
         detail["cluster_count"] = len(clusters)
         if not clusters:
-            return {
-                "success": False,
-                "reason": "candidate cloud was ambiguous",
-                "detail": detail,
-            }
+            return rejected_payload("rejected_ambiguous", "candidate cloud was ambiguous")
 
         def circle_support_at(x_km: float, y_km: float) -> tuple[float, list[float]]:
             support_total = 0.0
@@ -2450,77 +3005,227 @@ class ForwardModel:
             return support_total, residuals
 
         top_clusters = clusters[: min(8, len(clusters))]
-        ranked_clusters: list[tuple[float, float, _PairwiseResidualFit, _IntersectionCluster]] = []
-        for cluster in top_clusters:
-            candidate_support, _support_residuals = circle_support_at(cluster.mean_x_km, cluster.mean_y_km)
-            cand_lat, cand_lon = from_xy(cluster.mean_x_km, cluster.mean_y_km)
-            pairwise_fit = _score_candidate_position_pairwise(
-                cand_lat,
-                cand_lon,
-                scored,
-                raw_by_index,
-                period_s,
-                direction,
-            )
-            ranked_clusters.append((candidate_support, pairwise_fit.weighted_rms_deg, pairwise_fit, cluster))
 
-        max_support_score = max((item[0] for item in ranked_clusters), default=0.0)
-        supported_clusters = [
-            item for item in ranked_clusters
-            if item[0] >= max_support_score * _INTERSECTION_SUPPORT_KEEP_FRACTION
-        ]
-        ranked_clusters = supported_clusters or ranked_clusters
-        ranked_clusters.sort(key=lambda item: (-item[0], item[1], item[3].rms_km))
-        best_support_score, _best_pairwise_rms_deg, best_pairwise_fit, best_cluster = ranked_clusters[0]
-        if not math.isfinite(best_pairwise_fit.score):
+        # ── New cluster-quality scoring ─────────────────────────────────
+        # Rank clusters by the combined quality score (support + compactness
+        # + conditioning + diversity) rather than raw support alone.
+        quality_ranked: list[tuple[float, float, _PairwiseResidualFit, _IntersectionCluster, dict]] = []
+
+        for cluster in top_clusters:
+            candidate_x = cluster.mean_x_km
+            candidate_y = cluster.mean_y_km
+
+            # 1. Raw inlier circles for this cluster
+            inlier_idx, inlier_residuals = _cluster_inlier_circles(
+                cluster, admitted_by_arr_index, selected_rows, cluster_radius_km,
+            )
+
+            if not inlier_idx:
+                continue
+
+            # 2. Support score (existing metric, kept as a component)
+            candidate_support, _ = circle_support_at(candidate_x, candidate_y)
+
+            # 3. Pairwise residual fit
+            cand_lat, cand_lon = from_xy(candidate_x, candidate_y)
+            pairwise_fit = _score_candidate_position_pairwise(
+                cand_lat, cand_lon, selected, raw_by_index, period_s, direction,
+            )
+
+            # 4. Combined quality score
+            quality = _score_cluster_quality(
+                candidate_x, candidate_y,
+                inlier_idx, inlier_residuals,
+                admitted_by_arr_index, selected_rows,
+                plausible, cluster,
+            )
+
+            quality_ranked.append((
+                quality["quality_score"],
+                pairwise_fit.weighted_rms_deg,
+                pairwise_fit,
+                cluster,
+                quality,
+            ))
+
+        if not quality_ranked:
+            return rejected_payload("rejected_no_viable_clusters", "no clusters passed quality gates")
+
+        # Sort by quality score (descending), then pairwise RMS (ascending), then RMS (ascending)
+        quality_ranked.sort(key=lambda item: (-item[0], item[1], item[3].rms_km))
+
+        # ── Cluster serialization with full diagnostics ─────────────────
+        def serialize_cluster_v2(
+            rank: int,
+            item: tuple[float, float, _PairwiseResidualFit, _IntersectionCluster, dict],
+        ) -> dict:
+            quality_score, _pairwise_rms, pairwise_fit, cluster, quality = item
+            next_quality = quality_ranked[rank][0] if rank < len(quality_ranked) else 0.0
+            next_support = quality_ranked[rank][4]["support_score"] if rank < len(quality_ranked) else 0.0
+
+            contributing_admitted_indices = sorted(cluster.contributing_arc_indices)
+            contributing_circle_indices = [
+                int(selected_rows[idx][6])
+                for idx in contributing_admitted_indices
+                if 0 <= idx < len(selected_rows)
+            ]
+            cluster_lat, cluster_lon = from_xy(cluster.mean_x_km, cluster.mean_y_km)
+
+            # Refined subset circle indices
+            refined_indices = quality.get("refined_subset", {}).get("selected_indices", [])
+            refined_circle_indices = [
+                int(selected_rows[idx][6])
+                for idx in refined_indices
+                if 0 <= idx < len(selected_rows)
+            ]
+
+            # Excluded from refined subset with reasons
+            excluded_indices = quality.get("refined_subset", {}).get("excluded_indices", [])
+            exclusion_reasons = quality.get("refined_subset", {}).get("exclusion_reasons", {})
+            excluded_circle_details = []
+            for ex_idx in excluded_indices[:20]:  # cap for payload size
+                reason = exclusion_reasons.get(ex_idx, "unknown")
+                circle_idx = int(selected_rows[ex_idx][6]) if 0 <= ex_idx < len(selected_rows) else None
+                excluded_circle_details.append({"circle_index": circle_idx, "reason": reason})
+
             return {
-                "success": False,
-                "reason": "candidate cloud was ambiguous",
-                "detail": detail,
+                "cluster_rank": rank + 1,
+                "lat": round(cluster_lat, 6),
+                "lon": round(cluster_lon, 6),
+                "cluster_quality_score": round(quality_score, 6),
+                "cluster_support_score": round(quality["support_score"], 6),
+                "cluster_compactness_km": round(quality["compactness_km"], 3),
+                "cluster_conditioning_min_eigenvalue": round(quality["conditioning_min_eigenvalue"], 6),
+                "cluster_conditioning_max_eigenvalue": round(quality["conditioning_max_eigenvalue"], 6),
+                "cluster_condition_number": (
+                    round(quality["condition_number"], 3)
+                    if math.isfinite(quality["condition_number"]) else None
+                ),
+                "cluster_inverse_condition_number": round(quality["inverse_condition_number"], 6),
+                "cluster_diversity_score": round(quality["diversity_score"], 6),
+                "cluster_effective_aircraft_count": quality["effective_aircraft_count"],
+                "cluster_effective_frame_count": quality["effective_frame_count"],
+                "cluster_raw_inlier_count": quality["raw_inlier_count"],
+                "cluster_refined_subset_count": quality["refined_subset_count"],
+                "pairwise_fit_score": round(float(pairwise_fit.score), 6) if math.isfinite(pairwise_fit.score) else None,
+                "pairwise_weighted_rms_deg": round(float(pairwise_fit.weighted_rms_deg), 3) if math.isfinite(pairwise_fit.weighted_rms_deg) else None,
+                "quality_dominance_ratio": (
+                    round(quality_score / next_quality, 3)
+                    if next_quality > 0.0 else None
+                ),
+                "support_dominance_ratio": (
+                    round(quality["support_score"] / next_support, 3)
+                    if next_support > 0.0 else None
+                ),
+                "member_count": int(cluster.member_count),
+                "rms_km": round(float(cluster.rms_km), 3),
+                "contributing_pair_indices": contributing_circle_indices,
+                "contributing_circle_indices": contributing_circle_indices,
+                "refined_subset_circle_indices": refined_circle_indices,
+                "excluded_from_refined_subset": excluded_circle_details,
+                "inlier_pair_indices": [],
+                "is_selected_best": rank == 0,
             }
 
-        second_support_score = 0.0
+        detail["candidate_clusters"] = [
+            serialize_cluster_v2(rank, item)
+            for rank, item in enumerate(quality_ranked[:8])
+        ]
+
+        # ── Best cluster selection ──────────────────────────────────────
+        best_quality_score, _best_pairwise_rms_deg, best_pairwise_fit, best_cluster, best_quality = quality_ranked[0]
+
+        if not math.isfinite(best_pairwise_fit.score):
+            return rejected_payload("rejected_ambiguous", "best cluster has non-finite pairwise fit")
+
+        # ── Ambiguity decision using quality score ──────────────────────
+        second_quality_score = 0.0
         second_cluster: Optional[_IntersectionCluster] = None
-        if len(ranked_clusters) > 1:
-            second_support_score, _second_pairwise_rms_deg, _second_pairwise_fit, second_cluster = ranked_clusters[1]
-            support_ratio = (
-                best_support_score / second_support_score
-                if second_support_score > 0.0
-                else float("inf")
+        second_quality: Optional[dict] = None
+        if len(quality_ranked) > 1:
+            second_quality_score, _second_rms, _second_fit, second_cluster, second_quality = quality_ranked[1]
+
+        # The ambiguity test now uses the quality-score ratio, not just support ratio.
+        # A cluster is accepted when it is clearly better on the fuller quality measure.
+        quality_ratio = (
+            best_quality_score / second_quality_score
+            if second_quality_score > 0.0
+            else float("inf")
+        )
+
+        # Also check support ratio as a secondary guard (preserve backward compatibility)
+        best_support_from_quality = best_quality["support_score"]
+        second_support_from_quality = second_quality["support_score"] if second_quality else 0.0
+        support_ratio = (
+            best_support_from_quality / second_support_from_quality
+            if second_support_from_quality > 0.0
+            else float("inf")
+        )
+
+        # Adaptive ambiguity threshold: for small frames with few inlier circles,
+        # the quality scores of competing clusters are naturally closer.
+        # Lower the threshold when the best cluster has strong absolute quality.
+        raw_inlier_count = best_quality["raw_inlier_count"]
+        if raw_inlier_count >= 8:
+            effective_threshold = _QUALITY_AMBIGUITY_THRESHOLD
+        elif raw_inlier_count >= 4:
+            # Interpolate between 1.15 and _QUALITY_AMBIGUITY_THRESHOLD
+            t = (raw_inlier_count - 4) / 4.0
+            effective_threshold = 1.15 + t * (_QUALITY_AMBIGUITY_THRESHOLD - 1.15)
+        else:
+            effective_threshold = 1.15
+
+        # If best cluster has very strong absolute quality, accept even with closer ratio
+        if best_quality_score >= 2.0 and quality_ratio >= 1.1:
+            effective_threshold = 1.05
+
+        # Reject as ambiguous only when BOTH quality and support fail to separate clearly.
+        # This allows a tight, well-conditioned cluster to win over a broader one even
+        # when raw support is similar.
+        is_ambiguous = False
+        ambiguity_reason = ""
+
+        if quality_ratio < effective_threshold:
+            # Quality scores are close — check if the second cluster is actually competitive
+            if second_cluster is not None:
+                # Additional guard: second cluster must also have meaningful total weight
+                if second_cluster.total_weight >= best_cluster.total_weight * _INTERSECTION_SECONDARY_WEIGHT_FRACTION:
+                    is_ambiguous = True
+                    ambiguity_reason = (
+                        f"quality ratio {quality_ratio:.2f} below threshold {effective_threshold:.2f}"
+                    )
+
+        if is_ambiguous and not manually_forced_preview:
+            return rejected_payload(
+                "rejected_ambiguous",
+                f"candidate cloud was ambiguous: {ambiguity_reason}",
+                {
+                    "quality_ratio": round(quality_ratio, 3),
+                    "support_ratio": round(support_ratio, 3),
+                    "best_quality_score": round(best_quality_score, 6),
+                    "second_quality_score": round(second_quality_score, 6),
+                    "cluster_count": len(clusters),
+                },
             )
-            if (
-                second_cluster is not None
-                and support_ratio < _INTERSECTION_FIT_DOMINANCE_RATIO
-                and second_cluster.total_weight >= best_cluster.total_weight * _INTERSECTION_SECONDARY_WEIGHT_FRACTION
-            ):
-                return {
-                    "success": False,
-                    "reason": "candidate cloud was ambiguous",
-                    "detail": {
-                        **detail,
-                        "support_dominance_ratio": support_ratio,
-                        "cluster_count": len(clusters),
-                    },
-                }
 
         lat, lon = from_xy(best_cluster.mean_x_km, best_cluster.mean_y_km)
         receiver_distance_m = _haversine_m(origin_lat, origin_lon, lat, lon)
         detail["receiver_distance_m"] = receiver_distance_m
         dominance_ratio = (
-            best_support_score / second_support_score
-            if second_support_score > 0.0
+            best_quality_score / second_quality_score
+            if second_quality_score > 0.0
             else float("inf")
         )
         _best_support_check, normalized_residuals = circle_support_at(best_cluster.mean_x_km, best_cluster.mean_y_km)
-        inlier_indices = {
+        inlier_indices_set = {
             idx for idx, residual in enumerate(normalized_residuals)
             if residual <= 2.5
         }
-        inlier_circles = [admitted_by_arr_index[idx] for idx in sorted(inlier_indices)]
+        inlier_circles = [admitted_by_arr_index[idx] for idx in sorted(inlier_indices_set)]
         inlier_candidates = [
             candidate
             for candidate in plausible
-            if candidate.arc_i in inlier_indices and candidate.arc_j in inlier_indices
+            if candidate.arc_i in inlier_indices_set and candidate.arc_j in inlier_indices_set
             and math.hypot(candidate.x_km - best_cluster.center_x_km, candidate.y_km - best_cluster.center_y_km) <= cluster_radius_km
         ]
         n_contributing_arcs = len(inlier_circles)
@@ -2545,71 +3250,61 @@ class ForwardModel:
         # Compute summary stats from inlier admitted circles.
         n_selected = len(selected)
         total_weight = sum(s.circle_score for s in selected)
-        inlier_bearings = [float(selected_rows[idx][4]) for idx in inlier_indices]
+        inlier_bearings = [float(selected_rows[idx][4]) for idx in inlier_indices_set]
         az_spread = _circular_spread_deg(inlier_bearings)
         interp_frac = (
             sum(1 for s in inlier_circles if s.interpolated_a or s.interpolated_b) / len(inlier_circles)
             if inlier_circles else 1.0
         )
         inlier_residual_summary = {
-            "min": min((normalized_residuals[idx] for idx in inlier_indices), default=None),
+            "min": min((normalized_residuals[idx] for idx in inlier_indices_set), default=None),
             "mean": (
-                sum(normalized_residuals[idx] for idx in inlier_indices) / len(inlier_indices)
-                if inlier_indices else None
+                sum(normalized_residuals[idx] for idx in inlier_indices_set) / len(inlier_indices_set)
+                if inlier_indices_set else None
             ),
-            "max": max((normalized_residuals[idx] for idx in inlier_indices), default=None),
+            "max": max((normalized_residuals[idx] for idx in inlier_indices_set), default=None),
         }
-
-        def pairwise_residual_for_raw(raw: dict) -> float:
-            bearing_a = _bearing_deg(lat, lon, raw["lat_a"], raw["lon_a"])
-            bearing_b = _bearing_deg(lat, lon, raw["lat_b"], raw["lon_b"])
-            predicted_phase_deg = (bearing_b - bearing_a) % 360.0
-            dt_s = (raw["arrival_us_b"] - raw["arrival_us_a"]) / 1_000_000.0
-            observed_phase_deg = ((dt_s / period_s) * 360.0 * direction) % 360.0
-            return (observed_phase_deg - predicted_phase_deg + 540.0) % 360.0 - 180.0
-
-        def serialize_pair_circle(sc, admitted_idx: int, inlier: bool) -> dict:
-            raw = raw_by_index.get(int(sc.circle_index), {})
-            normalized = normalized_residuals[admitted_idx] if admitted_idx < len(normalized_residuals) else None
-            pair_residual_deg = pairwise_residual_for_raw(raw) if raw else None
-            return {
-                "circle_index": int(sc.circle_index),
-                "frame_index": int(sc.frame_index),
-                "icao_a": sc.icao_a,
-                "icao_b": sc.icao_b,
-                "circle_score": round(float(sc.circle_score), 6),
-                "intrinsic_weight": round(float(sc.intrinsic_weight), 6),
-                "prior_weight": round(float(sc.prior_weight), 6),
-                "sigma_band_metres": round(float(sc.sigma_band_metres), 3),
-                "pair_baseline_m": round(float(sc.pair_baseline_m), 3),
-                "delta_phi_deg": round(math.degrees(float(sc.delta_phi)), 3),
-                "interpolated_a": bool(sc.interpolated_a),
-                "interpolated_b": bool(sc.interpolated_b),
-                "n_replies_a": int(sc.n_replies_a),
-                "n_replies_b": int(sc.n_replies_b),
-                "position_age_a_seconds": round(float(sc.position_age_a_seconds), 3),
-                "position_age_b_seconds": round(float(sc.position_age_b_seconds), 3),
-                "pair_midpoint_bearing_deg": round(float(raw.get("rx_bearing", 0.0)), 3) if raw else None,
-                "inlier": inlier,
-                "normalized_residual": round(float(normalized), 6) if normalized is not None else None,
-                "pair_residual_deg": round(float(pair_residual_deg), 3) if pair_residual_deg is not None else None,
-                "cx_km": round(float(raw["cx_km"]), 6) if raw else None,
-                "cy_km": round(float(raw["cy_km"]), 6) if raw else None,
-                "R_km": round(float(raw["R_km"]), 6) if raw else None,
-            }
+        inlier_circle_indices = [
+            int(selected_rows[idx][6])
+            for idx in sorted(inlier_indices_set)
+            if 0 <= idx < len(selected_rows)
+        ]
+        for cluster_row in detail["candidate_clusters"]:
+            cluster_row["inlier_pair_indices"] = [
+                idx for idx in cluster_row["contributing_circle_indices"]
+                if idx in inlier_circle_indices
+            ]
 
         admitted_pair_circles = [
-            serialize_pair_circle(sc, idx, idx in inlier_indices)
+            serialize_pair_circle(
+                sc,
+                admitted_idx=idx,
+                inlier=idx in inlier_indices_set,
+                normalized_residual=normalized_residuals[idx] if idx < len(normalized_residuals) else None,
+                chosen_lat=lat,
+                chosen_lon=lon,
+            )
             for idx, sc in enumerate(admitted_by_arr_index)
         ]
         inlier_pair_circles = [
             row for row in admitted_pair_circles if row["inlier"]
         ]
 
+        # Refined subset details from quality scoring
+        refined_subset = best_quality.get("refined_subset", {})
+        refined_circle_indices = [
+            int(selected_rows[idx][6])
+            for idx in refined_subset.get("selected_indices", [])
+            if 0 <= idx < len(selected_rows)
+        ]
+
         detail["selection_diagnostics"].update({
-            "best_cluster_support_score": best_support_score,
+            "best_cluster_quality_score": round(best_quality_score, 6),
+            "best_cluster_support_score": round(best_quality["support_score"], 6),
             "inlier_circle_count": n_contributing_arcs,
             "total_inlier_pair_circles": n_contributing_arcs,
+            "refined_subset_count": len(refined_circle_indices),
+            "refined_subset_circle_indices": refined_circle_indices,
             "inlier_residual_summary": inlier_residual_summary,
             "pairwise_fit_score": best_pairwise_fit.score,
             "pairwise_weighted_rms_deg": best_pairwise_fit.weighted_rms_deg,
@@ -2618,6 +3313,13 @@ class ForwardModel:
 
         return {
             "success": True,
+            "available": True,
+            "solve_status": "success",
+            "solve_reason": "success",
+            "manually_forced_preview": bool(manually_forced_preview),
+            "automatic_acceptance_status": (
+                "would_be_rejected_ambiguous" if manually_forced_preview and quality_ratio < effective_threshold else "accepted"
+            ),
             "result": {
                 "lat": lat,
                 "lon": lon,
@@ -2638,19 +3340,21 @@ class ForwardModel:
                 "cluster_best_weight": best_cluster.total_weight,
                 "cluster_second_weight": second_cluster.total_weight if second_cluster is not None else 0.0,
                 "dominance_ratio": dominance_ratio,
-                "support_dominance_ratio": dominance_ratio,
+                "support_dominance_ratio": support_ratio,
+                "quality_ratio": quality_ratio,
                 "receiver_distance_m": receiver_distance_m,
                 "selection_diagnostics": detail["selection_diagnostics"],
                 "admitted_pair_circles": admitted_pair_circles,
                 "inlier_pair_circles": inlier_pair_circles,
-                "pair_circle_summary": {
-                    "total_raw_pair_circles": len(raw_circles),
-                    "total_scored_pair_circles": len(scored),
-                    "total_admitted_pair_circles": len(admitted_pair_circles),
-                    "total_inlier_pair_circles": len(inlier_pair_circles),
-                    "admitted_pairs_containing_reference": detail["selection_diagnostics"]["admitted_pairs_containing_reference"],
-                    "admitted_pairs_not_containing_reference": detail["selection_diagnostics"]["admitted_pairs_not_containing_reference"],
-                },
+                "refined_subset_circle_indices": refined_circle_indices,
+                "scored_pair_circles": [serialize_pair_circle(sc) for sc in scored],
+                "candidate_intersections": detail.get("candidate_intersections", []),
+                "candidate_clusters": detail.get("candidate_clusters", []),
+                "manually_forced_preview": bool(manually_forced_preview),
+                "automatic_acceptance_status": (
+                    "would_be_rejected_ambiguous" if manually_forced_preview and quality_ratio < effective_threshold else "accepted"
+                ),
+                "pair_circle_summary": pair_circle_summary(len(inlier_pair_circles)),
                 "raw_candidate_count": detail["raw_candidate_count"],
                 "plausible_candidate_count": detail["plausible_candidate_count"],
                 "degenerate_baseline_pairs": detail["degenerate_baseline_pairs"],
@@ -2661,8 +3365,23 @@ class ForwardModel:
                 "pairwise_mean_residual_deg": best_pairwise_fit.mean_residual_deg,
                 "pairwise_residual_sigma_deg": best_pairwise_fit.residual_sigma_deg,
                 "pairwise_weighted_rms_deg": best_pairwise_fit.weighted_rms_deg,
-                "best_cluster_support_score": best_support_score,
-                "second_cluster_support_score": second_support_score,
+                "best_cluster_quality_score": round(best_quality_score, 6),
+                "best_cluster_support_score": round(best_quality["support_score"], 6),
+                "best_cluster_compactness_km": round(best_quality["compactness_km"], 3),
+                "best_cluster_conditioning_min_eigenvalue": round(best_quality["conditioning_min_eigenvalue"], 6),
+                "best_cluster_conditioning_max_eigenvalue": round(best_quality["conditioning_max_eigenvalue"], 6),
+                "best_cluster_condition_number": (
+                    round(best_quality["condition_number"], 3)
+                    if math.isfinite(best_quality["condition_number"]) else None
+                ),
+                "best_cluster_inverse_condition_number": round(best_quality["inverse_condition_number"], 6),
+                "best_cluster_diversity_score": round(best_quality["diversity_score"], 6),
+                "best_cluster_effective_aircraft_count": best_quality["effective_aircraft_count"],
+                "best_cluster_effective_frame_count": best_quality["effective_frame_count"],
+                "best_cluster_raw_inlier_count": best_quality["raw_inlier_count"],
+                "best_cluster_refined_subset_count": best_quality["refined_subset_count"],
+                "second_cluster_quality_score": round(second_quality_score, 6) if second_quality else 0.0,
+                "second_cluster_support_score": round(second_quality["support_score"], 6) if second_quality else 0.0,
                 "inlier_residual_summary": inlier_residual_summary,
                 "cluster_radius_km": cluster_radius_km,
             },

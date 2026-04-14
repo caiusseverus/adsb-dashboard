@@ -2450,6 +2450,7 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
         admitted_pair_circles: list[dict] = []
         inlier_pair_circles: list[dict] = []
         pair_circle_summary: dict = {}
+        candidate_clusters: list[dict] = []
         diagnostics: dict = {}
         frame_lat = None
         frame_lon = None
@@ -2482,11 +2483,18 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
             if not solve_result.get("success"):
                 frame_solve_reason = solve_result.get("reason", "unknown")
                 diagnostics = solve_result.get("detail", {}).get("selection_diagnostics", {})
+                # Extract pair/cluster diagnostics from the rejected payload so the UI
+                # can render admitted pairs, scored pairs, and candidate clusters even
+                # when the automatic solver rejects the frame.
+                admitted_pair_circles = solve_result.get("admitted_pair_circles", [])
+                pair_circle_summary = solve_result.get("pair_circle_summary", {})
+                candidate_clusters = solve_result.get("candidate_clusters", [])
             else:
                 result = solve_result["result"]
                 admitted_pair_circles = result.get("admitted_pair_circles", [])
                 inlier_pair_circles = result.get("inlier_pair_circles", [])
                 pair_circle_summary = result.get("pair_circle_summary", {})
+                candidate_clusters = result.get("candidate_clusters", [])
                 diagnostics = result.get("selection_diagnostics", {})
                 raw_cep = solve_result["result"].get("centroid_uncertainty_km")
                 raw_arcs = solve_result["result"].get("n_contributing_arcs", 0)
@@ -2585,9 +2593,125 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
             "frame_n_arcs": frame_n_arcs,
             "frame_n_inlier_pair_circles": frame_n_arcs,
             "frame_solve_reason": frame_solve_reason,
+            "candidate_clusters": candidate_clusters,
+            "scored_pair_circles": solve_result.get("scored_pair_circles", []) if not solve_result.get("success") else result.get("scored_pair_circles", []),
         }
     finally:
         _record_api_timing("iid_sweep_frame_fm_geometry", t0)
+
+
+@router.post("/iids/{iid}/sweep-frames/{frame_index}/fm-geometry/manual-preview")
+async def post_iid_sweep_frame_fm_geometry_manual_preview(
+    iid: int,
+    frame_index: int,
+    body: dict,
+):
+    """Run a manual preview solve using only a user-selected subset of admitted pairs.
+
+    This endpoint never writes to the accumulation buffer or the stored FM position.
+    It returns the same diagnostic shape as the normal fm-geometry endpoint so the
+    UI can overlay the preview result on the map.
+    """
+    t0 = time.perf_counter()
+    try:
+        if _state is None:
+            return {"iid": iid, "frame_index": frame_index, "available": False, "reason": "radar module not initialised"}
+
+        model = _state.get_rotation_model(iid)
+        if model is None or model.period_s is None:
+            return {"iid": iid, "frame_index": frame_index, "available": False, "reason": "rotation model with period required"}
+
+        frame = next((f for f in _state.get_sweep_frames(iid) if f.frame_index == frame_index), None)
+        if frame is None:
+            return {"iid": iid, "frame_index": frame_index, "available": False, "reason": "frame not found"}
+        if not frame.observations:
+            return {"iid": iid, "frame_index": frame_index, "available": False, "reason": "frame has no observations"}
+
+        direction = int(body.get("direction", 1))
+        selected_circle_indices = body.get("selected_circle_indices", [])
+        if not selected_circle_indices:
+            return {"iid": iid, "frame_index": frame_index, "available": False, "reason": "no selected_circle_indices provided"}
+
+        sweep_direction = 1 if direction >= 0 else -1
+        import config as _config
+        from .forward_model import ForwardModel
+        recv_lat = getattr(_config, "RECEIVER_LAT", None)
+        recv_lon = getattr(_config, "RECEIVER_LON", None)
+        if recv_lat is None or recv_lon is None:
+            return {"iid": iid, "frame_index": frame_index, "available": False, "reason": "receiver coordinates not configured"}
+
+        solve_result = ForwardModel._solve_by_intersection_attempt(
+            [frame],
+            model.period_s,
+            recv_lat,
+            recv_lon,
+            direction=sweep_direction,
+            max_per_frame=50,
+            max_per_icao=50,
+            manual_selected_circle_indices=set(int(idx) for idx in selected_circle_indices),
+            manually_forced_preview=True,
+        )
+
+        # Reuse the same extraction logic as the GET endpoint
+        admitted_pair_circles = []
+        inlier_pair_circles = []
+        pair_circle_summary = {}
+        candidate_clusters = []
+        diagnostics = {}
+        frame_lat = None
+        frame_lon = None
+        frame_cep_km = None
+        frame_n_arcs = None
+        frame_solve_reason = None
+
+        if not solve_result.get("success"):
+            frame_solve_reason = solve_result.get("reason", "unknown")
+            diagnostics = solve_result.get("detail", {}).get("selection_diagnostics", {})
+            admitted_pair_circles = solve_result.get("admitted_pair_circles", [])
+            pair_circle_summary = solve_result.get("pair_circle_summary", {})
+            candidate_clusters = solve_result.get("candidate_clusters", [])
+        else:
+            result = solve_result["result"]
+            admitted_pair_circles = result.get("admitted_pair_circles", [])
+            inlier_pair_circles = result.get("inlier_pair_circles", [])
+            pair_circle_summary = result.get("pair_circle_summary", {})
+            diagnostics = result.get("selection_diagnostics", {})
+            candidate_clusters = result.get("candidate_clusters", [])
+            raw_cep = result.get("centroid_uncertainty_km")
+            raw_arcs = result.get("n_contributing_arcs", 0)
+            frame_lat = result.get("lat")
+            frame_lon = result.get("lon")
+            if raw_cep is not None:
+                frame_cep_km = raw_cep
+                frame_n_arcs = raw_arcs
+
+        return {
+            "iid": iid,
+            "frame_index": frame.frame_index,
+            "available": True,
+            "direction": "CW" if sweep_direction == 1 else "CCW",
+            "period_s": model.period_s,
+            "quality": frame.quality,
+            "ref_icao": frame.ref_icao,
+            "n_aircraft": 1 + len(frame.observations),
+            "selection_diagnostics": diagnostics,
+            "observations": admitted_pair_circles,
+            "admitted_pair_circles": admitted_pair_circles,
+            "inlier_pair_circles": inlier_pair_circles,
+            "pair_circle_summary": pair_circle_summary,
+            "candidate_clusters": candidate_clusters,
+            "frame_lat": round(frame_lat, 6) if frame_lat is not None else None,
+            "frame_lon": round(frame_lon, 6) if frame_lon is not None else None,
+            "frame_cep_km": round(frame_cep_km, 2) if frame_cep_km is not None else None,
+            "frame_n_arcs": frame_n_arcs,
+            "frame_n_inlier_pair_circles": frame_n_arcs,
+            "frame_solve_reason": frame_solve_reason,
+            "scored_pair_circles": solve_result.get("scored_pair_circles", []),
+            "manually_forced_preview": True,
+            "automatic_acceptance_status": solve_result.get("automatic_acceptance_status", "accepted"),
+        }
+    finally:
+        _record_api_timing("iid_sweep_frame_fm_geometry_manual_preview", t0)
 
 
 @router.get("/iids/{iid}/reference-aircraft")
