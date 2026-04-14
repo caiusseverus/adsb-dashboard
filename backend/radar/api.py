@@ -2469,6 +2469,9 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
         frame_n_arcs = None
         frame_solve_reason = None
         solve_result = None
+        would_accumulate = None
+        accumulation_rejection_reason = None
+        accumulation_gate_metrics: Optional[dict] = None
 
         def from_receiver_xy(x_km: float, y_km: float) -> tuple[float, float]:
             if recv_lat is None or recv_lon is None:
@@ -2500,6 +2503,33 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
                 admitted_pair_circles = solve_result.get("admitted_pair_circles", [])
                 pair_circle_summary = solve_result.get("pair_circle_summary", {})
                 candidate_clusters = solve_result.get("candidate_clusters", [])
+                # Even on solver rejection, check accumulation admission against the
+                # best candidate cluster if available.
+                from .forward_model import ForwardModel
+                _clusters = solve_result.get("candidate_clusters", [])
+                if _clusters:
+                    best_cluster = _clusters[0]
+                    second_cluster = _clusters[1] if len(_clusters) > 1 else {}
+                    _synthetic_result = {
+                        "centroid_uncertainty_km": best_cluster.get("cluster_compactness_km"),
+                        "n_inlier_pair_circles": best_cluster.get("cluster_raw_inlier_count"),
+                        "n_contributing_arcs": best_cluster.get("member_count"),
+                        "best_cluster_support_score": best_cluster.get("cluster_support_score"),
+                        "support_dominance_ratio": best_cluster.get("support_dominance_ratio"),
+                        "pairwise_weighted_rms_deg": best_cluster.get("pairwise_weighted_rms_deg"),
+                        "cluster_member_count": best_cluster.get("member_count", 0),
+                        "second_cluster_member_count": second_cluster.get("member_count", 0),
+                        "member_dominance_ratio": best_cluster.get("member_dominance_ratio"),
+                        "weight_dominance_ratio": (
+                            best_cluster.get("cluster_total_weight", 0.0) / second_cluster.get("cluster_total_weight", 1.0)
+                            if second_cluster.get("cluster_total_weight", 0.0) > 0.0 else float("inf")
+                        ),
+                    }
+                    _rej, _tier = ForwardModel._classify_frame_for_accumulation(_synthetic_result)
+                    accumulation_rejection = _rej
+                    would_accumulate = _rej is None
+                    accumulation_rejection_reason = _rej
+                    accumulation_gate_metrics = {**_synthetic_result, "admission_tier": _tier}
             else:
                 result = solve_result["result"]
                 admitted_pair_circles = result.get("admitted_pair_circles", [])
@@ -2509,9 +2539,36 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
                 diagnostics = result.get("selection_diagnostics", {})
                 raw_cep = solve_result["result"].get("centroid_uncertainty_km")
                 raw_arcs = solve_result["result"].get("n_contributing_arcs", 0)
-                # Apply the same quality gates the centroid accumulator uses.
-                # cep_km < 0.05 km is a solver artifact (perfectly coincident
-                # intersection points from degenerate geometry).
+                # Check accumulation admission regardless of per-frame display gates.
+                # This tells us whether the frame would enter the centroid buffer.
+                # The centroid accumulator uses _classify_frame_for_accumulation(), which
+                # enforces a tiered admission policy: high-confidence frames must pass all
+                # quality gates; geometry-dominant frames bypass noisy pairwise RMS when
+                # member/weight dominance is strong.
+                from .forward_model import ForwardModel
+                _rej, _tier = ForwardModel._classify_frame_for_accumulation(result)
+                accumulation_rejection = _rej
+                would_accumulate = _rej is None
+                accumulation_rejection_reason = _rej
+                accumulation_gate_metrics = {
+                    "centroid_uncertainty_km": result.get("centroid_uncertainty_km"),
+                    "n_inlier_pair_circles": result.get("n_inlier_pair_circles", result.get("n_contributing_arcs", 0)),
+                    "best_cluster_support_score": result.get("best_cluster_support_score"),
+                    "support_dominance_ratio": result.get("support_dominance_ratio"),
+                    "pairwise_weighted_rms_deg": result.get("pairwise_weighted_rms_deg"),
+                    "cluster_member_count": result.get("cluster_member_count", 0),
+                    "second_cluster_member_count": result.get("second_cluster_member_count", 0),
+                    "member_dominance_ratio": result.get("member_dominance_ratio"),
+                    "weight_dominance_ratio": result.get("weight_dominance_ratio"),
+                    "admission_tier": _tier,
+                }
+
+                # Per-frame display gate: only the diagnostic thresholds required to
+                # show a location and CEP on the UI.  This is intentionally more
+                # permissive than the accumulation gate so operators can still inspect
+                # the geometry of marginal frames.  cep_km < 0.05 km is a solver
+                # artifact (perfectly coincident intersection points from degenerate
+                # geometry).
                 if raw_cep is not None and raw_cep >= MIN_CEP_KM and raw_arcs >= _PER_FRAME_MIN_CONTRIBUTING_ARCS and raw_cep < _PER_FRAME_MAX_CEP_KM:
                     frame_lat = solve_result["result"].get("lat")
                     frame_lon = solve_result["result"].get("lon")
@@ -2604,6 +2661,9 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
             "frame_n_arcs": frame_n_arcs,
             "frame_n_inlier_pair_circles": frame_n_arcs,
             "frame_solve_reason": frame_solve_reason,
+            "would_accumulate": would_accumulate,
+            "accumulation_rejection_reason": accumulation_rejection_reason,
+            "accumulation_gate_metrics": accumulation_gate_metrics,
             "candidate_clusters": candidate_clusters,
             "scored_pair_circles": solve_result.get("scored_pair_circles", []) if not solve_result.get("success") else result.get("scored_pair_circles", []),
         }
@@ -2674,6 +2734,9 @@ async def post_iid_sweep_frame_fm_geometry_manual_preview(
         frame_cep_km = None
         frame_n_arcs = None
         frame_solve_reason = None
+        would_accumulate = None
+        accumulation_rejection_reason = None
+        accumulation_gate_metrics: Optional[dict] = None
 
         if not solve_result.get("success"):
             frame_solve_reason = solve_result.get("reason", "unknown")
@@ -2681,6 +2744,33 @@ async def post_iid_sweep_frame_fm_geometry_manual_preview(
             admitted_pair_circles = solve_result.get("admitted_pair_circles", [])
             pair_circle_summary = solve_result.get("pair_circle_summary", {})
             candidate_clusters = solve_result.get("candidate_clusters", [])
+            # Even on solver rejection, check accumulation admission against the
+            # best candidate cluster if available.  This is only a prediction — the
+            # manual preview never writes to the accumulation buffer.
+            from .forward_model import ForwardModel
+            _clusters = solve_result.get("candidate_clusters", [])
+            if _clusters:
+                best_cluster = _clusters[0]
+                second_cluster = _clusters[1] if len(_clusters) > 1 else {}
+                _synthetic_result = {
+                    "centroid_uncertainty_km": best_cluster.get("cluster_compactness_km"),
+                    "n_inlier_pair_circles": best_cluster.get("cluster_raw_inlier_count"),
+                    "n_contributing_arcs": best_cluster.get("member_count"),
+                    "best_cluster_support_score": best_cluster.get("cluster_support_score"),
+                    "support_dominance_ratio": best_cluster.get("support_dominance_ratio"),
+                    "pairwise_weighted_rms_deg": best_cluster.get("pairwise_weighted_rms_deg"),
+                    "cluster_member_count": best_cluster.get("member_count", 0),
+                    "second_cluster_member_count": second_cluster.get("member_count", 0),
+                    "member_dominance_ratio": best_cluster.get("member_dominance_ratio"),
+                    "weight_dominance_ratio": (
+                        best_cluster.get("cluster_total_weight", 0.0) / second_cluster.get("cluster_total_weight", 1.0)
+                        if second_cluster.get("cluster_total_weight", 0.0) > 0.0 else float("inf")
+                    ),
+                }
+                _rej, _tier = ForwardModel._classify_frame_for_accumulation(_synthetic_result)
+                would_accumulate = _rej is None
+                accumulation_rejection_reason = _rej
+                accumulation_gate_metrics = {**_synthetic_result, "admission_tier": _tier}
         else:
             result = solve_result["result"]
             admitted_pair_circles = result.get("admitted_pair_circles", [])
@@ -2695,6 +2785,22 @@ async def post_iid_sweep_frame_fm_geometry_manual_preview(
             if raw_cep is not None:
                 frame_cep_km = raw_cep
                 frame_n_arcs = raw_arcs
+            # Accumulation admission check (same as GET endpoint).
+            _rej, _tier = ForwardModel._classify_frame_for_accumulation(result)
+            would_accumulate = _rej is None
+            accumulation_rejection_reason = _rej
+            accumulation_gate_metrics = {
+                "centroid_uncertainty_km": result.get("centroid_uncertainty_km"),
+                "n_inlier_pair_circles": result.get("n_inlier_pair_circles", result.get("n_contributing_arcs", 0)),
+                "best_cluster_support_score": result.get("best_cluster_support_score"),
+                "support_dominance_ratio": result.get("support_dominance_ratio"),
+                "pairwise_weighted_rms_deg": result.get("pairwise_weighted_rms_deg"),
+                "cluster_member_count": result.get("cluster_member_count", 0),
+                "second_cluster_member_count": result.get("second_cluster_member_count", 0),
+                "member_dominance_ratio": result.get("member_dominance_ratio"),
+                "weight_dominance_ratio": result.get("weight_dominance_ratio"),
+                "admission_tier": _tier,
+            }
 
         # Build the same layers structure as the GET endpoint so the UI can
         # render preview geometry on the map.
@@ -2824,6 +2930,8 @@ async def post_iid_sweep_frame_fm_geometry_manual_preview(
             "frame_n_arcs": frame_n_arcs,
             "frame_n_inlier_pair_circles": frame_n_arcs,
             "frame_solve_reason": frame_solve_reason,
+            "would_accumulate": would_accumulate,
+            "accumulation_rejection_reason": accumulation_rejection_reason,
             "scored_pair_circles": solve_result.get("scored_pair_circles", []),
             "manually_forced_preview": True,
             "automatic_acceptance_status": solve_result.get("automatic_acceptance_status", "accepted"),

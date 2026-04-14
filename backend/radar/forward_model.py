@@ -75,6 +75,12 @@ ACCUM_MIN_INLIER_PAIR_CIRCLES = 6
 ACCUM_MIN_SUPPORT_SCORE = 0.8
 ACCUM_MIN_SUPPORT_DOMINANCE_RATIO = 1.25
 ACCUM_MAX_PAIRWISE_WEIGHTED_RMS_DEG = 35.0
+# Geometry-dominant admission tier: strong member/weight dominance can bypass
+# pairwise RMS and support-dominance gates, but at reduced accumulation weight.
+ACCUM_GEOM_DOMINANT_MIN_MEMBER_COUNT = 6      # best cluster must have at least this many members
+ACCUM_GEOM_DOMINANT_MIN_MEMBER_RATIO = 2.0    # best_members / second_members threshold
+ACCUM_GEOM_DOMINANT_MIN_WEIGHT_RATIO = 1.5    # best_weight / second_weight threshold
+ACCUM_GEOM_DOMINANT_WEIGHT_SCALE = 0.5        # accumulation weight multiplier for geometry-dominant frames
 _PER_FRAME_BUFFER_MAX = 5000
 _PER_FRAME_TRIM_FRACTION = 0.05   # drop outermost 5% by distance before centroid
 _INTERSECTION_CLUSTER_RADIUS_KM = 40.0       # bootstrap default; tightened adaptively once converged
@@ -218,6 +224,11 @@ class FramePositionEstimate:
     best_cluster_support_score: float = 0.0
     support_dominance_ratio: float = 0.0
     pairwise_weighted_rms_deg: float = float("inf")
+    cluster_member_count: int = 0
+    second_cluster_member_count: int = 0
+    member_dominance_ratio: float = 0.0
+    weight_dominance_ratio: float = 0.0
+    admission_tier: str = "accepted_high_confidence"
 
 
 @dataclass
@@ -1897,25 +1908,66 @@ class ForwardModel:
         self._frame_positions_loaded: set[int] = set()  # IIDs whose DB rows have been loaded
 
     @staticmethod
-    def _accumulation_rejection_reason(result: dict) -> Optional[str]:
-        """Return why a per-frame solve should not enter long-term accumulation."""
+    def _classify_frame_for_accumulation(result: dict) -> tuple[Optional[str], str]:
+        """Classify a per-frame solve result for accumulation.
+
+        Three-tier classification:
+          - ``accepted_high_confidence``: all quality gates pass
+          - ``accepted_geometry_dominant``: pairwise RMS or support-dominance is weak
+            but the best cluster is clearly dominant by member count and weight
+          - ``rejected``: hard gates failed; do not accumulate
+
+        Returns:
+            (rejection_reason, tier) where rejection_reason is None when accepted.
+        """
         cep_km = float(result.get("centroid_uncertainty_km", float("inf")))
         n_inliers = int(result.get("n_inlier_pair_circles", result.get("n_contributing_arcs", 0)))
         support_score = float(result.get("best_cluster_support_score", 0.0))
-        dominance = float(result.get("support_dominance_ratio", result.get("dominance_ratio", 0.0)))
+        support_dominance = float(result.get("support_dominance_ratio", result.get("dominance_ratio", 0.0)))
         pairwise_rms = float(result.get("pairwise_weighted_rms_deg", float("inf")))
+        member_count = int(result.get("cluster_member_count", 0))
+        second_member_count = int(result.get("second_cluster_member_count", 0))
+        member_ratio = float(result.get("member_dominance_ratio", 0.0))
+        weight_ratio = float(result.get("weight_dominance_ratio", 0.0))
 
+        # Hard gates that cannot be bypassed by any tier
         if n_inliers < ACCUM_MIN_INLIER_PAIR_CIRCLES:
-            return "too_few_inlier_pair_circles"
+            return "too_few_inlier_pair_circles", "rejected"
         if not math.isfinite(cep_km) or cep_km >= ACCUM_MAX_FRAME_CEP_KM:
-            return "excessive_frame_cep"
+            return "excessive_frame_cep", "rejected"
         if support_score < ACCUM_MIN_SUPPORT_SCORE:
-            return "poor_support_score"
-        if dominance < ACCUM_MIN_SUPPORT_DOMINANCE_RATIO:
-            return "poor_support_dominance"
-        if not math.isfinite(pairwise_rms) or pairwise_rms > ACCUM_MAX_PAIRWISE_WEIGHTED_RMS_DEG:
-            return "poor_pairwise_residual_rms"
-        return None
+            return "poor_support_score", "rejected"
+
+        # Tier 1: full quality gates pass — high confidence
+        support_dom_ok = support_dominance >= ACCUM_MIN_SUPPORT_DOMINANCE_RATIO
+        rms_ok = math.isfinite(pairwise_rms) and pairwise_rms <= ACCUM_MAX_PAIRWISE_WEIGHTED_RMS_DEG
+        if support_dom_ok and rms_ok:
+            return None, "accepted_high_confidence"
+
+        # Tier 2: geometry-dominant bypass — strong member/weight dominance can override
+        # noisy pairwise RMS and borderline support-dominance.
+        no_second = second_member_count == 0
+        member_dom_ok = member_count >= ACCUM_GEOM_DOMINANT_MIN_MEMBER_COUNT and (
+            no_second or member_ratio >= ACCUM_GEOM_DOMINANT_MIN_MEMBER_RATIO
+        )
+        weight_dom_ok = no_second or not math.isfinite(weight_ratio) or weight_ratio >= ACCUM_GEOM_DOMINANT_MIN_WEIGHT_RATIO
+        if member_dom_ok and weight_dom_ok:
+            return None, "accepted_geometry_dominant"
+
+        # Rejected: report the primary failing gate
+        if not support_dom_ok:
+            return "poor_support_dominance", "rejected"
+        return "poor_pairwise_residual_rms", "rejected"
+
+    @staticmethod
+    def _accumulation_rejection_reason(result: dict) -> Optional[str]:
+        """Return why a per-frame solve should not enter long-term accumulation.
+
+        Backward-compatible wrapper around ``_classify_frame_for_accumulation``.
+        Returns None when accepted (any tier), or a reason string when rejected.
+        """
+        rejection, _tier = ForwardModel._classify_frame_for_accumulation(result)
+        return rejection
 
     def _ensure_airports(self, receiver_lat: float, receiver_lon: float) -> list[_AirportCandidate]:
         if self._airports_loaded:
@@ -1949,19 +2001,54 @@ class ForwardModel:
             iid, frame, period_s, receiver_lat, receiver_lon,
         )
         if est is None:
+            if solve_result is not None:
+                n_arcs = solve_result.get("result", {}).get("n_contributing_arcs", 0)
+                cep_km = solve_result.get("result", {}).get("centroid_uncertainty_km", float("inf"))
+                log.info(
+                    "ForwardModel: IID %d — frame %d solve succeeded but est is None "
+                    "(n_contributing_arcs=%d < %d, cep_km=%.1f >= %.1f)",
+                    iid,
+                    getattr(frame, "frame_index", "?"),
+                    n_arcs,
+                    _PER_FRAME_MIN_CONTRIBUTING_ARCS,
+                    cep_km,
+                    _PER_FRAME_MAX_CEP_KM,
+                )
             return
 
         # Stricter accumulation admission gate — prevents weak frame solves
         # from entering the long-term buffer while still returning the estimate
         # for per-frame diagnostics and UI inspection.
+        # solve_result is the full outer response dict; extract the inner "result"
+        # sub-dict which carries the quality metrics used for gating.
         if solve_result is not None:
-            rejection = self._accumulation_rejection_reason(solve_result)
+            inner = solve_result.get("result", {})
+            rejection, tier = self._classify_frame_for_accumulation(inner)
             if rejection is not None:
+                n_inliers = int(inner.get("n_inlier_pair_circles", inner.get("n_contributing_arcs", 0)))
+                cep_km = float(inner.get("centroid_uncertainty_km", float("inf")))
+                support = float(inner.get("best_cluster_support_score", 0.0))
+                support_dom = float(inner.get("support_dominance_ratio", inner.get("dominance_ratio", 0.0)))
+                member_dom = float(inner.get("member_dominance_ratio", 0.0))
+                rms = float(inner.get("pairwise_weighted_rms_deg", float("inf")))
                 log.info(
-                    "ForwardModel: IID %d — frame %d solved but excluded from accumulation: %s",
-                    iid, est.frame_index, rejection,
+                    "ForwardModel: IID %d — frame %d solved but excluded from accumulation: %s "
+                    "(cep=%.1f km, inliers=%d, support=%.2f, support_dom=%.2f, "
+                    "member_dom=%.2f, rms=%.1f°)",
+                    iid, est.frame_index, rejection, cep_km, n_inliers, support,
+                    support_dom, member_dom, rms,
                 )
                 return
+            est.admission_tier = tier
+            if tier == "accepted_geometry_dominant":
+                est.weight *= ACCUM_GEOM_DOMINANT_WEIGHT_SCALE
+                log.info(
+                    "ForwardModel: IID %d — frame %d admitted as geometry_dominant "
+                    "(weight scaled to %.3f, member_dom=%.2f, rms=%.1f°)",
+                    iid, est.frame_index, est.weight,
+                    float(inner.get("member_dominance_ratio", 0.0)),
+                    float(inner.get("pairwise_weighted_rms_deg", float("inf"))),
+                )
 
         self._add_frame_position(iid, est)
 
@@ -2041,8 +2128,12 @@ class ForwardModel:
             cluster_dominance_ratio=best.get("support_dominance_ratio", best.get("dominance_ratio", 0.0)),
             interpolated_position_fraction=best.get("interpolated_fraction", 0.0),
             best_cluster_support_score=best.get("best_cluster_support_score", 0.0),
-            support_dominance_ratio=best.get("support_dominance_ratio", best.get("dominance_ratio", 0.0)),
+            support_dominance_ratio=best.get("support_dominance_ratio", 0.0),
             pairwise_weighted_rms_deg=best.get("pairwise_weighted_rms_deg", float("inf")),
+            cluster_member_count=int(best.get("cluster_member_count", 0)),
+            second_cluster_member_count=int(best.get("second_cluster_member_count", 0)),
+            member_dominance_ratio=float(best.get("member_dominance_ratio", 0.0)),
+            weight_dominance_ratio=float(best.get("weight_dominance_ratio", 0.0)),
         )
         return est, best_result
 
@@ -2102,6 +2193,11 @@ class ForwardModel:
             if iid not in self._frame_positions:
                 self._frame_positions[iid] = deque(maxlen=_PER_FRAME_BUFFER_MAX)
             self._frame_positions[iid].append(estimate)
+            n_accumulated = len(self._frame_positions[iid])
+        log.debug(
+            "ForwardModel: IID %d — accumulated frame %d (%.4f, %.4f) cep=%.1f km [%d total in buffer]",
+            iid, estimate.frame_index, estimate.lat, estimate.lon, estimate.cep_km, n_accumulated,
+        )
         try:
             from db import stats_db
             stats_db.insert_frame_position(iid, estimate)
@@ -3107,8 +3203,11 @@ class ForwardModel:
             item: tuple[float, float, _PairwiseResidualFit, _IntersectionCluster, dict],
         ) -> dict:
             quality_score, _pairwise_rms, pairwise_fit, cluster, quality = item
-            next_quality = quality_ranked[rank][0] if rank < len(quality_ranked) else 0.0
-            next_support = quality_ranked[rank][4]["support_score"] if rank < len(quality_ranked) else 0.0
+            # Use rank+1 for dominance comparisons (compare against the NEXT cluster, not self)
+            next_rank = rank + 1
+            next_quality = quality_ranked[next_rank][0] if next_rank < len(quality_ranked) else 0.0
+            next_support = quality_ranked[next_rank][4]["support_score"] if next_rank < len(quality_ranked) else 0.0
+            next_member_count = quality_ranked[next_rank][3].member_count if next_rank < len(quality_ranked) else 0
 
             contributing_admitted_indices = sorted(cluster.contributing_arc_indices)
             contributing_circle_indices = [
@@ -3165,6 +3264,12 @@ class ForwardModel:
                     if next_support > 0.0 else None
                 ),
                 "member_count": int(cluster.member_count),
+                "next_cluster_member_count": int(next_member_count),
+                "member_dominance_ratio": (
+                    round(cluster.member_count / next_member_count, 3)
+                    if next_member_count > 0 else None
+                ),
+                "cluster_total_weight": round(float(cluster.total_weight), 6),
                 "rms_km": round(float(cluster.rms_km), 3),
                 "contributing_pair_indices": contributing_circle_indices,
                 "contributing_circle_indices": contributing_circle_indices,
@@ -3398,8 +3503,19 @@ class ForwardModel:
                 ),
                 "total_selected_weight": total_weight,
                 "cluster_member_count": best_cluster.member_count,
+                "second_cluster_member_count": second_cluster.member_count if second_cluster is not None else 0,
+                "member_dominance_ratio": (
+                    best_cluster.member_count / second_cluster.member_count
+                    if second_cluster is not None and second_cluster.member_count > 0
+                    else float("inf")
+                ),
                 "cluster_best_weight": best_cluster.total_weight,
                 "cluster_second_weight": second_cluster.total_weight if second_cluster is not None else 0.0,
+                "weight_dominance_ratio": (
+                    best_cluster.total_weight / second_cluster.total_weight
+                    if second_cluster is not None and second_cluster.total_weight > 0.0
+                    else float("inf")
+                ),
                 "dominance_ratio": dominance_ratio,
                 "support_dominance_ratio": support_ratio,
                 "quality_ratio": quality_ratio,
