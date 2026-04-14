@@ -80,7 +80,12 @@ log.setLevel(logging.INFO)  # main module always logs at INFO regardless of DEBU
 # ---------------------------------------------------------------------------
 state = AircraftState(aircraft_timeout=config.AIRCRAFT_TIMEOUT)
 track_store = TrackStore()
-radar_state = RadarState(aircraft_state=state, track_store=track_store)
+radar_state = RadarState(
+    aircraft_state=state,
+    track_store=track_store,
+    receiver_lat=config.RECEIVER_LAT,
+    receiver_lon=config.RECEIVER_LON,
+)
 aircraft_localiser = AircraftLocaliser(
     radar_state=radar_state,
     aircraft_state=state,
@@ -91,6 +96,8 @@ aircraft_localiser = AircraftLocaliser(
     max_cep_m=config.STAGE3_MAX_CEP_M,
     stable_calibration_samples=config.STAGE3_STABLE_CALIBRATION_SAMPLES,
 )
+# Wire live-path config into localiser
+aircraft_localiser._ray_retention_s = config.STAGE3_RAY_RETENTION_S
 
 # Register per-frame FM solve callback — runs on the Beast decoder thread after each
 # completed sweep frame.  Called outside RadarState._lock, so safe to call ForwardModel.
@@ -1403,12 +1410,6 @@ async def _coincident_loop() -> None:
             await _run_ci()
 
 
-_AIRCRAFT_LOC_MAX_TARGETS = 20
-_AIRCRAFT_LOC_MAX_OBS_PER_TARGET = 6
-_AIRCRAFT_LOC_MAX_PAIRWISE = 50
-_AIRCRAFT_LOC_MAX_ITERS = 10
-
-
 async def _aircraft_bearing_calibration_loop() -> None:
     """Stage 3: continuously fit per-radar bearing calibration from truth aircraft."""
     await asyncio.sleep(30)  # let the radar loop seed first
@@ -1423,7 +1424,7 @@ async def _aircraft_bearing_calibration_loop() -> None:
                 continue
             updated = await asyncio.to_thread(
                 aircraft_localiser.run_calibration_cycle,
-                _AIRCRAFT_LOC_MAX_TARGETS,
+                config.STAGE3_MAX_TARGETS_PER_CYCLE,
             )
             if updated:
                 await asyncio.to_thread(stats_db.upsert_radar_bearing_calibrations, updated)
@@ -1435,7 +1436,7 @@ async def _aircraft_bearing_calibration_loop() -> None:
 
 
 async def _aircraft_localisation_loop() -> None:
-    """Stage 3: continuously solve aircraft positions from bearing observations."""
+    """Stage 3: continuously solve aircraft positions from live bearing observations."""
     await asyncio.sleep(60)  # let calibration run first
     while True:
         await asyncio.sleep(config.STAGE3_LOCALISATION_INTERVAL_S)
@@ -1455,7 +1456,7 @@ async def _aircraft_localisation_loop() -> None:
             fixes = await asyncio.to_thread(
                 aircraft_localiser.run_localisation_cycle,
                 target_icaos,
-                _AIRCRAFT_LOC_MAX_TARGETS,
+                config.STAGE3_MAX_TARGETS_PER_CYCLE,
             )
             if fixes:
                 log.debug("Stage3: produced %d fix(es) for %d target(s)", len(fixes), len(target_icaos))

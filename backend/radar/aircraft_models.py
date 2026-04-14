@@ -11,6 +11,38 @@ from dataclasses import dataclass, field
 
 
 @dataclass
+class Stage3LiveDetection:
+    """One live DF11 detection event usable by Stage 3 localisation."""
+    iid: int
+    icao: str | None
+    arrival_us: float               # Beast-monotonic timestamp (microseconds)
+    wall_ts: float                  # Wall-clock time for age filtering
+    df: int                         # Downlink format (11 for squitter)
+    signal_dbfs: float | None
+    receiver_lat: float
+    receiver_lon: float
+    truth_lat: float | None = None
+    truth_lon: float | None = None
+    position_age_seconds: float | None = None
+    association_confidence: float = 1.0
+
+
+@dataclass
+class Stage3LiveRay:
+    """One bearing ray emitted from a live detection."""
+    track_id: str | None
+    icao: str | None
+    iid: int
+    ts: float                       # Wall-clock time ray was emitted
+    radar_lat: float
+    radar_lon: float
+    bearing_deg: float
+    bearing_sigma_deg: float
+    accepted: bool
+    rejection_reason: str | None = None
+
+
+@dataclass
 class RadarBearingCalibration:
     """Per-radar Stage 3 bearing calibration record, persisted in radar_bearing_calibration."""
     iid: int
@@ -65,7 +97,7 @@ class AircraftTrackState:
     vx_mps: float                   # east velocity (m/s)
     vy_mps: float                   # north velocity (m/s)
     alt_ft: float | None
-    covariance: list                # 4×4 flattened, position/velocity
+    position_covariance: list       # 2×2 flattened position covariance [var_x, cov_xy, cov_xy, var_y]
     last_update_ts: float
     source: str                     # "stage3" or "adsb_seed"
     history: list[AircraftFix] = field(default_factory=list)

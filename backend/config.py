@@ -232,6 +232,15 @@ STAGE3_MAX_CEP_M: float = float(os.getenv("STAGE3_MAX_CEP_M", "50000"))
 STAGE3_CALIBRATION_INTERVAL_S: float = float(os.getenv("STAGE3_CALIBRATION_INTERVAL_S", "60"))
 STAGE3_LOCALISATION_INTERVAL_S: float = float(os.getenv("STAGE3_LOCALISATION_INTERVAL_S", "10"))
 STAGE3_STABLE_CALIBRATION_SAMPLES: int = int(os.getenv("STAGE3_STABLE_CALIBRATION_SAMPLES", "50"))
+# Live-path operational settings
+STAGE3_MAX_TARGETS_PER_CYCLE: int = int(os.getenv("STAGE3_MAX_TARGETS_PER_CYCLE", "20"))
+STAGE3_MAX_RAYS_PER_TARGET: int = int(os.getenv("STAGE3_MAX_RAYS_PER_TARGET", "6"))
+STAGE3_MAX_PAIRWISE_INTERSECTIONS: int = int(os.getenv("STAGE3_MAX_PAIRWISE_INTERSECTIONS", "50"))
+STAGE3_MAX_SOLVER_ITERS: int = int(os.getenv("STAGE3_MAX_SOLVER_ITERS", "10"))
+STAGE3_RAY_RETENTION_S: float = float(os.getenv("STAGE3_RAY_RETENTION_S", "30"))
+STAGE3_LIVE_DETECTION_RETENTION_S: float = float(os.getenv("STAGE3_LIVE_DETECTION_RETENTION_S", "30"))
+STAGE3_MIN_SYNC_QUALITY: float = float(os.getenv("STAGE3_MIN_SYNC_QUALITY", "0.3"))
+STAGE3_USE_DF11: bool = _bool("STAGE3_USE_DF11", True)
 
 # Queue-depth thresholds for CPU-pressure-triggered snapshot degradation.
 # When the median queue depth over a 6-cycle window exceeds a threshold the

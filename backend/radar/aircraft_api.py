@@ -185,7 +185,7 @@ async def run_localisation(icaos: str | None = None):
     fixes = await asyncio.to_thread(
         _localiser.run_localisation_cycle,
         target_list,
-        config._AIRCRAFT_LOC_MAX_TARGETS if hasattr(config, "_AIRCRAFT_LOC_MAX_TARGETS") else 20,
+        config.STAGE3_MAX_TARGETS_PER_CYCLE,
     )
 
     return {
@@ -231,20 +231,30 @@ async def reset_calibrations():
 
 
 # ---------------------------------------------------------------------------
-# Helper: active ICAOs from radar frames
+# Helper: active ICAOs from live detection buffer
 # ---------------------------------------------------------------------------
 
 def _get_active_icaos() -> list[str]:
-    """Collect ICAOs recently observed in any radar sweep frame."""
+    """Collect ICAOs recently seen in the Stage 3 live detection buffer.
+
+    Uses live detections instead of sweep frames so that aircraft not admitted
+    into sweep frames are still eligible for localisation.
+    """
     if _localiser is None:
         return []
-    icaos: set[str] = set()
-    for iid, _auth, _model in _localiser.get_eligible_iids():
-        frames = _localiser._radar_state.get_sweep_frames(iid)
-        for frame in frames[-5:]:   # last 5 frames per radar
-            if frame.ref_icao:
-                icaos.add(frame.ref_icao)
-            for obs in frame.observations:
-                if obs.icao:
-                    icaos.add(obs.icao)
+    detections = _localiser._radar_state.get_recent_live_detections(
+        max_age_s=config.STAGE3_RAY_RETENTION_S
+    )
+    icaos = {d.icao for d in detections if d.icao}
+    if not icaos:
+        # Fallback: any ICAO from the last few sweep frames (for warm-up before
+        # live detection buffer is populated).
+        for iid, _auth, _model in _localiser.get_eligible_iids():
+            frames = _localiser._radar_state.get_sweep_frames(iid)
+            for frame in frames[-3:]:
+                if frame.ref_icao:
+                    icaos.add(frame.ref_icao)
+                for obs in frame.observations:
+                    if obs.icao:
+                        icaos.add(obs.icao)
     return sorted(icaos)

@@ -23,6 +23,7 @@ except Exception:
     _decode_cffi = None
 
 from .models import RadarIID, RotationModel, CalibrationPair
+from .aircraft_models import Stage3LiveDetection
 
 if TYPE_CHECKING:
     from aircraft_state import AircraftState
@@ -125,6 +126,98 @@ _ADSB_POSITION_MAX_AGE_S = 30.0
 _MIN_FRAME_START_SEPARATION_FRACTION = 0.5
 _PHASE_FAMILY_HISTORY_MIN = 2
 _PHASE_FAMILY_TOLERANCE_FRACTION = 0.15
+
+
+import math as _math
+
+
+def _bearing_deg_simple(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Forward azimuth from point 1 to point 2 in [0, 360)."""
+    phi1 = _math.radians(lat1)
+    phi2 = _math.radians(lat2)
+    dlam = _math.radians(lon2 - lon1)
+    x = _math.cos(phi1) * _math.sin(phi2) - _math.sin(phi1) * _math.cos(phi2) * _math.cos(dlam)
+    y = _math.sin(dlam) * _math.cos(phi2)
+    return (_math.degrees(_math.atan2(y, x)) + 360) % 360
+
+
+def _get_authoritative_radar_position(model: RadarIID) -> dict:
+    """Return the best-available radar position for a RadarIID model.
+
+    Shared helper used by both radar/api.py and aircraft_localiser.py so that
+    Stage 2 and Stage 3 always agree on where a given radar is.
+    Priority: manual > CI > FM > TDOA (by lowest CEP).
+    Returns dict with keys: source, lat, lon, cep_m.
+    """
+    if model is None:
+        return {"source": "none", "lat": None, "lon": None, "cep_m": None}
+
+    if model.resolution_mode == "locked_unresolvable":
+        return {"source": "none", "lat": None, "lon": None, "cep_m": None}
+
+    if (
+        model.resolution_mode == "locked_position"
+        and model.manual_lat is not None
+        and model.manual_lon is not None
+    ):
+        return {
+            "source": "manual",
+            "lat": model.manual_lat,
+            "lon": model.manual_lon,
+            "cep_m": None,
+        }
+
+    candidates: list[dict] = []
+    if model.ci_lat is not None and model.ci_lon is not None:
+        candidates.append({"source": "ci", "lat": model.ci_lat, "lon": model.ci_lon, "cep_m": model.ci_cep_m})
+    if model.fm_lat is not None and model.fm_lon is not None:
+        candidates.append({"source": "fm", "lat": model.fm_lat, "lon": model.fm_lon, "cep_m": model.fm_cep_m})
+    if model.lat is not None and model.lon is not None and not model.multi_radar_flag:
+        candidates.append({"source": "tdoa", "lat": model.lat, "lon": model.lon, "cep_m": model.cep_m})
+
+    if not candidates:
+        return {"source": "none", "lat": None, "lon": None, "cep_m": None}
+
+    candidates.sort(key=lambda c: (c.get("cep_m") is None, c.get("cep_m") or float("inf")))
+    return candidates[0]
+
+
+def _sync_quality_from_model(model: RadarIID) -> float:
+    """Derive a 0-1 sync quality score from the rotation model status."""
+    if model is None or model.period_s is None:
+        return 0.0
+    status = getattr(model, "status", "UNKNOWN")
+    if status == "SINGLE_RADAR":
+        return 1.0
+    if status == "LIKELY_SINGLE":
+        return 0.8
+    if status == "CHECK_MULTI":
+        return 0.5
+    if status == "MULTI_RADAR":
+        return 0.3
+    return 0.0
+
+
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class LiveSyncState:
+    """Per-IID live synchronisation state for Stage 3 bearing computation.
+
+    Updated each time a sweep frame is completed. The localiser converts
+    message arrival times to bearings using: bearing = (arrival_us -
+    phase_epoch_us) / period_us * 360 % 360 + phase_offset_deg.
+    """
+    iid: int
+    period_s: float
+    phase_epoch_us: float       # ref_arrival_us from last completed frame
+    phase_offset_deg: float     # bearing from radar to ref aircraft at that epoch
+    sync_quality: float         # 0.0–1.0; derived from rotation model status
+    sync_jitter_deg: float      # estimated bearing jitter (refined by calibration)
+    last_sync_update_ts: float  # wall-clock time of last update
+    source: str                 # "sweep_frame"
+    usable: bool                # sync_quality is above the minimum threshold
 
 
 class AircraftPositionTracker:
@@ -824,9 +917,17 @@ class RadarState:
     and builds per-IID rotation models on a background schedule.
     """
 
-    def __init__(self, aircraft_state: Optional["AircraftState"] = None, track_store: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        aircraft_state: Optional["AircraftState"] = None,
+        track_store: Optional[Any] = None,
+        receiver_lat: Optional[float] = None,
+        receiver_lon: Optional[float] = None,
+    ) -> None:
         self._aircraft_state = aircraft_state
         self._track_store = track_store
+        self._receiver_lat: float = receiver_lat or 0.0
+        self._receiver_lon: float = receiver_lon or 0.0
 
         # Lightweight ADS-B position tracker for real-time position capture
         self._adsb_tracker = AircraftPositionTracker()
@@ -881,6 +982,17 @@ class RadarState:
         # Bounded deque prevents unbounded growth; 2000 events ≈ a few seconds at high rate.
         self._flash_events: deque[tuple[int, int, str, int]] = deque(maxlen=2000)
         self._flash_seq: int = 0
+
+        # ------------------------------------------------------------------
+        # Stage 3 live state — sync states and detection buffer.
+        # These are updated from the decoder thread and read by the localiser.
+        # ------------------------------------------------------------------
+        # Per-IID live sync state; updated each time a sweep frame is completed.
+        self._live_sync_states: dict[int, LiveSyncState] = {}
+        # Bounded buffer of recent Stage 3-usable live detections.
+        # 10 000 entries ≈ a few minutes of DF11 traffic at moderate density.
+        self._LIVE_DETECTION_BUFFER_MAX = 10_000
+        self._live_detection_buffer: deque[Stage3LiveDetection] = deque(maxlen=self._LIVE_DETECTION_BUFFER_MAX)
 
         import threading
         self._lock = threading.Lock()
@@ -1210,6 +1322,8 @@ class RadarState:
 
     def on_df11_batch(self, events: list[tuple[int, int, str, float | None]]) -> None:
         """Process a batch of pre-decoded DF11 events from the radar worker."""
+        if not events:
+            return
         t0 = time.perf_counter()
         t_cpu0 = time.thread_time()
         builder_s = 0.0
@@ -1224,8 +1338,6 @@ class RadarState:
         active_iid_count = 0
         fired_phase_metrics = _new_fired_burst_phase_metrics()
         try:
-            if not events:
-                return
             t_prepare = time.perf_counter()
             prepared: list[tuple[int, str, float | None, float]] = []
             for timestamp, iid, icao_hex, signal_dbfs in events:
@@ -1284,6 +1396,34 @@ class RadarState:
                 processed_count += len(iid_events)
             builder_s = time.perf_counter() - t_builder
             builder_cpu_s = time.thread_time() - t_builder_cpu
+
+            # Record Stage 3 live detections for IIDs with a usable sync state.
+            # Done after the burst-builder pass so sync states updated by any newly
+            # completed frames are available for this batch.
+            now_ts = time.time()
+            latest_us = prepared[-1][3] if prepared else None
+            for iid, icao_hex, signal_dbfs, arrival_us in prepared:
+                sync_state = self._live_sync_states.get(iid)
+                if sync_state is None or not sync_state.usable:
+                    continue
+                wall_ts = self._estimate_wall_time_from_arrival_us(arrival_us, latest_us)
+                pos = None
+                if wall_ts is not None:
+                    pos = self._adsb_tracker.get_position_at(icao_hex, wall_ts)
+                self._live_detection_buffer.append(Stage3LiveDetection(
+                    iid=iid,
+                    icao=icao_hex,
+                    arrival_us=arrival_us,
+                    wall_ts=now_ts,
+                    df=11,
+                    signal_dbfs=signal_dbfs,
+                    receiver_lat=self._receiver_lat,
+                    receiver_lon=self._receiver_lon,
+                    truth_lat=pos.get("lat") if pos else None,
+                    truth_lon=pos.get("lon") if pos else None,
+                    position_age_seconds=pos.get("position_age_seconds") if pos else None,
+                    association_confidence=1.0 if pos is not None else 0.0,
+                ))
         except Exception:
             pass
         finally:
@@ -1355,6 +1495,35 @@ class RadarState:
                     pass  # never let FM errors affect the sweep builder
                 finally:
                     metrics["fm_callback_ms"] += (time.perf_counter() - t_fm_callback) * 1000
+
+        # Update live sync state for Stage 3 whenever a usable frame is completed.
+        # The sync state captures: when was phase=0 (ref_arrival_us) and what bearing
+        # the radar was pointing at that moment (bearing from radar to ref aircraft).
+        if n_aircraft >= 3:
+            model = self._models.get(iid)
+            if model is not None:
+                radar_pos = _get_authoritative_radar_position(model)
+                if (
+                    radar_pos["lat"] is not None
+                    and current_frame.ref_lat is not None
+                    and current_frame.ref_lon is not None
+                ):
+                    ref_bearing = _bearing_deg_simple(
+                        radar_pos["lat"], radar_pos["lon"],
+                        current_frame.ref_lat, current_frame.ref_lon,
+                    )
+                    sync_quality = _sync_quality_from_model(model)
+                    self._live_sync_states[iid] = LiveSyncState(
+                        iid=iid,
+                        period_s=period_s,
+                        phase_epoch_us=current_frame.ref_arrival_us,
+                        phase_offset_deg=ref_bearing,
+                        sync_quality=sync_quality,
+                        sync_jitter_deg=5.0,  # refined by calibration in localiser
+                        last_sync_update_ts=time.time(),
+                        source="sweep_frame",
+                        usable=sync_quality >= 0.3,
+                    )
 
         self._live_frames[iid] = None
         return metrics
@@ -2971,6 +3140,96 @@ class RadarState:
                 "source": payload.get("source"),
                 "detail": detail,
             }
+
+    # ------------------------------------------------------------------
+    # Stage 3: live sync state accessors
+    # ------------------------------------------------------------------
+
+    def get_live_sync_state(self, iid: int) -> LiveSyncState | None:
+        """Return the current live sync state for one IID, or None."""
+        return self._live_sync_states.get(iid)
+
+    def get_all_live_sync_states(self) -> dict[int, LiveSyncState]:
+        """Return a snapshot of all current live sync states."""
+        return dict(self._live_sync_states)
+
+    def update_live_sync_state(self, iid: int, **kwargs) -> None:
+        """Merge updated fields into an existing LiveSyncState (e.g. jitter from calibration)."""
+        existing = self._live_sync_states.get(iid)
+        if existing is None:
+            return
+        for key, value in kwargs.items():
+            if hasattr(existing, key):
+                object.__setattr__(existing, key, value)
+
+    # ------------------------------------------------------------------
+    # Stage 3: live detection buffer accessors
+    # ------------------------------------------------------------------
+
+    def get_recent_live_detections_for_iid(
+        self,
+        iid: int,
+        max_age_s: float = 30.0,
+    ) -> list[Stage3LiveDetection]:
+        """Return recent live detections for one IID, newest first."""
+        cutoff = time.time() - max_age_s
+        return [
+            d for d in reversed(self._live_detection_buffer)
+            if d.iid == iid and d.wall_ts >= cutoff
+        ]
+
+    def get_recent_live_detections_for_icao(
+        self,
+        icao: str,
+        max_age_s: float = 30.0,
+    ) -> list[Stage3LiveDetection]:
+        """Return recent live detections for one ICAO across all IIDs, newest first."""
+        cutoff = time.time() - max_age_s
+        return [
+            d for d in reversed(self._live_detection_buffer)
+            if d.icao == icao and d.wall_ts >= cutoff
+        ]
+
+    def get_recent_live_detections(
+        self,
+        iid_subset: set[int] | None = None,
+        max_age_s: float = 30.0,
+    ) -> list[Stage3LiveDetection]:
+        """Return recent live detections, optionally filtered to a set of IIDs."""
+        cutoff = time.time() - max_age_s
+        return [
+            d for d in reversed(self._live_detection_buffer)
+            if d.wall_ts >= cutoff
+            and (iid_subset is None or d.iid in iid_subset)
+        ]
+
+    def record_live_radar_detection(
+        self,
+        iid: int,
+        icao: str | None,
+        arrival_us: float,
+        df: int,
+        signal_dbfs: float | None,
+        truth_lat: float | None = None,
+        truth_lon: float | None = None,
+        position_age_seconds: float | None = None,
+        association_confidence: float = 1.0,
+    ) -> None:
+        """Explicitly record a Stage 3-usable live detection (called from external code)."""
+        self._live_detection_buffer.append(Stage3LiveDetection(
+            iid=iid,
+            icao=icao,
+            arrival_us=arrival_us,
+            wall_ts=time.time(),
+            df=df,
+            signal_dbfs=signal_dbfs,
+            receiver_lat=self._receiver_lat,
+            receiver_lon=self._receiver_lon,
+            truth_lat=truth_lat,
+            truth_lon=truth_lon,
+            position_age_seconds=position_age_seconds,
+            association_confidence=association_confidence,
+        ))
 
     def update_coincident_location(
         self,

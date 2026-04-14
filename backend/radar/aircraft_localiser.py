@@ -30,7 +30,9 @@ from .aircraft_models import (
     AircraftTrackState,
     RadarBearingCalibration,
     RadarBearingObservation,
+    Stage3LiveRay,
 )
+from .sweep import _get_authoritative_radar_position, LiveSyncState
 
 if TYPE_CHECKING:
     from .sweep import RadarState
@@ -114,43 +116,13 @@ def _enu_to_latlon(x: float, y: float, origin_lat: float, origin_lon: float) -> 
 
 
 # ---------------------------------------------------------------------------
-# Authoritative radar position (mirrors radar/api.py logic without FastAPI deps)
+# Authoritative radar position — delegate to the shared helper in sweep.py
+# so Stage 2 and Stage 3 always agree on radar location.
 # ---------------------------------------------------------------------------
 
 def _authoritative_position_for_model(model) -> dict:
     """Return the best-available radar position for a RadarIID model."""
-    if model is None:
-        return {"source": "none", "lat": None, "lon": None, "cep_m": None}
-
-    if model.resolution_mode == "locked_unresolvable":
-        return {"source": "none", "lat": None, "lon": None, "cep_m": None}
-
-    if (
-        model.resolution_mode == "locked_position"
-        and model.manual_lat is not None
-        and model.manual_lon is not None
-    ):
-        return {
-            "source": "manual",
-            "lat": model.manual_lat,
-            "lon": model.manual_lon,
-            "cep_m": None,
-        }
-
-    # Auto: rank CI, FM, TDOA by CEP; prefer lowest CEP
-    candidates: list[dict] = []
-    if model.ci_lat is not None and model.ci_lon is not None:
-        candidates.append({"source": "ci", "lat": model.ci_lat, "lon": model.ci_lon, "cep_m": model.ci_cep_m})
-    if model.fm_lat is not None and model.fm_lon is not None:
-        candidates.append({"source": "fm", "lat": model.fm_lat, "lon": model.fm_lon, "cep_m": model.fm_cep_m})
-    if model.lat is not None and model.lon is not None and not model.multi_radar_flag:
-        candidates.append({"source": "tdoa", "lat": model.lat, "lon": model.lon, "cep_m": model.cep_m})
-
-    if not candidates:
-        return {"source": "none", "lat": None, "lon": None, "cep_m": None}
-
-    candidates.sort(key=lambda c: (c.get("cep_m") is None, c.get("cep_m") or float("inf")))
-    return candidates[0]
+    return _get_authoritative_radar_position(model)
 
 
 # ---------------------------------------------------------------------------
@@ -557,7 +529,7 @@ def _update_track(
         vx_mps=vx,
         vy_mps=vy,
         alt_ft=fix.alt_ft,
-        covariance=[fix.cep_m ** 2, 0.0, 0.0, fix.cep_m ** 2],
+        position_covariance=[fix.cep_m ** 2, 0.0, 0.0, fix.cep_m ** 2],
         last_update_ts=now,
         source="stage3",
         history=history,
@@ -572,7 +544,7 @@ def _new_track(fix: AircraftFix, now: float) -> AircraftTrackState:
         vx_mps=0.0,
         vy_mps=0.0,
         alt_ft=fix.alt_ft,
-        covariance=[fix.cep_m ** 2, 0.0, 0.0, fix.cep_m ** 2],
+        position_covariance=[fix.cep_m ** 2, 0.0, 0.0, fix.cep_m ** 2],
         last_update_ts=now,
         source="stage3",
         history=[fix],
@@ -615,6 +587,15 @@ class AircraftLocaliser:
         self._last_calibration_ts = 0.0
         self._last_localisation_ts = 0.0
         self._backlog_skips = 0
+
+        # Live ray/seed evidence buffers — keyed by ICAO, bounded deques.
+        # Written during _solve_for_icao; read by build_evidence().
+        _RAY_BUF = 100
+        self._recent_rays_by_icao: dict[str, deque] = {}
+        self._recent_rejected_rays_by_icao: dict[str, deque] = {}
+        self._recent_seed_points_by_icao: dict[str, deque] = {}
+        self._RAY_BUFFER_MAX = _RAY_BUF
+        self._ray_retention_s: float = 30.0   # overridden by config in main.py
 
     # ------------------------------------------------------------------
     # DB round-trip helpers
@@ -778,6 +759,147 @@ class AircraftLocaliser:
         return all_obs
 
     # ------------------------------------------------------------------
+    # Stage 3B (live): Bearing observation from live detection + sync state
+    # ------------------------------------------------------------------
+
+    def _bearing_from_live_detection(
+        self,
+        detection,
+        sync_state: "LiveSyncState",
+        radar_lat: float,
+        radar_lon: float,
+        calibration: RadarBearingCalibration,
+    ) -> "RadarBearingObservation | None":
+        """Convert one live detection to a bearing observation.
+
+        Formula:
+          phase_deg = (arrival_us - phase_epoch_us) / period_us * 360 % 360
+          bearing   = phase_deg + phase_offset_deg + calibration.bearing_offset_deg
+        """
+        period_us = sync_state.period_s * 1e6
+        if period_us <= 0:
+            return None
+
+        phase_deg = (detection.arrival_us - sync_state.phase_epoch_us) / period_us * 360.0 % 360.0
+
+        bearing_raw = (phase_deg + sync_state.phase_offset_deg) % 360.0
+        bearing_obs = _wrap_deg(bearing_raw + calibration.bearing_offset_deg)
+        bearing_obs = (bearing_obs + 360.0) % 360.0
+
+        # Observation sigma: calibration residual + sync jitter + association penalty
+        sigma = max(calibration.bearing_sigma_deg, 0.5)
+        sigma = math.sqrt(sigma ** 2 + sync_state.sync_jitter_deg ** 2)
+        if detection.position_age_seconds is not None:
+            age_factor = 1.0 + detection.position_age_seconds / _MAX_POSITION_AGE_S
+            sigma = sigma * age_factor
+        # Association confidence penalty: unconfirmed targets get higher sigma
+        if detection.association_confidence < 1.0:
+            sigma = sigma / max(detection.association_confidence, 0.1)
+        sigma = max(sigma, 0.5)
+
+        assoc_conf = detection.association_confidence
+        if detection.position_age_seconds is not None:
+            assoc_conf = min(assoc_conf, max(0.0, 1.0 - detection.position_age_seconds / _MAX_POSITION_AGE_S))
+
+        return RadarBearingObservation(
+            iid=detection.iid,
+            icao=detection.icao,
+            arrival_us=detection.arrival_us,
+            phase_deg=phase_deg,
+            bearing_obs_deg=bearing_obs,
+            bearing_sigma_deg=sigma,
+            radar_lat=radar_lat,
+            radar_lon=radar_lon,
+            receiver_lat=detection.receiver_lat,
+            receiver_lon=detection.receiver_lon,
+            association_confidence=assoc_conf,
+            burst_signal_dbfs=detection.signal_dbfs,
+            altitude_ft=None,
+        )
+
+    def _build_live_observations_for_icao(
+        self,
+        icao: str,
+        iid: int,
+        sync_state: "LiveSyncState",
+        radar_lat: float,
+        radar_lon: float,
+        calibration: RadarBearingCalibration,
+        max_obs: int = 6,
+        detection_retention_s: float = 30.0,
+    ) -> list["RadarBearingObservation"]:
+        """Build bearing observations from live detections for one ICAO and IID."""
+        if not sync_state.usable:
+            return []
+        if calibration.quality == "none":
+            return []
+
+        detections = self._radar_state.get_recent_live_detections_for_icao(
+            icao, max_age_s=detection_retention_s
+        )
+        detections = [d for d in detections if d.iid == iid]
+        if not detections:
+            return []
+
+        obs_out: list[RadarBearingObservation] = []
+        for det in detections:
+            ob = self._bearing_from_live_detection(det, sync_state, radar_lat, radar_lon, calibration)
+            if ob is not None:
+                obs_out.append(ob)
+
+        # Most recent first
+        obs_out.sort(key=lambda o: o.arrival_us, reverse=True)
+        return obs_out[:max_obs]
+
+    def build_live_bearing_observations(
+        self,
+        icao: str,
+        iid_subset: set[int] | None = None,
+        max_obs_per_radar: int = 6,
+        detection_retention_s: float = 30.0,
+    ) -> list["RadarBearingObservation"]:
+        """Build live bearing observations for a target across all calibrated radars.
+
+        This is the live-path replacement for build_bearing_observations().
+        Uses live detections + live sync state instead of completed sweep frames.
+        """
+        with self._lock:
+            cals = dict(self._calibrations)
+
+        all_obs: list[RadarBearingObservation] = []
+        sync_states = self._radar_state.get_all_live_sync_states()
+
+        for iid, auth, _ in self.get_eligible_iids():
+            if iid_subset is not None and iid not in iid_subset:
+                continue
+            if iid not in cals:
+                continue
+            cal = cals[iid]
+            if cal.quality == "none":
+                continue
+            sync_state = sync_states.get(iid)
+            if sync_state is None or not sync_state.usable:
+                continue
+
+            # Propagate calibration sigma into sync state jitter if it provides tighter bound
+            if cal.bearing_sigma_deg < sync_state.sync_jitter_deg:
+                sync_state.sync_jitter_deg = cal.bearing_sigma_deg
+
+            obs = self._build_live_observations_for_icao(
+                icao=icao,
+                iid=iid,
+                sync_state=sync_state,
+                radar_lat=auth["lat"],
+                radar_lon=auth["lon"],
+                calibration=cal,
+                max_obs=max_obs_per_radar,
+                detection_retention_s=detection_retention_s,
+            )
+            all_obs.extend(obs)
+
+        return all_obs
+
+    # ------------------------------------------------------------------
     # Stage 3: Combined solve for one target
     # ------------------------------------------------------------------
 
@@ -787,12 +909,39 @@ class AircraftLocaliser:
         iid_subset: set[int] | None = None,
         max_cep_m: float | None = None,
     ) -> AircraftFix | None:
-        """Full pipeline for one aircraft: build obs → seed → solve."""
+        """Full pipeline for one aircraft: build live obs → emit rays → seed → solve."""
         max_cep_m = max_cep_m or self._max_cep_m
-        observations = self.build_bearing_observations(icao, iid_subset)
+
+        # Live path: use live detections instead of sweep frames
+        observations = self.build_live_bearing_observations(
+            icao, iid_subset, detection_retention_s=self._ray_retention_s
+        )
 
         with self._lock:
             cals = dict(self._calibrations)
+
+        now_ts = time.time()
+
+        # Emit rays for evidence — all observations are accepted rays at this stage
+        # (pre-solve; post-solve rejected rays would require a second pass).
+        accepted_rays: list[Stage3LiveRay] = []
+        for obs in observations:
+            accepted_rays.append(Stage3LiveRay(
+                track_id=icao,
+                icao=icao,
+                iid=obs.iid,
+                ts=now_ts,
+                radar_lat=obs.radar_lat,
+                radar_lon=obs.radar_lon,
+                bearing_deg=obs.bearing_obs_deg,
+                bearing_sigma_deg=obs.bearing_sigma_deg,
+                accepted=True,
+            ))
+
+        # Store accepted rays
+        if accepted_rays:
+            ray_buf = self._recent_rays_by_icao.setdefault(icao, deque(maxlen=self._RAY_BUFFER_MAX))
+            ray_buf.extend(accepted_rays)
 
         # Need at least 2 different radars
         unique_iids = {o.iid for o in observations}
@@ -804,6 +953,11 @@ class AircraftLocaliser:
             return None
 
         seed_lat, seed_lon = seeds[0]
+
+        # Store seed point
+        seed_buf = self._recent_seed_points_by_icao.setdefault(icao, deque(maxlen=20))
+        seed_buf.append({"lat": seed_lat, "lon": seed_lon, "ts": now_ts})
+
         fix = solve_snapshot(observations, cals, seed_lat, seed_lon)
         if fix is None:
             return None
@@ -967,18 +1121,34 @@ class AircraftLocaliser:
     ) -> dict:
         """Build evidence layers for the Stage 3 map page.
 
-        Returns the same envelope structure as the existing radar evidence API:
-          {available, reason, layers}
+        Reads from live ray/seed buffers (populated by _solve_for_icao), not
+        from sweep frames. Returns the same envelope structure as the radar
+        evidence API: {available, reason, layers}.
         Each layer: {method, label, geometry_type, source_count, active_estimate, features}
         """
         with self._lock:
             cals = dict(self._calibrations)
             track = self._tracks.get(icao)
 
-        observations = self.build_bearing_observations(icao, iid_subset)
-        unique_iids = {o.iid for o in observations}
+        # Collect recent live rays from the evidence buffers
+        recent_rays: list[Stage3LiveRay] = list(self._recent_rays_by_icao.get(icao, []))
+        recent_rejected: list[Stage3LiveRay] = list(self._recent_rejected_rays_by_icao.get(icao, []))
+        recent_seeds: list[dict] = list(self._recent_seed_points_by_icao.get(icao, []))
 
-        if not observations:
+        # Filter to time window
+        cutoff = time.time() - self._ray_retention_s
+        recent_rays = [r for r in recent_rays if r.ts >= cutoff]
+        recent_rejected = [r for r in recent_rejected if r.ts >= cutoff]
+        recent_seeds = [s for s in recent_seeds if s["ts"] >= cutoff]
+
+        # Apply IID filter
+        if iid_subset:
+            recent_rays = [r for r in recent_rays if r.iid in iid_subset]
+            recent_rejected = [r for r in recent_rejected if r.iid in iid_subset]
+
+        unique_iids = {r.iid for r in recent_rays} | {r.iid for r in recent_rejected}
+
+        if not recent_rays and track is None:
             return {"available": False, "reason": "no_observations", "layers": []}
 
         layers = []
@@ -989,6 +1159,7 @@ class AircraftLocaliser:
             if iid_subset and iid not in iid_subset:
                 continue
             cal = cals.get(iid)
+            sync = self._radar_state.get_live_sync_state(iid)
             radar_features.append({
                 "type": "Feature",
                 "geometry": {"type": "Point", "coordinates": [auth["lon"], auth["lat"]]},
@@ -998,6 +1169,8 @@ class AircraftLocaliser:
                     "role": "radar_origin",
                     "quality": cal.quality if cal else "none",
                     "has_obs": iid in unique_iids,
+                    "sync_quality": sync.sync_quality if sync else None,
+                    "sync_usable": sync.usable if sync else False,
                 },
             })
         layers.append({
@@ -1009,36 +1182,30 @@ class AircraftLocaliser:
             "features": radar_features,
         })
 
-        # --- Layer: Bearing Rays ---
-        ray_features = []
-        rejected_features = []
-        for obs in observations:
-            # Project ray 400 km
-            bearing_rad = math.radians(obs.bearing_obs_deg)
+        # --- Layer: Bearing Rays (accepted, from live buffer) ---
+        def _ray_to_feature(ray: Stage3LiveRay, role: str) -> dict:
             dist_m = 400_000.0
-            dlat = math.degrees(dist_m / _R_EARTH_M * math.cos(math.radians(obs.bearing_obs_deg)))
-            dlon_scale = math.cos(math.radians(obs.radar_lat))
-            end_lat = obs.radar_lat + math.degrees(dist_m * math.cos(math.radians(obs.bearing_obs_deg)) / _R_EARTH_M)
-            end_lon = obs.radar_lon + math.degrees(dist_m * math.sin(math.radians(obs.bearing_obs_deg)) / (_R_EARTH_M * dlon_scale))
-
-            feature = {
+            bearing_rad = math.radians(ray.bearing_deg)
+            dlon_scale = math.cos(math.radians(ray.radar_lat))
+            end_lat = ray.radar_lat + math.degrees(dist_m * math.cos(bearing_rad) / _R_EARTH_M)
+            end_lon = ray.radar_lon + math.degrees(dist_m * math.sin(bearing_rad) / (_R_EARTH_M * max(dlon_scale, 1e-6)))
+            return {
                 "type": "Feature",
                 "geometry": {
                     "type": "LineString",
-                    "coordinates": [
-                        [obs.radar_lon, obs.radar_lat],
-                        [end_lon, end_lat],
-                    ],
+                    "coordinates": [[ray.radar_lon, ray.radar_lat], [end_lon, end_lat]],
                 },
                 "properties": {
-                    "iid": obs.iid,
-                    "bearing_obs_deg": obs.bearing_obs_deg,
-                    "bearing_sigma_deg": obs.bearing_sigma_deg,
-                    "association_confidence": obs.association_confidence,
-                    "role": "bearing_ray",
+                    "iid": ray.iid,
+                    "bearing_deg": ray.bearing_deg,
+                    "bearing_sigma_deg": ray.bearing_sigma_deg,
+                    "role": role,
+                    "ts": ray.ts,
                 },
             }
-            ray_features.append(feature)
+
+        ray_features = [_ray_to_feature(r, "bearing_ray") for r in recent_rays]
+        rejected_features = [_ray_to_feature(r, "rejected_ray") for r in recent_rejected]
 
         layers.append({
             "method": "bearing_rays",
@@ -1049,25 +1216,24 @@ class AircraftLocaliser:
             "features": ray_features,
         })
 
-        # --- Layer: Rejected Rays (placeholder) ---
         layers.append({
             "method": "rejected_rays",
             "label": "Rejected Rays",
             "geometry_type": "line",
-            "source_count": 0,
+            "source_count": len(rejected_features),
             "active_estimate": None,
             "features": rejected_features,
         })
 
-        # --- Layer: Seed Intersections ---
-        seeds = generate_seeds(observations)
-        seed_features = []
-        for slat, slon in seeds:
-            seed_features.append({
+        # --- Layer: Seed Intersections (from live buffer) ---
+        seed_features = [
+            {
                 "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [slon, slat]},
-                "properties": {"role": "seed_intersection", "label": "Seed"},
-            })
+                "geometry": {"type": "Point", "coordinates": [s["lon"], s["lat"]]},
+                "properties": {"role": "seed_intersection", "label": "Seed", "ts": s["ts"]},
+            }
+            for s in recent_seeds
+        ]
         layers.append({
             "method": "seed_intersections",
             "label": "Seed Intersections",
@@ -1080,16 +1246,17 @@ class AircraftLocaliser:
         # --- Layer: Selected Aircraft Fix ---
         fix_features = []
         if track:
+            latest_fix = track.history[-1] if track.history else None
             fix_features.append({
                 "type": "Feature",
                 "geometry": {"type": "Point", "coordinates": [track.lon, track.lat]},
                 "properties": {
                     "role": "selected_fix",
                     "label": icao,
-                    "cep_m": track.history[-1].cep_m if track.history else None,
-                    "geometry_score": track.history[-1].geometry_score if track.history else None,
-                    "n_radars": track.history[-1].n_radars if track.history else None,
-                    "solver_status": track.history[-1].solver_status if track.history else None,
+                    "cep_m": latest_fix.cep_m if latest_fix else None,
+                    "geometry_score": latest_fix.geometry_score if latest_fix else None,
+                    "n_radars": latest_fix.n_radars if latest_fix else None,
+                    "solver_status": latest_fix.solver_status if latest_fix else None,
                 },
             })
         layers.append({
@@ -1097,7 +1264,7 @@ class AircraftLocaliser:
             "label": "Selected Aircraft Fix",
             "geometry_type": "point",
             "source_count": len(fix_features),
-            "active_estimate": track.lat if track else None,
+            "active_estimate": {"lat": track.lat, "lon": track.lon} if track else None,
             "features": fix_features,
         })
 
