@@ -2937,17 +2937,18 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
       }).addTo(lg)
     })
 
-    // Chord lines for admitted aircraft pairs, kept dim
+    // Chord lines (baselines) for admitted aircraft pairs — kept dim and dotted
+    // so they are visually distinct from the inscribed circles
     ;(lineLayer?.features ?? []).forEach(feature => {
       const props = feature.properties ?? {}
       const key = `${props.icao_a ?? ''}:${props.icao_b ?? ''}:${props.circle_index ?? ''}`
       if (!activePairs.has(key)) return
       const latlngs = feature.geometry.coordinates.map(([lon, lat]) => [lat, lon])
       L.polyline(latlngs, {
-        color: props.inlier ? '#3fb950' : '#4d5566',
-        weight: props.inlier ? 1.6 : 1.2,
-        opacity: props.inlier ? 0.85 : 0.6,
-        dashArray: props.inlier ? null : '5 5',
+        color: '#8b949e',
+        weight: 1.0,
+        opacity: props.inlier ? 0.5 : 0.3,
+        dashArray: '2 5',
       }).addTo(lg)
     })
 
