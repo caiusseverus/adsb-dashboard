@@ -281,10 +281,11 @@ class TestRadarCalibration:
 
         deleted = db.clear_radar_learning()
 
-        assert deleted == {"radar_iids_deleted": 1, "calibration_deleted": 1}
+        assert deleted == {"radar_iids_deleted": 1, "calibration_deleted": 1, "frame_positions_deleted": 0}
         with db._connect() as conn:
             assert conn.execute("SELECT COUNT(*) FROM radar_iids").fetchone()[0] == 0
             assert conn.execute("SELECT COUNT(*) FROM radar_calibration").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM radar_frame_positions").fetchone()[0] == 0
 
 
 # ---------------------------------------------------------------------------

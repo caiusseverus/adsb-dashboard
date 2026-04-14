@@ -3838,15 +3838,18 @@ class StatsDB:
         return int(n)
 
     def clear_radar_learning(self) -> dict:
-        """Delete all persisted passive-radar models and calibration rows."""
+        """Delete all persisted passive-radar state: IID models, calibration pairs, and frame positions."""
         with self._connect() as conn:
             radar_iids_deleted = conn.execute("SELECT COUNT(*) FROM radar_iids").fetchone()[0]
             calibration_deleted = conn.execute("SELECT COUNT(*) FROM radar_calibration").fetchone()[0]
+            frame_positions_deleted = conn.execute("SELECT COUNT(*) FROM radar_frame_positions").fetchone()[0]
             conn.execute("DELETE FROM radar_iids")
             conn.execute("DELETE FROM radar_calibration")
+            conn.execute("DELETE FROM radar_frame_positions")
         return {
             "radar_iids_deleted": int(radar_iids_deleted),
             "calibration_deleted": int(calibration_deleted),
+            "frame_positions_deleted": int(frame_positions_deleted),
         }
 
     def insert_calibration_pair(self, pair) -> None:

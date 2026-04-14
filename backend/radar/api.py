@@ -1435,14 +1435,25 @@ async def reset_iid_rotation(iid: int):
 
 @router.post("/reset")
 async def reset_all_radar_learning():
-    """Clear all learned passive-radar state and persisted calibration history."""
+    """Clear all learned passive-radar state: memory, calibration history, and frame positions."""
     if _state is None:
         return {"reset": False, "reason": "radar module not initialised"}
 
     from db import stats_db
 
     memory = _state.reset_all()
-    persisted = stats_db.clear_radar_learning()
+    persisted = await asyncio.to_thread(stats_db.clear_radar_learning)
+
+    # Also clear ForwardModel's in-memory frame position cache so it doesn't
+    # re-serve deleted rows on the next FM run.
+    try:
+        fm = _get_fm()
+        with fm._frame_positions_lock:
+            fm._frame_positions.clear()
+            fm._frame_positions_loaded.clear()
+    except Exception:
+        pass
+
     return {
         "reset": True,
         "memory": memory,

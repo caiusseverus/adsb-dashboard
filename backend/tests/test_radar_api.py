@@ -388,7 +388,7 @@ def test_reset_all_radar_learning_clears_memory_and_db(monkeypatch):
 
     class FakeStatsDB:
         def clear_radar_learning(self):
-            return {"radar_iids_deleted": 3, "calibration_deleted": 9}
+            return {"radar_iids_deleted": 3, "calibration_deleted": 9, "frame_positions_deleted": 12}
 
     prior_state = radar_api._state
     prior_db_module = sys.modules.get("db")
@@ -406,7 +406,7 @@ def test_reset_all_radar_learning_clears_memory_and_db(monkeypatch):
     assert payload["reset"] is True
     assert payload["memory"]["models"] == 1
     assert payload["memory"]["events"] == 1
-    assert payload["persisted"] == {"radar_iids_deleted": 3, "calibration_deleted": 9}
+    assert payload["persisted"] == {"radar_iids_deleted": 3, "calibration_deleted": 9, "frame_positions_deleted": 12}
     assert state.get_rotation_model(6) is None
     assert list(state._iid_events) == []
 

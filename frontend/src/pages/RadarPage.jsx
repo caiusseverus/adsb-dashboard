@@ -3609,7 +3609,7 @@ export default function RadarPage() {
   async function handleResetAll() {
     if (resettingAll) return
     const confirmed = window.confirm(
-      'Purge all historic radar learning and calibration history? This forces every IID to relearn from scratch.',
+      'Purge all radar learning?\n\nThis deletes:\n• IID rotation models\n• Co-sweep calibration pairs\n• Accumulated frame positions (FM solver input)\n\nEvery IID will relearn from scratch.',
     )
     if (!confirmed) return
 
