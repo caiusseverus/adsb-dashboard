@@ -63,6 +63,8 @@ from interrogators import router as interrogators_router
 from timing import router as timing_router
 from radar.sweep import RadarState
 from radar import api as radar_api
+from radar import aircraft_api as radar_aircraft_api
+from radar.aircraft_localiser import AircraftLocaliser
 
 
 
@@ -79,6 +81,16 @@ log.setLevel(logging.INFO)  # main module always logs at INFO regardless of DEBU
 state = AircraftState(aircraft_timeout=config.AIRCRAFT_TIMEOUT)
 track_store = TrackStore()
 radar_state = RadarState(aircraft_state=state, track_store=track_store)
+aircraft_localiser = AircraftLocaliser(
+    radar_state=radar_state,
+    aircraft_state=state,
+    receiver_lat=config.RECEIVER_LAT,
+    receiver_lon=config.RECEIVER_LON,
+    min_calibration_samples=config.STAGE3_MIN_CALIBRATION_SAMPLES,
+    min_radars_for_fix=config.STAGE3_MIN_RADARS_FOR_FIX,
+    max_cep_m=config.STAGE3_MAX_CEP_M,
+    stable_calibration_samples=config.STAGE3_STABLE_CALIBRATION_SAMPLES,
+)
 
 # Register per-frame FM solve callback — runs on the Beast decoder thread after each
 # completed sweep frame.  Called outside RadarState._lock, so safe to call ForwardModel.
@@ -1028,6 +1040,11 @@ async def _seed_startup_state() -> None:
     if config.GHOST_FILTER_MSGS > 0:
         await asyncio.to_thread(stats_db.purge_ghost_aircraft)
 
+    # Load Stage 3 bearing calibrations from DB
+    if config.STAGE3_ENABLED:
+        cal_rows = await asyncio.to_thread(stats_db.load_radar_bearing_calibrations)
+        aircraft_localiser.load_calibrations(cal_rows)
+
     # Correct country/foreign_military for all military aircraft using ICAO block.
     # Repairs entries written before the registration-prefix bug was fixed.
     mil_icaos = await asyncio.to_thread(stats_db.query_military_icaos)
@@ -1386,6 +1403,68 @@ async def _coincident_loop() -> None:
             await _run_ci()
 
 
+_AIRCRAFT_LOC_MAX_TARGETS = 20
+_AIRCRAFT_LOC_MAX_OBS_PER_TARGET = 6
+_AIRCRAFT_LOC_MAX_PAIRWISE = 50
+_AIRCRAFT_LOC_MAX_ITERS = 10
+
+
+async def _aircraft_bearing_calibration_loop() -> None:
+    """Stage 3: continuously fit per-radar bearing calibration from truth aircraft."""
+    await asyncio.sleep(30)  # let the radar loop seed first
+    while True:
+        await asyncio.sleep(config.STAGE3_CALIBRATION_INTERVAL_S)
+        try:
+            if radar_state.is_update_active():
+                continue
+            if _msg_queue.qsize() >= _BACKGROUND_QUEUE_BACKLOG_SKIP:
+                aircraft_localiser._backlog_skips += 1
+                log.debug("Stage3 cal loop: skipped — queue backlog %d", _msg_queue.qsize())
+                continue
+            updated = await asyncio.to_thread(
+                aircraft_localiser.run_calibration_cycle,
+                _AIRCRAFT_LOC_MAX_TARGETS,
+            )
+            if updated:
+                await asyncio.to_thread(stats_db.upsert_radar_bearing_calibrations, updated)
+                log.info("Stage3: calibrated %d radar(s)", len(updated))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Stage3 calibration loop error")
+
+
+async def _aircraft_localisation_loop() -> None:
+    """Stage 3: continuously solve aircraft positions from bearing observations."""
+    await asyncio.sleep(60)  # let calibration run first
+    while True:
+        await asyncio.sleep(config.STAGE3_LOCALISATION_INTERVAL_S)
+        try:
+            if radar_state.is_update_active():
+                continue
+            if _msg_queue.qsize() >= _BACKGROUND_QUEUE_BACKLOG_SKIP:
+                aircraft_localiser._backlog_skips += 1
+                log.debug("Stage3 loc loop: skipped — queue backlog %d", _msg_queue.qsize())
+                continue
+
+            target_icaos = radar_aircraft_api._get_active_icaos()
+
+            if not target_icaos:
+                continue
+
+            fixes = await asyncio.to_thread(
+                aircraft_localiser.run_localisation_cycle,
+                target_icaos,
+                _AIRCRAFT_LOC_MAX_TARGETS,
+            )
+            if fixes:
+                log.debug("Stage3: produced %d fix(es) for %d target(s)", len(fixes), len(target_icaos))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Stage3 localisation loop error")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await _seed_startup_state()
@@ -1446,6 +1525,9 @@ async def lifespan(app: FastAPI):
     if config.RADAR_COINCIDENT_BACKGROUND_ENABLED:
         _bg(_coincident_loop())
     _bg(_fm_loop())
+    if config.STAGE3_ENABLED:
+        _bg(_aircraft_bearing_calibration_loop())
+        _bg(_aircraft_localisation_loop())
     health_module.register_context(_msg_queue, _clients)
     register_runtime_stats(lambda: {
         "ws_clients":       len(_clients),
@@ -1490,6 +1572,9 @@ timing_router._state = state  # type: ignore[attr-defined]
 app.include_router(timing_router)
 radar_api._state = radar_state  # type: ignore[attr-defined]
 app.include_router(radar_api.router)
+radar_aircraft_api._localiser = aircraft_localiser  # type: ignore[attr-defined]
+radar_aircraft_api._msg_queue = _msg_queue  # type: ignore[attr-defined]
+app.include_router(radar_aircraft_api.router)
 if config.DEBUG_ENRICHMENT:
     log.info("Debug router mounted (DEBUG_ENRICHMENT=%s)", config.DEBUG_ENRICHMENT)
 

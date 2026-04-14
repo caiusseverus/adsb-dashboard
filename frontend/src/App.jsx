@@ -23,6 +23,7 @@ const SettingsPage       = lazy(() => import('./pages/SettingsPage'))
 const SkyView            = lazy(() => import('./pages/SkyView'))
 const PositionQualityPage = lazy(() => import('./pages/PositionQualityPage'))
 const RadarPage           = lazy(() => import('./pages/RadarPage'))
+const Stage3Page          = lazy(() => import('./pages/Stage3LocalisationPage'))
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 
@@ -185,6 +186,10 @@ export default function App() {
             onClick={() => setTab('radar')}
           >Radar</button>
           <button
+            className={tab === 'stage3' ? styles.tabActive : styles.tab}
+            onClick={() => setTab('stage3')}
+          >Localise</button>
+          <button
             className={tab === 'settings' ? styles.tabActive : styles.tab}
             onClick={() => setTab('settings')}
           >Settings</button>
@@ -227,6 +232,7 @@ export default function App() {
         {tab === 'sky' && <SkyView snapshot={snapshot} onSelectIcao={handleSelectIcao} />}
         {tab === 'positionqa' && debugMode && <PositionQualityPage />}
         {tab === 'radar' && <RadarPage />}
+        {tab === 'stage3' && <Stage3Page snapshot={snapshot} />}
         {tab === 'status' && <StatusPage />}
         {tab === 'settings' && <SettingsPage />}
       </Suspense>

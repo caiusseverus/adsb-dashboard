@@ -1,0 +1,302 @@
+.page {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background: #0b0c10;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 1rem;
+  background: #161b22;
+  border-bottom: 1px solid #21262d;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  row-gap: 0.4rem;
+}
+
+.toolbarTitle {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #c9d1d9;
+  margin-right: 0.25rem;
+}
+
+.statusStrip {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: 0.75rem;
+  color: #8b949e;
+  margin-left: auto;
+}
+
+.statusBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  padding: 0.15rem 0.5rem;
+  font-size: 0.72rem;
+}
+
+.statusBadge.enabled {
+  border-color: #3fb950;
+  color: #3fb950;
+}
+
+.statusBadge.disabled {
+  border-color: #6e7681;
+  color: #6e7681;
+}
+
+.statusBadge.backlog {
+  border-color: #d29922;
+  color: #d29922;
+}
+
+.modeGroup {
+  display: flex;
+  gap: 0.3rem;
+}
+
+.btn {
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 5px;
+  color: #8b949e;
+  font-size: 0.75rem;
+  padding: 0.22rem 0.6rem;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+.btn:hover { border-color: #388bfd; color: #c9d1d9; }
+
+.btnActive {
+  composes: btn;
+  background: #388bfd1a;
+  border-color: #388bfd;
+  color: #388bfd;
+}
+
+.btnDanger {
+  composes: btn;
+  border-color: #da3633;
+  color: #da3633;
+}
+.btnDanger:hover { border-color: #ff7b72; color: #ff7b72; }
+
+.mapArea {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+}
+
+/* ── Left control drawer ─────────────────────────────────────────────── */
+
+.drawer {
+  width: 280px;
+  min-width: 220px;
+  flex-shrink: 0;
+  background: #161b22;
+  border-right: 1px solid #21262d;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.drawerSection {
+  border-bottom: 1px solid #21262d;
+  padding: 0.6rem 0.75rem;
+}
+
+.drawerSection:last-child {
+  border-bottom: none;
+}
+
+.drawerLabel {
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #6e7681;
+  margin-bottom: 0.4rem;
+}
+
+/* ── Aircraft picker ─────────────────────────────────────────────────── */
+
+.aircraftList {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.filterInput {
+  width: 100%;
+  box-sizing: border-box;
+  background: #0b0c10;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  color: #c9d1d9;
+  font-size: 0.75rem;
+  padding: 0.25rem 0.5rem;
+  margin-bottom: 0.4rem;
+  outline: none;
+}
+.filterInput:focus { border-color: #388bfd; }
+
+.aircraftRow {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.25rem 0.4rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.75rem;
+  color: #8b949e;
+  border: 1px solid transparent;
+  transition: background 0.1s;
+}
+.aircraftRow:hover { background: #21262d; }
+
+.aircraftRowSelected {
+  composes: aircraftRow;
+  background: #388bfd1a;
+  border-color: #388bfd;
+  color: #388bfd;
+}
+
+.aircraftIcao {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.72rem;
+  color: #c9d1d9;
+}
+
+.aircraftCallsign {
+  font-size: 0.7rem;
+  color: #6e7681;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Radar chips ─────────────────────────────────────────────────────── */
+
+.radarChips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.radarChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  padding: 0.15rem 0.45rem;
+  font-size: 0.7rem;
+  color: #8b949e;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+.radarChip:hover { border-color: #58a6ff; color: #c9d1d9; }
+
+.radarChipActive {
+  composes: radarChip;
+  background: #388bfd1a;
+  border-color: #388bfd;
+  color: #58a6ff;
+}
+
+.radarChipStable .qualityDot { color: #3fb950; }
+.radarChipProvisional .qualityDot { color: #d29922; }
+.radarChipNone .qualityDot { color: #6e7681; }
+
+.qualityDot {
+  font-size: 0.6rem;
+}
+
+/* ── Map wrap ─────────────────────────────────────────────────────────── */
+
+.mapWrap {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Dark-theme Leaflet overrides */
+.mapWrap :global(.leaflet-control-attribution) {
+  background: rgba(11, 12, 16, 0.75);
+  color: #484f58;
+  font-size: 0.65rem;
+}
+.mapWrap :global(.leaflet-control-attribution a) {
+  color: #388bfd;
+}
+
+/* ── Legend ──────────────────────────────────────────────────────────── */
+
+.legend {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  padding: 0.35rem 0.9rem;
+  background: #161b22;
+  border-top: 1px solid #21262d;
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+
+.legendItem {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.7rem;
+  color: #8b949e;
+  white-space: nowrap;
+}
+
+.legendDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.legendLine {
+  width: 16px;
+  height: 2px;
+  flex-shrink: 0;
+}
+
+.noTarget {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  color: #484f58;
+  font-size: 0.85rem;
+}
+
+.emptyList {
+  font-size: 0.72rem;
+  color: #484f58;
+  padding: 0.3rem 0;
+}
+
+.actionBtn {
+  composes: btn;
+  display: block;
+  width: 100%;
+  text-align: left;
+  margin-bottom: 0.3rem;
+}
+.actionBtn:last-child { margin-bottom: 0; }

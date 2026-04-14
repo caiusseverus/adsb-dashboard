@@ -650,6 +650,16 @@ class StatsDB:
                 );
                 CREATE INDEX IF NOT EXISTS radar_frame_positions_iid
                     ON radar_frame_positions(iid);
+
+                CREATE TABLE IF NOT EXISTS radar_bearing_calibration (
+                    iid                 INTEGER PRIMARY KEY,
+                    bearing_offset_deg  REAL    NOT NULL,
+                    effective_delay_us  REAL    NOT NULL,
+                    bearing_sigma_deg   REAL    NOT NULL,
+                    n_samples           INTEGER NOT NULL,
+                    quality             TEXT    NOT NULL,
+                    last_calibrated_ts  REAL    NOT NULL
+                );
             """)
             for stmt in (
                 "ALTER TABLE radar_iids ADD COLUMN resolution_mode TEXT NOT NULL DEFAULT 'auto'",
@@ -3776,6 +3786,56 @@ class StatsDB:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM radar_iids").fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Stage 3 — radar bearing calibration
+    # ------------------------------------------------------------------
+
+    def upsert_radar_bearing_calibration(self, cal) -> None:
+        """Write or update one RadarBearingCalibration row."""
+        self.upsert_radar_bearing_calibrations([cal])
+
+    def upsert_radar_bearing_calibrations(self, cals) -> None:
+        """Write or update multiple RadarBearingCalibration rows in one transaction."""
+        if not cals:
+            return
+        def _write() -> None:
+            with self._connect() as conn:
+                conn.executemany("""
+                    INSERT INTO radar_bearing_calibration
+                        (iid, bearing_offset_deg, effective_delay_us,
+                         bearing_sigma_deg, n_samples, quality, last_calibrated_ts)
+                    VALUES (?,?,?,?,?,?,?)
+                    ON CONFLICT(iid) DO UPDATE SET
+                        bearing_offset_deg = excluded.bearing_offset_deg,
+                        effective_delay_us = excluded.effective_delay_us,
+                        bearing_sigma_deg  = excluded.bearing_sigma_deg,
+                        n_samples          = excluded.n_samples,
+                        quality            = excluded.quality,
+                        last_calibrated_ts = excluded.last_calibrated_ts
+                """, [
+                    (c.iid, c.bearing_offset_deg, c.effective_delay_us,
+                     c.bearing_sigma_deg, c.n_samples, c.quality, c.last_calibrated_ts)
+                    for c in cals
+                ])
+        self._run_with_lock_retry("upsert_radar_bearing_calibrations", _write)
+
+    def load_radar_bearing_calibrations(self) -> list[dict]:
+        """Load all persisted Stage 3 radar bearing calibration rows."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM radar_bearing_calibration"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_radar_bearing_calibrations(self) -> int:
+        """Delete all Stage 3 bearing calibration rows. Returns deleted count."""
+        with self._connect() as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM radar_bearing_calibration"
+            ).fetchone()[0]
+            conn.execute("DELETE FROM radar_bearing_calibration")
+        return int(n)
 
     def clear_radar_learning(self) -> dict:
         """Delete all persisted passive-radar models and calibration rows."""

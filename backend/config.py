@@ -222,6 +222,17 @@ RADAR_UPDATE_BUDGET_MS: float = float(os.getenv("RADAR_UPDATE_BUDGET_MS", "750")
 RADAR_IID_WS_REBUILD_INTERVAL_S: float = float(os.getenv("RADAR_IID_WS_REBUILD_INTERVAL_S", "5.0"))
 RADAR_COINCIDENT_BACKGROUND_ENABLED: bool = _bool("RADAR_COINCIDENT_BACKGROUND_ENABLED", False)
 
+# ---------------------------------------------------------------------------
+# Stage 3 — aircraft localisation from known radar bearings
+# ---------------------------------------------------------------------------
+STAGE3_ENABLED: bool = _bool("STAGE3_ENABLED", False)
+STAGE3_MIN_CALIBRATION_SAMPLES: int = int(os.getenv("STAGE3_MIN_CALIBRATION_SAMPLES", "10"))
+STAGE3_MIN_RADARS_FOR_FIX: int = int(os.getenv("STAGE3_MIN_RADARS_FOR_FIX", "2"))
+STAGE3_MAX_CEP_M: float = float(os.getenv("STAGE3_MAX_CEP_M", "50000"))
+STAGE3_CALIBRATION_INTERVAL_S: float = float(os.getenv("STAGE3_CALIBRATION_INTERVAL_S", "60"))
+STAGE3_LOCALISATION_INTERVAL_S: float = float(os.getenv("STAGE3_LOCALISATION_INTERVAL_S", "10"))
+STAGE3_STABLE_CALIBRATION_SAMPLES: int = int(os.getenv("STAGE3_STABLE_CALIBRATION_SAMPLES", "50"))
+
 # Queue-depth thresholds for CPU-pressure-triggered snapshot degradation.
 # When the median queue depth over a 6-cycle window exceeds a threshold the
 # snapshot mode escalates (same levels as memory pressure: elevated/high/critical).
