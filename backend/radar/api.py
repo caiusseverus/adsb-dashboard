@@ -2685,6 +2685,112 @@ async def post_iid_sweep_frame_fm_geometry_manual_preview(
                 frame_cep_km = raw_cep
                 frame_n_arcs = raw_arcs
 
+        # Build the same layers structure as the GET endpoint so the UI can
+        # render preview geometry on the map.
+        points = [
+            _point_feature(
+                frame.ref_lat,
+                frame.ref_lon,
+                icao=frame.ref_icao,
+                role="frame_aircraft",
+                source_role="sweep_reference",
+                arrival_us=frame.ref_arrival_us,
+            )
+        ]
+        aircraft_by_icao = {
+            frame.ref_icao: {
+                "lat": frame.ref_lat,
+                "lon": frame.ref_lon,
+                "arrival_us": frame.ref_arrival_us,
+                "interpolated": False,
+            }
+        }
+        for obs in frame.observations:
+            aircraft_by_icao[obs.icao] = {
+                "lat": obs.lat,
+                "lon": obs.lon,
+                "arrival_us": obs.arrival_us,
+                "interpolated": obs.interpolated,
+            }
+            points.append(_point_feature(
+                obs.lat,
+                obs.lon,
+                icao=obs.icao,
+                role="frame_aircraft",
+                arrival_us=obs.arrival_us,
+                interpolated=obs.interpolated,
+            ))
+
+        baselines: list[dict] = []
+        circles: list[dict] = []
+
+        def from_receiver_xy(x_km: float, y_km: float) -> tuple[float, float]:
+            r_km = 6371.0
+            cos_orig = max(math.cos(math.radians(recv_lat)), 1e-12)
+            lat = recv_lat + math.degrees(y_km / r_km)
+            lon = recv_lon + math.degrees(x_km / (r_km * cos_orig))
+            return lat, lon
+
+        MIN_CEP_KM = 0.05
+        if frame_lat is not None and frame_lon is not None and frame_cep_km is not None:
+            if frame_cep_km >= MIN_CEP_KM:
+                points.append(_point_feature(
+                    frame_lat,
+                    frame_lon,
+                    role="frame_estimate",
+                    source="frame_fm",
+                    cep_km=round(frame_cep_km, 2),
+                    n_arcs=frame_n_arcs,
+                ))
+                circles.append(_circle_feature(
+                    frame_lat,
+                    frame_lon,
+                    frame_cep_km,
+                    circle_type="frame_cep",
+                    source="frame_fm",
+                    selected=True,
+                    cep_km=round(frame_cep_km, 2),
+                    n_arcs=frame_n_arcs,
+                ))
+
+        for pair in admitted_pair_circles:
+            a = aircraft_by_icao.get(pair.get("icao_a"))
+            b = aircraft_by_icao.get(pair.get("icao_b"))
+            if a is not None and b is not None:
+                baselines.append(_line_feature(
+                    [(a["lat"], a["lon"]), (b["lat"], b["lon"])],
+                    icao_a=pair.get("icao_a"),
+                    icao_b=pair.get("icao_b"),
+                    pair_label=f"{pair.get('icao_a')} <-> {pair.get('icao_b')}",
+                    circle_index=pair.get("circle_index"),
+                    inlier=pair.get("inlier", False),
+                    selected=True,
+                    line_type="admitted_pair_baseline",
+                    normalized_residual=pair.get("normalized_residual"),
+                ))
+            if pair.get("cx_km") is not None and pair.get("cy_km") is not None and pair.get("R_km") is not None:
+                center_lat, center_lon = from_receiver_xy(pair["cx_km"], pair["cy_km"])
+                circles.append(_circle_feature(
+                    center_lat,
+                    center_lon,
+                    pair["R_km"],
+                    circle_type="admitted_pair_circle",
+                    circle_index=pair.get("circle_index"),
+                    icao_a=pair.get("icao_a"),
+                    icao_b=pair.get("icao_b"),
+                    pair_label=f"{pair.get('icao_a')} <-> {pair.get('icao_b')}",
+                    selected=True,
+                    inlier=pair.get("inlier", False),
+                    circle_score=pair.get("circle_score"),
+                    normalized_residual=pair.get("normalized_residual"),
+                ))
+
+        layers = [
+            _layer("frame_fm_geometry", "Frame Aircraft", "point", points, source_count=len(points)),
+            _layer("frame_fm_geometry", "Admitted Pair Baselines", "line", baselines, source_count=len(baselines)),
+            _layer("frame_fm_geometry", "Admitted Pair Circles", "circle", circles, source_count=len(circles)),
+        ]
+
         return {
             "iid": iid,
             "frame_index": frame.frame_index,
@@ -2700,6 +2806,7 @@ async def post_iid_sweep_frame_fm_geometry_manual_preview(
             "inlier_pair_circles": inlier_pair_circles,
             "pair_circle_summary": pair_circle_summary,
             "candidate_clusters": candidate_clusters,
+            "layers": layers,
             "frame_lat": round(frame_lat, 6) if frame_lat is not None else None,
             "frame_lon": round(frame_lon, 6) if frame_lon is not None else None,
             "frame_cep_km": round(frame_cep_km, 2) if frame_cep_km is not None else None,

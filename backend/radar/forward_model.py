@@ -1936,30 +1936,59 @@ class ForwardModel:
         receiver_lat: Optional[float],
         receiver_lon: Optional[float],
     ) -> None:
-        """Called for each new completed sweep frame. Solve and accumulate."""
+        """Called for each new completed sweep frame. Solve and accumulate.
+
+        The per-frame estimate is always returned for diagnostics, but the
+        stricter accumulation gates are enforced before writing to the
+        long-term buffer so that weak frame solves do not dilute the centroid.
+        """
         if receiver_lat is None or receiver_lon is None:
             return
-        est = self.solve_single_frame(iid, frame, period_s, receiver_lat, receiver_lon)
-        if est is not None:
-            self._add_frame_position(iid, est)
 
-    def solve_single_frame(
+        est, solve_result = self.solve_single_frame_with_result(
+            iid, frame, period_s, receiver_lat, receiver_lon,
+        )
+        if est is None:
+            return
+
+        # Stricter accumulation admission gate — prevents weak frame solves
+        # from entering the long-term buffer while still returning the estimate
+        # for per-frame diagnostics and UI inspection.
+        if solve_result is not None:
+            rejection = self._accumulation_rejection_reason(solve_result)
+            if rejection is not None:
+                log.info(
+                    "ForwardModel: IID %d — frame %d solved but excluded from accumulation: %s",
+                    iid, est.frame_index, rejection,
+                )
+                return
+
+        self._add_frame_position(iid, est)
+
+    def solve_single_frame_with_result(
         self,
         iid: int,
         frame,
         period_s: float,
         receiver_lat: float,
         receiver_lon: float,
-    ) -> Optional["FramePositionEstimate"]:
-        """Solve a single sweep frame's position using the inscribed-angle method.
+    ) -> tuple[Optional["FramePositionEstimate"], Optional[dict]]:
+        """Solve a single sweep frame and return both the estimate and the raw solve result.
 
-        Tries both rotation directions; returns the tighter result or None if
-        the frame geometry is insufficient to produce a reliable estimate.
+        The raw result dict is needed for accumulation-admission gating via
+        ``_accumulation_rejection_reason``.  The estimate alone is sufficient
+        for per-frame diagnostics, but the raw result carries the full quality
+        metadata (support scores, dominance ratios, pairwise RMS) that the
+        stricter accumulation gates require.
+
+        Returns:
+            (estimate, raw_result) — either may be None independently.
         """
         if getattr(frame, "quality", "insufficient") == "insufficient":
-            return None
+            return None, None
 
         best: Optional[dict] = None
+        best_result: Optional[dict] = None
         for direction in (1, -1):
             result = ForwardModel._solve_by_intersection_attempt(
                 [frame],
@@ -1987,21 +2016,20 @@ class ForwardModel:
             ) if best is not None else None
             if best is None or best_rank is None or rank > best_rank:
                 best = r
+                best_result = result
 
         if best is None:
-            return None
+            return None, None
 
         n_arcs = best.get("n_contributing_arcs", 0)
         cep_km = best.get("centroid_uncertainty_km", float("inf"))
         if n_arcs < _PER_FRAME_MIN_CONTRIBUTING_ARCS or cep_km >= _PER_FRAME_MAX_CEP_KM:
-            return None
+            return None, best_result
 
         # Azimuth spread: bearings from the estimated position to each selected observation.
-        selected = best.get("n_selected_observations", 0)
         azimuth_spread = best.get("azimuth_spread_deg", 0.0)
-
         weight = n_arcs / (cep_km + 0.5) ** 2
-        return FramePositionEstimate(
+        est = FramePositionEstimate(
             frame_index=getattr(frame, "frame_index", 0),
             sweep_start_us=getattr(frame, "ref_arrival_us", 0.0),
             lat=best["lat"],
@@ -2016,6 +2044,25 @@ class ForwardModel:
             support_dominance_ratio=best.get("support_dominance_ratio", best.get("dominance_ratio", 0.0)),
             pairwise_weighted_rms_deg=best.get("pairwise_weighted_rms_deg", float("inf")),
         )
+        return est, best_result
+
+    def solve_single_frame(
+        self,
+        iid: int,
+        frame,
+        period_s: float,
+        receiver_lat: float,
+        receiver_lon: float,
+    ) -> Optional["FramePositionEstimate"]:
+        """Solve a single sweep frame's position using the inscribed-angle method.
+
+        Tries both rotation directions; returns the tighter result or None if
+        the frame geometry is insufficient to produce a reliable estimate.
+        """
+        est, _ = self.solve_single_frame_with_result(
+            iid, frame, period_s, receiver_lat, receiver_lon,
+        )
+        return est
 
     # ── Per-frame buffer helpers ─────────────────────────────────────────
 
@@ -3311,15 +3358,29 @@ class ForwardModel:
             "pairwise_residual_sigma_deg": best_pairwise_fit.residual_sigma_deg,
         })
 
+        # Determine what the automatic solver would have done with this result.
+        # Three statuses: accepted, would_be_rejected_ambiguous, would_be_rejected_other.
+        _auto_status = "accepted"
+        if manually_forced_preview:
+            if quality_ratio < effective_threshold:
+                _auto_status = "would_be_rejected_ambiguous"
+            elif (
+                not math.isfinite(centroid_uncertainty_km)
+                or centroid_uncertainty_km < 0.05
+                or n_contributing_arcs < _PER_FRAME_MIN_CONTRIBUTING_ARCS
+                or centroid_uncertainty_km >= _PER_FRAME_MAX_CEP_KM
+                or not math.isfinite(best_pairwise_fit.weighted_rms_deg)
+                or best_pairwise_fit.weighted_rms_deg > _MAX_FINAL_RESIDUAL_SIGMA_DEG
+            ):
+                _auto_status = "would_be_rejected_other"
+
         return {
             "success": True,
             "available": True,
             "solve_status": "success",
             "solve_reason": "success",
             "manually_forced_preview": bool(manually_forced_preview),
-            "automatic_acceptance_status": (
-                "would_be_rejected_ambiguous" if manually_forced_preview and quality_ratio < effective_threshold else "accepted"
-            ),
+            "automatic_acceptance_status": _auto_status,
             "result": {
                 "lat": lat,
                 "lon": lon,
@@ -3351,9 +3412,7 @@ class ForwardModel:
                 "candidate_intersections": detail.get("candidate_intersections", []),
                 "candidate_clusters": detail.get("candidate_clusters", []),
                 "manually_forced_preview": bool(manually_forced_preview),
-                "automatic_acceptance_status": (
-                    "would_be_rejected_ambiguous" if manually_forced_preview and quality_ratio < effective_threshold else "accepted"
-                ),
+                "automatic_acceptance_status": _auto_status,
                 "pair_circle_summary": pair_circle_summary(len(inlier_pair_circles)),
                 "raw_candidate_count": detail["raw_candidate_count"],
                 "plausible_candidate_count": detail["plausible_candidate_count"],
