@@ -1129,11 +1129,10 @@ class AircraftLocaliser:
         with self._lock:
             cals = dict(self._calibrations)
             track = self._tracks.get(icao)
-
-        # Collect recent live rays from the evidence buffers
-        recent_rays: list[Stage3LiveRay] = list(self._recent_rays_by_icao.get(icao, []))
-        recent_rejected: list[Stage3LiveRay] = list(self._recent_rejected_rays_by_icao.get(icao, []))
-        recent_seeds: list[dict] = list(self._recent_seed_points_by_icao.get(icao, []))
+            # Snapshot evidence buffers under the same lock for consistency
+            recent_rays: list[Stage3LiveRay] = list(self._recent_rays_by_icao.get(icao, []))
+            recent_rejected: list[Stage3LiveRay] = list(self._recent_rejected_rays_by_icao.get(icao, []))
+            recent_seeds: list[dict] = list(self._recent_seed_points_by_icao.get(icao, []))
 
         # Filter to time window
         cutoff = time.time() - self._ray_retention_s
@@ -1293,11 +1292,15 @@ class AircraftLocaliser:
             "features": uncertainty_features,
         })
 
+        # Prefer n_radars from the latest fix if available; fall back to unique IIDs in evidence.
+        latest_fix = (track.history[-1] if track and track.history else None)
+        n_radars_out = latest_fix.n_radars if latest_fix is not None else len(unique_iids)
+
         return {
             "available": True,
             "reason": "ok",
             "layers": layers,
             "icao": icao,
-            "n_observations": len(observations),
-            "n_radars": len(unique_iids),
+            "n_observations": len(recent_rays),
+            "n_radars": n_radars_out,
         }

@@ -3,6 +3,7 @@
   flex-direction: column;
   flex: 1;
   min-height: 0;
+  overflow: hidden;
   background: #0b0c10;
 }
 
@@ -94,6 +95,7 @@
 .mapArea {
   flex: 1;
   min-height: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: row;
 }
@@ -230,6 +232,12 @@
 .mapWrap {
   flex: 1;
   min-height: 0;
+}
+
+/* Ensure Leaflet map fills its container */
+.mapWrap :global(.leaflet-container) {
+  height: 100%;
+  width: 100%;
 }
 
 /* Dark-theme Leaflet overrides */

@@ -1402,6 +1402,7 @@ class RadarState:
             # completed frames are available for this batch.
             now_ts = time.time()
             latest_us = prepared[-1][3] if prepared else None
+            new_detections = []
             for iid, icao_hex, signal_dbfs, arrival_us in prepared:
                 sync_state = self._live_sync_states.get(iid)
                 if sync_state is None or not sync_state.usable:
@@ -1410,7 +1411,7 @@ class RadarState:
                 pos = None
                 if wall_ts is not None:
                     pos = self._adsb_tracker.get_position_at(icao_hex, wall_ts)
-                self._live_detection_buffer.append(Stage3LiveDetection(
+                new_detections.append(Stage3LiveDetection(
                     iid=iid,
                     icao=icao_hex,
                     arrival_us=arrival_us,
@@ -1424,6 +1425,10 @@ class RadarState:
                     position_age_seconds=pos.get("position_age_seconds") if pos else None,
                     association_confidence=1.0 if pos is not None else 0.0,
                 ))
+            if new_detections:
+                with self._lock:
+                    for det in new_detections:
+                        self._live_detection_buffer.append(det)
         except Exception:
             pass
         finally:
@@ -3173,10 +3178,9 @@ class RadarState:
     ) -> list[Stage3LiveDetection]:
         """Return recent live detections for one IID, newest first."""
         cutoff = time.time() - max_age_s
-        return [
-            d for d in reversed(self._live_detection_buffer)
-            if d.iid == iid and d.wall_ts >= cutoff
-        ]
+        with self._lock:
+            snapshot = list(self._live_detection_buffer)
+        return [d for d in reversed(snapshot) if d.iid == iid and d.wall_ts >= cutoff]
 
     def get_recent_live_detections_for_icao(
         self,
@@ -3185,10 +3189,9 @@ class RadarState:
     ) -> list[Stage3LiveDetection]:
         """Return recent live detections for one ICAO across all IIDs, newest first."""
         cutoff = time.time() - max_age_s
-        return [
-            d for d in reversed(self._live_detection_buffer)
-            if d.icao == icao and d.wall_ts >= cutoff
-        ]
+        with self._lock:
+            snapshot = list(self._live_detection_buffer)
+        return [d for d in reversed(snapshot) if d.icao == icao and d.wall_ts >= cutoff]
 
     def get_recent_live_detections(
         self,
@@ -3197,10 +3200,11 @@ class RadarState:
     ) -> list[Stage3LiveDetection]:
         """Return recent live detections, optionally filtered to a set of IIDs."""
         cutoff = time.time() - max_age_s
+        with self._lock:
+            snapshot = list(self._live_detection_buffer)
         return [
-            d for d in reversed(self._live_detection_buffer)
-            if d.wall_ts >= cutoff
-            and (iid_subset is None or d.iid in iid_subset)
+            d for d in reversed(snapshot)
+            if d.wall_ts >= cutoff and (iid_subset is None or d.iid in iid_subset)
         ]
 
     def record_live_radar_detection(
@@ -3216,7 +3220,7 @@ class RadarState:
         association_confidence: float = 1.0,
     ) -> None:
         """Explicitly record a Stage 3-usable live detection (called from external code)."""
-        self._live_detection_buffer.append(Stage3LiveDetection(
+        det = Stage3LiveDetection(
             iid=iid,
             icao=icao,
             arrival_us=arrival_us,
@@ -3229,7 +3233,9 @@ class RadarState:
             truth_lon=truth_lon,
             position_age_seconds=position_age_seconds,
             association_confidence=association_confidence,
-        ))
+        )
+        with self._lock:
+            self._live_detection_buffer.append(det)
 
     def update_coincident_location(
         self,
