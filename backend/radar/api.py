@@ -480,6 +480,19 @@ def _layer(
     }
 
 
+def _sanitize_floats(obj):
+    """Recursively replace non-finite floats (inf, -inf, nan) with None."""
+    if isinstance(obj, float):
+        return None if not (obj == obj and obj != float("inf") and obj != float("-inf")) else obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_floats(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_sanitize_floats(v) for v in obj)
+    return obj
+
+
 def _extend_line_through_points(
     lat_a: float,
     lon_a: float,
@@ -2522,7 +2535,7 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
                         "member_dominance_ratio": best_cluster.get("member_dominance_ratio"),
                         "weight_dominance_ratio": (
                             best_cluster.get("cluster_total_weight", 0.0) / second_cluster.get("cluster_total_weight", 1.0)
-                            if second_cluster.get("cluster_total_weight", 0.0) > 0.0 else float("inf")
+                            if second_cluster.get("cluster_total_weight", 0.0) > 0.0 else None
                         ),
                     }
                     _rej, _tier = ForwardModel._classify_frame_for_accumulation(_synthetic_result)
@@ -2640,7 +2653,7 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
             _layer("frame_fm_geometry", "Admitted Pair Circles", "circle", circles, source_count=len(circles)),
         ]
 
-        return {
+        return _sanitize_floats({
             "iid": iid,
             "frame_index": frame.frame_index,
             "available": True,
@@ -2666,7 +2679,7 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
             "accumulation_gate_metrics": accumulation_gate_metrics,
             "candidate_clusters": candidate_clusters,
             "scored_pair_circles": solve_result.get("scored_pair_circles", []) if not solve_result.get("success") else result.get("scored_pair_circles", []),
-        }
+        })
     finally:
         _record_api_timing("iid_sweep_frame_fm_geometry", t0)
 
@@ -2764,7 +2777,7 @@ async def post_iid_sweep_frame_fm_geometry_manual_preview(
                     "member_dominance_ratio": best_cluster.get("member_dominance_ratio"),
                     "weight_dominance_ratio": (
                         best_cluster.get("cluster_total_weight", 0.0) / second_cluster.get("cluster_total_weight", 1.0)
-                        if second_cluster.get("cluster_total_weight", 0.0) > 0.0 else float("inf")
+                        if second_cluster.get("cluster_total_weight", 0.0) > 0.0 else None
                     ),
                 }
                 _rej, _tier = ForwardModel._classify_frame_for_accumulation(_synthetic_result)
@@ -2908,7 +2921,7 @@ async def post_iid_sweep_frame_fm_geometry_manual_preview(
             _layer("frame_fm_geometry", "Admitted Pair Circles", "circle", circles, source_count=len(circles)),
         ]
 
-        return {
+        return _sanitize_floats({
             "iid": iid,
             "frame_index": frame.frame_index,
             "available": True,
@@ -2935,7 +2948,7 @@ async def post_iid_sweep_frame_fm_geometry_manual_preview(
             "scored_pair_circles": solve_result.get("scored_pair_circles", []),
             "manually_forced_preview": True,
             "automatic_acceptance_status": solve_result.get("automatic_acceptance_status", "accepted"),
-        }
+        })
     finally:
         _record_api_timing("iid_sweep_frame_fm_geometry_manual_preview", t0)
 
