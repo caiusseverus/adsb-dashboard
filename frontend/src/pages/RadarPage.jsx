@@ -753,7 +753,7 @@ function formatMethodName(source) {
 
 function IIDTable({ rows, selectedIid, onSelect, onResetAll, resettingAll }) {
   return (
-    <section className={styles.card}>
+    <section className={styles.card} data-panel="iid-selector">
       <div className={styles.cardHeader}>
         <div>
           <div className={styles.cardTitle}>IID Selector</div>
@@ -917,7 +917,7 @@ function LocalisationControlPanel({ iid, onChanged }) {
   }
 
   return (
-    <section className={styles.card}>
+    <section className={styles.card} data-panel="localisation-control">
       <div className={styles.cardHeader}>
         <div>
           <div className={styles.cardTitle}>Localisation Control</div>
@@ -1423,7 +1423,7 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
   }
 
   return (
-    <section className={styles.card}>
+    <section className={styles.card} data-panel="evidence-map">
       <div className={styles.cardHeader}>
         <div>
           <div className={styles.cardTitle}>Position Accumulation Map</div>
@@ -1848,7 +1848,7 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
   }
 
   return (
-    <section className={styles.card}>
+    <section className={styles.card} data-panel="rotation-alignment">
       <div className={styles.cardHeader}>
           <div>
             <div className={styles.cardTitle}>Cycle Alignment</div>
@@ -2541,7 +2541,7 @@ function FMStatusPanel({ iid, refreshKey = 0 }) {
   const errorM = acc.error_vs_manual_m ?? null
 
   return (
-    <section className={styles.card}>
+    <section className={styles.card} data-panel="fm-status">
       <div className={styles.cardHeader}>
         <div>
           <div className={styles.cardTitle}>Frame Accumulation</div>
@@ -3370,7 +3370,7 @@ function SweepFrameStrips({ iid, selectedFrame, onSelectFrame }) {
   }
 
   return (
-    <section className={styles.card}>
+    <section className={styles.card} data-panel="sweep-frames">
       <div className={styles.cardHeader}>
         <div>
           <div className={styles.cardTitle}>Sweep Frames</div>
@@ -3658,9 +3658,10 @@ export default function RadarPage() {
     setControlRefreshKey(v => v + 1)
   }
 
-  return (
-    <main className={styles.main}>
-      <div className={styles.stack}>
+return (
+  <main className={styles.main}>
+    <div className={styles.stack}>
+      <div data-slot="iid-selector">
         <IIDTable
           rows={rows}
           selectedIid={selectedIid}
@@ -3668,29 +3669,84 @@ export default function RadarPage() {
           onResetAll={handleResetAll}
           resettingAll={resettingAll}
         />
+      </div>
+
+      <div data-slot="localisation-control">
         <LocalisationControlPanel
           iid={selectedIid}
           onChanged={handleChanged}
         />
-        <SolutionComparisonPanel iid={selectedIid} refreshKey={controlRefreshKey} />
-        <LazyMountSection placeholder="Loading sweep frames when visible…" minHeight={320}>
-          <SweepFrameStrips iid={selectedIid} selectedFrame={selectedFrame} onSelectFrame={setSelectedFrame} />
-        </LazyMountSection>
-        <FMStatusPanel iid={selectedIid} refreshKey={controlRefreshKey} onChanged={handleChanged} />
-        <EvidenceMapPanel key={selectedIid} iid={selectedIid} refreshKey={controlRefreshKey} />
-        <RotationAlignmentPanel
-          key={selectedIid}
+      </div>
+
+      <div data-slot="position-sources">
+        <SolutionComparisonPanel
           iid={selectedIid}
-          selectedRow={selectedRow}
-          selectedIcao={selectedIcao}
-          onSelectIcao={setSelectedIcao}
-          rows={rows}
-          onSelectIid={handleSelectIid}
+          refreshKey={controlRefreshKey}
         />
-        <LazyMountSection placeholder="Loading position verification when visible…" minHeight={760}>
-          <ReceiverCentredRadarField iid={selectedIid} selectedRow={selectedRow} />
+      </div>
+
+      <div data-slot="sweep-frames">
+        <LazyMountSection
+          placeholder="Loading sweep frames when visible…"
+          minHeight={320}
+        >
+          <SweepFrameStrips
+            iid={selectedIid}
+            selectedFrame={selectedFrame}
+            onSelectFrame={setSelectedFrame}
+          />
         </LazyMountSection>
       </div>
-    </main>
-  )
+
+      {selectedIid != null && (
+        <div data-slot="fm-status">
+          <FMStatusPanel
+            iid={selectedIid}
+            refreshKey={controlRefreshKey}
+            onChanged={handleChanged}
+          />
+        </div>
+      )}
+
+      {selectedIid != null && (
+        <div data-slot="evidence-map">
+          <LazyMountSection
+            placeholder="Loading evidence map when visible…"
+            minHeight={420}
+          >
+            <EvidenceMapPanel
+              iid={selectedIid}
+              refreshKey={controlRefreshKey}
+            />
+          </LazyMountSection>
+        </div>
+      )}
+
+      {selectedIid != null && (
+        <div data-slot="rotation-alignment">
+          <RotationAlignmentPanel
+            iid={selectedIid}
+            selectedRow={selectedRow}
+            selectedIcao={selectedIcao}
+            onSelectIcao={setSelectedIcao}
+            rows={rows}
+            onSelectIid={handleSelectIid}
+          />
+        </div>
+      )}
+
+      <div data-slot="position-verification">
+        <LazyMountSection
+          placeholder="Loading position verification when visible…"
+          minHeight={760}
+        >
+          <ReceiverCentredRadarField
+            iid={selectedIid}
+            selectedRow={selectedRow}
+          />
+        </LazyMountSection>
+      </div>
+    </div>
+  </main>
+)
 }
