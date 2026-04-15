@@ -1352,6 +1352,9 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
     setDeleteRunning(false)
   }
 
+  // Radar-level control metadata: manual position, authoritative display position
+  const { data: controlData } = useIidControl(iid, refreshKey + autoKey + deleteKey)
+  // Method evidence: frame scatter points and FM estimate layers only
   const { data, loading } = useEvidenceMethods(iid, ['forward_model'], refreshKey + autoKey + deleteKey)
   const loadedMethods = data?.methods ?? []
   const fmMethod = loadedMethods.find(m => m.method === 'forward_model') ?? { method: 'forward_model', available: false, layers: [] }
@@ -1359,9 +1362,9 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
 
   const scatterPoints = collectEvidencePoints(activeMethods).filter(p => p.role === 'frame_position_estimate')
 
-  // Ring anchor: prefer the display (manual or fm) position, fall back to FM layer estimate
+  // Ring anchor: prefer the authoritative display position from control, fall back to FM layer estimate
   const ringAnchor = (() => {
-    if (data?.display_lat != null) return { lat: data.display_lat, lon: data.display_lon }
+    if (controlData?.display_lat != null) return { lat: controlData.display_lat, lon: controlData.display_lon }
     const est = fmMethod.layers?.find(l => l.active_estimate)?.active_estimate
     return est?.lat != null ? { lat: est.lat, lon: est.lon } : null
   })()
@@ -1373,7 +1376,7 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
   const ringDistances = niceRingDistances(maxDistKm)
 
   // Bounds: scatter + anchor + inner ring context (so innermost ring is visible)
-  const solutionPoints = collectSolutionPoints(data, activeMethods)
+  const solutionPoints = collectSolutionPoints(controlData, activeMethods)
   const innerRing = ringAnchor && ringDistances.length > 0 ? ringDistances[0] : 0
   const ringContextPoints = ringAnchor && innerRing > 0 ? [
     { lat: ringAnchor.lat + innerRing / 111.32, lon: ringAnchor.lon },
@@ -1384,12 +1387,12 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
 
   const width = 600
   const height = 600
-  const selectedEstimate = data?.display_lat != null && data?.display_lon != null
-    ? { source: data.display_source, lat: data.display_lat, lon: data.display_lon, cep_m: data.display_cep_m }
+  const selectedEstimate = controlData?.display_lat != null && controlData?.display_lon != null
+    ? { source: controlData.display_source, lat: controlData.display_lat, lon: controlData.display_lon, cep_m: controlData.display_cep_m }
     : null
   const frameCount = fmMethod.layers?.find(l => l.label === 'Per-Frame Estimates')?.source_count ?? 0
   const fmEstimate = fmMethod.layers?.find(l => l.active_estimate)?.active_estimate ?? null
-  const manualEstimate = data?.manual_lat != null ? { lat: data.manual_lat, lon: data.manual_lon } : null
+  const manualEstimate = controlData?.manual_lat != null ? { lat: controlData.manual_lat, lon: controlData.manual_lon } : null
 
   const manualPoint = manualEstimate ? [{ lat: manualEstimate.lat, lon: manualEstimate.lon }] : []
   const points = [...scatterPoints, ...solutionPoints, ...ringContextPoints, ...manualPoint]
