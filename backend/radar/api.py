@@ -566,6 +566,8 @@ def _evidence_meta(iid: int, method: str, model) -> dict:
         "iid": iid,
         "method": method,
         "resolution_mode": model.resolution_mode if model is not None else "auto",
+        "manual_lat": model.manual_lat if model is not None else None,
+        "manual_lon": model.manual_lon if model is not None else None,
         "display_position": {
             "source": auth["source"],
             "lat": auth["lat"],

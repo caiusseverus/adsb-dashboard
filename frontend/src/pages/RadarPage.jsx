@@ -468,9 +468,11 @@ function useEvidenceMethods(iid, methods, refreshKey = 0) {
         }))
         if (controller.signal.aborted) return
         const evidenceMethods = results.filter(Boolean)
-        const display = evidenceMethods.find(method => method?.display_position)?.display_position ?? null
+        const basePayload = evidenceMethods[0] ?? {}
+        const display = evidenceMethods.find(m => m?.display_position)?.display_position ?? null
         startTransition(() => {
           setData({
+            ...basePayload,
             iid,
             available: true,
             display_source: display?.source ?? 'none',
@@ -1303,6 +1305,13 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
 
   // Clear analysis whenever data refreshes (auto or after delete)
   useEffect(() => { setOutlierResult(null) }, [autoKey])
+
+  // Reset radar-specific local state on IID change (belt-and-suspenders alongside key remount)
+  useEffect(() => {
+    setOutlierResult(null)
+    setAnalyseRunning(false)
+    setDeleteRunning(false)
+  }, [iid])
 
   async function handleDeletePoint(frameIndex) {
     if (frameIndex == null) return
