@@ -495,6 +495,58 @@ def _estimate_cep(jac: np.ndarray | None, n_obs: int) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Stage 3B/3C helpers: per-IID candidate collapsing and display selection
+# ---------------------------------------------------------------------------
+
+def _score_live_bearing_candidate(obs: RadarBearingObservation) -> float:
+    """Lightweight ranking score for live bearing candidates. Higher is better.
+
+    Recency (arrival_us) is the primary criterion so the displayed ray always
+    reflects the latest burst centre.  Association confidence and bearing sigma
+    act as tiebreakers for detections with identical or very similar timestamps.
+    """
+    sigma_score = 1.0 / max(obs.bearing_sigma_deg, 0.5)
+    return obs.arrival_us + obs.association_confidence * 1e6 + sigma_score * 1e5
+
+
+def _collapse_candidates_by_iid(
+    observations: list[RadarBearingObservation],
+) -> list[RadarBearingObservation]:
+    """Return one observation per radar IID, keeping the best-scored candidate.
+
+    Collapsing before seed generation prevents a single radar that has retained
+    several recent detections from dominating pairwise intersection counts and
+    producing misleading seed clusters.
+    """
+    best: dict[int, RadarBearingObservation] = {}
+    for obs in observations:
+        if obs.iid not in best or _score_live_bearing_candidate(obs) > _score_live_bearing_candidate(best[obs.iid]):
+            best[obs.iid] = obs
+    return list(best.values())
+
+
+def _select_best_live_ray_per_radar(rays: list[Stage3LiveRay]) -> list[Stage3LiveRay]:
+    """Return one Stage3LiveRay per radar IID, preferring the newest burst-centre ray.
+
+    Used by build_evidence() to collapse the display layer so exactly one
+    bearing ray is rendered per radar regardless of how many solve cycles have
+    contributed rays to the buffer for a given aircraft.
+    """
+    best: dict[int, Stage3LiveRay] = {}
+    for ray in rays:
+        if ray.iid not in best:
+            best[ray.iid] = ray
+        else:
+            existing = best[ray.iid]
+            # Prefer higher arrival_us (most recent burst centre)
+            if ray.arrival_us > existing.arrival_us:
+                best[ray.iid] = ray
+            elif ray.arrival_us == existing.arrival_us and ray.association_confidence > existing.association_confidence:
+                best[ray.iid] = ray
+    return list(best.values())
+
+
+# ---------------------------------------------------------------------------
 # Stage 3E: Short-horizon runtime track filter
 # ---------------------------------------------------------------------------
 
@@ -922,10 +974,16 @@ class AircraftLocaliser:
 
         now_ts = time.time()
 
-        # Emit rays for evidence — all observations are accepted rays at this stage
-        # (pre-solve; post-solve rejected rays would require a second pass).
+        # Collapse to one observation per radar IID for display and seed generation.
+        # This prevents a single radar with several retained detections from
+        # producing many competing rays in the evidence layer and inflating
+        # pairwise seed intersections.  The full observation list is still passed
+        # to solve_snapshot(), which has its own per-IID deduplication.
+        display_obs = _collapse_candidates_by_iid(observations)
+
+        # Emit exactly one display ray per radar IID (burst-centre bearing).
         accepted_rays: list[Stage3LiveRay] = []
-        for obs in observations:
+        for obs in display_obs:
             accepted_rays.append(Stage3LiveRay(
                 track_id=icao,
                 icao=icao,
@@ -936,19 +994,23 @@ class AircraftLocaliser:
                 bearing_deg=obs.bearing_obs_deg,
                 bearing_sigma_deg=obs.bearing_sigma_deg,
                 accepted=True,
+                arrival_us=obs.arrival_us,
+                association_confidence=obs.association_confidence,
             ))
 
-        # Store accepted rays
+        # Store accepted rays — one per IID per solve cycle.
         if accepted_rays:
             ray_buf = self._recent_rays_by_icao.setdefault(icao, deque(maxlen=self._RAY_BUFFER_MAX))
             ray_buf.extend(accepted_rays)
 
         # Need at least 2 different radars
-        unique_iids = {o.iid for o in observations}
+        unique_iids = {o.iid for o in display_obs}
         if len(unique_iids) < self._min_radars_for_fix:
             return None
 
-        seeds = generate_seeds(observations)
+        # Use collapsed observation list for seed generation so one radar cannot
+        # generate multiple pairwise intersections.
+        seeds = generate_seeds(display_obs)
         if not seeds:
             return None
 
@@ -1203,7 +1265,11 @@ class AircraftLocaliser:
                 },
             }
 
-        ray_features = [_ray_to_feature(r, "bearing_ray") for r in recent_rays]
+        # Collapse to one display ray per radar IID: newest burst-centre bearing.
+        # The buffer may hold rays from multiple solve cycles; collapsing here
+        # ensures the evidence page renders exactly one bearing ray per radar.
+        display_rays = _select_best_live_ray_per_radar(recent_rays)
+        ray_features = [_ray_to_feature(r, "bearing_ray") for r in display_rays]
         rejected_features = [_ray_to_feature(r, "rejected_ray") for r in recent_rejected]
 
         layers.append({

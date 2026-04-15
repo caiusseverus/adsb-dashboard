@@ -40,6 +40,8 @@ class Stage3LiveRay:
     bearing_sigma_deg: float
     accepted: bool
     rejection_reason: str | None = None
+    arrival_us: float = 0.0         # Beast-monotonic burst-centre timestamp (microseconds)
+    association_confidence: float = 1.0  # Copied from the source observation for ranking
 
 
 @dataclass
