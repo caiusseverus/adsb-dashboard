@@ -452,6 +452,8 @@ function useEvidenceMethods(iid, methods, refreshKey = 0) {
       return
     }
 
+    // Clear stale data immediately so the map does not show previous radar's points
+    setData(null)
     const controller = new AbortController()
     setLoading(true)
 
@@ -739,6 +741,7 @@ function googleMapsUrl(lat, lon) {
 function formatMethodName(source) {
   switch (source) {
     case 'forward_model': return 'Forward Model'
+    case 'fm': return 'Estimated'
     case 'coincident_illumination': return 'Coincident Rays'
     case 'combined': return 'Combined'
     case 'manual': return 'Manual'
@@ -1024,6 +1027,7 @@ function SolutionComparisonPanel({ iid, refreshKey = 0 }) {
                 <th>Longitude</th>
                 <th title="Circular Error Probable — radius containing 50% of estimates">Uncertainty</th>
                 <th>Updated</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
@@ -1035,6 +1039,19 @@ function SolutionComparisonPanel({ iid, refreshKey = 0 }) {
                   <td className={styles.monoCell}>{method.lon != null ? method.lon.toFixed(4) : '—'}</td>
                   <td className={styles.monoCell}>{formatUncertainty(method.cep_m)}</td>
                   <td className={styles.monoCell}>{method.updated_ts ? new Date(method.updated_ts * 1000).toLocaleTimeString() : '—'}</td>
+                  <td className={styles.monoCell}>
+                    {method.lat != null && method.lon != null ? (
+                      <a
+                        href={googleMapsUrl(method.lat, method.lon)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ color: sourceColor(method.source), textDecoration: 'none' }}
+                        title="Open in Google Maps satellite view"
+                      >
+                        ↗ Map
+                      </a>
+                    ) : '—'}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -3648,10 +3665,9 @@ export default function RadarPage() {
           <SweepFrameStrips iid={selectedIid} selectedFrame={selectedFrame} onSelectFrame={setSelectedFrame} />
         </LazyMountSection>
         <FMStatusPanel iid={selectedIid} refreshKey={controlRefreshKey} onChanged={handleChanged} />
-        <LazyMountSection placeholder="Loading evidence map when visible…" minHeight={420}>
-          <EvidenceMapPanel iid={selectedIid} refreshKey={controlRefreshKey} />
-        </LazyMountSection>
+        <EvidenceMapPanel key={selectedIid} iid={selectedIid} refreshKey={controlRefreshKey} />
         <RotationAlignmentPanel
+          key={selectedIid}
           iid={selectedIid}
           selectedRow={selectedRow}
           selectedIcao={selectedIcao}
