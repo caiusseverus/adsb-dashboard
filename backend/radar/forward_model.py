@@ -2884,6 +2884,7 @@ class ForwardModel:
         omega = 2.0 * math.pi / period_s  # radar rotation rate in rad/s
         scored = compute_circle_scores(raw_circles, p_bar_enu_m, omega)
         selected = select_circles(scored)
+        detail["initial_admitted_pair_count"] = len(selected)
         if manual_selected_circle_indices is not None:
             requested = {int(idx) for idx in manual_selected_circle_indices}
             selected = [sc for sc in selected if int(sc.circle_index) in requested]
@@ -3194,8 +3195,24 @@ class ForwardModel:
         if not quality_ranked:
             return rejected_payload("rejected_no_viable_clusters", "no clusters passed quality gates")
 
-        # Sort by quality score (descending), then pairwise RMS (ascending), then RMS (ascending)
-        quality_ranked.sort(key=lambda item: (-item[0], item[1], item[3].rms_km))
+        # Sort by member count (descending) first — dominant cluster identification is
+        # member-first.  Quality score, compactness, and conditioning are secondary
+        # tiebreakers.  Pairwise RMS is NOT used for cluster selection; it is a
+        # confidence/refinement metric applied after the dominant cluster is chosen.
+        def _cluster_sort_key(item: tuple) -> tuple:
+            _q_score, _pairwise_rms, _pairwise_fit, cluster, quality = item
+            compactness = quality.get("compactness_km", float("inf"))
+            cond = quality.get("condition_number", float("inf"))
+            cond_sort = cond if math.isfinite(cond) else 1e9
+            return (
+                -cluster.member_count,   # primary: most intersection members first
+                -cluster.total_weight,   # secondary: highest aggregate weight first
+                cluster.rms_km,          # tertiary: raw cluster spread (tighter = more genuine)
+                compactness,             # quaternary: refined inlier compactness
+                cond_sort,               # quinary: best-conditioned first
+                -_q_score,               # senary: quality-score tiebreaker
+            )
+        quality_ranked.sort(key=_cluster_sort_key)
 
         # ── Cluster serialization with full diagnostics ─────────────────
         def serialize_cluster_v2(
@@ -3331,13 +3348,41 @@ class ForwardModel:
         if best_quality_score >= 2.0 and quality_ratio >= 1.1:
             effective_threshold = 1.05
 
-        # Reject as ambiguous only when BOTH quality and support fail to separate clearly.
+        # Determine if the best cluster is geometry-dominant (strong member-count and
+        # weight dominance over the second cluster).  A geometry-dominant cluster bypasses
+        # the quality-ratio ambiguity rejection — the intersection structure itself is
+        # sufficient evidence.
+        _second_member_count_check = second_cluster.member_count if second_cluster is not None else 0
+        _second_weight_check = second_cluster.total_weight if second_cluster is not None else 0.0
+        _member_ratio_for_dom = (
+            best_cluster.member_count / _second_member_count_check
+            if _second_member_count_check > 0 else float("inf")
+        )
+        _weight_ratio_for_dom = (
+            best_cluster.total_weight / _second_weight_check
+            if _second_weight_check > 0.0 else float("inf")
+        )
+        _is_geometry_dominant_cluster = (
+            best_cluster.member_count >= ACCUM_GEOM_DOMINANT_MIN_MEMBER_COUNT
+            and (
+                not math.isfinite(_member_ratio_for_dom)
+                or _member_ratio_for_dom >= ACCUM_GEOM_DOMINANT_MIN_MEMBER_RATIO
+            )
+            and (
+                not math.isfinite(_weight_ratio_for_dom)
+                or _weight_ratio_for_dom >= ACCUM_GEOM_DOMINANT_MIN_WEIGHT_RATIO
+            )
+        )
+
+        # Reject as ambiguous only when BOTH quality and support fail to separate clearly
+        # AND the cluster is not geometry-dominant by member count.
         # This allows a tight, well-conditioned cluster to win over a broader one even
-        # when raw support is similar.
+        # when raw support is similar.  Geometry-dominant clusters (strong member/weight
+        # dominance) bypass the quality-ratio ambiguity rejection entirely.
         is_ambiguous = False
         ambiguity_reason = ""
 
-        if quality_ratio < effective_threshold:
+        if not _is_geometry_dominant_cluster and quality_ratio < effective_threshold:
             # Quality scores are close — check if the second cluster is actually competitive
             if second_cluster is not None:
                 # Additional guard: second cluster must also have meaningful total weight
@@ -3357,6 +3402,11 @@ class ForwardModel:
                     "best_quality_score": round(best_quality_score, 6),
                     "second_quality_score": round(second_quality_score, 6),
                     "cluster_count": len(clusters),
+                    "is_geometry_dominant_cluster": _is_geometry_dominant_cluster,
+                    "best_cluster_member_count": best_cluster.member_count,
+                    "second_cluster_member_count": _second_member_count_check,
+                    "member_dominance_ratio": round(_member_ratio_for_dom, 3) if math.isfinite(_member_ratio_for_dom) else None,
+                    "weight_dominance_ratio": round(_weight_ratio_for_dom, 3) if math.isfinite(_weight_ratio_for_dom) else None,
                 },
             )
 
@@ -3450,6 +3500,36 @@ class ForwardModel:
             if 0 <= idx < len(selected_rows)
         ]
 
+        # ── Post-cluster pruning diagnostics ─────────────────────────────────
+        # Record which admitted circles are inconsistent with the dominant cluster.
+        # This is SUBTRACTIVE: we identify outliers *after* cluster discovery, not
+        # pre-emptively.  The inlier set is already computed (inlier_indices_set).
+        post_cluster_pruned_pairs: list[dict] = []
+        for _idx in range(len(admitted_by_arr_index)):
+            if _idx not in inlier_indices_set:
+                _sc = admitted_by_arr_index[_idx]
+                _residual = normalized_residuals[_idx] if _idx < len(normalized_residuals) else float("inf")
+                _raw_row = selected_rows[_idx]
+                post_cluster_pruned_pairs.append({
+                    "circle_index": int(_raw_row[6]),
+                    "admitted_index": _idx,
+                    "frame_index": int(_sc.frame_index),
+                    "icao_a": _sc.icao_a,
+                    "icao_b": _sc.icao_b,
+                    "normalized_residual": round(_residual, 3) if math.isfinite(_residual) else None,
+                    "removal_reason": "cluster_outlier",
+                })
+
+        # Refined pairwise fit using only cluster-inlier circles (not all admitted circles).
+        # This gives a pairwise RMS that reflects the cluster quality rather than being
+        # polluted by outlier circles outside the dominant cluster.
+        if inlier_circles:
+            refined_pairwise_fit = _score_candidate_position_pairwise(
+                lat, lon, inlier_circles, raw_by_index, period_s, direction,
+            )
+        else:
+            refined_pairwise_fit = best_pairwise_fit
+
         detail["selection_diagnostics"].update({
             "best_cluster_quality_score": round(best_quality_score, 6),
             "best_cluster_support_score": round(best_quality["support_score"], 6),
@@ -3461,23 +3541,38 @@ class ForwardModel:
             "pairwise_fit_score": best_pairwise_fit.score,
             "pairwise_weighted_rms_deg": best_pairwise_fit.weighted_rms_deg,
             "pairwise_residual_sigma_deg": best_pairwise_fit.residual_sigma_deg,
+            "refined_pairwise_weighted_rms_deg": refined_pairwise_fit.weighted_rms_deg,
+            "initial_admitted_pair_count": detail.get("initial_admitted_pair_count", len(selected)),
+            "post_cluster_pruned_pair_count": len(post_cluster_pruned_pairs),
+            "is_geometry_dominant_cluster": _is_geometry_dominant_cluster,
         })
 
         # Determine what the automatic solver would have done with this result.
-        # Three statuses: accepted, would_be_rejected_ambiguous, would_be_rejected_other.
+        # Three statuses: accepted, accepted_geometry_dominant, would_be_rejected_ambiguous,
+        # would_be_rejected_other.
+        # Pairwise RMS (even refined) should reduce confidence but not automatically
+        # kill a geometry-dominant frame.
         _auto_status = "accepted"
         if manually_forced_preview:
-            if quality_ratio < effective_threshold:
+            if quality_ratio < effective_threshold and not _is_geometry_dominant_cluster:
                 _auto_status = "would_be_rejected_ambiguous"
             elif (
                 not math.isfinite(centroid_uncertainty_km)
                 or centroid_uncertainty_km < 0.05
                 or n_contributing_arcs < _PER_FRAME_MIN_CONTRIBUTING_ARCS
                 or centroid_uncertainty_km >= _PER_FRAME_MAX_CEP_KM
-                or not math.isfinite(best_pairwise_fit.weighted_rms_deg)
-                or best_pairwise_fit.weighted_rms_deg > _MAX_FINAL_RESIDUAL_SIGMA_DEG
             ):
                 _auto_status = "would_be_rejected_other"
+            elif (
+                not math.isfinite(refined_pairwise_fit.weighted_rms_deg)
+                or refined_pairwise_fit.weighted_rms_deg > _MAX_FINAL_RESIDUAL_SIGMA_DEG
+            ):
+                # High pairwise RMS even after pruning — geometry-dominant frames
+                # survive with reduced weight; non-dominant frames are rejected.
+                if _is_geometry_dominant_cluster:
+                    _auto_status = "accepted_geometry_dominant"
+                else:
+                    _auto_status = "would_be_rejected_other"
 
         return {
             "success": True,
@@ -3496,6 +3591,7 @@ class ForwardModel:
                 "n_pairs": len(arr),
                 "n_selected_observations": n_selected,
                 "n_admitted_pair_circles": n_selected,
+                "initial_admitted_pair_count": detail.get("initial_admitted_pair_count", n_selected),
                 "interpolated_fraction": interp_frac,
                 "azimuth_spread_deg": az_spread,
                 "high_quality_frames": sum(
@@ -3519,10 +3615,13 @@ class ForwardModel:
                 "dominance_ratio": dominance_ratio,
                 "support_dominance_ratio": support_ratio,
                 "quality_ratio": quality_ratio,
+                "is_geometry_dominant_cluster": _is_geometry_dominant_cluster,
                 "receiver_distance_m": receiver_distance_m,
                 "selection_diagnostics": detail["selection_diagnostics"],
                 "admitted_pair_circles": admitted_pair_circles,
                 "inlier_pair_circles": inlier_pair_circles,
+                "post_cluster_pruned_pairs": post_cluster_pruned_pairs[:50],
+                "post_cluster_pruned_pair_count": len(post_cluster_pruned_pairs),
                 "refined_subset_circle_indices": refined_circle_indices,
                 "scored_pair_circles": [serialize_pair_circle(sc) for sc in scored],
                 "candidate_intersections": detail.get("candidate_intersections", []),
@@ -3540,6 +3639,10 @@ class ForwardModel:
                 "pairwise_mean_residual_deg": best_pairwise_fit.mean_residual_deg,
                 "pairwise_residual_sigma_deg": best_pairwise_fit.residual_sigma_deg,
                 "pairwise_weighted_rms_deg": best_pairwise_fit.weighted_rms_deg,
+                "refined_pairwise_weighted_rms_deg": (
+                    round(float(refined_pairwise_fit.weighted_rms_deg), 3)
+                    if math.isfinite(refined_pairwise_fit.weighted_rms_deg) else None
+                ),
                 "best_cluster_quality_score": round(best_quality_score, 6),
                 "best_cluster_support_score": round(best_quality["support_score"], 6),
                 "best_cluster_compactness_km": round(best_quality["compactness_km"], 3),

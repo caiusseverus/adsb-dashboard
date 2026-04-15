@@ -42,14 +42,16 @@ MIN_REPLIES_PER_BURST: int = 2
 MAX_POSITION_AGE_SEC: float = 10.0
 """Maximum ADS-B position age for both aircraft in a pair."""
 
-MIN_CIRCLE_SCORE: float = 0.05
-"""Minimum final pair circle score to enter the admitted candidate set."""
-
 MAX_PAIRS_PER_AIRCRAFT_PER_FRAME: int = 8
 """Per-frame cap preventing one aircraft from dominating the all-pairs set."""
 
-MAX_CIRCLES_PER_FRAME: int = 48
-"""Per-frame cap on admitted circles; large enough for all-pairs geometry, bounded for solve cost."""
+MAX_CIRCLES_PER_FRAME: int = 80
+"""Per-frame cap on admitted circles; increased to support broader initial admission set."""
+
+MIN_CIRCLE_SCORE: float = 0.0
+"""Minimum final pair circle score threshold; set to 0.0 to admit all non-degenerate circles
+regardless of quality-heuristic score. Only hard geometric gates apply. This prevents early
+exclusion of pairs that would support the true radar-location cluster."""
 
 
 # -- Data structures ---------------------------------------------------------
@@ -206,8 +208,8 @@ def _score_single_circle(
     omega: float,
 ) -> ScoredCircle:
     """Compute all score components for one pair circle."""
-    degenerate_low = delta_phi < math.radians(2.0)
-    degenerate_high = delta_phi > math.radians(178.0)
+    degenerate_low = delta_phi < math.radians(5.0)
+    degenerate_high = delta_phi > math.radians(175.0)
     invalid_geometry = (
         degenerate_low
         or degenerate_high
@@ -380,15 +382,22 @@ def _make_scored_circle(
 
 
 def _check_hard_gates(sc: ScoredCircle) -> Optional[str]:
-    """Check hard gates for a scored circle. Returns exclusion reason or None."""
+    """Check hard gates for a scored circle. Returns exclusion reason or None.
+
+    Only truly hard exclusions apply here:
+    - Degenerate inscribed-angle geometry (delta_phi too close to 0° or 180°)
+    - Insufficient reply count (data unreliable regardless of geometry)
+    - Stale ADS-B position (position unreliable regardless of geometry)
+
+    Fine-grained quality heuristics such as circle_score thresholds are NOT applied
+    here. Pair quality is evaluated post-cluster via normalized residuals, not pre-emptively.
+    """
     if sc.exclusion_reason == "degenerate_delta_phi":
         return "degenerate_delta_phi"
     if min(sc.n_replies_a, sc.n_replies_b) < MIN_REPLIES_PER_BURST:
         return "insufficient_replies"
     if max(sc.position_age_a_seconds, sc.position_age_b_seconds) > MAX_POSITION_AGE_SEC:
         return "stale_position"
-    if sc.circle_score < MIN_CIRCLE_SCORE:
-        return "low_score"
     return None
 
 

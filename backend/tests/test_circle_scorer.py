@@ -28,9 +28,9 @@ class TestConstants:
         assert POSITION_AGE_TAU_SEC == 4.0
         assert MIN_REPLIES_PER_BURST == 2
         assert MAX_POSITION_AGE_SEC == 10.0
-        assert MIN_CIRCLE_SCORE == 0.05
+        assert MIN_CIRCLE_SCORE == 0.0
         assert MAX_PAIRS_PER_AIRCRAFT_PER_FRAME == 8
-        assert MAX_CIRCLES_PER_FRAME == 48
+        assert MAX_CIRCLES_PER_FRAME == 80
 
 
 class TestCircularDistance:
@@ -178,13 +178,23 @@ class TestHardGates:
         assert selected == []
         assert scored[0].exclusion_reason == "stale_position"
 
-    def test_low_score_excluded(self):
+    def test_near_degenerate_high_angle_excluded(self):
+        scored = compute_circle_scores([
+            _make_circle(delta_phi=math.radians(176.0))
+        ], None, 0.628)
+        selected = select_circles(scored)
+        assert selected == []
+        assert scored[0].exclusion_reason == "degenerate_delta_phi"
+
+    def test_low_score_circle_now_admitted(self):
+        # Previously excluded by low_score gate; now admitted since only hard geometric
+        # gates apply — quality heuristics are handled post-cluster.
         scored = compute_circle_scores([
             _make_circle(delta_phi=math.radians(10.0), position_age_a_seconds=8.0, position_age_b_seconds=8.0)
         ], None, 0.628)
         selected = select_circles(scored)
-        assert selected == []
-        assert scored[0].exclusion_reason == "low_score"
+        assert len(selected) == 1
+        assert scored[0].exclusion_reason is None
 
 
 class TestPairAdmission:
