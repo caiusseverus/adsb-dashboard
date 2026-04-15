@@ -974,6 +974,9 @@ class RadarState:
         # 500 frames ≈ 33 minutes at 4s period; keeps memory bounded.
         self._LIVE_FRAMES_MAX = 500
         self._live_completed_frames: dict[int, deque] = {}
+        # Monotonically increasing frame counter per IID — never resets when the deque wraps,
+        # so frame_index stays unique even after the ring buffer fills.
+        self._live_frame_counters: dict[int, int] = {}
         self._native_burst_processors: dict[int, Any] = {}
 
         # Real-time DF11 flash events for the sweep diagram.
@@ -1095,6 +1098,7 @@ class RadarState:
             self._live_burst_centroids[iid] = {}
             self._live_frames[iid] = None
             self._live_completed_frames[iid] = deque(maxlen=self._LIVE_FRAMES_MAX)
+            self._live_frame_counters[iid] = 0
 
     def _process_fired_bursts(self, iid: int, fired_bursts: list[dict]) -> dict:
         metrics = _new_fired_burst_phase_metrics()
@@ -1479,8 +1483,10 @@ class RadarState:
             metrics["frame_finalized_count"] += 1
             quality = "good" if n_aircraft >= 4 else "marginal"
             from .models import SweepFrame
+            next_index = self._live_frame_counters.get(iid, 0)
+            self._live_frame_counters[iid] = next_index + 1
             frame = SweepFrame(
-                frame_index=len(self._live_completed_frames[iid]),
+                frame_index=next_index,
                 sweep_start_us=current_frame.ref_arrival_us,
                 ref_icao=current_frame.ref_icao,
                 ref_lat=current_frame.ref_lat,
@@ -1712,6 +1718,7 @@ class RadarState:
             self._live_burst_centroids[iid] = {}
             self._live_frames[iid] = None
             self._live_completed_frames[iid] = deque(maxlen=self._LIVE_FRAMES_MAX)
+            self._live_frame_counters[iid] = 0
 
         pending_bursts = self._live_bursts[iid]
         last_arrival = self._live_last_arrival[iid]
@@ -2233,7 +2240,8 @@ class RadarState:
             for live_dict in (self._live_bursts, self._live_last_arrival,
                                self._live_burst_centroids, self._live_frames,
                                self._live_last_frame_start_us,
-                               self._live_completed_frames):
+                               self._live_completed_frames,
+                               self._live_frame_counters):
                 if iid in live_dict:
                     del live_dict[iid]
                     had_any = True
@@ -2279,6 +2287,7 @@ class RadarState:
             self._live_frames.clear()
             self._live_last_frame_start_us.clear()
             self._live_completed_frames.clear()
+            self._live_frame_counters.clear()
             self._native_burst_processors.clear()
             return cleared
 
@@ -3281,8 +3290,11 @@ class RadarState:
             n_aircraft = n_obs + 1
             quality = "good" if n_aircraft >= 4 else ("marginal" if n_aircraft >= 3 else "insufficient")
             if n_aircraft >= 3:
+                # Use the next counter value (not yet incremented) so this synthetic
+                # frame never collides with any completed frame.
+                in_progress_index = self._live_frame_counters.get(iid, 0)
                 frames.append(SweepFrame(
-                    frame_index=len(frames),
+                    frame_index=in_progress_index,
                     sweep_start_us=in_progress.ref_arrival_us,
                     ref_icao=in_progress.ref_icao,
                     ref_lat=in_progress.ref_lat,
