@@ -287,6 +287,7 @@ class AlignedBurstSyncObs:
     pos_age_s: float            # ADS-B position age at burst time (seconds)
     range_nm: float             # Geometric range from radar to aircraft (nautical miles)
     ts: float                   # Wall-clock time for rolling-window age filtering
+    sync_update_eligible: bool = True  # True if this burst was eligible to steer sync
 
 
 class AircraftPositionTracker:
@@ -1067,6 +1068,12 @@ class RadarState:
         # 200 entries per IID ≈ ~50 rotations at 4 aircraft/rotation — sufficient window.
         self._MULTI_SYNC_OBS_MAX = 200
         self._live_aligned_burst_obs: dict[int, deque] = {}  # {iid: deque[AlignedBurstSyncObs]}
+        # Per-IID burst observation buffer for UI timeline rendering. This is broader
+        # than _live_aligned_burst_obs: it includes all burst-centre observations that
+        # can be compared against the maintained sync model, even when they are not
+        # eligible to steer sync updates.
+        self._BURST_SYNC_TIMELINE_OBS_MAX = 2000
+        self._live_burst_timeline_obs: dict[int, deque] = {}  # {iid: deque[AlignedBurstSyncObs]}
         # Bounded buffer of recent Stage 3-usable live detections.
         # 10 000 entries ≈ a few minutes of DF11 traffic at moderate density.
         self._LIVE_DETECTION_BUFFER_MAX = 10_000
@@ -1176,6 +1183,8 @@ class RadarState:
             self._live_frame_counters[iid] = 0
         if iid not in self._live_aligned_burst_obs:
             self._live_aligned_burst_obs[iid] = deque(maxlen=self._MULTI_SYNC_OBS_MAX)
+        if iid not in self._live_burst_timeline_obs:
+            self._live_burst_timeline_obs[iid] = deque(maxlen=self._BURST_SYNC_TIMELINE_OBS_MAX)
 
     def _process_fired_bursts(self, iid: int, fired_bursts: list[dict]) -> dict:
         metrics = _new_fired_burst_phase_metrics()
@@ -1317,16 +1326,17 @@ class RadarState:
             # so that bearing observations are built from burst-centre timestamps.
             self._record_live_burst_detection(iid, fired_icao, burst_centroid_us, burst_signal, pos)
 
-            # Record as aligned burst observation for multi-aircraft sync maintenance.
-            # Recorded for all dominant-family bursts that have a position — not only
-            # frame participants — so the sync buffer is populated continuously.
+            # Record burst-centre observations for sync timeline plotting.
+            # This is broader than sync maintenance: include all bursts that have
+            # usable geometry so the UI is not limited to only sync-driving updates.
             if (
                 lat is not None
                 and lon is not None
                 and _radar_pos_cache["lat"] is not None
-                and _matches_dominant(fired_icao)
+                and _radar_pos_cache["lon"] is not None
             ):
-                self._record_aligned_burst_sync_obs(
+                matches_dominant_for_sync = _matches_dominant(fired_icao)
+                self._record_burst_sync_timeline_obs(
                     iid=iid,
                     icao=fired_icao,
                     burst_centroid_us=burst_centroid_us,
@@ -1337,8 +1347,22 @@ class RadarState:
                     n_replies=fired_burst.get("n_replies", 1),
                     signal_dbfs=burst_signal,
                     pos_age_s=position_age_seconds,
-                    period_s=period_s,
+                    sync_update_eligible=matches_dominant_for_sync,
                 )
+                if matches_dominant_for_sync:
+                    self._record_aligned_burst_sync_obs(
+                        iid=iid,
+                        icao=fired_icao,
+                        burst_centroid_us=burst_centroid_us,
+                        radar_lat=_radar_pos_cache["lat"],
+                        radar_lon=_radar_pos_cache["lon"],
+                        aircraft_lat=lat,
+                        aircraft_lon=lon,
+                        n_replies=fired_burst.get("n_replies", 1),
+                        signal_dbfs=burst_signal,
+                        pos_age_s=position_age_seconds,
+                        period_s=period_s,
+                    )
 
             if fired_icao == ref_icao:
                 if current_frame is not None:
@@ -1820,6 +1844,7 @@ class RadarState:
             pos_age_s=pos_age_s,
             range_nm=_haversine_nm_simple(radar_lat, radar_lon, aircraft_lat, aircraft_lon),
             ts=time.time(),
+            sync_update_eligible=True,
         )
         obs_buf = self._live_aligned_burst_obs.setdefault(
             iid, deque(maxlen=self._MULTI_SYNC_OBS_MAX)
@@ -1831,6 +1856,44 @@ class RadarState:
         # (no bootstrap yet, too few observations, single-aircraft coverage).
         if period_s > 0.0:
             self._update_multi_aircraft_sync_state(iid=iid, period_s=period_s)
+
+    def _record_burst_sync_timeline_obs(
+        self,
+        iid: int,
+        icao: str,
+        burst_centroid_us: float,
+        radar_lat: float,
+        radar_lon: float,
+        aircraft_lat: float,
+        aircraft_lon: float,
+        n_replies: int,
+        signal_dbfs: float | None,
+        pos_age_s: float,
+        *,
+        sync_update_eligible: bool,
+    ) -> None:
+        """Record one burst-centre observation for sync timeline visualisation.
+
+        This buffer is intentionally broader than sync-maintenance updates: it
+        includes non-dominant/non-steering observations so the UI can render all
+        relevant burst-centre comparisons against the maintained sync model.
+        """
+        bearing_deg = _bearing_deg_simple(radar_lat, radar_lon, aircraft_lat, aircraft_lon)
+        obs = AlignedBurstSyncObs(
+            burst_centroid_us=burst_centroid_us,
+            icao=icao,
+            bearing_deg=bearing_deg,
+            n_replies=n_replies,
+            signal_dbfs=signal_dbfs,
+            pos_age_s=pos_age_s,
+            range_nm=_haversine_nm_simple(radar_lat, radar_lon, aircraft_lat, aircraft_lon),
+            ts=time.time(),
+            sync_update_eligible=sync_update_eligible,
+        )
+        timeline_buf = self._live_burst_timeline_obs.setdefault(
+            iid, deque(maxlen=self._BURST_SYNC_TIMELINE_OBS_MAX)
+        )
+        timeline_buf.append(obs)
 
     @staticmethod
     def _score_sync_burst_observation(obs: AlignedBurstSyncObs) -> float:
@@ -2305,15 +2368,13 @@ class RadarState:
             # Done before frame qualification checks so all radar-illuminated ICAOs are captured.
             self._record_live_burst_detection(iid, fired_icao, burst_centroid_us, burst_signal, pos)
 
-            # Record as aligned burst observation for multi-aircraft sync maintenance
-            # (Python fallback path, mirrors the native path in _process_fired_bursts).
+            # Record burst-centre sync observations for both visualisation coverage
+            # and (when dominant) sync maintenance updates.
+            matches_dominant_for_sync = self._burst_matches_dominant_period_family(iid, fired_icao, period_s)
             if lat is not None and lon is not None:
                 _radar_pos_fb = _get_authoritative_radar_position(model)
-                if (
-                    _radar_pos_fb["lat"] is not None
-                    and self._burst_matches_dominant_period_family(iid, fired_icao, period_s)
-                ):
-                    self._record_aligned_burst_sync_obs(
+                if _radar_pos_fb["lat"] is not None and _radar_pos_fb["lon"] is not None:
+                    self._record_burst_sync_timeline_obs(
                         iid=iid,
                         icao=fired_icao,
                         burst_centroid_us=burst_centroid_us,
@@ -2324,8 +2385,22 @@ class RadarState:
                         n_replies=fired_burst.get("n_replies", 1),
                         signal_dbfs=burst_signal,
                         pos_age_s=position_age_seconds,
-                        period_s=period_s,
+                        sync_update_eligible=matches_dominant_for_sync,
                     )
+                    if matches_dominant_for_sync:
+                        self._record_aligned_burst_sync_obs(
+                            iid=iid,
+                            icao=fired_icao,
+                            burst_centroid_us=burst_centroid_us,
+                            radar_lat=_radar_pos_fb["lat"],
+                            radar_lon=_radar_pos_fb["lon"],
+                            aircraft_lat=lat,
+                            aircraft_lon=lon,
+                            n_replies=fired_burst.get("n_replies", 1),
+                            signal_dbfs=burst_signal,
+                            pos_age_s=position_age_seconds,
+                            period_s=period_s,
+                        )
 
             if fired_icao == ref_icao:
                 # Reference burst inside an already-open frame is treated as a duplicate
@@ -2333,7 +2408,7 @@ class RadarState:
                 if current_frame is not None:
                     continue
 
-                if not self._burst_matches_dominant_period_family(iid, fired_icao, period_s):
+                if not matches_dominant_for_sync:
                     continue
 
                 if self._should_suppress_frame_start(iid, burst_centroid_us, period_s):
@@ -2362,7 +2437,7 @@ class RadarState:
                     continue
                 if lat is None or lon is None:
                     continue
-                if not self._burst_matches_dominant_period_family(iid, fired_icao, period_s):
+                if not matches_dominant_for_sync:
                     continue
                 if not self._burst_matches_reference_phase_family(
                     iid,
@@ -2785,6 +2860,7 @@ class RadarState:
                                self._live_completed_frames,
                                self._live_frame_counters,
                                self._live_aligned_burst_obs,
+                               self._live_burst_timeline_obs,
                                self._live_sync_states):
                 if iid in live_dict:
                     del live_dict[iid]
@@ -2833,6 +2909,7 @@ class RadarState:
             self._live_completed_frames.clear()
             self._live_frame_counters.clear()
             self._live_aligned_burst_obs.clear()
+            self._live_burst_timeline_obs.clear()
             self._live_sync_states.clear()
             self._native_burst_processors.clear()
             return cleared
@@ -3076,9 +3153,10 @@ class RadarState:
     def get_burst_sync_timeline(self, iid: int, window_s: float = 60.0) -> dict:
         """Return burst-centre sync observations with residuals for verification plotting.
 
-        Each entry represents one aligned burst observation compared against the current
-        sync model.  Intended for verification UI: plot residual_deg vs time with
-        inlier/rejected colouring to assess sync quality.
+        Each entry represents one burst-centre observation compared against the
+        current sync model. Timeline payloads intentionally include both
+        sync-update-eligible and non-eligible observations so visual diagnostics
+        are not restricted to the narrow sync-driving subset.
 
         Returns a dict with:
           - "observations": list of dicts (one per burst, sorted oldest-first)
@@ -3087,7 +3165,9 @@ class RadarState:
         """
         with self._lock:
             sync = self._live_sync_states.get(iid)
-            obs_buf = self._live_aligned_burst_obs.get(iid)
+            obs_buf = self._live_burst_timeline_obs.get(iid)
+            if obs_buf is None:
+                obs_buf = self._live_aligned_burst_obs.get(iid)
             obs_snapshot = list(obs_buf) if obs_buf else []
 
         if not obs_snapshot or sync is None:
@@ -3126,6 +3206,7 @@ class RadarState:
                 "signal_dbfs": obs.signal_dbfs,
                 "pos_age_s": obs.pos_age_s,
                 "range_nm": obs.range_nm,
+                "sync_update_eligible": bool(getattr(obs, "sync_update_eligible", True)),
             })
 
         # Sort chronologically by burst centre timestamp

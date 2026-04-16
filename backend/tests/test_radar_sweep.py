@@ -10,7 +10,14 @@ import config
 import pytest
 from radar.sweep import _analyse_iid_events
 from radar.models import LiveFrameState, RadarIID, ReferenceAircraftInfo, RotationModel
-from radar.sweep import RadarState, _reinforce_radar_characteristics, detect_bursts, detect_bursts_with_signals
+from radar.sweep import (
+    AlignedBurstSyncObs,
+    LiveSyncState,
+    RadarState,
+    _reinforce_radar_characteristics,
+    detect_bursts,
+    detect_bursts_with_signals,
+)
 
 
 def _make_events(iid: int, icao: str, arrivals_s: list[float]) -> list[tuple[int, int, str, None]]:
@@ -296,6 +303,57 @@ def test_get_iid_timeline_returns_recent_selected_iid_in_ascending_order():
         "ABC123": [9_000_000, 10_000_000],
         "DEF456": [11_000_000],
     }
+
+
+def test_get_burst_sync_timeline_includes_non_sync_driving_observations():
+    state = RadarState()
+    now_ts = 1_000.0
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=now_ts,
+        source="multi_aircraft_burst",
+        usable=True,
+    )
+    state._live_burst_timeline_obs[7] = deque([
+        AlignedBurstSyncObs(
+            burst_centroid_us=4_100_000.0,
+            icao="AAAAAA",
+            bearing_deg=7.0,
+            n_replies=3,
+            signal_dbfs=-18.0,
+            pos_age_s=0.4,
+            range_nm=12.0,
+            ts=now_ts - 5.0,
+            sync_update_eligible=False,
+        ),
+        AlignedBurstSyncObs(
+            burst_centroid_us=8_200_000.0,
+            icao="BBBBBB",
+            bearing_deg=20.0,
+            n_replies=4,
+            signal_dbfs=-15.0,
+            pos_age_s=0.3,
+            range_nm=18.0,
+            ts=now_ts - 4.0,
+            sync_update_eligible=True,
+        ),
+    ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("radar.sweep.time.time", lambda: now_ts)
+        timeline = state.get_burst_sync_timeline(7, window_s=60.0)
+
+    observations = timeline["observations"]
+    assert len(observations) == 2
+    assert observations[0]["icao"] == "AAAAAA"
+    assert observations[0]["sync_update_eligible"] is False
+    assert observations[1]["icao"] == "BBBBBB"
+    assert observations[1]["sync_update_eligible"] is True
 
 
 def test_update_rotation_models_defers_recently_stable_iids(monkeypatch):

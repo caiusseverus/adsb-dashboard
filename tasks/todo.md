@@ -8,6 +8,28 @@ Source inputs:
 Prepared: 2026-04-04
 Updated: 2026-04-06
 
+## 2026-04-16 Radar Sync Visualisation Purpose Split Follow-Up
+
+- [x] Inspect current `RotationAlignmentPanel` and `ReceiverCentredRadarField` wiring against intended panel roles
+- [x] Add live DF11 timing overlay to Burst Sync Alignment while preserving burst residual/classification diagnostics
+- [x] Change Burst Sync Alignment x-axis to a shared rolling time window usable by both burst and raw DF11 overlays
+- [x] Restore Position Verification to raw-DF11-first rendering and demote/remove burst-centre markers from primary display
+- [x] Update panel legends/copy so burst-vs-raw roles are explicit and accurate
+- [x] Run focused frontend verification and record results
+
+Plan confirmation: apply a frontend-focused corrective patch only; keep burst-sync backend route/model unchanged.
+
+### Review
+
+- Implementation:
+  - Updated [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) `RotationAlignmentPanel` to add a second live source via `useTimingEventStream` + `useTimingEventBuffer`, producing a faint raw DF11 timing tick overlay while keeping burst residual/classification points as primary diagnostics.
+  - Updated [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) `RotationAlignmentPanel` x-axis to a shared rolling time window (`windowStartUs`/`windowEndUs`), so burst points and raw DF11 timing markers are co-plotted in one timeline.
+  - Updated [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) `ReceiverCentredRadarField` to remove burst-centre primary drawing and restore raw DF11 arrivals as the dominant visual layer for beam-vs-reply checks.
+  - Updated `ReceiverCentredRadarField` metrics/legend/copy to describe raw DF11 as primary and remove burst inlier/outlier prominence from this panel.
+- Verification:
+  - `npm run build`
+  - Result: frontend build succeeded (existing chunk-size warning remains).
+
 ## 2026-04-16 Burst-Centre Sync Visualisation Wiring Rectification
 
 - [x] Inspect frontend and backend radar timeline/sync routes and identify legacy wiring points
@@ -3639,3 +3661,35 @@ Current passive-radar state:
   - `uv run --directory backend pytest tests/test_aircraft_state_counts.py`
   - Result: `2 passed in 0.36s` on 2026-04-08
   - `python3 -m py_compile backend/aircraft_state.py backend/tests/test_aircraft_state_counts.py`
+
+## Radar Sync Visualisation Follow-up
+
+- [x] Inspect and patch backend burst-sync timeline exposure so visualization includes all relevant burst-centre observations without changing sync-maintenance acceptance rules.
+- [x] Update Burst Sync Alignment residual mode to plot live DF11 arrivals as signed residual dots with early/on-time/late color semantics.
+- [x] Restore and wire a selectable legacy live DF alignment mode in Burst Sync Alignment.
+- [x] Restore Position Verification timing colours (blue early, green on time, red late) based on beam-vs-arrival residual timing.
+- [x] Run focused verification (`pytest` target + frontend build) and capture review notes.
+
+### Review
+
+- Plan verified on 2026-04-16 against `frontend/src/pages/RadarPage.jsx`, `frontend/src/hooks/useTimingEventStream.js`, `frontend/src/hooks/useTimingEventBuffer.js`, `backend/radar/sweep.py`, and `backend/radar/api.py`.
+- Root cause:
+  - Burst Sync Alignment was rendering raw DF11 only as neutral vertical ticks at zero residual, so the operator could not tell early/on-time/late behavior.
+  - Position Verification had been switched to a neutral raw-point color and had lost explicit timing class semantics.
+  - The burst-sync timeline endpoint only exposed the sync-driving burst subset (`_live_aligned_burst_obs`), which can underrepresent real burst-centre comparisons available for plotting.
+  - The broad per-aircraft live alignment visualization had been replaced, removing useful operational context.
+- Implementation result on 2026-04-16:
+  - Added a broader burst visualisation buffer in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) (`_live_burst_timeline_obs`) and wired timeline recording for all burst-centre observations with usable geometry, while preserving sync maintenance on dominant-family observations only.
+  - Extended burst-sync timeline payload entries with `sync_update_eligible` and switched timeline reads to the broader visualisation buffer in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py).
+  - Updated endpoint docs in [api.py](/home/keith/claude/adsb-dashboard/backend/radar/api.py) to reflect broader observation exposure.
+  - Added regression coverage in [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) proving non-sync-driving observations are included in burst sync timeline responses.
+  - Reworked [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx):
+    - Burst Sync Alignment residual mode now renders live DF11 as residual dots (blue early, green on time, red late) on the residual axis.
+    - Burst-centre observations remain primary and now distinguish sync-driving vs non-sync-driving points.
+    - Added a mode selector and restored legacy per-aircraft live DF alignment view using `/api/radar/iids/{iid}/timeline`.
+    - Restored Position Verification timing colours (blue/green/red) via beam-vs-arrival residual classification.
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_sweep.py`
+  - Result: `41 passed in 0.10s` on 2026-04-16.
+  - `npm run build` in `frontend/`
+  - Result: Vite production build succeeded on 2026-04-16.

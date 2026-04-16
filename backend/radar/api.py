@@ -1269,9 +1269,10 @@ async def get_iid_timeline(iid: int, window_s: float = Query(default=30.0, ge=5,
 async def get_burst_sync_timeline(iid: int, window_s: float = Query(default=60.0, ge=10, le=300)):
     """Burst-centre sync observations with residuals for verification plotting.
 
-    Returns one entry per aligned burst observation (not per DF11 message) within
-    the requested window, annotated with predicted bearing, residual, and inlier
-    classification against the current sync model.
+    Returns one entry per burst-centre observation (not per DF11 message) within
+    the requested window, annotated with predicted bearing, residual, and
+    classification against the current sync model. Payloads include observations
+    that did not steer sync updates so visual diagnostics are not artificially sparse.
     """
     t0 = time.perf_counter()
     try:
