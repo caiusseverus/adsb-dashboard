@@ -499,14 +499,26 @@ def _estimate_cep(jac: np.ndarray | None, n_obs: int) -> float:
 # ---------------------------------------------------------------------------
 
 def _score_live_bearing_candidate(obs: RadarBearingObservation) -> float:
-    """Lightweight ranking score for live bearing candidates. Higher is better.
+    """Ranking score for live bearing candidates.  Higher is better.
 
-    Recency (arrival_us) is the primary criterion so the displayed ray always
-    reflects the latest burst centre.  Association confidence and bearing sigma
-    act as tiebreakers for detections with identical or very similar timestamps.
+    Recency (arrival_us) is the primary axis so the displayed ray always uses
+    the latest burst centre.  Signal quality, association confidence, and bearing
+    sigma act as secondary factors — a stronger, well-confirmed recent burst is
+    preferred over an equally recent but weaker one.
     """
+    # Signal quality: stronger signals produce better amplitude-weighted burst centres.
+    if obs.burst_signal_dbfs is not None:
+        # Map [-50 dBFS, -10 dBFS] → [0.5, 1.5]; stronger gets a larger bonus.
+        sig_bonus = max(0.5, min(1.5, (obs.burst_signal_dbfs + 50.0) / 40.0 + 0.5))
+    else:
+        sig_bonus = 1.0  # neutral when signal is unavailable
+
     sigma_score = 1.0 / max(obs.bearing_sigma_deg, 0.5)
-    return obs.arrival_us + obs.association_confidence * 1e6 + sigma_score * 1e5
+    return (
+        obs.arrival_us
+        + obs.association_confidence * 1e6 * sig_bonus
+        + sigma_score * 1e5
+    )
 
 
 def _collapse_candidates_by_iid(
@@ -525,23 +537,32 @@ def _collapse_candidates_by_iid(
     return list(best.values())
 
 
+def _score_live_ray_for_display(ray: Stage3LiveRay) -> float:
+    """Ranking score for one Stage3LiveRay for display selection.  Higher is better.
+
+    Recency (arrival_us) is the primary axis.  Association confidence acts as a
+    secondary factor so a confirmed, recent ray beats an unconfirmed one of the
+    same burst-centre timestamp.
+    """
+    return ray.arrival_us + ray.association_confidence * 1e6
+
+
 def _select_best_live_ray_per_radar(rays: list[Stage3LiveRay]) -> list[Stage3LiveRay]:
-    """Return one Stage3LiveRay per radar IID, preferring the newest burst-centre ray.
+    """Return one Stage3LiveRay per radar IID, preferring the best-scored burst-centre ray.
 
     Used by build_evidence() to collapse the display layer so exactly one
     bearing ray is rendered per radar regardless of how many solve cycles have
     contributed rays to the buffer for a given aircraft.
+
+    Selection uses _score_live_ray_for_display() so the chosen ray reflects the
+    most recent well-confirmed burst centre, not just the most recent timestamp.
     """
     best: dict[int, Stage3LiveRay] = {}
     for ray in rays:
         if ray.iid not in best:
             best[ray.iid] = ray
         else:
-            existing = best[ray.iid]
-            # Prefer higher arrival_us (most recent burst centre)
-            if ray.arrival_us > existing.arrival_us:
-                best[ray.iid] = ray
-            elif ray.arrival_us == existing.arrival_us and ray.association_confidence > existing.association_confidence:
+            if _score_live_ray_for_display(ray) > _score_live_ray_for_display(best[ray.iid]):
                 best[ray.iid] = ray
     return list(best.values())
 
@@ -1232,13 +1253,18 @@ class AircraftLocaliser:
                     "has_obs": iid in unique_iids,
                     "sync_quality": sync.sync_quality if sync else None,
                     "sync_usable": sync.usable if sync else False,
-                    # Residual-tracking diagnostics (for verification plot / debugging)
+                    "sync_source": sync.source if sync else None,
+                    # Residual-tracking diagnostics
                     "sync_jitter_deg": sync.sync_jitter_deg if sync else None,
                     "residual_ema_deg": sync.residual_ema_deg if sync else None,
                     "last_residual_deg": sync.last_residual_deg if sync else None,
                     "n_sync_frames": sync.n_sync_frames if sync else None,
                     "n_rejected_frames": sync.n_rejected_frames if sync else None,
                     "sync_holdover": sync.holdover if sync else None,
+                    # Multi-aircraft burst-sync diagnostics (populated when source == "multi_aircraft_burst")
+                    "n_burst_obs_inliers": getattr(sync, "n_burst_obs_inliers", None) if sync else None,
+                    "n_burst_obs_rejected": getattr(sync, "n_burst_obs_rejected", None) if sync else None,
+                    "contributing_icao_count": getattr(sync, "contributing_icao_count", None) if sync else None,
                 },
             })
         layers.append({
@@ -1369,6 +1395,24 @@ class AircraftLocaliser:
         latest_fix = (track.history[-1] if track and track.history else None)
         n_radars_out = latest_fix.n_radars if latest_fix is not None else len(unique_iids)
 
+        # Build per-IID sync summary for the evidence envelope.
+        sync_summary = {}
+        for iid_key in unique_iids:
+            sync = self._radar_state.get_live_sync_state(iid_key)
+            if sync is not None:
+                sync_summary[str(iid_key)] = {
+                    "sync_source": sync.source,
+                    "sync_quality": sync.sync_quality,
+                    "sync_usable": sync.usable,
+                    "sync_jitter_deg": sync.sync_jitter_deg,
+                    "holdover": sync.holdover,
+                    "n_sync_frames": sync.n_sync_frames,
+                    "n_rejected_frames": sync.n_rejected_frames,
+                    "contributing_icao_count": getattr(sync, "contributing_icao_count", 0),
+                    "n_burst_obs_inliers": getattr(sync, "n_burst_obs_inliers", 0),
+                    "n_burst_obs_rejected": getattr(sync, "n_burst_obs_rejected", 0),
+                }
+
         return {
             "available": True,
             "reason": "ok",
@@ -1376,4 +1420,48 @@ class AircraftLocaliser:
             "icao": icao,
             "n_observations": len(recent_rays),
             "n_radars": n_radars_out,
+            "sync_diagnostics": sync_summary,
         }
+
+    def get_sync_diagnostics(self, iid_subset: set[int] | None = None) -> dict:
+        """Return per-IID multi-aircraft sync diagnostics for the verification endpoint.
+
+        Provides the information needed to tell whether poor sync is due to bad
+        burst-centre accuracy, weak aircraft positions, unstable period family
+        membership, or true sync drift.  Intended for the alignment / verification
+        visualisation path.
+        """
+        result: dict[int, dict] = {}
+        for iid, auth, _ in self.get_eligible_iids():
+            if iid_subset and iid not in iid_subset:
+                continue
+            sync = self._radar_state.get_live_sync_state(iid)
+            if sync is None:
+                result[iid] = {
+                    "iid": iid,
+                    "sync_available": False,
+                    "sync_source": None,
+                }
+                continue
+            result[iid] = {
+                "iid": iid,
+                "sync_available": True,
+                "sync_source": sync.source,
+                "period_s": sync.period_s,
+                "phase_epoch_us": sync.phase_epoch_us,
+                "phase_offset_deg": sync.phase_offset_deg,
+                "sync_quality": sync.sync_quality,
+                "sync_usable": sync.usable,
+                "sync_jitter_deg": sync.sync_jitter_deg,
+                "residual_ema_deg": sync.residual_ema_deg,
+                "last_residual_deg": sync.last_residual_deg,
+                "n_sync_frames": sync.n_sync_frames,
+                "n_rejected_frames": sync.n_rejected_frames,
+                "holdover": sync.holdover,
+                "last_sync_update_ts": sync.last_sync_update_ts,
+                # Multi-aircraft burst-sync diagnostics
+                "contributing_icao_count": getattr(sync, "contributing_icao_count", 0),
+                "n_burst_obs_inliers": getattr(sync, "n_burst_obs_inliers", 0),
+                "n_burst_obs_rejected": getattr(sync, "n_burst_obs_rejected", 0),
+            }
+        return result

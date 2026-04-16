@@ -246,6 +246,28 @@ class LiveSyncState:
     n_rejected_frames: int = 0           # count of rejected frame updates (diagnostics)
     last_residual_deg: float = 0.0       # most recent circular residual in degrees
     holdover: bool = False               # True when the last update was rejected or too weak
+    # Multi-aircraft sync diagnostics (populated by _update_multi_aircraft_sync_state)
+    n_burst_obs_inliers: int = 0         # inlier burst observations in last multi-aircraft update
+    n_burst_obs_rejected: int = 0        # rejected burst observations in last update
+    contributing_icao_count: int = 0     # distinct ICAOs contributing to current sync estimate
+
+
+@_dataclass
+class AlignedBurstSyncObs:
+    """One burst-centre bearing observation for multi-aircraft sync maintenance.
+
+    Recorded for each dominant-family burst that has an ADS-B position.
+    The rolling buffer of these observations is used by
+    _update_multi_aircraft_sync_state() to fit a robust phase correction
+    without depending on any single reference aircraft.
+    """
+    burst_centroid_us: float    # Beast-monotonic burst-centre timestamp
+    icao: str                   # Aircraft ICAO
+    bearing_deg: float          # Geometric bearing from radar to aircraft (pre-computed)
+    n_replies: int              # Burst reply count (quality factor for burst-centre accuracy)
+    signal_dbfs: float | None   # Average signal strength (dBFS, negative; None if unknown)
+    pos_age_s: float            # ADS-B position age at burst time (seconds)
+    ts: float                   # Wall-clock time for rolling-window age filtering
 
 
 class AircraftPositionTracker:
@@ -1020,6 +1042,12 @@ class RadarState:
         # ------------------------------------------------------------------
         # Per-IID live sync state; updated each time a sweep frame is completed.
         self._live_sync_states: dict[int, LiveSyncState] = {}
+        # Per-IID rolling buffer of aligned burst observations for multi-aircraft sync.
+        # Each entry is one dominant-family burst with a known ADS-B position and
+        # pre-computed geometric bearing.  Used by _update_multi_aircraft_sync_state().
+        # 200 entries per IID ≈ ~50 rotations at 4 aircraft/rotation — sufficient window.
+        self._MULTI_SYNC_OBS_MAX = 200
+        self._live_aligned_burst_obs: dict[int, deque] = {}  # {iid: deque[AlignedBurstSyncObs]}
         # Bounded buffer of recent Stage 3-usable live detections.
         # 10 000 entries ≈ a few minutes of DF11 traffic at moderate density.
         self._LIVE_DETECTION_BUFFER_MAX = 10_000
@@ -1127,6 +1155,8 @@ class RadarState:
             self._live_frames[iid] = None
             self._live_completed_frames[iid] = deque(maxlen=self._LIVE_FRAMES_MAX)
             self._live_frame_counters[iid] = 0
+        if iid not in self._live_aligned_burst_obs:
+            self._live_aligned_burst_obs[iid] = deque(maxlen=self._MULTI_SYNC_OBS_MAX)
 
     def _process_fired_bursts(self, iid: int, fired_bursts: list[dict]) -> dict:
         metrics = _new_fired_burst_phase_metrics()
@@ -1157,6 +1187,8 @@ class RadarState:
             return self._burst_matches_dominant_period_family(iid, icao, period_s)
 
         self._ensure_live_builder_state(iid)
+        # Pre-compute radar position once for the batch (used by sync observation recording).
+        _radar_pos_cache = _get_authoritative_radar_position(model)
         metrics["setup_ms"] += (time.perf_counter() - t_setup) * 1000
         batch_ref_icao: str | None = None
 
@@ -1265,6 +1297,28 @@ class RadarState:
             # This replaces the per-message detection recording in on_df11_batch()
             # so that bearing observations are built from burst-centre timestamps.
             self._record_live_burst_detection(iid, fired_icao, burst_centroid_us, burst_signal, pos)
+
+            # Record as aligned burst observation for multi-aircraft sync maintenance.
+            # Recorded for all dominant-family bursts that have a position — not only
+            # frame participants — so the sync buffer is populated continuously.
+            if (
+                lat is not None
+                and lon is not None
+                and _radar_pos_cache["lat"] is not None
+                and _matches_dominant(fired_icao)
+            ):
+                self._record_aligned_burst_sync_obs(
+                    iid=iid,
+                    icao=fired_icao,
+                    burst_centroid_us=burst_centroid_us,
+                    radar_lat=_radar_pos_cache["lat"],
+                    radar_lon=_radar_pos_cache["lon"],
+                    aircraft_lat=lat,
+                    aircraft_lon=lon,
+                    n_replies=fired_burst.get("n_replies", 1),
+                    signal_dbfs=burst_signal,
+                    pos_age_s=position_age_seconds,
+                )
 
             if fired_icao == ref_icao:
                 if current_frame is not None:
@@ -1516,8 +1570,11 @@ class RadarState:
                     metrics["fm_callback_ms"] += (time.perf_counter() - t_fm_callback) * 1000
 
         # Update live sync state for Stage 3 whenever a usable frame is completed.
-        # Uses residual-aware smoothing rather than hard replacement so that a
-        # single noisy frame cannot jump the phase anchor.
+        # Primary path: multi-aircraft rolling estimator (_update_multi_aircraft_sync_state).
+        # Aligned burst observations are recorded continuously in both burst processing loops
+        # (_process_fired_bursts and _on_df11_frame_builder) so the buffer is already populated
+        # with the current frame's participants by the time _finalize_live_frame is called.
+        # Initial bootstrap: single-frame reference-aircraft update for the very first sync.
         if n_aircraft >= 3:
             model = self._models.get(iid)
             if model is not None:
@@ -1527,20 +1584,34 @@ class RadarState:
                     and current_frame.ref_lat is not None
                     and current_frame.ref_lon is not None
                 ):
-                    ref_bearing = _bearing_deg_simple(
-                        radar_pos["lat"], radar_pos["lon"],
-                        current_frame.ref_lat, current_frame.ref_lon,
-                    )
                     sync_quality = _sync_quality_from_model(model)
-                    self._update_live_sync_state_filtered(
-                        iid=iid,
-                        period_s=period_s,
-                        new_epoch_us=current_frame.ref_arrival_us,
-                        new_offset_deg=ref_bearing,
-                        sync_quality=sync_quality,
-                        n_aircraft=n_aircraft,
-                        ref_pos_age_s=current_frame.ref_pos_age_s,
-                    )
+                    existing = self._live_sync_states.get(iid)
+                    if existing is None:
+                        # Bootstrap: no prior sync state — seed from reference aircraft bearing.
+                        # _update_live_sync_state_filtered initialises LiveSyncState so
+                        # the multi-aircraft path has a base model to compute residuals from.
+                        ref_bearing = _bearing_deg_simple(
+                            radar_pos["lat"], radar_pos["lon"],
+                            current_frame.ref_lat, current_frame.ref_lon,
+                        )
+                        self._update_live_sync_state_filtered(
+                            iid=iid,
+                            period_s=period_s,
+                            new_epoch_us=current_frame.ref_arrival_us,
+                            new_offset_deg=ref_bearing,
+                            sync_quality=sync_quality,
+                            n_aircraft=n_aircraft,
+                            ref_pos_age_s=current_frame.ref_pos_age_s,
+                        )
+                    else:
+                        # Primary sync: use multi-aircraft rolling estimator.
+                        # The aligned burst buffer is already populated with this frame's
+                        # participants from the burst processing loop above.
+                        self._update_multi_aircraft_sync_state(
+                            iid=iid,
+                            period_s=period_s,
+                            sync_quality=sync_quality,
+                        )
 
         self._live_frames[iid] = None
         return metrics
@@ -1706,6 +1777,241 @@ class RadarState:
         )
         # deque.append is GIL-safe; no lock needed for single-threaded DF11 path.
         self._live_detection_buffer.append(det)
+
+    def _record_aligned_burst_sync_obs(
+        self,
+        iid: int,
+        icao: str,
+        burst_centroid_us: float,
+        radar_lat: float,
+        radar_lon: float,
+        aircraft_lat: float,
+        aircraft_lon: float,
+        n_replies: int,
+        signal_dbfs: float | None,
+        pos_age_s: float,
+    ) -> None:
+        """Record one burst-centre bearing observation for multi-aircraft sync maintenance.
+
+        Called for every dominant-family burst that has an ADS-B position, from
+        both burst processing paths.  The pre-computed geometric bearing is stored
+        so _update_multi_aircraft_sync_state() can compute residuals without
+        re-fetching positions.
+        """
+        bearing_deg = _bearing_deg_simple(radar_lat, radar_lon, aircraft_lat, aircraft_lon)
+        obs = AlignedBurstSyncObs(
+            burst_centroid_us=burst_centroid_us,
+            icao=icao,
+            bearing_deg=bearing_deg,
+            n_replies=n_replies,
+            signal_dbfs=signal_dbfs,
+            pos_age_s=pos_age_s,
+            ts=time.time(),
+        )
+        obs_buf = self._live_aligned_burst_obs.setdefault(
+            iid, deque(maxlen=self._MULTI_SYNC_OBS_MAX)
+        )
+        obs_buf.append(obs)
+
+    @staticmethod
+    def _score_sync_burst_observation(obs: AlignedBurstSyncObs) -> float:
+        """Quality weight for one aligned burst observation. Higher = more influence.
+
+        Combines reply count, signal strength, and position age into a single
+        weight that reduces the influence of marginal or stale observations
+        without blocking them entirely.
+        """
+        # Reply count: more replies → better burst-centre accuracy
+        n_weight = min(obs.n_replies / 4.0, 1.0)
+
+        # Signal weight: stronger signal → better amplitude-weighted centre
+        if obs.signal_dbfs is not None:
+            # Map [-50 dBFS, -10 dBFS] → [0.2, 1.0]; stronger signal gets more weight
+            sig_weight = max(0.2, min(1.0, (obs.signal_dbfs + 50.0) / 40.0))
+        else:
+            sig_weight = 0.5  # neutral when signal strength is unavailable
+
+        # Position age: fresher ADS-B position → more reliable geometric bearing
+        if obs.pos_age_s <= 1.0:
+            age_weight = 1.0
+        elif obs.pos_age_s <= 5.0:
+            age_weight = 0.8
+        elif obs.pos_age_s <= 10.0:
+            age_weight = 0.5
+        else:
+            age_weight = 0.2
+
+        return n_weight * sig_weight * age_weight
+
+    @staticmethod
+    def _classify_sync_residual(abs_residual_deg: float) -> str:
+        """Classify a sync residual magnitude as 'inlier', 'soft', or 'rejected'.
+
+        Used by _update_multi_aircraft_sync_state() to weight observations.
+        Sync maintenance uses stricter thresholds than localisation candidate
+        acceptance so weak data does not aggressively steer the phase anchor.
+        """
+        if abs_residual_deg <= 20.0:
+            return "inlier"
+        if abs_residual_deg <= 50.0:
+            return "soft"
+        return "rejected"
+
+    def _update_multi_aircraft_sync_state(
+        self,
+        iid: int,
+        period_s: float,
+        sync_quality: float | None = None,
+    ) -> None:
+        """Update per-IID sync state from the multi-aircraft aligned burst buffer.
+
+        This is the primary sync-maintenance path.  Instead of anchoring on a
+        single reference aircraft (as _update_live_sync_state_filtered() does),
+        this method fits a robust phase correction from all recent dominant-family
+        burst observations across multiple aircraft.
+
+        The phase correction is applied with a conservative gain so the model
+        stays stable even when some observations are noisy.  At least two distinct
+        aircraft must contribute for an update to proceed — single-aircraft sync is
+        inherently fragile against position errors and burst-centre noise.
+
+        Sync maintenance is intentionally stricter than localisation candidate
+        acceptance: rejected observations do not influence the phase anchor, but
+        they do not suppress localisation attempts either.
+        """
+        obs_buf = self._live_aligned_burst_obs.get(iid)
+        if not obs_buf:
+            return
+
+        existing = self._live_sync_states.get(iid)
+        if existing is None:
+            # No seed sync state yet — first frame must still initialise via
+            # _update_live_sync_state_filtered() before multi-aircraft updates apply.
+            return
+
+        period_us = period_s * 1e6
+        now_ts = time.time()
+
+        # Rolling window covering the last few rotations — enough for a robust estimate
+        # without stale observations pulling the phase away from the current truth.
+        _MULTI_SYNC_WINDOW_ROTATIONS = 6
+        window_s = max(period_s * _MULTI_SYNC_WINDOW_ROTATIONS, 30.0)
+        cutoff_ts = now_ts - window_s
+
+        recent_obs = [o for o in obs_buf if o.ts >= cutoff_ts]
+        if len(recent_obs) < 3:
+            # Too few recent observations to fit a robust correction.
+            return
+
+        # Compute circular residual for each observation against the current model.
+        # Residual = observed_bearing − model_predicted_bearing (wrapped to (−180, 180]).
+        scored: list[tuple[float, float, str, str]] = []  # (residual, weight, status, icao)
+        for obs in recent_obs:
+            predicted = (
+                (obs.burst_centroid_us - existing.phase_epoch_us) / period_us * 360.0
+                + existing.phase_offset_deg
+            ) % 360.0
+            residual = (obs.bearing_deg - predicted + 540.0) % 360.0 - 180.0
+            abs_r = abs(residual)
+            status = self._classify_sync_residual(abs_r)
+            base_w = self._score_sync_burst_observation(obs)
+            if status == "rejected":
+                effective_w = 0.0
+            elif status == "soft":
+                effective_w = base_w * 0.2
+            else:
+                effective_w = base_w
+            scored.append((residual, effective_w, status, obs.icao))
+
+        # Multi-aircraft integrity check: require at least two distinct ICAOs
+        # contributing to prevent a single noisy aircraft from steering sync.
+        contributing_icaos = {
+            icao for _, w, status, icao in scored
+            if w > 0 and status != "rejected"
+        }
+        if len(contributing_icaos) < 2:
+            # Single-aircraft sync is too fragile — enter holdover rather than update.
+            existing.holdover = True
+            return
+
+        n_inliers = sum(1 for _, _, s, _ in scored if s == "inlier")
+        n_rejected = sum(1 for _, _, s, _ in scored if s == "rejected")
+
+        # Weighted phase correction: weighted circular mean of all non-rejected residuals.
+        total_w = sum(w for _, w, _, _ in scored)
+        if total_w <= 0:
+            return
+        phase_correction = sum(r * w for r, w, _, _ in scored) / total_w
+
+        # Conservative gain: multi-aircraft sync should be stable and predictable.
+        # Lower gain than the single-frame alpha so the model does not jump on
+        # individual noisy frames.  Gain is ~0.10–0.15 depending on inlier count.
+        n_eff = max(n_inliers, 1)
+        _MULTI_SYNC_GAIN_BASE = 0.12
+        _MULTI_SYNC_GAIN_MAX = 0.20
+        gain = min(_MULTI_SYNC_GAIN_BASE + 0.01 * (n_eff - 1), _MULTI_SYNC_GAIN_MAX)
+        limited_correction = phase_correction * gain
+
+        # Advance epoch to the most recent inlier/soft observation.
+        # Keeping the epoch fresh prevents accumulated error from large
+        # (burst_centroid_us - phase_epoch_us) distances.
+        inlier_obs = [
+            o for o, (_, _, s, _) in zip(recent_obs, scored)
+            if s in ("inlier", "soft")
+        ]
+        if not inlier_obs:
+            return
+        new_epoch_us = max(o.burst_centroid_us for o in inlier_obs)
+
+        # Propagate the existing model to the new epoch, then apply correction.
+        existing_at_new = (
+            (new_epoch_us - existing.phase_epoch_us) / period_us * 360.0
+            + existing.phase_offset_deg
+        ) % 360.0
+        new_offset = (existing_at_new + limited_correction) % 360.0
+
+        # Derive sync_jitter_deg from the spread of inlier residuals.
+        # This ties jitter to actual recent behaviour rather than a fixed constant.
+        inlier_abs_residuals = [abs(r) for r, _, s, _ in scored if s == "inlier"]
+        if len(inlier_abs_residuals) >= 3:
+            try:
+                new_jitter = min(max(statistics.stdev(inlier_abs_residuals), 1.5), 15.0)
+            except statistics.StatisticsError:
+                new_jitter = existing.sync_jitter_deg
+        elif len(inlier_abs_residuals) >= 1:
+            new_jitter = min(max(statistics.mean(inlier_abs_residuals), 1.5), 15.0)
+        else:
+            # No clean inliers — inflate jitter slightly but do not reset.
+            new_jitter = min(existing.sync_jitter_deg * 1.1, 15.0)
+
+        # Residual EMA: use abs(phase_correction) as a proxy for recent residual scatter.
+        _RESIDUAL_EMA_ALPHA = 0.2
+        new_ema = (
+            (1.0 - _RESIDUAL_EMA_ALPHA) * existing.residual_ema_deg
+            + _RESIDUAL_EMA_ALPHA * abs(phase_correction)
+        )
+
+        q = sync_quality if sync_quality is not None else existing.sync_quality
+
+        self._live_sync_states[iid] = LiveSyncState(
+            iid=iid,
+            period_s=period_s,
+            phase_epoch_us=new_epoch_us,
+            phase_offset_deg=new_offset,
+            sync_quality=q,
+            sync_jitter_deg=new_jitter,
+            last_sync_update_ts=now_ts,
+            source="multi_aircraft_burst",
+            usable=existing.usable,        # usability gate remains from rotation model quality
+            residual_ema_deg=new_ema,
+            n_sync_frames=existing.n_sync_frames + 1,
+            n_rejected_frames=existing.n_rejected_frames + (1 if n_rejected > max(len(recent_obs) // 2, 1) else 0),
+            last_residual_deg=phase_correction,
+            holdover=False,
+            n_burst_obs_inliers=n_inliers,
+            n_burst_obs_rejected=n_rejected,
+            contributing_icao_count=len(contributing_icaos),
+        )
 
     def _finalize_pending_burst(
         self,
@@ -1887,6 +2193,8 @@ class RadarState:
             self._live_frames[iid] = None
             self._live_completed_frames[iid] = deque(maxlen=self._LIVE_FRAMES_MAX)
             self._live_frame_counters[iid] = 0
+        if iid not in self._live_aligned_burst_obs:
+            self._live_aligned_burst_obs[iid] = deque(maxlen=self._MULTI_SYNC_OBS_MAX)
 
         pending_bursts = self._live_bursts[iid]
         last_arrival = self._live_last_arrival[iid]
@@ -1957,6 +2265,27 @@ class RadarState:
             # Record one burst-centre Stage3LiveDetection per fired burst (Python fallback path).
             # Done before frame qualification checks so all radar-illuminated ICAOs are captured.
             self._record_live_burst_detection(iid, fired_icao, burst_centroid_us, burst_signal, pos)
+
+            # Record as aligned burst observation for multi-aircraft sync maintenance
+            # (Python fallback path, mirrors the native path in _process_fired_bursts).
+            if lat is not None and lon is not None:
+                _radar_pos_fb = _get_authoritative_radar_position(model)
+                if (
+                    _radar_pos_fb["lat"] is not None
+                    and self._burst_matches_dominant_period_family(iid, fired_icao, period_s)
+                ):
+                    self._record_aligned_burst_sync_obs(
+                        iid=iid,
+                        icao=fired_icao,
+                        burst_centroid_us=burst_centroid_us,
+                        radar_lat=_radar_pos_fb["lat"],
+                        radar_lon=_radar_pos_fb["lon"],
+                        aircraft_lat=lat,
+                        aircraft_lon=lon,
+                        n_replies=fired_burst.get("n_replies", 1),
+                        signal_dbfs=burst_signal,
+                        pos_age_s=position_age_seconds,
+                    )
 
             if fired_icao == ref_icao:
                 # Reference burst inside an already-open frame is treated as a duplicate

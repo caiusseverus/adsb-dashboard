@@ -218,6 +218,28 @@ async def reset_tracks():
     return {"ok": True, "message": "Runtime tracks cleared"}
 
 
+@router.get("/sync-diagnostics")
+async def get_sync_diagnostics(iids: str | None = None):
+    """Per-IID multi-aircraft sync diagnostics for the alignment / verification visualisation.
+
+    Returns burst-centre sync state including contributing aircraft count, inlier/rejected
+    counts, jitter, holdover status, and sync source ("multi_aircraft_burst" vs "sweep_frame").
+    Useful for understanding why sync quality is poor or beam directions are unstable.
+    """
+    if not config.STAGE3_ENABLED or _localiser is None:
+        return {"enabled": False, "sync": {}}
+
+    iid_subset: set[int] | None = None
+    if iids:
+        try:
+            iid_subset = {int(i) for i in iids.split(",") if i.strip()}
+        except ValueError:
+            raise HTTPException(status_code=400, detail="iids must be comma-separated integers")
+
+    diag = await asyncio.to_thread(_localiser.get_sync_diagnostics, iid_subset)
+    return {"enabled": True, "sync": diag}
+
+
 @router.post("/calibration/reset")
 async def reset_calibrations():
     """Clear runtime calibrations AND delete all DB rows."""
