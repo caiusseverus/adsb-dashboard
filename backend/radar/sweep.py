@@ -198,6 +198,24 @@ def _sync_quality_from_model(model: RadarIID) -> float:
     return 0.0
 
 
+def _compute_sync_residual_deg(
+    existing: "LiveSyncState",
+    new_epoch_us: float,
+    new_offset_deg: float,
+    period_us: float,
+) -> float:
+    """Circular residual between a new frame's bearing and the existing sync prediction.
+
+    Converts the existing sync state forward to new_epoch_us, then returns the
+    signed angular difference in (-180, 180].  A residual near 0 means the new
+    frame agrees well with the current sync anchor.
+    """
+    existing_at_new_epoch = (
+        (new_epoch_us - existing.phase_epoch_us) / period_us * 360.0 + existing.phase_offset_deg
+    ) % 360.0
+    return (new_offset_deg - existing_at_new_epoch + 540.0) % 360.0 - 180.0
+
+
 from dataclasses import dataclass as _dataclass
 
 
@@ -206,18 +224,28 @@ class LiveSyncState:
     """Per-IID live synchronisation state for Stage 3 bearing computation.
 
     Updated each time a sweep frame is completed. The localiser converts
-    message arrival times to bearings using: bearing = (arrival_us -
-    phase_epoch_us) / period_us * 360 % 360 + phase_offset_deg.
+    burst-centre arrival times to bearings using:
+        bearing = (arrival_us - phase_epoch_us) / period_us * 360 % 360 + phase_offset_deg.
+
+    The phase epoch is advanced each accepted frame so long-baseline period
+    errors do not accumulate.  sync_jitter_deg is derived from the residual EMA
+    rather than a fixed constant.
     """
     iid: int
     period_s: float
-    phase_epoch_us: float       # ref_arrival_us from last completed frame
-    phase_offset_deg: float     # bearing from radar to ref aircraft at that epoch
+    phase_epoch_us: float       # burst-centre timestamp of last accepted frame
+    phase_offset_deg: float     # bearing from radar to ref aircraft at phase_epoch_us
     sync_quality: float         # 0.0–1.0; derived from rotation model status
-    sync_jitter_deg: float      # estimated bearing jitter (refined by calibration)
-    last_sync_update_ts: float  # wall-clock time of last update
+    sync_jitter_deg: float      # residual-EMA-derived bearing jitter (1-sigma estimate)
+    last_sync_update_ts: float  # wall-clock time of last accepted update
     source: str                 # "sweep_frame"
     usable: bool                # sync_quality is above the minimum threshold
+    # Residual tracking for robust sync (all fields have defaults for backwards compat)
+    residual_ema_deg: float = 5.0        # EMA of |residual| over accepted frames
+    n_sync_frames: int = 0               # count of accepted sync frame updates
+    n_rejected_frames: int = 0           # count of rejected frame updates (diagnostics)
+    last_residual_deg: float = 0.0       # most recent circular residual in degrees
+    holdover: bool = False               # True when the last update was rejected or too weak
 
 
 class AircraftPositionTracker:
@@ -1233,6 +1261,11 @@ class RadarState:
 
             from .models import SweepFrameObservation, LiveFrameState
 
+            # Record one burst-centre Stage3LiveDetection per fired burst.
+            # This replaces the per-message detection recording in on_df11_batch()
+            # so that bearing observations are built from burst-centre timestamps.
+            self._record_live_burst_detection(iid, fired_icao, burst_centroid_us, burst_signal, pos)
+
             if fired_icao == ref_icao:
                 if current_frame is not None:
                     continue
@@ -1257,6 +1290,7 @@ class RadarState:
                     ref_lon=lon,
                     ref_arrival_us=burst_centroid_us,
                     seen_icaos={ref_icao},
+                    ref_pos_age_s=position_age_seconds,
                 )
                 self._live_last_frame_start_us[iid] = burst_centroid_us
                 metrics["frame_start_count"] += 1
@@ -1401,38 +1435,12 @@ class RadarState:
             builder_s = time.perf_counter() - t_builder
             builder_cpu_s = time.thread_time() - t_builder_cpu
 
-            # Record Stage 3 live detections for IIDs with a usable sync state.
-            # Done after the burst-builder pass so sync states updated by any newly
-            # completed frames are available for this batch.
-            now_ts = time.time()
-            latest_us = prepared[-1][3] if prepared else None
-            new_detections = []
-            for iid, icao_hex, signal_dbfs, arrival_us in prepared:
-                sync_state = self._live_sync_states.get(iid)
-                if sync_state is None or not sync_state.usable:
-                    continue
-                wall_ts = self._estimate_wall_time_from_arrival_us(arrival_us, latest_us)
-                pos = None
-                if wall_ts is not None:
-                    pos = self._adsb_tracker.get_position_at(icao_hex, wall_ts)
-                new_detections.append(Stage3LiveDetection(
-                    iid=iid,
-                    icao=icao_hex,
-                    arrival_us=arrival_us,
-                    wall_ts=now_ts,
-                    df=11,
-                    signal_dbfs=signal_dbfs,
-                    receiver_lat=self._receiver_lat,
-                    receiver_lon=self._receiver_lon,
-                    truth_lat=pos.get("lat") if pos else None,
-                    truth_lon=pos.get("lon") if pos else None,
-                    position_age_seconds=pos.get("position_age_seconds") if pos else None,
-                    association_confidence=1.0 if pos is not None else 0.0,
-                ))
-            if new_detections:
-                with self._lock:
-                    for det in new_detections:
-                        self._live_detection_buffer.append(det)
+            # Stage 3 live detections are now recorded at burst-fire time inside
+            # _process_fired_bursts() (native path) and _on_df11_frame_builder()
+            # (Python fallback).  Each fired burst produces exactly one
+            # Stage3LiveDetection with arrival_us = burst_centroid_us so that
+            # bearing observations are built from burst-centre timestamps rather
+            # than individual message arrivals.
         except Exception:
             pass
         finally:
@@ -1508,8 +1516,8 @@ class RadarState:
                     metrics["fm_callback_ms"] += (time.perf_counter() - t_fm_callback) * 1000
 
         # Update live sync state for Stage 3 whenever a usable frame is completed.
-        # The sync state captures: when was phase=0 (ref_arrival_us) and what bearing
-        # the radar was pointing at that moment (bearing from radar to ref aircraft).
+        # Uses residual-aware smoothing rather than hard replacement so that a
+        # single noisy frame cannot jump the phase anchor.
         if n_aircraft >= 3:
             model = self._models.get(iid)
             if model is not None:
@@ -1524,20 +1532,180 @@ class RadarState:
                         current_frame.ref_lat, current_frame.ref_lon,
                     )
                     sync_quality = _sync_quality_from_model(model)
-                    self._live_sync_states[iid] = LiveSyncState(
+                    self._update_live_sync_state_filtered(
                         iid=iid,
                         period_s=period_s,
-                        phase_epoch_us=current_frame.ref_arrival_us,
-                        phase_offset_deg=ref_bearing,
+                        new_epoch_us=current_frame.ref_arrival_us,
+                        new_offset_deg=ref_bearing,
                         sync_quality=sync_quality,
-                        sync_jitter_deg=5.0,  # refined by calibration in localiser
-                        last_sync_update_ts=time.time(),
-                        source="sweep_frame",
-                        usable=sync_quality >= 0.3,
+                        n_aircraft=n_aircraft,
+                        ref_pos_age_s=current_frame.ref_pos_age_s,
                     )
 
         self._live_frames[iid] = None
         return metrics
+
+    def _update_live_sync_state_filtered(
+        self,
+        iid: int,
+        period_s: float,
+        new_epoch_us: float,
+        new_offset_deg: float,
+        sync_quality: float,
+        n_aircraft: int,
+        ref_pos_age_s: float,
+    ) -> None:
+        """Update the live sync state with residual-aware smoothing.
+
+        For the initial sync, accept unconditionally.  For subsequent frames,
+        compute the circular residual between the new observation and the
+        current prediction and apply a weighted update:
+          - residual <= 20°: standard EMA update (alpha = 1 / inertia)
+          - 20° < residual <= 50°: soft/damped update (alpha = 0.1)
+          - residual > 50°: reject — do not move the phase anchor
+
+        The phase epoch is always advanced to the new frame's epoch on accept,
+        preventing accumulated error from large (arrival_us - epoch) distances.
+
+        sync_jitter_deg is derived from the residual EMA so bearing uncertainty
+        reflects actual sync scatter rather than a fixed constant.
+
+        Quality gate: frames with fewer than 4 aircraft and a stale reference
+        position are too weak to steer the sync anchor.
+        """
+        # Sync-update quality gate — stricter than the localisation permit gate.
+        # Marginal frames (n_aircraft == 3) may still trigger the FM callback and
+        # produce live bearing observations; they just do not steer the sync anchor
+        # unless the reference position is very fresh.
+        sync_eligible = (
+            n_aircraft >= 4
+            or (n_aircraft >= 3 and ref_pos_age_s <= 2.0)
+        )
+
+        now_ts = time.time()
+        existing = self._live_sync_states.get(iid)
+
+        if not sync_eligible:
+            # Frame is too weak to steer sync; enter holdover if state exists.
+            if existing is not None:
+                existing.holdover = True
+            return
+
+        if existing is None:
+            # First sync for this IID — accept unconditionally.
+            self._live_sync_states[iid] = LiveSyncState(
+                iid=iid,
+                period_s=period_s,
+                phase_epoch_us=new_epoch_us,
+                phase_offset_deg=new_offset_deg,
+                sync_quality=sync_quality,
+                sync_jitter_deg=5.0,
+                last_sync_update_ts=now_ts,
+                source="sweep_frame",
+                usable=sync_quality >= 0.3,
+                residual_ema_deg=5.0,
+                n_sync_frames=1,
+                n_rejected_frames=0,
+                last_residual_deg=0.0,
+                holdover=False,
+            )
+            return
+
+        period_us = period_s * 1e6
+        residual_deg = _compute_sync_residual_deg(existing, new_epoch_us, new_offset_deg, period_us)
+        abs_residual = abs(residual_deg)
+
+        # Rolling EMA of |residual| — always updated for diagnostics, even on reject.
+        _RESIDUAL_EMA_ALPHA = 0.2
+        new_residual_ema = (
+            (1.0 - _RESIDUAL_EMA_ALPHA) * existing.residual_ema_deg
+            + _RESIDUAL_EMA_ALPHA * abs_residual
+        )
+
+        # Hard-reject threshold: frame is too inconsistent to trust.
+        _RESIDUAL_REJECT_DEG = 50.0
+        if abs_residual > _RESIDUAL_REJECT_DEG:
+            existing.n_rejected_frames += 1
+            existing.last_residual_deg = residual_deg
+            existing.residual_ema_deg = new_residual_ema
+            existing.sync_jitter_deg = min(max(new_residual_ema, 2.0), 20.0)
+            existing.holdover = True
+            return
+
+        # Soft-accept threshold: large but survivable residual.
+        # Heavily damped alpha prevents one bad frame from jumping the anchor.
+        _RESIDUAL_SOFT_DEG = 20.0
+        inertia = min(existing.n_sync_frames + 1, 30)
+        if abs_residual > _RESIDUAL_SOFT_DEG:
+            alpha = 0.1
+        else:
+            alpha = 1.0 / max(inertia, 2)
+
+        # Express the existing state at the new epoch, then blend the bearing.
+        existing_at_new_epoch = (
+            (new_epoch_us - existing.phase_epoch_us) / period_us * 360.0
+            + existing.phase_offset_deg
+        ) % 360.0
+        blended_offset = (existing_at_new_epoch + alpha * residual_deg) % 360.0
+
+        new_jitter = min(max(new_residual_ema, 1.5), 15.0)
+
+        self._live_sync_states[iid] = LiveSyncState(
+            iid=iid,
+            period_s=period_s,
+            phase_epoch_us=new_epoch_us,   # advance epoch to keep phase reference fresh
+            phase_offset_deg=blended_offset,
+            sync_quality=sync_quality,
+            sync_jitter_deg=new_jitter,
+            last_sync_update_ts=now_ts,
+            source="sweep_frame",
+            usable=sync_quality >= 0.3,
+            residual_ema_deg=new_residual_ema,
+            n_sync_frames=existing.n_sync_frames + 1,
+            n_rejected_frames=existing.n_rejected_frames,
+            last_residual_deg=residual_deg,
+            holdover=False,
+        )
+
+    def _record_live_burst_detection(
+        self,
+        iid: int,
+        icao: str,
+        burst_centroid_us: float,
+        signal_dbfs: float | None,
+        pos: dict | None,
+    ) -> None:
+        """Record one burst-centre Stage3LiveDetection into the live detection buffer.
+
+        Called once per fired burst so the bearing observation path receives
+        burst-centre timestamps rather than individual message arrivals.  Only
+        buffers detections for IIDs that have a usable sync state.
+        """
+        sync_state = self._live_sync_states.get(iid)
+        if sync_state is None or not sync_state.usable:
+            return
+
+        truth_lat = pos.get("lat") if pos else None
+        truth_lon = pos.get("lon") if pos else None
+        pos_age = pos.get("position_age_seconds") if pos else None
+        assoc_conf = 1.0 if pos is not None else 0.0
+
+        det = Stage3LiveDetection(
+            iid=iid,
+            icao=icao,
+            arrival_us=burst_centroid_us,   # burst-centre timestamp, not raw arrival
+            wall_ts=time.time(),
+            df=11,
+            signal_dbfs=signal_dbfs,
+            receiver_lat=self._receiver_lat,
+            receiver_lon=self._receiver_lon,
+            truth_lat=truth_lat,
+            truth_lon=truth_lon,
+            position_age_seconds=pos_age,
+            association_confidence=assoc_conf,
+        )
+        # deque.append is GIL-safe; no lock needed for single-threaded DF11 path.
+        self._live_detection_buffer.append(det)
 
     def _finalize_pending_burst(
         self,
@@ -1786,6 +1954,10 @@ class RadarState:
 
             from .models import SweepFrameObservation, LiveFrameState
 
+            # Record one burst-centre Stage3LiveDetection per fired burst (Python fallback path).
+            # Done before frame qualification checks so all radar-illuminated ICAOs are captured.
+            self._record_live_burst_detection(iid, fired_icao, burst_centroid_us, burst_signal, pos)
+
             if fired_icao == ref_icao:
                 # Reference burst inside an already-open frame is treated as a duplicate
                 # hit/sidelobe unless the frame has already expired, which was handled above.
@@ -1808,6 +1980,7 @@ class RadarState:
                     ref_lon=lon,
                     ref_arrival_us=burst_centroid_us,
                     seen_icaos={ref_icao},
+                    ref_pos_age_s=position_age_seconds,
                 )
                 self._live_last_frame_start_us[iid] = burst_centroid_us
             else:

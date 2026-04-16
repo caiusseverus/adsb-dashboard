@@ -80,6 +80,7 @@ class LiveFrameState:
     observations: list = field(default_factory=list)  # list of SweepFrameObservation
     seen_icaos: set[str] = field(default_factory=set)
     n_aircraft_seen: int = 1  # reference counts
+    ref_pos_age_s: float = 0.0  # position age of ref aircraft at frame start (for sync gate)
 
 
 @dataclass

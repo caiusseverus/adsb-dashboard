@@ -1232,6 +1232,13 @@ class AircraftLocaliser:
                     "has_obs": iid in unique_iids,
                     "sync_quality": sync.sync_quality if sync else None,
                     "sync_usable": sync.usable if sync else False,
+                    # Residual-tracking diagnostics (for verification plot / debugging)
+                    "sync_jitter_deg": sync.sync_jitter_deg if sync else None,
+                    "residual_ema_deg": sync.residual_ema_deg if sync else None,
+                    "last_residual_deg": sync.last_residual_deg if sync else None,
+                    "n_sync_frames": sync.n_sync_frames if sync else None,
+                    "n_rejected_frames": sync.n_rejected_frames if sync else None,
+                    "sync_holdover": sync.holdover if sync else None,
                 },
             })
         layers.append({
