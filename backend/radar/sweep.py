@@ -198,6 +198,12 @@ def _sync_quality_from_model(model: RadarIID) -> float:
     return 0.0
 
 
+def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
+    """Serialise a LiveSyncState to a plain dict for API/verification payloads."""
+    import dataclasses
+    return dataclasses.asdict(sync)
+
+
 def _compute_sync_residual_deg(
     existing: "LiveSyncState",
     new_epoch_us: float,
@@ -1318,6 +1324,7 @@ class RadarState:
                     n_replies=fired_burst.get("n_replies", 1),
                     signal_dbfs=burst_signal,
                     pos_age_s=position_age_seconds,
+                    period_s=period_s,
                 )
 
             if fired_icao == ref_icao:
@@ -1569,12 +1576,11 @@ class RadarState:
                 finally:
                     metrics["fm_callback_ms"] += (time.perf_counter() - t_fm_callback) * 1000
 
-        # Update live sync state for Stage 3 whenever a usable frame is completed.
-        # Primary path: multi-aircraft rolling estimator (_update_multi_aircraft_sync_state).
-        # Aligned burst observations are recorded continuously in both burst processing loops
-        # (_process_fired_bursts and _on_df11_frame_builder) so the buffer is already populated
-        # with the current frame's participants by the time _finalize_live_frame is called.
-        # Initial bootstrap: single-frame reference-aircraft update for the very first sync.
+        # Update live sync state for Stage 3 when a usable frame is completed.
+        # Bootstrap only: seed the first sync state from the reference aircraft bearing so
+        # the multi-aircraft estimator has an initial model to compute residuals against.
+        # Once bootstrapped, sync is driven entirely by _record_aligned_burst_sync_obs →
+        # _update_multi_aircraft_sync_state, which fires on every aligned burst arrival.
         if n_aircraft >= 3:
             model = self._models.get(iid)
             if model is not None:
@@ -1583,35 +1589,23 @@ class RadarState:
                     radar_pos["lat"] is not None
                     and current_frame.ref_lat is not None
                     and current_frame.ref_lon is not None
+                    and self._live_sync_states.get(iid) is None
                 ):
+                    # Bootstrap: no prior sync state — seed from reference aircraft bearing.
                     sync_quality = _sync_quality_from_model(model)
-                    existing = self._live_sync_states.get(iid)
-                    if existing is None:
-                        # Bootstrap: no prior sync state — seed from reference aircraft bearing.
-                        # _update_live_sync_state_filtered initialises LiveSyncState so
-                        # the multi-aircraft path has a base model to compute residuals from.
-                        ref_bearing = _bearing_deg_simple(
-                            radar_pos["lat"], radar_pos["lon"],
-                            current_frame.ref_lat, current_frame.ref_lon,
-                        )
-                        self._update_live_sync_state_filtered(
-                            iid=iid,
-                            period_s=period_s,
-                            new_epoch_us=current_frame.ref_arrival_us,
-                            new_offset_deg=ref_bearing,
-                            sync_quality=sync_quality,
-                            n_aircraft=n_aircraft,
-                            ref_pos_age_s=current_frame.ref_pos_age_s,
-                        )
-                    else:
-                        # Primary sync: use multi-aircraft rolling estimator.
-                        # The aligned burst buffer is already populated with this frame's
-                        # participants from the burst processing loop above.
-                        self._update_multi_aircraft_sync_state(
-                            iid=iid,
-                            period_s=period_s,
-                            sync_quality=sync_quality,
-                        )
+                    ref_bearing = _bearing_deg_simple(
+                        radar_pos["lat"], radar_pos["lon"],
+                        current_frame.ref_lat, current_frame.ref_lon,
+                    )
+                    self._update_live_sync_state_filtered(
+                        iid=iid,
+                        period_s=period_s,
+                        new_epoch_us=current_frame.ref_arrival_us,
+                        new_offset_deg=ref_bearing,
+                        sync_quality=sync_quality,
+                        n_aircraft=n_aircraft,
+                        ref_pos_age_s=current_frame.ref_pos_age_s,
+                    )
 
         self._live_frames[iid] = None
         return metrics
@@ -1790,6 +1784,7 @@ class RadarState:
         n_replies: int,
         signal_dbfs: float | None,
         pos_age_s: float,
+        period_s: float = 0.0,
     ) -> None:
         """Record one burst-centre bearing observation for multi-aircraft sync maintenance.
 
@@ -1797,6 +1792,10 @@ class RadarState:
         both burst processing paths.  The pre-computed geometric bearing is stored
         so _update_multi_aircraft_sync_state() can compute residuals without
         re-fetching positions.
+
+        After inserting the observation, immediately drives _update_multi_aircraft_sync_state
+        so sync evolves continuously as bursts arrive rather than waiting for frame
+        completion.  period_s must be non-zero for the sync update to fire.
         """
         bearing_deg = _bearing_deg_simple(radar_lat, radar_lon, aircraft_lat, aircraft_lon)
         obs = AlignedBurstSyncObs(
@@ -1812,6 +1811,12 @@ class RadarState:
             iid, deque(maxlen=self._MULTI_SYNC_OBS_MAX)
         )
         obs_buf.append(obs)
+
+        # Drive sync update immediately — sync is burst-driven, not frame-driven.
+        # _update_multi_aircraft_sync_state returns early if conditions are not met
+        # (no bootstrap yet, too few observations, single-aircraft coverage).
+        if period_s > 0.0:
+            self._update_multi_aircraft_sync_state(iid=iid, period_s=period_s)
 
     @staticmethod
     def _score_sync_burst_observation(obs: AlignedBurstSyncObs) -> float:
@@ -1932,10 +1937,18 @@ class RadarState:
         if len(contributing_icaos) < 2:
             # Single-aircraft sync is too fragile — enter holdover rather than update.
             existing.holdover = True
+            existing.usable = False
             return
 
         n_inliers = sum(1 for _, _, s, _ in scored if s == "inlier")
         n_rejected = sum(1 for _, _, s, _ in scored if s == "rejected")
+
+        # Reject update if majority of observations are outliers — data quality is
+        # too poor to steer the phase anchor reliably.
+        if n_rejected >= len(recent_obs) // 2 + 1:
+            existing.holdover = True
+            existing.usable = False
+            return
 
         # Weighted phase correction: weighted circular mean of all non-rejected residuals.
         total_w = sum(w for _, w, _, _ in scored)
@@ -1993,6 +2006,18 @@ class RadarState:
 
         q = sync_quality if sync_quality is not None else existing.sync_quality
 
+        # Derive usable from current sync evidence rather than inheriting the previous value.
+        # Requires: ≥3 inliers, ≥2 contributing aircraft, jitter below threshold,
+        # and acceptable rejection ratio.
+        _MIN_INLIERS_FOR_USABLE = 3
+        _MAX_JITTER_FOR_USABLE = 15.0
+        new_usable = (
+            n_inliers >= _MIN_INLIERS_FOR_USABLE
+            and len(contributing_icaos) >= 2
+            and new_jitter < _MAX_JITTER_FOR_USABLE
+            and n_rejected < len(recent_obs) // 2 + 1
+        )
+
         self._live_sync_states[iid] = LiveSyncState(
             iid=iid,
             period_s=period_s,
@@ -2002,7 +2027,7 @@ class RadarState:
             sync_jitter_deg=new_jitter,
             last_sync_update_ts=now_ts,
             source="multi_aircraft_burst",
-            usable=existing.usable,        # usability gate remains from rotation model quality
+            usable=new_usable,
             residual_ema_deg=new_ema,
             n_sync_frames=existing.n_sync_frames + 1,
             n_rejected_frames=existing.n_rejected_frames + (1 if n_rejected > max(len(recent_obs) // 2, 1) else 0),
@@ -2285,6 +2310,7 @@ class RadarState:
                         n_replies=fired_burst.get("n_replies", 1),
                         signal_dbfs=burst_signal,
                         pos_age_s=position_age_seconds,
+                        period_s=period_s,
                     )
 
             if fired_icao == ref_icao:
@@ -2743,7 +2769,9 @@ class RadarState:
                                self._live_burst_centroids, self._live_frames,
                                self._live_last_frame_start_us,
                                self._live_completed_frames,
-                               self._live_frame_counters):
+                               self._live_frame_counters,
+                               self._live_aligned_burst_obs,
+                               self._live_sync_states):
                 if iid in live_dict:
                     del live_dict[iid]
                     had_any = True
@@ -2790,6 +2818,8 @@ class RadarState:
             self._live_last_frame_start_us.clear()
             self._live_completed_frames.clear()
             self._live_frame_counters.clear()
+            self._live_aligned_burst_obs.clear()
+            self._live_sync_states.clear()
             self._native_burst_processors.clear()
             return cleared
 
@@ -3028,6 +3058,69 @@ class RadarState:
                     icao_arrivals[icao].append(arrival_us)
 
         return {icao: list(reversed(arrivals)) for icao, arrivals in icao_arrivals.items()}
+
+    def get_burst_sync_timeline(self, iid: int, window_s: float = 60.0) -> dict:
+        """Return burst-centre sync observations with residuals for verification plotting.
+
+        Each entry represents one aligned burst observation compared against the current
+        sync model.  Intended for verification UI: plot residual_deg vs time with
+        inlier/rejected colouring to assess sync quality.
+
+        Returns a dict with:
+          - "observations": list of dicts (one per burst, sorted oldest-first)
+          - "sync_state": current LiveSyncState fields (or None)
+          - "window_s": window actually used
+        """
+        with self._lock:
+            sync = self._live_sync_states.get(iid)
+            obs_buf = self._live_aligned_burst_obs.get(iid)
+            obs_snapshot = list(obs_buf) if obs_buf else []
+
+        if not obs_snapshot or sync is None:
+            return {
+                "observations": [],
+                "sync_state": _live_sync_state_to_dict(sync) if sync else None,
+                "window_s": window_s,
+            }
+
+        period_us = sync.period_s * 1e6
+        now_ts = time.time()
+        cutoff_ts = now_ts - window_s
+
+        entries = []
+        for obs in obs_snapshot:
+            if obs.ts < cutoff_ts:
+                continue
+            predicted_deg = (
+                (obs.burst_centroid_us - sync.phase_epoch_us) / period_us * 360.0
+                + sync.phase_offset_deg
+            ) % 360.0
+            residual_deg = (obs.bearing_deg - predicted_deg + 540.0) % 360.0 - 180.0
+            abs_r = abs(residual_deg)
+            classification = self._classify_sync_residual(abs_r)
+            weight = self._score_sync_burst_observation(obs)
+            entries.append({
+                "beam_center_us": obs.burst_centroid_us,
+                "wall_ts": obs.ts,
+                "icao": obs.icao,
+                "bearing_deg": obs.bearing_deg,
+                "predicted_deg": predicted_deg,
+                "residual_deg": residual_deg,
+                "weight": weight,
+                "classification": classification,
+                "n_replies": obs.n_replies,
+                "signal_dbfs": obs.signal_dbfs,
+                "pos_age_s": obs.pos_age_s,
+            })
+
+        # Sort chronologically by burst centre timestamp
+        entries.sort(key=lambda e: e["beam_center_us"])
+
+        return {
+            "observations": entries,
+            "sync_state": _live_sync_state_to_dict(sync),
+            "window_s": window_s,
+        }
 
     def get_dwell_profile(self, iid: int, icao: str, sweep_idx: int | None = None) -> list[dict]:
         """Return per-reply RSSI+timestamp within the most recent (or specified) burst."""

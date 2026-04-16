@@ -1264,6 +1264,23 @@ async def get_iid_timeline(iid: int, window_s: float = Query(default=30.0, ge=5,
         _record_api_timing("iid_timeline", t0)
 
 
+@router.get("/iids/{iid}/burst_sync_timeline")
+async def get_burst_sync_timeline(iid: int, window_s: float = Query(default=60.0, ge=10, le=300)):
+    """Burst-centre sync observations with residuals for verification plotting.
+
+    Returns one entry per aligned burst observation (not per DF11 message) within
+    the requested window, annotated with predicted bearing, residual, and inlier
+    classification against the current sync model.
+    """
+    t0 = time.perf_counter()
+    try:
+        if _state is None:
+            return {"observations": [], "sync_state": None, "window_s": window_s}
+        return _state.get_burst_sync_timeline(iid, window_s)
+    finally:
+        _record_api_timing("burst_sync_timeline", t0)
+
+
 @router.get("/iids/{iid}/rotation")
 async def get_iid_rotation(iid: int):
     """Current rotation model for a single IID."""
