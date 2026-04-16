@@ -222,6 +222,21 @@ RADAR_UPDATE_BUDGET_MS: float = float(os.getenv("RADAR_UPDATE_BUDGET_MS", "750")
 RADAR_IID_WS_REBUILD_INTERVAL_S: float = float(os.getenv("RADAR_IID_WS_REBUILD_INTERVAL_S", "5.0"))
 RADAR_COINCIDENT_BACKGROUND_ENABLED: bool = _bool("RADAR_COINCIDENT_BACKGROUND_ENABLED", False)
 
+# Live radar sync refinement feature flags.
+# period refinement: derive a small correction to period_s from the residual
+# slope of recent multi-aircraft burst observations, on top of the aggregate
+# estimator's base period.
+RADAR_SYNC_PERIOD_REFINE_ENABLED: bool = _bool("RADAR_SYNC_PERIOD_REFINE_ENABLED", True)
+# waveform correction: learn an empirical phase-in-rotation residual waveform
+# and subtract it when predicting bearing from arrival time.
+RADAR_SYNC_WAVEFORM_ENABLED: bool = _bool("RADAR_SYNC_WAVEFORM_ENABLED", True)
+# propagation delay: subtract aircraft-to-receiver (and, where available,
+# radar-to-aircraft) light-time from observation arrival timestamps before
+# using them in the sync model.
+RADAR_SYNC_PROP_DELAY_ENABLED: bool = _bool("RADAR_SYNC_PROP_DELAY_ENABLED", True)
+# Number of circular bins for the phase-in-rotation waveform model.
+RADAR_SYNC_WAVEFORM_BIN_COUNT: int = int(os.getenv("RADAR_SYNC_WAVEFORM_BIN_COUNT", "24"))
+
 # ---------------------------------------------------------------------------
 # Stage 3 — aircraft localisation from known radar bearings
 # ---------------------------------------------------------------------------

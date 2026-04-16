@@ -1720,6 +1720,134 @@ const legendDotStyle = {
   display: 'inline-block',
 }
 
+function SyncDiagnosticsPanel({ syncState, waveformBins, perIcaoQuality, observations }) {
+  if (!syncState) return null
+  const basePeriod = Number(syncState.period_base_s)
+  const livePeriod = Number(syncState.period_s)
+  const ppm = Number(syncState.period_correction_ppm)
+  const slope = Number(syncState.residual_slope_deg_per_s)
+  const wfReduction = Number(syncState.waveform_residual_reduction_deg)
+  const pillStyle = {
+    display: 'inline-block',
+    padding: '2px 6px',
+    margin: '2px',
+    border: '1px solid #30363d',
+    borderRadius: '3px',
+    fontSize: '0.72rem',
+    color: '#c9d1d9',
+    background: '#0f141b',
+  }
+  const valueStyle = { color: '#d2e4ff', fontFamily: 'SFMono-Regular, Consolas, monospace', marginLeft: '4px' }
+
+  // Residual-vs-phase scatter and residual-vs-range scatter.
+  const phaseW = 360, phaseH = 90
+  const waveW = 360, waveH = 90
+  const rangeW = 360, rangeH = 90
+  const phaseDots = []
+  const rangeDots = []
+  const absResiduals = []
+  let maxRangeNm = 10
+  for (const obs of observations || []) {
+    const phase = Number(obs?.phase_in_rot_deg)
+    const resRaw = Number(obs?.residual_raw_deg ?? obs?.residual_deg)
+    const resCorr = Number(obs?.residual_corrected_deg ?? obs?.residual_deg)
+    const rangeNm = Number(obs?.range_nm)
+    if (Number.isFinite(phase) && Number.isFinite(resRaw)) {
+      phaseDots.push({ phase, res: resRaw, cls: obs.classification })
+      absResiduals.push(Math.abs(resRaw))
+    }
+    if (Number.isFinite(rangeNm) && Number.isFinite(resCorr)) {
+      rangeDots.push({ r: rangeNm, res: resCorr, cls: obs.classification })
+      if (rangeNm > maxRangeNm) maxRangeNm = rangeNm
+    }
+  }
+  const yAbs = Math.max(10, Math.min(60, Math.ceil(Math.max(1, ...absResiduals) / 5) * 5))
+
+  return (
+    <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '2px' }}>
+        <span style={pillStyle}>Base period<span style={valueStyle}>{Number.isFinite(basePeriod) && basePeriod > 0 ? `${basePeriod.toFixed(4)}s` : '—'}</span></span>
+        <span style={pillStyle}>Refined period<span style={valueStyle}>{Number.isFinite(livePeriod) && livePeriod > 0 ? `${livePeriod.toFixed(4)}s` : '—'}</span></span>
+        <span style={pillStyle}>ppm<span style={valueStyle}>{Number.isFinite(ppm) ? `${ppm >= 0 ? '+' : ''}${ppm.toFixed(1)}` : '—'}</span></span>
+        <span style={pillStyle}>Slope<span style={valueStyle}>{Number.isFinite(slope) ? `${slope.toFixed(3)}°/s` : '—'}</span></span>
+        <span style={pillStyle}>Refine<span style={valueStyle}>{syncState.period_refine_enabled ? 'on' : 'off'}</span></span>
+        <span style={pillStyle}>Waveform<span style={valueStyle}>{syncState.waveform_enabled ? (syncState.waveform_applied ? 'applied' : 'learning') : 'off'}</span></span>
+        <span style={pillStyle}>Wf Δ|res|<span style={valueStyle}>{Number.isFinite(wfReduction) ? `${wfReduction.toFixed(2)}°` : '—'}</span></span>
+        <span style={pillStyle}>Prop delay<span style={valueStyle}>{syncState.prop_delay_enabled ? 'on' : 'off'}</span></span>
+        <span style={pillStyle}>Contributors<span style={valueStyle}>{syncState.contributing_icao_count ?? '—'}</span></span>
+      </div>
+
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px', marginTop: '0.4rem' }}>
+        <div>
+          <div style={{ fontSize: '0.7rem', color: '#8b949e', marginBottom: '2px' }}>Residual vs phase-in-rotation</div>
+          <svg width={phaseW} height={phaseH} style={{ background: '#0f141b', border: '1px solid #30363d' }}>
+            <line x1={0} y1={phaseH / 2} x2={phaseW} y2={phaseH / 2} stroke="#58a6ff55" />
+            {phaseDots.map((d, i) => (
+              <circle key={i} cx={(d.phase / 360) * phaseW}
+                      cy={phaseH / 2 - (Math.max(-yAbs, Math.min(yAbs, d.res)) / yAbs) * (phaseH / 2 - 3)}
+                      r={1.6} fill={burstSyncClassColor(d.cls)} fillOpacity={0.7} />
+            ))}
+            {Array.isArray(waveformBins) && waveformBins.length > 1 && (
+              <polyline
+                fill="none" stroke="#d29922" strokeWidth={1.2}
+                points={waveformBins.map(b => {
+                  const x = (Number(b.phase_center_deg) / 360) * phaseW
+                  const y = phaseH / 2 - (Math.max(-yAbs, Math.min(yAbs, Number(b.correction_deg))) / yAbs) * (phaseH / 2 - 3)
+                  return `${x.toFixed(1)},${y.toFixed(1)}`
+                }).join(' ')}
+              />
+            )}
+            <text x={2} y={10} fontSize="9" fill="#8b949e">+{yAbs}°</text>
+            <text x={2} y={phaseH - 2} fontSize="9" fill="#8b949e">-{yAbs}°</text>
+            <text x={phaseW - 25} y={phaseH - 2} fontSize="9" fill="#8b949e">360°</text>
+          </svg>
+        </div>
+
+        <div>
+          <div style={{ fontSize: '0.7rem', color: '#8b949e', marginBottom: '2px' }}>Residual vs range (corrected)</div>
+          <svg width={rangeW} height={rangeH} style={{ background: '#0f141b', border: '1px solid #30363d' }}>
+            <line x1={0} y1={rangeH / 2} x2={rangeW} y2={rangeH / 2} stroke="#58a6ff55" />
+            {rangeDots.map((d, i) => (
+              <circle key={i} cx={(d.r / maxRangeNm) * rangeW}
+                      cy={rangeH / 2 - (Math.max(-yAbs, Math.min(yAbs, d.res)) / yAbs) * (rangeH / 2 - 3)}
+                      r={1.6} fill={burstSyncClassColor(d.cls)} fillOpacity={0.7} />
+            ))}
+            <text x={2} y={10} fontSize="9" fill="#8b949e">+{yAbs}°</text>
+            <text x={2} y={rangeH - 2} fontSize="9" fill="#8b949e">-{yAbs}°</text>
+            <text x={rangeW - 38} y={rangeH - 2} fontSize="9" fill="#8b949e">{maxRangeNm.toFixed(0)}NM</text>
+          </svg>
+        </div>
+
+        {Array.isArray(perIcaoQuality) && perIcaoQuality.length > 0 && (
+          <div style={{ maxHeight: '110px', overflow: 'auto', fontSize: '0.7rem' }}>
+            <div style={{ color: '#8b949e', marginBottom: '2px' }}>Per-aircraft residual quality</div>
+            <table style={{ borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ color: '#8b949e' }}>
+                  <th style={{ textAlign: 'left', padding: '0 6px' }}>icao</th>
+                  <th style={{ textAlign: 'right', padding: '0 6px' }}>median°</th>
+                  <th style={{ textAlign: 'right', padding: '0 6px' }}>mad°</th>
+                  <th style={{ textAlign: 'right', padding: '0 6px' }}>n</th>
+                </tr>
+              </thead>
+              <tbody>
+                {perIcaoQuality.slice(0, 12).map(q => (
+                  <tr key={q.icao}>
+                    <td style={{ padding: '0 6px', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{q.icao}</td>
+                    <td style={{ padding: '0 6px', textAlign: 'right' }}>{Number(q.residual_median_deg).toFixed(2)}</td>
+                    <td style={{ padding: '0 6px', textAlign: 'right' }}>{Number(q.residual_mad_deg).toFixed(2)}</td>
+                    <td style={{ padding: '0 6px', textAlign: 'right' }}>{q.n}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, rows, onSelectIid }) {
   const [alignmentMode, setAlignmentMode] = useState(BURST_SYNC_VIEW_MODE_RESIDUALS)
   const [rotation, setRotation] = useState(null)
@@ -2144,6 +2272,13 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
           </button>
         </div>
       </div>
+
+      <SyncDiagnosticsPanel
+        syncState={syncState}
+        waveformBins={burstTimeline?.waveform_bins}
+        perIcaoQuality={burstTimeline?.per_icao_quality}
+        observations={filteredObservations}
+      />
 
       {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS ? (
         <>
