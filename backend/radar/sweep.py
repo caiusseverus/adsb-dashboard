@@ -141,6 +141,18 @@ def _bearing_deg_simple(lat1: float, lon1: float, lat2: float, lon2: float) -> f
     return (_math.degrees(_math.atan2(y, x)) + 360) % 360
 
 
+def _haversine_nm_simple(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two lat/lon points in nautical miles."""
+    r_m = 6_371_000.0
+    phi1 = _math.radians(lat1)
+    phi2 = _math.radians(lat2)
+    dphi = _math.radians(lat2 - lat1)
+    dlam = _math.radians(lon2 - lon1)
+    a = _math.sin(dphi / 2.0) ** 2 + _math.cos(phi1) * _math.cos(phi2) * _math.sin(dlam / 2.0) ** 2
+    c = 2.0 * _math.asin(_math.sqrt(max(0.0, min(1.0, a))))
+    return (r_m * c) / 1852.0
+
+
 def _get_authoritative_radar_position(model: RadarIID) -> dict:
     """Return the best-available radar position for a RadarIID model.
 
@@ -273,6 +285,7 @@ class AlignedBurstSyncObs:
     n_replies: int              # Burst reply count (quality factor for burst-centre accuracy)
     signal_dbfs: float | None   # Average signal strength (dBFS, negative; None if unknown)
     pos_age_s: float            # ADS-B position age at burst time (seconds)
+    range_nm: float             # Geometric range from radar to aircraft (nautical miles)
     ts: float                   # Wall-clock time for rolling-window age filtering
 
 
@@ -1805,6 +1818,7 @@ class RadarState:
             n_replies=n_replies,
             signal_dbfs=signal_dbfs,
             pos_age_s=pos_age_s,
+            range_nm=_haversine_nm_simple(radar_lat, radar_lon, aircraft_lat, aircraft_lon),
             ts=time.time(),
         )
         obs_buf = self._live_aligned_burst_obs.setdefault(
@@ -3111,6 +3125,7 @@ class RadarState:
                 "n_replies": obs.n_replies,
                 "signal_dbfs": obs.signal_dbfs,
                 "pos_age_s": obs.pos_age_s,
+                "range_nm": obs.range_nm,
             })
 
         # Sort chronologically by burst centre timestamp

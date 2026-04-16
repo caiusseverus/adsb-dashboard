@@ -1265,6 +1265,7 @@ async def get_iid_timeline(iid: int, window_s: float = Query(default=30.0, ge=5,
 
 
 @router.get("/iids/{iid}/burst_sync_timeline")
+@router.get("/iids/{iid}/burst-sync-timeline")
 async def get_burst_sync_timeline(iid: int, window_s: float = Query(default=60.0, ge=10, le=300)):
     """Burst-centre sync observations with residuals for verification plotting.
 

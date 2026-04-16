@@ -8,6 +8,31 @@ Source inputs:
 Prepared: 2026-04-04
 Updated: 2026-04-06
 
+## 2026-04-16 Burst-Centre Sync Visualisation Wiring Rectification
+
+- [x] Inspect frontend and backend radar timeline/sync routes and identify legacy wiring points
+- [x] Add or expose a dedicated burst-sync timeline API route path for frontend consumption
+- [x] Update `RotationAlignmentPanel` to poll burst-sync timeline data and render residual/classification observations
+- [x] Update `ReceiverCentredRadarField` so burst-centre observations are the primary sync verification layer, with raw DF11 optional secondary context
+- [x] Update panel labels/legend text to clearly distinguish burst-sync observations from raw message diagnostics
+- [x] Run focused backend/frontend verification and record results
+
+Plan confirmation: proceeding with a targeted wiring rectification only (no unrelated radar refactors), preserving legacy timeline/raw-event endpoints as secondary diagnostics.
+
+### Review
+
+- Implementation:
+  - Updated [api.py](/home/keith/claude/adsb-dashboard/backend/radar/api.py) to expose a frontend-friendly burst-sync timeline alias route at `/api/radar/iids/{iid}/burst-sync-timeline` while retaining the existing underscore route.
+  - Updated [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) so `get_burst_sync_timeline()` observations now include `range_nm` derived from radar-to-aircraft geometry, enabling polar-field projection from burst-centre observations.
+  - Updated [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) so `RotationAlignmentPanel` now polls burst-sync timeline data and renders a residual-vs-time burst-sync scatter (inlier/soft/rejected), replacing legacy raw timeline/websocket wiring.
+  - Updated [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) so `ReceiverCentredRadarField` now uses burst-centre observations as the primary verification overlay, computes beam residual checks at `beam_center_us`, and renders raw DF11 events as a faint secondary diagnostic layer.
+  - Updated panel titles, legend chips, and explanatory text in [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) to explicitly distinguish burst-sync verification data from raw message context.
+- Verification:
+  - `python3 -m py_compile backend/radar/api.py backend/radar/sweep.py`
+  - `uv run --directory backend pytest tests/test_radar_api.py tests/test_radar_sweep.py`
+  - `npm run build`
+  - Result: backend `73 passed in 0.61s`; frontend build succeeded (existing chunk-size warning remains).
+
 ## 2026-04-13 All-Pairs Circle Solver Follow-Up Refactor
 
 - [x] Inspect the current backend all-pairs circle path, endpoint rejection, and payload diagnostics

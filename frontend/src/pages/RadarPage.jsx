@@ -20,9 +20,9 @@ import {
 } from '../utils/messageField'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
-const RADAR_WS_BASE = import.meta.env.PROD
-  ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`
-  : 'ws://localhost:8000'
+const BURST_SYNC_POLL_MS = 1500
+const BURST_SYNC_ALIGNMENT_WINDOW_S = 90
+const BURST_SYNC_FIELD_WINDOW_S = 60
 const RADAR_FIELD_PERSISTENCE_US = 3_000_000
 const RADAR_FIELD_BUFFER_MAX = 60_000
 const RADAR_FIELD_AXIS_HEADROOM = 1.08
@@ -1644,194 +1644,140 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
   )
 }
 
-function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, rows, onSelectIid }) {
-  const [timeline, setTimeline] = useState(null)
-  const [rotation, setRotation] = useState(null)
-  const [resetting, setResetting] = useState(false)
+function burstSyncClassColor(classification) {
+  switch (classification) {
+    case 'inlier': return '#3fb950'
+    case 'soft': return '#d29922'
+    case 'rejected': return '#ff7b72'
+    default: return '#8b949e'
+  }
+}
+
+function useBurstSyncTimeline(iid, windowS, pollMs = BURST_SYNC_POLL_MS) {
+  const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
-  const [refOverride, setRefOverride] = useState(null)
-  const [refOverrideSent, setRefOverrideSent] = useState(false)
-  const timelineCacheRef = useRef(new Map())
-  const rotationCacheRef = useRef(new Map())
 
   useEffect(() => {
     if (iid == null) {
-      setTimeline(null)
-      setRotation(null)
+      setData(null)
       setLoading(false)
+      return
+    }
+    let cancelled = false
+    let intervalId = null
+
+    async function pollOnce() {
+      try {
+        if (!cancelled) setLoading(true)
+        const response = await fetch(`${API_BASE}/api/radar/iids/${iid}/burst-sync-timeline?window_s=${windowS}`)
+        if (!response.ok) return
+        const payload = await response.json()
+        if (cancelled) return
+        startTransition(() => setData(payload))
+      } catch {
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+
+    pollOnce()
+    intervalId = setInterval(pollOnce, pollMs)
+    return () => {
+      cancelled = true
+      clearInterval(intervalId)
+    }
+  }, [iid, pollMs, windowS])
+
+  return { data, loading }
+}
+
+const legendDotStyle = {
+  width: '0.55rem',
+  height: '0.55rem',
+  borderRadius: '999px',
+  display: 'inline-block',
+}
+
+function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, rows, onSelectIid }) {
+  const [rotation, setRotation] = useState(null)
+  const [resetting, setResetting] = useState(false)
+  const [rotationLoading, setRotationLoading] = useState(false)
+  const [refOverride, setRefOverride] = useState(null)
+  const [refOverrideSent, setRefOverrideSent] = useState(false)
+  const rotationCacheRef = useRef(new Map())
+  const { data: burstTimeline, loading: burstLoading } = useBurstSyncTimeline(iid, BURST_SYNC_ALIGNMENT_WINDOW_S)
+
+  useEffect(() => {
+    if (iid == null) {
+      setRotation(null)
+      setRotationLoading(false)
       setRefOverride(null)
       setRefOverrideSent(false)
       return
     }
 
     let cancelled = false
-    let ws
-    let retryTimer = null
-    let fallbackTimer = null
-    let lastMessageWall = 0
-    const cachedTimeline = timelineCacheRef.current.get(iid)
     const cachedRotation = rotationCacheRef.current.get(iid)
-
-    setTimeline(cachedTimeline ?? null)
     setRotation(cachedRotation ?? null)
-    setLoading(true)
+    setRotationLoading(true)
 
-    async function fetchTimeline() {
+    async function pollRotation() {
       try {
-        const timelineResp = await fetch(`${API_BASE}/api/radar/iids/${iid}/timeline?window_s=90`)
-        if (!timelineResp.ok) return
-        const timelineData = await timelineResp.json()
+        const response = await fetch(`${API_BASE}/api/radar/iids/${iid}/rotation`)
+        if (!response.ok) return
+        const payload = await response.json()
         if (cancelled) return
-        timelineCacheRef.current.set(iid, timelineData)
-        startTransition(() => {
-          setTimeline(timelineData)
-        })
-      } catch {}
-    }
-
-    async function fetchRotation() {
-      try {
-        const rotationResp = await fetch(`${API_BASE}/api/radar/iids/${iid}/rotation`)
-        if (!rotationResp.ok) return
-        const rotationData = await rotationResp.json()
-        if (cancelled) return
-        rotationCacheRef.current.set(iid, rotationData)
-        startTransition(() => {
-          setRotation(rotationData)
-        })
-      } catch {}
-    }
-
-    async function refreshOnce() {
-      await Promise.allSettled([fetchTimeline(), fetchRotation()])
-      if (!cancelled) setLoading(false)
-    }
-
-    function connect() {
-      if (cancelled) return
-      ws = new WebSocket(`${RADAR_WS_BASE}/ws/radar/iids/${iid}`)
-
-      ws.onopen = () => {
-        try {
-          ws.send(JSON.stringify({ window_s: 90 }))
-        } catch {}
-        lastMessageWall = performance.now()
-      }
-
-      ws.onmessage = event => {
-        lastMessageWall = performance.now()
-        try {
-          const payload = JSON.parse(event.data)
-          const timelineData = payload?.timeline ?? null
-          const rotationData = payload?.rotation ?? null
-          if (timelineData) {
-            timelineCacheRef.current.set(iid, timelineData)
-            startTransition(() => {
-              setTimeline(timelineData)
-            })
-          }
-          if (rotationData) {
-            rotationCacheRef.current.set(iid, rotationData)
-            startTransition(() => {
-              setRotation(rotationData)
-            })
-          }
-          if (!cancelled) setLoading(false)
-        } catch {}
-      }
-
-      ws.onclose = () => {
-        if (cancelled) return
-        retryTimer = setTimeout(connect, 2000)
-      }
-
-      ws.onerror = () => {
-        // Don't close — let onclose handle reconnection
+        rotationCacheRef.current.set(iid, payload)
+        startTransition(() => setRotation(payload))
+      } catch {
+      } finally {
+        if (!cancelled) setRotationLoading(false)
       }
     }
 
-    refreshOnce()
-    connect()
-    fallbackTimer = setInterval(() => {
-      if (cancelled) return
-      if (performance.now() - lastMessageWall > 1500) {
-        refreshOnce()
-      }
-    }, 1000)
-
+    pollRotation()
+    const intervalId = setInterval(pollRotation, BURST_SYNC_POLL_MS)
     return () => {
       cancelled = true
-      clearTimeout(retryTimer)
-      clearInterval(fallbackTimer)
-      ws?.close()
+      clearInterval(intervalId)
     }
   }, [iid])
 
-  const periodS = timeline?.dominant_period_s ?? rotation?.period_s ?? null
-  const icaos = Array.isArray(timeline?.icaos) ? timeline.icaos : []
-  const periodUs = periodS != null ? periodS * 1_000_000 : null
-  const sortedIcaos = useMemo(() => [...icaos].sort((a, b) => {
-    if ((b.arrivals_us?.length ?? 0) !== (a.arrivals_us?.length ?? 0)) {
-      return (b.arrivals_us?.length ?? 0) - (a.arrivals_us?.length ?? 0)
+  const observations = Array.isArray(burstTimeline?.observations) ? burstTimeline.observations : []
+  const syncState = burstTimeline?.sync_state ?? null
+  const loading = burstLoading || rotationLoading
+  const periodS = syncState?.period_s ?? rotation?.period_s ?? selectedRow?.period_s ?? null
+  const inlierCount = observations.filter(obs => obs.classification === 'inlier').length
+  const softCount = observations.filter(obs => obs.classification === 'soft').length
+  const rejectedCount = observations.filter(obs => obs.classification === 'rejected').length
+  const sortedIcaos = useMemo(() => {
+    const counts = new Map()
+    for (const obs of observations) {
+      if (!obs?.icao) continue
+      counts.set(obs.icao, (counts.get(obs.icao) ?? 0) + 1)
     }
-    return a.icao.localeCompare(b.icao)
-  }), [icaos])
-
-  if (iid == null) {
-    return (
-      <section className={styles.card}>
-        <div className={styles.cardHeader}>
-          <div>
-            <div className={styles.cardTitle}>Cycle Alignment</div>
-            <div className={styles.sectionLead}>
-              Select an IID to compare ICAO reply timings against the detected cycle.
-            </div>
-          </div>
-        </div>
-        <div className={styles.empty}>Choose an IID from the selector above.</div>
-      </section>
-    )
-  }
-
-  const chartW = 980
-  const rowH = 18
-  const padL = 120
-  const padR = 24
-  const padT = 44
-  const padB = 26
-  const plotW = chartW - padL - padR
-  const chartH = padT + padB + Math.max(sortedIcaos.length, 1) * rowH
-  const minWindowUs = 60 * 1_000_000
-  const visibleSpanUs = Math.max(minWindowUs, periodUs * 6)
-  const gridCount = Math.max(1, Math.ceil(visibleSpanUs / periodUs))
-
-  function relUsToX(relUs) {
-    return padL + (relUs / visibleSpanUs) * plotW
-  }
-
-  function classColor(classification, selected) {
-    switch (classification) {
-      case 'primary': return '#58a6ff'
-      case 'primary_harmonic': return '#3fb950'
-      case 'residual': return '#ff7b72'
-      default: return selected ? '#ffd166' : '#8b949e'
-    }
-  }
+    return [...counts.entries()]
+      .map(([icao, count]) => ({ icao, count }))
+      .sort((a, b) => (b.count - a.count) || a.icao.localeCompare(b.icao))
+  }, [observations])
+  const filteredObservations = selectedIcao
+    ? observations.filter(obs => obs.icao === selectedIcao)
+    : observations
 
   async function handleReset() {
     if (iid == null || resetting) return
     setResetting(true)
     try {
       await resetIid(iid)
-      setTimeline(null)
       setRotation(null)
-      timelineCacheRef.current.delete(iid)
       rotationCacheRef.current.delete(iid)
       onSelectIcao(null)
       setRefOverride(null)
       setRefOverrideSent(false)
-    } catch {}
-    setResetting(false)
+    } catch {
+    } finally {
+      setResetting(false)
+    }
   }
 
   async function handleSetRefOverride(icao) {
@@ -1847,15 +1793,60 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
     } catch {}
   }
 
+  if (iid == null) {
+    return (
+      <section className={styles.card}>
+        <div className={styles.cardHeader}>
+          <div>
+            <div className={styles.cardTitle}>Burst Sync Alignment</div>
+            <div className={styles.sectionLead}>
+              Select an IID to inspect burst-centre residuals against the maintained sync model.
+            </div>
+          </div>
+        </div>
+        <div className={styles.empty}>Choose an IID from the selector above.</div>
+      </section>
+    )
+  }
+
+  const chartW = 980
+  const chartH = 340
+  const padL = 58
+  const padR = 26
+  const padT = 24
+  const padB = 40
+  const plotW = chartW - padL - padR
+  const plotH = chartH - padT - padB
+  const firstUs = filteredObservations[0]?.beam_center_us ?? null
+  const lastUs = filteredObservations[filteredObservations.length - 1]?.beam_center_us ?? null
+  const spanUs = firstUs != null && lastUs != null ? Math.max(1, lastUs - firstUs) : 1
+  const maxAbsResidual = filteredObservations.reduce((max, obs) => {
+    const value = Math.abs(Number(obs?.residual_deg ?? 0))
+    return Number.isFinite(value) ? Math.max(max, value) : max
+  }, 0)
+  const jitterDeg = Number(syncState?.sync_jitter_deg)
+  const yAbs = Math.min(
+    180,
+    Math.max(45, maxAbsResidual * 1.25, Number.isFinite(jitterDeg) ? jitterDeg * 4 : 0),
+  )
+
+  function obsToX(obs) {
+    return padL + ((obs.beam_center_us - firstUs) / spanUs) * plotW
+  }
+
+  function residualToY(residualDeg) {
+    return padT + ((yAbs - residualDeg) / (2 * yAbs)) * plotH
+  }
+
   return (
     <section className={styles.card} data-panel="rotation-alignment">
       <div className={styles.cardHeader}>
-          <div>
-            <div className={styles.cardTitle}>Cycle Alignment</div>
-            <div className={styles.sectionLead}>
-            Each row starts at that ICAO&apos;s first observed reply. Use readiness to judge whether the displayed primary period is established or still provisional under sparse traffic.
-            </div>
+        <div>
+          <div className={styles.cardTitle}>Burst Sync Alignment</div>
+          <div className={styles.sectionLead}>
+            Burst-centre residuals against the maintained sync model. Inliers support sync, soft points are weakly consistent, and rejected points are outliers.
           </div>
+        </div>
         <div className={styles.metricRow}>
           <span className={styles.metricPill}>
             IID{' '}
@@ -1890,13 +1881,17 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
           <span className={styles.metricPill}>
             Period <span className={styles.metricValue}>{periodS != null ? `${periodS.toFixed(4)}s` : '—'}</span>
           </span>
-          {(selectedRow?.period_std_s != null || rotation?.period_std_s != null) && (
-            <span className={styles.metricPill} title="Standard deviation of the detected period across sweeps">
-              Period σ <span className={styles.metricValue}>
-                ±{((selectedRow?.period_std_s ?? rotation?.period_std_s) * 1000).toFixed(1)}ms
-              </span>
+          <span className={styles.metricPill}>
+            Jitter <span className={styles.metricValue}>
+              {syncState?.sync_jitter_deg != null ? `±${syncState.sync_jitter_deg.toFixed(1)}°` : '—'}
             </span>
-          )}
+          </span>
+          <span className={styles.metricPill}>
+            Obs <span className={styles.metricValue}>{observations.length}</span>
+          </span>
+          <span className={styles.metricPill}>
+            Refresh <span className={styles.metricValue}>{loading ? 'updating' : '1.5s poll'}</span>
+          </span>
           <span className={styles.metricPill} title="Set reference aircraft for next FM run">
             Ref A/C
             <select
@@ -1919,12 +1914,9 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
             </select>
             {refOverrideSent && refOverride && <span style={{ color: '#d29922', marginLeft: '3px' }}>⚑</span>}
           </span>
-          <span className={styles.metricPill}>
-            Refresh <span className={styles.metricValue}>{loading ? 'updating' : 'live'}</span>
-          </span>
-          <span className={styles.legendChip}><span className={styles.legendDotPrimary} />Primary</span>
-          <span className={styles.legendChip}><span className={styles.legendDotHarmonic} />Primary harmonic</span>
-          <span className={styles.legendChip}><span className={styles.legendDotResidual} />Residual</span>
+          <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#3fb950' }} />Inlier</span>
+          <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#d29922' }} />Soft</span>
+          <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#ff7b72' }} />Rejected</span>
           <button
             type="button"
             className={styles.resetButton}
@@ -1936,101 +1928,129 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
         </div>
       </div>
 
-      {periodUs == null || sortedIcaos.length === 0 ? (
-        <div className={styles.empty}>No cycle-alignment data yet for this IID.</div>
+      {observations.length === 0 ? (
+        <div className={styles.empty}>No burst-sync observations yet for this IID.</div>
       ) : (
-        <div className={styles.alignmentWrap}>
-          <svg
-            width={chartW}
-            height={chartH}
-            viewBox={`0 0 ${chartW} ${chartH}`}
-            className={styles.alignmentSvg}
-          >
-            {Array.from({ length: gridCount + 1 }, (_, idx) => {
-              const relUs = idx * periodUs
-              const x = relUsToX(relUs)
-              return (
-                <g key={idx}>
-                  <line
-                    x1={x}
-                    y1={padT - 10}
-                    x2={x}
-                    y2={chartH - padB}
-                    stroke={idx === 0 ? '#58a6ff66' : '#30363d'}
-                    strokeDasharray={idx === 0 ? '0' : '4 4'}
-                  />
-                  <text x={x} y={18} textAnchor="middle" className={styles.axisLabel}>
-                    {(idx * periodS).toFixed(1)}s
-                  </text>
-                </g>
-              )
-            })}
-
-            <text x={padL + plotW / 2} y={chartH - 6} textAnchor="middle" className={styles.axisLabel}>
-              Elapsed time since each ICAO&apos;s first observed reply
-            </text>
-
-            {sortedIcaos.map((entry, rowIdx) => {
-              const y = padT + rowIdx * rowH + rowH / 2
-              const arrivals = Array.isArray(entry.arrivals_us) ? entry.arrivals_us : []
-              const familySeries = Array.isArray(entry.family_series) && entry.family_series.length > 0
-                ? entry.family_series
-                : [{
-                    family: entry.classification ?? 'unclassified',
-                    arrivals_us: arrivals,
-                    multiplier: entry.multiplier,
-                  }]
-              const isSelected = selectedIcao === entry.icao
-
-              return (
-                <g key={entry.icao}>
-                  <rect
-                    x={padL}
-                    y={padT + rowIdx * rowH + 1}
-                    width={plotW}
-                    height={rowH - 2}
-                    fill={isSelected ? '#388bfd12' : rowIdx % 2 === 0 ? '#0f1720' : '#111820'}
-                    rx={3}
-                  />
-                  <text
-                    x={padL - 10}
-                    y={y + 4}
-                    textAnchor="end"
-                    className={styles.alignmentLabel}
-                    fill={isSelected ? '#ffd166' : '#c9d1d9'}
-                    onClick={() => onSelectIcao(entry.icao === selectedIcao ? null : entry.icao)}
+        <>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem', marginBottom: '0.7rem' }}>
+            <button
+              type="button"
+              className={styles.metricPill}
+              onClick={() => onSelectIcao(null)}
+              style={{
+                cursor: 'pointer',
+                background: selectedIcao == null ? '#388bfd22' : '#0f141b',
+                color: selectedIcao == null ? '#d2e4ff' : '#8b949e',
+              }}
+            >
+              All ICAOs ({observations.length})
+            </button>
+            {sortedIcaos.slice(0, 12).map(entry => (
+              <button
+                key={entry.icao}
+                type="button"
+                className={styles.metricPill}
+                onClick={() => onSelectIcao(selectedIcao === entry.icao ? null : entry.icao)}
+                style={{
+                  cursor: 'pointer',
+                  background: selectedIcao === entry.icao ? '#388bfd22' : '#0f141b',
+                  color: selectedIcao === entry.icao ? '#d2e4ff' : '#8b949e',
+                }}
+              >
+                <span style={{ fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{entry.icao}</span>
+                <span className={styles.metricValue}>{entry.count}</span>
+              </button>
+            ))}
+          </div>
+          <div className={styles.alignmentWrap}>
+            <svg
+              width={chartW}
+              height={chartH}
+              viewBox={`0 0 ${chartW} ${chartH}`}
+              className={styles.alignmentSvg}
+            >
+              {[1, 0.5, 0, -0.5, -1].map(f => {
+                const residual = yAbs * f
+                const y = residualToY(residual)
+                return (
+                  <g key={f}>
+                    <line
+                      x1={padL}
+                      y1={y}
+                      x2={chartW - padR}
+                      y2={y}
+                      stroke={residual === 0 ? '#58a6ff88' : '#30363d'}
+                      strokeDasharray={residual === 0 ? '0' : '4 4'}
+                    />
+                    <text x={padL - 8} y={y + 4} textAnchor="end" className={styles.axisLabel}>
+                      {residual.toFixed(0)}°
+                    </text>
+                  </g>
+                )
+              })}
+              {Number.isFinite(jitterDeg) && jitterDeg > 0 && (
+                <rect
+                  x={padL}
+                  y={residualToY(jitterDeg)}
+                  width={plotW}
+                  height={Math.max(1, residualToY(-jitterDeg) - residualToY(jitterDeg))}
+                  fill="rgba(63, 185, 80, 0.08)"
+                />
+              )}
+              {Array.from({ length: 7 }, (_, idx) => {
+                const x = padL + (idx / 6) * plotW
+                const relS = (spanUs * idx / 6) / 1_000_000
+                return (
+                  <g key={idx}>
+                    <line
+                      x1={x}
+                      y1={padT}
+                      x2={x}
+                      y2={chartH - padB}
+                      stroke="#21262d"
+                      strokeDasharray="3 5"
+                    />
+                    <text x={x} y={chartH - 10} textAnchor="middle" className={styles.axisLabel}>
+                      +{relS.toFixed(1)}s
+                    </text>
+                  </g>
+                )
+              })}
+              <text x={padL + plotW / 2} y={18} textAnchor="middle" className={styles.axisLabel}>
+                Burst-centre residual_deg by elapsed time in window
+              </text>
+              <text x={padL + plotW / 2} y={chartH - 4} textAnchor="middle" className={styles.axisLabel}>
+                Elapsed seconds from first burst-centre observation in window
+              </text>
+              {filteredObservations.map(obs => {
+                const x = obsToX(obs)
+                const y = residualToY(Number(obs.residual_deg ?? 0))
+                const weight = Number(obs.weight ?? 0)
+                const radius = Math.max(2.5, Math.min(5.2, 2.5 + weight * 2.2))
+                return (
+                  <circle
+                    key={`${obs.icao}-${obs.beam_center_us}-${obs.residual_deg}`}
+                    cx={x}
+                    cy={y}
+                    r={radius}
+                    fill={burstSyncClassColor(obs.classification)}
+                    opacity={0.9}
+                    stroke={selectedIcao === obs.icao ? '#ffd166' : 'none'}
+                    strokeWidth={selectedIcao === obs.icao ? 1.2 : 0}
                   >
-                    {entry.icao}  {arrivals.length}
-                  </text>
-                  {familySeries.map((series, seriesIdx) => {
-                    const seriesArrivals = Array.isArray(series.arrivals_us) ? series.arrivals_us : []
-                    const firstArrival = seriesArrivals.length > 0 ? seriesArrivals[0] : null
-                    const relArrivals = firstArrival == null
-                      ? []
-                      : seriesArrivals
-                          .map(arrival => arrival - firstArrival)
-                          .filter(relUs => relUs >= 0 && relUs <= visibleSpanUs)
-                    const pointColor = classColor(series.family, isSelected)
-                    const yOffset = series.family.startsWith('primary') ? -2 : 2
-
-                    return relArrivals.map((relUs, idx) => (
-                      <circle
-                        key={`${entry.icao}-${series.family}-${seriesIdx}-${idx}-${relUs}`}
-                        cx={relUsToX(relUs)}
-                        cy={y + yOffset}
-                        r={isSelected ? 4 : 3}
-                        fill={pointColor}
-                        opacity={0.9}
-                        stroke={isSelected ? '#ffd166' : 'none'}
-                        strokeWidth={isSelected ? 1.25 : 0}
-                      />
-                    ))
-                  })}
-                </g>
-              )
-            })}
-          </svg>
-        </div>
+                    <title>
+                      {`${obs.icao} residual ${Number(obs.residual_deg ?? 0).toFixed(2)}° | predicted ${Number(obs.predicted_deg ?? 0).toFixed(1)}° | replies ${obs.n_replies ?? 0}`}
+                    </title>
+                  </circle>
+                )
+              })}
+            </svg>
+          </div>
+          <div style={{ fontSize: '0.74rem', color: '#8b949e', marginTop: '0.5rem', textAlign: 'center' }}>
+            Inlier {inlierCount} · Soft {softCount} · Rejected {rejectedCount}
+            {syncState?.sync_jitter_deg != null ? ` · Sync jitter ±${syncState.sync_jitter_deg.toFixed(1)}°` : ''}
+          </div>
+        </>
       )}
     </section>
   )
@@ -2056,29 +2076,22 @@ function haversineNm(lat1, lon1, lat2, lon2) {
   return d / 1852
 }
 
-/**
- * Colour a radar-field dot by how early (blue) or late (red) the message
- * arrived relative to the sweep beam passing that bearing.
- *   delta > 0  →  dot bearing is ahead of beam at arrival time  →  early  →  blue
- *   delta < 0  →  beam had already passed the dot bearing       →  late   →  red
- */
-function sweepTimingColour(ev, beamAnchor, periodUs) {
-  if (beamAnchor == null || periodUs == null || ev.bearing_deg == null) return '#8b949e'
-  const beamAtArrival = (
-    (beamAnchor.ref_bearing_deg + ((ev.arrival_us - beamAnchor.ref_arrival_us) / periodUs) * 360) % 360 + 360
+function beamResidualAtTimestampDeg(bearingDeg, sampleUs, beamAnchor, periodUs) {
+  if (
+    beamAnchor == null
+    || periodUs == null
+    || !Number.isFinite(bearingDeg)
+    || !Number.isFinite(sampleUs)
+  ) {
+    return null
+  }
+  const beamAtSample = (
+    (beamAnchor.ref_bearing_deg + ((sampleUs - beamAnchor.ref_arrival_us) / periodUs) * 360) % 360 + 360
   ) % 360
-  // Normalise to (−180, +180]: positive = dot ahead of beam = early
-  const delta = ((ev.bearing_deg - beamAtArrival + 540) % 360) - 180
-  const maxDeg = 30  // ±30° maps to full saturation
-  const t = Math.max(-1, Math.min(1, delta / maxDeg))
-  const abs_t = Math.abs(t)
-  const hue = t >= 0 ? 213 : 3
-  const sat = Math.round(abs_t * 88)
-  const light = Math.round(55 + (1 - abs_t) * 10)
-  return `hsl(${hue},${sat}%,${light}%)`
+  return ((bearingDeg - beamAtSample + 540) % 360) - 180
 }
 
-const SYNC_STALE_US = 15_000_000  // 15 s without a DF11 → aircraft gone
+const SYNC_STALE_US = 15_000_000  // 15 s without burst-centre updates → re-evaluate anchor
 
 function ReceiverCentredRadarField({ iid, selectedRow }) {
   const canvasRef = useRef(null)
@@ -2089,7 +2102,7 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
   const beamAnchorRef = useRef(null)
   const lastDrawMsRef = useRef(0)
   const canvasSizeRef = useRef({ width: 0, height: 0 })
-  const lastSeenUsRef = useRef({})   // icao → latest DF11 arrival_us seen
+  const lastSeenUsRef = useRef({})   // icao → latest burst beam_center_us seen
   const [liveEnabled] = useState(true)
   const [syncOverrideIcao, setSyncOverrideIcao] = useState(null)
   const [displaySyncIcao, setDisplaySyncIcao] = useState(null)
@@ -2098,18 +2111,31 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
   const { data: fmLocationData } = useFmLocation(iid)
   const refInfo = useReferenceAircraft(iid)
   const receiverPos = useReceiverPosition()
+  const { data: burstTimeline, loading: burstLoading } = useBurstSyncTimeline(iid, BURST_SYNC_FIELD_WINDOW_S)
   const timingPacket = useTimingEventStream({ enabled: liveEnabled, iid, df11Only: true })
   const timingView = useTimingEventBuffer(timingPacket, RADAR_FIELD_PERSISTENCE_US, RADAR_FIELD_BUFFER_MAX)
+  const burstObservations = useMemo(() => {
+    const observations = Array.isArray(burstTimeline?.observations) ? burstTimeline.observations : []
+    return observations.filter(obs => (
+      Number.isFinite(obs?.beam_center_us)
+      && Number.isFinite(obs?.bearing_deg)
+      && Number.isFinite(obs?.range_nm)
+    ))
+  }, [burstTimeline?.observations])
+  const latestBurstUs = burstObservations.length > 0
+    ? Number(burstObservations[burstObservations.length - 1].beam_center_us)
+    : 0
 
   useEffect(() => {
     const packetNowUs = Number(timingView?.nowUs ?? 0)
+    const sourceNowUs = Math.max(packetNowUs, latestBurstUs)
     const wallNowMs = performance.now()
     const projectedDisplayNowUs = displayNowUsRef.current > 0
       ? displayNowUsRef.current + Math.max(0, wallNowMs - displayNowWallRef.current) * 1000
-      : packetNowUs
-    displayNowUsRef.current = Math.max(projectedDisplayNowUs, packetNowUs)
+      : sourceNowUs
+    displayNowUsRef.current = Math.max(projectedDisplayNowUs, sourceNowUs)
     displayNowWallRef.current = wallNowMs
-  }, [timingView?.nowUs])
+  }, [timingView?.nowUs, latestBurstUs])
 
   useEffect(() => {
     rangeAxisMaxRef.current = null
@@ -2137,31 +2163,28 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
   const period_s = beamAnchorRef.current?.period_s ?? latestFrame?.period_s ?? selectedRow?.period_s ?? null
   const fmPos = fmLocationData?.status === 'LOCALISED' ? fmLocationData : null
 
-  // Track the most recent DF11 arrival_us per ICAO across the live event buffer.
   useEffect(() => {
-    for (const ev of radarFieldEvents) {
-      if (ev.df !== 11 || ev.iid !== iid) continue
-      const prev = lastSeenUsRef.current[ev.icao] ?? 0
-      if (ev.arrival_us > prev) lastSeenUsRef.current[ev.icao] = ev.arrival_us
+    for (const obs of burstObservations) {
+      if (!obs?.icao) continue
+      const prev = lastSeenUsRef.current[obs.icao] ?? 0
+      if (obs.beam_center_us > prev) lastSeenUsRef.current[obs.icao] = obs.beam_center_us
     }
-  }, [radarFieldEvents, iid])
+  }, [burstObservations])
 
-  // Auto re-sync: when the current anchor ICAO hasn't been seen for SYNC_STALE_US, switch.
   useEffect(() => {
     const anchor = beamAnchorRef.current
     if (!anchor) return
-    const nowUs = Number(timingView?.nowUs ?? 0)
+    const nowUs = Math.max(Number(timingView?.nowUs ?? 0), latestBurstUs)
     if (nowUs === 0) return
     const lastSeen = lastSeenUsRef.current[anchor.ref_icao] ?? 0
     if (lastSeen === 0 || nowUs - lastSeen <= SYNC_STALE_US) return
-    // Find the best currently-visible replacement.
     const candidates = [preferredRefIcao, ...frames.map(f => f.ref_icao)].filter(Boolean)
     const newIcao = candidates.find(icao => (lastSeenUsRef.current[icao] ?? 0) > nowUs - SYNC_STALE_US) ?? null
     if (newIcao === anchor.ref_icao) return
     beamAnchorRef.current = null
     setSyncOverrideIcao(newIcao !== preferredRefIcao ? newIcao : null)
     setDisplaySyncIcao(null)
-  }, [timingView?.nowUs, preferredRefIcao, frames])
+  }, [timingView?.nowUs, latestBurstUs, preferredRefIcao, frames])
 
   useEffect(() => {
     if (!fmPos || !latestFrame) {
@@ -2200,8 +2223,7 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
   function handleResetSync() {
     beamAnchorRef.current = null
     setDisplaySyncIcao(null)
-    // Immediately pick the best visible ICAO rather than waiting for auto-detection.
-    const nowUs = Number(timingView?.nowUs ?? 0)
+    const nowUs = Math.max(Number(timingView?.nowUs ?? 0), latestBurstUs)
     if (nowUs > 0) {
       const candidates = [preferredRefIcao, ...frames.map(f => f.ref_icao)].filter(Boolean)
       const newIcao = candidates.find(icao => (lastSeenUsRef.current[icao] ?? 0) > nowUs - SYNC_STALE_US) ?? null
@@ -2216,8 +2238,7 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
     const draw = () => {
       rafRef.current = requestAnimationFrame(draw)
       const canvas = canvasRef.current
-      if (!canvas) return
-      if (document.hidden) return
+      if (!canvas || document.hidden) return
       const frameNowMs = performance.now()
       if ((frameNowMs - lastDrawMsRef.current) < 50) return
       lastDrawMsRef.current = frameNowMs
@@ -2229,18 +2250,23 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
         canvas.height = height
         canvasSizeRef.current = { width, height }
       }
+
       const ctx = canvas.getContext('2d')
       const interpUs = Math.max(0, frameNowMs - displayNowWallRef.current) * 1000
       const liveClockUs = Math.max(0, displayNowUsRef.current + interpUs)
       const renderNowUs = Math.max(0, liveClockUs - MESSAGE_FIELD_RENDER_HOLDBACK_US)
-      const cutoffUs = Math.max(0, renderNowUs - RADAR_FIELD_PERSISTENCE_US)
-      const events = []
+      const rawCutoffUs = Math.max(0, renderNowUs - RADAR_FIELD_PERSISTENCE_US)
+      const syncCutoffUs = Math.max(0, renderNowUs - BURST_SYNC_FIELD_WINDOW_S * 1_000_000)
+      const rawEvents = []
       for (let index = radarFieldEvents.length - 1; index >= 0; index -= 1) {
         const ev = radarFieldEvents[index]
         if (ev.arrival_us > renderNowUs) continue
-        if (ev.arrival_us < cutoffUs) break
-        events.push(ev)
+        if (ev.arrival_us < rawCutoffUs) break
+        rawEvents.push(ev)
       }
+      const syncEvents = burstObservations.filter(obs => (
+        obs.beam_center_us <= renderNowUs && obs.beam_center_us >= syncCutoffUs
+      ))
 
       ctx.fillStyle = '#0b0c10'
       ctx.fillRect(0, 0, width, height)
@@ -2258,7 +2284,9 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
       ctx.fillStyle = '#8b949e'
       ctx.font = '10px monospace'
 
-      const targetRangeMax = Math.max(50, Math.max(1, ...events.map(ev => ev.range_nm ?? 0)) * RADAR_FIELD_AXIS_HEADROOM)
+      const rawMaxRange = rawEvents.reduce((max, ev) => Math.max(max, ev.range_nm ?? 0), 0)
+      const syncMaxRange = syncEvents.reduce((max, obs) => Math.max(max, obs.range_nm ?? 0), 0)
+      const targetRangeMax = Math.max(50, Math.max(rawMaxRange, syncMaxRange, 1) * RADAR_FIELD_AXIS_HEADROOM)
       const nextRangeState = smoothAxisMax(targetRangeMax, rangeAxisMaxRef.current, frameNowMs)
       rangeAxisMaxRef.current = nextRangeState
       const maxRangeNm = nextRangeState.value
@@ -2288,7 +2316,13 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
       const periodUs = beamAnchor?.period_s != null && beamAnchor.period_s > 0
         ? beamAnchor.period_s * 1_000_000
         : null
-      if (fmPos && receiverPos && Number.isFinite(receiverPos.lat) && Number.isFinite(receiverPos.lon)) {
+      const hasRadarOrigin = (
+        fmPos
+        && receiverPos
+        && Number.isFinite(receiverPos.lat)
+        && Number.isFinite(receiverPos.lon)
+      )
+      if (hasRadarOrigin) {
         const radarBearingDeg = bearing(receiverPos.lat, receiverPos.lon, fmPos.lat, fmPos.lon)
         const radarRangeNm = haversineNm(receiverPos.lat, receiverPos.lon, fmPos.lat, fmPos.lon)
         const radarTheta = (radarBearingDeg - 90) * Math.PI / 180
@@ -2297,7 +2331,6 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
           x: cx + Math.cos(radarTheta) * radarRadius,
           y: cy + Math.sin(radarTheta) * radarRadius,
         }
-
         if (beamAnchor?.ref_bearing_deg != null && beamAnchor?.ref_arrival_us != null && periodUs != null && renderNowUs > 0) {
           const sweepTurns = ((renderNowUs - beamAnchor.ref_arrival_us) / periodUs) % 1
           const normalizedTurns = (sweepTurns + 1) % 1
@@ -2334,17 +2367,44 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
         ctx.stroke()
       }
 
-      for (const ev of events) {
+      for (const ev of rawEvents) {
         const r = (ev.range_nm / Math.max(1e-6, maxRangeNm)) * radius
         const theta = (ev.bearing_deg - 90) * Math.PI / 180
         const x = cx + Math.cos(theta) * r
         const y = cy + Math.sin(theta) * r
         const ageRatio = (renderNowUs - ev.arrival_us) / Math.max(1, RADAR_FIELD_PERSISTENCE_US)
-        const alpha = 0.18 + (1 - Math.min(1, ageRatio)) * 0.8
-        ctx.fillStyle = sweepTimingColour(ev, beamAnchor, periodUs)
+        const alpha = 0.05 + (1 - Math.min(1, ageRatio)) * 0.22
+        ctx.fillStyle = '#8b949e'
         ctx.globalAlpha = alpha
-        const size = ev.msg_len >= 14 ? 3.5 : 2.5
+        const size = ev.msg_len >= 14 ? 2.6 : 2.0
         ctx.fillRect(x - size / 2, y - size / 2, size, size)
+        ctx.globalAlpha = 1
+      }
+
+      const burstOrigin = hasRadarOrigin ? beamOrigin : { x: cx, y: cy }
+      for (const obs of syncEvents) {
+        const r = (obs.range_nm / Math.max(1e-6, maxRangeNm)) * radius
+        const theta = (obs.bearing_deg - 90) * Math.PI / 180
+        const x = burstOrigin.x + Math.cos(theta) * r
+        const y = burstOrigin.y + Math.sin(theta) * r
+        const ageRatio = (renderNowUs - obs.beam_center_us) / Math.max(1, BURST_SYNC_FIELD_WINDOW_S * 1_000_000)
+        const alpha = 0.35 + (1 - Math.min(1, ageRatio)) * 0.6
+        const pointRadius = 3.6 + Math.min(1.6, Number(obs.n_replies ?? 1) / 5)
+        ctx.beginPath()
+        ctx.arc(x, y, pointRadius, 0, Math.PI * 2)
+        ctx.fillStyle = burstSyncClassColor(obs.classification)
+        ctx.globalAlpha = alpha
+        ctx.fill()
+
+        const beamResidual = beamResidualAtTimestampDeg(obs.bearing_deg, obs.beam_center_us, beamAnchor, periodUs)
+        if (beamResidual != null) {
+          const strength = Math.min(0.9, Math.max(0.2, Math.abs(beamResidual) / 35))
+          ctx.strokeStyle = beamResidual >= 0
+            ? `rgba(88,166,255,${strength})`
+            : `rgba(255,123,114,${strength})`
+          ctx.lineWidth = 1.1
+          ctx.stroke()
+        }
         ctx.globalAlpha = 1
       }
 
@@ -2353,7 +2413,7 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
       ctx.fillStyle = '#58a6ff'
       ctx.fill()
 
-      if (fmPos && receiverPos) {
+      if (hasRadarOrigin) {
         ctx.beginPath()
         ctx.arc(beamOrigin.x, beamOrigin.y, 4.5, 0, Math.PI * 2)
         ctx.fillStyle = '#d29922'
@@ -2363,9 +2423,9 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
       ctx.textAlign = 'left'
       ctx.textBaseline = 'alphabetic'
       ctx.fillStyle = '#8b949e'
-      ctx.fillText('Receiver-centred DF11 field', left, height - 12)
+      ctx.fillText('Burst-centre sync field (primary) + raw DF11 context (secondary)', left, height - 12)
       ctx.textAlign = 'right'
-      ctx.fillText(`${events.length} points`, width - 12, height - 12)
+      ctx.fillText(`${syncEvents.length} burst obs · ${rawEvents.length} raw msgs`, width - 12, height - 12)
     }
 
     rafRef.current = requestAnimationFrame(draw)
@@ -2373,22 +2433,28 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
       if (rafRef.current) cancelAnimationFrame(rafRef.current)
     }
   }, [
+    burstObservations,
     fmPos?.lat,
     fmPos?.lon,
     iid,
     latestFrame?.frame_index,
     period_s,
     preferredRefIcao,
+    radarFieldEvents,
     receiverPos?.lat,
     receiverPos?.lon,
-    radarFieldEvents,
   ])
 
   const syncLabel = displaySyncIcao
-    ? <span style={{ fontFamily: 'SFMono-Regular, Consolas, monospace', color: '#58a6ff', marginLeft: '0.6rem', fontSize: '0.82rem' }}>
+    ? (
+      <span style={{ fontFamily: 'SFMono-Regular, Consolas, monospace', color: '#58a6ff', marginLeft: '0.6rem', fontSize: '0.82rem' }}>
         sync: {displaySyncIcao}
       </span>
+    )
     : null
+  const inlierCount = burstObservations.filter(obs => obs.classification === 'inlier').length
+  const softCount = burstObservations.filter(obs => obs.classification === 'soft').length
+  const rejectedCount = burstObservations.filter(obs => obs.classification === 'rejected').length
 
   return (
     <section className={styles.card}>
@@ -2398,17 +2464,35 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
             Position Verification{syncLabel}
           </div>
           <div className={styles.sectionLead}>
-            DF11 arrivals for the selected IID on a receiver-centred polar bearing/range field, with about 3 s persistence.
-            {' '}The beam is projected from the solved radar position into that field.
+            Burst-centre observations are the primary sync checks on this receiver-centred field.
+            {' '}Raw DF11 arrivals remain as faint secondary context only.
           </div>
         </div>
-        <button
-          className={styles.btn}
-          onClick={handleResetSync}
-          title="Re-assess which aircraft to use for beam synchronisation"
-        >
-          Reset Sync
-        </button>
+        <div className={styles.metricRow}>
+          <span className={styles.metricPill}>
+            Burst obs <span className={styles.metricValue}>{burstObservations.length}</span>
+          </span>
+          <span className={styles.metricPill}>
+            Inlier <span className={styles.metricValue}>{inlierCount}</span>
+          </span>
+          <span className={styles.metricPill}>
+            Soft <span className={styles.metricValue}>{softCount}</span>
+          </span>
+          <span className={styles.metricPill}>
+            Rejected <span className={styles.metricValue}>{rejectedCount}</span>
+          </span>
+          <span className={styles.metricPill}>
+            Refresh <span className={styles.metricValue}>{burstLoading ? 'updating' : '1.5s poll'}</span>
+          </span>
+          <button
+            type="button"
+            className={styles.actionButton}
+            onClick={handleResetSync}
+            title="Re-assess which aircraft to use for beam synchronisation"
+          >
+            Reset Sync
+          </button>
+        </div>
       </div>
       <div style={{ display: 'flex', justifyContent: 'center', padding: '0.5rem 0' }}>
         <canvas
@@ -2418,9 +2502,16 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
           style={{ borderRadius: '4px', background: '#0b0c10', width: '100%', maxWidth: '720px', aspectRatio: '1 / 1' }}
         />
       </div>
+      <div style={{ display: 'flex', justifyContent: 'center', gap: '0.45rem', flexWrap: 'wrap', marginTop: '0.25rem' }}>
+        <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#3fb950' }} />Burst inlier</span>
+        <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#d29922' }} />Burst soft</span>
+        <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#ff7b72' }} />Burst rejected</span>
+        <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#8b949e', opacity: 0.45 }} />Raw messages</span>
+      </div>
       <div style={{ fontSize: '0.72rem', color: '#8b949e', textAlign: 'center', marginTop: '0.25rem' }}>
         Receiver shown in blue. {fmPos ? 'Solved radar shown in amber.' : 'Run FM to project the radar beam origin.'}
-        {' '}Beam rotation uses the latest good sweep frame and measured period when available.
+        {' '}Burst points are beam-checked at their own `beam_center_us` timestamps.
+        {!fmPos ? ' Without FM, burst geometry is shown receiver-centred as fallback.' : ''}
       </div>
     </section>
   )
