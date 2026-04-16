@@ -1778,8 +1778,10 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
   }, [iid])
 
   useEffect(() => {
-    if (iid == null) {
-      setLegacyTimeline(null)
+    // Only poll the legacy timeline when the legacy alignment view is active.
+    // This endpoint is expensive on the backend and the default view
+    // (burst-sync residuals) does not use it.
+    if (iid == null || alignmentMode !== BURST_SYNC_VIEW_MODE_LEGACY) {
       setLegacyLoading(false)
       return
     }
@@ -1808,7 +1810,7 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
       cancelled = true
       clearInterval(intervalId)
     }
-  }, [iid])
+  }, [iid, alignmentMode])
 
   const observations = Array.isArray(burstTimeline?.observations) ? burstTimeline.observations : []
   const legacyIcaosRaw = Array.isArray(legacyTimeline?.icaos) ? legacyTimeline.icaos : []

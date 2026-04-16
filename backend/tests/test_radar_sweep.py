@@ -1302,3 +1302,83 @@ def test_lookup_adsb_position_does_not_project_beyond_vector_window():
     pos = state._lookup_adsb_position("AAAAAA", 1004.5)
 
     assert pos is None
+
+
+# ---------------------------------------------------------------------------
+# FM mailbox semantics — frame finalisation must hand work off to the worker
+# rather than invoking the legacy callback inline.
+# ---------------------------------------------------------------------------
+
+def _seed_live_frame(state: RadarState, iid: int, *, n_observations: int) -> None:
+    """Helper: install a LiveFrameState with enough observations to finalise."""
+    from radar.models import SweepFrameObservation
+    state._ensure_live_builder_state(iid)
+    state._live_frames[iid] = LiveFrameState(
+        ref_icao="AAAAAA",
+        ref_lat=51.0,
+        ref_lon=-1.0,
+        ref_arrival_us=0.0,
+        seen_icaos={"AAAAAA"},
+    )
+    for i in range(n_observations):
+        state._live_frames[iid].observations.append(
+            SweepFrameObservation(
+                icao=f"OBS{i:03d}",
+                lat=51.0 + i * 0.01,
+                lon=-1.0 + i * 0.01,
+                arrival_us=1000.0 * (i + 1),
+            )
+        )
+
+
+def test_finalize_live_frame_enqueues_fm_mailbox_instead_of_inline_callback():
+    state = RadarState()
+    _seed_live_frame(state, iid=41, n_observations=3)  # 4 aircraft → "good"
+
+    callback_invocations: list = []
+    state.per_frame_solve_callback = lambda *args, **kw: callback_invocations.append(args)
+
+    metrics = state._finalize_live_frame(41, period_s=4.0)
+
+    # Legacy callback must NOT be invoked inline any more.
+    assert callback_invocations == []
+    # Mailbox must hold the frame for the worker.
+    pending = state.claim_pending_fm_frames()
+    assert len(pending) == 1
+    enq_iid, enq_frame, enq_period = pending[0]
+    assert enq_iid == 41
+    assert enq_frame.quality == "good"
+    assert enq_period == 4.0
+    # Metrics still report a single handoff.
+    assert metrics["fm_callback_count"] == 1
+
+
+def test_fm_mailbox_latest_frame_wins_for_same_iid():
+    state = RadarState()
+
+    _seed_live_frame(state, iid=42, n_observations=3)
+    state._finalize_live_frame(42, period_s=4.0)
+
+    _seed_live_frame(state, iid=42, n_observations=4)  # 5 aircraft
+    state._finalize_live_frame(42, period_s=4.5)
+
+    pending = state.claim_pending_fm_frames()
+    assert len(pending) == 1  # same IID coalesced
+    _iid, frame, period_s = pending[0]
+    assert period_s == 4.5
+    assert len(frame.observations) == 4
+    # Mailbox cleared on claim.
+    assert state.claim_pending_fm_frames() == []
+
+
+def test_fm_mailbox_preserves_distinct_iids():
+    state = RadarState()
+    _seed_live_frame(state, iid=50, n_observations=3)
+    state._finalize_live_frame(50, period_s=4.0)
+    _seed_live_frame(state, iid=51, n_observations=3)
+    state._finalize_live_frame(51, period_s=5.0)
+
+    pending = {iid: (frame, period_s) for iid, frame, period_s in state.claim_pending_fm_frames()}
+    assert set(pending.keys()) == {50, 51}
+    assert pending[50][1] == 4.0
+    assert pending[51][1] == 5.0

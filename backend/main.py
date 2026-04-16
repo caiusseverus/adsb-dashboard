@@ -99,22 +99,52 @@ aircraft_localiser = AircraftLocaliser(
 # Wire live-path config into localiser
 aircraft_localiser._ray_retention_s = config.STAGE3_RAY_RETENTION_S
 
-# Register per-frame FM solve callback — runs on the Beast decoder thread after each
-# completed sweep frame.  Called outside RadarState._lock, so safe to call ForwardModel.
-def _register_per_frame_fm_callback() -> None:
+# FM solve runs on a dedicated worker thread that drains RadarState's per-IID
+# mailbox.  Keeping FM work off the radar worker thread prevents burst
+# processing from stalling when a solve is slow.  Latest-wins: a newer frame
+# for the same IID supersedes any unsolved older frame before the worker picks
+# it up, and at most one solve is in flight per IID at a time.
+_fm_worker_thread: threading.Thread | None = None
+_fm_worker_stop = threading.Event()
+
+
+def _start_fm_worker() -> threading.Thread | None:
     try:
         from radar.api import _get_fm
-        def _cb(iid: int, frame, period_s: float) -> None:
-            _get_fm().on_new_frame(
-                iid, frame, period_s,
-                getattr(config, "RECEIVER_LAT", None),
-                getattr(config, "RECEIVER_LON", None),
-            )
-        radar_state.per_frame_solve_callback = _cb
     except Exception:
-        log.exception("ForwardModel: failed to register per-frame callback")
+        log.exception("ForwardModel: worker failed to import _get_fm")
+        return None
 
-_register_per_frame_fm_callback()
+    def _run() -> None:
+        while not _fm_worker_stop.is_set():
+            # Block until there is work, with a short timeout so shutdown is responsive.
+            radar_state.wait_for_pending_fm_frames(timeout=0.5)
+            if _fm_worker_stop.is_set():
+                return
+            pending = radar_state.claim_pending_fm_frames()
+            if not pending:
+                continue
+            # Single-threaded worker: there is at most one solve in flight per
+            # IID because we process the claimed batch sequentially before
+            # re-draining.  Any frames arriving mid-solve overwrite the
+            # mailbox entry for that IID (latest wins) and are picked up on
+            # the next drain.
+            for iid, frame, period_s in pending:
+                try:
+                    _get_fm().on_new_frame(
+                        iid, frame, period_s,
+                        getattr(config, "RECEIVER_LAT", None),
+                        getattr(config, "RECEIVER_LON", None),
+                    )
+                except Exception:
+                    log.exception("fm-worker: solve failed for IID %d", iid)
+
+    t = threading.Thread(target=_run, daemon=True, name="fm-worker")
+    t.start()
+    return t
+
+
+_fm_worker_thread = _start_fm_worker()
 
 # Each connected WebSocket gets its own bounded send queue.
 # _push_updates enqueues the serialised payload and returns immediately;
@@ -1080,6 +1110,15 @@ async def _graceful_shutdown(bg_tasks: list) -> None:
     _radar_queue.put(_RADAR_SENTINEL)
     if _radar_thread is not None:
         _radar_thread.join(timeout=2.0)
+
+    log.info("Shutdown: stopping FM worker…")
+    _fm_worker_stop.set()
+    try:
+        radar_state._fm_mailbox_event.set()  # wake the worker immediately
+    except Exception:
+        pass
+    if _fm_worker_thread is not None:
+        _fm_worker_thread.join(timeout=2.0)
 
     log.info("Shutdown: closing in-progress visits…")
     try:

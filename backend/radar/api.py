@@ -1976,13 +1976,25 @@ def _build_frame_accumulation_summary(iid: int, model) -> dict:
         return {"n_estimates": 0, "centroid": None, "error_vs_manual_m": None}
 
 
+_FM_DIAG_CACHE_TTL_S = 3.0
+_fm_diag_cache: dict[int, tuple[float, dict]] = {}
+
+
 @router.get("/iids/{iid}/fm-diagnostics")
 async def get_iid_fm_diagnostics(iid: int):
     """Show the data funnel: how many burst centroids become usable SweepFrames.
 
     This answers: 'why is run_full_pipeline returning None?'
+
+    Result is cached per-IID for a few seconds because the underlying work
+    (build_sweep_frames + get_sweep_history) is expensive and the frontend
+    polls this endpoint repeatedly.
     """
     t0 = time.perf_counter()
+    cached = _fm_diag_cache.get(iid)
+    if cached is not None and (t0 - cached[0]) < _FM_DIAG_CACHE_TTL_S:
+        _record_api_timing("iid_fm_diagnostics", t0)
+        return cached[1]
     try:
         if _state is None:
             return {"iid": iid, "available": False, "reason": "radar module not initialised"}
@@ -2007,7 +2019,7 @@ async def get_iid_fm_diagnostics(iid: int):
         sweep_aircraft_counts = [s.get("n_aircraft", 0) for s in sweeps]
         max_aircraft = max(sweep_aircraft_counts) if sweep_aircraft_counts else 0
 
-        return {
+        payload = {
             "iid": iid,
             "available": True,
             "rotation_model": {
@@ -2060,6 +2072,8 @@ async def get_iid_fm_diagnostics(iid: int):
             },
             "frame_accumulation": _build_frame_accumulation_summary(iid, model),
         }
+        _fm_diag_cache[iid] = (time.perf_counter(), payload)
+        return payload
     finally:
         _record_api_timing("iid_fm_diagnostics", t0)
 

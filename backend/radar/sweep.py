@@ -1085,7 +1085,35 @@ class RadarState:
 
         # Injected at startup; called outside _lock for each completed good/marginal frame.
         # Signature: (iid: int, frame: SweepFrame, period_s: float) -> None
+        # Kept for backwards-compat / tests, but the hot path now uses the per-IID
+        # mailbox below rather than invoking this callback inline.
         self.per_frame_solve_callback = None
+
+        # Per-IID latest-frame mailbox: a background FM worker consumes frames
+        # from here so the radar worker thread is never blocked by FM solves.
+        # "Latest wins": a newer frame for the same IID overwrites an unsolved
+        # older frame — we only care about the most recent estimate.
+        self._fm_mailbox_lock = threading.Lock()
+        self._fm_mailbox: dict[int, tuple] = {}  # {iid: (frame, period_s)}
+        self._fm_mailbox_event = threading.Event()
+
+        # Per-IID throttle timestamps for _update_multi_aircraft_sync_state.
+        # Rolling-fit work is skipped if the last update fired recently; the
+        # observation buffer keeps growing in the meantime so the next update
+        # sees the full set.
+        self._MULTI_SYNC_UPDATE_MIN_INTERVAL_S = 0.25
+        self._last_multi_sync_update_ts: dict[int, float] = {}
+
+        # Per-IID rotation-analysis gating: (last event count, last run ts).
+        # update_rotation_models() uses these to skip _analyse_iid_events for
+        # IIDs whose event stream has not meaningfully grown since last run.
+        self._rotation_analysis_meta: dict[int, tuple[int, float]] = {}
+        # Upper bound on events passed to _analyse_iid_events for a single IID.
+        # Protects the rotation loop when a hot IID accumulates many events.
+        self._ROTATION_ANALYSIS_MAX_EVENTS_PER_IID = 4000
+        # Minimum new-event delta required to re-run analysis for an already
+        # established IID.  Lower deltas are deferred until the next cycle.
+        self._ROTATION_ANALYSIS_MIN_DELTA = 40
 
     # ------------------------------------------------------------------
     # Frame ingestion
@@ -1603,13 +1631,14 @@ class RadarState:
                 period_s=period_s,
             )
             self._live_completed_frames[iid].append(frame)
-            if self.per_frame_solve_callback is not None and quality in ("good", "marginal"):
+            if quality in ("good", "marginal"):
                 metrics["fm_callback_count"] += 1
                 t_fm_callback = time.perf_counter()
                 try:
-                    self.per_frame_solve_callback(iid, frame, period_s)
-                except Exception:
-                    pass  # never let FM errors affect the sweep builder
+                    # Non-blocking hand-off to the FM worker — latest frame wins.
+                    with self._fm_mailbox_lock:
+                        self._fm_mailbox[iid] = (frame, period_s)
+                    self._fm_mailbox_event.set()
                 finally:
                     metrics["fm_callback_ms"] += (time.perf_counter() - t_fm_callback) * 1000
 
@@ -1646,6 +1675,26 @@ class RadarState:
 
         self._live_frames[iid] = None
         return metrics
+
+    def claim_pending_fm_frames(self) -> list[tuple]:
+        """Atomically drain the per-IID FM mailbox.
+
+        Returns a list of (iid, frame, period_s) for each IID with a pending
+        frame at call time.  "Latest wins": each IID appears at most once, with
+        its most recent frame.  Clears the wake event.
+        """
+        with self._fm_mailbox_lock:
+            if not self._fm_mailbox:
+                self._fm_mailbox_event.clear()
+                return []
+            items = [(iid, frame, period_s) for iid, (frame, period_s) in self._fm_mailbox.items()]
+            self._fm_mailbox.clear()
+            self._fm_mailbox_event.clear()
+        return items
+
+    def wait_for_pending_fm_frames(self, timeout: float | None = None) -> bool:
+        """Block until the mailbox has pending frames, or timeout."""
+        return self._fm_mailbox_event.wait(timeout=timeout)
 
     def _update_live_sync_state_filtered(
         self,
@@ -1851,11 +1900,15 @@ class RadarState:
         )
         obs_buf.append(obs)
 
-        # Drive sync update immediately — sync is burst-driven, not frame-driven.
-        # _update_multi_aircraft_sync_state returns early if conditions are not met
-        # (no bootstrap yet, too few observations, single-aircraft coverage).
+        # Drive sync update — throttled per IID so repeated bursts do not trigger
+        # a rolling fit on every single arrival.  Observations keep accumulating
+        # in obs_buf, so the next update sees the full recent window.
         if period_s > 0.0:
-            self._update_multi_aircraft_sync_state(iid=iid, period_s=period_s)
+            now_mono = time.monotonic()
+            last = self._last_multi_sync_update_ts.get(iid, 0.0)
+            if (now_mono - last) >= self._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
+                self._last_multi_sync_update_ts[iid] = now_mono
+                self._update_multi_aircraft_sync_state(iid=iid, period_s=period_s)
 
     def _record_burst_sync_timeline_obs(
         self,
@@ -2720,9 +2773,31 @@ class RadarState:
             history_fetch_s = 0.0
             cache_build_s = 0.0
             unprocessed_iids: set[int] = set()
+            event_cap = self._ROTATION_ANALYSIS_MAX_EVENTS_PER_IID
+            min_delta = self._ROTATION_ANALYSIS_MIN_DELTA
             for index, iid in enumerate(ordered_iids):
                 evs = by_iid[iid]
-                analysed_models[iid] = _analyse_iid_events(evs)
+                prev_count, _prev_ts = self._rotation_analysis_meta.get(iid, (0, 0.0))
+                existing_model = self._models.get(iid)
+                # Skip reanalysis when the IID has an established model and the
+                # event delta since the last run is below threshold.  Newly-seen
+                # IIDs (no prev_count) and IIDs without a model always run.
+                if (
+                    existing_model is not None
+                    and existing_model.rotation_model is not None
+                    and prev_count > 0
+                    and (len(evs) - prev_count) < min_delta
+                ):
+                    continue
+                # Tail-slice hot IIDs so a single noisy stream cannot dominate
+                # the rotation update cycle.  The most recent events are the
+                # most relevant to the current rotation model anyway.
+                if event_cap > 0 and len(evs) > event_cap:
+                    evs_for_analysis = evs[-event_cap:]
+                else:
+                    evs_for_analysis = evs
+                analysed_models[iid] = _analyse_iid_events(evs_for_analysis)
+                self._rotation_analysis_meta[iid] = (len(evs), time.time())
                 if budget_s is not None and (time.perf_counter() - t_sweeps) >= budget_s:
                     unprocessed_iids.update(ordered_iids[index + 1:])
                     break

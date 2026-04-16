@@ -3693,3 +3693,43 @@ Current passive-radar state:
   - Result: `41 passed in 0.10s` on 2026-04-16.
   - `npm run build` in `frontend/`
   - Result: Vite production build succeeded on 2026-04-16.
+
+## 2026-04-16 — Radar hot-path performance rectification
+
+Goal: eliminate message drops and radar queue saturation caused by expensive FM/sweep work running inline on the radar worker thread.
+
+- [x] A+B. Per-IID FM mailbox in `RadarState`
+  - Replaced inline `per_frame_solve_callback(iid, frame, period_s)` in `_finalize_live_frame()` with a non-blocking enqueue into `RadarState._fm_mailbox: dict[int, (frame, period_s)]`.
+  - "Latest wins": newer frames overwrite unsolved older frames for the same IID, bounding backlog.
+  - New API: `claim_pending_fm_frames()` / `wait_for_pending_fm_frames(timeout)`.
+- [x] B. Dedicated FM worker thread in `main.py`
+  - `_start_fm_worker()` drains the mailbox, at most one solve in flight per IID.
+  - Wake via `threading.Event`; clean shutdown via `_fm_worker_stop`.
+- [x] C. Pragmatic cap on `update_rotation_models()`
+  - Per-IID tail-slice: `_ROTATION_ANALYSIS_MAX_EVENTS_PER_IID = 4000`.
+  - Per-IID event-delta gate: `_ROTATION_ANALYSIS_MIN_DELTA = 40` skips reanalysis if established model has not accumulated meaningful new evidence.
+  - Conservative — does not over-defer CHECK_MULTI; newly-seen IIDs always run.
+- [x] D. Throttle `_update_multi_aircraft_sync_state` per IID
+  - `_MULTI_SYNC_UPDATE_MIN_INTERVAL_S = 0.25`; observations keep accumulating in `_live_aligned_burst_obs` so throttled updates see the full window.
+- [x] E. Frontend polling gate
+  - `RadarPage.jsx`: legacy-timeline poll only runs when `alignmentMode === BURST_SYNC_VIEW_MODE_LEGACY`.
+- [x] F. Cache `iid_fm_diagnostics` (3s TTL)
+  - Avoids recomputing `build_sweep_frames` + `get_sweep_history` on every poll.
+
+### Tests
+- New regression tests in `test_radar_sweep.py`:
+  - `test_finalize_live_frame_enqueues_fm_mailbox_instead_of_inline_callback`
+  - `test_fm_mailbox_latest_frame_wins_for_same_iid`
+  - `test_fm_mailbox_preserves_distinct_iids`
+- Full suite: `291 passed in 1.49s`.
+
+### Perf validation checklist (manual, against `/api/debug/perf`)
+- [ ] `radar_fired_burst_phase_ms.fm_callback_avg` drops to near zero (was == `finalize_avg`).
+- [ ] `radar_fired_burst_phase_ms.finalize_avg` drops substantially.
+- [ ] `radar_worker_phase_ms.process_burst_avg` drops.
+- [ ] `radar_rotation_ms.sweep_build_avg` reduced; stable across cycles with hot IIDs.
+- [ ] `_radar_queue` depth falls, `_radar_drops` counter stable.
+- [ ] `_msg_queue` depth falls, `_msg_drops` counter stable.
+- [ ] FM solves still run (check `fm_last_run` timestamps under `/api/radar/iids/{iid}/fm-diagnostics`).
+- [ ] Burst-sync residual UI still responsive (250 ms throttle imperceptible).
+- [ ] Legacy timeline still renders when selected.
