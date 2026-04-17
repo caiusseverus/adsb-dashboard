@@ -1740,9 +1740,8 @@ function SyncDiagnosticsPanel({ syncState, waveformBins, perIcaoQuality, observa
   const valueStyle = { color: '#d2e4ff', fontFamily: 'SFMono-Regular, Consolas, monospace', marginLeft: '4px' }
 
   // Residual-vs-phase scatter and residual-vs-range scatter.
-  const phaseW = 360, phaseH = 90
-  const waveW = 360, waveH = 90
-  const rangeW = 360, rangeH = 90
+  const phaseW = 520, phaseH = 132
+  const rangeW = 520, rangeH = 132
   const phaseDots = []
   const rangeDots = []
   const absResiduals = []
@@ -1777,10 +1776,15 @@ function SyncDiagnosticsPanel({ syncState, waveformBins, perIcaoQuality, observa
         <span style={pillStyle}>Contributors<span style={valueStyle}>{syncState.contributing_icao_count ?? '—'}</span></span>
       </div>
 
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px', marginTop: '0.4rem' }}>
-        <div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '12px', marginTop: '0.4rem' }}>
+        <div style={{ minWidth: 0 }}>
           <div style={{ fontSize: '0.7rem', color: '#8b949e', marginBottom: '2px' }}>Residual vs phase-in-rotation</div>
-          <svg width={phaseW} height={phaseH} style={{ background: '#0f141b', border: '1px solid #30363d' }}>
+          <svg
+            width="100%"
+            height={phaseH}
+            viewBox={`0 0 ${phaseW} ${phaseH}`}
+            style={{ background: '#0f141b', border: '1px solid #30363d', display: 'block' }}
+          >
             <line x1={0} y1={phaseH / 2} x2={phaseW} y2={phaseH / 2} stroke="#58a6ff55" />
             {phaseDots.map((d, i) => (
               <circle key={i} cx={(d.phase / 360) * phaseW}
@@ -1803,9 +1807,14 @@ function SyncDiagnosticsPanel({ syncState, waveformBins, perIcaoQuality, observa
           </svg>
         </div>
 
-        <div>
+        <div style={{ minWidth: 0 }}>
           <div style={{ fontSize: '0.7rem', color: '#8b949e', marginBottom: '2px' }}>Residual vs range (corrected)</div>
-          <svg width={rangeW} height={rangeH} style={{ background: '#0f141b', border: '1px solid #30363d' }}>
+          <svg
+            width="100%"
+            height={rangeH}
+            viewBox={`0 0 ${rangeW} ${rangeH}`}
+            style={{ background: '#0f141b', border: '1px solid #30363d', display: 'block' }}
+          >
             <line x1={0} y1={rangeH / 2} x2={rangeW} y2={rangeH / 2} stroke="#58a6ff55" />
             {rangeDots.map((d, i) => (
               <circle key={i} cx={(d.r / maxRangeNm) * rangeW}
@@ -1819,9 +1828,9 @@ function SyncDiagnosticsPanel({ syncState, waveformBins, perIcaoQuality, observa
         </div>
 
         {Array.isArray(perIcaoQuality) && perIcaoQuality.length > 0 && (
-          <div style={{ maxHeight: '110px', overflow: 'auto', fontSize: '0.7rem' }}>
+          <div style={{ maxHeight: '150px', overflow: 'auto', fontSize: '0.72rem', minWidth: 0, border: '1px solid #30363d', background: '#0f141b' }}>
             <div style={{ color: '#8b949e', marginBottom: '2px' }}>Per-aircraft residual quality</div>
-            <table style={{ borderCollapse: 'collapse' }}>
+            <table style={{ borderCollapse: 'collapse', width: '100%' }}>
               <thead>
                 <tr style={{ color: '#8b949e' }}>
                   <th style={{ textAlign: 'left', padding: '0 6px' }}>icao</th>
@@ -1972,8 +1981,7 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
     if (!syncState || syncState.period_s == null || syncState.phase_epoch_us == null || syncState.phase_offset_deg == null) {
       return []
     }
-    const periodUs = Number(syncState.period_s) * 1_000_000
-    if (!Number.isFinite(periodUs) || periodUs <= 0) return []
+    const waveformBins = Array.isArray(burstTimeline?.waveform_bins) ? burstTimeline.waveform_bins : []
 
     const dots = []
     for (const ev of rawDf11Arrivals) {
@@ -1981,10 +1989,12 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
       const bearingDeg = Number(ev?.bearing_deg)
       if (!Number.isFinite(arrivalUs) || !Number.isFinite(bearingDeg)) continue
       if (selectedIcao && ev?.icao !== selectedIcao) continue
-      const predictedDeg = (
-        ((arrivalUs - Number(syncState.phase_epoch_us)) / periodUs) * 360
-        + Number(syncState.phase_offset_deg)
-      ) % 360
+      const prediction = predictBearingFromSyncModel(syncState, arrivalUs, {
+        rangeNm: Number(ev?.range_nm),
+        waveformBins,
+      })
+      if (!prediction) continue
+      const predictedDeg = prediction.predictedDeg
       const residualDeg = wrapSignedResidualDeg(bearingDeg, predictedDeg)
       const timingClass = classifyTimingResidual(residualDeg, BURST_SYNC_DF11_ON_TIME_THRESHOLD_DEG)
       dots.push({
@@ -1998,6 +2008,7 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
     }
     return dots
   }, [
+    burstTimeline?.waveform_bins,
     rawDf11Arrivals,
     selectedIcao,
     syncState,
@@ -2596,6 +2607,58 @@ function haversineNm(lat1, lon1, lat2, lon2) {
   return d / 1852
 }
 
+const US_PER_NM_LIGHT = (1852 / 299792458) * 1_000_000
+
+function computePropagationDelayUs(rangeNm) {
+  if (!Number.isFinite(rangeNm) || rangeNm <= 0) return 0
+  return rangeNm * US_PER_NM_LIGHT
+}
+
+function waveformBinIndex(phaseDeg, nBins) {
+  const phase = ((phaseDeg % 360) + 360) % 360
+  const width = 360 / nBins
+  let idx = Math.floor(phase / width)
+  if (idx < 0) idx = 0
+  if (idx >= nBins) idx = nBins - 1
+  return idx
+}
+
+function applyPhaseWaveformCorrection(waveformBins, phaseDeg, applied) {
+  if (!applied || !Array.isArray(waveformBins) || waveformBins.length === 0) return 0
+  const nBins = waveformBins.length
+  const idx = waveformBinIndex(phaseDeg, nBins)
+  const width = 360 / nBins
+  const centre = (idx + 0.5) * width
+  let delta = (((phaseDeg % 360) + 360) % 360) - centre
+  if (delta > width) delta -= 360
+  else if (delta < -width) delta += 360
+  const other = delta >= 0 ? (idx + 1) % nBins : (idx - 1 + nBins) % nBins
+  const frac = Math.abs(delta) / width
+  const a = Number(waveformBins[idx]?.correction_deg ?? 0)
+  const b = Number(waveformBins[other]?.correction_deg ?? 0)
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0
+  return ((1 - frac) * a) + (frac * b)
+}
+
+function predictBearingFromSyncModel(syncState, arrivalUs, { rangeNm = null, waveformBins = null } = {}) {
+  if (!syncState) return null
+  const periodUs = Number(syncState.period_s) * 1_000_000
+  const phaseEpochUs = Number(syncState.phase_epoch_us)
+  const phaseOffsetDeg = Number(syncState.phase_offset_deg)
+  if (!Number.isFinite(periodUs) || periodUs <= 0 || !Number.isFinite(phaseEpochUs) || !Number.isFinite(phaseOffsetDeg)) {
+    return null
+  }
+  const propDelayEnabled = Boolean(syncState.prop_delay_enabled)
+  const effectiveUs = propDelayEnabled ? (arrivalUs - computePropagationDelayUs(rangeNm)) : arrivalUs
+  const phaseInRotDeg = ((((effectiveUs - phaseEpochUs) / periodUs) * 360) % 360 + 360) % 360
+  let predictedDeg = (phaseInRotDeg + phaseOffsetDeg) % 360
+  if (Boolean(syncState.waveform_enabled) && Boolean(syncState.waveform_applied)) {
+    const corr = applyPhaseWaveformCorrection(waveformBins, phaseInRotDeg, true)
+    predictedDeg = (predictedDeg - corr + 360) % 360
+  }
+  return { predictedDeg, phaseInRotDeg }
+}
+
 function beamResidualAtTimestampDeg(bearingDeg, sampleUs, beamAnchor, periodUs) {
   if (
     beamAnchor == null
@@ -2628,6 +2691,7 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
   const [displaySyncIcao, setDisplaySyncIcao] = useState(null)
 
   const frameData = useSweepFrames(iid)
+  const { data: burstTimeline } = useBurstSyncTimeline(iid, BURST_SYNC_ALIGNMENT_WINDOW_S)
   const { data: fmLocationData } = useFmLocation(iid)
   const refInfo = useReferenceAircraft(iid)
   const receiverPos = useReceiverPosition()
@@ -2667,7 +2731,18 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
     const currentRefIcao = beamAnchorRef.current?.ref_icao
     return currentRefIcao ? f.ref_icao === currentRefIcao : true
   }) ?? [...frames].reverse().find(f => f.quality === 'good' || f.quality === 'marginal')
-  const period_s = beamAnchorRef.current?.period_s ?? latestFrame?.period_s ?? selectedRow?.period_s ?? null
+  const syncState = burstTimeline?.sync_state ?? null
+  const syncWaveformBins = Array.isArray(burstTimeline?.waveform_bins) ? burstTimeline.waveform_bins : []
+  const hasAuthoritativeSync = (
+    Boolean(syncState?.usable)
+    && Number.isFinite(Number(syncState?.period_s))
+    && Number(syncState?.period_s) > 0
+    && Number.isFinite(Number(syncState?.phase_epoch_us))
+    && Number.isFinite(Number(syncState?.phase_offset_deg))
+  )
+  const period_s = hasAuthoritativeSync
+    ? Number(syncState.period_s)
+    : (beamAnchorRef.current?.period_s ?? latestFrame?.period_s ?? selectedRow?.period_s ?? null)
   const fmPos = fmLocationData?.status === 'LOCALISED' ? fmLocationData : null
 
   useEffect(() => {
@@ -2679,6 +2754,7 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
   }, [radarFieldEvents, iid])
 
   useEffect(() => {
+    if (hasAuthoritativeSync) return
     const anchor = beamAnchorRef.current
     if (!anchor) return
     const nowUs = Number(timingView?.nowUs ?? 0)
@@ -2691,9 +2767,14 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
     beamAnchorRef.current = null
     setSyncOverrideIcao(newIcao !== preferredRefIcao ? newIcao : null)
     setDisplaySyncIcao(null)
-  }, [timingView?.nowUs, preferredRefIcao, frames])
+  }, [hasAuthoritativeSync, timingView?.nowUs, preferredRefIcao, frames])
 
   useEffect(() => {
+    if (hasAuthoritativeSync) {
+      beamAnchorRef.current = null
+      setDisplaySyncIcao(null)
+      return
+    }
     if (!fmPos || !latestFrame) {
       beamAnchorRef.current = null
       return
@@ -2716,6 +2797,7 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
       setDisplaySyncIcao(nextAnchor.ref_icao)
     }
   }, [
+    hasAuthoritativeSync,
     fmPos?.lat,
     fmPos?.lon,
     latestFrame?.frame_index,
@@ -2833,7 +2915,14 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
           x: cx + Math.cos(radarTheta) * radarRadius,
           y: cy + Math.sin(radarTheta) * radarRadius,
         }
-        if (beamAnchor?.ref_bearing_deg != null && beamAnchor?.ref_arrival_us != null && periodUs != null && renderNowUs > 0) {
+        if (hasAuthoritativeSync) {
+          const prediction = predictBearingFromSyncModel(syncState, renderNowUs, {
+            waveformBins: syncWaveformBins,
+          })
+          if (prediction) {
+            beamSweepDeg = prediction.predictedDeg
+          }
+        } else if (beamAnchor?.ref_bearing_deg != null && beamAnchor?.ref_arrival_us != null && periodUs != null && renderNowUs > 0) {
           const sweepTurns = ((renderNowUs - beamAnchor.ref_arrival_us) / periodUs) % 1
           const normalizedTurns = (sweepTurns + 1) % 1
           beamSweepDeg = (beamAnchor.ref_bearing_deg + normalizedTurns * 360.0) % 360.0
@@ -2876,7 +2965,15 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
         const y = cy + Math.sin(theta) * r
         const ageRatio = (renderNowUs - ev.arrival_us) / Math.max(1, RADAR_FIELD_PERSISTENCE_US)
         const alpha = 0.18 + (1 - Math.min(1, ageRatio)) * 0.8
-        const timingResidual = beamResidualAtTimestampDeg(ev.bearing_deg, ev.arrival_us, beamAnchor, periodUs)
+        const timingResidual = hasAuthoritativeSync
+          ? (() => {
+            const prediction = predictBearingFromSyncModel(syncState, ev.arrival_us, {
+              rangeNm: Number(ev?.range_nm),
+              waveformBins: syncWaveformBins,
+            })
+            return prediction ? wrapSignedResidualDeg(ev.bearing_deg, prediction.predictedDeg) : null
+          })()
+          : beamResidualAtTimestampDeg(ev.bearing_deg, ev.arrival_us, beamAnchor, periodUs)
         const timingClass = classifyTimingResidual(timingResidual, POSITION_VERIFICATION_ON_TIME_THRESHOLD_DEG)
         ctx.fillStyle = timingClassColor(timingClass)
         ctx.globalAlpha = alpha
@@ -2910,6 +3007,7 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
       if (rafRef.current) cancelAnimationFrame(rafRef.current)
     }
   }, [
+    hasAuthoritativeSync,
     fmPos?.lat,
     fmPos?.lon,
     iid,
@@ -2919,9 +3017,17 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
     radarFieldEvents,
     receiverPos?.lat,
     receiverPos?.lon,
+    syncState,
+    syncWaveformBins,
   ])
 
-  const syncLabel = displaySyncIcao
+  const syncLabel = hasAuthoritativeSync
+    ? (
+      <span style={{ color: '#3fb950', marginLeft: '0.6rem', fontSize: '0.82rem' }}>
+        sync: refined model
+      </span>
+    )
+    : displaySyncIcao
     ? (
       <span style={{ fontFamily: 'SFMono-Regular, Consolas, monospace', color: '#58a6ff', marginLeft: '0.6rem', fontSize: '0.82rem' }}>
         sync: {displaySyncIcao}
@@ -2952,11 +3058,14 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
           <span className={styles.metricPill}>
             Refresh <span className={styles.metricValue}>{timingView?.nowUs ? 'live stream' : 'connecting'}</span>
           </span>
+          <span className={styles.metricPill}>
+            Predictor <span className={styles.metricValue}>{hasAuthoritativeSync ? 'refined sync' : 'frame anchor'}</span>
+          </span>
           <button
             type="button"
             className={styles.actionButton}
             onClick={handleResetSync}
-            title="Re-assess which aircraft to use for beam synchronisation"
+            title="Re-assess the fallback frame-anchor synchronisation"
           >
             Reset Sync
           </button>

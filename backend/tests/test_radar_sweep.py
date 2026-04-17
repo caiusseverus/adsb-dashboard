@@ -12,8 +12,10 @@ from radar.sweep import _analyse_iid_events
 from radar.models import LiveFrameState, RadarIID, ReferenceAircraftInfo, RotationModel
 from radar.sweep import (
     AlignedBurstSyncObs,
+    IcaoSyncQuality,
     LiveSyncState,
     RadarState,
+    WaveformBin,
     _reinforce_radar_characteristics,
     detect_bursts,
     detect_bursts_with_signals,
@@ -172,14 +174,62 @@ def test_reset_iid_clears_in_memory_learning_state():
         10: RadarIID(iid=10, period_s=5.0, primary_support_count=4),
     }
     state._sweep_history = {9: deque([{"centroid_us": 1_000_000}]), 10: deque([{"centroid_us": 2_000_000}])}
+    state._last_multi_sync_update_ts = {9: 100.0, 10: 200.0}
+    state._live_waveform_bins = {
+        9: [WaveformBin(correction_deg=1.0, weight=2.0, n=3)],
+        10: [WaveformBin(correction_deg=0.5, weight=1.0, n=2)],
+    }
+    state._live_icao_sync_quality = {
+        9: {"AAAAAA": IcaoSyncQuality(residual_mad_deg=2.0)},
+        10: {"BBBBBB": IcaoSyncQuality(residual_mad_deg=1.0)},
+    }
 
     did_reset = state.reset_iid(9)
 
     assert did_reset is True
     assert 9 not in state._models
     assert 9 not in state._sweep_history
+    assert 9 not in state._last_multi_sync_update_ts
+    assert 9 not in state._live_waveform_bins
+    assert 9 not in state._live_icao_sync_quality
     assert all(event[1] != 9 for event in state._iid_events)
     assert 10 in state._models
+    assert 10 in state._last_multi_sync_update_ts
+    assert 10 in state._live_waveform_bins
+    assert 10 in state._live_icao_sync_quality
+
+
+def test_reset_all_clears_sync_refinement_state():
+    state = RadarState()
+    state._models = {7: RadarIID(iid=7, period_s=4.0, primary_support_count=6)}
+    state._iid_events = deque([(1_000_000, 7, "AAAAAA", None)])
+    state._last_multi_sync_update_ts = {7: 123.0}
+    state._live_waveform_bins = {7: [WaveformBin(correction_deg=1.5, weight=4.0, n=8)]}
+    state._live_icao_sync_quality = {7: {"AAAAAA": IcaoSyncQuality(residual_mad_deg=3.0)}}
+    state._live_sync_states = {
+        7: LiveSyncState(
+            iid=7,
+            period_s=4.0,
+            phase_epoch_us=0.0,
+            phase_offset_deg=0.0,
+            sync_quality=1.0,
+            sync_jitter_deg=2.0,
+            last_sync_update_ts=1000.0,
+            source="multi_aircraft_burst",
+            usable=True,
+        )
+    }
+
+    cleared = state.reset_all()
+
+    assert cleared["sync_states"] == 1
+    assert cleared["waveform_bins"] == 1
+    assert cleared["icao_sync_quality"] == 1
+    assert cleared["multi_sync_throttle"] == 1
+    assert state._live_sync_states == {}
+    assert state._live_waveform_bins == {}
+    assert state._live_icao_sync_quality == {}
+    assert state._last_multi_sync_update_ts == {}
 
 
 def test_detect_bursts_with_signals_refines_beam_center_toward_stronger_replies():
@@ -193,6 +243,9 @@ def test_detect_bursts_with_signals_refines_beam_center_toward_stronger_replies(
     burst = bursts[0]
     assert burst["centroid_us"] == 1_004_000
     assert burst["beam_center_method"] == "amplitude_weighted"
+    assert burst["beam_center_simple_us"] == pytest.approx(1_004_000)
+    assert burst["beam_center_weighted_us"] == pytest.approx(burst["beam_center_us"])
+    assert burst["beam_center_delta_us"] == pytest.approx(burst["beam_center_us"] - burst["beam_center_simple_us"])
     assert burst["beam_center_us"] > 1_004_000
     assert burst["beam_center_us"] < 1_005_000
 

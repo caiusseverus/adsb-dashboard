@@ -472,6 +472,11 @@ class AlignedBurstSyncObs:
     prop_delay_aircraft_to_receiver_us: float = 0.0
     prop_delay_radar_to_aircraft_us: float | None = None
     effective_arrival_us: float = 0.0
+    # Burst-centre estimator diagnostics.
+    burst_center_simple_us: float | None = None
+    burst_center_weighted_us: float | None = None
+    burst_center_delta_us: float | None = None
+    burst_center_method: str = "centroid"
 
 
 class AircraftPositionTracker:
@@ -588,6 +593,9 @@ def refine_burst_center(reply_samples: list[tuple[float, float | None]]) -> dict
         return {
             "beam_center_us": raw_centroid_us,
             "beam_center_method": "centroid",
+            "beam_center_simple_us": raw_centroid_us,
+            "beam_center_weighted_us": None,
+            "beam_center_delta_us": 0.0,
         }
 
     weight_sum = sum(weight for _arrival_us, weight in weighted_samples)
@@ -595,6 +603,9 @@ def refine_burst_center(reply_samples: list[tuple[float, float | None]]) -> dict
         return {
             "beam_center_us": raw_centroid_us,
             "beam_center_method": "centroid",
+            "beam_center_simple_us": raw_centroid_us,
+            "beam_center_weighted_us": None,
+            "beam_center_delta_us": 0.0,
         }
 
     weighted_center = (
@@ -603,6 +614,9 @@ def refine_burst_center(reply_samples: list[tuple[float, float | None]]) -> dict
     return {
         "beam_center_us": weighted_center,
         "beam_center_method": "amplitude_weighted",
+        "beam_center_simple_us": raw_centroid_us,
+        "beam_center_weighted_us": weighted_center,
+        "beam_center_delta_us": weighted_center - raw_centroid_us,
     }
 
 
@@ -685,6 +699,9 @@ def detect_bursts_with_signals(reply_samples: list[tuple[float, float | None]]) 
                 "signal_dbfs": round(sum(signals) / len(signals), 2) if signals else None,
                 "beam_center_us": refinement["beam_center_us"],
                 "beam_center_method": refinement["beam_center_method"],
+                "beam_center_simple_us": refinement.get("beam_center_simple_us"),
+                "beam_center_weighted_us": refinement.get("beam_center_weighted_us"),
+                "beam_center_delta_us": refinement.get("beam_center_delta_us"),
             }
         )
 
@@ -725,12 +742,12 @@ def analyse_icao(bursts: list[dict]) -> dict | None:
         for cluster in clusters:
             if len(cluster) < 2:
                 continue
-            cluster_med = round(statistics.median(cluster), 4)
+            cluster_med = statistics.median(cluster)
             series_candidates.append(
                 {
                     "period_s": cluster_med,
                     "n_intervals": len(cluster),
-                    "std_s": round(statistics.stdev(cluster), 6) if len(cluster) > 1 else 0.0,
+                    "std_s": statistics.stdev(cluster) if len(cluster) > 1 else 0.0,
                 }
             )
 
@@ -759,9 +776,9 @@ def analyse_icao(bursts: list[dict]) -> dict | None:
         "n_intervals": strongest["n_intervals"],
         "centroids_us": centroids,
         "median_period_s": strongest_period,
-        "mean_period_s": round(statistics.mean(filtered), 4),
+        "mean_period_s": statistics.mean(filtered),
         "std_s": strongest["std_s"],
-        "all_intervals_s": [round(iv, 4) for iv in intervals_s],
+        "all_intervals_s": list(intervals_s),
         "series_candidates": series_candidates,
         "avg_replies_per_burst": round(
             statistics.mean(b["n_replies"] for b in bursts), 1
@@ -785,7 +802,7 @@ def _snap_intervals(intervals_s: list[float], base_period: float,
         if abs(ratio - nearest) / nearest < tolerance:
             mult_counts[nearest] += 1
         else:
-            non_snapped.append(round(iv, 4))
+            non_snapped.append(iv)
 
     total = len(intervals_s)
     n_snapped = sum(mult_counts.values())
@@ -795,10 +812,10 @@ def _snap_intervals(intervals_s: list[float], base_period: float,
     implied_detect = n_snapped / total_sweeps if total_sweeps > 0 else 0.0
 
     return {
-        "snap_rate": round(snap_rate, 3),
+        "snap_rate": snap_rate,
         "mult_counts": dict(sorted(mult_counts.items())),
         "non_snapped": non_snapped,
-        "implied_detect": round(implied_detect, 3),
+        "implied_detect": implied_detect,
     }
 
 
@@ -843,7 +860,7 @@ def _evaluate_base_candidate(
                 best_error = error_sum
 
         coverage = len(best_sequence) / len(centroids_us) if centroids_us else 0.0
-        return best_sequence, round(coverage, 3)
+        return best_sequence, coverage
 
     for icao, result in icao_results.items():
         period = result["median_period_s"]
@@ -882,11 +899,11 @@ def _evaluate_base_candidate(
 
         if best_match is not None:
             nearest_int = best_match["nearest_int"]
-            detection_rate = round(1.0 / nearest_int, 3)
+            detection_rate = 1.0 / nearest_int
             folded[icao] = {
-                "raw_period_s": round(best_match["period_s"], 4),
+                "raw_period_s": best_match["period_s"],
                 "multiplier": nearest_int,
-                "folded_period_s": round(best_match["period_s"] / nearest_int, 4),
+                "folded_period_s": best_match["period_s"] / nearest_int,
                 "detection_rate": detection_rate,
                 "method": "median",
                 "snap_info": None,
@@ -896,7 +913,7 @@ def _evaluate_base_candidate(
             if nearest_int == 1:
                 direct_count += 1
         else:
-            residual[icao] = round(period, 4)
+            residual[icao] = period
 
     # Pass 2: interval-level snap check for residuals
     snap_threshold = 0.80
@@ -916,7 +933,7 @@ def _evaluate_base_candidate(
             folded[icao] = {
                 "raw_period_s": residual[icao],
                 "multiplier": dom_mult,
-                "folded_period_s": round(candidate, 4),
+                "folded_period_s": candidate,
                 "detection_rate": snap["implied_detect"],
                 "method": "interval",
                 "snap_info": snap,
@@ -932,11 +949,11 @@ def _evaluate_base_candidate(
         if len(sequence) >= 3 and coverage >= 0.6:
             observed_span_s = (sequence[-1] - sequence[0]) / 1_000_000.0 if len(sequence) > 1 else 0.0
             implied_sweeps = max(1, round(observed_span_s / candidate))
-            detection_rate = round((len(sequence) - 1) / implied_sweeps, 3) if implied_sweeps > 0 else 0.0
+            detection_rate = ((len(sequence) - 1) / implied_sweeps) if implied_sweeps > 0 else 0.0
             folded[icao] = {
                 "raw_period_s": residual[icao],
                 "multiplier": 1,
-                "folded_period_s": round(candidate, 4),
+                "folded_period_s": candidate,
                 "detection_rate": detection_rate,
                 "method": "centroid",
                 "snap_info": {
@@ -952,10 +969,10 @@ def _evaluate_base_candidate(
         still_residual[icao] = residual[icao]
 
     return {
-        "dominant_period_s": round(candidate, 4),
+        "dominant_period_s": candidate,
         "folded": folded,
         "residual": still_residual,
-        "support_weight": round(support_weight, 6),
+        "support_weight": support_weight,
         "direct_count": direct_count,
         "folded_count": folded_count,
     }
@@ -971,16 +988,20 @@ def _fold_harmonics(icao_results: dict[str, dict], tolerance: float = 0.05) -> d
     if not icao_results:
         return {"dominant_period_s": None, "folded": {}, "residual": {}}
 
-    candidates = sorted({
-        round(series["period_s"], 4)
+    candidate_values = sorted([
+        series["period_s"]
         for result in icao_results.values()
         for series in (result.get("series_candidates") or [])
         if series.get("period_s") is not None
-    } | {
-        round(result["median_period_s"], 4)
+    ] + [
+        result["median_period_s"]
         for result in icao_results.values()
         if result.get("median_period_s") is not None
-    })
+    ])
+    candidates: list[float] = []
+    for value in candidate_values:
+        if not candidates or abs(value - candidates[-1]) > 1e-9:
+            candidates.append(value)
     if not candidates:
         return {"dominant_period_s": None, "folded": {}, "residual": {}}
 
@@ -1092,10 +1113,10 @@ def _periods_match(period_a: float | None, period_b: float | None, tolerance: fl
 
 def _blend_period(existing_period: float | None, support_count: int, observed_period: float) -> tuple[float, int]:
     if existing_period is None or existing_period <= 0:
-        return round(observed_period, 4), 1
+        return observed_period, 1
     weight = max(1, min(support_count, SUPPORT_CAP))
     blended = ((existing_period * weight) + observed_period) / (weight + 1)
-    return round(blended, 4), min(weight + 1, SUPPORT_CAP)
+    return blended, min(weight + 1, SUPPORT_CAP)
 
 
 def _confidence_from_support(support_count: int, target: int) -> float:
@@ -1108,7 +1129,7 @@ def _reinforce_period_slot(existing_period: float | None, support_count: int, ob
     if observed_period is None:
         return existing_period, support_count
     if existing_period is None:
-        return round(observed_period, 4), 1
+        return observed_period, 1
     if _periods_match(existing_period, observed_period):
         return _blend_period(existing_period, support_count, observed_period)
     return existing_period, support_count
@@ -1133,14 +1154,14 @@ def _reinforce_radar_characteristics(radar_iid: RadarIID, model: RotationModel) 
             continue
         if primary_period is None:
             if support_gain > 0:
-                primary_period, primary_support = round(observed_period, 4), support_gain
+                primary_period, primary_support = observed_period, support_gain
             continue
 
         if support_gain > 0:
             primary_support = max(primary_support - 1, 0)
             replacement_threshold = max(MIN_QUALIFYING_ICAOS, primary_support + 1)
             if support_gain >= replacement_threshold:
-                primary_period = round(observed_period, 4)
+                primary_period = observed_period
                 primary_support = min(support_gain, SUPPORT_CAP)
             continue
 
@@ -1568,6 +1589,10 @@ class RadarState:
                     signal_dbfs=burst_signal,
                     pos_age_s=position_age_seconds,
                     sync_update_eligible=matches_dominant_for_sync,
+                    burst_center_method=fired_burst.get("burst_center_method", "centroid"),
+                    burst_center_simple_us=fired_burst.get("burst_center_simple_us"),
+                    burst_center_weighted_us=fired_burst.get("burst_center_weighted_us"),
+                    burst_center_delta_us=fired_burst.get("burst_center_delta_us"),
                 )
                 if matches_dominant_for_sync:
                     self._record_aligned_burst_sync_obs(
@@ -2142,6 +2167,10 @@ class RadarState:
         pos_age_s: float,
         *,
         sync_update_eligible: bool,
+        burst_center_method: str = "centroid",
+        burst_center_simple_us: float | None = None,
+        burst_center_weighted_us: float | None = None,
+        burst_center_delta_us: float | None = None,
     ) -> None:
         """Record one burst-centre observation for sync timeline visualisation.
 
@@ -2167,6 +2196,10 @@ class RadarState:
             prop_delay_aircraft_to_receiver_us=prop_delay_us,
             prop_delay_radar_to_aircraft_us=None,
             effective_arrival_us=effective_us,
+            burst_center_simple_us=burst_center_simple_us,
+            burst_center_weighted_us=burst_center_weighted_us,
+            burst_center_delta_us=burst_center_delta_us,
+            burst_center_method=burst_center_method,
         )
         timeline_buf = self._live_burst_timeline_obs.setdefault(
             iid, deque(maxlen=self._BURST_SYNC_TIMELINE_OBS_MAX)
@@ -2282,18 +2315,24 @@ class RadarState:
             arrival_us = obs.effective_arrival_us if (
                 existing.prop_delay_enabled and obs.effective_arrival_us
             ) else obs.burst_centroid_us
-            phase_in_rot = ((arrival_us - existing.phase_epoch_us) / period_us * 360.0) % 360.0
-            predicted = (phase_in_rot + existing.phase_offset_deg) % 360.0
+            predicted_raw, phase_in_rot = _predict_bearing_from_sync(
+                existing,
+                obs.burst_centroid_us,
+                range_nm=obs.range_nm,
+                waveform_bins=None,
+            )
             # Residual against the raw (pre-waveform) model — this is what the
             # refinement fit sees and what learns the waveform.
-            residual_raw = (obs.bearing_deg - predicted + 540.0) % 360.0 - 180.0
+            residual_raw = (obs.bearing_deg - predicted_raw + 540.0) % 360.0 - 180.0
             # Corrected residual: apply current waveform to see how close we are
             # on the model actually exposed to the localiser.
-            wf_corr = _apply_phase_waveform_correction(
-                waveform_bins, phase_in_rot,
-                applied=existing.waveform_applied,
+            predicted_corr, _ = _predict_bearing_from_sync(
+                existing,
+                obs.burst_centroid_us,
+                range_nm=obs.range_nm,
+                waveform_bins=waveform_bins,
             )
-            residual = ((obs.bearing_deg - (predicted - wf_corr)) + 540.0) % 360.0 - 180.0
+            residual = (obs.bearing_deg - predicted_corr + 540.0) % 360.0 - 180.0
             abs_r = abs(residual)
             status = self._classify_sync_residual(abs_r)
             base_w = self._score_sync_burst_observation(obs)
@@ -2574,13 +2613,8 @@ class RadarState:
         if not replies:
             return None
 
-        total_w = 0.0
-        weighted_sum = 0.0
-        for ts, sig in replies:
-            w = 10.0 ** (sig / 20.0) if sig is not None else 1.0
-            weighted_sum += ts * w
-            total_w += w
-        burst_centroid_us = (weighted_sum / total_w) if total_w > 0 else replies[-1][0]
+        refinement = refine_burst_center(replies)
+        burst_centroid_us = refinement["beam_center_us"]
         burst_signal = max((s for _, s in replies if s is not None), default=None)
 
         centroid_hist = self._live_burst_centroids[iid].setdefault(icao, [])
@@ -2593,6 +2627,10 @@ class RadarState:
             "burst_centroid_us": burst_centroid_us,
             "burst_signal": burst_signal,
             "n_replies": len(replies),
+            "burst_center_method": refinement.get("beam_center_method", "centroid"),
+            "burst_center_simple_us": refinement.get("beam_center_simple_us"),
+            "burst_center_weighted_us": refinement.get("beam_center_weighted_us"),
+            "burst_center_delta_us": refinement.get("beam_center_delta_us"),
         }
 
     def _finalize_expired_pending_bursts(
@@ -2832,6 +2870,10 @@ class RadarState:
                         signal_dbfs=burst_signal,
                         pos_age_s=position_age_seconds,
                         sync_update_eligible=matches_dominant_for_sync,
+                        burst_center_method=fired_burst.get("burst_center_method", "centroid"),
+                        burst_center_simple_us=fired_burst.get("burst_center_simple_us"),
+                        burst_center_weighted_us=fired_burst.get("burst_center_weighted_us"),
+                        burst_center_delta_us=fired_burst.get("burst_center_delta_us"),
                     )
                     if matches_dominant_for_sync:
                         self._record_aligned_burst_sync_obs(
@@ -3316,6 +3358,9 @@ class RadarState:
         """Clear learned in-memory state for one IID so it can be relearned."""
         with self._lock:
             had_any = False
+            if iid in self._dirty_iids:
+                self._dirty_iids.discard(iid)
+                had_any = True
             if iid in self._models:
                 del self._models[iid]
                 had_any = True
@@ -3329,10 +3374,20 @@ class RadarState:
                                self._live_frame_counters,
                                self._live_aligned_burst_obs,
                                self._live_burst_timeline_obs,
-                               self._live_sync_states):
+                               self._live_sync_states,
+                               self._last_multi_sync_update_ts,
+                               self._live_waveform_bins,
+                               self._live_icao_sync_quality,
+                               self._rotation_analysis_meta):
                 if iid in live_dict:
                     del live_dict[iid]
                     had_any = True
+            with self._fm_mailbox_lock:
+                if iid in self._fm_mailbox:
+                    del self._fm_mailbox[iid]
+                    had_any = True
+                if not self._fm_mailbox:
+                    self._fm_mailbox_event.clear()
             if iid in self._native_burst_processors:
                 del self._native_burst_processors[iid]
                 had_any = True
@@ -3340,6 +3395,13 @@ class RadarState:
                 filtered_events = deque(ev for ev in self._iid_events if ev[1] != iid)
                 had_any = had_any or len(filtered_events) != len(self._iid_events)
                 self._iid_events = filtered_events
+            if self._live_detection_buffer:
+                filtered_detections = deque(
+                    (det for det in self._live_detection_buffer if det.iid != iid),
+                    maxlen=self._LIVE_DETECTION_BUFFER_MAX,
+                )
+                had_any = had_any or len(filtered_detections) != len(self._live_detection_buffer)
+                self._live_detection_buffer = filtered_detections
             if iid in self._iid_latest_arrival_us:
                 del self._iid_latest_arrival_us[iid]
                 had_any = True
@@ -3362,10 +3424,15 @@ class RadarState:
                 "events": len(self._iid_events),
                 "pending_pairs": len(self._pending_pairs),
                 "seen_pair_keys": len(self._seen_pair_keys),
+                "sync_states": len(self._live_sync_states),
+                "waveform_bins": len(self._live_waveform_bins),
+                "icao_sync_quality": len(self._live_icao_sync_quality),
+                "multi_sync_throttle": len(self._last_multi_sync_update_ts),
             }
             self._models.clear()
             self._sweep_history.clear()
             self._iid_events.clear()
+            self._dirty_iids.clear()
             self._iid_latest_arrival_us.clear()
             self._pending_pairs.clear()
             self._seen_pair_keys.clear()
@@ -3379,7 +3446,15 @@ class RadarState:
             self._live_aligned_burst_obs.clear()
             self._live_burst_timeline_obs.clear()
             self._live_sync_states.clear()
+            self._last_multi_sync_update_ts.clear()
+            self._live_waveform_bins.clear()
+            self._live_icao_sync_quality.clear()
+            self._rotation_analysis_meta.clear()
+            self._live_detection_buffer.clear()
             self._native_burst_processors.clear()
+            with self._fm_mailbox_lock:
+                self._fm_mailbox.clear()
+                self._fm_mailbox_event.clear()
             return cleared
 
     def get_all_rotation_models(self) -> dict[int, RadarIID]:
@@ -3651,23 +3726,25 @@ class RadarState:
 
         now_ts = time.time()
         cutoff_ts = now_ts - window_s
-        period_us = sync.period_s * 1e6
 
         entries = []
         for obs in obs_snapshot:
             if obs.ts < cutoff_ts:
                 continue
-            # Predicted bearing without the waveform correction (raw model).
-            arrival_us_eff = obs.effective_arrival_us if (
-                sync.prop_delay_enabled and obs.effective_arrival_us
-            ) else obs.burst_centroid_us
-            phase_in_rot = ((arrival_us_eff - sync.phase_epoch_us) / period_us * 360.0) % 360.0
-            predicted_raw = (phase_in_rot + sync.phase_offset_deg) % 360.0
-            residual_raw = (obs.bearing_deg - predicted_raw + 540.0) % 360.0 - 180.0
-            wf_corr = _apply_phase_waveform_correction(
-                waveform_bins, phase_in_rot, applied=sync.waveform_applied,
+            # Authoritative predictor: same path used elsewhere for refined sync.
+            predicted_raw, phase_in_rot = _predict_bearing_from_sync(
+                sync,
+                obs.burst_centroid_us,
+                range_nm=getattr(obs, "range_nm", None),
+                waveform_bins=None,
             )
-            predicted_corr = (predicted_raw - wf_corr) % 360.0
+            residual_raw = (obs.bearing_deg - predicted_raw + 540.0) % 360.0 - 180.0
+            predicted_corr, _ = _predict_bearing_from_sync(
+                sync,
+                obs.burst_centroid_us,
+                range_nm=getattr(obs, "range_nm", None),
+                waveform_bins=waveform_bins,
+            )
             residual_corr = (obs.bearing_deg - predicted_corr + 540.0) % 360.0 - 180.0
             abs_r = abs(residual_corr)
             classification = self._classify_sync_residual(abs_r)
@@ -3694,6 +3771,10 @@ class RadarState:
                 "pos_age_s": obs.pos_age_s,
                 "range_nm": obs.range_nm,
                 "sync_update_eligible": bool(getattr(obs, "sync_update_eligible", True)),
+                "burst_center_method": getattr(obs, "burst_center_method", "centroid"),
+                "burst_center_simple_us": getattr(obs, "burst_center_simple_us", None),
+                "burst_center_weighted_us": getattr(obs, "burst_center_weighted_us", None),
+                "burst_center_delta_us": getattr(obs, "burst_center_delta_us", None),
             })
 
         # Sort chronologically by burst centre timestamp

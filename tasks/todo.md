@@ -8,6 +8,33 @@ Source inputs:
 Prepared: 2026-04-04
 Updated: 2026-04-06
 
+## 2026-04-17 Radar Sync Compliance Gap Remediation
+
+- [x] Unify sync-sensitive frontend verification with the authoritative refined live sync model (period/phase/waveform/prop-delay basis)
+- [x] Ensure `reset_iid()` and `reset_all()` clear all new refinement/waveform/throttle/quality state
+- [x] Remove premature internal period rounding in aggregate/base estimation and reinforcement paths
+- [x] Add minimal burst-centre estimator comparison diagnostics to burst-sync timeline payloads
+- [x] Run focused + full backend tests and frontend build verification
+
+Plan confirmation: apply a focused backend/frontend corrective patch only; preserve existing operational behaviour except where required for sync-model consistency and precision retention.
+
+### Review
+
+- Implementation:
+  - Updated [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) period/base estimator internals to keep full precision (removed early rounding in harmonic folding, candidate scoring, and period reinforcement paths).
+  - Updated [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) burst-sync timeline prediction to call the shared authoritative sync predictor helper, keeping diagnostics aligned with the refined model.
+  - Updated [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) reset paths to clear newly added per-IID refinement state (`_live_waveform_bins`, `_live_icao_sync_quality`, `_last_multi_sync_update_ts`) and related derived state (`_rotation_analysis_meta`, per-IID live detections, dirty IID flag, pending FM mailbox entry).
+  - Updated [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) burst-centre diagnostics to expose simple centroid vs amplitude-weighted centre fields (`burst_center_simple_us`, `burst_center_weighted_us`, `burst_center_delta_us`, `burst_center_method`) in burst-sync timeline observations.
+  - Updated [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) `ReceiverCentredRadarField` to use the authoritative refined sync predictor for beam sweep and DF11 residual timing classification (with waveform + propagation correction), with frame-anchor retained only as explicit fallback.
+  - Updated [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) `RotationAlignmentPanel` raw DF11 residual dots to use the same refined predictor basis for consistency.
+  - Updated [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) with reset-state and burst-centre-diagnostic assertions.
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/radar/api.py backend/radar/aircraft_localiser.py backend/tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py`
+  - `uv run --directory backend pytest`
+  - `cd frontend && npm run build`
+  - Result: backend `292 passed`; frontend build succeeded (existing chunk-size warning remains).
+
 ## 2026-04-16 Radar Sync Visualisation Purpose Split Follow-Up
 
 - [x] Inspect current `RotationAlignmentPanel` and `ReceiverCentredRadarField` wiring against intended panel roles
