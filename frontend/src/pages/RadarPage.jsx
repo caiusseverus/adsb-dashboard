@@ -19,6 +19,9 @@ import {
 } from '../utils/messageField'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
+const RADAR_SYNC_WS_BASE = import.meta.env.PROD
+  ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`
+  : 'ws://localhost:8000'
 const BURST_SYNC_POLL_MS = 1500
 const BURST_SYNC_ALIGNMENT_WINDOW_S = 90
 const BURST_SYNC_DF11_ON_TIME_THRESHOLD_DEG = 6
@@ -1675,75 +1678,123 @@ function timingClassColor(timingClass) {
   }
 }
 
-function useBurstSyncTimeline(iid, windowS, pollMs = BURST_SYNC_POLL_MS) {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(false)
+function useRadarSyncStream(iid, windowS, debugLimit = 120) {
+  const [snapshot, setSnapshot] = useState(null)
+  const [status, setStatus] = useState({
+    connected: false,
+    mode: 'idle',
+    lastUpdateAt: null,
+    sequence: null,
+    fallback: false,
+  })
+  const retryRef = useRef(null)
+  const fallbackRef = useRef(null)
+  const lastUpdateRef = useRef(0)
 
   useEffect(() => {
     if (iid == null) {
-      setData(null)
-      setLoading(false)
+      setSnapshot(null)
+      setStatus({
+        connected: false,
+        mode: 'idle',
+        lastUpdateAt: null,
+        sequence: null,
+        fallback: false,
+      })
       return
     }
-    let cancelled = false
-    let intervalId = null
 
-    async function pollOnce() {
-      try {
-        if (!cancelled) setLoading(true)
-        const response = await fetch(`${API_BASE}/api/radar/iids/${iid}/burst-sync-timeline?window_s=${windowS}`)
-        if (!response.ok) return
-        const payload = await response.json()
-        if (cancelled) return
-        startTransition(() => setData(payload))
-      } catch {
-      } finally {
-        if (!cancelled) setLoading(false)
+    let closed = false
+    let ws = null
+
+    const ingestSnapshot = payload => {
+      if (!payload || payload.type !== 'radar_sync') return
+      lastUpdateRef.current = performance.now()
+      startTransition(() => setSnapshot(payload))
+      setStatus({
+        connected: true,
+        mode: 'stream',
+        lastUpdateAt: Date.now(),
+        sequence: payload.sequence ?? null,
+        fallback: false,
+      })
+    }
+
+    const pollFallback = () => {
+      if (closed) return
+      fetch(`${API_BASE}/api/radar/iids/${iid}/sync-snapshot?window_s=${windowS}&debug_limit=${debugLimit}`)
+        .then(response => response.ok ? response.json() : null)
+        .then(payload => {
+          if (closed || !payload) return
+          lastUpdateRef.current = performance.now()
+          startTransition(() => setSnapshot(payload))
+          setStatus({
+            connected: false,
+            mode: 'fallback',
+            lastUpdateAt: Date.now(),
+            sequence: payload.sequence ?? null,
+            fallback: true,
+          })
+        })
+        .catch(() => {
+          if (!closed) {
+            setStatus(prev => ({ ...prev, connected: false, mode: 'disconnected', fallback: true }))
+          }
+        })
+    }
+
+    const connect = () => {
+      if (closed) return
+      ws = new WebSocket(`${RADAR_SYNC_WS_BASE}/ws/radar/iids/${iid}/sync`)
+      ws.onopen = () => {
+        try {
+          ws.send(JSON.stringify({ window_s: windowS, debug_limit: debugLimit }))
+        } catch {}
+        setStatus(prev => ({ ...prev, connected: true, mode: 'connecting', fallback: false }))
       }
-    }
-
-    pollOnce()
-    intervalId = setInterval(pollOnce, pollMs)
-    return () => {
-      cancelled = true
-      clearInterval(intervalId)
-    }
-  }, [iid, pollMs, windowS])
-
-  return { data, loading }
-}
-
-function useSyncDebug(iid, windowS, pollMs = BURST_SYNC_POLL_MS) {
-  const [data, setData] = useState(null)
-
-  useEffect(() => {
-    if (iid == null) {
-      setData(null)
-      return
-    }
-    let cancelled = false
-    let intervalId = null
-
-    async function pollOnce() {
-      try {
-        const response = await fetch(`${API_BASE}/api/radar/iids/${iid}/sync-debug?window_s=${windowS}&limit=120`)
-        if (!response.ok) return
-        const payload = await response.json()
-        if (cancelled) return
-        startTransition(() => setData(payload))
-      } catch {
+      ws.onmessage = event => {
+        try {
+          const payload = JSON.parse(event.data)
+          if (payload.type === 'radar_sync_heartbeat') {
+            lastUpdateRef.current = performance.now()
+            setStatus(prev => ({
+              ...prev,
+              connected: true,
+              mode: 'stream',
+              sequence: payload.sequence ?? prev.sequence,
+              fallback: false,
+            }))
+            return
+          }
+          ingestSnapshot(payload)
+        } catch {}
       }
+      ws.onclose = () => {
+        if (closed) return
+        setStatus(prev => ({ ...prev, connected: false, mode: 'reconnecting' }))
+        retryRef.current = setTimeout(connect, 1000)
+      }
+      ws.onerror = () => ws.close()
     }
 
-    pollOnce()
-    intervalId = setInterval(pollOnce, pollMs)
+    pollFallback()
+    connect()
+    fallbackRef.current = setInterval(() => {
+      if (closed) return
+      if (performance.now() - lastUpdateRef.current > 2500) {
+        pollFallback()
+      }
+    }, 1000)
+
     return () => {
-      cancelled = true
-      clearInterval(intervalId)
+      closed = true
+      clearTimeout(retryRef.current)
+      clearInterval(fallbackRef.current)
+      ws?.close()
     }
-  }, [iid, pollMs, windowS])
+  }, [debugLimit, iid, windowS])
 
-  return data
+  return { snapshot, status }
 }
 
 const legendDotStyle = {
@@ -1769,8 +1820,11 @@ function SyncDiagnosticsPanel({
   const ppm = Number(syncState.period_correction_ppm)
   const slope = Number(syncState.residual_slope_deg_per_s)
   const wfReduction = Number(syncState.waveform_residual_reduction_deg)
-  const updateApplied = Number(syncState.period_update_applied)
+  const updateProposed = Number(syncState.period_update_proposed_s ?? syncState.period_update_term)
+  const updateApplied = Number(syncState.period_update_applied_s ?? syncState.period_update_applied)
   const updateGain = Number(syncState.period_update_gain)
+  const updatePpmUnclamped = Number(syncState.period_update_ppm_unclamped)
+  const updatePpmApplied = Number(syncState.period_update_ppm_applied)
   const fitEligible = Number(syncState.fit_eligible_observations)
   const fitTotal = Number(syncState.fit_total_observations)
   const fitSpan = Number(syncState.fit_span_s)
@@ -1828,12 +1882,18 @@ function SyncDiagnosticsPanel({
         <span style={pillStyle}>Period samples<span style={valueStyle}>{recentPeriods.length || '—'}</span></span>
         <span style={pillStyle}>ppm<span style={valueStyle}>{Number.isFinite(ppm) ? `${ppm >= 0 ? '+' : ''}${ppm.toFixed(1)}` : '—'}</span></span>
         <span style={pillStyle}>Slope<span style={valueStyle}>{Number.isFinite(slope) ? `${slope.toFixed(3)}°/s` : '—'}</span></span>
+        <span style={pillStyle}>Period status<span style={valueStyle}>{syncState.period_correction_status || 'unknown'}</span></span>
         <span style={pillStyle}>Slope trend<span style={valueStyle}>{slopeTrend == null ? '—' : (slopeTrend < 0 ? 'shrinking' : slopeTrend > 0 ? 'growing' : 'flat')}</span></span>
         <span style={pillStyle}>Refine<span style={valueStyle}>{syncState.period_refine_enabled ? 'on' : 'off'}</span></span>
-        <span style={pillStyle}>Period update<span style={valueStyle}>{Number.isFinite(updateApplied) ? `${updateApplied >= 0 ? '+' : ''}${(updateApplied * 1e6).toFixed(1)}µs` : '—'}</span></span>
+        <span style={pillStyle}>Proposed ΔT<span style={valueStyle}>{Number.isFinite(updateProposed) ? `${updateProposed >= 0 ? '+' : ''}${(updateProposed * 1e6).toFixed(1)}µs` : '—'}</span></span>
+        <span style={pillStyle}>Applied ΔT<span style={valueStyle}>{Number.isFinite(updateApplied) ? `${updateApplied >= 0 ? '+' : ''}${(updateApplied * 1e6).toFixed(1)}µs` : '—'}</span></span>
+        <span style={pillStyle}>Update ppm<span style={valueStyle}>
+          {Number.isFinite(updatePpmApplied) ? `${Number.isFinite(updatePpmUnclamped) ? `${updatePpmUnclamped.toFixed(1)}→` : ''}${updatePpmApplied.toFixed(1)}` : '—'}
+        </span></span>
         <span style={pillStyle}>Direction<span style={valueStyle}>{syncState.period_update_direction || '—'}</span></span>
         <span style={pillStyle}>Gain<span style={valueStyle}>{Number.isFinite(updateGain) ? updateGain.toFixed(2) : '—'}</span></span>
-        <span style={pillStyle}>Block<span style={valueStyle}>{syncState.period_refine_block_reason || 'none'}</span></span>
+        <span style={pillStyle}>Block<span style={valueStyle}>{syncState.period_update_block_reason || syncState.period_refine_block_reason || 'none'}</span></span>
+        <span style={pillStyle}>Clamp<span style={valueStyle}>{syncState.period_update_clamp_reason || 'none'}</span></span>
         <span style={pillStyle}>Fit support<span style={valueStyle}>{Number.isFinite(fitEligible) && Number.isFinite(fitTotal) ? `${fitEligible}/${fitTotal}` : '—'}</span></span>
         <span style={pillStyle}>Fit span<span style={valueStyle}>{Number.isFinite(fitSpan) ? `${fitSpan.toFixed(1)}s` : '—'}</span></span>
         <span style={pillStyle}>Waveform<span style={valueStyle}>{syncState.waveform_enabled ? (syncState.waveform_applied ? 'applied' : 'learning') : 'off'}</span></span>
@@ -1850,13 +1910,14 @@ function SyncDiagnosticsPanel({
             <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '4px 6px', overflow: 'auto' }}>
               <div style={{ color: '#8b949e', marginBottom: '2px' }}>Recent period updates</div>
               <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                <thead><tr style={{ color: '#8b949e' }}><th style={{ textAlign: 'right' }}>slope</th><th style={{ textAlign: 'right' }}>Δµs</th><th style={{ textAlign: 'left' }}>gate</th></tr></thead>
+                <thead><tr style={{ color: '#8b949e' }}><th style={{ textAlign: 'right' }}>slope</th><th style={{ textAlign: 'right' }}>proposed</th><th style={{ textAlign: 'right' }}>applied</th><th style={{ textAlign: 'left' }}>state</th></tr></thead>
                 <tbody>
                   {recentUpdates.map((u, i) => (
                     <tr key={`${u.ts}-${i}`}>
                       <td style={{ textAlign: 'right', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{Number(u.residual_slope_deg_per_s ?? 0).toFixed(3)}</td>
-                      <td style={{ textAlign: 'right', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{(Number(u.period_update_applied ?? 0) * 1e6).toFixed(1)}</td>
-                      <td>{u.period_refine_block_reason || 'applied'}</td>
+                      <td style={{ textAlign: 'right', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{(Number(u.period_update_proposed_s ?? u.period_update_term ?? 0) * 1e6).toFixed(1)}</td>
+                      <td style={{ textAlign: 'right', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{(Number(u.period_update_applied_s ?? u.period_update_applied ?? 0) * 1e6).toFixed(1)}</td>
+                      <td>{u.period_update_block_reason || u.period_update_clamp_reason || u.period_correction_status || 'applied'}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -2109,11 +2170,31 @@ function fmtUs(value) {
   return Number.isFinite(n) ? `${Math.round(n)}` : '-'
 }
 
-function SyncDebugPanel({ debug }) {
+function SyncDebugPanel({ debug, iid, windowS }) {
   const [showAdvanced, setShowAdvanced] = useState(false)
+  const [advancedDebug, setAdvancedDebug] = useState(null)
   const summary = debug?.summary ?? null
   const observations = Array.isArray(debug?.observations) ? debug.observations : []
   const phaseShape = debug?.observation_model_diagnostics?.folded_phase_shape || {}
+  useEffect(() => {
+    setAdvancedDebug(null)
+    setShowAdvanced(false)
+  }, [iid])
+
+  useEffect(() => {
+    if (!showAdvanced || iid == null || advancedDebug) return
+    const controller = new AbortController()
+    fetch(`${API_BASE}/api/radar/iids/${iid}/sync-debug?window_s=${windowS ?? BURST_SYNC_ALIGNMENT_WINDOW_S}&limit=120`, {
+      signal: controller.signal,
+    })
+      .then(response => response.ok ? response.json() : null)
+      .then(payload => {
+        if (payload) setAdvancedDebug(payload)
+      })
+      .catch(() => {})
+    return () => controller.abort()
+  }, [advancedDebug, iid, showAdvanced, windowS])
+
   const plotRows = useMemo(() => observations
     .map(obs => {
       const t = Number(obs.effective_beast_us)
@@ -2149,10 +2230,12 @@ function SyncDebugPanel({ debug }) {
   const fitCount = observations.filter(obs => obs.fit_eligible).length
   const nonFitCount = observations.length - fitCount
   const phaseBins = Array.isArray(phaseShape.phase_bins) ? phaseShape.phase_bins : []
-  const observationDiag = debug?.observation_model_diagnostics ?? summary.observation_model_diagnosis ?? {}
+  const advancedSource = advancedDebug ?? debug
+  const observationDiag = advancedSource?.observation_model_diagnostics ?? summary.observation_model_diagnosis ?? {}
   const methodRows = Array.isArray(observationDiag.method_summary_overall) ? observationDiag.method_summary_overall : []
   const perIcaoDiag = Array.isArray(observationDiag.per_icao) ? observationDiag.per_icao : []
-  const latest = observations.slice(-24)
+  const latestSource = Array.isArray(advancedSource?.observations) ? advancedSource.observations : observations
+  const latest = latestSource.slice(-24)
   const flagOk = summary.wall_clock_used_operationally === false
   const predictorOk = Boolean(summary.predictors_consistent_localiser)
     && Boolean(summary.predictors_consistent_position_verification)
@@ -2211,8 +2294,12 @@ function SyncDebugPanel({ debug }) {
         </div>
         <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: '4px', fontSize: '0.72rem' }}>
           <span className={styles.metricPill}>Mode <span className={styles.metricValue}>{summary.dominant_error_mode || '—'}</span></span>
+          <span className={styles.metricPill}>Correction <span className={styles.metricValue}>{summary.period_correction_status || 'unknown'}</span></span>
           <span className={styles.metricPill}>Period <span className={styles.metricValue}>{fmtNumber(summary.current_period_s, 6, 's')}</span></span>
           <span className={styles.metricPill}>Slope <span className={styles.metricValue}>{fmtNumber(summary.fit_slope_deg_per_s ?? summary.current_slope_deg_per_s, 4, '°/s')}</span></span>
+          <span className={styles.metricPill}>Proposed ΔT <span className={styles.metricValue}>{fmtNumber(summary.period_update_proposed_us, 1, 'µs')}</span></span>
+          <span className={styles.metricPill}>Applied ΔT <span className={styles.metricValue}>{fmtNumber(summary.period_update_applied_us, 1, 'µs')}</span></span>
+          <span className={styles.metricPill}>Block/clamp <span className={styles.metricValue}>{summary.period_update_block_reason || summary.period_update_clamp_reason || 'none'}</span></span>
           <span className={styles.metricPill}>Raw median/MAD <span className={styles.metricValue}>{fmtNumber(summary.raw_median_abs_residual_deg, 2, '°')} / {fmtNumber(summary.raw_mad_deg, 2, '°')}</span></span>
           <span className={styles.metricPill}>Detrended median/MAD <span className={styles.metricValue}>{fmtNumber(summary.detrended_median_abs_residual_deg, 2, '°')} / {fmtNumber(summary.detrended_mad_deg, 2, '°')}</span></span>
           <span className={styles.metricPill}>Repeatability <span className={styles.metricValue}>{fmtNumber(Number(summary.cycle_to_cycle_repeatability) * 100, 0, '%')}</span></span>
@@ -2390,19 +2477,21 @@ function SyncDebugPanel({ debug }) {
   )
 }
 
-function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, rows, onSelectIid }) {
+function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, rows, onSelectIid, syncSnapshot, syncFeedStatus }) {
   const [alignmentMode, setAlignmentMode] = useState(BURST_SYNC_VIEW_MODE_RESIDUALS)
-  const [rotation, setRotation] = useState(null)
   const [resetting, setResetting] = useState(false)
-  const [rotationLoading, setRotationLoading] = useState(false)
   const [legacyTimeline, setLegacyTimeline] = useState(null)
   const [legacyLoading, setLegacyLoading] = useState(false)
   const [refOverride, setRefOverride] = useState(null)
   const [refOverrideSent, setRefOverrideSent] = useState(false)
-  const rotationCacheRef = useRef(new Map())
   const timelineCacheRef = useRef(new Map())
-  const { data: burstTimeline, loading: burstLoading } = useBurstSyncTimeline(iid, BURST_SYNC_ALIGNMENT_WINDOW_S)
-  const syncDebug = useSyncDebug(iid, BURST_SYNC_ALIGNMENT_WINDOW_S)
+  const streamStatus = syncFeedStatus ?? {
+    connected: false,
+    mode: 'idle',
+    lastUpdateAt: null,
+    sequence: null,
+    fallback: false,
+  }
   const timingPacket = useTimingEventStream({ enabled: iid != null, iid, df11Only: true })
   const timingView = useTimingEventBuffer(
     timingPacket,
@@ -2412,39 +2501,10 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
 
   useEffect(() => {
     if (iid == null) {
-      setRotation(null)
-      setRotationLoading(false)
       setLegacyTimeline(null)
       setLegacyLoading(false)
       setRefOverride(null)
       setRefOverrideSent(false)
-      return
-    }
-
-    let cancelled = false
-    const cachedRotation = rotationCacheRef.current.get(iid)
-    setRotation(cachedRotation ?? null)
-    setRotationLoading(true)
-
-    async function pollRotation() {
-      try {
-        const response = await fetch(`${API_BASE}/api/radar/iids/${iid}/rotation`)
-        if (!response.ok) return
-        const payload = await response.json()
-        if (cancelled) return
-        rotationCacheRef.current.set(iid, payload)
-        startTransition(() => setRotation(payload))
-      } catch {
-      } finally {
-        if (!cancelled) setRotationLoading(false)
-      }
-    }
-
-    pollRotation()
-    const intervalId = setInterval(pollRotation, BURST_SYNC_POLL_MS)
-    return () => {
-      cancelled = true
-      clearInterval(intervalId)
     }
   }, [iid])
 
@@ -2483,10 +2543,13 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
     }
   }, [iid, alignmentMode])
 
+  const burstTimeline = syncSnapshot
+  const syncDebug = syncSnapshot?.sync_debug ?? null
+  const rotation = syncSnapshot?.rotation ?? null
   const observations = Array.isArray(burstTimeline?.observations) ? burstTimeline.observations : []
   const legacyIcaosRaw = Array.isArray(legacyTimeline?.icaos) ? legacyTimeline.icaos : []
   const syncState = burstTimeline?.sync_state ?? null
-  const loading = burstLoading || rotationLoading || legacyLoading
+  const loading = legacyLoading || streamStatus.mode === 'connecting' || streamStatus.mode === 'reconnecting'
   const periodS = syncState?.period_s ?? rotation?.period_s ?? selectedRow?.period_s ?? null
   const legacyPeriodS = legacyTimeline?.dominant_period_s ?? rotation?.period_s ?? selectedRow?.period_s ?? null
   const legacyPeriodUs = legacyPeriodS != null ? legacyPeriodS * 1_000_000 : null
@@ -2501,52 +2564,19 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
   )
   const windowEndUs = Math.max(timingNowUs, latestBurstUs)
   const windowStartUs = Math.max(0, windowEndUs - windowSpanUs)
-  const rawDf11Arrivals = useMemo(() => {
-    if (iid == null || windowEndUs <= 0) return []
-    return selectMessageFieldEvents({
-      events: timingView?.events ?? [],
-      renderNowUs: windowEndUs,
-      persistenceUs: windowSpanUs,
-      trafficFilter: 'df11',
-      iidFilter: iid,
-    })
-  }, [iid, timingView?.events, windowEndUs, windowSpanUs])
-  const rawDf11ResidualDots = useMemo(() => {
-    if (!syncState || syncState.period_s == null || syncState.phase_epoch_us == null || syncState.phase_offset_deg == null) {
-      return []
-    }
-    const waveformBins = Array.isArray(burstTimeline?.waveform_bins) ? burstTimeline.waveform_bins : []
-
-    const dots = []
-    for (const ev of rawDf11Arrivals) {
-      const arrivalUs = Number(ev?.arrival_us)
-      const bearingDeg = Number(ev?.bearing_deg)
-      if (!Number.isFinite(arrivalUs) || !Number.isFinite(bearingDeg)) continue
-      if (selectedIcao && ev?.icao !== selectedIcao) continue
-      const prediction = predictBearingFromSyncModel(syncState, arrivalUs, {
-        rangeNm: Number(ev?.range_nm),
-        waveformBins,
-      })
-      if (!prediction) continue
-      const predictedDeg = prediction.predictedDeg
-      const residualDeg = wrapSignedResidualDeg(bearingDeg, predictedDeg)
-      const timingClass = classifyTimingResidual(residualDeg, BURST_SYNC_DF11_ON_TIME_THRESHOLD_DEG)
-      dots.push({
-        seq: ev.seq,
-        icao: ev.icao,
-        arrival_us: arrivalUs,
-        residual_deg: residualDeg,
-        predicted_deg: predictedDeg,
-        timing_class: timingClass,
-      })
-    }
-    return dots
-  }, [
-    burstTimeline?.waveform_bins,
-    rawDf11Arrivals,
-    selectedIcao,
-    syncState,
-  ])
+  // DF11 residual dots for the burst-sync chart are now backend-derived.
+  // The backend computes them via _build_df11_residual_observations() using the
+  // same predict_sync_observation() call and the same sync snapshot as burst
+  // observations, so both chart layers are timing-consistent and directly comparable.
+  // Frontend residual math (predictBearingFromSyncModel / wrapSignedResidualDeg) is
+  // no longer used for this chart — residual_deg and timing_class come from the backend.
+  const df11ResidualDots = useMemo(() => {
+    const backendDots = Array.isArray(burstTimeline?.df11_residual_observations)
+      ? burstTimeline.df11_residual_observations
+      : []
+    if (!selectedIcao) return backendDots
+    return backendDots.filter(dot => dot.icao === selectedIcao)
+  }, [burstTimeline?.df11_residual_observations, selectedIcao])
   const filteredObservations = observations.filter(obs => {
     const sampleUs = Number(obs?.beam_center_us ?? 0)
     if (!Number.isFinite(sampleUs) || sampleUs < windowStartUs || sampleUs > windowEndUs) return false
@@ -2558,9 +2588,9 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
   const rejectedCount = filteredObservations.filter(obs => obs.classification === 'rejected').length
   const syncDrivingCount = filteredObservations.filter(obs => obs?.sync_update_eligible !== false).length
   const nonSyncDrivingCount = filteredObservations.length - syncDrivingCount
-  const dfEarlyCount = rawDf11ResidualDots.filter(dot => dot.timing_class === 'early').length
-  const dfOnTimeCount = rawDf11ResidualDots.filter(dot => dot.timing_class === 'on_time').length
-  const dfLateCount = rawDf11ResidualDots.filter(dot => dot.timing_class === 'late').length
+  const dfEarlyCount = df11ResidualDots.filter(dot => dot.timing_class === 'early').length
+  const dfOnTimeCount = df11ResidualDots.filter(dot => dot.timing_class === 'on_time').length
+  const dfLateCount = df11ResidualDots.filter(dot => dot.timing_class === 'late').length
   const sortedLegacyIcaos = useMemo(() => [...legacyIcaosRaw].sort((a, b) => {
     if ((b.arrivals_us?.length ?? 0) !== (a.arrivals_us?.length ?? 0)) {
       return (b.arrivals_us?.length ?? 0) - (a.arrivals_us?.length ?? 0)
@@ -2589,9 +2619,7 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
     setResetting(true)
     try {
       await resetIid(iid)
-      setRotation(null)
       setLegacyTimeline(null)
-      rotationCacheRef.current.delete(iid)
       timelineCacheRef.current.delete(iid)
       onSelectIcao(null)
       setRefOverride(null)
@@ -2645,7 +2673,7 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
     const value = Math.abs(Number(obs?.residual_deg ?? 0))
     return Number.isFinite(value) ? Math.max(max, value) : max
   }, 0)
-  const maxAbsResidualDf11 = rawDf11ResidualDots.reduce((max, dot) => {
+  const maxAbsResidualDf11 = df11ResidualDots.reduce((max, dot) => {
     const value = Math.abs(Number(dot?.residual_deg ?? 0))
     return Number.isFinite(value) ? Math.max(max, value) : max
   }, 0)
@@ -2682,6 +2710,9 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
   const legacyDisplayIcaos = selectedIcao
     ? sortedLegacyIcaos.filter(entry => entry.icao === selectedIcao)
     : sortedLegacyIcaos
+  const syncFeedAgeS = streamStatus.lastUpdateAt != null
+    ? Math.max(0, (Date.now() - streamStatus.lastUpdateAt) / 1000)
+    : null
 
   return (
     <section className={styles.card} data-panel="rotation-alignment">
@@ -2690,7 +2721,7 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
           <div className={styles.cardTitle}>Burst Sync Alignment</div>
           <div className={styles.sectionLead}>
             {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS
-              ? 'Burst-centre residuals are primary; live DF11 residual dots show whether arrivals are early, on time, or late against the maintained sync model.'
+              ? 'Both layers are backend-derived and directly comparable: burst-centre residuals (circles) and DF11 arrival residuals (dots) use the same authoritative sync model and predictor.'
               : 'Legacy view: per-aircraft live DF alignment across the rolling window for broad multi-aircraft timing context.'}
           </div>
         </div>
@@ -2758,7 +2789,7 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
                 Burst obs <span className={styles.metricValue}>{filteredObservations.length}</span>
               </span>
               <span className={styles.metricPill}>
-                DF11 residual dots <span className={styles.metricValue}>{rawDf11ResidualDots.length}</span>
+                DF11 residual dots <span className={styles.metricValue}>{df11ResidualDots.length}</span>
               </span>
             </>
           ) : (
@@ -2767,7 +2798,15 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
             </span>
           )}
           <span className={styles.metricPill}>
-            Refresh <span className={styles.metricValue}>{loading ? 'updating' : '1.5s poll'}</span>
+            Sync feed <span className={styles.metricValue}>
+              {streamStatus.fallback ? 'fallback' : streamStatus.connected ? 'stream' : (streamStatus.mode || 'idle')}
+            </span>
+          </span>
+          <span className={styles.metricPill}>
+            Last sync <span className={styles.metricValue}>{syncFeedAgeS != null ? `${syncFeedAgeS.toFixed(1)}s` : '—'}</span>
+          </span>
+          <span className={styles.metricPill}>
+            Seq <span className={styles.metricValue}>{streamStatus.sequence ?? '—'}</span>
           </span>
           <span className={styles.metricPill} title="Set reference aircraft for next FM run">
             Ref A/C
@@ -2835,15 +2874,15 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
         candidates={burstTimeline?.phase_anchor_candidates}
       />
 
-      <SyncDebugPanel debug={syncDebug} />
+      <SyncDebugPanel debug={syncDebug} iid={iid} windowS={BURST_SYNC_ALIGNMENT_WINDOW_S} />
 
       {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS ? (
         <>
-          {filteredObservations.length === 0 && rawDf11ResidualDots.length === 0 ? (
+          {filteredObservations.length === 0 && df11ResidualDots.length === 0 ? (
             <div className={styles.empty}>
               {syncState
-                ? 'No burst-sync or live DF11 residual data yet for this IID.'
-                : 'Waiting for a maintained sync model before DF11 residual dots can be plotted.'}
+                ? 'No burst-sync or DF11 residual data yet for this IID.'
+                : 'Waiting for a maintained sync model before backend DF11 residual dots can be computed.'}
             </div>
           ) : (
             <>
@@ -2932,26 +2971,28 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
                     )
                   })}
                   <text x={padL + plotW / 2} y={18} textAnchor="middle" className={styles.axisLabel}>
-                    Burst-centre residuals and live DF11 residual dots
+                    Burst-centre residuals and DF11 arrival residuals — both backend-derived, directly comparable
                   </text>
                   <text x={padL + plotW / 2} y={chartH - 4} textAnchor="middle" className={styles.axisLabel}>
                     Elapsed seconds across rolling window
                   </text>
                   {(() => {
-                    const stride = Math.max(1, Math.ceil(rawDf11ResidualDots.length / 2400))
-                    return rawDf11ResidualDots
+                    // Backend-derived DF11 residual dots — timing_class and residual_deg
+                    // come from predict_sync_observation() on the backend, same path as burst obs.
+                    const stride = Math.max(1, Math.ceil(df11ResidualDots.length / 2400))
+                    return df11ResidualDots
                       .filter((_, idx) => idx % stride === 0)
                       .map((dot, idx) => (
                         <circle
-                          key={`raw-df11-dot-${dot.seq ?? idx}`}
-                          cx={sampleUsToX(Number(dot.arrival_us ?? windowStartUs))}
+                          key={`df11-dot-${dot.icao ?? ''}-${dot.arrival_beast_us ?? idx}`}
+                          cx={sampleUsToX(Number(dot.arrival_beast_us ?? windowStartUs))}
                           cy={residualToY(Number(dot.residual_deg ?? 0))}
                           r={1.9}
                           fill={timingClassColor(dot.timing_class)}
                           opacity={0.62}
                         >
                           <title>
-                            {`${dot.icao ?? 'DF11'} ${dot.timing_class.replace('_', ' ')} residual ${Number(dot.residual_deg ?? 0).toFixed(2)}°`}
+                            {`${dot.icao ?? 'DF11'} ${(dot.timing_class ?? '').replace('_', ' ')} residual ${Number(dot.residual_deg ?? 0).toFixed(2)}° (backend)`}
                           </title>
                         </circle>
                       ))
@@ -3222,7 +3263,7 @@ function beamResidualAtTimestampDeg(bearingDeg, sampleUs, beamAnchor, periodUs) 
 
 const SYNC_STALE_US = 15_000_000  // 15 s without DF11 updates → re-evaluate anchor
 
-function ReceiverCentredRadarField({ iid, selectedRow }) {
+function ReceiverCentredRadarField({ iid, selectedRow, syncSnapshot }) {
   const canvasRef = useRef(null)
   const rafRef = useRef(null)
   const rangeAxisMaxRef = useRef(null)
@@ -3237,7 +3278,7 @@ function ReceiverCentredRadarField({ iid, selectedRow }) {
   const [displaySyncIcao, setDisplaySyncIcao] = useState(null)
 
   const frameData = useSweepFrames(iid)
-  const { data: burstTimeline } = useBurstSyncTimeline(iid, BURST_SYNC_ALIGNMENT_WINDOW_S)
+  const burstTimeline = syncSnapshot
   const { data: fmLocationData } = useFmLocation(iid)
   const refInfo = useReferenceAircraft(iid)
   const receiverPos = useReceiverPosition()
@@ -4831,6 +4872,10 @@ export default function RadarPage() {
   const [resettingAll, setResettingAll] = useState(false)
   const [controlRefreshKey, setControlRefreshKey] = useState(0)
   const selectedRow = rows.find(row => row.iid === selectedIid) ?? null
+  const { snapshot: syncSnapshot, status: syncFeedStatus } = useRadarSyncStream(
+    selectedIid,
+    BURST_SYNC_ALIGNMENT_WINDOW_S,
+  )
 
   useEffect(() => {
     if (rows.length === 0) return
@@ -4943,6 +4988,8 @@ return (
             onSelectIcao={setSelectedIcao}
             rows={rows}
             onSelectIid={handleSelectIid}
+            syncSnapshot={syncSnapshot}
+            syncFeedStatus={syncFeedStatus}
           />
         </div>
       )}
@@ -4955,6 +5002,7 @@ return (
           <ReceiverCentredRadarField
             iid={selectedIid}
             selectedRow={selectedRow}
+            syncSnapshot={syncSnapshot}
           />
         </LazyMountSection>
       </div>

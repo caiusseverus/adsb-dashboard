@@ -2072,6 +2072,63 @@ async def radar_iid_websocket_endpoint(ws: WebSocket, iid: int) -> None:
         log.debug("Radar IID WebSocket error: %s", exc)
 
 
+@app.websocket("/ws/radar/iids/{iid}/sync")
+async def radar_iid_sync_websocket_endpoint(ws: WebSocket, iid: int) -> None:
+    """Selected-IID pushed sync snapshot feed for RadarPage default diagnostics."""
+    await ws.accept()
+    window_s = 90.0
+    debug_limit = 120
+    last_sequence = None
+    last_heartbeat = 0.0
+    last_rebuild = 0.0
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=0.2)
+                try:
+                    request = json.loads(msg)
+                    req_window_s = float(request.get("window_s", window_s))
+                    req_debug_limit = int(request.get("debug_limit", debug_limit))
+                    if 10 <= req_window_s <= 300:
+                        window_s = req_window_s
+                    if 1 <= req_debug_limit <= 300:
+                        debug_limit = req_debug_limit
+                except Exception:
+                    pass
+            except asyncio.TimeoutError:
+                pass
+
+            now = time.time()
+            sent_kind = "none"
+            if now - last_rebuild >= 0.25:
+                payload = radar_api.build_iid_sync_snapshot_payload(
+                    radar_state,
+                    iid,
+                    window_s=window_s,
+                    debug_limit=debug_limit,
+                )
+                last_rebuild = now
+                sequence = payload.get("sequence")
+                if sequence != last_sequence:
+                    await ws.send_text(_json_dumps(payload))
+                    last_sequence = sequence
+                    last_heartbeat = now
+                    sent_kind = "snapshot"
+            if sent_kind == "none" and now - last_heartbeat >= 1.0:
+                await ws.send_text(_json_dumps({
+                    "type": "radar_sync_heartbeat",
+                    "iid": iid,
+                    "server_ts": now,
+                    "sequence": last_sequence,
+                }))
+                last_heartbeat = now
+            await asyncio.sleep(0.1)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        log.debug("Radar IID sync WebSocket error: %s", exc)
+
+
 @app.get("/api/stats")
 async def get_stats() -> dict:
     """HTTP fallback – returns the same snapshot the WebSocket streams."""

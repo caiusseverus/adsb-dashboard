@@ -1127,6 +1127,38 @@ def build_iid_rotation_payload(state: "RadarState" | None, iid: int) -> dict:
     }
 
 
+def build_iid_sync_snapshot_payload(
+    state: "RadarState" | None,
+    iid: int,
+    window_s: float = 90.0,
+    debug_limit: int = 120,
+) -> dict:
+    """Build the shared selected-IID sync snapshot for HTTP and websocket clients."""
+    if state is None:
+        return {
+            "type": "radar_sync",
+            "iid": iid,
+            "sequence": 0,
+            "server_ts": time.time(),
+            "window_s": window_s,
+            "rotation": {"iid": iid, "status": None},
+            "sync_state": None,
+            "observations": [],
+            "sync_debug": {
+                "iid": iid,
+                "available": False,
+                "reason": "radar module not initialised",
+                "observations": [],
+                "summary": {"iid": iid, "wall_clock_used_operationally": False},
+            },
+        }
+    snapshot = state.get_live_sync_snapshot(iid, window_s=window_s, debug_limit=debug_limit)
+    payload = dict(snapshot)
+    payload["rotation"] = build_iid_rotation_payload(state, iid)
+    payload["rotation"].update(_control_payload(state.get_rotation_model(iid)))
+    return payload
+
+
 def _pick_family_sequence(
     centroids_us: list[int],
     period_s: float | None,
@@ -1309,6 +1341,20 @@ async def get_iid_sync_debug(
         return _state.get_sync_debug_payload(iid, window_s=window_s, limit=limit)
     finally:
         _record_api_timing("sync_debug", t0)
+
+
+@router.get("/iids/{iid}/sync-snapshot")
+async def get_iid_sync_snapshot(
+    iid: int,
+    window_s: float = Query(default=90.0, ge=10, le=300),
+    debug_limit: int = Query(default=120, ge=1, le=300),
+):
+    """Shared fast-changing Radar sync snapshot used by the pushed UI feed."""
+    t0 = time.perf_counter()
+    try:
+        return build_iid_sync_snapshot_payload(_state, iid, window_s=window_s, debug_limit=debug_limit)
+    finally:
+        _record_api_timing("sync_snapshot", t0)
 
 
 @router.get("/iids/{iid}/rotation")
