@@ -8,6 +8,34 @@ Source inputs:
 Prepared: 2026-04-04
 Updated: 2026-04-06
 
+## 2026-04-17 Radar Sync Stream and Period Correction Diagnosis
+
+- [x] Inspect RadarPage sync polling, existing websocket/fallback hooks, radar API routes, and live sync state maintenance
+- [x] Add a compact per-IID sync snapshot that reuses one backend build for rotation, burst residuals, and compact sync-debug fields
+- [x] Add a pushed `/ws/radar/iids/{iid}/sync` feed with heartbeat/sequence diagnostics and an HTTP fallback snapshot
+- [x] Replace default RadarPage fast sync polling with one pushed sync subscription and keep legacy/advanced data lazy or low-rate
+- [x] Split period update diagnostics into proposed/applied delta, gain, ppm, allowed/block reason, clamp reason, support, span, and status
+- [x] Verify slope-to-period conversion, fit gates/clamps, and refined period propagation through predictor paths; fix implementation defects found
+- [x] Add focused backend/frontend validation and document results
+
+Plan confirmation: proceeding without a separate confirmation stop because the task explicitly says not to ask for confirmation. Scope is limited to RadarPage sync transport/load and period-correction diagnosis/fix.
+
+### Review
+
+- Implementation:
+  - Added `RadarState.get_live_sync_snapshot()` in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py), with a per-IID signature cache and sequence counter so websocket and HTTP fallback clients reuse one combined sync snapshot when live inputs have not changed.
+  - Added `/api/radar/iids/{iid}/sync-snapshot` and `/ws/radar/iids/{iid}/sync`, combining rotation, burst residual timeline, sync state, waveform/anchor fields, period histories, and sync-debug data for the default RadarPage sync panels.
+  - Replaced the default RadarPage `rotation`, `burst-sync-timeline`, and `sync-debug` 1.5s polling path with one `useRadarSyncStream()` subscription shared by Burst Sync Alignment and Position Verification. The legacy alignment timeline remains opt-in and poll-driven only when selected.
+  - Split period-correction state into proposed/applied seconds and microseconds, unclamped/applied ppm, allowed/block/clamp reasons, fit support/span, adaptive clamp limits, and `period_correction_status`.
+  - Verified the slope conversion sign was already correct. The practical convergence blocker was opaque and tight clamping: clamp reasons were stored as block reasons, and the base-period clamp could cap total correction even under persistent strong-fit slope. Strong, persistent multi-aircraft fits now get wider safety clamps while weak fits keep the conservative limits.
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/radar/api.py backend/main.py backend/tests/test_radar_sweep.py backend/tests/test_radar_api.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py::test_period_refinement_uses_effective_time_slope_and_correct_sign tests/test_radar_sweep.py::test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change tests/test_radar_api.py::test_get_iid_sync_debug_endpoint_exposes_summary_and_observation tests/test_radar_api.py::test_get_iid_sync_snapshot_endpoint_combines_fast_sync_payloads`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py`
+  - `uv run --directory backend pytest`
+  - `cd frontend && npm run build`
+  - Result: focused backend tests passed (`4 passed`), radar sweep/API suites passed (`90 passed`), full backend passed (`305 passed`), frontend build succeeded with the existing chunk-size warning.
+
 ## 2026-04-17 Radar Sync Detrended Phase-Shape Diagnostics
 
 - [x] Inspect sync residual generation, period-fit slope basis, sync-debug API payload, and Radar page diagnostic rendering

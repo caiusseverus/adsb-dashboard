@@ -91,3 +91,11 @@
 - When a live panel filters a high-rate stream client-side, check whether the backend can apply the same filter before serialisation. Sending all events and discarding most of them in React still burns backend GIL time and can starve decode work.
 - When a diagnostic solver is declared obsolete for the operator workflow, remove every UI trigger for it instead of only lazy-loading or hiding it behind a manual button. Keep backend debug endpoints separate from page behavior.
 - When throttling passive-radar reference selection, do not replace repeated rescoring with unconditional reuse of the prior reference just because it is recent. Verify that SweepFrame construction still starts frames under live burst ordering; prefer one rescore per IID batch over stale-reference reuse that can suppress frame starts.
+
+## 2026-04-16
+
+- When two adjacent radar panels have different operational purposes, do not let both become driven by the same primary data primitive. Keep the alignment panel burst-sync-primary with raw live context, and keep position verification raw-live-primary with burst diagnostics secondary.
+
+## 2026-04-17
+
+- When building recovery logic for a wrong absolute phase branch, do not use residual-quality memory from that wrong branch as a hard eligibility gate. Use it as a score penalty or diagnostic only, otherwise every suitable recovery anchor can be rejected before it gets a chance to correct the branch.
