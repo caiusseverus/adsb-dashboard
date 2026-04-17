@@ -630,6 +630,9 @@ def predict_localiser_live_path_bearing(
     *,
     range_nm: float | None = None,
     waveform_bins: list | None = None,
+    bearing_rate_deg_s: float | None = None,
+    motion_comp_dt_us: float | None = None,
+    motion_comp_block_reason: str | None = None,
 ) -> float:
     """Backend-localiser live predictor before calibration offset.
 
@@ -642,6 +645,9 @@ def predict_localiser_live_path_bearing(
         arrival_beast_us,
         range_nm=range_nm,
         waveform_bins=waveform_bins,
+        bearing_rate_deg_s=bearing_rate_deg_s,
+        motion_comp_dt_us=motion_comp_dt_us,
+        motion_comp_block_reason=motion_comp_block_reason,
     )
     return prediction.predicted_bearing_deg
 
@@ -887,6 +893,9 @@ class AircraftLocaliser:
             detection.arrival_us,
             range_nm=range_nm,
             waveform_bins=waveform_bins,
+            bearing_rate_deg_s=getattr(detection, "bearing_rate_deg_s", None),
+            motion_comp_dt_us=getattr(detection, "motion_comp_dt_us", None),
+            motion_comp_block_reason=getattr(detection, "motion_comp_block_reason", None),
         )
         phase_deg = prediction.phase_in_rot_deg
         bearing_raw = prediction.predicted_bearing_deg

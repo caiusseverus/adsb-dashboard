@@ -136,9 +136,11 @@ def test_get_iid_sync_debug_endpoint_exposes_summary_and_observation(monkeypatch
     assert payload["available"] is True
     assert payload["summary"]["wall_clock_used_operationally"] is False
     assert payload["summary"]["predictors_consistent_burst_sync"] is True
+    assert "motion_comp_applied_count" in payload["summary"]
     assert payload["observations"][0]["iid"] == 23
     assert "pred_position_verification_deg" in payload["observations"][0]
     assert "pred_using_wall_clock_deg" in payload["observations"][0]
+    assert "motion_comp_improvement_deg" in payload["observations"][0]
 
 
 def test_get_iid_timeline_marks_non_primary_family_points_as_residual():

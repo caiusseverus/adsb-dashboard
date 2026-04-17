@@ -36,6 +36,36 @@ Plan confirmation: implement a focused diagnostics-only patch. Operational predi
   - `npm run build`
   - Result: backend focused tests passed, radar test pair passed (`83 passed`), full backend passed (`298 passed`), frontend build succeeded with the existing large-chunk warning.
 
+## 2026-04-17 Radar Sync Aircraft Motion Compensation
+
+- [x] Inspect current authoritative sync predictor, burst observation capture, period fit, localiser, diagnostics payloads, and Radar page rendering
+- [x] Add explicit bearing-rate and motion-compensation helpers with reliability gates and Beast-relative timing fields
+- [x] Route authoritative prediction, burst residual generation, period/phase fitting, sync-debug, and live localiser construction through the motion-capable predictor
+- [x] Add per-observation and summary before/after residual diagnostics, including high-rate splits and per-aircraft summaries
+- [x] Add Radar page diagnostics for residual-vs-bearing-rate, residual improvement, summary pills, and per-aircraft before/after table
+- [x] Add/update focused backend tests for motion compensation, fallbacks, and diagnostic fields
+- [x] Run focused backend tests, full backend tests if feasible, frontend build, and record results
+
+Plan confirmation: implement motion compensation as an optional first-order timing correction on Beast-relative burst-centre observations. Use bearing-rate estimates only when the observation already has trustworthy radar-to-aircraft geometry, keep propagation and motion terms separate in diagnostics, and fall back to the current model when motion quality gates fail.
+
+### Review
+
+- Implementation:
+  - Added motion-compensation feature flags in [config.py](/home/keith/claude/adsb-dashboard/backend/config.py): `RADAR_SYNC_MOTION_COMP_PHASE_ENABLED` and `RADAR_SYNC_MOTION_COMP_FIT_ENABLED`.
+  - Updated [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) with finite-difference bearing-rate estimation, first-order `Δt = θdot / 360 * T²` timing correction, reliability block reasons, and explicit propagation-vs-motion Beast timestamp fields.
+  - Extended `predict_sync_observation()` in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) so burst-sync residuals, period/phase fitting, sync-debug, and Stage 3 live localiser calls can use the same motion-capable authoritative path.
+  - Added before/after residual diagnostics, motion applied/blocked fields, high-rate residual summaries, and per-aircraft motion summaries to burst timeline and sync-debug payloads.
+  - Updated [aircraft_models.py](/home/keith/claude/adsb-dashboard/backend/radar/aircraft_models.py) and [aircraft_localiser.py](/home/keith/claude/adsb-dashboard/backend/radar/aircraft_localiser.py) so live detections carry motion fields into the shared predictor.
+  - Updated [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) with motion summary pills, residual-vs-bearing-rate, residual improvement, and per-aircraft before/after diagnostics.
+  - Added focused assertions in [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) and [test_radar_api.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_api.py).
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/radar/api.py backend/radar/aircraft_localiser.py backend/radar/aircraft_models.py backend/tests/test_radar_sweep.py backend/tests/test_radar_api.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py::test_authoritative_sync_predictor_applies_motion_compensation tests/test_radar_sweep.py::test_get_sync_debug_payload_compares_predictor_paths_on_same_observation tests/test_radar_api.py::test_get_iid_sync_debug_endpoint_exposes_summary_and_observation`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py`
+  - `uv run --directory backend pytest`
+  - `npm run build`
+  - Result: focused tests passed, radar API/sweep tests passed (`84 passed`), full backend passed (`299 passed`), frontend build succeeded with the existing chunk-size warning.
+
 ## 2026-04-17 Radar Sync Compliance Gap Remediation
 
 - [x] Unify sync-sensitive frontend verification with the authoritative refined live sync model (period/phase/waveform/prop-delay basis)

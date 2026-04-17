@@ -31,12 +31,16 @@ try:
         RADAR_SYNC_PERIOD_REFINE_ENABLED,
         RADAR_SYNC_WAVEFORM_ENABLED,
         RADAR_SYNC_PROP_DELAY_ENABLED,
+        RADAR_SYNC_MOTION_COMP_PHASE_ENABLED,
+        RADAR_SYNC_MOTION_COMP_FIT_ENABLED,
         RADAR_SYNC_WAVEFORM_BIN_COUNT,
     )
 except Exception:  # pragma: no cover — config not importable in some test harnesses
     RADAR_SYNC_PERIOD_REFINE_ENABLED = True
     RADAR_SYNC_WAVEFORM_ENABLED = True
     RADAR_SYNC_PROP_DELAY_ENABLED = True
+    RADAR_SYNC_MOTION_COMP_PHASE_ENABLED = True
+    RADAR_SYNC_MOTION_COMP_FIT_ENABLED = True
     RADAR_SYNC_WAVEFORM_BIN_COUNT = 24
 
 if TYPE_CHECKING:
@@ -140,6 +144,10 @@ _ADSB_POSITION_MAX_AGE_S = 30.0
 _MIN_FRAME_START_SEPARATION_FRACTION = 0.5
 _PHASE_FAMILY_HISTORY_MIN = 2
 _PHASE_FAMILY_TOLERANCE_FRACTION = 0.15
+_MOTION_RATE_MIN_DT_S = 1.0
+_MOTION_RATE_MAX_DT_S = 60.0
+_MOTION_RATE_MAX_POS_AGE_S = 8.0
+_MOTION_RATE_MAX_ABS_DEG_S = 20.0
 
 
 import math as _math
@@ -324,13 +332,20 @@ class SyncPrediction:
     """
     raw_arrival_us: float
     effective_arrival_us: float
+    prop_corrected_beast_us: float
+    motion_corrected_beast_us: float
     propagation_correction_us: float
+    motion_comp_dt_us: float | None
+    bearing_rate_deg_s: float | None
+    motion_comp_enabled: bool
+    motion_comp_applied: bool
+    motion_comp_block_reason: str | None
     phase_in_rot_deg: float
     predicted_bearing_raw_deg: float
     predicted_bearing_deg: float
     waveform_correction_deg: float
     waveform_applied: bool
-    predictor_version: str = "authoritative_sync_v2"
+    predictor_version: str = "authoritative_sync_v3_motion"
 
 
 def predict_sync_observation(
@@ -341,6 +356,10 @@ def predict_sync_observation(
     waveform_bins: list[WaveformBin] | None = None,
     apply_propagation: bool | None = None,
     apply_waveform: bool | None = None,
+    apply_motion: bool | None = None,
+    bearing_rate_deg_s: float | None = None,
+    motion_comp_dt_us: float | None = None,
+    motion_comp_block_reason: str | None = None,
 ) -> SyncPrediction:
     """Predict bearing from arrival time using the refined sync model.
 
@@ -348,8 +367,9 @@ def predict_sync_observation(
     residual generation, live period fitting, diagnostics, and Stage 3 live
     bearing observation construction.  Update order is explicit:
       1. compute propagation-corrected effective time,
-      2. compute phase with the current refined period,
-      3. apply the current waveform correction to the predicted bearing.
+      2. subtract aircraft-motion timing shift when enabled and valid,
+      3. compute phase with the current refined period,
+      4. apply the current waveform correction to the predicted bearing.
     """
     period_us = sync.period_s * 1e6
     if period_us <= 0:
@@ -357,7 +377,14 @@ def predict_sync_observation(
         return SyncPrediction(
             raw_arrival_us=arrival_us,
             effective_arrival_us=arrival_us,
+            prop_corrected_beast_us=arrival_us,
+            motion_corrected_beast_us=arrival_us,
             propagation_correction_us=0.0,
+            motion_comp_dt_us=None,
+            bearing_rate_deg_s=bearing_rate_deg_s,
+            motion_comp_enabled=False,
+            motion_comp_applied=False,
+            motion_comp_block_reason="invalid_period",
             phase_in_rot_deg=0.0,
             predicted_bearing_raw_deg=predicted,
             predicted_bearing_deg=predicted,
@@ -370,6 +397,25 @@ def predict_sync_observation(
     if prop_enabled:
         prop_delay_us = _compute_propagation_delay_us(range_nm)
         effective_us = arrival_us - prop_delay_us
+    prop_corrected_us = effective_us
+
+    motion_enabled = sync.motion_comp_phase_enabled if apply_motion is None else bool(apply_motion)
+    motion_dt = motion_comp_dt_us
+    if motion_dt is None:
+        motion_dt = _compute_motion_comp_dt_us(sync.period_s, bearing_rate_deg_s)
+    motion_applied = False
+    motion_block = motion_comp_block_reason
+    if not motion_enabled:
+        motion_block = "disabled"
+    elif motion_block is not None:
+        motion_applied = False
+    elif motion_dt is None:
+        motion_block = motion_block or "bearing_rate_unavailable"
+    else:
+        effective_us = prop_corrected_us - motion_dt
+        motion_applied = True
+        motion_block = None
+
     phase_in_rot = ((effective_us - sync.phase_epoch_us) / period_us * 360.0) % 360.0
     predicted_raw = (phase_in_rot + sync.phase_offset_deg) % 360.0
     predicted = predicted_raw
@@ -384,7 +430,14 @@ def predict_sync_observation(
     return SyncPrediction(
         raw_arrival_us=arrival_us,
         effective_arrival_us=effective_us,
+        prop_corrected_beast_us=prop_corrected_us,
+        motion_corrected_beast_us=effective_us,
         propagation_correction_us=prop_delay_us,
+        motion_comp_dt_us=motion_dt,
+        bearing_rate_deg_s=bearing_rate_deg_s,
+        motion_comp_enabled=motion_enabled,
+        motion_comp_applied=motion_applied,
+        motion_comp_block_reason=motion_block,
         phase_in_rot_deg=phase_in_rot,
         predicted_bearing_raw_deg=predicted_raw,
         predicted_bearing_deg=predicted,
@@ -435,6 +488,81 @@ def _circular_delta_deg(a_deg: float | None, b_deg: float | None) -> float | Non
     return (a_deg - b_deg + 540.0) % 360.0 - 180.0
 
 
+def _estimate_aircraft_bearing_rate(
+    *,
+    icao: str,
+    bearing_deg: float,
+    burst_centroid_us: float,
+    pos_age_s: float,
+    history: list["AlignedBurstSyncObs"],
+) -> dict:
+    """Estimate aircraft angular motion relative to the radar.
+
+    The relevant sync term is bearing rate as seen from the radar, not linear
+    speed or radial speed.  This first implementation uses finite differences
+    over recent trusted burst-position observations for the same ICAO.  Bearing
+    wrap is handled with a signed circular delta.
+    """
+    if not icao:
+        return {
+            "bearing_rate_deg_s": None,
+            "motion_comp_block_reason": "missing_icao",
+        }
+    if pos_age_s is None or pos_age_s > _MOTION_RATE_MAX_POS_AGE_S:
+        return {
+            "bearing_rate_deg_s": None,
+            "motion_comp_block_reason": "stale_position",
+        }
+
+    previous = None
+    for candidate in reversed(history):
+        if getattr(candidate, "icao", None) != icao:
+            continue
+        previous = candidate
+        break
+
+    if previous is None:
+        return {
+            "bearing_rate_deg_s": None,
+            "motion_comp_block_reason": "insufficient_history",
+        }
+    if getattr(previous, "pos_age_s", None) is None or previous.pos_age_s > _MOTION_RATE_MAX_POS_AGE_S:
+        return {
+            "bearing_rate_deg_s": None,
+            "motion_comp_block_reason": "previous_position_stale",
+        }
+
+    dt_s = (burst_centroid_us - previous.burst_centroid_us) / 1_000_000.0
+    if dt_s < _MOTION_RATE_MIN_DT_S:
+        return {
+            "bearing_rate_deg_s": None,
+            "motion_comp_block_reason": "time_delta_too_small",
+        }
+    if dt_s > _MOTION_RATE_MAX_DT_S:
+        return {
+            "bearing_rate_deg_s": None,
+            "motion_comp_block_reason": "time_delta_too_large",
+        }
+
+    delta_deg = _circular_delta_deg(bearing_deg, previous.bearing_deg)
+    if delta_deg is None:
+        return {
+            "bearing_rate_deg_s": None,
+            "motion_comp_block_reason": "bearing_delta_unavailable",
+        }
+    bearing_rate_deg_s = delta_deg / dt_s
+    if abs(bearing_rate_deg_s) > _MOTION_RATE_MAX_ABS_DEG_S:
+        return {
+            "bearing_rate_deg_s": bearing_rate_deg_s,
+            "motion_comp_block_reason": "bearing_rate_absurd",
+        }
+
+    return {
+        "bearing_rate_deg_s": bearing_rate_deg_s,
+        "motion_comp_block_reason": None,
+    }
+
+
 # One-way speed-of-light delay per nautical mile, microseconds.
 # c = 299792458 m/s, 1 NM = 1852 m → 1 NM ≈ 6.18 µs.
 _US_PER_NM_LIGHT = 1852.0 / 299792458.0 * 1e6
@@ -449,6 +577,20 @@ def _compute_propagation_delay_us(range_nm: float | None) -> float:
     if range_nm is None or range_nm <= 0:
         return 0.0
     return float(range_nm) * _US_PER_NM_LIGHT
+
+
+def _compute_motion_comp_dt_us(period_s: float, bearing_rate_deg_s: float | None) -> float | None:
+    """First-order beam-crossing timing shift from aircraft bearing rate.
+
+    If aircraft bearing changes by Δθ during one sweep, the apparent crossing
+    time shifts by approximately (Δθ / 360) * T.  With a bearing rate θdot this
+    is (θdot / 360) * T².  The returned value is subtracted from the
+    propagation-corrected Beast timestamp to put the observation on the raw
+    sweep-period basis used by phase/period fitting.
+    """
+    if bearing_rate_deg_s is None or period_s <= 0:
+        return None
+    return (bearing_rate_deg_s / 360.0) * (period_s ** 2) * 1_000_000.0
 
 
 @_dataclass
@@ -531,6 +673,14 @@ class LiveSyncState:
     waveform_learning_residual_basis: str = "residual_after_waveform_detrended_deg"
     # Propagation delay correction diagnostics.
     prop_delay_enabled: bool = False       # config flag state
+    # Aircraft angular-motion timing correction diagnostics.
+    motion_comp_phase_enabled: bool = False
+    motion_comp_fit_enabled: bool = False
+    motion_comp_applied_count: int = 0
+    motion_comp_blocked_count: int = 0
+    motion_comp_mean_dt_us: float = 0.0
+    motion_comp_mean_residual_improvement_deg: float = 0.0
+    motion_comp_high_rate_mean_residual_improvement_deg: float | None = None
 
 
 @_dataclass
@@ -560,6 +710,14 @@ class AlignedBurstSyncObs:
     prop_delay_aircraft_to_receiver_us: float = 0.0
     prop_delay_radar_to_aircraft_us: float | None = None
     effective_arrival_us: float = 0.0
+    # Aircraft-motion compensation diagnostics.  bearing_rate_deg_s is the
+    # angular motion of this aircraft as seen from the radar; radial speed is
+    # not the term that changes apparent sweep recurrence.
+    bearing_rate_deg_s: float | None = None
+    motion_comp_dt_us: float | None = None
+    motion_corrected_beast_us: float | None = None
+    motion_comp_applied: bool = False
+    motion_comp_block_reason: str | None = None
     # Burst-centre estimator diagnostics.
     burst_center_simple_us: float | None = None
     burst_center_weighted_us: float | None = None
@@ -2083,6 +2241,8 @@ class RadarState:
                 waveform_bin_count=int(RADAR_SYNC_WAVEFORM_BIN_COUNT),
                 waveform_residual_reduction_deg=0.0,
                 prop_delay_enabled=bool(RADAR_SYNC_PROP_DELAY_ENABLED),
+                motion_comp_phase_enabled=bool(RADAR_SYNC_MOTION_COMP_PHASE_ENABLED),
+                motion_comp_fit_enabled=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
             )
             return
 
@@ -2167,6 +2327,13 @@ class RadarState:
             waveform_update_block_reason=existing.waveform_update_block_reason,
             waveform_learning_residual_basis=existing.waveform_learning_residual_basis,
             prop_delay_enabled=existing.prop_delay_enabled,
+            motion_comp_phase_enabled=existing.motion_comp_phase_enabled,
+            motion_comp_fit_enabled=existing.motion_comp_fit_enabled,
+            motion_comp_applied_count=existing.motion_comp_applied_count,
+            motion_comp_blocked_count=existing.motion_comp_blocked_count,
+            motion_comp_mean_dt_us=existing.motion_comp_mean_dt_us,
+            motion_comp_mean_residual_improvement_deg=existing.motion_comp_mean_residual_improvement_deg,
+            motion_comp_high_rate_mean_residual_improvement_deg=existing.motion_comp_high_rate_mean_residual_improvement_deg,
         )
 
     def _record_live_burst_detection(
@@ -2191,6 +2358,25 @@ class RadarState:
         truth_lon = pos.get("lon") if pos else None
         pos_age = pos.get("position_age_seconds") if pos else None
         assoc_conf = 1.0 if pos is not None else 0.0
+        bearing_rate_deg_s = None
+        motion_comp_dt_us = None
+        motion_comp_block_reason = None
+        if truth_lat is not None and truth_lon is not None:
+            model = self._models.get(iid)
+            radar_pos = _get_authoritative_radar_position(model)
+            if radar_pos.get("lat") is not None and radar_pos.get("lon") is not None:
+                bearing_deg = _bearing_deg_simple(radar_pos["lat"], radar_pos["lon"], truth_lat, truth_lon)
+                history = list(self._live_burst_timeline_obs.get(iid) or self._live_aligned_burst_obs.get(iid) or [])
+                motion_estimate = _estimate_aircraft_bearing_rate(
+                    icao=icao,
+                    bearing_deg=bearing_deg,
+                    burst_centroid_us=burst_centroid_us,
+                    pos_age_s=pos_age or 0.0,
+                    history=history,
+                )
+                bearing_rate_deg_s = motion_estimate.get("bearing_rate_deg_s")
+                motion_comp_block_reason = motion_estimate.get("motion_comp_block_reason")
+                motion_comp_dt_us = _compute_motion_comp_dt_us(sync_state.period_s, bearing_rate_deg_s)
 
         det = Stage3LiveDetection(
             iid=iid,
@@ -2205,6 +2391,9 @@ class RadarState:
             truth_lon=truth_lon,
             position_age_seconds=pos_age,
             association_confidence=assoc_conf,
+            bearing_rate_deg_s=bearing_rate_deg_s,
+            motion_comp_dt_us=motion_comp_dt_us,
+            motion_comp_block_reason=motion_comp_block_reason,
         )
         # deque.append is GIL-safe; no lock needed for single-threaded DF11 path.
         self._live_detection_buffer.append(det)
@@ -2237,7 +2426,30 @@ class RadarState:
         bearing_deg = _bearing_deg_simple(radar_lat, radar_lon, aircraft_lat, aircraft_lon)
         range_nm = _haversine_nm_simple(radar_lat, radar_lon, aircraft_lat, aircraft_lon)
         prop_delay_us = _compute_propagation_delay_us(range_nm)
-        effective_us = (burst_centroid_us - prop_delay_us) if RADAR_SYNC_PROP_DELAY_ENABLED else burst_centroid_us
+        prop_corrected_us = (burst_centroid_us - prop_delay_us) if RADAR_SYNC_PROP_DELAY_ENABLED else burst_centroid_us
+        obs_buf = self._live_aligned_burst_obs.setdefault(
+            iid, deque(maxlen=self._MULTI_SYNC_OBS_MAX)
+        )
+        motion_estimate = _estimate_aircraft_bearing_rate(
+            icao=icao,
+            bearing_deg=bearing_deg,
+            burst_centroid_us=burst_centroid_us,
+            pos_age_s=pos_age_s,
+            history=list(obs_buf),
+        )
+        bearing_rate_deg_s = motion_estimate.get("bearing_rate_deg_s")
+        motion_comp_dt_us = _compute_motion_comp_dt_us(period_s, bearing_rate_deg_s) if period_s > 0 else None
+        motion_block_reason = motion_estimate.get("motion_comp_block_reason")
+        motion_applied = bool(
+            RADAR_SYNC_MOTION_COMP_PHASE_ENABLED
+            and motion_comp_dt_us is not None
+            and motion_block_reason is None
+        )
+        if not RADAR_SYNC_MOTION_COMP_PHASE_ENABLED:
+            motion_block_reason = "disabled"
+        elif motion_comp_dt_us is None and motion_block_reason is None:
+            motion_block_reason = "bearing_rate_unavailable"
+        effective_us = prop_corrected_us - motion_comp_dt_us if motion_applied else prop_corrected_us
         obs = AlignedBurstSyncObs(
             burst_centroid_us=burst_centroid_us,
             icao=icao,
@@ -2252,9 +2464,11 @@ class RadarState:
             prop_delay_aircraft_to_receiver_us=prop_delay_us,
             prop_delay_radar_to_aircraft_us=None,
             effective_arrival_us=effective_us,
-        )
-        obs_buf = self._live_aligned_burst_obs.setdefault(
-            iid, deque(maxlen=self._MULTI_SYNC_OBS_MAX)
+            bearing_rate_deg_s=bearing_rate_deg_s,
+            motion_comp_dt_us=motion_comp_dt_us,
+            motion_corrected_beast_us=effective_us,
+            motion_comp_applied=motion_applied,
+            motion_comp_block_reason=motion_block_reason,
         )
         obs_buf.append(obs)
 
@@ -2296,7 +2510,32 @@ class RadarState:
         bearing_deg = _bearing_deg_simple(radar_lat, radar_lon, aircraft_lat, aircraft_lon)
         range_nm = _haversine_nm_simple(radar_lat, radar_lon, aircraft_lat, aircraft_lon)
         prop_delay_us = _compute_propagation_delay_us(range_nm)
-        effective_us = (burst_centroid_us - prop_delay_us) if RADAR_SYNC_PROP_DELAY_ENABLED else burst_centroid_us
+        prop_corrected_us = (burst_centroid_us - prop_delay_us) if RADAR_SYNC_PROP_DELAY_ENABLED else burst_centroid_us
+        timeline_buf = self._live_burst_timeline_obs.setdefault(
+            iid, deque(maxlen=self._BURST_SYNC_TIMELINE_OBS_MAX)
+        )
+        sync = self._live_sync_states.get(iid)
+        period_s = sync.period_s if sync is not None and sync.period_s > 0 else 0.0
+        motion_estimate = _estimate_aircraft_bearing_rate(
+            icao=icao,
+            bearing_deg=bearing_deg,
+            burst_centroid_us=burst_centroid_us,
+            pos_age_s=pos_age_s,
+            history=list(timeline_buf),
+        )
+        bearing_rate_deg_s = motion_estimate.get("bearing_rate_deg_s")
+        motion_comp_dt_us = _compute_motion_comp_dt_us(period_s, bearing_rate_deg_s) if period_s > 0 else None
+        motion_block_reason = motion_estimate.get("motion_comp_block_reason")
+        motion_applied = bool(
+            RADAR_SYNC_MOTION_COMP_PHASE_ENABLED
+            and motion_comp_dt_us is not None
+            and motion_block_reason is None
+        )
+        if not RADAR_SYNC_MOTION_COMP_PHASE_ENABLED:
+            motion_block_reason = "disabled"
+        elif motion_comp_dt_us is None and motion_block_reason is None:
+            motion_block_reason = "bearing_rate_unavailable"
+        effective_us = prop_corrected_us - motion_comp_dt_us if motion_applied else prop_corrected_us
         obs = AlignedBurstSyncObs(
             burst_centroid_us=burst_centroid_us,
             icao=icao,
@@ -2311,13 +2550,15 @@ class RadarState:
             prop_delay_aircraft_to_receiver_us=prop_delay_us,
             prop_delay_radar_to_aircraft_us=None,
             effective_arrival_us=effective_us,
+            bearing_rate_deg_s=bearing_rate_deg_s,
+            motion_comp_dt_us=motion_comp_dt_us,
+            motion_corrected_beast_us=effective_us,
+            motion_comp_applied=motion_applied,
+            motion_comp_block_reason=motion_block_reason,
             burst_center_simple_us=burst_center_simple_us,
             burst_center_weighted_us=burst_center_weighted_us,
             burst_center_delta_us=burst_center_delta_us,
             burst_center_method=burst_center_method,
-        )
-        timeline_buf = self._live_burst_timeline_obs.setdefault(
-            iid, deque(maxlen=self._BURST_SYNC_TIMELINE_OBS_MAX)
         )
         timeline_buf.append(obs)
 
@@ -2436,6 +2677,7 @@ class RadarState:
                 waveform_bins=None,
                 apply_propagation=False,
                 apply_waveform=False,
+                apply_motion=False,
             )
             raw_prediction = predict_sync_observation(
                 existing,
@@ -2443,12 +2685,24 @@ class RadarState:
                 range_nm=obs.range_nm,
                 waveform_bins=None,
                 apply_waveform=False,
+                apply_motion=False,
+            )
+            without_motion_prediction = predict_sync_observation(
+                existing,
+                obs.burst_centroid_us,
+                range_nm=obs.range_nm,
+                waveform_bins=waveform_bins,
+                apply_motion=False,
             )
             corrected_prediction = predict_sync_observation(
                 existing,
                 obs.burst_centroid_us,
                 range_nm=obs.range_nm,
                 waveform_bins=waveform_bins,
+                apply_motion=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
+                bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
+                motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
+                motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
             )
             residual_raw = (
                 obs.bearing_deg - uncorrected_prediction.predicted_bearing_deg + 540.0
@@ -2458,6 +2712,9 @@ class RadarState:
             ) % 360.0 - 180.0
             residual = (
                 obs.bearing_deg - corrected_prediction.predicted_bearing_deg + 540.0
+            ) % 360.0 - 180.0
+            residual_without_motion = (
+                obs.bearing_deg - without_motion_prediction.predicted_bearing_deg + 540.0
             ) % 360.0 - 180.0
             abs_r = abs(residual)
             status = self._classify_sync_residual(abs_r)
@@ -2501,6 +2758,8 @@ class RadarState:
                 "residual": residual,
                 "residual_raw": residual_raw,
                 "residual_after_prop": residual_after_prop,
+                "residual_without_motion": residual_without_motion,
+                "motion_comp_improvement_deg": abs(residual_without_motion) - abs(residual),
                 "weight": effective_w,
                 "status": status,
                 "icao": obs.icao,
@@ -2708,6 +2967,31 @@ class RadarState:
             + _WAVEFORM_REDUCTION_ALPHA * reduction
         )
 
+        motion_applied_entries = [
+            e for e in scored
+            if e["prediction"].motion_comp_applied and e["status"] in ("inlier", "soft")
+        ]
+        motion_blocked_count = sum(
+            1 for e in scored
+            if e["prediction"].motion_comp_enabled and not e["prediction"].motion_comp_applied
+        )
+        motion_mean_dt_us = (
+            sum(e["prediction"].motion_comp_dt_us or 0.0 for e in motion_applied_entries) / len(motion_applied_entries)
+            if motion_applied_entries else 0.0
+        )
+        motion_mean_improvement = (
+            sum(e["motion_comp_improvement_deg"] for e in motion_applied_entries) / len(motion_applied_entries)
+            if motion_applied_entries else 0.0
+        )
+        high_rate_entries = [
+            e for e in motion_applied_entries
+            if e["prediction"].bearing_rate_deg_s is not None and abs(e["prediction"].bearing_rate_deg_s) >= 0.2
+        ]
+        motion_high_rate_mean_improvement = (
+            sum(e["motion_comp_improvement_deg"] for e in high_rate_entries) / len(high_rate_entries)
+            if high_rate_entries else None
+        )
+
         # Per-ICAO quality memory update: EMA of signed residual (bias) and
         # |residual − bias| (spread).  Used as a downweight multiplier above.
         _ICAO_QUALITY_ALPHA = 0.1
@@ -2811,7 +3095,7 @@ class RadarState:
             period_update_gain=_PERIOD_GAIN,
             period_refine_block_reason=period_refine_block_reason,
             fit_time_basis="effective_beast_time_s",
-            fit_residual_basis="observed_minus_authoritative_prediction_after_waveform_deg",
+            fit_residual_basis="observed_minus_authoritative_prediction_after_prop_motion_waveform_deg",
             fit_total_observations=len(recent_obs),
             fit_eligible_observations=len(fit_scored),
             fit_rejected_observations=len(recent_obs) - len(fit_scored),
@@ -2827,6 +3111,13 @@ class RadarState:
             waveform_update_block_reason=waveform_update_block_reason,
             waveform_learning_residual_basis="residual_after_waveform_detrended_deg",
             prop_delay_enabled=bool(RADAR_SYNC_PROP_DELAY_ENABLED),
+            motion_comp_phase_enabled=bool(RADAR_SYNC_MOTION_COMP_PHASE_ENABLED),
+            motion_comp_fit_enabled=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
+            motion_comp_applied_count=len(motion_applied_entries),
+            motion_comp_blocked_count=motion_blocked_count,
+            motion_comp_mean_dt_us=motion_mean_dt_us,
+            motion_comp_mean_residual_improvement_deg=motion_mean_improvement,
+            motion_comp_high_rate_mean_residual_improvement_deg=motion_high_rate_mean_improvement,
         )
         self._live_sync_states[iid] = new_state
 
@@ -4017,6 +4308,7 @@ class RadarState:
                 waveform_bins=None,
                 apply_propagation=False,
                 apply_waveform=False,
+                apply_motion=False,
             )
             raw_prediction = predict_sync_observation(
                 sync,
@@ -4024,12 +4316,23 @@ class RadarState:
                 range_nm=getattr(obs, "range_nm", None),
                 waveform_bins=None,
                 apply_waveform=False,
+                apply_motion=False,
+            )
+            without_motion_prediction = predict_sync_observation(
+                sync,
+                obs.burst_centroid_us,
+                range_nm=getattr(obs, "range_nm", None),
+                waveform_bins=waveform_bins,
+                apply_motion=False,
             )
             corrected_prediction = predict_sync_observation(
                 sync,
                 obs.burst_centroid_us,
                 range_nm=getattr(obs, "range_nm", None),
                 waveform_bins=waveform_bins,
+                bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
+                motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
+                motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
             )
             residual_raw = (
                 obs.bearing_deg - uncorrected_prediction.predicted_bearing_deg + 540.0
@@ -4039,6 +4342,9 @@ class RadarState:
             ) % 360.0 - 180.0
             residual_corr = (
                 obs.bearing_deg - corrected_prediction.predicted_bearing_deg + 540.0
+            ) % 360.0 - 180.0
+            residual_without_motion = (
+                obs.bearing_deg - without_motion_prediction.predicted_bearing_deg + 540.0
             ) % 360.0 - 180.0
             abs_r = abs(residual_corr)
             classification = self._classify_sync_residual(abs_r)
@@ -4068,19 +4374,31 @@ class RadarState:
                 "predicted_deg": corrected_prediction.predicted_bearing_deg,
                 "predicted_raw_deg": raw_prediction.predicted_bearing_raw_deg,
                 "predicted_after_prop_deg": raw_prediction.predicted_bearing_deg,
+                "pred_without_motion_deg": without_motion_prediction.predicted_bearing_deg,
+                "pred_with_motion_deg": corrected_prediction.predicted_bearing_deg,
                 "predicted_corrected_deg": corrected_prediction.predicted_bearing_deg,
                 "residual_deg": residual_corr,
                 # Separate raw vs corrected residual so the UI can show the
                 # effect of the waveform correction directly.
                 "residual_raw_deg": residual_raw,
                 "residual_after_prop_deg": residual_after_prop,
+                "residual_without_motion_deg": residual_without_motion,
+                "residual_with_motion_deg": residual_corr,
                 "residual_after_waveform_deg": residual_corr,
                 "residual_corrected_deg": residual_corr,
+                "motion_comp_improvement_deg": abs(residual_without_motion) - abs(residual_corr),
                 "residual_for_period_fit_deg": residual_corr if fit_eligible else None,
                 "phase_in_rot_deg": corrected_prediction.phase_in_rot_deg,
                 "raw_arrival_us": getattr(obs, "raw_arrival_us", obs.burst_centroid_us),
+                "prop_corrected_beast_us": corrected_prediction.prop_corrected_beast_us,
                 "effective_arrival_us": corrected_prediction.effective_arrival_us,
+                "motion_corrected_beast_us": corrected_prediction.motion_corrected_beast_us,
                 "prop_delay_us": corrected_prediction.propagation_correction_us,
+                "bearing_rate_deg_s": corrected_prediction.bearing_rate_deg_s,
+                "motion_comp_dt_us": corrected_prediction.motion_comp_dt_us,
+                "motion_comp_enabled": corrected_prediction.motion_comp_enabled,
+                "motion_comp_applied": corrected_prediction.motion_comp_applied,
+                "motion_comp_block_reason": corrected_prediction.motion_comp_block_reason,
                 "waveform_correction_deg": corrected_prediction.waveform_correction_deg,
                 "waveform_applied": corrected_prediction.waveform_applied,
                 "prediction_path": corrected_prediction.predictor_version,
@@ -4101,6 +4419,12 @@ class RadarState:
 
         # Sort chronologically by burst centre timestamp
         entries.sort(key=lambda e: e["beam_center_us"])
+        motion_applied_entries = [e for e in entries if e.get("motion_comp_applied")]
+        motion_improvements = [
+            e.get("motion_comp_improvement_deg")
+            for e in motion_applied_entries
+            if e.get("motion_comp_improvement_deg") is not None
+        ]
 
         # Serialise waveform bins.
         n_bins = len(waveform_bins)
@@ -4138,6 +4462,20 @@ class RadarState:
             "slope_history": slope_history,
             "period_history": period_history,
             "predictor_consistency": getattr(sync, "predictor_consistency", None),
+            "motion_comp_summary": {
+                "phase_enabled": bool(getattr(sync, "motion_comp_phase_enabled", False)),
+                "fit_enabled": bool(getattr(sync, "motion_comp_fit_enabled", False)),
+                "applied_count": len(motion_applied_entries),
+                "blocked_count": sum(1 for e in entries if e.get("motion_comp_enabled") and not e.get("motion_comp_applied")),
+                "mean_motion_comp_dt_us": (
+                    sum(e.get("motion_comp_dt_us") or 0.0 for e in motion_applied_entries) / len(motion_applied_entries)
+                    if motion_applied_entries else 0.0
+                ),
+                "mean_residual_improvement_deg": (
+                    sum(motion_improvements) / len(motion_improvements)
+                    if motion_improvements else None
+                ),
+            },
         }
 
     def get_sync_debug_payload(self, iid: int, window_s: float = 60.0, limit: int = 80) -> dict:
@@ -4197,6 +4535,15 @@ class RadarState:
             clean = [abs(v) for v in values if v is not None]
             return max(clean) if clean else None
 
+        def _median_abs(values: list[float | None]) -> float | None:
+            clean = sorted(abs(v) for v in values if v is not None)
+            if not clean:
+                return None
+            mid = len(clean) // 2
+            if len(clean) % 2:
+                return clean[mid]
+            return (clean[mid - 1] + clean[mid]) / 2.0
+
         observations: list[dict] = []
         localiser_deltas: list[float | None] = []
         position_deltas: list[float | None] = []
@@ -4204,6 +4551,13 @@ class RadarState:
         raw_effective_deltas: list[float | None] = []
         wall_effective_deltas: list[float | None] = []
         roundtrip_errors: list[float | None] = []
+        residuals_without_motion: list[float | None] = []
+        residuals_with_motion: list[float | None] = []
+        fit_residuals_without_motion: list[float | None] = []
+        fit_residuals_with_motion: list[float | None] = []
+        high_rate_residuals_without_motion: list[float | None] = []
+        high_rate_residuals_with_motion: list[float | None] = []
+        motion_improvements: list[float | None] = []
 
         localiser_predictor = None
         try:
@@ -4221,6 +4575,16 @@ class RadarState:
                 burst_center_beast_us,
                 range_nm=range_nm,
                 waveform_bins=waveform_bins,
+                bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
+                motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
+                motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
+            )
+            without_motion_prediction = predict_sync_observation(
+                sync,
+                burst_center_beast_us,
+                range_nm=range_nm,
+                waveform_bins=waveform_bins,
+                apply_motion=False,
             )
             effective_beast_us = authoritative.effective_arrival_us
 
@@ -4243,6 +4607,9 @@ class RadarState:
                     burst_center_beast_us,
                     range_nm=range_nm,
                     waveform_bins=waveform_bins,
+                    bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
+                    motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
+                    motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
                 )
             else:
                 pred_localiser_live_deg = authoritative.predicted_bearing_deg
@@ -4255,11 +4622,17 @@ class RadarState:
                 burst_center_beast_us,
                 range_nm=range_nm,
                 waveform_bins=waveform_bins,
+                bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
+                motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
+                motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
             ).predicted_bearing_deg
             pred_burst_sync_deg = authoritative.predicted_bearing_deg
 
             pred_authoritative_deg = authoritative.predicted_bearing_deg
             resid_authoritative_deg = _circular_delta_deg(obs.bearing_deg, pred_authoritative_deg)
+            resid_without_motion_deg = _circular_delta_deg(
+                obs.bearing_deg, without_motion_prediction.predicted_bearing_deg,
+            )
             resid_localiser_deg = _circular_delta_deg(obs.bearing_deg, pred_localiser_live_deg)
             resid_position_deg = _circular_delta_deg(obs.bearing_deg, pred_position_verification_deg)
             resid_burstsync_deg = _circular_delta_deg(obs.bearing_deg, pred_burst_sync_deg)
@@ -4309,11 +4682,20 @@ class RadarState:
                 "raw_arrival_beast_us": raw_arrival_beast_us,
                 "burst_center_beast_us": burst_center_beast_us,
                 "effective_beast_us": effective_beast_us,
+                "prop_corrected_beast_us": authoritative.prop_corrected_beast_us,
+                "motion_corrected_beast_us": authoritative.motion_corrected_beast_us,
                 "prop_delay_us": authoritative.propagation_correction_us,
+                "bearing_rate_deg_s": authoritative.bearing_rate_deg_s,
+                "motion_comp_dt_us": authoritative.motion_comp_dt_us,
+                "motion_comp_enabled": authoritative.motion_comp_enabled,
+                "motion_comp_applied": authoritative.motion_comp_applied,
+                "motion_comp_block_reason": authoritative.motion_comp_block_reason,
                 "wall_ts": obs.ts,
                 "range_nm": range_nm,
                 "true_bearing_deg": obs.bearing_deg,
                 "pred_authoritative_deg": pred_authoritative_deg,
+                "pred_without_motion_deg": without_motion_prediction.predicted_bearing_deg,
+                "pred_with_motion_deg": pred_authoritative_deg,
                 "phase_authoritative_deg": authoritative.phase_in_rot_deg,
                 "pred_localiser_live_deg": pred_localiser_live_deg,
                 "pred_position_verification_deg": pred_position_verification_deg,
@@ -4323,6 +4705,12 @@ class RadarState:
                 "pred_using_effective_beast_deg": pred_using_effective.predicted_bearing_deg if pred_using_effective else None,
                 "pred_using_wall_clock_deg": pred_using_wall.predicted_bearing_deg if pred_using_wall else None,
                 "resid_authoritative_deg": resid_authoritative_deg,
+                "resid_without_motion_deg": resid_without_motion_deg,
+                "resid_with_motion_deg": resid_authoritative_deg,
+                "motion_comp_improvement_deg": (
+                    abs(resid_without_motion_deg) - abs(resid_authoritative_deg)
+                    if resid_without_motion_deg is not None and resid_authoritative_deg is not None else None
+                ),
                 "resid_localiser_deg": resid_localiser_deg,
                 "resid_position_verification_deg": resid_position_deg,
                 "resid_burst_sync_deg": resid_burstsync_deg,
@@ -4356,6 +4744,20 @@ class RadarState:
             raw_effective_deltas.append(delta_raw_effective)
             wall_effective_deltas.append(delta_wall_effective)
             roundtrip_errors.append(wall_roundtrip_error_us)
+            residuals_without_motion.append(resid_without_motion_deg)
+            residuals_with_motion.append(resid_authoritative_deg)
+            improvement = (
+                abs(resid_without_motion_deg) - abs(resid_authoritative_deg)
+                if resid_without_motion_deg is not None and resid_authoritative_deg is not None else None
+            )
+            motion_improvements.append(improvement)
+            if fit_reject_reason is None:
+                fit_residuals_without_motion.append(resid_without_motion_deg)
+                fit_residuals_with_motion.append(resid_authoritative_deg)
+            br = getattr(obs, "bearing_rate_deg_s", None)
+            if br is not None and abs(br) >= 0.2:
+                high_rate_residuals_without_motion.append(resid_without_motion_deg)
+                high_rate_residuals_with_motion.append(resid_authoritative_deg)
 
         tolerance_deg = 0.05
         summary = {
@@ -4378,6 +4780,30 @@ class RadarState:
             "waveform_enabled": getattr(sync, "waveform_enabled", None),
             "waveform_applied": getattr(sync, "waveform_applied", None),
             "prop_delay_enabled": getattr(sync, "prop_delay_enabled", None),
+            "motion_comp_phase_enabled": getattr(sync, "motion_comp_phase_enabled", None),
+            "motion_comp_fit_enabled": getattr(sync, "motion_comp_fit_enabled", None),
+            "motion_comp_applied_count": sum(1 for obs in observations if obs.get("motion_comp_applied")),
+            "motion_comp_blocked_count": sum(1 for obs in observations if obs.get("motion_comp_enabled") and not obs.get("motion_comp_applied")),
+            "motion_comp_mean_dt_us": (
+                sum(obs.get("motion_comp_dt_us") or 0.0 for obs in observations if obs.get("motion_comp_applied"))
+                / max(1, sum(1 for obs in observations if obs.get("motion_comp_applied")))
+            ),
+            "mean_abs_residual_without_motion_deg": _mean_abs(residuals_without_motion),
+            "mean_abs_residual_with_motion_deg": _mean_abs(residuals_with_motion),
+            "median_abs_residual_without_motion_deg": _median_abs(residuals_without_motion),
+            "median_abs_residual_with_motion_deg": _median_abs(residuals_with_motion),
+            "fit_mean_abs_residual_without_motion_deg": _mean_abs(fit_residuals_without_motion),
+            "fit_mean_abs_residual_with_motion_deg": _mean_abs(fit_residuals_with_motion),
+            "fit_median_abs_residual_without_motion_deg": _median_abs(fit_residuals_without_motion),
+            "fit_median_abs_residual_with_motion_deg": _median_abs(fit_residuals_with_motion),
+            "high_rate_mean_abs_residual_without_motion_deg": _mean_abs(high_rate_residuals_without_motion),
+            "high_rate_mean_abs_residual_with_motion_deg": _mean_abs(high_rate_residuals_with_motion),
+            "high_rate_median_abs_residual_without_motion_deg": _median_abs(high_rate_residuals_without_motion),
+            "high_rate_median_abs_residual_with_motion_deg": _median_abs(high_rate_residuals_with_motion),
+            "mean_motion_comp_improvement_deg": (
+                sum(v for v in motion_improvements if v is not None) / len([v for v in motion_improvements if v is not None])
+                if any(v is not None for v in motion_improvements) else None
+            ),
             "predictor_consistency_tolerance_deg": tolerance_deg,
             "predictors_consistent_localiser": (_max_abs(localiser_deltas) or 0.0) <= tolerance_deg,
             "predictors_consistent_position_verification": (_max_abs(position_deltas) or 0.0) <= tolerance_deg,

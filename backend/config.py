@@ -234,6 +234,12 @@ RADAR_SYNC_WAVEFORM_ENABLED: bool = _bool("RADAR_SYNC_WAVEFORM_ENABLED", True)
 # radar-to-aircraft) light-time from observation arrival timestamps before
 # using them in the sync model.
 RADAR_SYNC_PROP_DELAY_ENABLED: bool = _bool("RADAR_SYNC_PROP_DELAY_ENABLED", True)
+# aircraft motion compensation: subtract the first-order beam-crossing shift
+# caused by aircraft angular motion relative to the radar.  Phase prediction
+# and period fitting are separately gated so diagnostics can keep comparing
+# both paths even if one side is disabled.
+RADAR_SYNC_MOTION_COMP_PHASE_ENABLED: bool = _bool("RADAR_SYNC_MOTION_COMP_PHASE_ENABLED", True)
+RADAR_SYNC_MOTION_COMP_FIT_ENABLED: bool = _bool("RADAR_SYNC_MOTION_COMP_FIT_ENABLED", True)
 # Number of circular bins for the phase-in-rotation waveform model.
 RADAR_SYNC_WAVEFORM_BIN_COUNT: int = int(os.getenv("RADAR_SYNC_WAVEFORM_BIN_COUNT", "24"))
 

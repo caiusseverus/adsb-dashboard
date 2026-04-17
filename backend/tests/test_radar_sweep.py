@@ -465,6 +465,12 @@ def test_get_sync_debug_payload_compares_predictor_paths_on_same_observation(mon
     assert obs["delta_position_vs_authoritative_deg"] == pytest.approx(0.0)
     assert obs["delta_burstsync_vs_authoritative_deg"] == pytest.approx(0.0)
     assert obs["fit_eligible"] is True
+    assert "bearing_rate_deg_s" in obs
+    assert "motion_comp_dt_us" in obs
+    assert "motion_comp_applied" in obs
+    assert "resid_without_motion_deg" in obs
+    assert "resid_with_motion_deg" in obs
+    assert "motion_comp_improvement_deg" in obs
 
 
 def test_authoritative_sync_predictor_applies_prop_and_waveform():
@@ -501,6 +507,41 @@ def test_authoritative_sync_predictor_applies_prop_and_waveform():
         (prediction.predicted_bearing_raw_deg - 10.0) % 360.0
     )
     assert no_prop.predicted_bearing_deg == pytest.approx(185.0)
+
+
+def test_authoritative_sync_predictor_applies_motion_compensation():
+    sync = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1000.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        motion_comp_phase_enabled=True,
+    )
+
+    without_motion = predict_sync_observation(
+        sync,
+        4_000_000.0,
+        apply_propagation=False,
+        apply_waveform=False,
+        apply_motion=False,
+    )
+    with_motion = predict_sync_observation(
+        sync,
+        4_000_000.0,
+        apply_propagation=False,
+        apply_waveform=False,
+        bearing_rate_deg_s=1.0,
+    )
+
+    assert with_motion.motion_comp_applied is True
+    assert with_motion.motion_comp_dt_us == pytest.approx((1.0 / 360.0) * 16.0 * 1_000_000.0)
+    assert with_motion.effective_arrival_us < without_motion.effective_arrival_us
+    assert ((with_motion.predicted_bearing_deg - without_motion.predicted_bearing_deg + 540.0) % 360.0 - 180.0) == pytest.approx(-4.0)
 
 
 def test_period_refinement_uses_effective_time_slope_and_correct_sign(monkeypatch):

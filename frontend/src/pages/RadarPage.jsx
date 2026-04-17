@@ -1981,8 +1981,6 @@ function SyncDebugPanel({ debug }) {
     }
     return rows
   }, [observations])
-  if (!summary) return null
-
   const latest = observations.slice(-36)
   const fitCount = observations.filter(obs => obs.fit_eligible).length
   const nonFitCount = observations.length - fitCount
@@ -2000,6 +1998,47 @@ function SyncDebugPanel({ debug }) {
   const spanEff = Math.max(1, maxEff - minEff)
   const residualAbsMax = Math.min(180, Math.max(20, ...observations.map(obs => Math.abs(Number(obs.resid_authoritative_deg ?? 0))).filter(Number.isFinite), 20))
   const maxRelUs = Math.max(1, ...byIcao.map(obs => Number(obs.relative_us)).filter(Number.isFinite))
+  const motionRows = observations.filter(obs => Number.isFinite(Number(obs.bearing_rate_deg_s)))
+  const motionAppliedCount = observations.filter(obs => obs.motion_comp_applied).length
+  const motionImprovements = observations.map(obs => Number(obs.motion_comp_improvement_deg)).filter(Number.isFinite)
+  const meanMotionImprovement = motionImprovements.length
+    ? motionImprovements.reduce((sum, v) => sum + v, 0) / motionImprovements.length
+    : null
+  const meanMotionDtUs = (() => {
+    const values = observations.filter(obs => obs.motion_comp_applied).map(obs => Number(obs.motion_comp_dt_us)).filter(Number.isFinite)
+    return values.length ? values.reduce((sum, v) => sum + v, 0) / values.length : null
+  })()
+  const maxAbsRate = Math.max(0.5, ...motionRows.map(obs => Math.abs(Number(obs.bearing_rate_deg_s))).filter(Number.isFinite))
+  const improvementAbsMax = Math.max(5, ...motionImprovements.map(v => Math.abs(v)), 5)
+  const motionByIcao = useMemo(() => {
+    const grouped = new Map()
+    for (const obs of observations) {
+      const icao = obs?.icao
+      if (!icao) continue
+      const rate = Number(obs.bearing_rate_deg_s)
+      const before = Number(obs.resid_without_motion_deg)
+      const after = Number(obs.resid_with_motion_deg ?? obs.resid_authoritative_deg)
+      const improvement = Number(obs.motion_comp_improvement_deg)
+      const row = grouped.get(icao) || { icao, n: 0, rateSum: 0, beforeAbsSum: 0, afterAbsSum: 0, improvementSum: 0 }
+      if (Number.isFinite(rate)) row.rateSum += rate
+      if (Number.isFinite(before)) row.beforeAbsSum += Math.abs(before)
+      if (Number.isFinite(after)) row.afterAbsSum += Math.abs(after)
+      if (Number.isFinite(improvement)) row.improvementSum += improvement
+      row.n += 1
+      grouped.set(icao, row)
+    }
+    return Array.from(grouped.values())
+      .map(row => ({
+        icao: row.icao,
+        n: row.n,
+        bearing_rate_deg_s: row.rateSum / Math.max(1, row.n),
+        before_abs_deg: row.beforeAbsSum / Math.max(1, row.n),
+        after_abs_deg: row.afterAbsSum / Math.max(1, row.n),
+        improvement_deg: row.improvementSum / Math.max(1, row.n),
+      }))
+      .sort((a, b) => Math.abs(b.bearing_rate_deg_s) - Math.abs(a.bearing_rate_deg_s))
+  }, [observations])
+  if (!summary) return null
 
   function xEffective(effectiveBeastUs) {
     return padL + ((Number(effectiveBeastUs) - minEff) / spanEff) * plotInnerW
@@ -2013,6 +2052,12 @@ function SyncDebugPanel({ debug }) {
   function basisY(valueDeg) {
     const value = Math.max(-60, Math.min(60, Number(valueDeg)))
     return padT + ((60 - value) / 120) * plotInnerH
+  }
+  function xBearingRate(rateDegS) {
+    return padL + ((Math.max(-maxAbsRate, Math.min(maxAbsRate, Number(rateDegS))) + maxAbsRate) / (2 * maxAbsRate)) * plotInnerW
+  }
+  function yImprovement(valueDeg) {
+    return padT + ((improvementAbsMax - Number(valueDeg)) / (2 * improvementAbsMax)) * plotInnerH
   }
 
   const panelStyle = { padding: '8px', marginBottom: '0.7rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }
@@ -2038,6 +2083,9 @@ function SyncDebugPanel({ debug }) {
           <span className={styles.metricPill}>Predictors <span className={styles.metricValue}>{predictorOk ? 'consistent' : 'CHECK'}</span></span>
           <span className={styles.metricPill}>Fit <span className={styles.metricValue}>{fitCount}/{observations.length}</span></span>
           <span className={styles.metricPill}>Display-only <span className={styles.metricValue}>{nonFitCount}</span></span>
+          <span className={styles.metricPill}>Motion <span className={styles.metricValue}>{summary.motion_comp_phase_enabled ? 'enabled' : 'off'}</span></span>
+          <span className={styles.metricPill}>Motion applied <span className={styles.metricValue}>{motionAppliedCount}</span></span>
+          <span className={styles.metricPill}>Motion Δ|res| <span className={styles.metricValue}>{fmtNumber(meanMotionImprovement, 2, '°')}</span></span>
         </div>
       </div>
 
@@ -2048,6 +2096,10 @@ function SyncDebugPanel({ debug }) {
         <div>Raw vs effective max <span className={styles.metricValue}>{fmtNumber(summary.max_raw_vs_effective_prediction_delta_deg, 3, '°')}</span></div>
         <div>Wall vs effective max <span className={styles.metricValue}>{fmtNumber(summary.max_wall_vs_effective_prediction_delta_deg, 3, '°')}</span></div>
         <div>Wall roundtrip max <span className={styles.metricValue}>{fmtNumber(summary.max_wall_roundtrip_error_us, 1, 'µs')}</span></div>
+        <div>Motion applied <span className={styles.metricValue}>{motionAppliedCount}/{observations.length}</span></div>
+        <div>Motion Δt mean <span className={styles.metricValue}>{fmtNumber(meanMotionDtUs, 1, 'µs')}</span></div>
+        <div>Motion Δ|res| mean <span className={styles.metricValue}>{fmtNumber(meanMotionImprovement, 2, '°')}</span></div>
+        <div>High-rate before/after <span className={styles.metricValue}>{fmtNumber(summary.high_rate_mean_abs_residual_without_motion_deg, 2, '°')} / {fmtNumber(summary.high_rate_mean_abs_residual_with_motion_deg, 2, '°')}</span></div>
       </div>
 
       <div style={{ overflowX: 'auto', border: '1px solid #30363d', marginBottom: '0.6rem' }}>
@@ -2059,6 +2111,11 @@ function SyncDebugPanel({ debug }) {
               <th style={thStyle}>effective Beast</th>
               <th style={thStyle}>true</th>
               <th style={thStyle}>auth</th>
+              <th style={thStyle}>rate</th>
+              <th style={thStyle}>mot µs</th>
+              <th style={thStyle}>before</th>
+              <th style={thStyle}>after</th>
+              <th style={thStyle}>Δ|res|</th>
               <th style={thStyle}>localiser</th>
               <th style={thStyle}>position</th>
               <th style={thStyle}>burst</th>
@@ -2078,6 +2135,11 @@ function SyncDebugPanel({ debug }) {
                   <td style={tdRight}>{fmtUs(obs.effective_beast_us)}</td>
                   <td style={tdRight}>{fmtNumber(obs.true_bearing_deg, 1, '°')}</td>
                   <td style={tdRight}>{fmtNumber(obs.pred_authoritative_deg, 1, '°')}</td>
+                  <td style={tdRight}>{fmtNumber(obs.bearing_rate_deg_s, 3, '°/s')}</td>
+                  <td style={tdRight}>{fmtNumber(obs.motion_comp_dt_us, 1)}</td>
+                  <td style={tdRight}>{fmtNumber(obs.resid_without_motion_deg, 2, '°')}</td>
+                  <td style={tdRight}>{fmtNumber(obs.resid_with_motion_deg ?? obs.resid_authoritative_deg, 2, '°')}</td>
+                  <td style={tdRight}>{fmtNumber(obs.motion_comp_improvement_deg, 2, '°')}</td>
                   <td style={tdRight}>{fmtNumber(obs.pred_localiser_live_deg, 1, '°')}</td>
                   <td style={tdRight}>{fmtNumber(obs.pred_position_verification_deg, 1, '°')}</td>
                   <td style={tdRight}>{fmtNumber(obs.pred_burst_sync_deg, 1, '°')}</td>
@@ -2093,6 +2155,40 @@ function SyncDebugPanel({ debug }) {
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '10px' }}>
+        <div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>Residual vs bearing rate</div>
+          <svg width="100%" height={plotH} viewBox={`0 0 ${plotW} ${plotH}`} style={{ background: '#0f141b', border: '1px solid #30363d' }}>
+            <line x1={padL} y1={yResidual(0)} x2={plotW - padR} y2={yResidual(0)} stroke="#58a6ff88" />
+            <line x1={xBearingRate(0)} y1={padT} x2={xBearingRate(0)} y2={plotH - padB} stroke="#30363d" strokeDasharray="3 5" />
+            {motionRows.map((obs, idx) => (
+              <g key={idx}>
+                <circle cx={xBearingRate(obs.bearing_rate_deg_s)} cy={yResidual(obs.resid_without_motion_deg)}
+                        r={2.2} fill="#ff7b72" opacity={0.55} />
+                <circle cx={xBearingRate(obs.bearing_rate_deg_s)} cy={yResidual(obs.resid_with_motion_deg ?? obs.resid_authoritative_deg)}
+                        r={2.3} fill="#3fb950" opacity={0.82} />
+              </g>
+            ))}
+            <text x={padL} y={plotH - 8} fill="#ff7b72" fontSize="9">before</text>
+            <text x={padL + 48} y={plotH - 8} fill="#3fb950" fontSize="9">after</text>
+            <text x={4} y={12} fill="#8b949e" fontSize="9">±{residualAbsMax.toFixed(0)}°</text>
+          </svg>
+        </div>
+        <div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>Residual improvement by bearing rate</div>
+          <svg width="100%" height={plotH} viewBox={`0 0 ${plotW} ${plotH}`} style={{ background: '#0f141b', border: '1px solid #30363d' }}>
+            <line x1={padL} y1={yImprovement(0)} x2={plotW - padR} y2={yImprovement(0)} stroke="#58a6ff88" />
+            <line x1={xBearingRate(0)} y1={padT} x2={xBearingRate(0)} y2={plotH - padB} stroke="#30363d" strokeDasharray="3 5" />
+            {motionRows.map((obs, idx) => {
+              const improvement = Number(obs.motion_comp_improvement_deg)
+              return Number.isFinite(improvement) ? (
+                <circle key={idx} cx={xBearingRate(obs.bearing_rate_deg_s)} cy={yImprovement(improvement)}
+                        r={obs.motion_comp_applied ? 2.6 : 1.9} fill={improvement >= 0 ? '#3fb950' : '#ff7b72'} opacity={obs.motion_comp_applied ? 0.82 : 0.35} />
+              ) : null
+            })}
+            <text x={padL} y={plotH - 8} fill="#8b949e" fontSize="9">positive means smaller residual</text>
+            <text x={4} y={12} fill="#8b949e" fontSize="9">±{improvementAbsMax.toFixed(0)}°</text>
+          </svg>
+        </div>
         <div>
           <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>Residual vs effective Beast time</div>
           <svg width="100%" height={plotH} viewBox={`0 0 ${plotW} ${plotH}`} style={{ background: '#0f141b', border: '1px solid #30363d' }}>
@@ -2142,6 +2238,33 @@ function SyncDebugPanel({ debug }) {
               <span>pred {fmtNumber(obs.pred_after_waveform_deg, 1, '°')}</span>
             </div>
           ))}
+        </div>
+        <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '6px', fontSize: '0.72rem', overflow: 'auto' }}>
+          <div style={{ color: '#8b949e', marginBottom: '4px' }}>Per-aircraft motion compensation</div>
+          <table style={tableStyle}>
+            <thead>
+              <tr>
+                <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
+                <th style={thStyle}>rate</th>
+                <th style={thStyle}>before</th>
+                <th style={thStyle}>after</th>
+                <th style={thStyle}>Δ|res|</th>
+                <th style={thStyle}>n</th>
+              </tr>
+            </thead>
+            <tbody>
+              {motionByIcao.slice(0, 12).map(row => (
+                <tr key={row.icao}>
+                  <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{row.icao}</td>
+                  <td style={tdRight}>{fmtNumber(row.bearing_rate_deg_s, 3, '°/s')}</td>
+                  <td style={tdRight}>{fmtNumber(row.before_abs_deg, 2, '°')}</td>
+                  <td style={tdRight}>{fmtNumber(row.after_abs_deg, 2, '°')}</td>
+                  <td style={tdRight}>{fmtNumber(row.improvement_deg, 2, '°')}</td>
+                  <td style={tdRight}>{row.n}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
     </div>

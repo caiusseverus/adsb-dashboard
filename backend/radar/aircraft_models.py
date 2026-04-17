@@ -25,6 +25,9 @@ class Stage3LiveDetection:
     truth_lon: float | None = None
     position_age_seconds: float | None = None
     association_confidence: float = 1.0
+    bearing_rate_deg_s: float | None = None
+    motion_comp_dt_us: float | None = None
+    motion_comp_block_reason: str | None = None
 
 
 @dataclass
