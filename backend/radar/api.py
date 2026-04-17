@@ -1283,6 +1283,34 @@ async def get_burst_sync_timeline(iid: int, window_s: float = Query(default=60.0
         _record_api_timing("burst_sync_timeline", t0)
 
 
+@router.get("/iids/{iid}/sync-debug")
+async def get_iid_sync_debug(
+    iid: int,
+    window_s: float = Query(default=60.0, ge=10, le=300),
+    limit: int = Query(default=80, ge=1, le=300),
+):
+    """Targeted sync consistency diagnostics for one IID.
+
+    The payload compares authoritative, localiser-live, position-verification,
+    and burst-sync predictions for the exact same burst-centre observations.
+    Wall-clock-derived prediction is included only as a diagnostic comparison;
+    operational sync math remains Beast-relative.
+    """
+    t0 = time.perf_counter()
+    try:
+        if _state is None:
+            return {
+                "iid": iid,
+                "available": False,
+                "reason": "radar module not initialised",
+                "observations": [],
+                "summary": {"iid": iid, "wall_clock_used_operationally": False},
+            }
+        return _state.get_sync_debug_payload(iid, window_s=window_s, limit=limit)
+    finally:
+        _record_api_timing("sync_debug", t0)
+
+
 @router.get("/iids/{iid}/rotation")
 async def get_iid_rotation(iid: int):
     """Current rotation model for a single IID."""

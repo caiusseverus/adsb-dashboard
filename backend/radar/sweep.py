@@ -428,6 +428,13 @@ def _compute_sync_residual_deg(
     return (new_offset_deg - existing_at_new_epoch + 540.0) % 360.0 - 180.0
 
 
+def _circular_delta_deg(a_deg: float | None, b_deg: float | None) -> float | None:
+    """Signed circular delta a-b in degrees, or None when either side is absent."""
+    if a_deg is None or b_deg is None:
+        return None
+    return (a_deg - b_deg + 540.0) % 360.0 - 180.0
+
+
 # One-way speed-of-light delay per nautical mile, microseconds.
 # c = 299792458 m/s, 1 NM = 1852 m → 1 NM ≈ 6.18 µs.
 _US_PER_NM_LIGHT = 1852.0 / 299792458.0 * 1e6
@@ -4131,6 +4138,287 @@ class RadarState:
             "slope_history": slope_history,
             "period_history": period_history,
             "predictor_consistency": getattr(sync, "predictor_consistency", None),
+        }
+
+    def get_sync_debug_payload(self, iid: int, window_s: float = 60.0, limit: int = 80) -> dict:
+        """Return per-observation sync consistency diagnostics for one IID.
+
+        Operational sync math in this payload is Beast-relative.  The
+        authoritative prediction uses the burst-centre Beast timestamp and lets
+        predict_sync_observation() derive `effective_beast_us` after propagation
+        correction when enabled.  Wall-clock conversion is computed only as an
+        explicit diagnostic comparison and is never fed back into sync state.
+        """
+        with self._lock:
+            sync = self._live_sync_states.get(iid)
+            obs_buf = self._live_burst_timeline_obs.get(iid)
+            if obs_buf is None:
+                obs_buf = self._live_aligned_burst_obs.get(iid)
+            obs_snapshot = list(obs_buf) if obs_buf else []
+            waveform_bins = list(self._live_waveform_bins.get(iid) or [])
+            icao_quality = dict(self._live_icao_sync_quality.get(iid) or {})
+            latest_arrival_beast_us = self._iid_latest_arrival_us.get(iid)
+
+        if sync is None:
+            return {
+                "iid": iid,
+                "available": False,
+                "reason": "sync_state_unavailable",
+                "observations": [],
+                "summary": {
+                    "iid": iid,
+                    "wall_clock_used_operationally": False,
+                },
+            }
+
+        now_ts = time.time()
+        cutoff_ts = now_ts - window_s
+        recent_obs = [obs for obs in obs_snapshot if obs.ts >= cutoff_ts]
+        recent_obs.sort(key=lambda obs: obs.burst_centroid_us)
+        if limit > 0:
+            recent_obs = recent_obs[-limit:]
+
+        def _predict_from_beast_input(input_beast_us: float | None) -> SyncPrediction | None:
+            if input_beast_us is None:
+                return None
+            return predict_sync_observation(
+                sync,
+                input_beast_us,
+                range_nm=None,
+                waveform_bins=waveform_bins,
+                apply_propagation=False,
+            )
+
+        def _mean_abs(values: list[float | None]) -> float | None:
+            clean = [abs(v) for v in values if v is not None]
+            return (sum(clean) / len(clean)) if clean else None
+
+        def _max_abs(values: list[float | None]) -> float | None:
+            clean = [abs(v) for v in values if v is not None]
+            return max(clean) if clean else None
+
+        observations: list[dict] = []
+        localiser_deltas: list[float | None] = []
+        position_deltas: list[float | None] = []
+        burstsync_deltas: list[float | None] = []
+        raw_effective_deltas: list[float | None] = []
+        wall_effective_deltas: list[float | None] = []
+        roundtrip_errors: list[float | None] = []
+
+        localiser_predictor = None
+        try:
+            from .aircraft_localiser import predict_localiser_live_path_bearing
+            localiser_predictor = predict_localiser_live_path_bearing
+        except Exception:
+            localiser_predictor = None
+
+        for obs in recent_obs:
+            raw_arrival_beast_us = float(getattr(obs, "raw_arrival_us", obs.burst_centroid_us) or obs.burst_centroid_us)
+            burst_center_beast_us = float(obs.burst_centroid_us)
+            range_nm = getattr(obs, "range_nm", None)
+            authoritative = predict_sync_observation(
+                sync,
+                burst_center_beast_us,
+                range_nm=range_nm,
+                waveform_bins=waveform_bins,
+            )
+            effective_beast_us = authoritative.effective_arrival_us
+
+            pred_using_raw = _predict_from_beast_input(raw_arrival_beast_us)
+            pred_using_burst_center = _predict_from_beast_input(burst_center_beast_us)
+            pred_using_effective = _predict_from_beast_input(effective_beast_us)
+
+            wall_clock_beast_us = None
+            if latest_arrival_beast_us is not None:
+                wall_clock_beast_us = latest_arrival_beast_us - max(0.0, now_ts - obs.ts) * 1_000_000.0
+            pred_using_wall = _predict_from_beast_input(wall_clock_beast_us)
+            wall_roundtrip_error_us = (
+                wall_clock_beast_us - burst_center_beast_us
+                if wall_clock_beast_us is not None else None
+            )
+
+            if localiser_predictor is not None:
+                pred_localiser_live_deg = localiser_predictor(
+                    sync,
+                    burst_center_beast_us,
+                    range_nm=range_nm,
+                    waveform_bins=waveform_bins,
+                )
+            else:
+                pred_localiser_live_deg = authoritative.predicted_bearing_deg
+
+            # Backend-side mirrors of the frontend position-verification and
+            # burst-sync paths.  Keeping these here makes path comparison depend
+            # on one backend implementation, not a frontend reimplementation.
+            pred_position_verification_deg = predict_sync_observation(
+                sync,
+                burst_center_beast_us,
+                range_nm=range_nm,
+                waveform_bins=waveform_bins,
+            ).predicted_bearing_deg
+            pred_burst_sync_deg = authoritative.predicted_bearing_deg
+
+            pred_authoritative_deg = authoritative.predicted_bearing_deg
+            resid_authoritative_deg = _circular_delta_deg(obs.bearing_deg, pred_authoritative_deg)
+            resid_localiser_deg = _circular_delta_deg(obs.bearing_deg, pred_localiser_live_deg)
+            resid_position_deg = _circular_delta_deg(obs.bearing_deg, pred_position_verification_deg)
+            resid_burstsync_deg = _circular_delta_deg(obs.bearing_deg, pred_burst_sync_deg)
+
+            delta_localiser = _circular_delta_deg(pred_localiser_live_deg, pred_authoritative_deg)
+            delta_position = _circular_delta_deg(pred_position_verification_deg, pred_authoritative_deg)
+            delta_burstsync = _circular_delta_deg(pred_burst_sync_deg, pred_authoritative_deg)
+            delta_raw_effective = _circular_delta_deg(
+                pred_using_raw.predicted_bearing_deg if pred_using_raw else None,
+                pred_using_effective.predicted_bearing_deg if pred_using_effective else None,
+            )
+            delta_wall_effective = _circular_delta_deg(
+                pred_using_wall.predicted_bearing_deg if pred_using_wall else None,
+                pred_using_effective.predicted_bearing_deg if pred_using_effective else None,
+            )
+
+            abs_r = abs(resid_authoritative_deg or 0.0)
+            classification = self._classify_sync_residual(abs_r)
+            weight = self._score_sync_burst_observation(obs)
+            q_entry = icao_quality.get(obs.icao)
+            fit_reject_reason = None
+            if not getattr(obs, "sync_update_eligible", True):
+                fit_reject_reason = "not_sync_update_eligible"
+            elif abs_r >= 150.0:
+                fit_reject_reason = "near_wrap_residual"
+            elif abs_r > 35.0:
+                fit_reject_reason = "residual_gate"
+            elif obs.pos_age_s > 8.0:
+                fit_reject_reason = "stale_position"
+            elif q_entry is not None and q_entry.n_recent >= 6 and (
+                q_entry.residual_mad_deg > 25.0 or abs(q_entry.residual_median_deg) > 45.0
+            ):
+                fit_reject_reason = "poor_icao_quality"
+            elif classification == "rejected" or weight <= 0:
+                fit_reject_reason = "zero_weight"
+
+            period_us = sync.period_s * 1_000_000.0
+            phase_from_period_only_deg = (
+                ((effective_beast_us / period_us) * 360.0) % 360.0
+                if period_us > 0 else None
+            )
+            phase_after_epoch_deg = authoritative.phase_in_rot_deg
+
+            observations.append({
+                "iid": iid,
+                "icao": obs.icao,
+                "raw_arrival_beast_us": raw_arrival_beast_us,
+                "burst_center_beast_us": burst_center_beast_us,
+                "effective_beast_us": effective_beast_us,
+                "prop_delay_us": authoritative.propagation_correction_us,
+                "wall_ts": obs.ts,
+                "range_nm": range_nm,
+                "true_bearing_deg": obs.bearing_deg,
+                "pred_authoritative_deg": pred_authoritative_deg,
+                "phase_authoritative_deg": authoritative.phase_in_rot_deg,
+                "pred_localiser_live_deg": pred_localiser_live_deg,
+                "pred_position_verification_deg": pred_position_verification_deg,
+                "pred_burst_sync_deg": pred_burst_sync_deg,
+                "pred_using_raw_beast_deg": pred_using_raw.predicted_bearing_deg if pred_using_raw else None,
+                "pred_using_burst_center_deg": pred_using_burst_center.predicted_bearing_deg if pred_using_burst_center else None,
+                "pred_using_effective_beast_deg": pred_using_effective.predicted_bearing_deg if pred_using_effective else None,
+                "pred_using_wall_clock_deg": pred_using_wall.predicted_bearing_deg if pred_using_wall else None,
+                "resid_authoritative_deg": resid_authoritative_deg,
+                "resid_localiser_deg": resid_localiser_deg,
+                "resid_position_verification_deg": resid_position_deg,
+                "resid_burst_sync_deg": resid_burstsync_deg,
+                "delta_localiser_vs_authoritative_deg": delta_localiser,
+                "delta_position_vs_authoritative_deg": delta_position,
+                "delta_burstsync_vs_authoritative_deg": delta_burstsync,
+                "delta_raw_vs_effective_deg": delta_raw_effective,
+                "delta_wall_vs_effective_deg": delta_wall_effective,
+                "fit_eligible": fit_reject_reason is None,
+                "fit_reject_reason": fit_reject_reason,
+                "sync_update_eligible": bool(getattr(obs, "sync_update_eligible", True)),
+                "phase_from_period_only_deg": phase_from_period_only_deg,
+                "phase_after_epoch_deg": phase_after_epoch_deg,
+                "waveform_correction_deg": authoritative.waveform_correction_deg,
+                "pred_after_waveform_deg": pred_authoritative_deg,
+                "wall_to_beast_roundtrip_error_us": wall_roundtrip_error_us,
+                "classification": classification,
+                "weight": weight,
+                "n_replies": obs.n_replies,
+                "pos_age_s": obs.pos_age_s,
+                "signal_dbfs": obs.signal_dbfs,
+                "burst_center_method": getattr(obs, "burst_center_method", "centroid"),
+                "burst_center_simple_us": getattr(obs, "burst_center_simple_us", None),
+                "burst_center_weighted_us": getattr(obs, "burst_center_weighted_us", None),
+                "burst_center_delta_us": getattr(obs, "burst_center_delta_us", None),
+            })
+
+            localiser_deltas.append(delta_localiser)
+            position_deltas.append(delta_position)
+            burstsync_deltas.append(delta_burstsync)
+            raw_effective_deltas.append(delta_raw_effective)
+            wall_effective_deltas.append(delta_wall_effective)
+            roundtrip_errors.append(wall_roundtrip_error_us)
+
+        tolerance_deg = 0.05
+        summary = {
+            "iid": iid,
+            "available": True,
+            "window_s": window_s,
+            "observation_count": len(observations),
+            "wall_clock_used_operationally": False,
+            "operational_time_basis": "effective_beast_us",
+            "current_period_s": sync.period_s,
+            "base_period_s": getattr(sync, "period_base_s", None),
+            "current_slope_deg_per_s": getattr(sync, "residual_slope_deg_per_s", None),
+            "phase_epoch_us": sync.phase_epoch_us,
+            "phase_offset_deg": sync.phase_offset_deg,
+            "fit_total_observations": getattr(sync, "fit_total_observations", None),
+            "fit_eligible_observations": getattr(sync, "fit_eligible_observations", None),
+            "fit_rejected_observations": getattr(sync, "fit_rejected_observations", None),
+            "fit_reject_counts": getattr(sync, "fit_reject_reasons", None),
+            "period_refine_block_reason": getattr(sync, "period_refine_block_reason", None),
+            "waveform_enabled": getattr(sync, "waveform_enabled", None),
+            "waveform_applied": getattr(sync, "waveform_applied", None),
+            "prop_delay_enabled": getattr(sync, "prop_delay_enabled", None),
+            "predictor_consistency_tolerance_deg": tolerance_deg,
+            "predictors_consistent_localiser": (_max_abs(localiser_deltas) or 0.0) <= tolerance_deg,
+            "predictors_consistent_position_verification": (_max_abs(position_deltas) or 0.0) <= tolerance_deg,
+            "predictors_consistent_burst_sync": (_max_abs(burstsync_deltas) or 0.0) <= tolerance_deg,
+            "mean_delta_localiser_vs_authoritative_deg": _mean_abs(localiser_deltas),
+            "max_delta_localiser_vs_authoritative_deg": _max_abs(localiser_deltas),
+            "mean_delta_position_vs_authoritative_deg": _mean_abs(position_deltas),
+            "max_delta_position_vs_authoritative_deg": _max_abs(position_deltas),
+            "mean_delta_burstsync_vs_authoritative_deg": _mean_abs(burstsync_deltas),
+            "max_delta_burstsync_vs_authoritative_deg": _max_abs(burstsync_deltas),
+            "mean_wall_roundtrip_error_us": _mean_abs(roundtrip_errors),
+            "max_wall_roundtrip_error_us": _max_abs(roundtrip_errors),
+            "mean_raw_vs_effective_prediction_delta_deg": _mean_abs(raw_effective_deltas),
+            "max_raw_vs_effective_prediction_delta_deg": _max_abs(raw_effective_deltas),
+            "mean_wall_vs_effective_prediction_delta_deg": _mean_abs(wall_effective_deltas),
+            "max_wall_vs_effective_prediction_delta_deg": _max_abs(wall_effective_deltas),
+            "predictor_consistency_metrics": {
+                "localiser": {
+                    "mean_abs_delta_deg": _mean_abs(localiser_deltas),
+                    "max_abs_delta_deg": _max_abs(localiser_deltas),
+                    "tolerance_deg": tolerance_deg,
+                },
+                "position_verification": {
+                    "mean_abs_delta_deg": _mean_abs(position_deltas),
+                    "max_abs_delta_deg": _max_abs(position_deltas),
+                    "tolerance_deg": tolerance_deg,
+                },
+                "burst_sync": {
+                    "mean_abs_delta_deg": _mean_abs(burstsync_deltas),
+                    "max_abs_delta_deg": _max_abs(burstsync_deltas),
+                    "tolerance_deg": tolerance_deg,
+                },
+            },
+        }
+
+        return {
+            "iid": iid,
+            "available": True,
+            "sync_state": _live_sync_state_to_dict(sync),
+            "summary": summary,
+            "observations": observations,
         }
 
     def get_dwell_profile(self, iid: int, icao: str, sweep_idx: int | None = None) -> list[dict]:

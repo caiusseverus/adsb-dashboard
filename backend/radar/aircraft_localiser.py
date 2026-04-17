@@ -624,6 +624,28 @@ def _new_track(fix: AircraftFix, now: float) -> AircraftTrackState:
     )
 
 
+def predict_localiser_live_path_bearing(
+    sync_state: "LiveSyncState",
+    arrival_beast_us: float,
+    *,
+    range_nm: float | None = None,
+    waveform_bins: list | None = None,
+) -> float:
+    """Backend-localiser live predictor before calibration offset.
+
+    This helper exists for sync-debug path comparison.  The operational
+    localiser calls the same authoritative predictor inside
+    _bearing_from_live_detection(); wall-clock timestamps are not accepted here.
+    """
+    prediction = predict_sync_observation(
+        sync_state,
+        arrival_beast_us,
+        range_nm=range_nm,
+        waveform_bins=waveform_bins,
+    )
+    return prediction.predicted_bearing_deg
+
+
 # ---------------------------------------------------------------------------
 # Main AircraftLocaliser class
 # ---------------------------------------------------------------------------

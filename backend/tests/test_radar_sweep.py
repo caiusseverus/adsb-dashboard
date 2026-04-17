@@ -413,6 +413,60 @@ def test_get_burst_sync_timeline_includes_non_sync_driving_observations():
     assert timeline["predictor_consistency"] is not None
 
 
+def test_get_sync_debug_payload_compares_predictor_paths_on_same_observation(monkeypatch):
+    state = RadarState()
+    now_ts = 1_000.0
+    state._iid_latest_arrival_us[7] = 8_200_000.0
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=now_ts,
+        source="multi_aircraft_burst",
+        usable=True,
+        prop_delay_enabled=True,
+    )
+    state._live_burst_timeline_obs[7] = deque([
+        AlignedBurstSyncObs(
+            burst_centroid_us=8_200_000.0,
+            icao="BBBBBB",
+            bearing_deg=20.0,
+            n_replies=4,
+            signal_dbfs=-15.0,
+            pos_age_s=0.3,
+            range_nm=18.0,
+            ts=now_ts,
+            sync_update_eligible=True,
+            raw_arrival_us=8_200_000.0,
+        ),
+    ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+
+    monkeypatch.setattr("radar.sweep.time.time", lambda: now_ts)
+    payload = state.get_sync_debug_payload(7, window_s=60.0)
+
+    assert payload["summary"]["wall_clock_used_operationally"] is False
+    assert payload["summary"]["operational_time_basis"] == "effective_beast_us"
+    assert payload["summary"]["predictors_consistent_localiser"] is True
+    assert payload["summary"]["predictors_consistent_position_verification"] is True
+    assert payload["summary"]["predictors_consistent_burst_sync"] is True
+
+    obs = payload["observations"][0]
+    assert obs["raw_arrival_beast_us"] == pytest.approx(8_200_000.0)
+    assert obs["burst_center_beast_us"] == pytest.approx(8_200_000.0)
+    assert obs["effective_beast_us"] < obs["burst_center_beast_us"]
+    assert obs["prop_delay_us"] > 0.0
+    assert obs["pred_authoritative_deg"] == pytest.approx(obs["pred_using_effective_beast_deg"])
+    assert obs["pred_using_wall_clock_deg"] is not None
+    assert obs["wall_to_beast_roundtrip_error_us"] == pytest.approx(0.0)
+    assert obs["delta_localiser_vs_authoritative_deg"] == pytest.approx(0.0)
+    assert obs["delta_position_vs_authoritative_deg"] == pytest.approx(0.0)
+    assert obs["delta_burstsync_vs_authoritative_deg"] == pytest.approx(0.0)
+    assert obs["fit_eligible"] is True
+
+
 def test_authoritative_sync_predictor_applies_prop_and_waveform():
     sync = LiveSyncState(
         iid=7,

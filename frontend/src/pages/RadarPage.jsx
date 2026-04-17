@@ -1713,6 +1713,39 @@ function useBurstSyncTimeline(iid, windowS, pollMs = BURST_SYNC_POLL_MS) {
   return { data, loading }
 }
 
+function useSyncDebug(iid, windowS, pollMs = BURST_SYNC_POLL_MS) {
+  const [data, setData] = useState(null)
+
+  useEffect(() => {
+    if (iid == null) {
+      setData(null)
+      return
+    }
+    let cancelled = false
+    let intervalId = null
+
+    async function pollOnce() {
+      try {
+        const response = await fetch(`${API_BASE}/api/radar/iids/${iid}/sync-debug?window_s=${windowS}&limit=120`)
+        if (!response.ok) return
+        const payload = await response.json()
+        if (cancelled) return
+        startTransition(() => setData(payload))
+      } catch {
+      }
+    }
+
+    pollOnce()
+    intervalId = setInterval(pollOnce, pollMs)
+    return () => {
+      cancelled = true
+      clearInterval(intervalId)
+    }
+  }, [iid, pollMs, windowS])
+
+  return data
+}
+
 const legendDotStyle = {
   width: '0.55rem',
   height: '0.55rem',
@@ -1922,6 +1955,199 @@ function SyncDiagnosticsPanel({
   )
 }
 
+function fmtNumber(value, digits = 2, suffix = '') {
+  const n = Number(value)
+  return Number.isFinite(n) ? `${n.toFixed(digits)}${suffix}` : '-'
+}
+
+function fmtUs(value) {
+  const n = Number(value)
+  return Number.isFinite(n) ? `${Math.round(n)}` : '-'
+}
+
+function SyncDebugPanel({ debug }) {
+  const summary = debug?.summary ?? null
+  const observations = Array.isArray(debug?.observations) ? debug.observations : []
+  const byIcao = useMemo(() => {
+    const first = new Map()
+    const rows = []
+    for (const obs of observations) {
+      const icao = obs?.icao
+      const eff = Number(obs?.effective_beast_us)
+      const resid = Number(obs?.resid_authoritative_deg)
+      if (!icao || !Number.isFinite(eff) || !Number.isFinite(resid)) continue
+      if (!first.has(icao)) first.set(icao, eff)
+      rows.push({ ...obs, relative_us: eff - first.get(icao) })
+    }
+    return rows
+  }, [observations])
+  if (!summary) return null
+
+  const latest = observations.slice(-36)
+  const fitCount = observations.filter(obs => obs.fit_eligible).length
+  const nonFitCount = observations.length - fitCount
+  const plotW = 720
+  const plotH = 160
+  const padL = 48
+  const padR = 16
+  const padT = 14
+  const padB = 28
+  const plotInnerW = plotW - padL - padR
+  const plotInnerH = plotH - padT - padB
+  const effValues = observations.map(obs => Number(obs.effective_beast_us)).filter(Number.isFinite)
+  const minEff = effValues.length ? Math.min(...effValues) : 0
+  const maxEff = effValues.length ? Math.max(...effValues) : minEff + 1
+  const spanEff = Math.max(1, maxEff - minEff)
+  const residualAbsMax = Math.min(180, Math.max(20, ...observations.map(obs => Math.abs(Number(obs.resid_authoritative_deg ?? 0))).filter(Number.isFinite), 20))
+  const maxRelUs = Math.max(1, ...byIcao.map(obs => Number(obs.relative_us)).filter(Number.isFinite))
+
+  function xEffective(effectiveBeastUs) {
+    return padL + ((Number(effectiveBeastUs) - minEff) / spanEff) * plotInnerW
+  }
+  function xRelative(relativeUs) {
+    return padL + (Number(relativeUs) / maxRelUs) * plotInnerW
+  }
+  function yResidual(residualDeg) {
+    return padT + ((residualAbsMax - Number(residualDeg)) / (2 * residualAbsMax)) * plotInnerH
+  }
+  function basisY(valueDeg) {
+    const value = Math.max(-60, Math.min(60, Number(valueDeg)))
+    return padT + ((60 - value) / 120) * plotInnerH
+  }
+
+  const panelStyle = { padding: '8px', marginBottom: '0.7rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }
+  const tableStyle = { width: '100%', borderCollapse: 'collapse', fontSize: '0.7rem' }
+  const thStyle = { textAlign: 'right', padding: '2px 5px', color: '#8b949e', whiteSpace: 'nowrap' }
+  const tdRight = { textAlign: 'right', padding: '2px 5px', fontFamily: 'SFMono-Regular, Consolas, monospace', whiteSpace: 'nowrap' }
+  const tdLeft = { textAlign: 'left', padding: '2px 5px', whiteSpace: 'nowrap' }
+  const flagOk = summary.wall_clock_used_operationally === false
+  const predictorOk = Boolean(summary.predictors_consistent_localiser)
+    && Boolean(summary.predictors_consistent_position_verification)
+    && Boolean(summary.predictors_consistent_burst_sync)
+
+  return (
+    <div style={panelStyle}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.4rem' }}>
+        <div>
+          <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Sync Debug</div>
+          <div style={{ color: '#8b949e', fontSize: '0.74rem' }}>Same observation, backend-computed predictor paths, explicit Beast and wall-clock basis.</div>
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: '4px', fontSize: '0.72rem' }}>
+          <span className={styles.metricPill}>Operational time <span className={styles.metricValue}>{summary.operational_time_basis || 'effective_beast_us'}</span></span>
+          <span className={styles.metricPill}>Wall operational <span className={styles.metricValue}>{flagOk ? 'false' : 'CHECK'}</span></span>
+          <span className={styles.metricPill}>Predictors <span className={styles.metricValue}>{predictorOk ? 'consistent' : 'CHECK'}</span></span>
+          <span className={styles.metricPill}>Fit <span className={styles.metricValue}>{fitCount}/{observations.length}</span></span>
+          <span className={styles.metricPill}>Display-only <span className={styles.metricValue}>{nonFitCount}</span></span>
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '6px', marginBottom: '0.5rem', fontSize: '0.72rem' }}>
+        <div>Period <span className={styles.metricValue}>{fmtNumber(summary.current_period_s, 6, 's')}</span></div>
+        <div>Base <span className={styles.metricValue}>{fmtNumber(summary.base_period_s, 6, 's')}</span></div>
+        <div>Slope <span className={styles.metricValue}>{fmtNumber(summary.current_slope_deg_per_s, 4, '°/s')}</span></div>
+        <div>Raw vs effective max <span className={styles.metricValue}>{fmtNumber(summary.max_raw_vs_effective_prediction_delta_deg, 3, '°')}</span></div>
+        <div>Wall vs effective max <span className={styles.metricValue}>{fmtNumber(summary.max_wall_vs_effective_prediction_delta_deg, 3, '°')}</span></div>
+        <div>Wall roundtrip max <span className={styles.metricValue}>{fmtNumber(summary.max_wall_roundtrip_error_us, 1, 'µs')}</span></div>
+      </div>
+
+      <div style={{ overflowX: 'auto', border: '1px solid #30363d', marginBottom: '0.6rem' }}>
+        <table style={tableStyle}>
+          <thead>
+            <tr>
+              <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
+              <th style={thStyle}>raw Beast</th>
+              <th style={thStyle}>effective Beast</th>
+              <th style={thStyle}>true</th>
+              <th style={thStyle}>auth</th>
+              <th style={thStyle}>localiser</th>
+              <th style={thStyle}>position</th>
+              <th style={thStyle}>burst</th>
+              <th style={thStyle}>Δ loc</th>
+              <th style={thStyle}>Δ pos</th>
+              <th style={thStyle}>Δ burst</th>
+              <th style={{ ...thStyle, textAlign: 'left' }}>fit</th>
+            </tr>
+          </thead>
+          <tbody>
+            {latest.map((obs, idx) => {
+              const fit = obs.fit_eligible !== false
+              return (
+                <tr key={`${obs.icao}-${obs.burst_center_beast_us}-${idx}`} style={{ opacity: fit ? 1 : 0.55, borderTop: '1px solid #21262d' }}>
+                  <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</td>
+                  <td style={tdRight}>{fmtUs(obs.raw_arrival_beast_us)}</td>
+                  <td style={tdRight}>{fmtUs(obs.effective_beast_us)}</td>
+                  <td style={tdRight}>{fmtNumber(obs.true_bearing_deg, 1, '°')}</td>
+                  <td style={tdRight}>{fmtNumber(obs.pred_authoritative_deg, 1, '°')}</td>
+                  <td style={tdRight}>{fmtNumber(obs.pred_localiser_live_deg, 1, '°')}</td>
+                  <td style={tdRight}>{fmtNumber(obs.pred_position_verification_deg, 1, '°')}</td>
+                  <td style={tdRight}>{fmtNumber(obs.pred_burst_sync_deg, 1, '°')}</td>
+                  <td style={tdRight}>{fmtNumber(obs.delta_localiser_vs_authoritative_deg, 3, '°')}</td>
+                  <td style={tdRight}>{fmtNumber(obs.delta_position_vs_authoritative_deg, 3, '°')}</td>
+                  <td style={tdRight}>{fmtNumber(obs.delta_burstsync_vs_authoritative_deg, 3, '°')}</td>
+                  <td style={tdLeft}>{fit ? 'fit' : (obs.fit_reject_reason || 'display')}</td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '10px' }}>
+        <div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>Residual vs effective Beast time</div>
+          <svg width="100%" height={plotH} viewBox={`0 0 ${plotW} ${plotH}`} style={{ background: '#0f141b', border: '1px solid #30363d' }}>
+            <line x1={padL} y1={yResidual(0)} x2={plotW - padR} y2={yResidual(0)} stroke="#58a6ff88" />
+            {observations.map((obs, idx) => (
+              <circle key={idx} cx={xEffective(obs.effective_beast_us)} cy={yResidual(obs.resid_authoritative_deg)}
+                      r={obs.fit_eligible ? 2.5 : 1.8} fill={obs.fit_eligible ? '#3fb950' : '#8b949e'} opacity={obs.fit_eligible ? 0.9 : 0.35} />
+            ))}
+            <text x={padL} y={plotH - 8} fill="#8b949e" fontSize="9">effective Beast window</text>
+            <text x={4} y={12} fill="#8b949e" fontSize="9">±{residualAbsMax.toFixed(0)}°</text>
+          </svg>
+        </div>
+        <div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>Residual vs ICAO-relative effective time</div>
+          <svg width="100%" height={plotH} viewBox={`0 0 ${plotW} ${plotH}`} style={{ background: '#0f141b', border: '1px solid #30363d' }}>
+            <line x1={padL} y1={yResidual(0)} x2={plotW - padR} y2={yResidual(0)} stroke="#58a6ff88" />
+            {byIcao.map((obs, idx) => (
+              <circle key={idx} cx={xRelative(obs.relative_us)} cy={yResidual(obs.resid_authoritative_deg)}
+                      r={obs.fit_eligible ? 2.4 : 1.7} fill={obs.fit_eligible ? '#58a6ff' : '#8b949e'} opacity={obs.fit_eligible ? 0.85 : 0.35} />
+            ))}
+            <text x={padL} y={plotH - 8} fill="#8b949e" fontSize="9">time since each ICAO first effective Beast sample</text>
+          </svg>
+        </div>
+        <div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>Timestamp basis comparison</div>
+          <svg width="100%" height={plotH} viewBox={`0 0 ${plotW} ${plotH}`} style={{ background: '#0f141b', border: '1px solid #30363d' }}>
+            <line x1={padL} y1={basisY(0)} x2={plotW - padR} y2={basisY(0)} stroke="#58a6ff88" />
+            {observations.map((obs, idx) => (
+              <g key={idx}>
+                <circle cx={xEffective(obs.effective_beast_us)} cy={basisY(obs.delta_raw_vs_effective_deg)} r={2.1} fill="#d29922" opacity={0.75} />
+                <circle cx={xEffective(obs.effective_beast_us)} cy={basisY(obs.delta_wall_vs_effective_deg)} r={2.1} fill="#ff7b72" opacity={0.75} />
+              </g>
+            ))}
+            <text x={padL} y={plotH - 8} fill="#d29922" fontSize="9">raw-effective</text>
+            <text x={padL + 92} y={plotH - 8} fill="#ff7b72" fontSize="9">wall-effective</text>
+            <text x={4} y={12} fill="#8b949e" fontSize="9">±60°</text>
+          </svg>
+        </div>
+        <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '6px', fontSize: '0.72rem' }}>
+          <div style={{ color: '#8b949e', marginBottom: '4px' }}>Phase decomposition</div>
+          {latest.slice(-6).map((obs, idx) => (
+            <div key={`${obs.icao}-${idx}`} style={{ display: 'grid', gridTemplateColumns: '5.5rem repeat(4, minmax(0, 1fr))', gap: '4px', opacity: obs.fit_eligible ? 1 : 0.58 }}>
+              <span style={{ fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</span>
+              <span>period {fmtNumber(obs.phase_from_period_only_deg, 1, '°')}</span>
+              <span>epoch {fmtNumber(obs.phase_after_epoch_deg, 1, '°')}</span>
+              <span>wave {fmtNumber(obs.waveform_correction_deg, 2, '°')}</span>
+              <span>pred {fmtNumber(obs.pred_after_waveform_deg, 1, '°')}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, rows, onSelectIid }) {
   const [alignmentMode, setAlignmentMode] = useState(BURST_SYNC_VIEW_MODE_RESIDUALS)
   const [rotation, setRotation] = useState(null)
@@ -1934,6 +2160,7 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
   const rotationCacheRef = useRef(new Map())
   const timelineCacheRef = useRef(new Map())
   const { data: burstTimeline, loading: burstLoading } = useBurstSyncTimeline(iid, BURST_SYNC_ALIGNMENT_WINDOW_S)
+  const syncDebug = useSyncDebug(iid, BURST_SYNC_ALIGNMENT_WINDOW_S)
   const timingPacket = useTimingEventStream({ enabled: iid != null, iid, df11Only: true })
   const timingView = useTimingEventBuffer(
     timingPacket,
@@ -2359,6 +2586,8 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
         periodHistory={burstTimeline?.period_history}
         predictorConsistency={burstTimeline?.predictor_consistency}
       />
+
+      <SyncDebugPanel debug={syncDebug} />
 
       {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS ? (
         <>

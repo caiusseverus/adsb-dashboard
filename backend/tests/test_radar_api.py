@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from radar import api as radar_api
 from radar.models import RadarIID, SweepFrame, SweepFrameObservation
-from radar.sweep import RadarState
+from radar.sweep import AlignedBurstSyncObs, LiveSyncState, RadarState
 
 
 def test_get_iids_reports_per_iid_last_seen_from_event_times():
@@ -93,6 +93,52 @@ def test_get_iid_timeline_includes_primary_harmonic_and_residual_classification(
     assert rows["CCCCCC"]["classification"] == "residual"
     assert rows["CCCCCC"]["multiplier"] is None
     assert [series["family"] for series in rows["CCCCCC"]["family_series"]] == ["residual"]
+
+
+def test_get_iid_sync_debug_endpoint_exposes_summary_and_observation(monkeypatch):
+    state = RadarState()
+    now_ts = 1_000.0
+    state._iid_latest_arrival_us[23] = 4_100_000.0
+    state._live_sync_states[23] = LiveSyncState(
+        iid=23,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=now_ts,
+        source="multi_aircraft_burst",
+        usable=True,
+    )
+    state._live_burst_timeline_obs[23] = deque([
+        AlignedBurstSyncObs(
+            burst_centroid_us=4_100_000.0,
+            icao="AAAAAA",
+            bearing_deg=9.0,
+            n_replies=4,
+            signal_dbfs=-18.0,
+            pos_age_s=0.4,
+            range_nm=12.0,
+            ts=now_ts,
+            sync_update_eligible=True,
+            raw_arrival_us=4_100_000.0,
+        )
+    ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+
+    prior_state = radar_api._state
+    radar_api._state = state
+    try:
+        monkeypatch.setattr("radar.sweep.time.time", lambda: now_ts)
+        payload = asyncio.run(radar_api.get_iid_sync_debug(23, window_s=60.0, limit=20))
+    finally:
+        radar_api._state = prior_state
+
+    assert payload["available"] is True
+    assert payload["summary"]["wall_clock_used_operationally"] is False
+    assert payload["summary"]["predictors_consistent_burst_sync"] is True
+    assert payload["observations"][0]["iid"] == 23
+    assert "pred_position_verification_deg" in payload["observations"][0]
+    assert "pred_using_wall_clock_deg" in payload["observations"][0]
 
 
 def test_get_iid_timeline_marks_non_primary_family_points_as_residual():

@@ -8,6 +8,34 @@ Source inputs:
 Prepared: 2026-04-04
 Updated: 2026-04-06
 
+## 2026-04-17 Radar Sync Consistency Diagnostic
+
+- [x] Inspect current backend predictor, burst-sync timeline, localiser, and Radar page wiring
+- [x] Add a dedicated per-IID sync-debug backend payload comparing one observation across all sync-sensitive paths
+- [x] Add summary consistency metrics for predictor deltas, time-basis deltas, roundtrip errors, fit support, and correction decomposition
+- [x] Expose the sync-debug payload through `/api/radar/iids/{iid}/sync-debug`
+- [x] Add a Radar page diagnostic panel with predictor table, residual-vs-effective-time, ICAO-relative residuals, timestamp-basis comparison, and phase decomposition
+- [x] Add/update focused backend coverage for payload fields and operational Beast-time rules
+- [x] Run backend/frontend verification and record results
+
+Plan confirmation: implement a focused diagnostics-only patch. Operational prediction remains Beast-relative and uses `effective_beast_us` after propagation correction when enabled; wall-clock prediction is exposed only as a diagnostic comparison.
+
+### Review
+
+- Implementation:
+  - Added `RadarState.get_sync_debug_payload()` in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) to emit per-observation sync-debug rows with raw arrival Beast time, burst-centre Beast time, effective Beast time, wall timestamp, propagation delay, truth bearing, all requested predictor outputs, residuals, deltas, fit eligibility, phase decomposition, and wall-to-Beast diagnostic error.
+  - Added `/api/radar/iids/{iid}/sync-debug` in [api.py](/home/keith/claude/adsb-dashboard/backend/radar/api.py).
+  - Added `predict_localiser_live_path_bearing()` in [aircraft_localiser.py](/home/keith/claude/adsb-dashboard/backend/radar/aircraft_localiser.py) so the sync-debug payload can compare the localiser-live path through backend code.
+  - Added `SyncDebugPanel` to [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) with predictor consistency table, residual-vs-effective-Beast plot, ICAO-relative residual plot, timestamp-basis comparison, and phase decomposition.
+  - Added focused coverage in [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) and [test_radar_api.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_api.py).
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/radar/api.py backend/radar/aircraft_localiser.py backend/tests/test_radar_sweep.py backend/tests/test_radar_api.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py::test_get_sync_debug_payload_compares_predictor_paths_on_same_observation tests/test_radar_api.py::test_get_iid_sync_debug_endpoint_exposes_summary_and_observation`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py`
+  - `uv run --directory backend pytest`
+  - `npm run build`
+  - Result: backend focused tests passed, radar test pair passed (`83 passed`), full backend passed (`298 passed`), frontend build succeeded with the existing large-chunk warning.
+
 ## 2026-04-17 Radar Sync Compliance Gap Remediation
 
 - [x] Unify sync-sensitive frontend verification with the authoritative refined live sync model (period/phase/waveform/prop-delay basis)
