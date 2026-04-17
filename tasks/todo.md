@@ -36,6 +36,34 @@ Plan confirmation: implement a focused diagnostics-only patch. Operational predi
   - `npm run build`
   - Result: backend focused tests passed, radar test pair passed (`83 passed`), full backend passed (`298 passed`), frontend build succeeded with the existing large-chunk warning.
 
+## 2026-04-17 Radar Observation Model Diagnostics
+
+- [x] Inspect current burst finalization, sync-debug payload, localiser predictor, and Radar page sync-debug UI
+- [x] Add diagnostic-only burst timestamp candidates without changing the operational burst timestamp
+- [x] Extend sync-debug observations with burst shape, signal, position timing, and per-method residual fields
+- [x] Add backend summaries by timestamp method, fit-driving subset, quality bins, position age, bearing rate, range, and ICAO
+- [x] Add an operator-facing Observation model diagnosis section with method comparison, per-aircraft consistency, and compact characteristic plots/tables
+- [x] Add/update focused backend tests for candidate fields, Beast-only residual comparisons, summaries, and diagnosis flags
+- [x] Run backend and frontend verification, then document results
+
+Plan confirmation: implement this as diagnostics only. Keep the sync solver and operational burst timestamp definition unchanged; compare alternate Beast-relative burst timestamp definitions against the authoritative predictor and expose which observation subgroup explains the residual spread.
+
+### Review
+
+- Implementation:
+  - Added diagnostic-only burst timestamp candidates in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py): first reply, strongest reply, simple centroid, weighted centroid, mid-strong-window midpoint, and last reply, all exposed as `*_beast_us` without changing the operational burst timestamp.
+  - Extended sync-debug observations with per-method predicted/residual fields, residual-improvement fields, burst shape/signal metadata, position age/interpolation/extrapolation/source-age fields, and Beast-equivalent truth-position timestamp when source age is known.
+  - Added `observation_model_diagnostics` summaries for overall, fit-driving, and high-quality method comparisons; signal/width/reply-count/position-age/bearing-rate/range bins; correlations; per-ICAO consistency; and rule-based likely contributors.
+  - Added an Observation model diagnosis block to [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) with method comparison, per-aircraft table, residual-vs-characteristic plots, residual-improvement plot, residual-vs-phase small multiples, and split-bin summaries.
+  - Added focused assertions in [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) and [test_radar_api.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_api.py).
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/radar/api.py backend/radar/aircraft_localiser.py backend/tests/test_radar_sweep.py backend/tests/test_radar_api.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py::test_detect_bursts_with_signals_refines_beam_center_toward_stronger_replies tests/test_radar_sweep.py::test_get_sync_debug_payload_compares_predictor_paths_on_same_observation tests/test_radar_api.py::test_get_iid_sync_debug_endpoint_exposes_summary_and_observation`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py`
+  - `uv run --directory backend pytest`
+  - `npm run build`
+  - Result: focused tests passed, radar API/sweep tests passed (`84 passed`), full backend passed (`299 passed`), frontend build succeeded with the existing large-chunk warning.
+
 ## 2026-04-17 Radar Sync Aircraft Motion Compensation
 
 - [x] Inspect current authoritative sync predictor, burst observation capture, period fit, localiser, diagnostics payloads, and Radar page rendering

@@ -149,6 +149,15 @@ _MOTION_RATE_MAX_DT_S = 60.0
 _MOTION_RATE_MAX_POS_AGE_S = 8.0
 _MOTION_RATE_MAX_ABS_DEG_S = 20.0
 
+_BURST_TIMESTAMP_METHODS = (
+    ("first_reply", "burst_ts_first_reply_beast_us", "resid_first_reply_deg"),
+    ("strongest_reply", "burst_ts_strongest_reply_beast_us", "resid_strongest_reply_deg"),
+    ("simple_centroid", "burst_ts_simple_centroid_beast_us", "resid_simple_centroid_deg"),
+    ("weighted_centroid", "burst_ts_weighted_centroid_beast_us", "resid_weighted_centroid_deg"),
+    ("mid_strong_window", "burst_ts_mid_strong_window_beast_us", "resid_mid_strong_window_deg"),
+    ("last_reply", "burst_ts_last_reply_beast_us", "resid_last_reply_deg"),
+)
+
 
 import math as _math
 
@@ -274,6 +283,31 @@ def _fit_weighted_slope(xs: list[float], ys: list[float], ws: list[float]) -> tu
     b = num / den
     a = my - b * mx
     return a, b
+
+
+def _median_float(values: list[float]) -> float | None:
+    if not values:
+        return None
+    clean = sorted(values)
+    mid = len(clean) // 2
+    if len(clean) % 2:
+        return clean[mid]
+    return (clean[mid - 1] + clean[mid]) / 2.0
+
+
+def _residual_stats(values: list[float | None]) -> dict:
+    clean = [float(v) for v in values if v is not None and _math.isfinite(float(v))]
+    abs_clean = [abs(v) for v in clean]
+    median = _median_float(clean)
+    deviations = [abs(v - median) for v in clean] if median is not None else []
+    return {
+        "count": len(clean),
+        "mean_abs_residual_deg": (sum(abs_clean) / len(abs_clean)) if abs_clean else None,
+        "median_abs_residual_deg": _median_float(abs_clean),
+        "robust_spread_mad_deg": _median_float(deviations),
+        "mean_residual_deg": (sum(clean) / len(clean)) if clean else None,
+        "median_residual_deg": median,
+    }
 
 
 def _waveform_bin_index(phase_deg: float, n_bins: int) -> int:
@@ -723,6 +757,18 @@ class AlignedBurstSyncObs:
     burst_center_weighted_us: float | None = None
     burst_center_delta_us: float | None = None
     burst_center_method: str = "centroid"
+    burst_ts_first_reply_beast_us: float | None = None
+    burst_ts_strongest_reply_beast_us: float | None = None
+    burst_ts_simple_centroid_beast_us: float | None = None
+    burst_ts_weighted_centroid_beast_us: float | None = None
+    burst_ts_mid_strong_window_beast_us: float | None = None
+    burst_ts_last_reply_beast_us: float | None = None
+    burst_span_us: float | None = None
+    peak_amplitude: float | None = None
+    position_interpolated: bool = False
+    position_extrapolated: bool = False
+    position_source_age_s: float | None = None
+    truth_position_ts_beast_us: float | None = None
 
 
 class AircraftPositionTracker:
@@ -783,7 +829,15 @@ class AircraftPositionTracker:
         # If within 1 second, use position directly — direct (non-interpolated)
         # positions get position_age_seconds = 0.0 per spec.
         if abs(age) <= 1.0:
-            return {"lat": lat, "lon": lon, "interpolated": False, "position_age_seconds": 0.0}
+            return {
+                "lat": lat,
+                "lon": lon,
+                "interpolated": False,
+                "extrapolated": False,
+                "position_age_seconds": 0.0,
+                "source_age_seconds": age,
+                "source_wall_ts": entry["ts"],
+            }
 
         # Try to project using velocity vector — this is interpolation, so report age
         if groundspeed_kts is not None and track_deg is not None and groundspeed_kts > 0:
@@ -797,9 +851,12 @@ class AircraftPositionTracker:
                 "lat": lat + dlat,
                 "lon": lon + dlon,
                 "interpolated": True,
+                "extrapolated": True,
                 "groundspeed_kts": groundspeed_kts,
                 "track_deg": track_deg,
                 "position_age_seconds": abs(age),
+                "source_age_seconds": age,
+                "source_wall_ts": entry["ts"],
             }
 
         # No velocity data — use position directly if reasonably fresh
@@ -807,7 +864,15 @@ class AircraftPositionTracker:
         # 5 seconds at 200m/s = ~1km position error, acceptable for radar localisation
         # This is a direct (non-interpolated) use of the position — age = 0.0 per spec.
         if abs(age) <= 5.0:
-            return {"lat": lat, "lon": lon, "interpolated": False, "position_age_seconds": 0.0}
+            return {
+                "lat": lat,
+                "lon": lon,
+                "interpolated": False,
+                "extrapolated": False,
+                "position_age_seconds": 0.0,
+                "source_age_seconds": age,
+                "source_wall_ts": entry["ts"],
+            }
 
         return None  # Stale with no velocity vector
 
@@ -863,6 +928,64 @@ def refine_burst_center(reply_samples: list[tuple[float, float | None]]) -> dict
         "beam_center_simple_us": raw_centroid_us,
         "beam_center_weighted_us": weighted_center,
         "beam_center_delta_us": weighted_center - raw_centroid_us,
+    }
+
+
+def _compute_burst_timestamp_candidates(reply_samples: list[tuple[float, float | None]]) -> dict:
+    """Return diagnostic timestamp definitions for one burst in Beast microseconds."""
+    if not reply_samples:
+        return {
+            "burst_ts_first_reply_beast_us": None,
+            "burst_ts_strongest_reply_beast_us": None,
+            "burst_ts_simple_centroid_beast_us": None,
+            "burst_ts_weighted_centroid_beast_us": None,
+            "burst_ts_mid_strong_window_beast_us": None,
+            "burst_ts_last_reply_beast_us": None,
+            "burst_span_us": None,
+            "peak_amplitude": None,
+        }
+
+    samples = sorted(reply_samples, key=lambda item: item[0])
+    arrivals_us = [float(arrival_us) for arrival_us, _signal_dbfs in samples]
+    simple_centroid = sum(arrivals_us) / len(arrivals_us)
+    weighted_samples: list[tuple[float, float]] = []
+    strongest_ts = None
+    strongest_signal = None
+    for arrival_us, signal_dbfs in samples:
+        if signal_dbfs is None:
+            continue
+        if strongest_signal is None or signal_dbfs > strongest_signal:
+            strongest_signal = signal_dbfs
+            strongest_ts = float(arrival_us)
+        weight = _signal_weight(signal_dbfs)
+        if weight is not None and weight > 0:
+            weighted_samples.append((float(arrival_us), weight))
+
+    weighted_centroid = None
+    if len(weighted_samples) >= 2:
+        weight_sum = sum(weight for _arrival_us, weight in weighted_samples)
+        if weight_sum > 0:
+            weighted_centroid = sum(arrival_us * weight for arrival_us, weight in weighted_samples) / weight_sum
+
+    mid_strong_window = None
+    if strongest_signal is not None:
+        strong_arrivals = [
+            float(arrival_us)
+            for arrival_us, signal_dbfs in samples
+            if signal_dbfs is not None and signal_dbfs >= strongest_signal - 6.0
+        ]
+        if strong_arrivals:
+            mid_strong_window = (min(strong_arrivals) + max(strong_arrivals)) / 2.0
+
+    return {
+        "burst_ts_first_reply_beast_us": arrivals_us[0],
+        "burst_ts_strongest_reply_beast_us": strongest_ts,
+        "burst_ts_simple_centroid_beast_us": simple_centroid,
+        "burst_ts_weighted_centroid_beast_us": weighted_centroid,
+        "burst_ts_mid_strong_window_beast_us": mid_strong_window,
+        "burst_ts_last_reply_beast_us": arrivals_us[-1],
+        "burst_span_us": arrivals_us[-1] - arrivals_us[0] if len(arrivals_us) > 1 else 0.0,
+        "peak_amplitude": strongest_signal,
     }
 
 
@@ -935,6 +1058,7 @@ def detect_bursts_with_signals(reply_samples: list[tuple[float, float | None]]) 
             for arrival_us, signal_dbfs in group
         ]
         refinement = refine_burst_center(group)
+        timestamp_candidates = _compute_burst_timestamp_candidates(group)
         bursts.append(
             {
                 "centroid_us": sum(arrivals_us) / len(arrivals_us),
@@ -948,6 +1072,7 @@ def detect_bursts_with_signals(reply_samples: list[tuple[float, float | None]]) 
                 "beam_center_simple_us": refinement.get("beam_center_simple_us"),
                 "beam_center_weighted_us": refinement.get("beam_center_weighted_us"),
                 "beam_center_delta_us": refinement.get("beam_center_delta_us"),
+                **timestamp_candidates,
             }
         )
 
@@ -1793,6 +1918,8 @@ class RadarState:
             lat = lon = None
             interpolated = False
             position_age_seconds = 0.0
+            position_extrapolated = False
+            position_source_age_s = None
             pos: dict | None = None
             metrics["position_lookup_count"] += 1
             t_position_lookup = time.perf_counter()
@@ -1805,6 +1932,8 @@ class RadarState:
                         lon = pos.get("lon")
                         interpolated = pos.get("interpolated", False)
                         position_age_seconds = pos.get("position_age_seconds", 0.0)
+                        position_extrapolated = bool(pos.get("extrapolated", False))
+                        position_source_age_s = pos.get("source_age_seconds")
             except Exception:
                 pass
             finally:
@@ -1843,6 +1972,21 @@ class RadarState:
                     burst_center_simple_us=fired_burst.get("burst_center_simple_us"),
                     burst_center_weighted_us=fired_burst.get("burst_center_weighted_us"),
                     burst_center_delta_us=fired_burst.get("burst_center_delta_us"),
+                    burst_ts_first_reply_beast_us=fired_burst.get("burst_ts_first_reply_beast_us"),
+                    burst_ts_strongest_reply_beast_us=fired_burst.get("burst_ts_strongest_reply_beast_us"),
+                    burst_ts_simple_centroid_beast_us=fired_burst.get("burst_ts_simple_centroid_beast_us"),
+                    burst_ts_weighted_centroid_beast_us=fired_burst.get("burst_ts_weighted_centroid_beast_us"),
+                    burst_ts_mid_strong_window_beast_us=fired_burst.get("burst_ts_mid_strong_window_beast_us"),
+                    burst_ts_last_reply_beast_us=fired_burst.get("burst_ts_last_reply_beast_us"),
+                    burst_span_us=fired_burst.get("burst_span_us"),
+                    peak_amplitude=fired_burst.get("peak_amplitude"),
+                    position_interpolated=interpolated,
+                    position_extrapolated=position_extrapolated,
+                    position_source_age_s=position_source_age_s,
+                    truth_position_ts_beast_us=(
+                        burst_centroid_us - position_source_age_s * 1_000_000.0
+                        if position_source_age_s is not None else None
+                    ),
                 )
                 if matches_dominant_for_sync:
                     self._record_aligned_burst_sync_obs(
@@ -2500,6 +2644,18 @@ class RadarState:
         burst_center_simple_us: float | None = None,
         burst_center_weighted_us: float | None = None,
         burst_center_delta_us: float | None = None,
+        burst_ts_first_reply_beast_us: float | None = None,
+        burst_ts_strongest_reply_beast_us: float | None = None,
+        burst_ts_simple_centroid_beast_us: float | None = None,
+        burst_ts_weighted_centroid_beast_us: float | None = None,
+        burst_ts_mid_strong_window_beast_us: float | None = None,
+        burst_ts_last_reply_beast_us: float | None = None,
+        burst_span_us: float | None = None,
+        peak_amplitude: float | None = None,
+        position_interpolated: bool = False,
+        position_extrapolated: bool = False,
+        position_source_age_s: float | None = None,
+        truth_position_ts_beast_us: float | None = None,
     ) -> None:
         """Record one burst-centre observation for sync timeline visualisation.
 
@@ -2559,6 +2715,18 @@ class RadarState:
             burst_center_weighted_us=burst_center_weighted_us,
             burst_center_delta_us=burst_center_delta_us,
             burst_center_method=burst_center_method,
+            burst_ts_first_reply_beast_us=burst_ts_first_reply_beast_us,
+            burst_ts_strongest_reply_beast_us=burst_ts_strongest_reply_beast_us,
+            burst_ts_simple_centroid_beast_us=burst_ts_simple_centroid_beast_us,
+            burst_ts_weighted_centroid_beast_us=burst_ts_weighted_centroid_beast_us,
+            burst_ts_mid_strong_window_beast_us=burst_ts_mid_strong_window_beast_us,
+            burst_ts_last_reply_beast_us=burst_ts_last_reply_beast_us,
+            burst_span_us=burst_span_us,
+            peak_amplitude=peak_amplitude,
+            position_interpolated=position_interpolated,
+            position_extrapolated=position_extrapolated,
+            position_source_age_s=position_source_age_s,
+            truth_position_ts_beast_us=truth_position_ts_beast_us,
         )
         timeline_buf.append(obs)
 
@@ -3169,6 +3337,7 @@ class RadarState:
             return None
 
         refinement = refine_burst_center(replies)
+        timestamp_candidates = _compute_burst_timestamp_candidates(replies)
         burst_centroid_us = refinement["beam_center_us"]
         burst_signal = max((s for _, s in replies if s is not None), default=None)
 
@@ -3186,6 +3355,7 @@ class RadarState:
             "burst_center_simple_us": refinement.get("beam_center_simple_us"),
             "burst_center_weighted_us": refinement.get("beam_center_weighted_us"),
             "burst_center_delta_us": refinement.get("beam_center_delta_us"),
+            **timestamp_candidates,
         }
 
     def _finalize_expired_pending_bursts(
@@ -3388,6 +3558,8 @@ class RadarState:
             lat = lon = None
             interpolated = False
             position_age_seconds = 0.0
+            position_extrapolated = False
+            position_source_age_s = None
             pos: dict | None = None
             try:
                 wall_ts = self._estimate_wall_time_from_arrival_us(burst_centroid_us, arrival_us)
@@ -3398,6 +3570,8 @@ class RadarState:
                         lon = pos.get("lon")
                         interpolated = pos.get("interpolated", False)
                         position_age_seconds = pos.get("position_age_seconds", 0.0)
+                        position_extrapolated = bool(pos.get("extrapolated", False))
+                        position_source_age_s = pos.get("source_age_seconds")
             except Exception:
                 pass
 
@@ -3429,6 +3603,21 @@ class RadarState:
                         burst_center_simple_us=fired_burst.get("burst_center_simple_us"),
                         burst_center_weighted_us=fired_burst.get("burst_center_weighted_us"),
                         burst_center_delta_us=fired_burst.get("burst_center_delta_us"),
+                        burst_ts_first_reply_beast_us=fired_burst.get("burst_ts_first_reply_beast_us"),
+                        burst_ts_strongest_reply_beast_us=fired_burst.get("burst_ts_strongest_reply_beast_us"),
+                        burst_ts_simple_centroid_beast_us=fired_burst.get("burst_ts_simple_centroid_beast_us"),
+                        burst_ts_weighted_centroid_beast_us=fired_burst.get("burst_ts_weighted_centroid_beast_us"),
+                        burst_ts_mid_strong_window_beast_us=fired_burst.get("burst_ts_mid_strong_window_beast_us"),
+                        burst_ts_last_reply_beast_us=fired_burst.get("burst_ts_last_reply_beast_us"),
+                        burst_span_us=fired_burst.get("burst_span_us"),
+                        peak_amplitude=fired_burst.get("peak_amplitude"),
+                        position_interpolated=interpolated,
+                        position_extrapolated=position_extrapolated,
+                        position_source_age_s=position_source_age_s,
+                        truth_position_ts_beast_us=(
+                            burst_centroid_us - position_source_age_s * 1_000_000.0
+                            if position_source_age_s is not None else None
+                        ),
                     )
                     if matches_dominant_for_sync:
                         self._record_aligned_burst_sync_obs(
@@ -4630,6 +4819,38 @@ class RadarState:
 
             pred_authoritative_deg = authoritative.predicted_bearing_deg
             resid_authoritative_deg = _circular_delta_deg(obs.bearing_deg, pred_authoritative_deg)
+            candidate_timestamps = {
+                "first_reply": getattr(obs, "burst_ts_first_reply_beast_us", None),
+                "strongest_reply": getattr(obs, "burst_ts_strongest_reply_beast_us", None),
+                "simple_centroid": getattr(obs, "burst_ts_simple_centroid_beast_us", None),
+                "weighted_centroid": getattr(obs, "burst_ts_weighted_centroid_beast_us", None),
+                "mid_strong_window": getattr(obs, "burst_ts_mid_strong_window_beast_us", None),
+                "last_reply": getattr(obs, "burst_ts_last_reply_beast_us", None),
+            }
+            candidate_residuals: dict[str, float | None] = {}
+            candidate_predictions: dict[str, float | None] = {}
+            candidate_phases: dict[str, float | None] = {}
+            for method_name, ts_beast_us in candidate_timestamps.items():
+                if ts_beast_us is None:
+                    candidate_residuals[method_name] = None
+                    candidate_predictions[method_name] = None
+                    candidate_phases[method_name] = None
+                    continue
+                candidate_prediction = predict_sync_observation(
+                    sync,
+                    float(ts_beast_us),
+                    range_nm=range_nm,
+                    waveform_bins=waveform_bins,
+                    bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
+                    motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
+                    motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
+                )
+                candidate_predictions[method_name] = candidate_prediction.predicted_bearing_deg
+                candidate_phases[method_name] = candidate_prediction.phase_in_rot_deg
+                candidate_residuals[method_name] = _circular_delta_deg(
+                    obs.bearing_deg,
+                    candidate_prediction.predicted_bearing_deg,
+                )
             resid_without_motion_deg = _circular_delta_deg(
                 obs.bearing_deg, without_motion_prediction.predicted_bearing_deg,
             )
@@ -4707,6 +4928,46 @@ class RadarState:
                 "resid_authoritative_deg": resid_authoritative_deg,
                 "resid_without_motion_deg": resid_without_motion_deg,
                 "resid_with_motion_deg": resid_authoritative_deg,
+                "resid_first_reply_deg": candidate_residuals.get("first_reply"),
+                "resid_strongest_reply_deg": candidate_residuals.get("strongest_reply"),
+                "resid_simple_centroid_deg": candidate_residuals.get("simple_centroid"),
+                "resid_weighted_centroid_deg": candidate_residuals.get("weighted_centroid"),
+                "resid_mid_strong_window_deg": candidate_residuals.get("mid_strong_window"),
+                "resid_last_reply_deg": candidate_residuals.get("last_reply"),
+                "resid_improvement_first_reply_deg": (
+                    abs(resid_authoritative_deg) - abs(candidate_residuals["first_reply"])
+                    if resid_authoritative_deg is not None and candidate_residuals.get("first_reply") is not None else None
+                ),
+                "resid_improvement_strongest_reply_deg": (
+                    abs(resid_authoritative_deg) - abs(candidate_residuals["strongest_reply"])
+                    if resid_authoritative_deg is not None and candidate_residuals.get("strongest_reply") is not None else None
+                ),
+                "resid_improvement_simple_centroid_deg": (
+                    abs(resid_authoritative_deg) - abs(candidate_residuals["simple_centroid"])
+                    if resid_authoritative_deg is not None and candidate_residuals.get("simple_centroid") is not None else None
+                ),
+                "resid_improvement_weighted_centroid_deg": (
+                    abs(resid_authoritative_deg) - abs(candidate_residuals["weighted_centroid"])
+                    if resid_authoritative_deg is not None and candidate_residuals.get("weighted_centroid") is not None else None
+                ),
+                "resid_improvement_mid_strong_window_deg": (
+                    abs(resid_authoritative_deg) - abs(candidate_residuals["mid_strong_window"])
+                    if resid_authoritative_deg is not None and candidate_residuals.get("mid_strong_window") is not None else None
+                ),
+                "resid_improvement_last_reply_deg": (
+                    abs(resid_authoritative_deg) - abs(candidate_residuals["last_reply"])
+                    if resid_authoritative_deg is not None and candidate_residuals.get("last_reply") is not None else None
+                ),
+                "pred_first_reply_deg": candidate_predictions.get("first_reply"),
+                "pred_strongest_reply_deg": candidate_predictions.get("strongest_reply"),
+                "pred_simple_centroid_deg": candidate_predictions.get("simple_centroid"),
+                "pred_weighted_centroid_deg": candidate_predictions.get("weighted_centroid"),
+                "pred_mid_strong_window_deg": candidate_predictions.get("mid_strong_window"),
+                "pred_last_reply_deg": candidate_predictions.get("last_reply"),
+                "phase_first_reply_deg": candidate_phases.get("first_reply"),
+                "phase_strongest_reply_deg": candidate_phases.get("strongest_reply"),
+                "phase_simple_centroid_deg": candidate_phases.get("simple_centroid"),
+                "phase_weighted_centroid_deg": candidate_phases.get("weighted_centroid"),
                 "motion_comp_improvement_deg": (
                     abs(resid_without_motion_deg) - abs(resid_authoritative_deg)
                     if resid_without_motion_deg is not None and resid_authoritative_deg is not None else None
@@ -4730,12 +4991,32 @@ class RadarState:
                 "classification": classification,
                 "weight": weight,
                 "n_replies": obs.n_replies,
+                "burst_reply_count": obs.n_replies,
                 "pos_age_s": obs.pos_age_s,
+                "position_age_ms": obs.pos_age_s * 1000.0 if obs.pos_age_s is not None else None,
+                "position_interpolated": bool(getattr(obs, "position_interpolated", False)),
+                "position_extrapolated": bool(getattr(obs, "position_extrapolated", False)),
+                "position_source_age_ms": (
+                    abs(getattr(obs, "position_source_age_s")) * 1000.0
+                    if getattr(obs, "position_source_age_s", None) is not None else None
+                ),
+                "truth_position_ts_beast_us": getattr(obs, "truth_position_ts_beast_us", None),
                 "signal_dbfs": obs.signal_dbfs,
+                "signal_strength": obs.signal_dbfs,
+                "peak_amplitude": getattr(obs, "peak_amplitude", None),
+                "burst_width_us": getattr(obs, "burst_span_us", None),
+                "burst_duration_us": getattr(obs, "burst_span_us", None),
+                "burst_span_us": getattr(obs, "burst_span_us", None),
                 "burst_center_method": getattr(obs, "burst_center_method", "centroid"),
                 "burst_center_simple_us": getattr(obs, "burst_center_simple_us", None),
                 "burst_center_weighted_us": getattr(obs, "burst_center_weighted_us", None),
                 "burst_center_delta_us": getattr(obs, "burst_center_delta_us", None),
+                "burst_ts_first_reply_beast_us": candidate_timestamps.get("first_reply"),
+                "burst_ts_strongest_reply_beast_us": candidate_timestamps.get("strongest_reply"),
+                "burst_ts_simple_centroid_beast_us": candidate_timestamps.get("simple_centroid"),
+                "burst_ts_weighted_centroid_beast_us": candidate_timestamps.get("weighted_centroid"),
+                "burst_ts_mid_strong_window_beast_us": candidate_timestamps.get("mid_strong_window"),
+                "burst_ts_last_reply_beast_us": candidate_timestamps.get("last_reply"),
             })
 
             localiser_deltas.append(delta_localiser)
@@ -4759,6 +5040,247 @@ class RadarState:
                 high_rate_residuals_without_motion.append(resid_without_motion_deg)
                 high_rate_residuals_with_motion.append(resid_authoritative_deg)
 
+        def _method_summary(rows: list[dict]) -> list[dict]:
+            out = []
+            for method_name, _ts_field, resid_field in _BURST_TIMESTAMP_METHODS:
+                stats = _residual_stats([row.get(resid_field) for row in rows])
+                out.append({
+                    "method": method_name,
+                    "residual_field": resid_field,
+                    **stats,
+                })
+            return out
+
+        def _bin_rows(rows: list[dict], field: str, bins: list[tuple[str, float | None, float | None]]) -> list[dict]:
+            out = []
+            for label, lo, hi in bins:
+                selected = []
+                for row in rows:
+                    value = row.get(field)
+                    if value is None:
+                        continue
+                    value_f = float(value)
+                    if lo is not None and value_f < lo:
+                        continue
+                    if hi is not None and value_f >= hi:
+                        continue
+                    selected.append(row)
+                out.append({
+                    "bin": label,
+                    "field": field,
+                    **_residual_stats([row.get("resid_authoritative_deg") for row in selected]),
+                    "methods": _method_summary(selected),
+                })
+            return out
+
+        def _corr_abs(rows: list[dict], x_field: str, y_field: str = "resid_authoritative_deg") -> float | None:
+            pairs = []
+            for row in rows:
+                x = row.get(x_field)
+                y = row.get(y_field)
+                if x is None or y is None:
+                    continue
+                x_f = float(x)
+                y_f = abs(float(y))
+                if _math.isfinite(x_f) and _math.isfinite(y_f):
+                    pairs.append((x_f, y_f))
+            if len(pairs) < 3:
+                return None
+            xs = [p[0] for p in pairs]
+            ys = [p[1] for p in pairs]
+            mx = sum(xs) / len(xs)
+            my = sum(ys) / len(ys)
+            den_x = sum((x - mx) ** 2 for x in xs)
+            den_y = sum((y - my) ** 2 for y in ys)
+            if den_x <= 0 or den_y <= 0:
+                return None
+            return sum((x - mx) * (y - my) for x, y in pairs) / _math.sqrt(den_x * den_y)
+
+        method_overall = _method_summary(observations)
+        fit_rows = [row for row in observations if row.get("fit_eligible")]
+        high_quality_rows = [
+            row for row in observations
+            if row.get("fit_eligible")
+            and (row.get("n_replies") or 0) >= 4
+            and (row.get("pos_age_s") or 0.0) <= 1.0
+            and (row.get("signal_dbfs") is None or row.get("signal_dbfs") >= -25.0)
+        ]
+        method_fit = _method_summary(fit_rows)
+        method_high_quality = _method_summary(high_quality_rows)
+        current_median_abs = _residual_stats([row.get("resid_authoritative_deg") for row in observations])["median_abs_residual_deg"]
+        best_method = min(
+            [entry for entry in method_overall if entry["median_abs_residual_deg"] is not None],
+            key=lambda entry: entry["median_abs_residual_deg"],
+            default=None,
+        )
+        best_method_name = best_method["method"] if best_method is not None else None
+        best_method_median = best_method["median_abs_residual_deg"] if best_method is not None else None
+        best_improvement = (
+            current_median_abs - best_method_median
+            if current_median_abs is not None and best_method_median is not None else None
+        )
+
+        operational_methods = defaultdict(int)
+        for row in observations:
+            operational_methods[row.get("burst_center_method") or "unknown"] += 1
+        operational_method = max(operational_methods.items(), key=lambda item: item[1])[0] if operational_methods else "unknown"
+
+        signal_bins = _bin_rows(observations, "signal_dbfs", [
+            ("strong", -25.0, None),
+            ("medium", -40.0, -25.0),
+            ("weak", None, -40.0),
+        ])
+        burst_width_bins = _bin_rows(observations, "burst_span_us", [
+            ("short", None, 20_000.0),
+            ("medium", 20_000.0, 80_000.0),
+            ("long", 80_000.0, None),
+        ])
+        reply_count_bins = _bin_rows(observations, "n_replies", [
+            ("low", None, 3.0),
+            ("medium", 3.0, 6.0),
+            ("high", 6.0, None),
+        ])
+        position_age_bins = _bin_rows(observations, "position_age_ms", [
+            ("fresh", None, 250.0),
+            ("recent", 250.0, 1000.0),
+            ("stale", 1000.0, None),
+        ])
+        bearing_rate_bins = _bin_rows(observations, "bearing_rate_deg_s", [
+            ("left_fast", None, -0.2),
+            ("near_stationary", -0.2, 0.2),
+            ("right_fast", 0.2, None),
+        ])
+        range_bins = _bin_rows(observations, "range_nm", [
+            ("near", None, 25.0),
+            ("mid", 25.0, 75.0),
+            ("far", 75.0, None),
+        ])
+
+        per_icao = []
+        by_icao: dict[str, list[dict]] = defaultdict(list)
+        for row in observations:
+            if row.get("icao"):
+                by_icao[row["icao"]].append(row)
+        for icao, rows in by_icao.items():
+            current_stats = _residual_stats([row.get("resid_authoritative_deg") for row in rows])
+            method_stats = _method_summary(rows)
+            best = min(
+                [entry for entry in method_stats if entry["median_abs_residual_deg"] is not None],
+                key=lambda entry: entry["median_abs_residual_deg"],
+                default=None,
+            )
+            current_med = current_stats["median_abs_residual_deg"]
+            best_med = best["median_abs_residual_deg"] if best is not None else None
+            per_icao.append({
+                "icao": icao,
+                "count": len(rows),
+                "mean_residual_deg": current_stats["mean_residual_deg"],
+                "median_residual_deg": current_stats["median_residual_deg"],
+                "absolute_residual_spread_deg": current_stats["robust_spread_mad_deg"],
+                "median_abs_residual_deg": current_med,
+                "mean_range_nm": sum((row.get("range_nm") or 0.0) for row in rows) / len(rows),
+                "mean_bearing_rate_deg_s": (
+                    sum((row.get("bearing_rate_deg_s") or 0.0) for row in rows) / len(rows)
+                ),
+                "mean_position_age_ms": (
+                    sum((row.get("position_age_ms") or 0.0) for row in rows) / len(rows)
+                ),
+                "best_burst_timestamp_method": best["method"] if best is not None else None,
+                "best_method_median_abs_residual_deg": best_med,
+                "best_vs_operational_improvement_deg": (
+                    current_med - best_med if current_med is not None and best_med is not None else None
+                ),
+            })
+        per_icao.sort(key=lambda row: (row["count"], row.get("median_abs_residual_deg") or 0.0), reverse=True)
+
+        def _worst_bin_label(bin_rows: list[dict]) -> str | None:
+            eligible = [row for row in bin_rows if row.get("count", 0) > 0 and row.get("median_abs_residual_deg") is not None]
+            if not eligible:
+                return None
+            return max(eligible, key=lambda row: row["median_abs_residual_deg"])["bin"]
+
+        pos_age_corr = _corr_abs(observations, "position_age_ms")
+        bearing_rate_corr = _corr_abs(observations, "bearing_rate_deg_s")
+        range_corr = _corr_abs(observations, "range_nm")
+        aircraft_medians = [row["median_residual_deg"] for row in per_icao if row.get("median_residual_deg") is not None]
+        aircraft_offset_spread = _residual_stats(aircraft_medians)["robust_spread_mad_deg"]
+        likely_contributors = []
+        if best_improvement is not None and best_improvement > 3.0:
+            likely_contributors.append({
+                "type": "timestamp_definition",
+                "score": best_improvement,
+                "detail": f"{best_method_name} improves median |residual| by {best_improvement:.2f} deg",
+            })
+        if pos_age_corr is not None and abs(pos_age_corr) >= 0.35:
+            likely_contributors.append({
+                "type": "truth_position_timing",
+                "score": abs(pos_age_corr),
+                "detail": f"|residual| correlation with position age is {pos_age_corr:.2f}",
+            })
+        if bearing_rate_corr is not None and abs(bearing_rate_corr) >= 0.35:
+            likely_contributors.append({
+                "type": "motion_compensation",
+                "score": abs(bearing_rate_corr),
+                "detail": f"|residual| correlation with bearing rate is {bearing_rate_corr:.2f}",
+            })
+        weak_bin = next((row for row in signal_bins if row["bin"] == "weak"), None)
+        strong_bin = next((row for row in signal_bins if row["bin"] == "strong"), None)
+        if weak_bin and strong_bin and weak_bin.get("median_abs_residual_deg") is not None and strong_bin.get("median_abs_residual_deg") is not None:
+            weak_gap = weak_bin["median_abs_residual_deg"] - strong_bin["median_abs_residual_deg"]
+            if weak_gap > 3.0:
+                likely_contributors.append({
+                    "type": "burst_shape_signal",
+                    "score": weak_gap,
+                    "detail": f"weak bursts are {weak_gap:.2f} deg worse than strong bursts",
+                })
+        if aircraft_offset_spread is not None and aircraft_offset_spread > 3.0:
+            likely_contributors.append({
+                "type": "aircraft_specific_bias",
+                "score": aircraft_offset_spread,
+                "detail": f"per-aircraft median residual MAD is {aircraft_offset_spread:.2f} deg",
+            })
+        if not likely_contributors and observations:
+            likely_contributors.append({
+                "type": "deeper_model_mismatch",
+                "score": current_median_abs or 0.0,
+                "detail": "no timestamp, quality, position-age, motion, or ICAO split dominates",
+            })
+        likely_contributors.sort(key=lambda item: item["score"], reverse=True)
+
+        observation_model_diagnostics = {
+            "operational_burst_timestamp_method": operational_method,
+            "operational_residual_field": "resid_authoritative_deg",
+            "best_diagnostic_burst_timestamp_method": best_method_name,
+            "best_diagnostic_method_median_abs_residual_deg": best_method_median,
+            "best_vs_operational_median_abs_improvement_deg": best_improvement,
+            "method_summary_overall": method_overall,
+            "method_summary_fit_driving": method_fit,
+            "method_summary_high_quality": method_high_quality,
+            "bins": {
+                "signal_strength": signal_bins,
+                "burst_width": burst_width_bins,
+                "reply_count": reply_count_bins,
+                "position_age": position_age_bins,
+                "bearing_rate": bearing_rate_bins,
+                "range": range_bins,
+            },
+            "correlations": {
+                "abs_residual_vs_position_age": pos_age_corr,
+                "abs_residual_vs_bearing_rate": bearing_rate_corr,
+                "abs_residual_vs_range": range_corr,
+            },
+            "per_icao": per_icao,
+            "spread_strongest_by": {
+                "signal_class": _worst_bin_label(signal_bins),
+                "burst_width": _worst_bin_label(burst_width_bins),
+                "reply_count": _worst_bin_label(reply_count_bins),
+                "position_age": _worst_bin_label(position_age_bins),
+                "bearing_rate": _worst_bin_label(bearing_rate_bins),
+                "aircraft_identity_mad_deg": aircraft_offset_spread,
+            },
+            "likely_contributors": likely_contributors,
+        }
+
         tolerance_deg = 0.05
         summary = {
             "iid": iid,
@@ -4767,6 +5289,10 @@ class RadarState:
             "observation_count": len(observations),
             "wall_clock_used_operationally": False,
             "operational_time_basis": "effective_beast_us",
+            "operational_burst_timestamp_method": operational_method,
+            "best_diagnostic_burst_timestamp_method": best_method_name,
+            "best_diagnostic_method_median_abs_residual_deg": best_method_median,
+            "best_vs_operational_median_abs_improvement_deg": best_improvement,
             "current_period_s": sync.period_s,
             "base_period_s": getattr(sync, "period_base_s", None),
             "current_slope_deg_per_s": getattr(sync, "residual_slope_deg_per_s", None),
@@ -4837,6 +5363,14 @@ class RadarState:
                     "tolerance_deg": tolerance_deg,
                 },
             },
+            "observation_model_diagnosis": {
+                "operational_burst_timestamp_method": operational_method,
+                "best_diagnostic_burst_timestamp_method": best_method_name,
+                "best_diagnostic_method_median_abs_residual_deg": best_method_median,
+                "best_vs_operational_median_abs_improvement_deg": best_improvement,
+                "spread_strongest_by": observation_model_diagnostics["spread_strongest_by"],
+                "likely_contributors": likely_contributors,
+            },
         }
 
         return {
@@ -4845,6 +5379,7 @@ class RadarState:
             "sync_state": _live_sync_state_to_dict(sync),
             "summary": summary,
             "observations": observations,
+            "observation_model_diagnostics": observation_model_diagnostics,
         }
 
     def get_dwell_profile(self, iid: int, icao: str, sweep_idx: int | None = None) -> list[dict]:

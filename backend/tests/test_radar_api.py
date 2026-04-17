@@ -141,6 +141,8 @@ def test_get_iid_sync_debug_endpoint_exposes_summary_and_observation(monkeypatch
     assert "pred_position_verification_deg" in payload["observations"][0]
     assert "pred_using_wall_clock_deg" in payload["observations"][0]
     assert "motion_comp_improvement_deg" in payload["observations"][0]
+    assert "observation_model_diagnostics" in payload
+    assert payload["summary"]["operational_burst_timestamp_method"] is not None
 
 
 def test_get_iid_timeline_marks_non_primary_family_points_as_residual():

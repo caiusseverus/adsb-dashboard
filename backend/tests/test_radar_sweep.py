@@ -249,6 +249,14 @@ def test_detect_bursts_with_signals_refines_beam_center_toward_stronger_replies(
     assert burst["beam_center_delta_us"] == pytest.approx(burst["beam_center_us"] - burst["beam_center_simple_us"])
     assert burst["beam_center_us"] > 1_004_000
     assert burst["beam_center_us"] < 1_005_000
+    assert burst["burst_ts_first_reply_beast_us"] == pytest.approx(1_000_000)
+    assert burst["burst_ts_strongest_reply_beast_us"] == pytest.approx(1_004_000)
+    assert burst["burst_ts_simple_centroid_beast_us"] == pytest.approx(1_004_000)
+    assert burst["burst_ts_weighted_centroid_beast_us"] == pytest.approx(burst["beam_center_us"])
+    assert burst["burst_ts_mid_strong_window_beast_us"] == pytest.approx(1_004_000)
+    assert burst["burst_ts_last_reply_beast_us"] == pytest.approx(1_008_000)
+    assert burst["burst_span_us"] == pytest.approx(8_000)
+    assert burst["peak_amplitude"] == pytest.approx(-6.0)
 
 
 def test_detect_bursts_preserves_order_insensitive_grouping():
@@ -441,6 +449,19 @@ def test_get_sync_debug_payload_compares_predictor_paths_on_same_observation(mon
             ts=now_ts,
             sync_update_eligible=True,
             raw_arrival_us=8_200_000.0,
+            burst_center_method="amplitude_weighted",
+            burst_ts_first_reply_beast_us=8_190_000.0,
+            burst_ts_strongest_reply_beast_us=8_200_000.0,
+            burst_ts_simple_centroid_beast_us=8_198_000.0,
+            burst_ts_weighted_centroid_beast_us=8_200_000.0,
+            burst_ts_mid_strong_window_beast_us=8_200_000.0,
+            burst_ts_last_reply_beast_us=8_206_000.0,
+            burst_span_us=16_000.0,
+            peak_amplitude=-12.0,
+            position_interpolated=True,
+            position_extrapolated=True,
+            position_source_age_s=0.3,
+            truth_position_ts_beast_us=7_900_000.0,
         ),
     ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
 
@@ -471,6 +492,24 @@ def test_get_sync_debug_payload_compares_predictor_paths_on_same_observation(mon
     assert "resid_without_motion_deg" in obs
     assert "resid_with_motion_deg" in obs
     assert "motion_comp_improvement_deg" in obs
+    assert obs["burst_ts_first_reply_beast_us"] == pytest.approx(8_190_000.0)
+    assert obs["resid_first_reply_deg"] is not None
+    assert obs["resid_weighted_centroid_deg"] == pytest.approx(obs["resid_authoritative_deg"])
+    assert obs["burst_span_us"] == pytest.approx(16_000.0)
+    assert obs["peak_amplitude"] == pytest.approx(-12.0)
+    assert obs["position_interpolated"] is True
+    assert obs["position_extrapolated"] is True
+    assert obs["position_age_ms"] == pytest.approx(300.0)
+    assert obs["position_source_age_ms"] == pytest.approx(300.0)
+    assert obs["truth_position_ts_beast_us"] == pytest.approx(7_900_000.0)
+    diag = payload["observation_model_diagnostics"]
+    assert diag["operational_burst_timestamp_method"] == "amplitude_weighted"
+    assert diag["best_diagnostic_burst_timestamp_method"] is not None
+    assert diag["method_summary_overall"]
+    assert diag["method_summary_fit_driving"]
+    assert diag["bins"]["position_age"]
+    assert diag["per_icao"][0]["icao"] == "BBBBBB"
+    assert payload["summary"]["observation_model_diagnosis"]["likely_contributors"]
 
 
 def test_authoritative_sync_predictor_applies_prop_and_waveform():
