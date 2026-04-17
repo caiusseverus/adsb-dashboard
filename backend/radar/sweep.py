@@ -1607,6 +1607,11 @@ class RadarState:
         # ------------------------------------------------------------------
         # Per-IID per-aircraft pending burst replies: {iid: {icao: [(arrival_us, signal), ...]}}
         self._live_bursts: dict[int, dict[str, list[tuple[float, float | None]]]] = {}
+        # Diagnostic-only mirror of pending burst replies for the native burst path.
+        # The operational native processor still owns burst firing and centroid
+        # selection; this mirror only preserves reply timing so sync-debug can
+        # compare alternate timestamp definitions on the same fired bursts.
+        self._live_burst_diagnostic_replies: dict[int, dict[str, list[tuple[float, float | None]]]] = {}
         # Per-IID last arrival time per aircraft (for gap detection): {iid: {icao: arrival_us}}
         self._live_last_arrival: dict[int, dict[str, float]] = {}
         # Per-IID per-aircraft completed burst centroid history: {iid: {icao: [centroid_us, ...]}}
@@ -1797,6 +1802,8 @@ class RadarState:
             self._live_frames[iid] = None
             self._live_completed_frames[iid] = deque(maxlen=self._LIVE_FRAMES_MAX)
             self._live_frame_counters[iid] = 0
+        if iid not in self._live_burst_diagnostic_replies:
+            self._live_burst_diagnostic_replies[iid] = {}
         if iid not in self._live_aligned_burst_obs:
             self._live_aligned_burst_obs[iid] = deque(maxlen=self._MULTI_SYNC_OBS_MAX)
         if iid not in self._live_burst_timeline_obs:
@@ -2095,6 +2102,122 @@ class RadarState:
                 metrics["frame_mutation_ms"] += (time.perf_counter() - t_frame_mutation) * 1000
         return metrics
 
+    def _finalize_diagnostic_burst(
+        self,
+        iid: int,
+        icao: str,
+        trigger_arrival_us: float,
+    ) -> dict | None:
+        """Finalize the diagnostic-only reply mirror for one native-fired burst."""
+        pending_by_icao = self._live_burst_diagnostic_replies.get(iid)
+        if pending_by_icao is None:
+            return None
+        replies = pending_by_icao.pop(icao, [])
+        if not replies:
+            return None
+
+        refinement = refine_burst_center(replies)
+        timestamp_candidates = _compute_burst_timestamp_candidates(replies)
+        burst_signal = max((s for _, s in replies if s is not None), default=None)
+        has_signal = burst_signal is not None
+        return {
+            "icao": icao,
+            "trigger_arrival_us": trigger_arrival_us,
+            "n_replies": len(replies),
+            "burst_signal": burst_signal,
+            "burst_center_method": "diagnostic_weighted" if has_signal else "centroid",
+            "burst_center_simple_us": refinement.get("beam_center_simple_us"),
+            "burst_center_weighted_us": refinement.get("beam_center_weighted_us"),
+            "burst_center_delta_us": refinement.get("beam_center_delta_us"),
+            **timestamp_candidates,
+        }
+
+    def _collect_native_burst_diagnostics(
+        self,
+        iid: int,
+        iid_events: list[tuple[float, str, float | None]],
+    ) -> list[dict]:
+        """Mirror native burst grouping so diagnostics retain reply-level timestamps.
+
+        The native burst processor intentionally remains authoritative for which
+        bursts fire and what operational `burst_centroid_us` is used.  This
+        mirror follows the same gap rule and only attaches candidate timestamps
+        to the fired burst dictionaries for sync-debug comparison.
+        """
+        pending_by_icao = self._live_burst_diagnostic_replies.setdefault(iid, {})
+        fired: list[dict] = []
+        for arrival_us, icao, signal_dbfs in iid_events:
+            replies = pending_by_icao.get(icao)
+            if replies and arrival_us - replies[-1][0] > BURST_GAP_US:
+                diagnostic = self._finalize_diagnostic_burst(iid, icao, trigger_arrival_us=arrival_us)
+                if diagnostic is not None:
+                    fired.append(diagnostic)
+                replies = []
+                pending_by_icao[icao] = replies
+            pending_by_icao.setdefault(icao, replies or []).append((arrival_us, signal_dbfs))
+        fired.sort(key=lambda burst: (
+            burst.get("burst_ts_weighted_centroid_beast_us")
+            or burst.get("burst_ts_simple_centroid_beast_us")
+            or 0.0
+        ))
+        return fired
+
+    @staticmethod
+    def _enrich_native_fired_bursts_with_diagnostics(
+        fired_bursts: list[dict],
+        diagnostic_bursts: list[dict],
+    ) -> list[dict]:
+        """Attach diagnostic candidate timestamps to native fired-burst records."""
+        by_key: dict[tuple[str, int, int], list[dict]] = defaultdict(list)
+        for diagnostic in diagnostic_bursts:
+            trigger = diagnostic.get("trigger_arrival_us")
+            if trigger is None:
+                continue
+            key = (
+                diagnostic.get("icao"),
+                int(round(float(trigger))),
+                int(diagnostic.get("n_replies") or 0),
+            )
+            by_key[key].append(diagnostic)
+
+        enriched: list[dict] = []
+        for fired in fired_bursts:
+            row = dict(fired)
+            trigger = row.get("trigger_arrival_us")
+            key = (
+                row.get("icao"),
+                int(round(float(trigger))) if trigger is not None else 0,
+                int(row.get("n_replies") or 0),
+            )
+            matches = by_key.get(key) or []
+            diagnostic = matches.pop(0) if matches else None
+            if diagnostic is None and int(row.get("n_replies") or 0) == 1:
+                # A one-reply native burst has enough information in the native
+                # output itself: the operational centroid is the reply timestamp.
+                # This fallback is diagnostic-only and does not alter the solver.
+                ts = row.get("burst_centroid_us")
+                diagnostic = {
+                    "burst_center_method": "centroid",
+                    "burst_center_simple_us": ts,
+                    "burst_center_weighted_us": ts if row.get("burst_signal") is not None else None,
+                    "burst_center_delta_us": 0.0,
+                    "burst_ts_first_reply_beast_us": ts,
+                    "burst_ts_strongest_reply_beast_us": ts if row.get("burst_signal") is not None else None,
+                    "burst_ts_simple_centroid_beast_us": ts,
+                    "burst_ts_weighted_centroid_beast_us": ts if row.get("burst_signal") is not None else None,
+                    "burst_ts_mid_strong_window_beast_us": ts if row.get("burst_signal") is not None else None,
+                    "burst_ts_last_reply_beast_us": ts,
+                    "burst_span_us": 0.0,
+                    "peak_amplitude": row.get("burst_signal"),
+                }
+            if diagnostic is not None:
+                for key_name, value in diagnostic.items():
+                    if key_name in {"icao", "trigger_arrival_us", "n_replies", "burst_signal"}:
+                        continue
+                    row.setdefault(key_name, value)
+            enriched.append(row)
+        return enriched
+
     def on_df11_batch(self, events: list[tuple[int, int, str, float | None]]) -> None:
         """Process a batch of pre-decoded DF11 events from the radar worker."""
         if not events:
@@ -2155,8 +2278,13 @@ class RadarState:
                     if processor is None:
                         processor = _decode_cffi.RadarBurstProcessor()
                         self._native_burst_processors[iid] = processor
+                    diagnostic_bursts = self._collect_native_burst_diagnostics(iid, iid_events)
                     t_native_burst = time.perf_counter()
                     fired_bursts = processor.process_batch(iid_events, BURST_GAP_US)
+                    fired_bursts = self._enrich_native_fired_bursts_with_diagnostics(
+                        fired_bursts,
+                        diagnostic_bursts,
+                    )
                     native_burst_s += time.perf_counter() - t_native_burst
                     fired_burst_count += len(fired_bursts)
                     t_process_burst = time.perf_counter()
@@ -3499,11 +3627,14 @@ class RadarState:
         # Ensure per-IID state exists
         if iid not in self._live_bursts:
             self._live_bursts[iid] = {}
+            self._live_burst_diagnostic_replies[iid] = {}
             self._live_last_arrival[iid] = {}
             self._live_burst_centroids[iid] = {}
             self._live_frames[iid] = None
             self._live_completed_frames[iid] = deque(maxlen=self._LIVE_FRAMES_MAX)
             self._live_frame_counters[iid] = 0
+        if iid not in self._live_burst_diagnostic_replies:
+            self._live_burst_diagnostic_replies[iid] = {}
         if iid not in self._live_aligned_burst_obs:
             self._live_aligned_burst_obs[iid] = deque(maxlen=self._MULTI_SYNC_OBS_MAX)
 
@@ -4112,6 +4243,7 @@ class RadarState:
                 del self._sweep_history[iid]
                 had_any = True
             for live_dict in (self._live_bursts, self._live_last_arrival,
+                               self._live_burst_diagnostic_replies,
                                self._live_burst_centroids, self._live_frames,
                                self._live_last_frame_start_us,
                                self._live_completed_frames,
@@ -4185,6 +4317,7 @@ class RadarState:
             self._pending_pairs.clear()
             self._seen_pair_keys.clear()
             self._live_bursts.clear()
+            self._live_burst_diagnostic_replies.clear()
             self._live_last_arrival.clear()
             self._live_burst_centroids.clear()
             self._live_frames.clear()
@@ -4968,6 +5101,8 @@ class RadarState:
                 "phase_strongest_reply_deg": candidate_phases.get("strongest_reply"),
                 "phase_simple_centroid_deg": candidate_phases.get("simple_centroid"),
                 "phase_weighted_centroid_deg": candidate_phases.get("weighted_centroid"),
+                "phase_mid_strong_window_deg": candidate_phases.get("mid_strong_window"),
+                "phase_last_reply_deg": candidate_phases.get("last_reply"),
                 "motion_comp_improvement_deg": (
                     abs(resid_without_motion_deg) - abs(resid_authoritative_deg)
                     if resid_without_motion_deg is not None and resid_authoritative_deg is not None else None
@@ -5040,13 +5175,39 @@ class RadarState:
                 high_rate_residuals_without_motion.append(resid_without_motion_deg)
                 high_rate_residuals_with_motion.append(resid_authoritative_deg)
 
-        def _method_summary(rows: list[dict]) -> list[dict]:
+        def _method_unavailable_reasons(rows: list[dict]) -> dict[str, str | None]:
+            reasons: dict[str, str | None] = {}
+            for method_name, ts_field, resid_field in _BURST_TIMESTAMP_METHODS:
+                has_ts = any(row.get(ts_field) is not None for row in rows)
+                has_resid = any(row.get(resid_field) is not None for row in rows)
+                if has_resid:
+                    reasons[method_name] = None
+                elif has_ts:
+                    reasons[method_name] = "candidate timestamp present but residual unavailable"
+                elif method_name in {"strongest_reply", "weighted_centroid", "mid_strong_window"}:
+                    reasons[method_name] = "per-reply signal data unavailable in this window"
+                else:
+                    reasons[method_name] = "reply-level timestamps unavailable in this window"
+            return reasons
+
+        def _method_summary(rows: list[dict], reasons: dict[str, str | None] | None = None) -> list[dict]:
             out = []
             for method_name, _ts_field, resid_field in _BURST_TIMESTAMP_METHODS:
-                stats = _residual_stats([row.get(resid_field) for row in rows])
+                paired_rows = [
+                    row for row in rows
+                    if row.get("resid_authoritative_deg") is not None and row.get(resid_field) is not None
+                ]
+                stats = _residual_stats([row.get(resid_field) for row in paired_rows])
+                paired_operational_stats = _residual_stats([
+                    row.get("resid_authoritative_deg") for row in paired_rows
+                ])
+                unavailable_reason = (reasons or {}).get(method_name)
                 out.append({
                     "method": method_name,
                     "residual_field": resid_field,
+                    "available": stats["count"] > 0,
+                    "unavailable_reason": unavailable_reason if stats["count"] <= 0 else None,
+                    "paired_operational_median_abs_residual_deg": paired_operational_stats["median_abs_residual_deg"],
                     **stats,
                 })
             return out
@@ -5069,7 +5230,7 @@ class RadarState:
                     "bin": label,
                     "field": field,
                     **_residual_stats([row.get("resid_authoritative_deg") for row in selected]),
-                    "methods": _method_summary(selected),
+                    "methods": _method_summary(selected, _method_unavailable_reasons(selected)),
                 })
             return out
 
@@ -5096,7 +5257,8 @@ class RadarState:
                 return None
             return sum((x - mx) * (y - my) for x, y in pairs) / _math.sqrt(den_x * den_y)
 
-        method_overall = _method_summary(observations)
+        method_unavailable_reasons = _method_unavailable_reasons(observations)
+        method_overall = _method_summary(observations, method_unavailable_reasons)
         fit_rows = [row for row in observations if row.get("fit_eligible")]
         high_quality_rows = [
             row for row in observations
@@ -5105,8 +5267,8 @@ class RadarState:
             and (row.get("pos_age_s") or 0.0) <= 1.0
             and (row.get("signal_dbfs") is None or row.get("signal_dbfs") >= -25.0)
         ]
-        method_fit = _method_summary(fit_rows)
-        method_high_quality = _method_summary(high_quality_rows)
+        method_fit = _method_summary(fit_rows, _method_unavailable_reasons(fit_rows))
+        method_high_quality = _method_summary(high_quality_rows, _method_unavailable_reasons(high_quality_rows))
         current_median_abs = _residual_stats([row.get("resid_authoritative_deg") for row in observations])["median_abs_residual_deg"]
         best_method = min(
             [entry for entry in method_overall if entry["median_abs_residual_deg"] is not None],
@@ -5115,9 +5277,12 @@ class RadarState:
         )
         best_method_name = best_method["method"] if best_method is not None else None
         best_method_median = best_method["median_abs_residual_deg"] if best_method is not None else None
+        best_paired_operational_median = (
+            best_method.get("paired_operational_median_abs_residual_deg") if best_method is not None else None
+        )
         best_improvement = (
-            current_median_abs - best_method_median
-            if current_median_abs is not None and best_method_median is not None else None
+            best_paired_operational_median - best_method_median
+            if best_paired_operational_median is not None and best_method_median is not None else None
         )
 
         operational_methods = defaultdict(int)
@@ -5163,7 +5328,7 @@ class RadarState:
                 by_icao[row["icao"]].append(row)
         for icao, rows in by_icao.items():
             current_stats = _residual_stats([row.get("resid_authoritative_deg") for row in rows])
-            method_stats = _method_summary(rows)
+            method_stats = _method_summary(rows, _method_unavailable_reasons(rows))
             best = min(
                 [entry for entry in method_stats if entry["median_abs_residual_deg"] is not None],
                 key=lambda entry: entry["median_abs_residual_deg"],
@@ -5256,6 +5421,17 @@ class RadarState:
             "method_summary_overall": method_overall,
             "method_summary_fit_driving": method_fit,
             "method_summary_high_quality": method_high_quality,
+            "available_burst_timestamp_methods": [
+                entry["method"] for entry in method_overall if entry.get("available")
+            ],
+            "unavailable_burst_timestamp_methods": [
+                entry["method"] for entry in method_overall if not entry.get("available")
+            ],
+            "method_unavailable_reasons": {
+                method: reason
+                for method, reason in method_unavailable_reasons.items()
+                if reason is not None
+            },
             "bins": {
                 "signal_strength": signal_bins,
                 "burst_width": burst_width_bins,
@@ -5368,6 +5544,9 @@ class RadarState:
                 "best_diagnostic_burst_timestamp_method": best_method_name,
                 "best_diagnostic_method_median_abs_residual_deg": best_method_median,
                 "best_vs_operational_median_abs_improvement_deg": best_improvement,
+                "available_burst_timestamp_methods": observation_model_diagnostics["available_burst_timestamp_methods"],
+                "unavailable_burst_timestamp_methods": observation_model_diagnostics["unavailable_burst_timestamp_methods"],
+                "method_unavailable_reasons": observation_model_diagnostics["method_unavailable_reasons"],
                 "spread_strongest_by": observation_model_diagnostics["spread_strongest_by"],
                 "likely_contributors": likely_contributors,
             },

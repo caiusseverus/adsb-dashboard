@@ -64,6 +64,32 @@ Plan confirmation: implement this as diagnostics only. Keep the sync solver and 
   - `npm run build`
   - Result: focused tests passed, radar API/sweep tests passed (`84 passed`), full backend passed (`299 passed`), frontend build succeeded with the existing large-chunk warning.
 
+## 2026-04-17 Radar Observation Model Diagnostics Backend Fix
+
+- [x] Inspect native and Python burst-building paths for candidate timestamp retention
+- [x] Add backend diagnostic reply-retention for the native burst path without changing operational burst timestamps
+- [x] Enrich fired burst observations with real candidate timestamps before sync-debug recording
+- [x] Mark method availability/unavailability explicitly in observation-model summaries
+- [x] Add focused tests that fail when candidate methods remain zero-count on native-style burst processing
+- [x] Run focused and broader verification, then record results
+
+Plan confirmation: repair backend diagnostic data population only. The operational solver keeps using the current burst timestamp; this fix makes the comparison payload honest and populated.
+
+### Review
+
+- Implementation:
+  - Added a diagnostic-only reply mirror for native burst processing in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py), so live native-fired bursts retain per-reply Beast timestamps and signal values for observation-model diagnostics.
+  - Enriched native `fired_bursts` with first/strongest/simple/weighted/mid-strong-window/last timestamp candidates before `_process_fired_bursts()` records sync-debug observations. The operational `burst_centroid_us` from the native processor is not changed.
+  - Added a one-reply native fallback where the native burst output itself is sufficient to identify first/simple/last and signal-based methods.
+  - Updated method summaries to compare only paired observations where both operational and candidate residuals exist, and added `available_burst_timestamp_methods`, `unavailable_burst_timestamp_methods`, and `method_unavailable_reasons`.
+  - Added a native-style regression test in [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) that fails if candidate residuals remain zero-count on the native burst path.
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py::test_native_burst_path_populates_observation_model_timestamp_candidates tests/test_radar_sweep.py::test_get_sync_debug_payload_compares_predictor_paths_on_same_observation`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py`
+  - `uv run --directory backend pytest`
+  - Result: focused tests passed, radar API/sweep tests passed (`85 passed`), full backend passed (`300 passed`).
+
 ## 2026-04-17 Radar Sync Aircraft Motion Compensation
 
 - [x] Inspect current authoritative sync predictor, burst observation capture, period fit, localiser, diagnostics payloads, and Radar page rendering

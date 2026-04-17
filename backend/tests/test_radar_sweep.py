@@ -512,6 +512,91 @@ def test_get_sync_debug_payload_compares_predictor_paths_on_same_observation(mon
     assert payload["summary"]["observation_model_diagnosis"]["likely_contributors"]
 
 
+def test_native_burst_path_populates_observation_model_timestamp_candidates(monkeypatch):
+    import radar.sweep as sweep_module
+
+    class FakeNativeBurstProcessor:
+        def __init__(self):
+            self.pending = {}
+
+        def process_batch(self, events, burst_gap_us):
+            fired = []
+            for arrival_us, icao, signal_dbfs in events:
+                replies = self.pending.get(icao, [])
+                if replies and arrival_us - replies[-1][0] > burst_gap_us:
+                    fired.append({
+                        "icao": icao,
+                        "burst_centroid_us": 1_003_000.0,
+                        "burst_signal": max(s for _arrival, s in replies if s is not None),
+                        "trigger_arrival_us": arrival_us,
+                        "n_replies": len(replies),
+                    })
+                    replies = []
+                replies.append((arrival_us, signal_dbfs))
+                self.pending[icao] = replies
+            return fired
+
+        def matches_dominant_period(self, *args, **kwargs):
+            return True
+
+        def select_reference(self, **kwargs):
+            return "AAAAAA"
+
+    monkeypatch.setattr(
+        sweep_module,
+        "_decode_cffi",
+        SimpleNamespace(RadarBurstProcessor=FakeNativeBurstProcessor),
+    )
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    state._models[31] = RadarIID(
+        iid=31,
+        period_s=4.0,
+        manual_lat=51.0,
+        manual_lon=-1.0,
+        resolution_mode="locked_position",
+    )
+    state._live_sync_states[31] = LiveSyncState(
+        iid=31,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=1_000.0,
+        source="multi_aircraft_burst",
+        usable=True,
+    )
+    state._adsb_tracker.update("AAAAAA", 51.1, -1.1, ts=1_000.0)
+
+    state.on_df11_batch([
+        (int(1_000_000.0 * 12), 31, "AAAAAA", -24.0),
+        (int(1_004_000.0 * 12), 31, "AAAAAA", -6.0),
+        (int(1_008_000.0 * 12), 31, "AAAAAA", -18.0),
+    ])
+    state.on_df11_batch([
+        (int(1_500_000.0 * 12), 31, "AAAAAA", -12.0),
+    ])
+
+    payload = state.get_sync_debug_payload(31, window_s=60.0)
+
+    assert payload["observations"]
+    obs = payload["observations"][0]
+    assert obs["burst_ts_first_reply_beast_us"] == pytest.approx(0.0)
+    assert obs["burst_ts_strongest_reply_beast_us"] == pytest.approx(4_000.0)
+    assert obs["burst_ts_simple_centroid_beast_us"] == pytest.approx(4_000.0)
+    assert obs["burst_ts_last_reply_beast_us"] == pytest.approx(8_000.0)
+    assert obs["resid_first_reply_deg"] is not None
+    assert obs["phase_first_reply_deg"] is not None
+    assert obs["resid_improvement_first_reply_deg"] is not None
+    diag = payload["observation_model_diagnostics"]
+    assert "first_reply" in diag["available_burst_timestamp_methods"]
+    assert "simple_centroid" in diag["available_burst_timestamp_methods"]
+    assert diag["method_summary_overall"][0]["count"] > 0
+    assert diag["best_diagnostic_burst_timestamp_method"] is not None
+
+
 def test_authoritative_sync_predictor_applies_prop_and_waveform():
     sync = LiveSyncState(
         iid=7,
