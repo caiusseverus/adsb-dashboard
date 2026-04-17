@@ -141,7 +141,17 @@ def test_get_iid_sync_debug_endpoint_exposes_summary_and_observation(monkeypatch
     assert "pred_position_verification_deg" in payload["observations"][0]
     assert "pred_using_wall_clock_deg" in payload["observations"][0]
     assert "motion_comp_improvement_deg" in payload["observations"][0]
+    assert "residual_detrended_deg" in payload["observations"][0]
+    assert "phase_deg" in payload["observations"][0]
+    assert "cycle_index" in payload["observations"][0]
     assert "observation_model_diagnostics" in payload
+    assert payload["observation_model_diagnostics"]["folded_phase_shape"]["phase_bins"]
+    assert payload["summary"]["dominant_error_mode"] in {
+        "period_drift",
+        "repeatable_phase_shape",
+        "unstable_cycle_shape",
+        "mixed",
+    }
     assert payload["summary"]["operational_burst_timestamp_method"] is not None
 
 

@@ -8,6 +8,35 @@ Source inputs:
 Prepared: 2026-04-04
 Updated: 2026-04-06
 
+## 2026-04-17 Radar Sync Detrended Phase-Shape Diagnostics
+
+- [x] Inspect sync residual generation, period-fit slope basis, sync-debug API payload, and Radar page diagnostic rendering
+- [x] Add diagnostic-only detrended residual fields using the same Beast-time slope basis as period refinement
+- [x] Add folded phase-in-rotation and per-cycle metadata plus phase-bin/repeatability summaries
+- [x] Add a compact dominant-error-mode classification for period drift vs repeatable phase shape vs unstable cycle shape
+- [x] Simplify the default Radar sync-debug UI to summary, raw residual vs time, detrended residual vs phase, and folded per-sweep overlay
+- [x] Move low-value existing sync diagnostics behind an advanced diagnostics toggle
+- [x] Add/update focused tests and run backend/frontend verification
+
+Plan confirmation: implement a focused diagnostics-only pass. The operational solver, period refinement, phase anchor, waveform learning, propagation correction, and motion compensation behavior remain unchanged; new fields explain the existing residuals on the same Beast-time basis.
+
+### Review
+
+- Implementation:
+  - Added diagnostic-only detrending helpers in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py), using a weighted residual-vs-effective-Beast-time slope over the displayed sync-debug rows and leaving solver state unchanged.
+  - Extended sync-debug observations with `residual_raw_deg`, `fit_slope_deg_per_s`, `time_offset_s`, `detrend_component_deg`, `residual_detrended_deg`, `phase_deg`, `cycle_index`, and `cycle_start_beast_us`.
+  - Added folded phase-shape diagnostics with phase-binned median detrended residual, bin spread, per-cycle shape error, repeatability score, and compact rule-based `dominant_error_mode`.
+  - Replaced the default Radar sync-debug panel in [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) with compact summary pills, raw residual vs elapsed Beast time, detrended residual vs phase, and folded per-sweep overlay.
+  - Moved timestamp/predictor checks, observation rows, burst-method summary, and per-aircraft quality into an explicit advanced diagnostics toggle.
+  - Added focused payload assertions in [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) and [test_radar_api.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_api.py).
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/radar/api.py backend/tests/test_radar_sweep.py backend/tests/test_radar_api.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py::test_get_sync_debug_payload_compares_predictor_paths_on_same_observation tests/test_radar_api.py::test_get_iid_sync_debug_endpoint_exposes_summary_and_observation`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py`
+  - `uv run --directory backend pytest`
+  - `cd frontend && npm run build`
+  - Result: focused tests passed, radar sweep/API tests passed (`88 passed`), full backend passed (`303 passed`), frontend build succeeded with the existing chunk-size warning.
+
 ## 2026-04-17 Radar Sync Consistency Diagnostic
 
 - [x] Inspect current backend predictor, burst-sync timeline, localiser, and Radar page wiring
@@ -3903,3 +3932,60 @@ Plan confirmation: proceeding without further confirmation per task request. Sco
   - `uv run --directory backend pytest`
   - `cd frontend && npm run build`
   - Result: focused tests `49 passed`; full backend `296 passed`; frontend build succeeded with the existing large-chunk warning.
+
+## 2026-04-17 Radar Phase Anchor Rework
+
+- [x] Inspect live sync state, burst-sync timeline/debug payloads, localiser predictor use, and Radar page diagnostics
+- [x] Add explicit per-ICAO phase-anchor candidate scoring and replacement hysteresis
+- [x] Solve absolute phase offset primarily from the selected anchor aircraft using Beast-relative effective timestamps and circular statistics
+- [x] Keep period refinement multi-aircraft while limiting non-anchor aircraft to validation and small nudges
+- [x] Expose summary, observation, and candidate-level phase-anchor diagnostics in backend payloads
+- [x] Add Radar page anchor status, candidate, implied-offset, and validation diagnostics
+- [x] Add/update focused backend tests for anchor selection, anchor-led offset solve, and validation/nudge behavior
+- [x] Run backend/frontend verification and record results
+
+Plan confirmation: proceeding without further confirmation per task request. Period solving remains the multi-aircraft long-baseline slope loop; absolute phase anchoring becomes a shorter-baseline selected-aircraft solve, with the rest of the population used only for validation, small correction, and anchor replacement diagnostics.
+
+### Review
+
+- Implementation:
+  - Added circular mean/MAD helpers and explicit phase-anchor fields to `LiveSyncState` in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py).
+  - Added `_select_phase_anchor_aircraft()`, `_solve_phase_anchor_from_icao()`, and `_validate_phase_anchor_against_population()` in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py).
+  - Changed `_update_multi_aircraft_sync_state()` so period slope fitting remains multi-aircraft, while absolute `phase_offset_deg` is derived from the selected anchor aircraft and only receives a capped validation nudge from non-anchor aircraft. If no suitable anchor exists, the previous mixed correction remains as fallback.
+  - Decoupled anchor scoring from the old residual gate so a wrong absolute branch does not cause a coherent anchor aircraft to be rejected as a residual outlier.
+  - Extended burst-sync timeline and sync-debug observations with `implied_phase_offset_deg`, `anchor_relative_phase_error_deg`, `phase_anchor_contributor`, and `phase_anchor_reject_reason`, and exposed ranked anchor candidates.
+  - Added `PhaseAnchorPanel` to [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) with current anchor status, candidate table, implied-offset scatter, per-aircraft offset rows, and validation summary.
+  - Added focused regression tests in [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) for wrong-branch recovery and capped population nudging.
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/radar/api.py backend/radar/aircraft_localiser.py`
+  - `python3 -m py_compile backend/radar/sweep.py backend/tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py::test_phase_anchor_selected_aircraft_recovers_wrong_absolute_branch tests/test_radar_sweep.py::test_phase_anchor_uses_population_only_as_small_validation_nudge tests/test_radar_sweep.py::test_period_refinement_uses_effective_time_slope_and_correct_sign`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py`
+  - `uv run --directory backend pytest`
+  - `cd frontend && npm run build`
+  - Result: focused anchor/period tests passed, radar sweep/API tests passed (`87 passed`), full backend passed (`302 passed`), frontend build succeeded with the existing chunk-size warning.
+
+## 2026-04-17 Radar Phase Anchor Rejection Fix
+
+- [x] Re-check phase-anchor hard rejection gates after live report that suitable aircraft are rejected
+- [x] Convert branch-contaminated quality signals from hard reject gates into score penalties
+- [x] Add a regression for coherent candidates with poor old residual-quality memory
+- [x] Run focused backend verification and frontend build if UI changes are needed
+
+Plan confirmation: fix the anchor selection gate only. Do not change the period solver or UI unless diagnostics need field compatibility updates.
+
+### Review
+
+- Implementation:
+  - Relaxed phase-anchor hard rejection in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py): poor per-ICAO residual quality memory, moderate phase spread, aging observations, and moderate position age are now warning/score penalties instead of hard rejects.
+  - Kept hard rejects for structural failures: too few observations, pathological phase spread, fully stale positions, or fully stale observations.
+  - Increased the anchor solve position-age allowance to match the selector, so candidates selected with acceptable but not ultra-fresh positions are not immediately discarded.
+  - Updated the Radar page candidate table to show warning reasons for candidate rows rather than hiding why the score was reduced.
+  - Added `test_phase_anchor_quality_memory_is_warning_not_hard_reject` to prevent old wrong-branch residual memory from blocking a coherent anchor candidate.
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py::test_phase_anchor_selected_aircraft_recovers_wrong_absolute_branch tests/test_radar_sweep.py::test_phase_anchor_quality_memory_is_warning_not_hard_reject tests/test_radar_sweep.py::test_phase_anchor_uses_population_only_as_small_validation_nudge`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py`
+  - `uv run --directory backend pytest`
+  - `cd frontend && npm run build`
+  - Result: focused anchor tests passed, radar sweep/API tests passed (`88 passed`), full backend passed (`303 passed`), frontend build succeeded with the existing chunk-size warning.

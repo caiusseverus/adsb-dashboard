@@ -310,6 +310,156 @@ def _residual_stats(values: list[float | None]) -> dict:
     }
 
 
+def _clamp_float(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _compute_folded_phase_shape(rows: list[dict], n_bins: int = 24) -> dict:
+    """Summarise diagnostic-only detrended residual shape folded by rotation phase."""
+    if n_bins <= 0:
+        n_bins = 24
+    bins: list[list[float]] = [[] for _ in range(n_bins)]
+    cycle_bins: dict[int, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for row in rows:
+        phase = row.get("phase_deg")
+        resid = row.get("residual_detrended_deg")
+        cycle_index = row.get("cycle_index")
+        if phase is None or resid is None:
+            continue
+        phase_f = float(phase) % 360.0
+        resid_f = float(resid)
+        if not _math.isfinite(phase_f) or not _math.isfinite(resid_f):
+            continue
+        idx = _waveform_bin_index(phase_f, n_bins)
+        bins[idx].append(resid_f)
+        if cycle_index is not None:
+            cycle_bins[int(cycle_index)][idx].append(resid_f)
+
+    bin_width = 360.0 / n_bins
+    phase_bins = []
+    bin_medians: list[float] = []
+    bin_spreads: list[float] = []
+    for idx, values in enumerate(bins):
+        stats = _residual_stats(values)
+        median = stats["median_residual_deg"]
+        spread = stats["robust_spread_mad_deg"]
+        if median is not None:
+            bin_medians.append(median)
+        if spread is not None:
+            bin_spreads.append(spread)
+        phase_bins.append({
+            "phase_start_deg": idx * bin_width,
+            "phase_center_deg": (idx + 0.5) * bin_width,
+            "phase_end_deg": (idx + 1) * bin_width,
+            "count": stats["count"],
+            "median_residual_detrended_deg": median,
+            "spread_mad_deg": spread,
+            "median_abs_residual_detrended_deg": stats["median_abs_residual_deg"],
+        })
+
+    cycle_summaries = []
+    cycle_shape_errors: list[float] = []
+    for cycle_index, per_bin in cycle_bins.items():
+        cycle_points = 0
+        cycle_errors = []
+        cycle_values = []
+        for idx, values in per_bin.items():
+            bin_median = phase_bins[idx]["median_residual_detrended_deg"]
+            if bin_median is None:
+                continue
+            cycle_median = _median_float(values)
+            if cycle_median is None:
+                continue
+            cycle_points += len(values)
+            cycle_values.extend(values)
+            cycle_errors.append(abs(cycle_median - bin_median))
+        error = _median_float(cycle_errors)
+        if error is not None:
+            cycle_shape_errors.append(error)
+        stats = _residual_stats(cycle_values)
+        cycle_summaries.append({
+            "cycle_index": cycle_index,
+            "count": cycle_points,
+            "median_shape_error_deg": error,
+            "median_residual_detrended_deg": stats["median_residual_deg"],
+            "spread_mad_deg": stats["robust_spread_mad_deg"],
+        })
+    cycle_summaries.sort(key=lambda row: row["cycle_index"])
+
+    phase_shape_strength = _residual_stats(bin_medians)["median_abs_residual_deg"]
+    within_bin_spread = _median_float(bin_spreads)
+    cycle_shape_error = _median_float(cycle_shape_errors)
+    if phase_shape_strength is None:
+        repeatability_score = None
+    else:
+        noise = cycle_shape_error if cycle_shape_error is not None else within_bin_spread
+        if noise is None:
+            repeatability_score = None
+        else:
+            repeatability_score = _clamp_float(
+                phase_shape_strength / max(phase_shape_strength + noise, 1.0),
+                0.0,
+                1.0,
+            )
+
+    return {
+        "phase_bin_count": n_bins,
+        "phase_bins": phase_bins,
+        "cycles": cycle_summaries,
+        "phase_shape_strength_deg": phase_shape_strength,
+        "within_bin_spread_mad_deg": within_bin_spread,
+        "cycle_shape_error_median_deg": cycle_shape_error,
+        "cycle_to_cycle_repeatability": repeatability_score,
+        "cycle_count": len(cycle_summaries),
+    }
+
+
+def _classify_sync_error_mode(
+    *,
+    slope_deg_per_s: float | None,
+    time_span_s: float,
+    raw_mad_deg: float | None,
+    detrended_mad_deg: float | None,
+    phase_shape_strength_deg: float | None,
+    repeatability: float | None,
+) -> dict:
+    """Compact rule-based interpretation for operator diagnostics only."""
+    slope = abs(float(slope_deg_per_s or 0.0))
+    drift_deg = slope * max(0.0, time_span_s)
+    period_drift_strength = _clamp_float(drift_deg / 20.0, 0.0, 1.0)
+    if raw_mad_deg is not None and detrended_mad_deg is not None and raw_mad_deg > 0:
+        drift_improvement = _clamp_float((raw_mad_deg - detrended_mad_deg) / raw_mad_deg, 0.0, 1.0)
+        period_drift_strength = max(period_drift_strength, drift_improvement)
+
+    phase_shape_strength = _clamp_float(float(phase_shape_strength_deg or 0.0) / 10.0, 0.0, 1.0)
+    repeat = repeatability if repeatability is not None else 0.0
+    unstable_strength = _clamp_float((1.0 - repeat) * (float(detrended_mad_deg or 0.0) / 12.0), 0.0, 1.0)
+
+    period_strong = period_drift_strength >= 0.35
+    shape_strong = phase_shape_strength >= 0.35 and repeat >= 0.45
+    unstable = unstable_strength >= 0.35 and repeat < 0.45
+    if period_strong and shape_strong:
+        mode = "mixed"
+    elif period_strong and not shape_strong:
+        mode = "period_drift"
+    elif shape_strong:
+        mode = "repeatable_phase_shape"
+    elif unstable:
+        mode = "unstable_cycle_shape"
+    else:
+        mode = "mixed" if period_drift_strength >= 0.2 or phase_shape_strength >= 0.2 else "unstable_cycle_shape"
+
+    return {
+        "dominant_error_mode": mode,
+        "period_drift_strength": period_drift_strength,
+        "period_drift_window_deg": drift_deg,
+        "phase_shape_strength": phase_shape_strength,
+        "phase_shape_strength_deg": phase_shape_strength_deg,
+        "cycle_to_cycle_repeatability": repeatability,
+        "unstable_cycle_strength": unstable_strength,
+    }
+
+
 def _waveform_bin_index(phase_deg: float, n_bins: int) -> int:
     """Phase (0–360) → bin index in [0, n_bins).  Wraps negative/large phases."""
     if n_bins <= 0:
@@ -5687,6 +5837,79 @@ class RadarState:
                 high_rate_residuals_without_motion.append(resid_without_motion_deg)
                 high_rate_residuals_with_motion.append(resid_authoritative_deg)
 
+        # Diagnostic-only detrending: remove the current period-refinement
+        # residual slope from the plotted residuals without changing solver
+        # state, phase anchors, waveform learning, or period updates.
+        fit_origin_candidates = [
+            float(row["effective_beast_us"])
+            for row in observations
+            if row.get("fit_eligible") and row.get("effective_beast_us") is not None
+        ]
+        all_effective_candidates = [
+            float(row["effective_beast_us"])
+            for row in observations
+            if row.get("effective_beast_us") is not None
+        ]
+        fit_time_origin_beast_us = (
+            min(fit_origin_candidates)
+            if fit_origin_candidates else (min(all_effective_candidates) if all_effective_candidates else None)
+        )
+        fit_slope_deg_per_s = getattr(sync, "residual_slope_deg_per_s", 0.0) or 0.0
+        local_fit_rows = [
+            row for row in observations
+            if row.get("fit_eligible")
+            and row.get("effective_beast_us") is not None
+            and row.get("resid_authoritative_deg") is not None
+            and (row.get("weight") or 0.0) > 0.0
+        ]
+        if fit_time_origin_beast_us is not None and len(local_fit_rows) >= 2:
+            xs = [(float(row["effective_beast_us"]) - float(fit_time_origin_beast_us)) / 1_000_000.0 for row in local_fit_rows]
+            ys = [float(row["resid_authoritative_deg"]) for row in local_fit_rows]
+            ws = [float(row.get("weight") or 0.0) for row in local_fit_rows]
+            _a_debug_fit, fit_slope_deg_per_s = _fit_weighted_slope(xs, ys, ws)
+        period_us = sync.period_s * 1_000_000.0 if sync.period_s and sync.period_s > 0 else None
+        for row in observations:
+            effective_us = row.get("effective_beast_us")
+            residual_raw_deg = row.get("resid_authoritative_deg")
+            row["residual_raw_deg"] = residual_raw_deg
+            row["residual_deg"] = residual_raw_deg
+            row["fit_slope_deg_per_s"] = fit_slope_deg_per_s
+            row["fit_time_origin_beast_us"] = fit_time_origin_beast_us
+            row["phase_deg"] = row.get("phase_authoritative_deg")
+            if effective_us is None or fit_time_origin_beast_us is None:
+                row["time_offset_s"] = None
+                row["detrend_component_deg"] = None
+                row["residual_detrended_deg"] = residual_raw_deg
+            else:
+                time_offset_s = (float(effective_us) - float(fit_time_origin_beast_us)) / 1_000_000.0
+                detrend_component_deg = fit_slope_deg_per_s * time_offset_s
+                row["time_offset_s"] = time_offset_s
+                row["detrend_component_deg"] = detrend_component_deg
+                row["residual_detrended_deg"] = _circular_delta_deg(residual_raw_deg, detrend_component_deg)
+            if period_us and effective_us is not None:
+                cycle_index = int(_math.floor((float(effective_us) - sync.phase_epoch_us) / period_us))
+                row["cycle_index"] = cycle_index
+                row["cycle_start_beast_us"] = sync.phase_epoch_us + cycle_index * period_us
+            else:
+                row["cycle_index"] = None
+                row["cycle_start_beast_us"] = None
+
+        raw_residual_stats = _residual_stats([row.get("residual_raw_deg") for row in observations])
+        detrended_residual_stats = _residual_stats([row.get("residual_detrended_deg") for row in observations])
+        effective_span_s = (
+            (max(all_effective_candidates) - min(all_effective_candidates)) / 1_000_000.0
+            if len(all_effective_candidates) >= 2 else 0.0
+        )
+        phase_shape_diagnostics = _compute_folded_phase_shape(observations)
+        error_mode = _classify_sync_error_mode(
+            slope_deg_per_s=fit_slope_deg_per_s,
+            time_span_s=effective_span_s,
+            raw_mad_deg=raw_residual_stats["robust_spread_mad_deg"],
+            detrended_mad_deg=detrended_residual_stats["robust_spread_mad_deg"],
+            phase_shape_strength_deg=phase_shape_diagnostics["phase_shape_strength_deg"],
+            repeatability=phase_shape_diagnostics["cycle_to_cycle_repeatability"],
+        )
+
         def _method_unavailable_reasons(rows: list[dict]) -> dict[str, str | None]:
             reasons: dict[str, str | None] = {}
             for method_name, ts_field, resid_field in _BURST_TIMESTAMP_METHODS:
@@ -5927,6 +6150,10 @@ class RadarState:
         observation_model_diagnostics = {
             "operational_burst_timestamp_method": operational_method,
             "operational_residual_field": "resid_authoritative_deg",
+            "detrended_residual_field": "residual_detrended_deg",
+            "folded_phase_shape": phase_shape_diagnostics,
+            "dominant_error_mode": error_mode["dominant_error_mode"],
+            "error_mode_diagnostics": error_mode,
             "best_diagnostic_burst_timestamp_method": best_method_name,
             "best_diagnostic_method_median_abs_residual_deg": best_method_median,
             "best_vs_operational_median_abs_improvement_deg": best_improvement,
@@ -5984,6 +6211,19 @@ class RadarState:
             "current_period_s": sync.period_s,
             "base_period_s": getattr(sync, "period_base_s", None),
             "current_slope_deg_per_s": getattr(sync, "residual_slope_deg_per_s", None),
+            "fit_slope_deg_per_s": fit_slope_deg_per_s,
+            "fit_time_origin_beast_us": fit_time_origin_beast_us,
+            "detrending_basis": "diagnostic_only_weighted_fit_residual_vs_effective_beast_time_s",
+            "raw_median_abs_residual_deg": raw_residual_stats["median_abs_residual_deg"],
+            "detrended_median_abs_residual_deg": detrended_residual_stats["median_abs_residual_deg"],
+            "raw_mad_deg": raw_residual_stats["robust_spread_mad_deg"],
+            "detrended_mad_deg": detrended_residual_stats["robust_spread_mad_deg"],
+            "dominant_error_mode": error_mode["dominant_error_mode"],
+            "period_drift_strength": error_mode["period_drift_strength"],
+            "phase_shape_strength": error_mode["phase_shape_strength"],
+            "phase_shape_strength_deg": error_mode["phase_shape_strength_deg"],
+            "cycle_to_cycle_repeatability": error_mode["cycle_to_cycle_repeatability"],
+            "phase_shape_repeatability_score": error_mode["cycle_to_cycle_repeatability"],
             "phase_epoch_us": sync.phase_epoch_us,
             "phase_offset_deg": sync.phase_offset_deg,
             "phase_anchor_icao": getattr(sync, "phase_anchor_icao", None),
@@ -6068,6 +6308,10 @@ class RadarState:
             },
             "observation_model_diagnosis": {
                 "operational_burst_timestamp_method": operational_method,
+                "dominant_error_mode": error_mode["dominant_error_mode"],
+                "period_drift_strength": error_mode["period_drift_strength"],
+                "phase_shape_strength": error_mode["phase_shape_strength"],
+                "cycle_to_cycle_repeatability": error_mode["cycle_to_cycle_repeatability"],
                 "best_diagnostic_burst_timestamp_method": best_method_name,
                 "best_diagnostic_method_median_abs_residual_deg": best_method_median,
                 "best_vs_operational_median_abs_improvement_deg": best_improvement,

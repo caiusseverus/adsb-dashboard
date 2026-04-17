@@ -492,6 +492,14 @@ def test_get_sync_debug_payload_compares_predictor_paths_on_same_observation(mon
     assert "resid_without_motion_deg" in obs
     assert "resid_with_motion_deg" in obs
     assert "motion_comp_improvement_deg" in obs
+    assert obs["residual_raw_deg"] == pytest.approx(obs["resid_authoritative_deg"])
+    assert obs["residual_detrended_deg"] is not None
+    assert obs["detrend_component_deg"] is not None
+    assert obs["fit_slope_deg_per_s"] is not None
+    assert obs["fit_time_origin_beast_us"] is not None
+    assert obs["phase_deg"] == pytest.approx(obs["phase_authoritative_deg"])
+    assert obs["cycle_index"] is not None
+    assert obs["cycle_start_beast_us"] is not None
     assert obs["burst_ts_first_reply_beast_us"] == pytest.approx(8_190_000.0)
     assert obs["resid_first_reply_deg"] is not None
     assert obs["resid_weighted_centroid_deg"] == pytest.approx(obs["resid_authoritative_deg"])
@@ -507,9 +515,20 @@ def test_get_sync_debug_payload_compares_predictor_paths_on_same_observation(mon
     assert diag["best_diagnostic_burst_timestamp_method"] is not None
     assert diag["method_summary_overall"]
     assert diag["method_summary_fit_driving"]
+    assert diag["folded_phase_shape"]["phase_bins"]
+    assert diag["dominant_error_mode"] in {
+        "period_drift",
+        "repeatable_phase_shape",
+        "unstable_cycle_shape",
+        "mixed",
+    }
     assert diag["bins"]["position_age"]
     assert diag["per_icao"][0]["icao"] == "BBBBBB"
     assert payload["summary"]["observation_model_diagnosis"]["likely_contributors"]
+    assert payload["summary"]["fit_time_origin_beast_us"] is not None
+    assert payload["summary"]["raw_median_abs_residual_deg"] is not None
+    assert payload["summary"]["detrended_median_abs_residual_deg"] is not None
+    assert payload["summary"]["dominant_error_mode"] == diag["dominant_error_mode"]
 
 
 def test_native_burst_path_populates_observation_model_timestamp_candidates(monkeypatch):

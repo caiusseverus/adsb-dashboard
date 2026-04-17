@@ -2110,297 +2110,216 @@ function fmtUs(value) {
 }
 
 function SyncDebugPanel({ debug }) {
+  const [showAdvanced, setShowAdvanced] = useState(false)
   const summary = debug?.summary ?? null
   const observations = Array.isArray(debug?.observations) ? debug.observations : []
-  const byIcao = useMemo(() => {
-    const first = new Map()
-    const rows = []
-    for (const obs of observations) {
-      const icao = obs?.icao
-      const eff = Number(obs?.effective_beast_us)
-      const resid = Number(obs?.resid_authoritative_deg)
-      if (!icao || !Number.isFinite(eff) || !Number.isFinite(resid)) continue
-      if (!first.has(icao)) first.set(icao, eff)
-      rows.push({ ...obs, relative_us: eff - first.get(icao) })
+  const phaseShape = debug?.observation_model_diagnostics?.folded_phase_shape || {}
+  const plotRows = useMemo(() => observations
+    .map(obs => {
+      const t = Number(obs.effective_beast_us)
+      const raw = Number(obs.residual_raw_deg ?? obs.resid_authoritative_deg)
+      const detrended = Number(obs.residual_detrended_deg)
+      const phase = Number(obs.phase_deg ?? obs.phase_authoritative_deg)
+      const cycle = Number(obs.cycle_index)
+      return {
+        ...obs,
+        t,
+        raw,
+        detrended,
+        phase,
+        cycle: Number.isFinite(cycle) ? cycle : null,
+        fit: obs.fit_eligible !== false,
+      }
+    })
+    .filter(row => Number.isFinite(row.t) && Number.isFinite(row.raw)), [observations])
+  const cycleRows = useMemo(() => {
+    const grouped = new Map()
+    for (const row of plotRows) {
+      if (row.cycle == null || !Number.isFinite(row.phase) || !Number.isFinite(row.detrended)) continue
+      if (!grouped.has(row.cycle)) grouped.set(row.cycle, [])
+      grouped.get(row.cycle).push(row)
     }
-    return rows
-  }, [observations])
-  const latest = observations.slice(-36)
+    return Array.from(grouped.entries())
+      .sort((a, b) => a[0] - b[0])
+      .slice(-18)
+      .map(([cycle, rows]) => ({ cycle, rows: rows.slice().sort((a, b) => a.phase - b.phase) }))
+  }, [plotRows])
+  if (!summary) return null
+
   const fitCount = observations.filter(obs => obs.fit_eligible).length
   const nonFitCount = observations.length - fitCount
+  const phaseBins = Array.isArray(phaseShape.phase_bins) ? phaseShape.phase_bins : []
+  const observationDiag = debug?.observation_model_diagnostics ?? summary.observation_model_diagnosis ?? {}
+  const methodRows = Array.isArray(observationDiag.method_summary_overall) ? observationDiag.method_summary_overall : []
+  const perIcaoDiag = Array.isArray(observationDiag.per_icao) ? observationDiag.per_icao : []
+  const latest = observations.slice(-24)
+  const flagOk = summary.wall_clock_used_operationally === false
+  const predictorOk = Boolean(summary.predictors_consistent_localiser)
+    && Boolean(summary.predictors_consistent_position_verification)
+    && Boolean(summary.predictors_consistent_burst_sync)
   const plotW = 720
-  const plotH = 160
+  const plotH = 190
   const padL = 48
   const padR = 16
   const padT = 14
   const padB = 28
   const plotInnerW = plotW - padL - padR
   const plotInnerH = plotH - padT - padB
-  const effValues = observations.map(obs => Number(obs.effective_beast_us)).filter(Number.isFinite)
+  const effValues = plotRows.map(row => row.t)
   const minEff = effValues.length ? Math.min(...effValues) : 0
   const maxEff = effValues.length ? Math.max(...effValues) : minEff + 1
   const spanEff = Math.max(1, maxEff - minEff)
-  const residualAbsMax = Math.min(180, Math.max(20, ...observations.map(obs => Math.abs(Number(obs.resid_authoritative_deg ?? 0))).filter(Number.isFinite), 20))
-  const maxRelUs = Math.max(1, ...byIcao.map(obs => Number(obs.relative_us)).filter(Number.isFinite))
-  const motionRows = observations.filter(obs => Number.isFinite(Number(obs.bearing_rate_deg_s)))
-  const motionAppliedCount = observations.filter(obs => obs.motion_comp_applied).length
-  const motionImprovements = observations.map(obs => Number(obs.motion_comp_improvement_deg)).filter(Number.isFinite)
-  const meanMotionImprovement = motionImprovements.length
-    ? motionImprovements.reduce((sum, v) => sum + v, 0) / motionImprovements.length
-    : null
-  const meanMotionDtUs = (() => {
-    const values = observations.filter(obs => obs.motion_comp_applied).map(obs => Number(obs.motion_comp_dt_us)).filter(Number.isFinite)
-    return values.length ? values.reduce((sum, v) => sum + v, 0) / values.length : null
-  })()
-  const maxAbsRate = Math.max(0.5, ...motionRows.map(obs => Math.abs(Number(obs.bearing_rate_deg_s))).filter(Number.isFinite))
-  const improvementAbsMax = Math.max(5, ...motionImprovements.map(v => Math.abs(v)), 5)
-  const motionByIcao = useMemo(() => {
-    const grouped = new Map()
-    for (const obs of observations) {
-      const icao = obs?.icao
-      if (!icao) continue
-      const rate = Number(obs.bearing_rate_deg_s)
-      const before = Number(obs.resid_without_motion_deg)
-      const after = Number(obs.resid_with_motion_deg ?? obs.resid_authoritative_deg)
-      const improvement = Number(obs.motion_comp_improvement_deg)
-      const row = grouped.get(icao) || { icao, n: 0, rateSum: 0, beforeAbsSum: 0, afterAbsSum: 0, improvementSum: 0 }
-      if (Number.isFinite(rate)) row.rateSum += rate
-      if (Number.isFinite(before)) row.beforeAbsSum += Math.abs(before)
-      if (Number.isFinite(after)) row.afterAbsSum += Math.abs(after)
-      if (Number.isFinite(improvement)) row.improvementSum += improvement
-      row.n += 1
-      grouped.set(icao, row)
-    }
-    return Array.from(grouped.values())
-      .map(row => ({
-        icao: row.icao,
-        n: row.n,
-        bearing_rate_deg_s: row.rateSum / Math.max(1, row.n),
-        before_abs_deg: row.beforeAbsSum / Math.max(1, row.n),
-        after_abs_deg: row.afterAbsSum / Math.max(1, row.n),
-        improvement_deg: row.improvementSum / Math.max(1, row.n),
-      }))
-      .sort((a, b) => Math.abs(b.bearing_rate_deg_s) - Math.abs(a.bearing_rate_deg_s))
-  }, [observations])
-  if (!summary) return null
-
-  function xEffective(effectiveBeastUs) {
-    return padL + ((Number(effectiveBeastUs) - minEff) / spanEff) * plotInnerW
-  }
-  function xRelative(relativeUs) {
-    return padL + (Number(relativeUs) / maxRelUs) * plotInnerW
-  }
-  function yResidual(residualDeg) {
-    return padT + ((residualAbsMax - Number(residualDeg)) / (2 * residualAbsMax)) * plotInnerH
-  }
-  function basisY(valueDeg) {
-    const value = Math.max(-60, Math.min(60, Number(valueDeg)))
-    return padT + ((60 - value) / 120) * plotInnerH
-  }
-  function xBearingRate(rateDegS) {
-    return padL + ((Math.max(-maxAbsRate, Math.min(maxAbsRate, Number(rateDegS))) + maxAbsRate) / (2 * maxAbsRate)) * plotInnerW
-  }
-  function yImprovement(valueDeg) {
-    return padT + ((improvementAbsMax - Number(valueDeg)) / (2 * improvementAbsMax)) * plotInnerH
-  }
-
+  const residualAbsMax = Math.min(180, Math.max(
+    12,
+    ...plotRows.flatMap(row => [Math.abs(row.raw), Math.abs(row.detrended)].filter(Number.isFinite)),
+  ))
   const panelStyle = { padding: '8px', marginBottom: '0.7rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }
   const tableStyle = { width: '100%', borderCollapse: 'collapse', fontSize: '0.7rem' }
   const thStyle = { textAlign: 'right', padding: '2px 5px', color: '#8b949e', whiteSpace: 'nowrap' }
   const tdRight = { textAlign: 'right', padding: '2px 5px', fontFamily: 'SFMono-Regular, Consolas, monospace', whiteSpace: 'nowrap' }
   const tdLeft = { textAlign: 'left', padding: '2px 5px', whiteSpace: 'nowrap' }
-  const observationDiag = debug?.observation_model_diagnostics ?? summary.observation_model_diagnosis ?? {}
-  const methodRows = Array.isArray(observationDiag.method_summary_overall) ? observationDiag.method_summary_overall : []
-  const methodFitRows = Array.isArray(observationDiag.method_summary_fit_driving) ? observationDiag.method_summary_fit_driving : []
-  const perIcaoDiag = Array.isArray(observationDiag.per_icao) ? observationDiag.per_icao : []
-  const likelyContributors = Array.isArray(observationDiag.likely_contributors) ? observationDiag.likely_contributors : []
-  const splitBins = observationDiag.bins && typeof observationDiag.bins === 'object' ? observationDiag.bins : {}
-  const methodFitByName = new Map(methodFitRows.map(row => [row.method, row]))
-  const improvementFieldByMethod = {
-    first_reply: 'resid_improvement_first_reply_deg',
-    strongest_reply: 'resid_improvement_strongest_reply_deg',
-    simple_centroid: 'resid_improvement_simple_centroid_deg',
-    weighted_centroid: 'resid_improvement_weighted_centroid_deg',
-    mid_strong_window: 'resid_improvement_mid_strong_window_deg',
-    last_reply: 'resid_improvement_last_reply_deg',
+
+  function xEffective(effectiveBeastUs) {
+    return padL + ((Number(effectiveBeastUs) - minEff) / spanEff) * plotInnerW
   }
-  const bestImprovementField = improvementFieldByMethod[observationDiag.best_diagnostic_burst_timestamp_method]
-  const characteristicPlots = [
-    { title: 'Residual vs signal strength', xField: 'signal_dbfs', suffix: 'dBFS' },
-    { title: 'Residual vs burst width', xField: 'burst_span_us', suffix: 'us' },
-    { title: 'Residual vs reply count', xField: 'n_replies', suffix: '' },
-    { title: 'Residual vs position age', xField: 'position_age_ms', suffix: 'ms' },
-    { title: 'Residual vs bearing rate', xField: 'bearing_rate_deg_s', suffix: 'deg/s' },
-    { title: 'Residual vs range', xField: 'range_nm', suffix: 'NM' },
-  ]
-  const phaseMethodPlots = [
-    { title: 'first reply residual vs phase', phaseField: 'phase_first_reply_deg', residField: 'resid_first_reply_deg' },
-    { title: 'strongest reply residual vs phase', phaseField: 'phase_strongest_reply_deg', residField: 'resid_strongest_reply_deg' },
-    { title: 'simple centroid residual vs phase', phaseField: 'phase_simple_centroid_deg', residField: 'resid_simple_centroid_deg' },
-    { title: 'weighted centroid residual vs phase', phaseField: 'phase_weighted_centroid_deg', residField: 'resid_weighted_centroid_deg' },
-  ]
-  function miniScatter(plot) {
-    const rows = observations
-      .map(obs => ({ x: Number(obs[plot.xField]), y: Number(obs.resid_authoritative_deg), fit: obs.fit_eligible !== false }))
-      .filter(point => Number.isFinite(point.x) && Number.isFinite(point.y))
-    if (!rows.length) return <div style={{ color: '#8b949e', fontSize: '0.7rem' }}>No data</div>
-    const minX = Math.min(...rows.map(point => point.x))
-    const maxX = Math.max(...rows.map(point => point.x))
-    const spanX = Math.max(1e-9, maxX - minX)
-    const yMax = Math.max(10, Math.min(90, Math.ceil(Math.max(...rows.map(point => Math.abs(point.y)), 1) / 5) * 5))
+  function xPhase(phaseDeg) {
+    return padL + ((((Number(phaseDeg) % 360) + 360) % 360) / 360) * plotInnerW
+  }
+  function yResidual(residualDeg) {
+    return padT + ((residualAbsMax - Number(residualDeg)) / (2 * residualAbsMax)) * plotInnerH
+  }
+  function plotFrame(children, xLabel) {
     return (
-      <svg width="100%" height={120} viewBox="0 0 300 120" style={{ background: '#0f141b', border: '1px solid #30363d' }}>
-        <line x1={28} y1={60} x2={292} y2={60} stroke="#58a6ff66" />
-        {rows.map((point, idx) => (
-          <circle
-            key={idx}
-            cx={28 + ((point.x - minX) / spanX) * 264}
-            cy={60 - (Math.max(-yMax, Math.min(yMax, point.y)) / yMax) * 54}
-            r={point.fit ? 2.2 : 1.7}
-            fill={point.fit ? '#3fb950' : '#8b949e'}
-            opacity={point.fit ? 0.82 : 0.35}
-          />
+      <svg width="100%" height={plotH} viewBox={`0 0 ${plotW} ${plotH}`} style={{ background: '#0f141b', border: '1px solid #30363d', display: 'block' }}>
+        <line x1={padL} y1={yResidual(0)} x2={plotW - padR} y2={yResidual(0)} stroke="#58a6ff88" />
+        {[-0.5, 0.5].map(mult => (
+          <line key={mult} x1={padL} y1={yResidual(mult * residualAbsMax)} x2={plotW - padR} y2={yResidual(mult * residualAbsMax)} stroke="#21262d" strokeDasharray="3 5" />
         ))}
-        <text x={3} y={11} fill="#8b949e" fontSize="9">±{yMax.toFixed(0)}°</text>
-        <text x={28} y={115} fill="#8b949e" fontSize="9">{minX.toFixed(1)}</text>
-        <text x={240} y={115} fill="#8b949e" fontSize="9">{maxX.toFixed(1)}{plot.suffix}</text>
+        {children}
+        <text x={4} y={12} fill="#8b949e" fontSize="9">±{residualAbsMax.toFixed(0)}°</text>
+        <text x={padL} y={plotH - 8} fill="#8b949e" fontSize="9">{xLabel}</text>
       </svg>
     )
   }
-  function miniPhaseScatter(plot) {
-    const rows = observations
-      .map(obs => ({ x: Number(obs[plot.phaseField]), y: Number(obs[plot.residField]), fit: obs.fit_eligible !== false }))
-      .filter(point => Number.isFinite(point.x) && Number.isFinite(point.y))
-    if (!rows.length) return <div style={{ color: '#8b949e', fontSize: '0.7rem' }}>No data</div>
-    const yMax = Math.max(10, Math.min(90, Math.ceil(Math.max(...rows.map(point => Math.abs(point.y)), 1) / 5) * 5))
-    return (
-      <svg width="100%" height={100} viewBox="0 0 300 100" style={{ background: '#0f141b', border: '1px solid #30363d' }}>
-        <line x1={28} y1={50} x2={292} y2={50} stroke="#58a6ff66" />
-        {rows.map((point, idx) => (
-          <circle
-            key={idx}
-            cx={28 + ((point.x % 360) / 360) * 264}
-            cy={50 - (Math.max(-yMax, Math.min(yMax, point.y)) / yMax) * 44}
-            r={point.fit ? 2 : 1.6}
-            fill={point.fit ? '#58a6ff' : '#8b949e'}
-            opacity={point.fit ? 0.82 : 0.35}
-          />
-        ))}
-        <text x={3} y={11} fill="#8b949e" fontSize="9">±{yMax.toFixed(0)}°</text>
-        <text x={28} y={96} fill="#8b949e" fontSize="9">0°</text>
-        <text x={262} y={96} fill="#8b949e" fontSize="9">360°</text>
-      </svg>
-    )
-  }
-  function miniImprovementScatter() {
-    const rows = observations
-      .map(obs => ({ x: Number(obs.effective_beast_us), y: Number(bestImprovementField ? obs[bestImprovementField] : NaN), fit: obs.fit_eligible !== false }))
-      .filter(point => Number.isFinite(point.x) && Number.isFinite(point.y))
-    if (!rows.length) return <div style={{ color: '#8b949e', fontSize: '0.7rem' }}>No data</div>
-    const minX = Math.min(...rows.map(point => point.x))
-    const maxX = Math.max(...rows.map(point => point.x))
-    const spanX = Math.max(1, maxX - minX)
-    const yMax = Math.max(5, Math.ceil(Math.max(...rows.map(point => Math.abs(point.y)), 1) / 2) * 2)
-    return (
-      <svg width="100%" height={120} viewBox="0 0 300 120" style={{ background: '#0f141b', border: '1px solid #30363d' }}>
-        <line x1={28} y1={60} x2={292} y2={60} stroke="#58a6ff66" />
-        {rows.map((point, idx) => (
-          <circle
-            key={idx}
-            cx={28 + ((point.x - minX) / spanX) * 264}
-            cy={60 - (Math.max(-yMax, Math.min(yMax, point.y)) / yMax) * 54}
-            r={point.fit ? 2.2 : 1.7}
-            fill={point.y >= 0 ? '#3fb950' : '#ff7b72'}
-            opacity={point.fit ? 0.82 : 0.35}
-          />
-        ))}
-        <text x={3} y={11} fill="#8b949e" fontSize="9">±{yMax.toFixed(0)}°</text>
-        <text x={28} y={115} fill="#8b949e" fontSize="9">positive is tighter</text>
-      </svg>
-    )
-  }
-  const flagOk = summary.wall_clock_used_operationally === false
-  const predictorOk = Boolean(summary.predictors_consistent_localiser)
-    && Boolean(summary.predictors_consistent_position_verification)
-    && Boolean(summary.predictors_consistent_burst_sync)
 
   return (
     <div style={panelStyle}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.4rem' }}>
         <div>
-          <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Sync Debug</div>
-          <div style={{ color: '#8b949e', fontSize: '0.74rem' }}>Same observation, backend-computed predictor paths, explicit Beast and wall-clock basis.</div>
+          <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Sync Diagnosis</div>
+          <div style={{ color: '#8b949e', fontSize: '0.74rem' }}>Beast-time residual drift, folded phase shape, and sweep-to-sweep repeatability.</div>
         </div>
         <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: '4px', fontSize: '0.72rem' }}>
-          <span className={styles.metricPill}>Operational time <span className={styles.metricValue}>{summary.operational_time_basis || 'effective_beast_us'}</span></span>
-          <span className={styles.metricPill}>Wall operational <span className={styles.metricValue}>{flagOk ? 'false' : 'CHECK'}</span></span>
-          <span className={styles.metricPill}>Predictors <span className={styles.metricValue}>{predictorOk ? 'consistent' : 'CHECK'}</span></span>
+          <span className={styles.metricPill}>Mode <span className={styles.metricValue}>{summary.dominant_error_mode || '—'}</span></span>
+          <span className={styles.metricPill}>Period <span className={styles.metricValue}>{fmtNumber(summary.current_period_s, 6, 's')}</span></span>
+          <span className={styles.metricPill}>Slope <span className={styles.metricValue}>{fmtNumber(summary.fit_slope_deg_per_s ?? summary.current_slope_deg_per_s, 4, '°/s')}</span></span>
+          <span className={styles.metricPill}>Raw median/MAD <span className={styles.metricValue}>{fmtNumber(summary.raw_median_abs_residual_deg, 2, '°')} / {fmtNumber(summary.raw_mad_deg, 2, '°')}</span></span>
+          <span className={styles.metricPill}>Detrended median/MAD <span className={styles.metricValue}>{fmtNumber(summary.detrended_median_abs_residual_deg, 2, '°')} / {fmtNumber(summary.detrended_mad_deg, 2, '°')}</span></span>
+          <span className={styles.metricPill}>Repeatability <span className={styles.metricValue}>{fmtNumber(Number(summary.cycle_to_cycle_repeatability) * 100, 0, '%')}</span></span>
           <span className={styles.metricPill}>Fit <span className={styles.metricValue}>{fitCount}/{observations.length}</span></span>
-          <span className={styles.metricPill}>Display-only <span className={styles.metricValue}>{nonFitCount}</span></span>
-          <span className={styles.metricPill}>Motion <span className={styles.metricValue}>{summary.motion_comp_phase_enabled ? 'enabled' : 'off'}</span></span>
-          <span className={styles.metricPill}>Motion applied <span className={styles.metricValue}>{motionAppliedCount}</span></span>
-          <span className={styles.metricPill}>Motion Δ|res| <span className={styles.metricValue}>{fmtNumber(meanMotionImprovement, 2, '°')}</span></span>
+          <span className={styles.metricPill}>Basis <span className={styles.metricValue}>{summary.operational_time_basis || 'effective_beast_us'}</span></span>
         </div>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '6px', marginBottom: '0.5rem', fontSize: '0.72rem' }}>
-        <div>Period <span className={styles.metricValue}>{fmtNumber(summary.current_period_s, 6, 's')}</span></div>
-        <div>Base <span className={styles.metricValue}>{fmtNumber(summary.base_period_s, 6, 's')}</span></div>
-        <div>Slope <span className={styles.metricValue}>{fmtNumber(summary.current_slope_deg_per_s, 4, '°/s')}</span></div>
-        <div>Raw vs effective max <span className={styles.metricValue}>{fmtNumber(summary.max_raw_vs_effective_prediction_delta_deg, 3, '°')}</span></div>
-        <div>Wall vs effective max <span className={styles.metricValue}>{fmtNumber(summary.max_wall_vs_effective_prediction_delta_deg, 3, '°')}</span></div>
-        <div>Wall roundtrip max <span className={styles.metricValue}>{fmtNumber(summary.max_wall_roundtrip_error_us, 1, 'µs')}</span></div>
-        <div>Motion applied <span className={styles.metricValue}>{motionAppliedCount}/{observations.length}</span></div>
-        <div>Motion Δt mean <span className={styles.metricValue}>{fmtNumber(meanMotionDtUs, 1, 'µs')}</span></div>
-        <div>Motion Δ|res| mean <span className={styles.metricValue}>{fmtNumber(meanMotionImprovement, 2, '°')}</span></div>
-        <div>High-rate before/after <span className={styles.metricValue}>{fmtNumber(summary.high_rate_mean_abs_residual_without_motion_deg, 2, '°')} / {fmtNumber(summary.high_rate_mean_abs_residual_with_motion_deg, 2, '°')}</span></div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(330px, 1fr))', gap: '10px', marginBottom: '0.6rem' }}>
+        <div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>Raw residual vs elapsed Beast time</div>
+          {plotFrame(plotRows.map((row, idx) => (
+            <circle key={idx} cx={xEffective(row.t)} cy={yResidual(row.raw)}
+                    r={row.fit ? 2.6 : 1.8} fill={row.fit ? '#3fb950' : '#8b949e'} opacity={row.fit ? 0.9 : 0.35}>
+              <title>{`${row.icao || '—'} raw ${row.raw.toFixed(2)}°`}</title>
+            </circle>
+          )), `${(spanEff / 1_000_000).toFixed(1)}s Beast-time window`)}
+        </div>
+        <div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>Detrended residual vs phase-in-rotation</div>
+          {plotFrame(
+            <>
+              {plotRows.filter(row => Number.isFinite(row.phase) && Number.isFinite(row.detrended)).map((row, idx) => (
+                <circle key={idx} cx={xPhase(row.phase)} cy={yResidual(row.detrended)}
+                        r={row.fit ? 2.6 : 1.8} fill={row.fit ? '#58a6ff' : '#8b949e'} opacity={row.fit ? 0.86 : 0.35}>
+                  <title>{`${row.icao || '—'} phase ${row.phase.toFixed(1)}° detrended ${row.detrended.toFixed(2)}°`}</title>
+                </circle>
+              ))}
+              <polyline
+                fill="none"
+                stroke="#ffd166"
+                strokeWidth={1.6}
+                points={phaseBins
+                  .filter(bin => Number.isFinite(Number(bin.median_residual_detrended_deg)))
+                  .map(bin => `${xPhase(bin.phase_center_deg).toFixed(1)},${yResidual(bin.median_residual_detrended_deg).toFixed(1)}`)
+                  .join(' ')}
+              />
+            </>,
+            '0-360° phase',
+          )}
+        </div>
       </div>
 
-      <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '6px', marginBottom: '0.6rem' }}>
-        <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '4px' }}>
-          <div>
-            <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Observation model diagnosis</div>
-            <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>Alternative Beast timestamp definitions, burst shape, truth timing, motion, and ICAO splits.</div>
-          </div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: '4px', fontSize: '0.72rem' }}>
-            <span className={styles.metricPill}>Operational <span className={styles.metricValue}>{observationDiag.operational_burst_timestamp_method || summary.operational_burst_timestamp_method || 'current'}</span></span>
-            <span className={styles.metricPill}>Best method <span className={styles.metricValue}>{observationDiag.best_diagnostic_burst_timestamp_method || '—'}</span></span>
-            <span className={styles.metricPill}>Best median <span className={styles.metricValue}>{fmtNumber(observationDiag.best_diagnostic_method_median_abs_residual_deg, 2, '°')}</span></span>
-            <span className={styles.metricPill}>Δ median <span className={styles.metricValue}>{fmtNumber(observationDiag.best_vs_operational_median_abs_improvement_deg, 2, '°')}</span></span>
-          </div>
-        </div>
-
-        {likelyContributors.length > 0 && (
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px', fontSize: '0.72rem' }}>
-            {likelyContributors.slice(0, 5).map(item => (
-              <span key={`${item.type}-${item.detail}`} className={styles.metricPill}>{item.type}<span className={styles.metricValue}>{item.detail || fmtNumber(item.score, 2)}</span></span>
+      <div style={{ marginBottom: '0.6rem' }}>
+        <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>Folded per-sweep overlay after detrending</div>
+        {plotFrame(
+          <>
+            {cycleRows.map((cycle, idx) => (
+              <polyline
+                key={cycle.cycle}
+                fill="none"
+                stroke={idx === cycleRows.length - 1 ? '#58a6ff' : '#8b949e'}
+                strokeWidth={idx === cycleRows.length - 1 ? 1.2 : 0.8}
+                opacity={idx === cycleRows.length - 1 ? 0.75 : 0.25}
+                points={cycle.rows.map(row => `${xPhase(row.phase).toFixed(1)},${yResidual(row.detrended).toFixed(1)}`).join(' ')}
+              />
             ))}
-          </div>
+            <polyline
+              fill="none"
+              stroke="#ffd166"
+              strokeWidth={2}
+              points={phaseBins
+                .filter(bin => Number.isFinite(Number(bin.median_residual_detrended_deg)))
+                .map(bin => `${xPhase(bin.phase_center_deg).toFixed(1)},${yResidual(bin.median_residual_detrended_deg).toFixed(1)}`)
+                .join(' ')}
+            />
+          </>,
+          `${cycleRows.length} cycles overlaid on 0-360° phase`,
         )}
+      </div>
 
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '8px' }}>
-          <div style={{ overflow: 'auto' }}>
-            <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>Residual by burst timestamp method</div>
+      <button
+        type="button"
+        onClick={() => setShowAdvanced(v => !v)}
+        style={{ marginBottom: showAdvanced ? '0.5rem' : 0, padding: '4px 8px', border: '1px solid #30363d', borderRadius: '4px', background: '#0f141b', color: '#c9d1d9', cursor: 'pointer' }}
+      >
+        {showAdvanced ? 'Hide advanced diagnostics' : 'Show advanced diagnostics'}
+      </button>
+
+      {showAdvanced && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '10px' }}>
+          <div style={{ overflow: 'auto', border: '1px solid #30363d', background: '#0f141b' }}>
+            <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>Observation rows</div>
             <table style={tableStyle}>
               <thead>
                 <tr>
-                  <th style={{ ...thStyle, textAlign: 'left' }}>method</th>
-                  <th style={thStyle}>n</th>
-                  <th style={thStyle}>median |res|</th>
-                  <th style={thStyle}>MAD</th>
-                  <th style={thStyle}>fit median</th>
+                  <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
+                  <th style={thStyle}>raw</th>
+                  <th style={thStyle}>trend</th>
+                  <th style={thStyle}>detrended</th>
+                  <th style={thStyle}>phase</th>
+                  <th style={thStyle}>cycle</th>
+                  <th style={{ ...thStyle, textAlign: 'left' }}>fit</th>
                 </tr>
               </thead>
               <tbody>
-                {methodRows.map(row => {
-                  const fitRow = methodFitByName.get(row.method) || {}
+                {latest.map((obs, idx) => {
+                  const fit = obs.fit_eligible !== false
                   return (
-                    <tr key={row.method}>
-                      <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{row.method}</td>
-                      <td style={tdRight}>{row.count ?? 0}</td>
-                      <td style={tdRight}>{fmtNumber(row.median_abs_residual_deg, 2, '°')}</td>
-                      <td style={tdRight}>{fmtNumber(row.robust_spread_mad_deg, 2, '°')}</td>
-                      <td style={tdRight}>{fmtNumber(fitRow.median_abs_residual_deg, 2, '°')}</td>
+                    <tr key={`${obs.icao}-${obs.burst_center_beast_us}-${idx}`} style={{ opacity: fit ? 1 : 0.55, borderTop: '1px solid #21262d' }}>
+                      <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</td>
+                      <td style={tdRight}>{fmtNumber(obs.residual_raw_deg ?? obs.resid_authoritative_deg, 2, '°')}</td>
+                      <td style={tdRight}>{fmtNumber(obs.detrend_component_deg, 2, '°')}</td>
+                      <td style={tdRight}>{fmtNumber(obs.residual_detrended_deg, 2, '°')}</td>
+                      <td style={tdRight}>{fmtNumber(obs.phase_deg ?? obs.phase_authoritative_deg, 1, '°')}</td>
+                      <td style={tdRight}>{obs.cycle_index ?? '—'}</td>
+                      <td style={tdLeft}>{fit ? 'fit' : (obs.fit_reject_reason || 'display')}</td>
                     </tr>
                   )
                 })}
@@ -2408,239 +2327,65 @@ function SyncDebugPanel({ debug }) {
             </table>
           </div>
 
-          <div style={{ overflow: 'auto' }}>
-            <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>Per-aircraft consistency</div>
+          <div style={{ overflow: 'auto', border: '1px solid #30363d', background: '#0f141b' }}>
+            <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>Timestamp and predictor checks</div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', padding: '0 6px 6px', fontSize: '0.72rem' }}>
+              <span className={styles.metricPill}>Wall operational <span className={styles.metricValue}>{flagOk ? 'false' : 'CHECK'}</span></span>
+              <span className={styles.metricPill}>Predictors <span className={styles.metricValue}>{predictorOk ? 'consistent' : 'CHECK'}</span></span>
+              <span className={styles.metricPill}>Display-only <span className={styles.metricValue}>{nonFitCount}</span></span>
+              <span className={styles.metricPill}>Raw/effective max <span className={styles.metricValue}>{fmtNumber(summary.max_raw_vs_effective_prediction_delta_deg, 3, '°')}</span></span>
+              <span className={styles.metricPill}>Wall/effective max <span className={styles.metricValue}>{fmtNumber(summary.max_wall_vs_effective_prediction_delta_deg, 3, '°')}</span></span>
+              <span className={styles.metricPill}>Wall roundtrip max <span className={styles.metricValue}>{fmtNumber(summary.max_wall_roundtrip_error_us, 1, 'µs')}</span></span>
+            </div>
             <table style={tableStyle}>
               <thead>
                 <tr>
-                  <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
+                  <th style={{ ...thStyle, textAlign: 'left' }}>method</th>
                   <th style={thStyle}>n</th>
-                  <th style={thStyle}>median</th>
-                  <th style={thStyle}>spread</th>
-                  <th style={thStyle}>best</th>
-                  <th style={thStyle}>Δ</th>
+                  <th style={thStyle}>median |res|</th>
+                  <th style={thStyle}>MAD</th>
                 </tr>
               </thead>
               <tbody>
-                {perIcaoDiag.slice(0, 12).map(row => (
-                  <tr key={row.icao}>
-                    <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{row.icao}</td>
-                    <td style={tdRight}>{row.count}</td>
-                    <td style={tdRight}>{fmtNumber(row.median_residual_deg, 2, '°')}</td>
-                    <td style={tdRight}>{fmtNumber(row.absolute_residual_spread_deg, 2, '°')}</td>
-                    <td style={tdRight}>{row.best_burst_timestamp_method || '—'}</td>
-                    <td style={tdRight}>{fmtNumber(row.best_vs_operational_improvement_deg, 2, '°')}</td>
+                {methodRows.map(row => (
+                  <tr key={row.method}>
+                    <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{row.method}</td>
+                    <td style={tdRight}>{row.count ?? 0}</td>
+                    <td style={tdRight}>{fmtNumber(row.median_abs_residual_deg, 2, '°')}</td>
+                    <td style={tdRight}>{fmtNumber(row.robust_spread_mad_deg, 2, '°')}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
-        </div>
 
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '8px', marginTop: '8px' }}>
-          {characteristicPlots.map(plot => (
-            <div key={plot.xField}>
-              <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>{plot.title}</div>
-              {miniScatter(plot)}
+          {perIcaoDiag.length > 0 && (
+            <div style={{ overflow: 'auto', border: '1px solid #30363d', background: '#0f141b' }}>
+              <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>Per-aircraft anchor quality</div>
+              <table style={tableStyle}>
+                <thead>
+                  <tr>
+                    <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
+                    <th style={thStyle}>n</th>
+                    <th style={thStyle}>median</th>
+                    <th style={thStyle}>spread</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {perIcaoDiag.slice(0, 12).map(row => (
+                    <tr key={row.icao}>
+                      <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{row.icao}</td>
+                      <td style={tdRight}>{row.count}</td>
+                      <td style={tdRight}>{fmtNumber(row.median_residual_deg, 2, '°')}</td>
+                      <td style={tdRight}>{fmtNumber(row.absolute_residual_spread_deg, 2, '°')}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
-          ))}
-          <div>
-            <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>Residual improvement by alternative burst method</div>
-            {miniImprovementScatter()}
-          </div>
+          )}
         </div>
-
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '8px', marginTop: '8px' }}>
-          {phaseMethodPlots.map(plot => (
-            <div key={plot.residField}>
-              <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>{plot.title}</div>
-              {miniPhaseScatter(plot)}
-            </div>
-          ))}
-        </div>
-
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '6px', marginTop: '8px', fontSize: '0.7rem' }}>
-          {Object.entries(splitBins).slice(0, 6).map(([name, rows]) => (
-            <div key={name} style={{ border: '1px solid #30363d', padding: '4px', minWidth: 0 }}>
-              <div style={{ color: '#8b949e', marginBottom: '2px' }}>{name.replaceAll('_', ' ')}</div>
-              {(Array.isArray(rows) ? rows : []).map(row => (
-                <div key={`${name}-${row.bin}`} style={{ display: 'grid', gridTemplateColumns: '1fr 3rem 4rem 4rem', gap: '4px' }}>
-                  <span>{row.bin}</span>
-                  <span style={{ textAlign: 'right' }}>{row.count ?? 0}</span>
-                  <span style={{ textAlign: 'right', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{fmtNumber(row.median_abs_residual_deg, 1, '°')}</span>
-                  <span style={{ textAlign: 'right', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{fmtNumber(row.robust_spread_mad_deg, 1, '°')}</span>
-                </div>
-              ))}
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div style={{ overflowX: 'auto', border: '1px solid #30363d', marginBottom: '0.6rem' }}>
-        <table style={tableStyle}>
-          <thead>
-            <tr>
-              <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
-              <th style={thStyle}>raw Beast</th>
-              <th style={thStyle}>effective Beast</th>
-              <th style={thStyle}>true</th>
-              <th style={thStyle}>auth</th>
-              <th style={thStyle}>rate</th>
-              <th style={thStyle}>mot µs</th>
-              <th style={thStyle}>before</th>
-              <th style={thStyle}>after</th>
-              <th style={thStyle}>Δ|res|</th>
-              <th style={thStyle}>localiser</th>
-              <th style={thStyle}>position</th>
-              <th style={thStyle}>burst</th>
-              <th style={thStyle}>Δ loc</th>
-              <th style={thStyle}>Δ pos</th>
-              <th style={thStyle}>Δ burst</th>
-              <th style={{ ...thStyle, textAlign: 'left' }}>fit</th>
-            </tr>
-          </thead>
-          <tbody>
-            {latest.map((obs, idx) => {
-              const fit = obs.fit_eligible !== false
-              return (
-                <tr key={`${obs.icao}-${obs.burst_center_beast_us}-${idx}`} style={{ opacity: fit ? 1 : 0.55, borderTop: '1px solid #21262d' }}>
-                  <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</td>
-                  <td style={tdRight}>{fmtUs(obs.raw_arrival_beast_us)}</td>
-                  <td style={tdRight}>{fmtUs(obs.effective_beast_us)}</td>
-                  <td style={tdRight}>{fmtNumber(obs.true_bearing_deg, 1, '°')}</td>
-                  <td style={tdRight}>{fmtNumber(obs.pred_authoritative_deg, 1, '°')}</td>
-                  <td style={tdRight}>{fmtNumber(obs.bearing_rate_deg_s, 3, '°/s')}</td>
-                  <td style={tdRight}>{fmtNumber(obs.motion_comp_dt_us, 1)}</td>
-                  <td style={tdRight}>{fmtNumber(obs.resid_without_motion_deg, 2, '°')}</td>
-                  <td style={tdRight}>{fmtNumber(obs.resid_with_motion_deg ?? obs.resid_authoritative_deg, 2, '°')}</td>
-                  <td style={tdRight}>{fmtNumber(obs.motion_comp_improvement_deg, 2, '°')}</td>
-                  <td style={tdRight}>{fmtNumber(obs.pred_localiser_live_deg, 1, '°')}</td>
-                  <td style={tdRight}>{fmtNumber(obs.pred_position_verification_deg, 1, '°')}</td>
-                  <td style={tdRight}>{fmtNumber(obs.pred_burst_sync_deg, 1, '°')}</td>
-                  <td style={tdRight}>{fmtNumber(obs.delta_localiser_vs_authoritative_deg, 3, '°')}</td>
-                  <td style={tdRight}>{fmtNumber(obs.delta_position_vs_authoritative_deg, 3, '°')}</td>
-                  <td style={tdRight}>{fmtNumber(obs.delta_burstsync_vs_authoritative_deg, 3, '°')}</td>
-                  <td style={tdLeft}>{fit ? 'fit' : (obs.fit_reject_reason || 'display')}</td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '10px' }}>
-        <div>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>Residual vs bearing rate</div>
-          <svg width="100%" height={plotH} viewBox={`0 0 ${plotW} ${plotH}`} style={{ background: '#0f141b', border: '1px solid #30363d' }}>
-            <line x1={padL} y1={yResidual(0)} x2={plotW - padR} y2={yResidual(0)} stroke="#58a6ff88" />
-            <line x1={xBearingRate(0)} y1={padT} x2={xBearingRate(0)} y2={plotH - padB} stroke="#30363d" strokeDasharray="3 5" />
-            {motionRows.map((obs, idx) => (
-              <g key={idx}>
-                <circle cx={xBearingRate(obs.bearing_rate_deg_s)} cy={yResidual(obs.resid_without_motion_deg)}
-                        r={2.2} fill="#ff7b72" opacity={0.55} />
-                <circle cx={xBearingRate(obs.bearing_rate_deg_s)} cy={yResidual(obs.resid_with_motion_deg ?? obs.resid_authoritative_deg)}
-                        r={2.3} fill="#3fb950" opacity={0.82} />
-              </g>
-            ))}
-            <text x={padL} y={plotH - 8} fill="#ff7b72" fontSize="9">before</text>
-            <text x={padL + 48} y={plotH - 8} fill="#3fb950" fontSize="9">after</text>
-            <text x={4} y={12} fill="#8b949e" fontSize="9">±{residualAbsMax.toFixed(0)}°</text>
-          </svg>
-        </div>
-        <div>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>Residual improvement by bearing rate</div>
-          <svg width="100%" height={plotH} viewBox={`0 0 ${plotW} ${plotH}`} style={{ background: '#0f141b', border: '1px solid #30363d' }}>
-            <line x1={padL} y1={yImprovement(0)} x2={plotW - padR} y2={yImprovement(0)} stroke="#58a6ff88" />
-            <line x1={xBearingRate(0)} y1={padT} x2={xBearingRate(0)} y2={plotH - padB} stroke="#30363d" strokeDasharray="3 5" />
-            {motionRows.map((obs, idx) => {
-              const improvement = Number(obs.motion_comp_improvement_deg)
-              return Number.isFinite(improvement) ? (
-                <circle key={idx} cx={xBearingRate(obs.bearing_rate_deg_s)} cy={yImprovement(improvement)}
-                        r={obs.motion_comp_applied ? 2.6 : 1.9} fill={improvement >= 0 ? '#3fb950' : '#ff7b72'} opacity={obs.motion_comp_applied ? 0.82 : 0.35} />
-              ) : null
-            })}
-            <text x={padL} y={plotH - 8} fill="#8b949e" fontSize="9">positive means smaller residual</text>
-            <text x={4} y={12} fill="#8b949e" fontSize="9">±{improvementAbsMax.toFixed(0)}°</text>
-          </svg>
-        </div>
-        <div>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>Residual vs effective Beast time</div>
-          <svg width="100%" height={plotH} viewBox={`0 0 ${plotW} ${plotH}`} style={{ background: '#0f141b', border: '1px solid #30363d' }}>
-            <line x1={padL} y1={yResidual(0)} x2={plotW - padR} y2={yResidual(0)} stroke="#58a6ff88" />
-            {observations.map((obs, idx) => (
-              <circle key={idx} cx={xEffective(obs.effective_beast_us)} cy={yResidual(obs.resid_authoritative_deg)}
-                      r={obs.fit_eligible ? 2.5 : 1.8} fill={obs.fit_eligible ? '#3fb950' : '#8b949e'} opacity={obs.fit_eligible ? 0.9 : 0.35} />
-            ))}
-            <text x={padL} y={plotH - 8} fill="#8b949e" fontSize="9">effective Beast window</text>
-            <text x={4} y={12} fill="#8b949e" fontSize="9">±{residualAbsMax.toFixed(0)}°</text>
-          </svg>
-        </div>
-        <div>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>Residual vs ICAO-relative effective time</div>
-          <svg width="100%" height={plotH} viewBox={`0 0 ${plotW} ${plotH}`} style={{ background: '#0f141b', border: '1px solid #30363d' }}>
-            <line x1={padL} y1={yResidual(0)} x2={plotW - padR} y2={yResidual(0)} stroke="#58a6ff88" />
-            {byIcao.map((obs, idx) => (
-              <circle key={idx} cx={xRelative(obs.relative_us)} cy={yResidual(obs.resid_authoritative_deg)}
-                      r={obs.fit_eligible ? 2.4 : 1.7} fill={obs.fit_eligible ? '#58a6ff' : '#8b949e'} opacity={obs.fit_eligible ? 0.85 : 0.35} />
-            ))}
-            <text x={padL} y={plotH - 8} fill="#8b949e" fontSize="9">time since each ICAO first effective Beast sample</text>
-          </svg>
-        </div>
-        <div>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>Timestamp basis comparison</div>
-          <svg width="100%" height={plotH} viewBox={`0 0 ${plotW} ${plotH}`} style={{ background: '#0f141b', border: '1px solid #30363d' }}>
-            <line x1={padL} y1={basisY(0)} x2={plotW - padR} y2={basisY(0)} stroke="#58a6ff88" />
-            {observations.map((obs, idx) => (
-              <g key={idx}>
-                <circle cx={xEffective(obs.effective_beast_us)} cy={basisY(obs.delta_raw_vs_effective_deg)} r={2.1} fill="#d29922" opacity={0.75} />
-                <circle cx={xEffective(obs.effective_beast_us)} cy={basisY(obs.delta_wall_vs_effective_deg)} r={2.1} fill="#ff7b72" opacity={0.75} />
-              </g>
-            ))}
-            <text x={padL} y={plotH - 8} fill="#d29922" fontSize="9">raw-effective</text>
-            <text x={padL + 92} y={plotH - 8} fill="#ff7b72" fontSize="9">wall-effective</text>
-            <text x={4} y={12} fill="#8b949e" fontSize="9">±60°</text>
-          </svg>
-        </div>
-        <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '6px', fontSize: '0.72rem' }}>
-          <div style={{ color: '#8b949e', marginBottom: '4px' }}>Phase decomposition</div>
-          {latest.slice(-6).map((obs, idx) => (
-            <div key={`${obs.icao}-${idx}`} style={{ display: 'grid', gridTemplateColumns: '5.5rem repeat(4, minmax(0, 1fr))', gap: '4px', opacity: obs.fit_eligible ? 1 : 0.58 }}>
-              <span style={{ fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</span>
-              <span>period {fmtNumber(obs.phase_from_period_only_deg, 1, '°')}</span>
-              <span>epoch {fmtNumber(obs.phase_after_epoch_deg, 1, '°')}</span>
-              <span>wave {fmtNumber(obs.waveform_correction_deg, 2, '°')}</span>
-              <span>pred {fmtNumber(obs.pred_after_waveform_deg, 1, '°')}</span>
-            </div>
-          ))}
-        </div>
-        <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '6px', fontSize: '0.72rem', overflow: 'auto' }}>
-          <div style={{ color: '#8b949e', marginBottom: '4px' }}>Per-aircraft motion compensation</div>
-          <table style={tableStyle}>
-            <thead>
-              <tr>
-                <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
-                <th style={thStyle}>rate</th>
-                <th style={thStyle}>before</th>
-                <th style={thStyle}>after</th>
-                <th style={thStyle}>Δ|res|</th>
-                <th style={thStyle}>n</th>
-              </tr>
-            </thead>
-            <tbody>
-              {motionByIcao.slice(0, 12).map(row => (
-                <tr key={row.icao}>
-                  <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{row.icao}</td>
-                  <td style={tdRight}>{fmtNumber(row.bearing_rate_deg_s, 3, '°/s')}</td>
-                  <td style={tdRight}>{fmtNumber(row.before_abs_deg, 2, '°')}</td>
-                  <td style={tdRight}>{fmtNumber(row.after_abs_deg, 2, '°')}</td>
-                  <td style={tdRight}>{fmtNumber(row.improvement_deg, 2, '°')}</td>
-                  <td style={tdRight}>{row.n}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
+      )}
     </div>
   )
 }
