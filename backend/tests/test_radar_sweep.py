@@ -16,6 +16,7 @@ from radar.sweep import (
     LiveSyncState,
     RadarState,
     WaveformBin,
+    predict_sync_observation,
     _reinforce_radar_characteristics,
     detect_bursts,
     detect_bursts_with_signals,
@@ -407,6 +408,136 @@ def test_get_burst_sync_timeline_includes_non_sync_driving_observations():
     assert observations[0]["sync_update_eligible"] is False
     assert observations[1]["icao"] == "BBBBBB"
     assert observations[1]["sync_update_eligible"] is True
+    assert "fit_eligible" in observations[1]
+    assert "predicted_corrected_deg" in observations[1]
+    assert timeline["predictor_consistency"] is not None
+
+
+def test_authoritative_sync_predictor_applies_prop_and_waveform():
+    sync = LiveSyncState(
+        iid=7,
+        period_s=10.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=5.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1000.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        waveform_enabled=True,
+        waveform_applied=True,
+        prop_delay_enabled=True,
+    )
+    bins = [WaveformBin(correction_deg=10.0, weight=10.0, n=10) for _ in range(24)]
+
+    prediction = predict_sync_observation(sync, 5_000_000.0, range_nm=10.0, waveform_bins=bins)
+    no_prop = predict_sync_observation(
+        sync,
+        5_000_000.0,
+        range_nm=10.0,
+        waveform_bins=bins,
+        apply_propagation=False,
+        apply_waveform=False,
+    )
+
+    assert prediction.effective_arrival_us < 5_000_000.0
+    assert prediction.propagation_correction_us > 0.0
+    assert prediction.waveform_correction_deg == pytest.approx(10.0)
+    assert prediction.predicted_bearing_deg == pytest.approx(
+        (prediction.predicted_bearing_raw_deg - 10.0) % 360.0
+    )
+    assert no_prop.predicted_bearing_deg == pytest.approx(185.0)
+
+
+def test_period_refinement_uses_effective_time_slope_and_correct_sign(monkeypatch):
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=10.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=10.0,
+        prop_delay_enabled=True,
+        period_refine_enabled=True,
+    )
+
+    obs = deque(maxlen=state._MULTI_SYNC_OBS_MAX)
+    for idx, t_s in enumerate([0, 4, 8, 12, 16, 20, 24, 28]):
+        icao = "AAAAAA" if idx % 2 == 0 else "BBBBBB"
+        predicted = ((t_s / 10.0) * 360.0) % 360.0
+        residual = 0.5 * t_s
+        obs.append(AlignedBurstSyncObs(
+            burst_centroid_us=t_s * 1_000_000.0,
+            icao=icao,
+            bearing_deg=(predicted + residual) % 360.0,
+            n_replies=4,
+            signal_dbfs=-12.0,
+            pos_age_s=0.2,
+            range_nm=0.0,
+            ts=995.0 + idx * 0.5,
+            sync_update_eligible=True,
+        ))
+    state._live_aligned_burst_obs[7] = obs
+
+    state._update_multi_aircraft_sync_state(7, period_s=10.0)
+
+    sync = state.get_live_sync_state(7)
+    assert sync.residual_slope_deg_per_s == pytest.approx(0.5, rel=0.05)
+    assert sync.period_s < 10.0
+    assert sync.period_update_direction == "decrease"
+    assert sync.period_update_applied < 0.0
+    assert sync.period_update_gain == pytest.approx(0.25)
+    assert sync.fit_eligible_observations == 8
+    assert sync.fit_time_basis == "effective_beast_time_s"
+    assert state.get_burst_sync_timeline(7, window_s=60.0)["period_update_history"]
+
+
+def test_period_fit_rejects_large_residuals_without_hiding_timeline(monkeypatch):
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=10.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=10.0,
+    )
+    state._live_burst_timeline_obs[7] = deque([
+        AlignedBurstSyncObs(
+            burst_centroid_us=1_000_000.0,
+            icao="AAAAAA",
+            bearing_deg=150.0,
+            n_replies=4,
+            signal_dbfs=-12.0,
+            pos_age_s=0.2,
+            range_nm=5.0,
+            ts=999.0,
+            sync_update_eligible=True,
+        )
+    ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+
+    timeline = state.get_burst_sync_timeline(7, window_s=60.0)
+
+    assert len(timeline["observations"]) == 1
+    assert timeline["observations"][0]["fit_eligible"] is False
+    assert timeline["observations"][0]["fit_reject_reason"] == "residual_gate"
 
 
 def test_update_rotation_models_defers_recently_stable_iids(monkeypatch):

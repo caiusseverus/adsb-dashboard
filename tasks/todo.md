@@ -3760,3 +3760,34 @@ Goal: eliminate message drops and radar queue saturation caused by expensive FM/
 - [ ] FM solves still run (check `fm_last_run` timestamps under `/api/radar/iids/{iid}/fm-diagnostics`).
 - [ ] Burst-sync residual UI still responsive (250 ms throttle imperceptible).
 - [ ] Legacy timeline still renders when selected.
+
+## 2026-04-17 Radar Sync Model Convergence Fix
+
+- [x] Audit current live sync predictor, period-refinement slope basis, and localiser live-bearing path
+- [x] Replace tuple predictor with one authoritative backend prediction helper exposing effective time, phase, bearing, waveform, propagation, and residual basis
+- [x] Correct period refinement to fit residual slope against effective Beast time and apply a sign/gain update with explicit diagnostics
+- [x] Add stricter fit-driving gates and reject-reason diagnostics separate from display classification
+- [x] Route `aircraft_localiser.py` live bearing observations through the authoritative predictor
+- [x] Expose convergence/update history, fit support, predictor consistency, and waveform-learning diagnostics to the burst-sync API/UI
+- [x] Add focused backend regression tests for predictor consistency, slope correction, gating, and payload diagnostics
+- [x] Run focused backend tests and frontend build verification
+
+Plan confirmation: proceeding without further confirmation per task request. Scope is limited to radar sync-model correctness/diagnostics and shared prediction paths.
+
+### Review
+
+- Implementation:
+  - Added `SyncPrediction` / `predict_sync_observation()` in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) as the authoritative backend predictor for effective time, phase, raw/prop/waveform-corrected bearing, propagation delay, waveform correction, and predictor path tagging.
+  - Changed multi-aircraft period refinement to fit corrected residuals against propagation-corrected Beast time, not wall-clock observation time, and documented the sign convention: positive residual slope decreases period because the model beam is lagging.
+  - Increased period-refinement gain to a conservative but functional `0.25`, retained per-update/base ppm clamps, and exposed update term/direction/applied/gain/block reason diagnostics.
+  - Added fit-driving gates separate from display classification: non-sync-driving observations, near-wrap residuals, large residuals, stale positions, poor ICAO quality, and zero-weight observations are marked with reject reasons and excluded from period fitting.
+  - Routed `aircraft_localiser.py` live detection bearings through `predict_sync_observation()` and added a `RadarState.get_live_waveform_bins()` accessor so live localisation uses the same propagation/waveform predictor basis as diagnostics.
+  - Added period/slope/update histories, fit support/reject summaries, predictor consistency flags, waveform-learning state, and raw/after-prop/after-waveform residual fields to the burst-sync timeline payload.
+  - Updated `RadarPage.jsx` refinement diagnostics with a compact health block showing slope trend, update direction/gain/block reason, fit support/span, reject reasons, waveform-learning block state, recent updates, and predictor consistency.
+  - Added backend regression tests for predictor prop/waveform application, period-refinement sign/slope basis, timeline gating diagnostics, and localiser predictor unification.
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/radar/aircraft_localiser.py backend/tests/test_radar_sweep.py backend/tests/test_aircraft_localiser_sync_predictor.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_aircraft_localiser_sync_predictor.py`
+  - `uv run --directory backend pytest`
+  - `cd frontend && npm run build`
+  - Result: focused tests `49 passed`; full backend `296 passed`; frontend build succeeded with the existing large-chunk warning.

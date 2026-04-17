@@ -15,6 +15,7 @@ import statistics
 import threading
 import time
 from collections import defaultdict, deque
+from dataclasses import dataclass as _dataclass, field as _field
 from typing import TYPE_CHECKING, Optional, Any
 
 try:
@@ -313,6 +314,85 @@ def _apply_phase_waveform_correction(
     return (1.0 - frac) * a + frac * b
 
 
+@_dataclass
+class SyncPrediction:
+    """Authoritative live sync prediction for one timestamp.
+
+    Sign convention: residuals are always observed_bearing - predicted_bearing.
+    Positive residual slope over effective Beast time means the model is rotating
+    too slowly, so period refinement must decrease period_s.
+    """
+    raw_arrival_us: float
+    effective_arrival_us: float
+    propagation_correction_us: float
+    phase_in_rot_deg: float
+    predicted_bearing_raw_deg: float
+    predicted_bearing_deg: float
+    waveform_correction_deg: float
+    waveform_applied: bool
+    predictor_version: str = "authoritative_sync_v2"
+
+
+def predict_sync_observation(
+    sync: "LiveSyncState",
+    arrival_us: float,
+    *,
+    range_nm: float | None = None,
+    waveform_bins: list[WaveformBin] | None = None,
+    apply_propagation: bool | None = None,
+    apply_waveform: bool | None = None,
+) -> SyncPrediction:
+    """Predict bearing from arrival time using the refined sync model.
+
+    This is the single authoritative predictor consumed by burst-sync
+    residual generation, live period fitting, diagnostics, and Stage 3 live
+    bearing observation construction.  Update order is explicit:
+      1. compute propagation-corrected effective time,
+      2. compute phase with the current refined period,
+      3. apply the current waveform correction to the predicted bearing.
+    """
+    period_us = sync.period_s * 1e6
+    if period_us <= 0:
+        predicted = sync.phase_offset_deg % 360.0
+        return SyncPrediction(
+            raw_arrival_us=arrival_us,
+            effective_arrival_us=arrival_us,
+            propagation_correction_us=0.0,
+            phase_in_rot_deg=0.0,
+            predicted_bearing_raw_deg=predicted,
+            predicted_bearing_deg=predicted,
+            waveform_correction_deg=0.0,
+            waveform_applied=False,
+        )
+    effective_us = arrival_us
+    prop_delay_us = 0.0
+    prop_enabled = sync.prop_delay_enabled if apply_propagation is None else bool(apply_propagation)
+    if prop_enabled:
+        prop_delay_us = _compute_propagation_delay_us(range_nm)
+        effective_us = arrival_us - prop_delay_us
+    phase_in_rot = ((effective_us - sync.phase_epoch_us) / period_us * 360.0) % 360.0
+    predicted_raw = (phase_in_rot + sync.phase_offset_deg) % 360.0
+    predicted = predicted_raw
+    waveform_correction = 0.0
+    waveform_enabled = (sync.waveform_enabled and sync.waveform_applied) if apply_waveform is None else bool(apply_waveform)
+    waveform_applied = bool(waveform_enabled)
+    if waveform_enabled:
+        waveform_correction = _apply_phase_waveform_correction(
+            waveform_bins, phase_in_rot, applied=True,
+        )
+        predicted = (predicted - waveform_correction) % 360.0
+    return SyncPrediction(
+        raw_arrival_us=arrival_us,
+        effective_arrival_us=effective_us,
+        propagation_correction_us=prop_delay_us,
+        phase_in_rot_deg=phase_in_rot,
+        predicted_bearing_raw_deg=predicted_raw,
+        predicted_bearing_deg=predicted,
+        waveform_correction_deg=waveform_correction,
+        waveform_applied=waveform_applied,
+    )
+
+
 def _predict_bearing_from_sync(
     sync: "LiveSyncState",
     arrival_us: float,
@@ -320,27 +400,14 @@ def _predict_bearing_from_sync(
     range_nm: float | None = None,
     waveform_bins: list[WaveformBin] | None = None,
 ) -> tuple[float, float]:
-    """Predict bearing from arrival time using the refined sync model.
-
-    Returns (predicted_deg, phase_in_rot_deg).  Applies propagation-delay
-    correction when enabled and the waveform correction when the state says
-    it is applied.  This is the single authoritative predictor consumed by
-    residual diagnostics and the localiser.
-    """
-    period_us = sync.period_s * 1e6
-    if period_us <= 0:
-        return sync.phase_offset_deg % 360.0, 0.0
-    effective_us = arrival_us
-    if sync.prop_delay_enabled:
-        effective_us = arrival_us - _compute_propagation_delay_us(range_nm)
-    phase_in_rot = ((effective_us - sync.phase_epoch_us) / period_us * 360.0) % 360.0
-    predicted = (phase_in_rot + sync.phase_offset_deg) % 360.0
-    if sync.waveform_enabled and sync.waveform_applied:
-        correction = _apply_phase_waveform_correction(
-            waveform_bins, phase_in_rot, applied=True,
-        )
-        predicted = (predicted - correction) % 360.0
-    return predicted, phase_in_rot
+    """Compatibility wrapper around the authoritative predictor."""
+    prediction = predict_sync_observation(
+        sync,
+        arrival_us,
+        range_nm=range_nm,
+        waveform_bins=waveform_bins,
+    )
+    return prediction.predicted_bearing_deg, prediction.phase_in_rot_deg
 
 
 def _compute_sync_residual_deg(
@@ -359,9 +426,6 @@ def _compute_sync_residual_deg(
         (new_epoch_us - existing.phase_epoch_us) / period_us * 360.0 + existing.phase_offset_deg
     ) % 360.0
     return (new_offset_deg - existing_at_new_epoch + 540.0) % 360.0 - 180.0
-
-
-from dataclasses import dataclass as _dataclass, field as _field
 
 
 # One-way speed-of-light delay per nautical mile, microseconds.
@@ -436,11 +500,28 @@ class LiveSyncState:
     residual_slope_deg_per_s: float = 0.0  # fitted residual-vs-time slope last update
     period_correction_ppm: float = 0.0     # (period_s - period_base_s) / period_base_s * 1e6
     period_refine_enabled: bool = False    # True if period refinement is active this session
+    period_update_term: float = 0.0         # unclamped candidate period delta in seconds
+    period_update_direction: str = "none"   # increase/decrease/none; positive residual slope decreases period
+    period_update_applied: float = 0.0      # actual applied period delta in seconds after clamps
+    period_update_gain: float = 0.0         # gain applied to residual_slope_deg_per_s
+    period_refine_block_reason: str | None = None
+    fit_time_basis: str = "effective_beast_time_s"
+    fit_residual_basis: str = "observed_minus_authoritative_prediction_after_waveform_deg"
+    fit_total_observations: int = 0
+    fit_eligible_observations: int = 0
+    fit_rejected_observations: int = 0
+    fit_reject_reasons: dict[str, int] = _field(default_factory=dict)
+    fit_contributing_icao_count: int = 0
+    fit_span_s: float = 0.0
+    predictor_consistency: dict[str, bool] = _field(default_factory=dict)
     # Phase-in-rotation waveform correction diagnostics.
     waveform_enabled: bool = False         # config flag state
     waveform_applied: bool = False         # True if waveform passed coverage threshold and is applied
     waveform_bin_count: int = 0            # configured bin count
     waveform_residual_reduction_deg: float = 0.0  # rolling |resid_raw| - |resid_corrected|
+    waveform_learning_enabled: bool = False
+    waveform_update_block_reason: str | None = None
+    waveform_learning_residual_basis: str = "residual_after_waveform_detrended_deg"
     # Propagation delay correction diagnostics.
     prop_delay_enabled: bool = False       # config flag state
 
@@ -1316,6 +1397,10 @@ class RadarState:
         # Per-IID per-ICAO residual quality memory, used to downweight repeatedly
         # noisy aircraft in slope fitting and waveform learning.
         self._live_icao_sync_quality: dict[int, dict[str, IcaoSyncQuality]] = {}
+        # Per-IID short histories for convergence diagnostics.
+        self._live_period_update_history: dict[int, deque] = {}
+        self._live_slope_history: dict[int, deque] = {}
+        self._live_period_history: dict[int, deque] = {}
 
         # Per-IID rotation-analysis gating: (last event count, last run ts).
         # update_rotation_models() uses these to skip _analyse_iid_events for
@@ -1980,6 +2065,12 @@ class RadarState:
                 residual_slope_deg_per_s=0.0,
                 period_correction_ppm=0.0,
                 period_refine_enabled=bool(RADAR_SYNC_PERIOD_REFINE_ENABLED),
+                predictor_consistency={
+                    "burst_sync": True,
+                    "period_fit": True,
+                    "localiser_live": True,
+                    "position_verification": True,
+                },
                 waveform_enabled=bool(RADAR_SYNC_WAVEFORM_ENABLED),
                 waveform_applied=False,
                 waveform_bin_count=int(RADAR_SYNC_WAVEFORM_BIN_COUNT),
@@ -2047,10 +2138,27 @@ class RadarState:
             residual_slope_deg_per_s=existing.residual_slope_deg_per_s,
             period_correction_ppm=existing.period_correction_ppm,
             period_refine_enabled=existing.period_refine_enabled,
+            period_update_term=existing.period_update_term,
+            period_update_direction=existing.period_update_direction,
+            period_update_applied=existing.period_update_applied,
+            period_update_gain=existing.period_update_gain,
+            period_refine_block_reason=existing.period_refine_block_reason,
+            fit_time_basis=existing.fit_time_basis,
+            fit_residual_basis=existing.fit_residual_basis,
+            fit_total_observations=existing.fit_total_observations,
+            fit_eligible_observations=existing.fit_eligible_observations,
+            fit_rejected_observations=existing.fit_rejected_observations,
+            fit_reject_reasons=dict(existing.fit_reject_reasons),
+            fit_contributing_icao_count=existing.fit_contributing_icao_count,
+            fit_span_s=existing.fit_span_s,
+            predictor_consistency=dict(existing.predictor_consistency),
             waveform_enabled=existing.waveform_enabled,
             waveform_applied=existing.waveform_applied,
             waveform_bin_count=existing.waveform_bin_count,
             waveform_residual_reduction_deg=existing.waveform_residual_reduction_deg,
+            waveform_learning_enabled=existing.waveform_learning_enabled,
+            waveform_update_block_reason=existing.waveform_update_block_reason,
+            waveform_learning_residual_basis=existing.waveform_learning_residual_basis,
             prop_delay_enabled=existing.prop_delay_enabled,
         )
 
@@ -2305,42 +2413,56 @@ class RadarState:
         waveform_bins = self._live_waveform_bins.get(iid)
         icao_quality = self._live_icao_sync_quality.setdefault(iid, {})
 
-        # Compute circular residual for each observation against the current model.
-        # Residual = observed_bearing − model_predicted_bearing (wrapped to (−180, 180]).
-        # Extended tuple now carries the observation timestamp and phase-in-rotation
-        # for slope fitting and waveform learning downstream.
-        scored: list[tuple[float, float, str, str, float, float, float, float]] = []
-        # (residual, weight, status, icao, effective_us, phase_in_rot, residual_raw, obs_ts)
+        # Compute residuals for each observation against the authoritative model.
+        # Residual = observed_bearing - predicted_bearing (wrapped to (-180, 180]).
+        # Period fitting uses corrected residuals after current propagation and
+        # waveform correction, and uses effective Beast time as the x-axis.  This
+        # keeps the fit on the same basis as the predictor and avoids fitting
+        # scheduler/wall-clock timing drift.
+        scored: list[dict] = []
+        fit_reject_reasons: dict[str, int] = defaultdict(int)
         for obs in recent_obs:
-            arrival_us = obs.effective_arrival_us if (
-                existing.prop_delay_enabled and obs.effective_arrival_us
-            ) else obs.burst_centroid_us
-            predicted_raw, phase_in_rot = _predict_bearing_from_sync(
+            uncorrected_prediction = predict_sync_observation(
                 existing,
                 obs.burst_centroid_us,
                 range_nm=obs.range_nm,
                 waveform_bins=None,
+                apply_propagation=False,
+                apply_waveform=False,
             )
-            # Residual against the raw (pre-waveform) model — this is what the
-            # refinement fit sees and what learns the waveform.
-            residual_raw = (obs.bearing_deg - predicted_raw + 540.0) % 360.0 - 180.0
-            # Corrected residual: apply current waveform to see how close we are
-            # on the model actually exposed to the localiser.
-            predicted_corr, _ = _predict_bearing_from_sync(
+            raw_prediction = predict_sync_observation(
+                existing,
+                obs.burst_centroid_us,
+                range_nm=obs.range_nm,
+                waveform_bins=None,
+                apply_waveform=False,
+            )
+            corrected_prediction = predict_sync_observation(
                 existing,
                 obs.burst_centroid_us,
                 range_nm=obs.range_nm,
                 waveform_bins=waveform_bins,
             )
-            residual = (obs.bearing_deg - predicted_corr + 540.0) % 360.0 - 180.0
+            residual_raw = (
+                obs.bearing_deg - uncorrected_prediction.predicted_bearing_deg + 540.0
+            ) % 360.0 - 180.0
+            residual_after_prop = (
+                obs.bearing_deg - raw_prediction.predicted_bearing_deg + 540.0
+            ) % 360.0 - 180.0
+            residual = (
+                obs.bearing_deg - corrected_prediction.predicted_bearing_deg + 540.0
+            ) % 360.0 - 180.0
             abs_r = abs(residual)
             status = self._classify_sync_residual(abs_r)
             base_w = self._score_sync_burst_observation(obs)
             # Per-ICAO quality downweight: noisy aircraft get smaller influence.
             q_entry = icao_quality.get(obs.icao)
+            q_reject = None
             if q_entry is not None:
                 mad = max(q_entry.residual_mad_deg, 0.5)
                 q_multiplier = max(0.1, min(1.0, 1.0 / (1.0 + mad / 3.0)))
+                if q_entry.n_recent >= 6 and (q_entry.residual_mad_deg > 25.0 or abs(q_entry.residual_median_deg) > 45.0):
+                    q_reject = "poor_icao_quality"
             else:
                 q_multiplier = 1.0
             if status == "rejected":
@@ -2349,16 +2471,45 @@ class RadarState:
                 effective_w = base_w * 0.2 * q_multiplier
             else:
                 effective_w = base_w * q_multiplier
-            scored.append(
-                (residual, effective_w, status, obs.icao,
-                 arrival_us, phase_in_rot, residual_raw, obs.ts)
-            )
+
+            fit_reject_reason = None
+            if not getattr(obs, "sync_update_eligible", True):
+                fit_reject_reason = "not_sync_update_eligible"
+            elif abs_r >= 150.0:
+                fit_reject_reason = "near_wrap_residual"
+            elif abs_r > 35.0:
+                fit_reject_reason = "residual_gate"
+            elif obs.pos_age_s > 8.0:
+                fit_reject_reason = "stale_position"
+            elif q_reject is not None:
+                fit_reject_reason = q_reject
+            elif effective_w <= 0:
+                fit_reject_reason = "zero_weight"
+
+            fit_eligible = fit_reject_reason is None
+            if fit_reject_reason is not None:
+                fit_reject_reasons[fit_reject_reason] += 1
+
+            scored.append({
+                "residual": residual,
+                "residual_raw": residual_raw,
+                "residual_after_prop": residual_after_prop,
+                "weight": effective_w,
+                "status": status,
+                "icao": obs.icao,
+                "effective_us": corrected_prediction.effective_arrival_us,
+                "phase_in_rot": corrected_prediction.phase_in_rot_deg,
+                "obs_ts": obs.ts,
+                "fit_eligible": fit_eligible,
+                "fit_reject_reason": fit_reject_reason,
+                "prediction": corrected_prediction,
+            })
 
         # Multi-aircraft integrity check: require at least two distinct ICAOs
         # contributing to prevent a single noisy aircraft from steering sync.
         contributing_icaos = {
-            icao for _, w, status, icao, *_ in scored
-            if w > 0 and status != "rejected"
+            e["icao"] for e in scored
+            if e["weight"] > 0 and e["status"] != "rejected"
         }
         if len(contributing_icaos) < 2:
             # Single-aircraft sync is too fragile — enter holdover rather than update.
@@ -2366,24 +2517,34 @@ class RadarState:
             existing.usable = False
             return
 
-        n_inliers = sum(1 for _, _, s, *_ in scored if s == "inlier")
-        n_rejected = sum(1 for _, _, s, *_ in scored if s == "rejected")
+        n_inliers = sum(1 for e in scored if e["status"] == "inlier")
+        n_rejected = sum(1 for e in scored if e["status"] == "rejected")
+        fit_scored = [
+            e for e in scored
+            if e["fit_eligible"] and e["weight"] > 0 and e["status"] != "rejected"
+        ]
+        fit_contributing_icaos = {e["icao"] for e in fit_scored}
 
         # Reject update if majority of observations are outliers — data quality is
         # too poor to steer the phase anchor reliably.
         if n_rejected >= len(recent_obs) // 2 + 1:
             existing.holdover = True
             existing.usable = False
+            existing.period_refine_block_reason = "majority_rejected"
+            existing.fit_reject_reasons = dict(fit_reject_reasons)
             return
 
-        # Weighted linear fit residual ~ a + b*(ts − t_ref) on non-rejected scores.
+        # Weighted linear fit residual ~ a + b*(effective_beast_time_s - t_ref).
         # a → phase correction term; b → angular-rate mismatch (deg/s) that converts
         # to a small period correction.  Both fall out of the same fit so phase and
         # period adjustments never fight each other.
-        t_ref = min(e[7] for e in scored)
-        xs = [e[7] - t_ref for e in scored]
-        ys = [e[0] for e in scored]
-        ws = [e[1] for e in scored]
+        fit_pool = fit_scored if fit_scored else [
+            e for e in scored if e["weight"] > 0 and e["status"] != "rejected"
+        ]
+        t_ref = min(e["effective_us"] for e in fit_pool) / 1_000_000.0
+        xs = [(e["effective_us"] / 1_000_000.0) - t_ref for e in fit_pool]
+        ys = [e["residual"] for e in fit_pool]
+        ws = [e["weight"] for e in fit_pool]
         a_fit, b_fit = _fit_weighted_slope(xs, ys, ws)
 
         # Weighted phase correction (the a term) — equivalent to the previous
@@ -2402,12 +2563,10 @@ class RadarState:
         # Advance epoch to the most recent inlier/soft observation.
         # Keeping the epoch fresh prevents accumulated error from large
         # (burst_centroid_us - phase_epoch_us) distances.
-        inlier_mask = [s in ("inlier", "soft") for _, _, s, *_ in scored]
-        if not any(inlier_mask):
+        anchor_pool = [e for e in scored if e["status"] in ("inlier", "soft") and e["weight"] > 0]
+        if not anchor_pool:
             return
-        new_epoch_us = max(
-            e[4] for e, keep in zip(scored, inlier_mask) if keep
-        )
+        new_epoch_us = max(e["effective_us"] for e in anchor_pool)
 
         # Propagate the existing model to the new epoch, then apply correction.
         existing_at_new = (
@@ -2417,64 +2576,97 @@ class RadarState:
         new_offset = (existing_at_new + limited_correction) % 360.0
 
         # Live period refinement from slope.
-        #   angular rate b is in deg/s; nominal rate 360/period_s.
-        #   rate_refined = rate_nominal + b · _PERIOD_GAIN
-        #   period_refined = 360 / rate_refined, clamped in ppm.
+        # residual = observed - predicted.  If residual rises with effective
+        # time, the predicted beam is falling behind: increase angular rate,
+        # which decreases period_s.  Negative slope does the opposite.
         refined_period_s = live_period_s
-        span_s = max((e[7] for e in scored), default=0.0) - t_ref
+        span_s = max(xs, default=0.0) if xs else 0.0
         _PERIOD_REFINE_MIN_INLIERS = 6
         _PERIOD_REFINE_MIN_SPAN_ROT = 2.0
-        _PERIOD_GAIN = 0.05
-        _PERIOD_PPM_PER_UPDATE_MAX = 50.0
+        _PERIOD_GAIN = 0.25
+        _PERIOD_PPM_PER_UPDATE_MAX = 100.0
         _PERIOD_PPM_FROM_BASE_MAX = 2000.0
+        period_update_term = 0.0
+        period_update_applied = 0.0
+        period_update_direction = "none"
+        period_refine_block_reason = None
         refine_ok = (
             bool(RADAR_SYNC_PERIOD_REFINE_ENABLED)
-            and n_inliers >= _PERIOD_REFINE_MIN_INLIERS
-            and len(contributing_icaos) >= 2
+            and len(fit_scored) >= _PERIOD_REFINE_MIN_INLIERS
+            and len(fit_contributing_icaos) >= 2
             and span_s >= _PERIOD_REFINE_MIN_SPAN_ROT * live_period_s
         )
+        if not RADAR_SYNC_PERIOD_REFINE_ENABLED:
+            period_refine_block_reason = "disabled"
+        elif len(fit_scored) < _PERIOD_REFINE_MIN_INLIERS:
+            period_refine_block_reason = "insufficient_fit_observations"
+        elif len(fit_contributing_icaos) < 2:
+            period_refine_block_reason = "insufficient_fit_icaos"
+        elif span_s < _PERIOD_REFINE_MIN_SPAN_ROT * live_period_s:
+            period_refine_block_reason = "insufficient_fit_span"
         if refine_ok and live_period_s > 0:
             rate_nominal = 360.0 / live_period_s
             rate_target = rate_nominal + b_fit * _PERIOD_GAIN
             if rate_target > 0:
                 candidate = 360.0 / rate_target
+                period_update_term = candidate - live_period_s
                 # Per-update ppm clamp.
                 delta_ppm = (candidate - live_period_s) / live_period_s * 1e6
                 if delta_ppm > _PERIOD_PPM_PER_UPDATE_MAX:
                     candidate = live_period_s * (1.0 + _PERIOD_PPM_PER_UPDATE_MAX * 1e-6)
+                    period_refine_block_reason = "per_update_clamped"
                 elif delta_ppm < -_PERIOD_PPM_PER_UPDATE_MAX:
                     candidate = live_period_s * (1.0 - _PERIOD_PPM_PER_UPDATE_MAX * 1e-6)
+                    period_refine_block_reason = "per_update_clamped"
                 # Absolute ppm from base clamp.
                 if base_period_s > 0:
                     abs_ppm = (candidate - base_period_s) / base_period_s * 1e6
                     if abs_ppm > _PERIOD_PPM_FROM_BASE_MAX:
                         candidate = base_period_s * (1.0 + _PERIOD_PPM_FROM_BASE_MAX * 1e-6)
+                        period_refine_block_reason = "base_ppm_clamped"
                     elif abs_ppm < -_PERIOD_PPM_FROM_BASE_MAX:
                         candidate = base_period_s * (1.0 - _PERIOD_PPM_FROM_BASE_MAX * 1e-6)
+                        period_refine_block_reason = "base_ppm_clamped"
                 refined_period_s = candidate
+                period_update_applied = refined_period_s - live_period_s
+                if period_update_applied > 0:
+                    period_update_direction = "increase"
+                elif period_update_applied < 0:
+                    period_update_direction = "decrease"
+                else:
+                    period_update_direction = "none"
+            else:
+                period_refine_block_reason = "non_positive_rate_target"
         period_correction_ppm = (
             (refined_period_s - base_period_s) / base_period_s * 1e6
             if base_period_s > 0 else 0.0
         )
 
-        # Waveform bin learning: slow EMA of inlier/soft raw residuals keyed by
-        # phase-in-rotation.  Applied correction subtracts this from predictions.
+        # Waveform bin learning: slow EMA of detrended residuals keyed by
+        # phase-in-rotation.  Period refinement sees long-term drift first;
+        # waveform learning then tracks repeatable intra-rotation structure.
+        waveform_learning_enabled = False
+        waveform_update_block_reason = None
         if RADAR_SYNC_WAVEFORM_ENABLED:
             n_bins = max(int(RADAR_SYNC_WAVEFORM_BIN_COUNT), 4)
             if waveform_bins is None or len(waveform_bins) != n_bins:
                 waveform_bins = [WaveformBin() for _ in range(n_bins)]
                 self._live_waveform_bins[iid] = waveform_bins
             _WAVEFORM_ALPHA = 0.02
-            for residual_c, w, status, _icao, _arrival, phase_in_rot, residual_raw, _ts in scored:
-                if w <= 0 or status == "rejected":
+            waveform_learning_enabled = abs(b_fit) <= 2.0 or len(fit_scored) < _PERIOD_REFINE_MIN_INLIERS
+            if not waveform_learning_enabled:
+                waveform_update_block_reason = "slope_too_large"
+            for e in scored:
+                if not waveform_learning_enabled or e["weight"] <= 0 or e["status"] == "rejected":
                     continue
-                idx = _waveform_bin_index(phase_in_rot, n_bins)
+                residual_detrended = e["residual_raw"] - (a_fit + b_fit * ((e["effective_us"] / 1_000_000.0) - t_ref))
+                idx = _waveform_bin_index(e["phase_in_rot"], n_bins)
                 bin_entry = waveform_bins[idx]
                 bin_entry.correction_deg = (
                     (1.0 - _WAVEFORM_ALPHA) * bin_entry.correction_deg
-                    + _WAVEFORM_ALPHA * residual_raw
+                    + _WAVEFORM_ALPHA * residual_detrended
                 )
-                bin_entry.weight += w
+                bin_entry.weight += e["weight"]
                 bin_entry.n += 1
             # Circular 3-wide triangular smoothing (0.25, 0.5, 0.25) over correction.
             if n_bins >= 3:
@@ -2493,11 +2685,12 @@ class RadarState:
             waveform_applied_new = bins_filled >= _WAVEFORM_MIN_BINS_FILLED
         else:
             waveform_applied_new = False
+            waveform_update_block_reason = "disabled"
 
         # Waveform residual reduction diagnostic: average |residual_raw| vs
         # |residual_corrected| across inlier/soft observations.
-        abs_raw = [abs(r[6]) for r in scored if r[2] in ("inlier", "soft")]
-        abs_corr = [abs(r[0]) for r in scored if r[2] in ("inlier", "soft")]
+        abs_raw = [abs(e["residual_raw"]) for e in scored if e["status"] in ("inlier", "soft")]
+        abs_corr = [abs(e["residual"]) for e in scored if e["status"] in ("inlier", "soft")]
         if abs_raw and abs_corr:
             reduction = (sum(abs_raw) / len(abs_raw)) - (sum(abs_corr) / len(abs_corr))
         else:
@@ -2511,7 +2704,12 @@ class RadarState:
         # Per-ICAO quality memory update: EMA of signed residual (bias) and
         # |residual − bias| (spread).  Used as a downweight multiplier above.
         _ICAO_QUALITY_ALPHA = 0.1
-        for residual_c, w, status, icao, _arrival, _phase_in_rot, _residual_raw, ts_obs in scored:
+        for e in scored:
+            residual_c = e["residual"]
+            w = e["weight"]
+            status = e["status"]
+            icao = e["icao"]
+            ts_obs = e["obs_ts"]
             if w <= 0 or status == "rejected":
                 continue
             q_entry = icao_quality.get(icao)
@@ -2538,7 +2736,7 @@ class RadarState:
 
         # Derive sync_jitter_deg from the spread of inlier residuals.
         # This ties jitter to actual recent behaviour rather than a fixed constant.
-        inlier_abs_residuals = [abs(r) for r, _, s, *_ in scored if s == "inlier"]
+        inlier_abs_residuals = [abs(e["residual"]) for e in scored if e["status"] == "inlier"]
         if len(inlier_abs_residuals) >= 3:
             try:
                 new_jitter = min(max(statistics.stdev(inlier_abs_residuals), 1.5), 15.0)
@@ -2571,7 +2769,14 @@ class RadarState:
             and n_rejected < len(recent_obs) // 2 + 1
         )
 
-        self._live_sync_states[iid] = LiveSyncState(
+        predictor_consistency = {
+            "burst_sync": True,
+            "period_fit": True,
+            "localiser_live": True,
+            "position_verification": True,
+        }
+
+        new_state = LiveSyncState(
             iid=iid,
             period_s=refined_period_s,
             phase_epoch_us=new_epoch_us,
@@ -2593,12 +2798,64 @@ class RadarState:
             residual_slope_deg_per_s=b_fit,
             period_correction_ppm=period_correction_ppm,
             period_refine_enabled=bool(RADAR_SYNC_PERIOD_REFINE_ENABLED),
+            period_update_term=period_update_term,
+            period_update_direction=period_update_direction,
+            period_update_applied=period_update_applied,
+            period_update_gain=_PERIOD_GAIN,
+            period_refine_block_reason=period_refine_block_reason,
+            fit_time_basis="effective_beast_time_s",
+            fit_residual_basis="observed_minus_authoritative_prediction_after_waveform_deg",
+            fit_total_observations=len(recent_obs),
+            fit_eligible_observations=len(fit_scored),
+            fit_rejected_observations=len(recent_obs) - len(fit_scored),
+            fit_reject_reasons=dict(fit_reject_reasons),
+            fit_contributing_icao_count=len(fit_contributing_icaos),
+            fit_span_s=span_s,
+            predictor_consistency=predictor_consistency,
             waveform_enabled=bool(RADAR_SYNC_WAVEFORM_ENABLED),
             waveform_applied=waveform_applied_new,
             waveform_bin_count=len(waveform_bins) if waveform_bins else 0,
             waveform_residual_reduction_deg=waveform_reduction_ema,
+            waveform_learning_enabled=waveform_learning_enabled,
+            waveform_update_block_reason=waveform_update_block_reason,
+            waveform_learning_residual_basis="residual_after_waveform_detrended_deg",
             prop_delay_enabled=bool(RADAR_SYNC_PROP_DELAY_ENABLED),
         )
+        self._live_sync_states[iid] = new_state
+
+        update_entry = {
+            "ts": now_ts,
+            "source": new_state.source,
+            "residual_slope_deg_per_s": b_fit,
+            "period_s": refined_period_s,
+            "period_base_s": base_period_s,
+            "period_correction_ppm": period_correction_ppm,
+            "period_update_term": period_update_term,
+            "period_update_applied": period_update_applied,
+            "period_update_direction": period_update_direction,
+            "period_update_gain": _PERIOD_GAIN,
+            "period_refine_block_reason": period_refine_block_reason,
+            "n_fit_observations": len(fit_scored),
+            "n_total_observations": len(recent_obs),
+            "n_fit_icaos": len(fit_contributing_icaos),
+            "fit_span_s": span_s,
+            "fit_reject_reasons": dict(fit_reject_reasons),
+            "waveform_learning_enabled": waveform_learning_enabled,
+            "waveform_update_block_reason": waveform_update_block_reason,
+        }
+        self._live_period_update_history.setdefault(iid, deque(maxlen=80)).append(update_entry)
+        self._live_slope_history.setdefault(iid, deque(maxlen=80)).append({
+            "ts": now_ts,
+            "residual_slope_deg_per_s": b_fit,
+            "fit_span_s": span_s,
+            "n_fit_observations": len(fit_scored),
+        })
+        self._live_period_history.setdefault(iid, deque(maxlen=80)).append({
+            "ts": now_ts,
+            "period_s": refined_period_s,
+            "period_base_s": base_period_s,
+            "period_correction_ppm": period_correction_ppm,
+        })
 
     def _finalize_pending_burst(
         self,
@@ -3378,6 +3635,9 @@ class RadarState:
                                self._last_multi_sync_update_ts,
                                self._live_waveform_bins,
                                self._live_icao_sync_quality,
+                               self._live_period_update_history,
+                               self._live_slope_history,
+                               self._live_period_history,
                                self._rotation_analysis_meta):
                 if iid in live_dict:
                     del live_dict[iid]
@@ -3428,6 +3688,7 @@ class RadarState:
                 "waveform_bins": len(self._live_waveform_bins),
                 "icao_sync_quality": len(self._live_icao_sync_quality),
                 "multi_sync_throttle": len(self._last_multi_sync_update_ts),
+                "period_update_history": len(self._live_period_update_history),
             }
             self._models.clear()
             self._sweep_history.clear()
@@ -3449,6 +3710,9 @@ class RadarState:
             self._last_multi_sync_update_ts.clear()
             self._live_waveform_bins.clear()
             self._live_icao_sync_quality.clear()
+            self._live_period_update_history.clear()
+            self._live_slope_history.clear()
+            self._live_period_history.clear()
             self._rotation_analysis_meta.clear()
             self._live_detection_buffer.clear()
             self._native_burst_processors.clear()
@@ -3714,6 +3978,9 @@ class RadarState:
             obs_snapshot = list(obs_buf) if obs_buf else []
             waveform_bins = list(self._live_waveform_bins.get(iid) or [])
             icao_quality = dict(self._live_icao_sync_quality.get(iid) or {})
+            update_history = list(self._live_period_update_history.get(iid) or [])
+            slope_history = list(self._live_slope_history.get(iid) or [])
+            period_history = list(self._live_period_history.get(iid) or [])
 
         if not obs_snapshot or sync is None:
             return {
@@ -3722,6 +3989,10 @@ class RadarState:
                 "window_s": window_s,
                 "waveform_bins": [],
                 "per_icao_quality": [],
+                "period_update_history": update_history,
+                "slope_history": slope_history,
+                "period_history": period_history,
+                "predictor_consistency": getattr(sync, "predictor_consistency", None) if sync else None,
             }
 
         now_ts = time.time()
@@ -3731,41 +4002,85 @@ class RadarState:
         for obs in obs_snapshot:
             if obs.ts < cutoff_ts:
                 continue
-            # Authoritative predictor: same path used elsewhere for refined sync.
-            predicted_raw, phase_in_rot = _predict_bearing_from_sync(
+            # Authoritative predictor: same path used by fitting and the live localiser.
+            uncorrected_prediction = predict_sync_observation(
                 sync,
                 obs.burst_centroid_us,
                 range_nm=getattr(obs, "range_nm", None),
                 waveform_bins=None,
+                apply_propagation=False,
+                apply_waveform=False,
             )
-            residual_raw = (obs.bearing_deg - predicted_raw + 540.0) % 360.0 - 180.0
-            predicted_corr, _ = _predict_bearing_from_sync(
+            raw_prediction = predict_sync_observation(
+                sync,
+                obs.burst_centroid_us,
+                range_nm=getattr(obs, "range_nm", None),
+                waveform_bins=None,
+                apply_waveform=False,
+            )
+            corrected_prediction = predict_sync_observation(
                 sync,
                 obs.burst_centroid_us,
                 range_nm=getattr(obs, "range_nm", None),
                 waveform_bins=waveform_bins,
             )
-            residual_corr = (obs.bearing_deg - predicted_corr + 540.0) % 360.0 - 180.0
+            residual_raw = (
+                obs.bearing_deg - uncorrected_prediction.predicted_bearing_deg + 540.0
+            ) % 360.0 - 180.0
+            residual_after_prop = (
+                obs.bearing_deg - raw_prediction.predicted_bearing_deg + 540.0
+            ) % 360.0 - 180.0
+            residual_corr = (
+                obs.bearing_deg - corrected_prediction.predicted_bearing_deg + 540.0
+            ) % 360.0 - 180.0
             abs_r = abs(residual_corr)
             classification = self._classify_sync_residual(abs_r)
             weight = self._score_sync_burst_observation(obs)
+            q_entry = icao_quality.get(obs.icao)
+            fit_reject_reason = None
+            if not getattr(obs, "sync_update_eligible", True):
+                fit_reject_reason = "not_sync_update_eligible"
+            elif abs_r >= 150.0:
+                fit_reject_reason = "near_wrap_residual"
+            elif abs_r > 35.0:
+                fit_reject_reason = "residual_gate"
+            elif obs.pos_age_s > 8.0:
+                fit_reject_reason = "stale_position"
+            elif q_entry is not None and q_entry.n_recent >= 6 and (
+                q_entry.residual_mad_deg > 25.0 or abs(q_entry.residual_median_deg) > 45.0
+            ):
+                fit_reject_reason = "poor_icao_quality"
+            elif classification == "rejected" or weight <= 0:
+                fit_reject_reason = "zero_weight"
+            fit_eligible = fit_reject_reason is None
             entries.append({
                 "beam_center_us": obs.burst_centroid_us,
                 "wall_ts": obs.ts,
                 "icao": obs.icao,
                 "bearing_deg": obs.bearing_deg,
-                "predicted_deg": predicted_corr,
+                "predicted_deg": corrected_prediction.predicted_bearing_deg,
+                "predicted_raw_deg": raw_prediction.predicted_bearing_raw_deg,
+                "predicted_after_prop_deg": raw_prediction.predicted_bearing_deg,
+                "predicted_corrected_deg": corrected_prediction.predicted_bearing_deg,
                 "residual_deg": residual_corr,
                 # Separate raw vs corrected residual so the UI can show the
                 # effect of the waveform correction directly.
                 "residual_raw_deg": residual_raw,
+                "residual_after_prop_deg": residual_after_prop,
+                "residual_after_waveform_deg": residual_corr,
                 "residual_corrected_deg": residual_corr,
-                "phase_in_rot_deg": phase_in_rot,
+                "residual_for_period_fit_deg": residual_corr if fit_eligible else None,
+                "phase_in_rot_deg": corrected_prediction.phase_in_rot_deg,
                 "raw_arrival_us": getattr(obs, "raw_arrival_us", obs.burst_centroid_us),
-                "effective_arrival_us": getattr(obs, "effective_arrival_us", obs.burst_centroid_us),
-                "prop_delay_us": getattr(obs, "prop_delay_aircraft_to_receiver_us", 0.0),
+                "effective_arrival_us": corrected_prediction.effective_arrival_us,
+                "prop_delay_us": corrected_prediction.propagation_correction_us,
+                "waveform_correction_deg": corrected_prediction.waveform_correction_deg,
+                "waveform_applied": corrected_prediction.waveform_applied,
+                "prediction_path": corrected_prediction.predictor_version,
                 "weight": weight,
                 "classification": classification,
+                "fit_eligible": fit_eligible,
+                "fit_reject_reason": fit_reject_reason,
                 "n_replies": obs.n_replies,
                 "signal_dbfs": obs.signal_dbfs,
                 "pos_age_s": obs.pos_age_s,
@@ -3812,6 +4127,10 @@ class RadarState:
             "window_s": window_s,
             "waveform_bins": waveform_payload,
             "per_icao_quality": quality_payload,
+            "period_update_history": update_history,
+            "slope_history": slope_history,
+            "period_history": period_history,
+            "predictor_consistency": getattr(sync, "predictor_consistency", None),
         }
 
     def get_dwell_profile(self, iid: int, icao: str, sweep_idx: int | None = None) -> list[dict]:
@@ -4453,6 +4772,10 @@ class RadarState:
     def get_all_live_sync_states(self) -> dict[int, LiveSyncState]:
         """Return a snapshot of all current live sync states."""
         return dict(self._live_sync_states)
+
+    def get_live_waveform_bins(self, iid: int) -> list[WaveformBin]:
+        """Return a snapshot of the learned waveform bins for one IID."""
+        return list(self._live_waveform_bins.get(iid) or [])
 
     def update_live_sync_state(self, iid: int, **kwargs) -> None:
         """Merge updated fields into an existing LiveSyncState (e.g. jitter from calibration)."""

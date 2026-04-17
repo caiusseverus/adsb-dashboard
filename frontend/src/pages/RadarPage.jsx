@@ -1720,13 +1720,38 @@ const legendDotStyle = {
   display: 'inline-block',
 }
 
-function SyncDiagnosticsPanel({ syncState, waveformBins, perIcaoQuality, observations }) {
+function SyncDiagnosticsPanel({
+  syncState,
+  waveformBins,
+  perIcaoQuality,
+  observations,
+  periodUpdateHistory,
+  slopeHistory,
+  periodHistory,
+  predictorConsistency,
+}) {
   if (!syncState) return null
   const basePeriod = Number(syncState.period_base_s)
   const livePeriod = Number(syncState.period_s)
   const ppm = Number(syncState.period_correction_ppm)
   const slope = Number(syncState.residual_slope_deg_per_s)
   const wfReduction = Number(syncState.waveform_residual_reduction_deg)
+  const updateApplied = Number(syncState.period_update_applied)
+  const updateGain = Number(syncState.period_update_gain)
+  const fitEligible = Number(syncState.fit_eligible_observations)
+  const fitTotal = Number(syncState.fit_total_observations)
+  const fitSpan = Number(syncState.fit_span_s)
+  const recentSlope = Array.isArray(slopeHistory) ? slopeHistory.slice(-12) : []
+  const recentPeriods = Array.isArray(periodHistory) ? periodHistory.slice(-12) : []
+  const slopeTrend = recentSlope.length >= 2
+    ? Math.abs(Number(recentSlope[recentSlope.length - 1]?.residual_slope_deg_per_s ?? 0))
+      - Math.abs(Number(recentSlope[0]?.residual_slope_deg_per_s ?? 0))
+    : null
+  const recentUpdates = Array.isArray(periodUpdateHistory) ? periodUpdateHistory.slice(-6).reverse() : []
+  const rejectReasons = syncState.fit_reject_reasons && typeof syncState.fit_reject_reasons === 'object'
+    ? Object.entries(syncState.fit_reject_reasons)
+    : []
+  const consistency = predictorConsistency || syncState.predictor_consistency || {}
   const pillStyle = {
     display: 'inline-block',
     padding: '2px 6px',
@@ -1767,14 +1792,54 @@ function SyncDiagnosticsPanel({ syncState, waveformBins, perIcaoQuality, observa
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '2px' }}>
         <span style={pillStyle}>Base period<span style={valueStyle}>{Number.isFinite(basePeriod) && basePeriod > 0 ? `${basePeriod.toFixed(4)}s` : '—'}</span></span>
         <span style={pillStyle}>Refined period<span style={valueStyle}>{Number.isFinite(livePeriod) && livePeriod > 0 ? `${livePeriod.toFixed(4)}s` : '—'}</span></span>
+        <span style={pillStyle}>Period samples<span style={valueStyle}>{recentPeriods.length || '—'}</span></span>
         <span style={pillStyle}>ppm<span style={valueStyle}>{Number.isFinite(ppm) ? `${ppm >= 0 ? '+' : ''}${ppm.toFixed(1)}` : '—'}</span></span>
         <span style={pillStyle}>Slope<span style={valueStyle}>{Number.isFinite(slope) ? `${slope.toFixed(3)}°/s` : '—'}</span></span>
+        <span style={pillStyle}>Slope trend<span style={valueStyle}>{slopeTrend == null ? '—' : (slopeTrend < 0 ? 'shrinking' : slopeTrend > 0 ? 'growing' : 'flat')}</span></span>
         <span style={pillStyle}>Refine<span style={valueStyle}>{syncState.period_refine_enabled ? 'on' : 'off'}</span></span>
+        <span style={pillStyle}>Period update<span style={valueStyle}>{Number.isFinite(updateApplied) ? `${updateApplied >= 0 ? '+' : ''}${(updateApplied * 1e6).toFixed(1)}µs` : '—'}</span></span>
+        <span style={pillStyle}>Direction<span style={valueStyle}>{syncState.period_update_direction || '—'}</span></span>
+        <span style={pillStyle}>Gain<span style={valueStyle}>{Number.isFinite(updateGain) ? updateGain.toFixed(2) : '—'}</span></span>
+        <span style={pillStyle}>Block<span style={valueStyle}>{syncState.period_refine_block_reason || 'none'}</span></span>
+        <span style={pillStyle}>Fit support<span style={valueStyle}>{Number.isFinite(fitEligible) && Number.isFinite(fitTotal) ? `${fitEligible}/${fitTotal}` : '—'}</span></span>
+        <span style={pillStyle}>Fit span<span style={valueStyle}>{Number.isFinite(fitSpan) ? `${fitSpan.toFixed(1)}s` : '—'}</span></span>
         <span style={pillStyle}>Waveform<span style={valueStyle}>{syncState.waveform_enabled ? (syncState.waveform_applied ? 'applied' : 'learning') : 'off'}</span></span>
+        <span style={pillStyle}>Waveform learn<span style={valueStyle}>{syncState.waveform_learning_enabled ? 'on' : (syncState.waveform_update_block_reason || 'off')}</span></span>
         <span style={pillStyle}>Wf Δ|res|<span style={valueStyle}>{Number.isFinite(wfReduction) ? `${wfReduction.toFixed(2)}°` : '—'}</span></span>
         <span style={pillStyle}>Prop delay<span style={valueStyle}>{syncState.prop_delay_enabled ? 'on' : 'off'}</span></span>
         <span style={pillStyle}>Contributors<span style={valueStyle}>{syncState.contributing_icao_count ?? '—'}</span></span>
+        <span style={pillStyle}>Predictors<span style={valueStyle}>{Object.values(consistency).every(Boolean) ? 'unified' : 'check'}</span></span>
       </div>
+
+      {(recentUpdates.length > 0 || rejectReasons.length > 0) && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '8px', marginTop: '0.4rem', fontSize: '0.72rem' }}>
+          {recentUpdates.length > 0 && (
+            <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '4px 6px', overflow: 'auto' }}>
+              <div style={{ color: '#8b949e', marginBottom: '2px' }}>Recent period updates</div>
+              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                <thead><tr style={{ color: '#8b949e' }}><th style={{ textAlign: 'right' }}>slope</th><th style={{ textAlign: 'right' }}>Δµs</th><th style={{ textAlign: 'left' }}>gate</th></tr></thead>
+                <tbody>
+                  {recentUpdates.map((u, i) => (
+                    <tr key={`${u.ts}-${i}`}>
+                      <td style={{ textAlign: 'right', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{Number(u.residual_slope_deg_per_s ?? 0).toFixed(3)}</td>
+                      <td style={{ textAlign: 'right', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{(Number(u.period_update_applied ?? 0) * 1e6).toFixed(1)}</td>
+                      <td>{u.period_refine_block_reason || 'applied'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {rejectReasons.length > 0 && (
+            <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '4px 6px' }}>
+              <div style={{ color: '#8b949e', marginBottom: '2px' }}>Fit reject reasons</div>
+              {rejectReasons.map(([reason, count]) => (
+                <span key={reason} style={pillStyle}>{reason}<span style={valueStyle}>{count}</span></span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '12px', marginTop: '0.4rem' }}>
         <div style={{ minWidth: 0 }}>
@@ -2289,6 +2354,10 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
         waveformBins={burstTimeline?.waveform_bins}
         perIcaoQuality={burstTimeline?.per_icao_quality}
         observations={filteredObservations}
+        periodUpdateHistory={burstTimeline?.period_update_history}
+        slopeHistory={burstTimeline?.slope_history}
+        periodHistory={burstTimeline?.period_history}
+        predictorConsistency={burstTimeline?.predictor_consistency}
       />
 
       {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS ? (

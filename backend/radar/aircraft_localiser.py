@@ -32,7 +32,7 @@ from .aircraft_models import (
     RadarBearingObservation,
     Stage3LiveRay,
 )
-from .sweep import _get_authoritative_radar_position, LiveSyncState
+from .sweep import _get_authoritative_radar_position, LiveSyncState, predict_sync_observation
 
 if TYPE_CHECKING:
     from .sweep import RadarState
@@ -842,20 +842,32 @@ class AircraftLocaliser:
         radar_lat: float,
         radar_lon: float,
         calibration: RadarBearingCalibration,
+        waveform_bins: list | None = None,
     ) -> "RadarBearingObservation | None":
         """Convert one live detection to a bearing observation.
 
-        Formula:
-          phase_deg = (arrival_us - phase_epoch_us) / period_us * 360 % 360
-          bearing   = phase_deg + phase_offset_deg + calibration.bearing_offset_deg
+        Uses the authoritative backend sync predictor so live localisation,
+        burst-sync diagnostics, and period fitting share propagation/waveform
+        timing semantics.  Calibration offset is the only localiser-specific
+        addition after prediction.
         """
-        period_us = sync_state.period_s * 1e6
-        if period_us <= 0:
+        if sync_state.period_s <= 0:
             return None
 
-        phase_deg = (detection.arrival_us - sync_state.phase_epoch_us) / period_us * 360.0 % 360.0
+        range_nm = None
+        if detection.truth_lat is not None and detection.truth_lon is not None:
+            range_nm = _haversine_m(
+                radar_lat, radar_lon, detection.truth_lat, detection.truth_lon,
+            ) / 1852.0
 
-        bearing_raw = (phase_deg + sync_state.phase_offset_deg) % 360.0
+        prediction = predict_sync_observation(
+            sync_state,
+            detection.arrival_us,
+            range_nm=range_nm,
+            waveform_bins=waveform_bins,
+        )
+        phase_deg = prediction.phase_in_rot_deg
+        bearing_raw = prediction.predicted_bearing_deg
         bearing_obs = _wrap_deg(bearing_raw + calibration.bearing_offset_deg)
         bearing_obs = (bearing_obs + 360.0) % 360.0
 
@@ -915,8 +927,11 @@ class AircraftLocaliser:
             return []
 
         obs_out: list[RadarBearingObservation] = []
+        waveform_bins = self._radar_state.get_live_waveform_bins(iid)
         for det in detections:
-            ob = self._bearing_from_live_detection(det, sync_state, radar_lat, radar_lon, calibration)
+            ob = self._bearing_from_live_detection(
+                det, sync_state, radar_lat, radar_lon, calibration, waveform_bins,
+            )
             if ob is not None:
                 obs_out.append(ob)
 
@@ -1463,5 +1478,27 @@ class AircraftLocaliser:
                 "contributing_icao_count": getattr(sync, "contributing_icao_count", 0),
                 "n_burst_obs_inliers": getattr(sync, "n_burst_obs_inliers", 0),
                 "n_burst_obs_rejected": getattr(sync, "n_burst_obs_rejected", 0),
+                "period_base_s": getattr(sync, "period_base_s", None),
+                "residual_slope_deg_per_s": getattr(sync, "residual_slope_deg_per_s", None),
+                "period_correction_ppm": getattr(sync, "period_correction_ppm", None),
+                "period_update_term": getattr(sync, "period_update_term", None),
+                "period_update_direction": getattr(sync, "period_update_direction", None),
+                "period_update_applied": getattr(sync, "period_update_applied", None),
+                "period_update_gain": getattr(sync, "period_update_gain", None),
+                "period_refine_block_reason": getattr(sync, "period_refine_block_reason", None),
+                "fit_time_basis": getattr(sync, "fit_time_basis", None),
+                "fit_residual_basis": getattr(sync, "fit_residual_basis", None),
+                "fit_total_observations": getattr(sync, "fit_total_observations", None),
+                "fit_eligible_observations": getattr(sync, "fit_eligible_observations", None),
+                "fit_rejected_observations": getattr(sync, "fit_rejected_observations", None),
+                "fit_reject_reasons": getattr(sync, "fit_reject_reasons", None),
+                "fit_contributing_icao_count": getattr(sync, "fit_contributing_icao_count", None),
+                "fit_span_s": getattr(sync, "fit_span_s", None),
+                "predictor_consistency": getattr(sync, "predictor_consistency", None),
+                "waveform_enabled": getattr(sync, "waveform_enabled", None),
+                "waveform_applied": getattr(sync, "waveform_applied", None),
+                "waveform_learning_enabled": getattr(sync, "waveform_learning_enabled", None),
+                "waveform_update_block_reason": getattr(sync, "waveform_update_block_reason", None),
+                "waveform_learning_residual_basis": getattr(sync, "waveform_learning_residual_basis", None),
             }
         return result
