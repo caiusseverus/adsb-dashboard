@@ -1955,6 +1955,150 @@ function SyncDiagnosticsPanel({
   )
 }
 
+function PhaseAnchorPanel({ syncState, observations, candidates }) {
+  if (!syncState) return null
+  const anchorIcao = syncState.phase_anchor_icao
+  const candidateRows = Array.isArray(candidates) && candidates.length > 0
+    ? candidates
+    : (Array.isArray(syncState.phase_anchor_candidates) ? syncState.phase_anchor_candidates : [])
+  const anchorObs = (observations || []).filter(obs => obs?.phase_anchor_contributor)
+  const impliedRows = (observations || [])
+    .filter(obs => Number.isFinite(Number(obs?.implied_phase_offset_deg)))
+    .slice(-160)
+  const scatterW = 520
+  const scatterH = 132
+  const times = impliedRows.map(obs => Number(obs.beam_center_us ?? obs.raw_arrival_us)).filter(Number.isFinite)
+  const tMin = times.length ? Math.min(...times) : 0
+  const tMax = times.length ? Math.max(...times) : 1
+  const tSpan = Math.max(1, tMax - tMin)
+  const sinceTs = Number(syncState.phase_anchor_since_ts)
+  const sinceAgeS = Number.isFinite(sinceTs) ? (Date.now() / 1000 - sinceTs) : null
+  const tableStyle = { width: '100%', borderCollapse: 'collapse', fontSize: '0.72rem' }
+  const thStyle = { textAlign: 'right', color: '#8b949e', fontWeight: 500, padding: '2px 5px', borderBottom: '1px solid #21262d' }
+  const tdRight = { textAlign: 'right', padding: '2px 5px', fontFamily: 'SFMono-Regular, Consolas, monospace', borderTop: '1px solid #21262d' }
+  const tdLeft = { textAlign: 'left', padding: '2px 5px', borderTop: '1px solid #21262d' }
+
+  return (
+    <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
+        <div>
+          <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Phase Anchor</div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>Absolute phase is anchored from one aircraft; the rest validate and nudge.</div>
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: '4px', fontSize: '0.72rem' }}>
+          <span className={styles.metricPill}>Anchor <span className={styles.metricValue}>{anchorIcao || '—'}</span></span>
+          <span className={styles.metricPill}>Status <span className={styles.metricValue}>{syncState.phase_anchor_status || '—'}</span></span>
+          <span className={styles.metricPill}>Score <span className={styles.metricValue}>{fmtNumber(syncState.phase_anchor_score, 1)}</span></span>
+          <span className={styles.metricPill}>Spread <span className={styles.metricValue}>{fmtNumber(syncState.phase_anchor_spread_deg, 2, '°')}</span></span>
+          <span className={styles.metricPill}>Obs <span className={styles.metricValue}>{syncState.phase_anchor_obs_count ?? anchorObs.length ?? '—'}</span></span>
+          <span className={styles.metricPill}>Since <span className={styles.metricValue}>{Number.isFinite(sinceAgeS) ? `${Math.max(0, sinceAgeS).toFixed(0)}s` : '—'}</span></span>
+          <span className={styles.metricPill}>Validation <span className={styles.metricValue}>{syncState.phase_validation_status || '—'}</span></span>
+          <span className={styles.metricPill}>Agree/reject <span className={styles.metricValue}>{syncState.phase_validation_contributors ?? 0}/{syncState.phase_validation_reject_count ?? 0}</span></span>
+          <span className={styles.metricPill}>Median Δ <span className={styles.metricValue}>{fmtNumber(syncState.phase_validation_median_error_deg, 2, '°')}</span></span>
+        </div>
+      </div>
+
+      {syncState.phase_anchor_replacement_reason && (
+        <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '0.35rem' }}>
+          Replacement reason <span className={styles.metricValue}>{syncState.phase_anchor_replacement_reason}</span>
+        </div>
+      )}
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '10px' }}>
+        <div style={{ overflow: 'auto', border: '1px solid #30363d', background: '#0f141b', minWidth: 0 }}>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>Anchor candidates</div>
+          <table style={tableStyle}>
+            <thead>
+              <tr>
+                <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
+                <th style={thStyle}>score</th>
+                <th style={thStyle}>spread</th>
+                <th style={thStyle}>count</th>
+                <th style={thStyle}>fit</th>
+                <th style={{ ...thStyle, textAlign: 'left' }}>status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {candidateRows.slice(0, 12).map(row => (
+                <tr key={row.icao} style={{ background: row.icao === anchorIcao ? '#388bfd18' : 'transparent' }}>
+                  <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{row.icao}</td>
+                  <td style={tdRight}>{fmtNumber(row.score, 1)}</td>
+                  <td style={tdRight}>{fmtNumber(row.spread_deg, 2, '°')}</td>
+                  <td style={tdRight}>{row.obs_count ?? '—'}</td>
+                  <td style={tdRight}>{fmtNumber(Number(row.fit_eligible_fraction) * 100, 0, '%')}</td>
+                  <td style={tdLeft}>{row.status === 'rejected' ? (row.reject_reasons?.join(', ') || 'rejected') : (row.warning_reasons?.length ? `candidate: ${row.warning_reasons.join(', ')}` : (row.status || 'candidate'))}</td>
+                </tr>
+              ))}
+              {candidateRows.length === 0 && (
+                <tr><td colSpan={6} style={{ ...tdLeft, color: '#8b949e' }}>No candidate ranking yet.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        <div style={{ minWidth: 0 }}>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>Implied phase offset by observation</div>
+          <svg width="100%" height={scatterH} viewBox={`0 0 ${scatterW} ${scatterH}`} style={{ background: '#0f141b', border: '1px solid #30363d', display: 'block' }}>
+            {[0, 90, 180, 270, 360].map(v => {
+              const y = scatterH - (v / 360) * scatterH
+              return <line key={v} x1={0} y1={y} x2={scatterW} y2={y} stroke={v === 0 || v === 360 ? '#30363d' : '#21262d'} />
+            })}
+            {impliedRows.map((obs, idx) => {
+              const t = Number(obs.beam_center_us ?? obs.raw_arrival_us)
+              const off = Number(obs.implied_phase_offset_deg)
+              const x = Number.isFinite(t) ? ((t - tMin) / tSpan) * scatterW : 0
+              const y = scatterH - (((off % 360) + 360) % 360 / 360) * scatterH
+              const isAnchor = obs.icao === anchorIcao
+              const rejected = Boolean(obs.phase_anchor_reject_reason)
+              return (
+                <circle
+                  key={`${obs.icao}-${t}-${idx}`}
+                  cx={x}
+                  cy={y}
+                  r={isAnchor ? 2.6 : 1.8}
+                  fill={isAnchor ? '#ffd166' : rejected ? '#ff7b72' : '#58a6ff'}
+                  fillOpacity={isAnchor ? 0.95 : 0.65}
+                >
+                  <title>{`${obs.icao || '—'} implied ${off.toFixed(2)}°${obs.anchor_relative_phase_error_deg != null ? ` | anchor Δ ${Number(obs.anchor_relative_phase_error_deg).toFixed(2)}°` : ''}`}</title>
+                </circle>
+              )
+            })}
+            <text x={2} y={10} fontSize="9" fill="#8b949e">360°</text>
+            <text x={2} y={scatterH - 2} fontSize="9" fill="#8b949e">0°</text>
+          </svg>
+        </div>
+
+        <div style={{ overflow: 'auto', border: '1px solid #30363d', background: '#0f141b', minWidth: 0 }}>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>Per-aircraft implied offsets</div>
+          <table style={tableStyle}>
+            <thead>
+              <tr>
+                <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
+                <th style={thStyle}>latest offset</th>
+                <th style={thStyle}>anchor Δ</th>
+                <th style={{ ...thStyle, textAlign: 'left' }}>role</th>
+              </tr>
+            </thead>
+            <tbody>
+              {impliedRows.slice(-20).reverse().map((obs, idx) => (
+                <tr key={`${obs.icao}-${obs.beam_center_us}-${idx}`}>
+                  <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</td>
+                  <td style={tdRight}>{fmtNumber(obs.implied_phase_offset_deg, 2, '°')}</td>
+                  <td style={tdRight}>{fmtNumber(obs.anchor_relative_phase_error_deg, 2, '°')}</td>
+                  <td style={tdLeft}>{obs.phase_anchor_contributor ? 'anchor' : (obs.phase_anchor_reject_reason || 'validator')}</td>
+                </tr>
+              ))}
+              {impliedRows.length === 0 && (
+                <tr><td colSpan={4} style={{ ...tdLeft, color: '#8b949e' }}>No implied-offset observations yet.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function fmtNumber(value, digits = 2, suffix = '') {
   const n = Number(value)
   return Number.isFinite(n) ? `${n.toFixed(digits)}${suffix}` : '-'
@@ -2938,6 +3082,12 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
         slopeHistory={burstTimeline?.slope_history}
         periodHistory={burstTimeline?.period_history}
         predictorConsistency={burstTimeline?.predictor_consistency}
+      />
+
+      <PhaseAnchorPanel
+        syncState={syncState}
+        observations={filteredObservations}
+        candidates={burstTimeline?.phase_anchor_candidates}
       />
 
       <SyncDebugPanel debug={syncDebug} />

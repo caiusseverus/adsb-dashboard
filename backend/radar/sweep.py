@@ -522,6 +522,36 @@ def _circular_delta_deg(a_deg: float | None, b_deg: float | None) -> float | Non
     return (a_deg - b_deg + 540.0) % 360.0 - 180.0
 
 
+def _circular_weighted_mean_deg(values: list[float], weights: list[float] | None = None) -> float | None:
+    """Weighted circular mean in [0, 360), or None when no finite values exist."""
+    if weights is None:
+        weights = [1.0] * len(values)
+    sin_sum = 0.0
+    cos_sum = 0.0
+    total_w = 0.0
+    for value, weight in zip(values, weights):
+        if not _math.isfinite(float(value)) or not _math.isfinite(float(weight)) or weight <= 0:
+            continue
+        rad = _math.radians(float(value))
+        sin_sum += _math.sin(rad) * float(weight)
+        cos_sum += _math.cos(rad) * float(weight)
+        total_w += float(weight)
+    if total_w <= 0.0 or (abs(sin_sum) < 1e-12 and abs(cos_sum) < 1e-12):
+        return None
+    return (_math.degrees(_math.atan2(sin_sum, cos_sum)) + 360.0) % 360.0
+
+
+def _circular_mad_deg(values: list[float], centre_deg: float | None = None) -> float | None:
+    """Median absolute circular deviation from centre_deg."""
+    clean = [float(v) for v in values if _math.isfinite(float(v))]
+    if not clean:
+        return None
+    centre = centre_deg if centre_deg is not None else _circular_weighted_mean_deg(clean)
+    if centre is None:
+        return None
+    return _median_float([abs(_circular_delta_deg(v, centre) or 0.0) for v in clean])
+
+
 def _estimate_aircraft_bearing_rate(
     *,
     icao: str,
@@ -715,6 +745,25 @@ class LiveSyncState:
     motion_comp_mean_dt_us: float = 0.0
     motion_comp_mean_residual_improvement_deg: float = 0.0
     motion_comp_high_rate_mean_residual_improvement_deg: float | None = None
+    # Absolute phase anchoring.  Period refinement and absolute phase are
+    # separate estimation problems: period_s is fitted from the multi-aircraft
+    # residual slope, while these fields describe the selected aircraft that
+    # currently defines the absolute sweep branch.
+    phase_anchor_icao: str | None = None
+    phase_anchor_score: float = 0.0
+    phase_anchor_obs_count: int = 0
+    phase_anchor_offset_raw_deg: float | None = None
+    phase_anchor_offset_smoothed_deg: float | None = None
+    phase_anchor_spread_deg: float | None = None
+    phase_anchor_status: str = "unavailable"
+    phase_anchor_since_ts: float | None = None
+    phase_anchor_replacement_reason: str | None = None
+    phase_anchor_candidate_count: int = 0
+    phase_validation_contributors: int = 0
+    phase_validation_reject_count: int = 0
+    phase_validation_median_error_deg: float | None = None
+    phase_validation_status: str = "unavailable"
+    phase_anchor_candidates: list[dict] = _field(default_factory=list)
 
 
 @_dataclass
@@ -2606,6 +2655,21 @@ class RadarState:
             motion_comp_mean_dt_us=existing.motion_comp_mean_dt_us,
             motion_comp_mean_residual_improvement_deg=existing.motion_comp_mean_residual_improvement_deg,
             motion_comp_high_rate_mean_residual_improvement_deg=existing.motion_comp_high_rate_mean_residual_improvement_deg,
+            phase_anchor_icao=existing.phase_anchor_icao,
+            phase_anchor_score=existing.phase_anchor_score,
+            phase_anchor_obs_count=existing.phase_anchor_obs_count,
+            phase_anchor_offset_raw_deg=existing.phase_anchor_offset_raw_deg,
+            phase_anchor_offset_smoothed_deg=existing.phase_anchor_offset_smoothed_deg,
+            phase_anchor_spread_deg=existing.phase_anchor_spread_deg,
+            phase_anchor_status=existing.phase_anchor_status,
+            phase_anchor_since_ts=existing.phase_anchor_since_ts,
+            phase_anchor_replacement_reason=existing.phase_anchor_replacement_reason,
+            phase_anchor_candidate_count=existing.phase_anchor_candidate_count,
+            phase_validation_contributors=existing.phase_validation_contributors,
+            phase_validation_reject_count=existing.phase_validation_reject_count,
+            phase_validation_median_error_deg=existing.phase_validation_median_error_deg,
+            phase_validation_status=existing.phase_validation_status,
+            phase_anchor_candidates=list(existing.phase_anchor_candidates),
         )
 
     def _record_live_burst_detection(
@@ -2902,6 +2966,304 @@ class RadarState:
             return "soft"
         return "rejected"
 
+    @staticmethod
+    def _implied_phase_offset_deg(
+        entry: dict,
+        sync: LiveSyncState,
+        epoch_us: float,
+    ) -> float:
+        """Return the offset implied by one observation at epoch_us.
+
+        The timestamp is the same Beast-relative effective timestamp used by
+        predict_sync_observation().  Waveform correction is inverted because the
+        predictor computes `bearing = phase + offset - waveform_correction`.
+        """
+        period_us = sync.period_s * 1_000_000.0
+        phase_rel = ((entry["effective_us"] - epoch_us) / period_us * 360.0) if period_us > 0 else 0.0
+        waveform_corr = getattr(entry["prediction"], "waveform_correction_deg", 0.0) or 0.0
+        obs = entry["obs"]
+        return (obs.bearing_deg + waveform_corr - phase_rel) % 360.0
+
+    def _select_phase_anchor_aircraft(
+        self,
+        iid: int,
+        scored: list[dict],
+        existing: LiveSyncState,
+        epoch_us: float,
+        now_ts: float,
+    ) -> dict:
+        """Rank and select the aircraft used for absolute phase anchoring.
+
+        This is deliberately separate from period fitting.  Candidates are
+        scored on their own short-window coherence: enough recent observations,
+        low circular spread of implied offsets, fresh positions, fit eligibility,
+        burst quality, and residual-quality memory.  The current anchor gets
+        hysteresis so the selected branch does not flap between similar aircraft.
+        """
+        by_icao: dict[str, list[dict]] = defaultdict(list)
+        for entry in scored:
+            obs = entry["obs"]
+            if not getattr(obs, "sync_update_eligible", True):
+                continue
+            if obs.icao:
+                by_icao[obs.icao].append(entry)
+
+        quality_memory = self._live_icao_sync_quality.get(iid) or {}
+        candidates: list[dict] = []
+        for icao, rows in by_icao.items():
+            count = len(rows)
+            offsets = [self._implied_phase_offset_deg(row, existing, epoch_us) for row in rows]
+            weights = [max(row.get("anchor_weight", 0.0), 0.05) for row in rows]
+            offset_mean = _circular_weighted_mean_deg(offsets, weights)
+            spread = _circular_mad_deg(offsets, offset_mean)
+            fit_count = sum(1 for row in rows if row.get("fit_eligible") and row.get("weight", 0.0) > 0.0)
+            fit_fraction = fit_count / count if count else 0.0
+            pos_ages = sorted(row["obs"].pos_age_s for row in rows if row["obs"].pos_age_s is not None)
+            median_pos_age = _median_float(pos_ages) if pos_ages else None
+            last_age_s = now_ts - max(row["obs_ts"] for row in rows)
+            signals = [row["obs"].signal_dbfs for row in rows if row["obs"].signal_dbfs is not None]
+            mean_signal = sum(signals) / len(signals) if signals else None
+            mean_weight = sum(weights) / len(weights) if weights else 0.0
+            q_entry = quality_memory.get(icao)
+            q_mad = q_entry.residual_mad_deg if q_entry is not None else None
+            q_bias = abs(q_entry.residual_median_deg) if q_entry is not None else None
+
+            reject_reasons = []
+            warning_reasons = []
+            if count < 3:
+                reject_reasons.append("insufficient_observations")
+            if spread is None or spread > 60.0:
+                reject_reasons.append("phase_spread_too_large")
+            elif spread > 18.0:
+                warning_reasons.append("phase_spread_high")
+            if median_pos_age is not None and median_pos_age > 15.0:
+                reject_reasons.append("stale_positions")
+            elif median_pos_age is not None and median_pos_age > 6.0:
+                warning_reasons.append("position_age_high")
+            if last_age_s > 30.0:
+                reject_reasons.append("stale_anchor_observations")
+            elif last_age_s > 12.0:
+                warning_reasons.append("anchor_observations_aging")
+            if q_entry is not None and q_entry.n_recent >= 6 and (
+                q_entry.residual_mad_deg > 25.0 or abs(q_entry.residual_median_deg) > 60.0
+            ):
+                warning_reasons.append("poor_icao_quality_memory")
+
+            count_score = min(count / 8.0, 1.0)
+            spread_score = 0.0 if spread is None else max(0.0, min(1.0, 1.0 - spread / 30.0))
+            age_score = 0.5 if median_pos_age is None else max(0.0, min(1.0, 1.0 - median_pos_age / 15.0))
+            signal_score = 0.6 if mean_signal is None else max(0.0, min(1.0, (mean_signal + 50.0) / 35.0))
+            quality_score = 1.0
+            if q_mad is not None:
+                quality_score = max(0.0, min(1.0, 1.0 - q_mad / 25.0))
+            score = 100.0 * (
+                0.28 * count_score
+                + 0.30 * spread_score
+                + 0.18 * fit_fraction
+                + 0.12 * age_score
+                + 0.07 * signal_score
+                + 0.05 * quality_score
+            )
+            if reject_reasons:
+                score *= 0.25
+            elif warning_reasons:
+                score *= 0.75
+
+            candidates.append({
+                "icao": icao,
+                "score": score,
+                "status": "rejected" if reject_reasons else "candidate",
+                "reject_reasons": reject_reasons,
+                "warning_reasons": warning_reasons,
+                "obs_count": count,
+                "fit_eligible_count": fit_count,
+                "fit_eligible_fraction": fit_fraction,
+                "offset_mean_deg": offset_mean,
+                "spread_deg": spread,
+                "median_pos_age_s": median_pos_age,
+                "last_age_s": last_age_s,
+                "mean_signal_dbfs": mean_signal,
+                "mean_weight": mean_weight,
+                "quality_residual_mad_deg": q_mad,
+                "quality_residual_bias_deg": q_bias,
+                "score_breakdown": {
+                    "count": count_score,
+                    "spread": spread_score,
+                    "fit_fraction": fit_fraction,
+                    "position_age": age_score,
+                    "signal": signal_score,
+                    "quality_memory": quality_score,
+                },
+            })
+
+        candidates.sort(key=lambda row: row["score"], reverse=True)
+        eligible = [row for row in candidates if row["status"] != "rejected"]
+        selected = eligible[0] if eligible else None
+        replacement_reason = "no_eligible_anchor" if selected is None else None
+
+        current = existing.phase_anchor_icao
+        current_candidate = next((row for row in eligible if row["icao"] == current), None) if current else None
+        if selected is not None and current_candidate is not None and selected["icao"] != current:
+            materially_better = selected["score"] >= current_candidate["score"] + 18.0 and selected["score"] >= current_candidate["score"] * 1.35
+            current_poor = (
+                (current_candidate.get("spread_deg") is not None and current_candidate["spread_deg"] > 12.0)
+                or current_candidate.get("last_age_s", 0.0) > 8.0
+                or current_candidate.get("fit_eligible_fraction", 0.0) < 0.6
+            )
+            if not materially_better and not current_poor:
+                selected = current_candidate
+                replacement_reason = "kept_current_anchor_hysteresis"
+            else:
+                replacement_reason = "better_candidate" if materially_better else "current_anchor_degraded"
+        elif selected is not None and current and selected["icao"] != current:
+            replacement_reason = "current_anchor_not_eligible"
+        elif selected is not None and not current:
+            replacement_reason = "initial_anchor"
+
+        if selected is not None:
+            for row in candidates:
+                if row["icao"] == selected["icao"]:
+                    row["status"] = "selected"
+                    break
+
+        return {
+            "selected": selected,
+            "candidates": candidates,
+            "replacement_reason": replacement_reason,
+        }
+
+    def _solve_phase_anchor_from_icao(
+        self,
+        anchor_icao: str,
+        scored: list[dict],
+        existing: LiveSyncState,
+        epoch_us: float,
+    ) -> dict | None:
+        """Solve absolute phase offset from one selected aircraft."""
+        rows = [
+            row for row in scored
+            if row["icao"] == anchor_icao
+            and row.get("anchor_weight", 0.0) > 0.0
+            and getattr(row["obs"], "sync_update_eligible", True)
+            and row["obs"].pos_age_s <= 15.0
+            and row.get("fit_reject_reason") != "near_wrap_residual"
+        ]
+        if len(rows) < 3:
+            rows = [
+                row for row in scored
+                if row["icao"] == anchor_icao
+                and row.get("anchor_weight", 0.0) > 0.0
+                and getattr(row["obs"], "sync_update_eligible", True)
+                and row.get("fit_reject_reason") != "near_wrap_residual"
+            ]
+        if len(rows) < 3:
+            return None
+
+        offsets = [self._implied_phase_offset_deg(row, existing, epoch_us) for row in rows]
+        weights = [max(row.get("anchor_weight", 0.0), 0.05) for row in rows]
+        raw = _circular_weighted_mean_deg(offsets, weights)
+        spread = _circular_mad_deg(offsets, raw)
+        if raw is None:
+            return None
+
+        existing_at_epoch = (
+            ((epoch_us - existing.phase_epoch_us) / (existing.period_s * 1_000_000.0) * 360.0)
+            + existing.phase_offset_deg
+        ) % 360.0 if existing.period_s > 0 else existing.phase_offset_deg
+        delta = _circular_delta_deg(raw, existing_at_epoch) or 0.0
+        # Anchor updates may correct a wrong absolute branch, but still cap each
+        # step so one outlier burst cannot jerk the live sweep.
+        alpha = 0.35 if existing.phase_anchor_icao == anchor_icao else 0.65
+        if spread is not None and spread <= 4.0 and existing.phase_anchor_icao != anchor_icao:
+            alpha = 0.8
+        max_step = 120.0 if existing.phase_anchor_icao != anchor_icao and spread is not None and spread <= 5.0 and len(rows) >= 4 else 45.0
+        limited_delta = max(-max_step, min(max_step, delta * alpha))
+        smoothed = (existing_at_epoch + limited_delta) % 360.0
+        return {
+            "offset_raw_deg": raw,
+            "offset_smoothed_deg": smoothed,
+            "spread_deg": spread,
+            "obs_count": len(rows),
+            "delta_from_existing_deg": delta,
+        }
+
+    def _validate_phase_anchor_against_population(
+        self,
+        anchor_icao: str,
+        anchor_offset_deg: float,
+        scored: list[dict],
+        existing: LiveSyncState,
+        epoch_us: float,
+    ) -> dict:
+        """Use non-anchor aircraft to validate and gently nudge the anchor."""
+        by_icao: dict[str, list[dict]] = defaultdict(list)
+        for row in scored:
+            if row["icao"] == anchor_icao:
+                continue
+            if row.get("anchor_weight", 0.0) <= 0.0:
+                continue
+            if not getattr(row["obs"], "sync_update_eligible", True):
+                continue
+            if row.get("fit_reject_reason") == "near_wrap_residual":
+                continue
+            by_icao[row["icao"]].append(row)
+
+        contributors = []
+        rejected = []
+        for icao, rows in by_icao.items():
+            if len(rows) < 2:
+                rejected.append({"icao": icao, "reason": "insufficient_observations", "error_deg": None})
+                continue
+            offsets = [self._implied_phase_offset_deg(row, existing, epoch_us) for row in rows]
+            weights = [max(row.get("anchor_weight", 0.0), 0.05) for row in rows]
+            offset = _circular_weighted_mean_deg(offsets, weights)
+            spread = _circular_mad_deg(offsets, offset)
+            error = _circular_delta_deg(offset, anchor_offset_deg) if offset is not None else None
+            if offset is None or error is None:
+                rejected.append({"icao": icao, "reason": "offset_unavailable", "error_deg": None})
+            elif spread is not None and spread > 20.0:
+                rejected.append({"icao": icao, "reason": "phase_spread_too_large", "error_deg": error})
+            elif abs(error) > 45.0:
+                rejected.append({"icao": icao, "reason": "branch_disagreement", "error_deg": error})
+            elif abs(error) > 25.0:
+                rejected.append({"icao": icao, "reason": "validation_gate", "error_deg": error})
+            else:
+                contributors.append({
+                    "icao": icao,
+                    "error_deg": error,
+                    "offset_deg": offset,
+                    "spread_deg": spread,
+                    "obs_count": len(rows),
+                    "weight": sum(weights),
+                })
+
+        errors = [row["error_deg"] for row in contributors]
+        median_error = _median_float(sorted(errors)) if errors else None
+        nudge = 0.0
+        if contributors:
+            weighted_error = sum(row["error_deg"] * row["weight"] for row in contributors) / sum(row["weight"] for row in contributors)
+            # Validation aircraft may refine the selected branch but cannot pick
+            # a different branch; cap the nudge tightly.
+            nudge = max(-3.0, min(3.0, weighted_error * 0.15))
+
+        strong_rejects = [row for row in rejected if row.get("error_deg") is not None and abs(row["error_deg"]) > 45.0]
+        if contributors:
+            status = "confirmed"
+        elif strong_rejects:
+            status = "population_disagrees"
+        else:
+            status = "anchor_only"
+
+        return {
+            "contributors": contributors,
+            "rejected": rejected,
+            "contributor_count": len(contributors),
+            "reject_count": len(rejected),
+            "median_error_deg": median_error,
+            "nudge_deg": nudge,
+            "status": status,
+        }
+
     def _update_multi_aircraft_sync_state(
         self,
         iid: int,
@@ -3057,6 +3419,7 @@ class RadarState:
                 "residual_without_motion": residual_without_motion,
                 "motion_comp_improvement_deg": abs(residual_without_motion) - abs(residual),
                 "weight": effective_w,
+                "anchor_weight": base_w * q_multiplier,
                 "status": status,
                 "icao": obs.icao,
                 "effective_us": corrected_prediction.effective_arrival_us,
@@ -3065,19 +3428,17 @@ class RadarState:
                 "fit_eligible": fit_eligible,
                 "fit_reject_reason": fit_reject_reason,
                 "prediction": corrected_prediction,
+                "obs": obs,
             })
 
-        # Multi-aircraft integrity check: require at least two distinct ICAOs
-        # contributing to prevent a single noisy aircraft from steering sync.
+        # Multi-aircraft period fitting remains distinct from absolute phase
+        # anchoring.  A single high-quality aircraft may maintain the absolute
+        # branch, but period refinement still requires a multi-aircraft,
+        # long-baseline fit below.
         contributing_icaos = {
             e["icao"] for e in scored
             if e["weight"] > 0 and e["status"] != "rejected"
         }
-        if len(contributing_icaos) < 2:
-            # Single-aircraft sync is too fragile — enter holdover rather than update.
-            existing.holdover = True
-            existing.usable = False
-            return
 
         n_inliers = sum(1 for e in scored if e["status"] == "inlier")
         n_rejected = sum(1 for e in scored if e["status"] == "rejected")
@@ -3087,26 +3448,29 @@ class RadarState:
         ]
         fit_contributing_icaos = {e["icao"] for e in fit_scored}
 
-        # Reject update if majority of observations are outliers — data quality is
-        # too poor to steer the phase anchor reliably.
-        if n_rejected >= len(recent_obs) // 2 + 1:
-            existing.holdover = True
-            existing.usable = False
-            existing.period_refine_block_reason = "majority_rejected"
-            existing.fit_reject_reasons = dict(fit_reject_reasons)
-            return
+        # A majority of residual outliers blocks period refinement, but does
+        # not by itself block anchor selection.  A wrong absolute branch makes
+        # every good anchor observation look like a residual outlier until the
+        # branch is corrected.
+        majority_rejected = n_rejected >= len(recent_obs) // 2 + 1
 
         # Weighted linear fit residual ~ a + b*(effective_beast_time_s - t_ref).
         # a → phase correction term; b → angular-rate mismatch (deg/s) that converts
         # to a small period correction.  Both fall out of the same fit so phase and
         # period adjustments never fight each other.
         fit_pool = fit_scored if fit_scored else [
-            e for e in scored if e["weight"] > 0 and e["status"] != "rejected"
+            e for e in scored
+            if e.get("anchor_weight", 0.0) > 0.0
+            and e.get("fit_reject_reason") != "near_wrap_residual"
         ]
+        if not fit_pool:
+            existing.holdover = True
+            existing.usable = False
+            return
         t_ref = min(e["effective_us"] for e in fit_pool) / 1_000_000.0
         xs = [(e["effective_us"] / 1_000_000.0) - t_ref for e in fit_pool]
         ys = [e["residual"] for e in fit_pool]
-        ws = [e["weight"] for e in fit_pool]
+        ws = [e["weight"] if e in fit_scored else e.get("anchor_weight", 0.0) for e in fit_pool]
         a_fit, b_fit = _fit_weighted_slope(xs, ys, ws)
 
         # Weighted phase correction (the a term) — equivalent to the previous
@@ -3125,17 +3489,92 @@ class RadarState:
         # Advance epoch to the most recent inlier/soft observation.
         # Keeping the epoch fresh prevents accumulated error from large
         # (burst_centroid_us - phase_epoch_us) distances.
-        anchor_pool = [e for e in scored if e["status"] in ("inlier", "soft") and e["weight"] > 0]
+        anchor_pool = [
+            e for e in scored
+            if e.get("anchor_weight", 0.0) > 0.0
+            and e.get("fit_reject_reason") != "near_wrap_residual"
+        ]
         if not anchor_pool:
             return
         new_epoch_us = max(e["effective_us"] for e in anchor_pool)
 
-        # Propagate the existing model to the new epoch, then apply correction.
+        # Propagate the existing model to the new epoch.  This is used only as
+        # the smoothing baseline and fallback; the preferred absolute phase
+        # offset comes from one selected anchor aircraft below.
         existing_at_new = (
             (new_epoch_us - existing.phase_epoch_us) / period_us * 360.0
             + existing.phase_offset_deg
         ) % 360.0
-        new_offset = (existing_at_new + limited_correction) % 360.0
+        mixed_fallback_offset = (existing_at_new + limited_correction) % 360.0
+        anchor_selection = self._select_phase_anchor_aircraft(
+            iid=iid,
+            scored=scored,
+            existing=existing,
+            epoch_us=new_epoch_us,
+            now_ts=now_ts,
+        )
+        selected_anchor = anchor_selection.get("selected")
+        anchor_solution = None
+        validation = {
+            "contributors": [],
+            "rejected": [],
+            "contributor_count": 0,
+            "reject_count": 0,
+            "median_error_deg": None,
+            "nudge_deg": 0.0,
+            "status": "unavailable",
+        }
+        phase_anchor_status = "fallback_mixed"
+        phase_anchor_icao = existing.phase_anchor_icao
+        phase_anchor_score = 0.0
+        phase_anchor_obs_count = 0
+        phase_anchor_raw = None
+        phase_anchor_smoothed = None
+        phase_anchor_spread = None
+        phase_anchor_since_ts = existing.phase_anchor_since_ts
+        phase_anchor_replacement_reason = anchor_selection.get("replacement_reason")
+        new_offset = mixed_fallback_offset
+        if selected_anchor is not None:
+            phase_anchor_icao = selected_anchor["icao"]
+            anchor_solution = self._solve_phase_anchor_from_icao(
+                phase_anchor_icao,
+                scored,
+                existing,
+                new_epoch_us,
+            )
+            if anchor_solution is not None:
+                phase_anchor_score = selected_anchor["score"]
+                phase_anchor_obs_count = anchor_solution["obs_count"]
+                phase_anchor_raw = anchor_solution["offset_raw_deg"]
+                phase_anchor_smoothed = anchor_solution["offset_smoothed_deg"]
+                phase_anchor_spread = anchor_solution["spread_deg"]
+                if existing.phase_anchor_icao != phase_anchor_icao or existing.phase_anchor_since_ts is None:
+                    phase_anchor_since_ts = now_ts
+                validation = self._validate_phase_anchor_against_population(
+                    phase_anchor_icao,
+                    phase_anchor_raw,
+                    scored,
+                    existing,
+                    new_epoch_us,
+                )
+                if (
+                    validation["status"] == "population_disagrees"
+                    and validation["reject_count"] >= 2
+                    and validation["contributor_count"] == 0
+                ):
+                    existing.holdover = True
+                    existing.usable = False
+                    existing.phase_anchor_status = "population_veto"
+                    existing.phase_anchor_replacement_reason = "population_veto"
+                    existing.phase_validation_status = validation["status"]
+                    existing.phase_validation_reject_count = validation["reject_count"]
+                    return
+                new_offset = (phase_anchor_smoothed + validation["nudge_deg"]) % 360.0
+                phase_anchor_status = "selected" if validation["status"] != "anchor_only" else "anchor_only"
+            else:
+                phase_anchor_status = "fallback_mixed_anchor_solve_failed"
+                phase_anchor_replacement_reason = "anchor_solve_failed"
+        phase_correction = _circular_delta_deg(new_offset, existing_at_new) or 0.0
 
         # Live period refinement from slope.
         # residual = observed - predicted.  If residual rises with effective
@@ -3154,12 +3593,15 @@ class RadarState:
         period_refine_block_reason = None
         refine_ok = (
             bool(RADAR_SYNC_PERIOD_REFINE_ENABLED)
+            and not majority_rejected
             and len(fit_scored) >= _PERIOD_REFINE_MIN_INLIERS
             and len(fit_contributing_icaos) >= 2
             and span_s >= _PERIOD_REFINE_MIN_SPAN_ROT * live_period_s
         )
         if not RADAR_SYNC_PERIOD_REFINE_ENABLED:
             period_refine_block_reason = "disabled"
+        elif majority_rejected:
+            period_refine_block_reason = "majority_rejected"
         elif len(fit_scored) < _PERIOD_REFINE_MIN_INLIERS:
             period_refine_block_reason = "insufficient_fit_observations"
         elif len(fit_contributing_icaos) < 2:
@@ -3349,11 +3791,17 @@ class RadarState:
         # and acceptable rejection ratio.
         _MIN_INLIERS_FOR_USABLE = 3
         _MAX_JITTER_FOR_USABLE = 15.0
+        anchor_ok = (
+            anchor_solution is not None
+            and phase_anchor_icao is not None
+            and phase_anchor_obs_count >= 3
+            and (phase_anchor_spread is None or phase_anchor_spread <= 18.0)
+            and phase_anchor_status in ("selected", "anchor_only")
+        )
         new_usable = (
-            n_inliers >= _MIN_INLIERS_FOR_USABLE
-            and len(contributing_icaos) >= 2
+            (anchor_ok or (n_inliers >= _MIN_INLIERS_FOR_USABLE and len(contributing_icaos) >= 2))
             and new_jitter < _MAX_JITTER_FOR_USABLE
-            and n_rejected < len(recent_obs) // 2 + 1
+            and (anchor_ok or n_rejected < len(recent_obs) // 2 + 1)
         )
 
         predictor_consistency = {
@@ -3414,6 +3862,21 @@ class RadarState:
             motion_comp_mean_dt_us=motion_mean_dt_us,
             motion_comp_mean_residual_improvement_deg=motion_mean_improvement,
             motion_comp_high_rate_mean_residual_improvement_deg=motion_high_rate_mean_improvement,
+            phase_anchor_icao=phase_anchor_icao,
+            phase_anchor_score=phase_anchor_score,
+            phase_anchor_obs_count=phase_anchor_obs_count,
+            phase_anchor_offset_raw_deg=phase_anchor_raw,
+            phase_anchor_offset_smoothed_deg=phase_anchor_smoothed,
+            phase_anchor_spread_deg=phase_anchor_spread,
+            phase_anchor_status=phase_anchor_status,
+            phase_anchor_since_ts=phase_anchor_since_ts,
+            phase_anchor_replacement_reason=phase_anchor_replacement_reason,
+            phase_anchor_candidate_count=len(anchor_selection.get("candidates") or []),
+            phase_validation_contributors=validation["contributor_count"],
+            phase_validation_reject_count=validation["reject_count"],
+            phase_validation_median_error_deg=validation["median_error_deg"],
+            phase_validation_status=validation["status"],
+            phase_anchor_candidates=anchor_selection.get("candidates") or [],
         )
         self._live_sync_states[iid] = new_state
 
@@ -3436,6 +3899,13 @@ class RadarState:
             "fit_reject_reasons": dict(fit_reject_reasons),
             "waveform_learning_enabled": waveform_learning_enabled,
             "waveform_update_block_reason": waveform_update_block_reason,
+            "phase_anchor_icao": phase_anchor_icao,
+            "phase_anchor_score": phase_anchor_score,
+            "phase_anchor_status": phase_anchor_status,
+            "phase_anchor_replacement_reason": phase_anchor_replacement_reason,
+            "phase_validation_contributors": validation["contributor_count"],
+            "phase_validation_reject_count": validation["reject_count"],
+            "phase_validation_median_error_deg": validation["median_error_deg"],
         }
         self._live_period_update_history.setdefault(iid, deque(maxlen=80)).append(update_entry)
         self._live_slope_history.setdefault(iid, deque(maxlen=80)).append({
@@ -4613,10 +5083,16 @@ class RadarState:
                 "slope_history": slope_history,
                 "period_history": period_history,
                 "predictor_consistency": getattr(sync, "predictor_consistency", None) if sync else None,
+                "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []) if sync else [],
             }
 
         now_ts = time.time()
         cutoff_ts = now_ts - window_s
+        candidate_by_icao = {
+            row.get("icao"): row
+            for row in getattr(sync, "phase_anchor_candidates", []) or []
+            if row.get("icao")
+        }
 
         entries = []
         for obs in obs_snapshot:
@@ -4668,6 +5144,17 @@ class RadarState:
             residual_without_motion = (
                 obs.bearing_deg - without_motion_prediction.predicted_bearing_deg + 540.0
             ) % 360.0 - 180.0
+            implied_phase_offset = (
+                obs.bearing_deg
+                + corrected_prediction.waveform_correction_deg
+                - corrected_prediction.phase_in_rot_deg
+            ) % 360.0
+            anchor_relative_error = _circular_delta_deg(
+                implied_phase_offset,
+                getattr(sync, "phase_anchor_offset_smoothed_deg", None),
+            )
+            candidate = candidate_by_icao.get(obs.icao) or {}
+            candidate_reasons = candidate.get("reject_reasons") or []
             abs_r = abs(residual_corr)
             classification = self._classify_sync_residual(abs_r)
             weight = self._score_sync_burst_observation(obs)
@@ -4710,6 +5197,10 @@ class RadarState:
                 "residual_corrected_deg": residual_corr,
                 "motion_comp_improvement_deg": abs(residual_without_motion) - abs(residual_corr),
                 "residual_for_period_fit_deg": residual_corr if fit_eligible else None,
+                "implied_phase_offset_deg": implied_phase_offset,
+                "anchor_relative_phase_error_deg": anchor_relative_error,
+                "phase_anchor_contributor": obs.icao == getattr(sync, "phase_anchor_icao", None),
+                "phase_anchor_reject_reason": ",".join(candidate_reasons) if candidate_reasons else None,
                 "phase_in_rot_deg": corrected_prediction.phase_in_rot_deg,
                 "raw_arrival_us": getattr(obs, "raw_arrival_us", obs.burst_centroid_us),
                 "prop_corrected_beast_us": corrected_prediction.prop_corrected_beast_us,
@@ -4784,6 +5275,7 @@ class RadarState:
             "slope_history": slope_history,
             "period_history": period_history,
             "predictor_consistency": getattr(sync, "predictor_consistency", None),
+            "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []),
             "motion_comp_summary": {
                 "phase_enabled": bool(getattr(sync, "motion_comp_phase_enabled", False)),
                 "fit_enabled": bool(getattr(sync, "motion_comp_fit_enabled", False)),
@@ -4837,6 +5329,11 @@ class RadarState:
         recent_obs.sort(key=lambda obs: obs.burst_centroid_us)
         if limit > 0:
             recent_obs = recent_obs[-limit:]
+        candidate_by_icao = {
+            row.get("icao"): row
+            for row in getattr(sync, "phase_anchor_candidates", []) or []
+            if row.get("icao")
+        }
 
         def _predict_from_beast_input(input_beast_us: float | None) -> SyncPrediction | None:
             if input_beast_us is None:
@@ -5029,6 +5526,17 @@ class RadarState:
                 if period_us > 0 else None
             )
             phase_after_epoch_deg = authoritative.phase_in_rot_deg
+            implied_phase_offset = (
+                obs.bearing_deg
+                + authoritative.waveform_correction_deg
+                - authoritative.phase_in_rot_deg
+            ) % 360.0
+            anchor_relative_error = _circular_delta_deg(
+                implied_phase_offset,
+                getattr(sync, "phase_anchor_offset_smoothed_deg", None),
+            )
+            candidate = candidate_by_icao.get(obs.icao) or {}
+            candidate_reasons = candidate.get("reject_reasons") or []
 
             observations.append({
                 "iid": iid,
@@ -5120,6 +5628,10 @@ class RadarState:
                 "sync_update_eligible": bool(getattr(obs, "sync_update_eligible", True)),
                 "phase_from_period_only_deg": phase_from_period_only_deg,
                 "phase_after_epoch_deg": phase_after_epoch_deg,
+                "implied_phase_offset_deg": implied_phase_offset,
+                "anchor_relative_phase_error_deg": anchor_relative_error,
+                "phase_anchor_contributor": obs.icao == getattr(sync, "phase_anchor_icao", None),
+                "phase_anchor_reject_reason": ",".join(candidate_reasons) if candidate_reasons else None,
                 "waveform_correction_deg": authoritative.waveform_correction_deg,
                 "pred_after_waveform_deg": pred_authoritative_deg,
                 "wall_to_beast_roundtrip_error_us": wall_roundtrip_error_us,
@@ -5474,6 +5986,21 @@ class RadarState:
             "current_slope_deg_per_s": getattr(sync, "residual_slope_deg_per_s", None),
             "phase_epoch_us": sync.phase_epoch_us,
             "phase_offset_deg": sync.phase_offset_deg,
+            "phase_anchor_icao": getattr(sync, "phase_anchor_icao", None),
+            "phase_anchor_score": getattr(sync, "phase_anchor_score", None),
+            "phase_anchor_status": getattr(sync, "phase_anchor_status", None),
+            "phase_anchor_offset_raw_deg": getattr(sync, "phase_anchor_offset_raw_deg", None),
+            "phase_anchor_offset_smoothed_deg": getattr(sync, "phase_anchor_offset_smoothed_deg", None),
+            "phase_anchor_spread_deg": getattr(sync, "phase_anchor_spread_deg", None),
+            "phase_anchor_obs_count": getattr(sync, "phase_anchor_obs_count", None),
+            "phase_anchor_since_ts": getattr(sync, "phase_anchor_since_ts", None),
+            "phase_anchor_replacement_reason": getattr(sync, "phase_anchor_replacement_reason", None),
+            "phase_anchor_candidate_count": getattr(sync, "phase_anchor_candidate_count", None),
+            "phase_validation_contributors": getattr(sync, "phase_validation_contributors", None),
+            "phase_validation_reject_count": getattr(sync, "phase_validation_reject_count", None),
+            "phase_validation_median_error_deg": getattr(sync, "phase_validation_median_error_deg", None),
+            "phase_validation_status": getattr(sync, "phase_validation_status", None),
+            "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []),
             "fit_total_observations": getattr(sync, "fit_total_observations", None),
             "fit_eligible_observations": getattr(sync, "fit_eligible_observations", None),
             "fit_rejected_observations": getattr(sync, "fit_rejected_observations", None),

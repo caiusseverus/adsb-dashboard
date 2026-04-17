@@ -720,6 +720,168 @@ def test_period_refinement_uses_effective_time_slope_and_correct_sign(monkeypatc
     assert state.get_burst_sync_timeline(7, window_s=60.0)["period_update_history"]
 
 
+def test_phase_anchor_selected_aircraft_recovers_wrong_absolute_branch(monkeypatch):
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=10.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=10.0,
+    )
+    obs = deque(maxlen=state._MULTI_SYNC_OBS_MAX)
+    # One aircraft has a tight implied absolute offset near 120 degrees.  From
+    # the old mixed-branch state these look like large residual outliers, so the
+    # anchor path must not depend on the old residual gate.
+    for idx, t_s in enumerate([0.0, 10.0, 20.0, 30.0]):
+        obs.append(AlignedBurstSyncObs(
+            burst_centroid_us=t_s * 1_000_000.0,
+            icao="AAAAAA",
+            bearing_deg=120.0,
+            n_replies=5,
+            signal_dbfs=-12.0,
+            pos_age_s=0.2,
+            range_nm=0.0,
+            ts=997.0 + idx,
+            sync_update_eligible=True,
+        ))
+    state._live_aligned_burst_obs[7] = obs
+
+    state._update_multi_aircraft_sync_state(7, period_s=10.0)
+
+    sync = state.get_live_sync_state(7)
+    assert sync.phase_anchor_icao == "AAAAAA"
+    assert sync.phase_anchor_status == "anchor_only"
+    assert sync.phase_anchor_obs_count == 4
+    assert sync.phase_anchor_offset_raw_deg == pytest.approx(120.0)
+    assert sync.phase_offset_deg == pytest.approx(96.0)
+    assert sync.phase_validation_status == "anchor_only"
+    assert sync.period_refine_block_reason == "majority_rejected"
+    timeline = state.get_burst_sync_timeline(7, window_s=60.0)
+    assert timeline["phase_anchor_candidates"][0]["icao"] == "AAAAAA"
+    assert timeline["observations"][0]["implied_phase_offset_deg"] == pytest.approx(120.0)
+    assert timeline["observations"][0]["phase_anchor_contributor"] is True
+
+
+def test_phase_anchor_quality_memory_is_warning_not_hard_reject(monkeypatch):
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=10.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=10.0,
+    )
+    state._live_icao_sync_quality[7] = {
+        "AAAAAA": IcaoSyncQuality(
+            residual_median_deg=95.0,
+            residual_mad_deg=35.0,
+            n_recent=12,
+            last_ts=999.0,
+        ),
+    }
+    obs = deque(maxlen=state._MULTI_SYNC_OBS_MAX)
+    for idx, t_s in enumerate([0.0, 10.0, 20.0, 30.0]):
+        obs.append(AlignedBurstSyncObs(
+            burst_centroid_us=t_s * 1_000_000.0,
+            icao="AAAAAA",
+            bearing_deg=110.0,
+            n_replies=5,
+            signal_dbfs=-12.0,
+            pos_age_s=0.2,
+            range_nm=0.0,
+            ts=997.0 + idx,
+            sync_update_eligible=True,
+        ))
+    state._live_aligned_burst_obs[7] = obs
+
+    state._update_multi_aircraft_sync_state(7, period_s=10.0)
+
+    sync = state.get_live_sync_state(7)
+    assert sync.phase_anchor_icao == "AAAAAA"
+    assert sync.phase_anchor_offset_raw_deg == pytest.approx(110.0)
+    candidate = sync.phase_anchor_candidates[0]
+    assert candidate["status"] == "selected"
+    assert candidate["reject_reasons"] == []
+    assert "poor_icao_quality_memory" in candidate["warning_reasons"]
+
+
+def test_phase_anchor_uses_population_only_as_small_validation_nudge(monkeypatch):
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=10.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=10.0,
+    )
+    obs = deque(maxlen=state._MULTI_SYNC_OBS_MAX)
+    for idx, t_s in enumerate([0.0, 10.0, 20.0, 30.0, 40.0]):
+        obs.append(AlignedBurstSyncObs(
+            burst_centroid_us=t_s * 1_000_000.0,
+            icao="ANCHOR",
+            bearing_deg=30.0,
+            n_replies=5,
+            signal_dbfs=-10.0,
+            pos_age_s=0.2,
+            range_nm=0.0,
+            ts=995.0 + idx,
+            sync_update_eligible=True,
+        ))
+    for idx, t_s in enumerate([5.0, 15.0, 25.0]):
+        # Validator agrees within +8 degrees.  It may nudge the branch by
+        # roughly 1.2 degrees, not replace the anchor with its own offset.
+        obs.append(AlignedBurstSyncObs(
+            burst_centroid_us=t_s * 1_000_000.0,
+            icao="BBBBBB",
+            bearing_deg=(30.0 + ((t_s / 10.0) * 360.0) + 8.0) % 360.0,
+            n_replies=4,
+            signal_dbfs=-14.0,
+            pos_age_s=0.2,
+            range_nm=0.0,
+            ts=997.0 + idx,
+            sync_update_eligible=True,
+        ))
+    state._live_aligned_burst_obs[7] = obs
+
+    state._update_multi_aircraft_sync_state(7, period_s=10.0)
+
+    sync = state.get_live_sync_state(7)
+    assert sync.phase_anchor_icao == "ANCHOR"
+    assert sync.phase_anchor_offset_raw_deg == pytest.approx(30.0)
+    assert sync.phase_validation_status == "confirmed"
+    assert sync.phase_validation_contributors == 1
+    assert sync.phase_validation_median_error_deg == pytest.approx(8.0)
+    assert sync.phase_offset_deg == pytest.approx(25.2)
+
+
 def test_period_fit_rejects_large_residuals_without_hiding_timeline(monkeypatch):
     import radar.sweep as sweep_module
 
