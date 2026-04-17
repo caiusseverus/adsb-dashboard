@@ -141,6 +141,11 @@ SERIES_CLUSTER_TOLERANCE = 0.12
 
 # Max age for ADS-B position to be considered "current" (seconds)
 _ADSB_POSITION_MAX_AGE_S = 30.0
+
+# On-time window for DF11 residual classification on the burst-sync residual chart.
+# Must match the BURST_SYNC_DF11_ON_TIME_THRESHOLD_DEG constant in RadarPage.jsx so
+# the backend-computed timing_class agrees with the frontend colour mapping.
+_DF11_RESIDUAL_ON_TIME_THRESHOLD_DEG = 6.0
 _MIN_FRAME_START_SEPARATION_FRACTION = 0.5
 _PHASE_FAMILY_HISTORY_MIN = 2
 _PHASE_FAMILY_TOLERANCE_FRACTION = 0.15
@@ -245,6 +250,38 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
     """Serialise a LiveSyncState to a plain dict for API/verification payloads."""
     import dataclasses
     return dataclasses.asdict(sync)
+
+
+def _classify_period_correction_status(
+    allowed: bool,
+    block_reason: str | None,
+    clamp_reason: str | None,
+    proposed_delta_s: float | None,
+    applied_delta_s: float | None,
+    residual_slope_deg_per_s: float | None,
+    fit_support: int,
+    fit_total: int,
+    fit_span_s: float,
+) -> str:
+    """Summarise the live period correction loop for compact operator display."""
+    slope_abs = abs(float(residual_slope_deg_per_s or 0.0))
+    proposed_abs = abs(float(proposed_delta_s or 0.0))
+    applied_abs = abs(float(applied_delta_s or 0.0))
+    if not allowed:
+        if block_reason in {"insufficient_fit_observations", "insufficient_fit_icaos", "insufficient_fit_span"}:
+            return "weak_fit"
+        return "blocked"
+    if clamp_reason:
+        return "clamp_limited"
+    if proposed_abs > 0.0 and applied_abs < proposed_abs * 0.25:
+        return "clamp_limited"
+    if slope_abs >= 0.05 and applied_abs > 0.0:
+        return "converging"
+    if fit_total > 0 and fit_support <= 0:
+        return "weak_fit"
+    if fit_span_s <= 0.0:
+        return "weak_fit"
+    return "unknown"
 
 
 def _fit_weighted_slope(xs: list[float], ys: list[float], ws: list[float]) -> tuple[float, float]:
@@ -868,6 +905,20 @@ class LiveSyncState:
     period_update_applied: float = 0.0      # actual applied period delta in seconds after clamps
     period_update_gain: float = 0.0         # gain applied to residual_slope_deg_per_s
     period_refine_block_reason: str | None = None
+    period_update_proposed_s: float = 0.0
+    period_update_proposed_us: float = 0.0
+    period_update_applied_s: float = 0.0
+    period_update_applied_us: float = 0.0
+    period_update_ppm_unclamped: float = 0.0
+    period_update_ppm_applied: float = 0.0
+    period_update_block_reason: str | None = None
+    period_update_clamp_reason: str | None = None
+    period_update_allowed: bool = False
+    period_update_fit_support: int = 0
+    period_update_fit_span_s: float = 0.0
+    period_correction_status: str = "unknown"
+    period_update_safety_ppm_per_update: float = 0.0
+    period_update_safety_ppm_from_base: float = 0.0
     fit_time_basis: str = "effective_beast_time_s"
     fit_residual_basis: str = "observed_minus_authoritative_prediction_after_waveform_deg"
     fit_total_observations: int = 0
@@ -1895,6 +1946,8 @@ class RadarState:
         self._live_period_update_history: dict[int, deque] = {}
         self._live_slope_history: dict[int, deque] = {}
         self._live_period_history: dict[int, deque] = {}
+        self._live_sync_snapshot_cache: dict[int, tuple[tuple, dict]] = {}
+        self._live_sync_snapshot_seq: dict[int, int] = {}
 
         # Per-IID rotation-analysis gating: (last event count, last run ts).
         # update_rotation_models() uses these to skip _analyse_iid_events for
@@ -2781,6 +2834,20 @@ class RadarState:
             period_update_applied=existing.period_update_applied,
             period_update_gain=existing.period_update_gain,
             period_refine_block_reason=existing.period_refine_block_reason,
+            period_update_proposed_s=existing.period_update_proposed_s,
+            period_update_proposed_us=existing.period_update_proposed_us,
+            period_update_applied_s=existing.period_update_applied_s,
+            period_update_applied_us=existing.period_update_applied_us,
+            period_update_ppm_unclamped=existing.period_update_ppm_unclamped,
+            period_update_ppm_applied=existing.period_update_ppm_applied,
+            period_update_block_reason=existing.period_update_block_reason,
+            period_update_clamp_reason=existing.period_update_clamp_reason,
+            period_update_allowed=existing.period_update_allowed,
+            period_update_fit_support=existing.period_update_fit_support,
+            period_update_fit_span_s=existing.period_update_fit_span_s,
+            period_correction_status=existing.period_correction_status,
+            period_update_safety_ppm_per_update=existing.period_update_safety_ppm_per_update,
+            period_update_safety_ppm_from_base=existing.period_update_safety_ppm_from_base,
             fit_time_basis=existing.fit_time_basis,
             fit_residual_basis=existing.fit_residual_basis,
             fit_total_observations=existing.fit_total_observations,
@@ -3730,59 +3797,137 @@ class RadarState:
         # residual = observed - predicted.  If residual rises with effective
         # time, the predicted beam is falling behind: increase angular rate,
         # which decreases period_s.  Negative slope does the opposite.
+        #
+        # The rotation period is set by hardware and rarely changes.  Once
+        # established the model should be stable.  Three design choices enforce
+        # this:
+        #
+        #   1. Slope EMA — the fitted slope b_fit is noisy on a single window.
+        #      We maintain a slow EMA of slope (τ ≈ 12 updates) and drive
+        #      period corrections from the smoothed value, not the raw fit.
+        #      This prevents one noisy window from immediately moving the period.
+        #
+        #   2. Persistent-slope gate — any period update requires the smoothed
+        #      slope to have pointed in the same direction for at least 5 of the
+        #      last 8 stored entries AND exceed a dead-band threshold.  Transient
+        #      sign flips that cause overshoot-then-correct oscillation are
+        #      suppressed because the gate will not re-open immediately after the
+        #      period moves.
+        #
+        #   3. Reduced gain — _PERIOD_GAIN is lowered from 0.25 to 0.12 so each
+        #      accepted correction is smaller and the convergence is monotone
+        #      rather than oscillatory.
         refined_period_s = live_period_s
         span_s = max(xs, default=0.0) if xs else 0.0
         _PERIOD_REFINE_MIN_INLIERS = 6
         _PERIOD_REFINE_MIN_SPAN_ROT = 2.0
-        _PERIOD_GAIN = 0.25
-        _PERIOD_PPM_PER_UPDATE_MAX = 100.0
+        _PERIOD_GAIN = 0.12
+        _PERIOD_PPM_PER_UPDATE_MAX = 60.0
+        _PERIOD_PPM_PER_UPDATE_STRONG_MAX = 400.0
         _PERIOD_PPM_FROM_BASE_MAX = 2000.0
+        _PERIOD_PPM_FROM_BASE_STRONG_MAX = 15000.0
+        # Slow EMA of the fitted slope.  α ≈ 0.08 → time constant ~12 updates.
+        # Stored in residual_slope_deg_per_s; the raw b_fit is in slope_history.
+        _SLOPE_EMA_ALPHA = 0.08
+        _SLOPE_DEAD_BAND = 0.08  # deg/s — smoothed slope must exceed this to drive period change
+        smoothed_slope = (
+            (1.0 - _SLOPE_EMA_ALPHA) * existing.residual_slope_deg_per_s
+            + _SLOPE_EMA_ALPHA * b_fit
+        )
         period_update_term = 0.0
         period_update_applied = 0.0
         period_update_direction = "none"
-        period_refine_block_reason = None
+        period_update_ppm_unclamped = 0.0
+        period_update_ppm_applied = 0.0
+        period_update_block_reason = None
+        period_update_clamp_reason = None
+        period_update_allowed = False
+        # Persistence check over a wider window (last 8 entries, require 5 to agree).
+        # Uses the stored smoothed-slope values (residual_slope_deg_per_s field),
+        # not raw b_fit, so the gate reflects the same damped signal used for correction.
+        previous_slope_rows = list(self._live_slope_history.get(iid) or [])[-8:]
+        _PERSIST_MIN_ENTRIES = 5
+        _PERSIST_DEAD_BAND = _SLOPE_DEAD_BAND
+        slope_signs = [
+            1 if float(row.get("residual_slope_deg_per_s") or 0.0) > 0 else -1
+            for row in previous_slope_rows
+            if abs(float(row.get("residual_slope_deg_per_s") or 0.0)) >= _PERSIST_DEAD_BAND
+        ]
+        current_slope_sign = 1 if smoothed_slope > 0 else -1 if smoothed_slope < 0 else 0
+        persistent_slope = (
+            current_slope_sign != 0
+            and len(slope_signs) >= _PERSIST_MIN_ENTRIES
+            and sum(1 for s in slope_signs if s == current_slope_sign) >= _PERSIST_MIN_ENTRIES
+            and abs(smoothed_slope) >= _SLOPE_DEAD_BAND
+        )
+        strong_fit_for_period = (
+            len(fit_scored) >= 12
+            and len(fit_contributing_icaos) >= 3
+            and span_s >= 4.0 * live_period_s
+            and n_rejected <= max(1, len(recent_obs) // 3)
+        )
+        adaptive_period_clamp = strong_fit_for_period and persistent_slope
+        ppm_per_update_limit = (
+            _PERIOD_PPM_PER_UPDATE_STRONG_MAX
+            if adaptive_period_clamp else _PERIOD_PPM_PER_UPDATE_MAX
+        )
+        ppm_from_base_limit = (
+            _PERIOD_PPM_FROM_BASE_STRONG_MAX
+            if adaptive_period_clamp else _PERIOD_PPM_FROM_BASE_MAX
+        )
+        # persistent_slope is now a hard gate on any period update, not just
+        # the strong-clamp path.  Without a persistent smoothed slope the period
+        # holds its current value even if the raw fit shows a non-zero slope.
         refine_ok = (
             bool(RADAR_SYNC_PERIOD_REFINE_ENABLED)
             and not majority_rejected
             and len(fit_scored) >= _PERIOD_REFINE_MIN_INLIERS
             and len(fit_contributing_icaos) >= 2
             and span_s >= _PERIOD_REFINE_MIN_SPAN_ROT * live_period_s
+            and persistent_slope
         )
         if not RADAR_SYNC_PERIOD_REFINE_ENABLED:
-            period_refine_block_reason = "disabled"
+            period_update_block_reason = "disabled"
         elif majority_rejected:
-            period_refine_block_reason = "majority_rejected"
+            period_update_block_reason = "majority_rejected"
         elif len(fit_scored) < _PERIOD_REFINE_MIN_INLIERS:
-            period_refine_block_reason = "insufficient_fit_observations"
+            period_update_block_reason = "insufficient_fit_observations"
         elif len(fit_contributing_icaos) < 2:
-            period_refine_block_reason = "insufficient_fit_icaos"
+            period_update_block_reason = "insufficient_fit_icaos"
         elif span_s < _PERIOD_REFINE_MIN_SPAN_ROT * live_period_s:
-            period_refine_block_reason = "insufficient_fit_span"
+            period_update_block_reason = "insufficient_fit_span"
+        elif not persistent_slope:
+            period_update_block_reason = "slope_not_persistent"
         if refine_ok and live_period_s > 0:
+            period_update_allowed = True
             rate_nominal = 360.0 / live_period_s
-            rate_target = rate_nominal + b_fit * _PERIOD_GAIN
+            # Use the smoothed slope — not the raw b_fit — for the period correction
+            # so transient noise in the fit does not immediately move the period.
+            rate_target = rate_nominal + smoothed_slope * _PERIOD_GAIN
             if rate_target > 0:
                 candidate = 360.0 / rate_target
                 period_update_term = candidate - live_period_s
+                period_update_ppm_unclamped = period_update_term / live_period_s * 1e6
                 # Per-update ppm clamp.
                 delta_ppm = (candidate - live_period_s) / live_period_s * 1e6
-                if delta_ppm > _PERIOD_PPM_PER_UPDATE_MAX:
-                    candidate = live_period_s * (1.0 + _PERIOD_PPM_PER_UPDATE_MAX * 1e-6)
-                    period_refine_block_reason = "per_update_clamped"
-                elif delta_ppm < -_PERIOD_PPM_PER_UPDATE_MAX:
-                    candidate = live_period_s * (1.0 - _PERIOD_PPM_PER_UPDATE_MAX * 1e-6)
-                    period_refine_block_reason = "per_update_clamped"
+                if delta_ppm > ppm_per_update_limit:
+                    candidate = live_period_s * (1.0 + ppm_per_update_limit * 1e-6)
+                    period_update_clamp_reason = "per_update_clamped"
+                elif delta_ppm < -ppm_per_update_limit:
+                    candidate = live_period_s * (1.0 - ppm_per_update_limit * 1e-6)
+                    period_update_clamp_reason = "per_update_clamped"
                 # Absolute ppm from base clamp.
                 if base_period_s > 0:
                     abs_ppm = (candidate - base_period_s) / base_period_s * 1e6
-                    if abs_ppm > _PERIOD_PPM_FROM_BASE_MAX:
-                        candidate = base_period_s * (1.0 + _PERIOD_PPM_FROM_BASE_MAX * 1e-6)
-                        period_refine_block_reason = "base_ppm_clamped"
-                    elif abs_ppm < -_PERIOD_PPM_FROM_BASE_MAX:
-                        candidate = base_period_s * (1.0 - _PERIOD_PPM_FROM_BASE_MAX * 1e-6)
-                        period_refine_block_reason = "base_ppm_clamped"
+                    if abs_ppm > ppm_from_base_limit:
+                        candidate = base_period_s * (1.0 + ppm_from_base_limit * 1e-6)
+                        period_update_clamp_reason = "base_ppm_clamped"
+                    elif abs_ppm < -ppm_from_base_limit:
+                        candidate = base_period_s * (1.0 - ppm_from_base_limit * 1e-6)
+                        period_update_clamp_reason = "base_ppm_clamped"
                 refined_period_s = candidate
                 period_update_applied = refined_period_s - live_period_s
+                period_update_ppm_applied = period_update_applied / live_period_s * 1e6
                 if period_update_applied > 0:
                     period_update_direction = "increase"
                 elif period_update_applied < 0:
@@ -3790,7 +3935,20 @@ class RadarState:
                 else:
                     period_update_direction = "none"
             else:
-                period_refine_block_reason = "non_positive_rate_target"
+                period_update_allowed = False
+                period_update_block_reason = "non_positive_rate_target"
+        period_refine_block_reason = period_update_block_reason
+        period_correction_status = _classify_period_correction_status(
+            period_update_allowed,
+            period_update_block_reason,
+            period_update_clamp_reason,
+            period_update_term,
+            period_update_applied,
+            b_fit,
+            len(fit_scored),
+            len(recent_obs),
+            span_s,
+        )
         period_correction_ppm = (
             (refined_period_s - base_period_s) / base_period_s * 1e6
             if base_period_s > 0 else 0.0
@@ -3980,7 +4138,7 @@ class RadarState:
             n_burst_obs_rejected=n_rejected,
             contributing_icao_count=len(contributing_icaos),
             period_base_s=base_period_s,
-            residual_slope_deg_per_s=b_fit,
+            residual_slope_deg_per_s=smoothed_slope,
             period_correction_ppm=period_correction_ppm,
             period_refine_enabled=bool(RADAR_SYNC_PERIOD_REFINE_ENABLED),
             period_update_term=period_update_term,
@@ -3988,6 +4146,20 @@ class RadarState:
             period_update_applied=period_update_applied,
             period_update_gain=_PERIOD_GAIN,
             period_refine_block_reason=period_refine_block_reason,
+            period_update_proposed_s=period_update_term,
+            period_update_proposed_us=period_update_term * 1_000_000.0,
+            period_update_applied_s=period_update_applied,
+            period_update_applied_us=period_update_applied * 1_000_000.0,
+            period_update_ppm_unclamped=period_update_ppm_unclamped,
+            period_update_ppm_applied=period_update_ppm_applied,
+            period_update_block_reason=period_update_block_reason,
+            period_update_clamp_reason=period_update_clamp_reason,
+            period_update_allowed=period_update_allowed,
+            period_update_fit_support=len(fit_scored),
+            period_update_fit_span_s=span_s,
+            period_correction_status=period_correction_status,
+            period_update_safety_ppm_per_update=ppm_per_update_limit,
+            period_update_safety_ppm_from_base=ppm_from_base_limit,
             fit_time_basis="effective_beast_time_s",
             fit_residual_basis="observed_minus_authoritative_prediction_after_prop_motion_waveform_deg",
             fit_total_observations=len(recent_obs),
@@ -4038,9 +4210,23 @@ class RadarState:
             "period_base_s": base_period_s,
             "period_correction_ppm": period_correction_ppm,
             "period_update_term": period_update_term,
+            "period_update_proposed_s": period_update_term,
+            "period_update_proposed_us": period_update_term * 1_000_000.0,
             "period_update_applied": period_update_applied,
+            "period_update_applied_s": period_update_applied,
+            "period_update_applied_us": period_update_applied * 1_000_000.0,
             "period_update_direction": period_update_direction,
             "period_update_gain": _PERIOD_GAIN,
+            "period_update_ppm_unclamped": period_update_ppm_unclamped,
+            "period_update_ppm_applied": period_update_ppm_applied,
+            "period_update_allowed": period_update_allowed,
+            "period_update_block_reason": period_update_block_reason,
+            "period_update_clamp_reason": period_update_clamp_reason,
+            "period_correction_status": period_correction_status,
+            "period_s_before": live_period_s,
+            "period_s_after": refined_period_s,
+            "period_update_safety_ppm_per_update": ppm_per_update_limit,
+            "period_update_safety_ppm_from_base": ppm_from_base_limit,
             "period_refine_block_reason": period_refine_block_reason,
             "n_fit_observations": len(fit_scored),
             "n_total_observations": len(recent_obs),
@@ -4060,7 +4246,11 @@ class RadarState:
         self._live_period_update_history.setdefault(iid, deque(maxlen=80)).append(update_entry)
         self._live_slope_history.setdefault(iid, deque(maxlen=80)).append({
             "ts": now_ts,
-            "residual_slope_deg_per_s": b_fit,
+            # residual_slope_deg_per_s is the EMA-smoothed value — this is what the
+            # persistence gate and period correction use.  raw_slope_deg_per_s is the
+            # instantaneous fit result, kept for diagnostics only.
+            "residual_slope_deg_per_s": smoothed_slope,
+            "raw_slope_deg_per_s": b_fit,
             "fit_span_s": span_s,
             "n_fit_observations": len(fit_scored),
         })
@@ -4069,6 +4259,7 @@ class RadarState:
             "period_s": refined_period_s,
             "period_base_s": base_period_s,
             "period_correction_ppm": period_correction_ppm,
+            "period_correction_status": period_correction_status,
         })
 
     def _finalize_pending_burst(
@@ -4877,6 +5068,8 @@ class RadarState:
                                self._live_period_update_history,
                                self._live_slope_history,
                                self._live_period_history,
+                               self._live_sync_snapshot_cache,
+                               self._live_sync_snapshot_seq,
                                self._rotation_analysis_meta):
                 if iid in live_dict:
                     del live_dict[iid]
@@ -4953,6 +5146,8 @@ class RadarState:
             self._live_period_update_history.clear()
             self._live_slope_history.clear()
             self._live_period_history.clear()
+            self._live_sync_snapshot_cache.clear()
+            self._live_sync_snapshot_seq.clear()
             self._rotation_analysis_meta.clear()
             self._live_detection_buffer.clear()
             self._native_burst_processors.clear()
@@ -5197,6 +5392,107 @@ class RadarState:
 
         return {icao: list(reversed(arrivals)) for icao, arrivals in icao_arrivals.items()}
 
+    def _build_df11_residual_observations(
+        self,
+        sync: "LiveSyncState",
+        waveform_bins: list,
+        iid_events: list[tuple[float, int, str, "float | None"]],
+        latest_arrival_us: "float | None",
+    ) -> list[dict]:
+        """Compute DF11 residual observations for the burst-sync residual chart.
+
+        This is the authoritative backend path for individual DF11 arrival
+        residuals.  It uses the same predict_sync_observation() call as burst
+        observations so both chart layers share:
+          - Beast-relative timestamp basis
+          - current refined period / phase / anchor state
+          - propagation correction policy (driven by sync.prop_delay_enabled)
+          - waveform correction policy (driven by sync.waveform_enabled)
+          - residual wrapping convention: (obs - pred + 540) % 360 - 180
+
+        Motion compensation is intentionally omitted for individual DF11
+        arrivals: no per-message bearing-rate estimate is available, and the
+        burst-centre averaging that makes motion comp meaningful does not apply
+        to single-message events.
+
+        Individual DF11 arrivals that cannot be given a trustworthy residual
+        (no ADS-B position available at that timestamp) are omitted rather
+        than guessed — prefer omission over false precision.
+
+        Previously, DF11 residual dots were computed in the frontend using a
+        local predictBearingFromSyncModel() function.  That was inconsistent
+        with the backend burst residuals because it used a stale sync snapshot,
+        a different predictor code path, and potentially different waveform/
+        propagation correction state.  This method replaces that approach.
+        """
+        if sync is None or not sync.usable:
+            return []
+        receiver_lat = self._receiver_lat
+        receiver_lon = self._receiver_lon
+        if receiver_lat is None or receiver_lon is None:
+            return []
+
+        results: list[dict] = []
+        for arrival_us, _iid, icao, signal_dbfs in iid_events:
+            # Estimate wall-clock time for this arrival using the same method
+            # used for burst-centre position lookup.
+            wall_ts = self._estimate_wall_time_from_arrival_us(arrival_us, latest_arrival_us)
+            if wall_ts is None:
+                continue
+            pos = self._adsb_tracker.get_position_at(icao, wall_ts)
+            if pos is None or pos.get("lat") is None or pos.get("lon") is None:
+                # No trustworthy aircraft position — omit this dot entirely.
+                continue
+            truth_lat: float = pos["lat"]
+            truth_lon: float = pos["lon"]
+            # Bearing and range from the receiver to the aircraft at arrival time.
+            # Same geometry functions used for burst observations.
+            bearing_deg = _bearing_deg_simple(receiver_lat, receiver_lon, truth_lat, truth_lon)
+            range_nm = _haversine_nm_simple(receiver_lat, receiver_lon, truth_lat, truth_lon)
+            # Authoritative residual prediction — identical predictor path to
+            # get_burst_sync_timeline() burst entries.
+            prediction = predict_sync_observation(
+                sync,
+                arrival_us,
+                range_nm=range_nm,
+                waveform_bins=waveform_bins,
+                # Motion comp not applied: no bearing-rate estimate for single messages.
+                bearing_rate_deg_s=None,
+                motion_comp_dt_us=None,
+                motion_comp_block_reason="individual_df11_arrival",
+            )
+            # Residual wrapping: identical to burst observations.
+            residual_deg = (
+                bearing_deg - prediction.predicted_bearing_deg + 540.0
+            ) % 360.0 - 180.0
+            # timing_class uses the same threshold as BURST_SYNC_DF11_ON_TIME_THRESHOLD_DEG
+            # in RadarPage.jsx so the frontend colour mapping is consistent.
+            abs_res = abs(residual_deg)
+            if abs_res <= _DF11_RESIDUAL_ON_TIME_THRESHOLD_DEG:
+                timing_class = "on_time"
+            elif residual_deg > 0:
+                timing_class = "early"
+            else:
+                timing_class = "late"
+            results.append({
+                "icao": icao,
+                "arrival_beast_us": arrival_us,
+                "effective_beast_us": prediction.effective_arrival_us,
+                "true_bearing_deg": round(bearing_deg, 4),
+                "predicted_deg": round(prediction.predicted_bearing_deg, 4),
+                "residual_deg": round(residual_deg, 4),
+                "timing_class": timing_class,
+                "range_nm": round(range_nm, 2),
+                "pos_age_s": pos.get("position_age_seconds"),
+                "signal_dbfs": signal_dbfs,
+                # fit_eligible is always False for individual arrivals — only
+                # burst-centre observations drive sync fitting.
+                "fit_eligible": False,
+                "fit_reject_reason": "individual_df11_arrival",
+                "residual_source": "df11",
+            })
+        return results
+
     def get_burst_sync_timeline(self, iid: int, window_s: float = 60.0) -> dict:
         """Return burst-centre sync observations with residuals for verification plotting.
 
@@ -5221,6 +5517,17 @@ class RadarState:
             update_history = list(self._live_period_update_history.get(iid) or [])
             slope_history = list(self._live_slope_history.get(iid) or [])
             period_history = list(self._live_period_history.get(iid) or [])
+            # Snapshot recent individual DF11 arrivals for this IID within the window.
+            # Taken under the same lock so the timestamp basis matches the obs snapshot.
+            latest_arrival_us_for_iid = self._iid_latest_arrival_us.get(iid)
+            _df11_cutoff_us = (latest_arrival_us_for_iid or 0.0) - window_s * 1_000_000.0
+            iid_events_for_df11: list[tuple[float, int, str, float | None]] = []
+            for _ev in reversed(self._iid_events):
+                if _ev[0] < _df11_cutoff_us:
+                    break
+                if _ev[1] == iid:
+                    iid_events_for_df11.append(_ev)
+            iid_events_for_df11.reverse()
 
         if not obs_snapshot or sync is None:
             return {
@@ -5234,6 +5541,9 @@ class RadarState:
                 "period_history": period_history,
                 "predictor_consistency": getattr(sync, "predictor_consistency", None) if sync else None,
                 "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []) if sync else [],
+                # No sync state → no authoritative residuals possible.
+                "df11_residual_observations": [],
+                "chart_overlay_consistent": False,
             }
 
         now_ts = time.time()
@@ -5415,6 +5725,36 @@ class RadarState:
         ]
         quality_payload.sort(key=lambda x: -x["n"])
 
+        # Refresh the position tracker with current aircraft positions before
+        # computing DF11 residuals.  _adsb_tracker is normally refreshed only
+        # inside update_rotation_models() (every ~30s), so without this step
+        # get_position_at() would return None for all events and produce no dots.
+        if self._aircraft_state is not None:
+            try:
+                for _pos in self._aircraft_state.get_positions_snapshot():
+                    self._adsb_tracker.update(
+                        _pos["icao"],
+                        _pos["lat"],
+                        _pos["lon"],
+                        _pos.get("gs"),
+                        _pos.get("track"),
+                        ts=_pos.get("last_pos_ts") or time.time(),
+                    )
+            except Exception:
+                pass
+
+        # Build backend DF11 residual observations using the same authoritative
+        # predictor (predict_sync_observation) and the same sync snapshot used
+        # for burst observations above.  Both chart layers are therefore
+        # timing-consistent: identical timestamp basis, predictor path,
+        # propagation correction, waveform correction, and residual wrapping.
+        df11_residual_observations = self._build_df11_residual_observations(
+            sync=sync,
+            waveform_bins=waveform_bins,
+            iid_events=iid_events_for_df11,
+            latest_arrival_us=latest_arrival_us_for_iid,
+        )
+
         return {
             "observations": entries,
             "sync_state": _live_sync_state_to_dict(sync),
@@ -5440,7 +5780,120 @@ class RadarState:
                     if motion_improvements else None
                 ),
             },
+            # Both burst_observations and df11_residual_observations were derived from
+            # the same sync snapshot and the same predict_sync_observation() call.
+            # They are directly comparable on the residual chart.
+            "df11_residual_observations": df11_residual_observations,
+            "chart_overlay_consistent": True,
         }
+
+    def get_live_sync_snapshot(self, iid: int, window_s: float = 90.0, debug_limit: int = 120) -> dict:
+        """Return the shared compact sync snapshot used by the pushed Radar UI feed.
+
+        The snapshot combines the fast-changing sync payloads that previously
+        required separate frontend polls.  A signature cache prevents the
+        websocket loop, HTTP fallback, and reconnects from rebuilding expensive
+        diagnostics when no relevant live sync input has changed.
+        """
+        with self._lock:
+            sync = self._live_sync_states.get(iid)
+            model = self._models.get(iid)
+            obs_buf = self._live_burst_timeline_obs.get(iid) or self._live_aligned_burst_obs.get(iid)
+            obs_len = len(obs_buf) if obs_buf else 0
+            last_obs_us = None
+            last_obs_ts = None
+            if obs_buf:
+                last_obs = obs_buf[-1]
+                last_obs_us = getattr(last_obs, "burst_centroid_us", None)
+                last_obs_ts = getattr(last_obs, "ts", None)
+            signature = (
+                float(window_s),
+                int(debug_limit),
+                self._iid_latest_arrival_us.get(iid),
+                getattr(sync, "last_sync_update_ts", None),
+                getattr(sync, "period_s", None),
+                getattr(sync, "period_correction_status", None),
+                getattr(model, "last_updated", None),
+                getattr(model, "period_s", None),
+                getattr(model, "status", None),
+                obs_len,
+                last_obs_us,
+                last_obs_ts,
+                len(self._live_period_update_history.get(iid) or ()),
+            )
+            cached = self._live_sync_snapshot_cache.get(iid)
+            if cached is not None and cached[0] == signature:
+                return cached[1]
+            sequence = self._live_sync_snapshot_seq.get(iid, 0) + 1
+            self._live_sync_snapshot_seq[iid] = sequence
+
+        burst_timeline = self.get_burst_sync_timeline(iid, window_s=window_s)
+        sync_debug = self.get_sync_debug_payload(iid, window_s=window_s, limit=debug_limit)
+        compact_debug_observations = []
+        for row in sync_debug.get("observations", []):
+            compact_debug_observations.append({
+                "iid": row.get("iid"),
+                "icao": row.get("icao"),
+                "effective_beast_us": row.get("effective_beast_us"),
+                "burst_center_beast_us": row.get("burst_center_beast_us"),
+                "residual_raw_deg": row.get("residual_raw_deg"),
+                "resid_authoritative_deg": row.get("resid_authoritative_deg"),
+                "fit_slope_deg_per_s": row.get("fit_slope_deg_per_s"),
+                "time_offset_s": row.get("time_offset_s"),
+                "detrend_component_deg": row.get("detrend_component_deg"),
+                "residual_detrended_deg": row.get("residual_detrended_deg"),
+                "phase_deg": row.get("phase_deg"),
+                "phase_authoritative_deg": row.get("phase_authoritative_deg"),
+                "cycle_index": row.get("cycle_index"),
+                "cycle_start_beast_us": row.get("cycle_start_beast_us"),
+                "fit_eligible": row.get("fit_eligible"),
+                "fit_reject_reason": row.get("fit_reject_reason"),
+            })
+        compact_sync_debug = {
+            "iid": sync_debug.get("iid", iid),
+            "available": sync_debug.get("available", False),
+            "reason": sync_debug.get("reason"),
+            "sync_state": sync_debug.get("sync_state"),
+            "summary": sync_debug.get("summary", {}),
+            "observations": compact_debug_observations,
+            "observation_model_diagnostics": {
+                "folded_phase_shape": (
+                    sync_debug.get("observation_model_diagnostics", {}).get("folded_phase_shape", {})
+                ),
+            },
+            "advanced_available_via": f"/api/radar/iids/{iid}/sync-debug",
+        }
+        snapshot = {
+            "type": "radar_sync",
+            "iid": iid,
+            "sequence": sequence,
+            "server_ts": time.time(),
+            "window_s": window_s,
+            "sync_state": burst_timeline.get("sync_state"),
+            "observations": burst_timeline.get("observations", []),
+            # Backend-computed DF11 residual observations for the burst-sync chart overlay.
+            # Both "observations" (burst) and "df11_residual_observations" are derived from
+            # the same authoritative sync snapshot and predict_sync_observation() path.
+            # chart_overlay_consistent=True confirms they are directly comparable.
+            "df11_residual_observations": burst_timeline.get("df11_residual_observations", []),
+            "chart_overlay_consistent": burst_timeline.get("chart_overlay_consistent", False),
+            "waveform_bins": burst_timeline.get("waveform_bins", []),
+            "per_icao_quality": burst_timeline.get("per_icao_quality", []),
+            "period_update_history": burst_timeline.get("period_update_history", []),
+            "slope_history": burst_timeline.get("slope_history", []),
+            "period_history": burst_timeline.get("period_history", []),
+            "predictor_consistency": burst_timeline.get("predictor_consistency"),
+            "phase_anchor_candidates": burst_timeline.get("phase_anchor_candidates", []),
+            "motion_comp_summary": burst_timeline.get("motion_comp_summary"),
+            "sync_debug": compact_sync_debug,
+            "transport": {
+                "source": "shared_snapshot",
+                "cached": False,
+            },
+        }
+        with self._lock:
+            self._live_sync_snapshot_cache[iid] = (signature, snapshot)
+        return snapshot
 
     def get_sync_debug_payload(self, iid: int, window_s: float = 60.0, limit: int = 80) -> dict:
         """Return per-observation sync consistency diagnostics for one IID.
@@ -6246,6 +6699,21 @@ class RadarState:
             "fit_rejected_observations": getattr(sync, "fit_rejected_observations", None),
             "fit_reject_counts": getattr(sync, "fit_reject_reasons", None),
             "period_refine_block_reason": getattr(sync, "period_refine_block_reason", None),
+            "period_update_proposed_s": getattr(sync, "period_update_proposed_s", None),
+            "period_update_proposed_us": getattr(sync, "period_update_proposed_us", None),
+            "period_update_applied_s": getattr(sync, "period_update_applied_s", None),
+            "period_update_applied_us": getattr(sync, "period_update_applied_us", None),
+            "period_update_gain": getattr(sync, "period_update_gain", None),
+            "period_update_ppm_unclamped": getattr(sync, "period_update_ppm_unclamped", None),
+            "period_update_ppm_applied": getattr(sync, "period_update_ppm_applied", None),
+            "period_update_allowed": getattr(sync, "period_update_allowed", None),
+            "period_update_block_reason": getattr(sync, "period_update_block_reason", None),
+            "period_update_clamp_reason": getattr(sync, "period_update_clamp_reason", None),
+            "period_update_fit_support": getattr(sync, "period_update_fit_support", None),
+            "period_update_fit_span_s": getattr(sync, "period_update_fit_span_s", None),
+            "period_correction_status": getattr(sync, "period_correction_status", None),
+            "period_update_safety_ppm_per_update": getattr(sync, "period_update_safety_ppm_per_update", None),
+            "period_update_safety_ppm_from_base": getattr(sync, "period_update_safety_ppm_from_base", None),
             "waveform_enabled": getattr(sync, "waveform_enabled", None),
             "waveform_applied": getattr(sync, "waveform_applied", None),
             "prop_delay_enabled": getattr(sync, "prop_delay_enabled", None),

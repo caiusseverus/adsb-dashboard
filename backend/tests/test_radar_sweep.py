@@ -693,6 +693,9 @@ def test_period_refinement_uses_effective_time_slope_and_correct_sign(monkeypatc
     monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
 
     state = RadarState()
+    # Seed the sync state with a non-zero smoothed slope so the EMA starts warm.
+    # The persistence gate requires 5/8 history entries to agree in sign and
+    # exceed the dead-band, so we also pre-populate slope history below.
     state._live_sync_states[7] = LiveSyncState(
         iid=7,
         period_s=10.0,
@@ -706,7 +709,20 @@ def test_period_refinement_uses_effective_time_slope_and_correct_sign(monkeypatc
         period_base_s=10.0,
         prop_delay_enabled=True,
         period_refine_enabled=True,
+        residual_slope_deg_per_s=0.5,   # pre-warm the slope EMA
     )
+    # Pre-populate slope history with 6 consistent positive entries so the
+    # persistence gate (≥5/8 agree, smoothed ≥ dead-band) will open.
+    from collections import deque as _deque
+    state._live_slope_history[7] = _deque(maxlen=80)
+    for _ in range(6):
+        state._live_slope_history[7].append({
+            "ts": 998.0,
+            "residual_slope_deg_per_s": 0.5,
+            "raw_slope_deg_per_s": 0.5,
+            "fit_span_s": 28.0,
+            "n_fit_observations": 8,
+        })
 
     obs = deque(maxlen=state._MULTI_SYNC_OBS_MAX)
     for idx, t_s in enumerate([0, 4, 8, 12, 16, 20, 24, 28]):
@@ -729,14 +745,70 @@ def test_period_refinement_uses_effective_time_slope_and_correct_sign(monkeypatc
     state._update_multi_aircraft_sync_state(7, period_s=10.0)
 
     sync = state.get_live_sync_state(7)
-    assert sync.residual_slope_deg_per_s == pytest.approx(0.5, rel=0.05)
+    # residual_slope_deg_per_s is now the EMA-smoothed value.  Starting from 0.5
+    # and blending b_fit ≈ 0.5 with α=0.08, the result stays close to 0.5.
+    assert sync.residual_slope_deg_per_s == pytest.approx(0.5, rel=0.1)
     assert sync.period_s < 10.0
     assert sync.period_update_direction == "decrease"
     assert sync.period_update_applied < 0.0
-    assert sync.period_update_gain == pytest.approx(0.25)
+    assert sync.period_update_proposed_s < 0.0
+    assert sync.period_update_applied_s == pytest.approx(sync.period_update_applied)
+    assert sync.period_update_allowed is True
+    assert sync.period_update_block_reason is None
+    assert sync.period_update_fit_support == 8
+    assert sync.period_update_fit_span_s == pytest.approx(sync.fit_span_s)
+    assert sync.period_correction_status in {"converging", "clamp_limited"}
+    assert sync.period_update_gain == pytest.approx(0.12)
     assert sync.fit_eligible_observations == 8
     assert sync.fit_time_basis == "effective_beast_time_s"
-    assert state.get_burst_sync_timeline(7, window_s=60.0)["period_update_history"]
+    timeline = state.get_burst_sync_timeline(7, window_s=60.0)
+    assert timeline["period_update_history"]
+    update = timeline["period_update_history"][-1]
+    assert update["period_s_before"] == pytest.approx(10.0)
+    assert update["period_s_after"] == pytest.approx(sync.period_s)
+    assert "period_update_clamp_reason" in update
+
+
+def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monkeypatch):
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    state._iid_latest_arrival_us[7] = 4_000_000.0
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=4.0,
+    )
+    state._live_burst_timeline_obs[7] = deque([
+        AlignedBurstSyncObs(
+            burst_centroid_us=4_000_000.0,
+            icao="AAAAAA",
+            bearing_deg=0.0,
+            n_replies=4,
+            signal_dbfs=-12.0,
+            pos_age_s=0.2,
+            range_nm=0.0,
+            ts=999.0,
+            sync_update_eligible=True,
+        )
+    ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+
+    first = state.get_live_sync_snapshot(7, window_s=90.0, debug_limit=20)
+    second = state.get_live_sync_snapshot(7, window_s=90.0, debug_limit=20)
+
+    assert first is second
+    assert first["sequence"] == second["sequence"]
+    assert first["type"] == "radar_sync"
+    assert first["sync_debug"]["summary"]["operational_time_basis"] == "effective_beast_us"
 
 
 def test_phase_anchor_selected_aircraft_recovers_wrong_absolute_branch(monkeypatch):
