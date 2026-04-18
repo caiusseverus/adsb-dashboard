@@ -81,6 +81,14 @@ class TrackStore:
                 military, mlat, interesting, acas_ra_active, mlat_source,
             ))
 
+    def stats(self) -> dict:
+        """Return current track store statistics for observability."""
+        with self._lock:
+            return {
+                "aircraft_count": len(self._tracks),
+                "total_points":   sum(len(dq) for dq in self._tracks.values()),
+            }
+
     def expire(self, active_icaos: set[str]) -> None:
         """Remove tracks for aircraft no longer in the live set."""
         with self._lock:

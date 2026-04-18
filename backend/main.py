@@ -1570,9 +1570,13 @@ async def lifespan(app: FastAPI):
         _bg(_aircraft_localisation_loop())
     health_module.register_context(_msg_queue, _clients)
     register_runtime_stats(lambda: {
-        "ws_clients":       len(_clients),
-        "route_queue_size": len(_route_queue),
+        "ws_clients":        len(_clients),
+        "route_queue_size":  len(_route_queue),
         "route_queue_drops": _route_queue_drops,
+        "aircraft_state":    state.get_aux_dict_sizes(),
+        "cast":              cast.get_cache_stats(),
+        "track_store":       track_store.stats(),
+        "radar_state":       radar_state.get_memory_stats(),
     })
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",
              config.BEAST_HOST, config.BEAST_PORT)

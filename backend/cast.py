@@ -397,16 +397,37 @@ def _sweep_photo_cache_locked(now: float) -> None:
 
 
 def _sweep_cooldown_if_due() -> None:
-    """Globally purge cooldown entries older than 24 h, at most once per hour."""
+    """Globally purge expired cooldown entries, at most once per hour.
+
+    Uses the actual configured cooldown_minutes so entries are removed as soon
+    as they would no longer block a new cast — not on an arbitrary fixed cutoff.
+    """
     global _cooldown_sweep_ts
     now = time.time()
     if now - _cooldown_sweep_ts < _COOLDOWN_SWEEP_INTERVAL_S:
         return
     _cooldown_sweep_ts = now
-    cutoff = now - 86400.0  # entries older than 1 day are certainly expired regardless of cooldown_minutes
+    try:
+        cooldown_minutes = int(_get_config().get("cooldown_minutes", "30"))
+    except (ValueError, TypeError):
+        cooldown_minutes = 30
+    cutoff = now - (cooldown_minutes * 60)
     stale = [k for k, ts in _cooldown.items() if ts < cutoff]
     for k in stale:
         del _cooldown[k]
+
+
+def get_cache_stats() -> dict:
+    """Return current sizes of in-process caches for observability."""
+    with _photo_cache_lock:
+        photo_size = len(_photo_cache)
+    with _token_lock:
+        token_size = len(_tokens)
+    return {
+        "photo_cache": photo_size,
+        "cooldown":    len(_cooldown),
+        "token_store": token_size,
+    }
 
 
 def _fetch_photo(icao: str) -> bytes | None:
@@ -427,12 +448,14 @@ def _fetch_photo(icao: str) -> bytes | None:
         if not photos:
             with _photo_cache_lock:
                 _photo_cache[icao] = (None, now + _PHOTO_MISS_TTL_S)
+                _sweep_photo_cache_locked(now)
             return None
         src = (photos[0].get("thumbnail_large") or {}).get("src") or \
               (photos[0].get("thumbnail") or {}).get("src")
         if not src:
             with _photo_cache_lock:
                 _photo_cache[icao] = (None, now + _PHOTO_MISS_TTL_S)
+                _sweep_photo_cache_locked(now)
             return None
         with urllib.request.urlopen(
             urllib.request.Request(src, headers={"User-Agent": "adsb-dashboard/1.0"}),
@@ -442,11 +465,13 @@ def _fetch_photo(icao: str) -> bytes | None:
             photo = img_resp.read()
         with _photo_cache_lock:
             _photo_cache[icao] = (photo, now + _PHOTO_TTL_S)
+            _sweep_photo_cache_locked(now)
         return photo
     except Exception as exc:
         log.debug("cast: photo fetch failed for %s: %s", icao, exc)
         with _photo_cache_lock:
             _photo_cache[icao] = (None, now + _PHOTO_MISS_TTL_S)
+            _sweep_photo_cache_locked(now)
         return None
 
 

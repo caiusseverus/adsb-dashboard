@@ -101,6 +101,12 @@ async def get_status() -> dict:
             "size":  runtime.get("route_queue_size",  0),
             "drops": runtime.get("route_queue_drops", 0),
         },
+        "in_memory_state": {
+            "aircraft_state": runtime.get("aircraft_state", {}),
+            "cast":           runtime.get("cast", {}),
+            "track_store":    runtime.get("track_store", {}),
+            "radar_state":    runtime.get("radar_state", {}),
+        },
     }
 
 
