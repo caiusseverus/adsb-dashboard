@@ -176,6 +176,9 @@ _photo_cache: dict[str, tuple[bytes | None, float]] = {}
 _photo_cache_lock = threading.Lock()
 _PHOTO_TTL_S = 3600.0
 _PHOTO_MISS_TTL_S = 300.0
+_PHOTO_CACHE_MAX = 200  # hard cap: at most 200 photos (~10 MB worst case)
+_cooldown_sweep_ts: float = 0.0
+_COOLDOWN_SWEEP_INTERVAL_S = 3600.0  # sweep stale cooldown entries at most once per hour
 _ssl_context: ssl.SSLContext | None = None
 _cc_cache: dict[str, object] = {"device_name": None, "cc": None, "browser": None, "ts": 0.0}
 _CC_TTL_S = 300.0
@@ -383,11 +386,35 @@ def _get_route(icao: str) -> tuple[str | None, str | None, str | None, str | Non
 # Image generation
 # ---------------------------------------------------------------------------
 
+def _sweep_photo_cache_locked(now: float) -> None:
+    """Expire stale entries and enforce size cap. Must be called under _photo_cache_lock."""
+    expired = [k for k, (_, exp) in _photo_cache.items() if now >= exp]
+    for k in expired:
+        del _photo_cache[k]
+    # Hard size cap: evict oldest entries (dict preserves insertion order, Python 3.7+)
+    while len(_photo_cache) > _PHOTO_CACHE_MAX:
+        _photo_cache.pop(next(iter(_photo_cache)))
+
+
+def _sweep_cooldown_if_due() -> None:
+    """Globally purge cooldown entries older than 24 h, at most once per hour."""
+    global _cooldown_sweep_ts
+    now = time.time()
+    if now - _cooldown_sweep_ts < _COOLDOWN_SWEEP_INTERVAL_S:
+        return
+    _cooldown_sweep_ts = now
+    cutoff = now - 86400.0  # entries older than 1 day are certainly expired regardless of cooldown_minutes
+    stale = [k for k, ts in _cooldown.items() if ts < cutoff]
+    for k in stale:
+        del _cooldown[k]
+
+
 def _fetch_photo(icao: str) -> bytes | None:
     """Fetch thumbnail image bytes from planespotters.net, or None on failure."""
     icao = icao.upper()
     now = time.monotonic()
     with _photo_cache_lock:
+        _sweep_photo_cache_locked(now)
         cached = _photo_cache.get(icao)
         if cached is not None and now < cached[1]:
             return cached[0]
@@ -728,6 +755,7 @@ def check(aircraft_list: list[dict]) -> None:
     global _current_snapshot
     _current_snapshot = list(aircraft_list)  # copy so worker sees a stable list
 
+    _sweep_cooldown_if_due()
     cfg = _get_config()
 
     device_name = cfg.get("device_name", "").strip()

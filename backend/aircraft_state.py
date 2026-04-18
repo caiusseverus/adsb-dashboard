@@ -2071,6 +2071,12 @@ class AircraftState:
                      if now - ac.last_seen > self._timeout]
             for icao in stale:
                 expired.append(self._aircraft.pop(icao))
+                # Remove auxiliary ICAO-keyed state so it does not accumulate
+                # indefinitely as aircraft churn through the tracked set.
+                self._last_iid_by_icao.pop(icao, None)
+                self._acas_candidates.pop(icao, None)
+                self._last_acas_ts.pop(icao, None)
+                self._readsb_msg_counts.pop(icao, None)
 
             # Prune ICAO filter: evict entries not refreshed within expiry window.
             # Mirrors readsb icaoFilterExpire() which runs every ~60 s.
@@ -2080,6 +2086,17 @@ class AircraftState:
             for k in stale_icaos:
                 del self._confirmed_icaos[k]
 
+            # TTL sweep of ACAS dicts catches entries for ICAOs that were never
+            # tracked (ACAS message before aircraft object was created, or aircraft
+            # that slipped through between expiry cycles).
+            acas_cutoff = now - 120.0  # 4× ACAS_CONFIRM_WINDOW_S; safe beyond any dedup window
+            stale_cands = [k for k, v in self._acas_candidates.items() if v[1] < acas_cutoff]
+            for k in stale_cands:
+                del self._acas_candidates[k]
+            stale_last = [k for k, v in self._last_acas_ts.items() if v[0] < acas_cutoff]
+            for k in stale_last:
+                del self._last_acas_ts[k]
+
             # 60-minute pos_reliable timeout: aircraft silent for an hour gets
             # reliability reset so the next position must re-establish trust.
             for ac in self._aircraft.values():
@@ -2088,6 +2105,21 @@ class AircraftState:
                         ac.pos_reliable_odd  = 0.0
                         ac.pos_reliable_even = 0.0
         return expired
+
+    def get_aux_dict_sizes(self) -> dict:
+        """Return sizes of auxiliary ICAO-keyed dicts for observability."""
+        with self._lock:
+            return {
+                "aircraft":            len(self._aircraft),
+                "last_iid_by_icao":    len(self._last_iid_by_icao),
+                "acas_candidates":     len(self._acas_candidates),
+                "last_acas_ts":        len(self._last_acas_ts),
+                "readsb_msg_counts":   len(self._readsb_msg_counts),
+                "confirmed_icaos":     len(self._confirmed_icaos),
+                "adsbx_queue":         len(self._adsbx_queue),
+                "hexdb_queue":         len(self._hexdb_queue),
+                "sighting_counts_lru": len(self._sighting_counts),
+            }
 
     def drain_all(self) -> list:
         """Remove and return all currently tracked aircraft for visit close-out on shutdown."""

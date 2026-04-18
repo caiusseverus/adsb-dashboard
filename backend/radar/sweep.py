@@ -1039,6 +1039,20 @@ class AircraftPositionTracker:
         # {icao: {"lat", "lon", "groundspeed_kts", "track_deg", "ts"}}
         self._positions: dict[str, dict] = {}
 
+    def prune_stale(self, max_age_s: float = _ADSB_POSITION_MAX_AGE_S * 2) -> int:
+        """Remove entries older than max_age_s. Returns count removed."""
+        cutoff = time.time() - max_age_s
+        with self._lock:
+            stale = [icao for icao, entry in self._positions.items()
+                     if entry["ts"] < cutoff]
+            for icao in stale:
+                del self._positions[icao]
+        return len(stale)
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._positions)
+
     def update(self, icao: str, lat: float, lon: float,
                groundspeed_kts: float | None = None,
                track_deg: float | None = None,
@@ -2060,6 +2074,77 @@ class RadarState:
             self._live_aligned_burst_obs[iid] = deque(maxlen=self._MULTI_SYNC_OBS_MAX)
         if iid not in self._live_burst_timeline_obs:
             self._live_burst_timeline_obs[iid] = deque(maxlen=self._BURST_SYNC_TIMELINE_OBS_MAX)
+
+    _ICAO_STATE_PRUNE_INTERVAL_S = 120.0  # prune at most once every 2 minutes
+    _icao_state_last_prune_ts: float = 0.0
+
+    def _prune_live_icao_state(self, max_icao_age_s: float = 300.0) -> None:
+        """Prune stale per-ICAO entries from per-IID-per-ICAO dicts.
+
+        Called from update_rotation_models() to prevent indefinite growth as
+        aircraft churn through the tracked set.  max_icao_age_s defaults to
+        5 minutes — a generous window that keeps data for any aircraft still
+        transmitting at ~1 Hz.
+        """
+        now = time.time()
+        if now - self._icao_state_last_prune_ts < self._ICAO_STATE_PRUNE_INTERVAL_S:
+            return
+        self._icao_state_last_prune_ts = now
+        icao_quality_cutoff = now - max_icao_age_s
+
+        with self._lock:
+            # _live_icao_sync_quality: {iid: {icao: IcaoSyncQuality}}
+            # IcaoSyncQuality has a last_ts field set each time it is updated.
+            for iid_quality in self._live_icao_sync_quality.values():
+                stale = [icao for icao, q in iid_quality.items()
+                         if q.last_ts < icao_quality_cutoff]
+                for icao in stale:
+                    del iid_quality[icao]
+
+            # _live_last_arrival: {iid: {icao: arrival_us}} (Beast µs, not wall time).
+            # Prune ICAOs absent from _live_icao_sync_quality (already confirmed stale).
+            for iid, last_arr in self._live_last_arrival.items():
+                quality_dict = self._live_icao_sync_quality.get(iid, {})
+                stale = [icao for icao in last_arr if icao not in quality_dict]
+                for icao in stale:
+                    del last_arr[icao]
+
+            # _live_burst_diagnostic_replies: {iid: {icao: [...]}}
+            for iid, burst_map in self._live_burst_diagnostic_replies.items():
+                quality_dict = self._live_icao_sync_quality.get(iid, {})
+                stale = [icao for icao in burst_map if icao not in quality_dict]
+                for icao in stale:
+                    del burst_map[icao]
+
+            # _seen_pair_keys size cap: keys are position+tdoa tuples that grow
+            # monotonically with ICAO churn.  Reset when the set grows large;
+            # within-call dedup via the local copy in generate_calibration_pairs()
+            # still prevents duplicates within a single generation cycle.
+            _SEEN_PAIR_KEYS_MAX = 20_000
+            if len(self._seen_pair_keys) > _SEEN_PAIR_KEYS_MAX:
+                self._seen_pair_keys = set()
+
+        # _adsb_tracker: prune positions older than 2× _ADSB_POSITION_MAX_AGE_S
+        self._adsb_tracker.prune_stale()
+
+    def get_memory_stats(self) -> dict:
+        """Return current sizes of key in-memory structures for observability."""
+        with self._lock:
+            n_icao_quality = sum(len(v) for v in self._live_icao_sync_quality.values())
+            n_last_arrival = sum(len(v) for v in self._live_last_arrival.values())
+            n_live_bursts  = sum(len(v) for v in self._live_bursts.values())
+            return {
+                "models":              len(self._models),
+                "iid_events":          len(self._iid_events),
+                "seen_pair_keys":      len(self._seen_pair_keys),
+                "pending_pairs":       len(self._pending_pairs),
+                "adsb_tracker_positions": self._adsb_tracker.size(),
+                "live_icao_sync_quality_total": n_icao_quality,
+                "live_last_arrival_total":      n_last_arrival,
+                "live_bursts_total":            n_live_bursts,
+                "live_iids":           len(self._live_bursts),
+                "sweep_history_iids":  len(self._sweep_history),
+            }
 
     def _process_fired_bursts(self, iid: int, fired_bursts: list[dict]) -> dict:
         metrics = _new_fired_burst_phase_metrics()
@@ -4888,6 +4973,9 @@ class RadarState:
                     tracker_refresh_s = time.perf_counter() - t_tracker
                 except Exception:
                     pass
+
+            # Periodically prune per-ICAO state to prevent accumulation with ICAO churn.
+            self._prune_live_icao_state()
 
             analysed_models: dict[int, RotationModel] = {}
             t_sweeps = time.perf_counter()

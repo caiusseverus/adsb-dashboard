@@ -347,6 +347,59 @@ async def run_benchmark(fresh: bool = False, n: int = 5000) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Memory stats endpoint
+# ---------------------------------------------------------------------------
+
+@router.get("/memory-stats")
+async def get_memory_stats() -> dict:
+    """Return current sizes of key in-memory structures for leak monitoring.
+
+    Intended for long-run health checks on constrained hardware.  All reads
+    are lock-safe and involve no I/O; the endpoint is safe to poll frequently.
+    """
+    import main as _main_module
+    import cast as _cast_module
+
+    state = _main_module.state
+    radar_state = _main_module.radar_state
+
+    aircraft_stats = await asyncio.to_thread(state.get_aux_dict_sizes)
+    radar_stats = await asyncio.to_thread(radar_state.get_memory_stats)
+
+    with _cast_module._photo_cache_lock:
+        photo_cache_size = len(_cast_module._photo_cache)
+    cooldown_size = len(_cast_module._cooldown)
+    token_size: int
+    with _cast_module._token_lock:
+        token_size = len(_cast_module._tokens)
+
+    route_queue_len: int
+    try:
+        route_queue_len = len(_main_module._route_queue)
+    except AttributeError:
+        route_queue_len = -1
+
+    track_store_size: int
+    try:
+        with _main_module.track_store._lock:
+            track_store_size = len(_main_module.track_store._tracks)
+    except AttributeError:
+        track_store_size = -1
+
+    return {
+        "aircraft_state": aircraft_stats,
+        "radar_state": radar_stats,
+        "cast": {
+            "photo_cache":  photo_cache_size,
+            "cooldown":     cooldown_size,
+            "token_store":  token_size,
+        },
+        "route_queue_len": route_queue_len,
+        "track_store_aircraft_count": track_store_size,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Benchmark status (polled by UI to show running state)
 # ---------------------------------------------------------------------------
 
