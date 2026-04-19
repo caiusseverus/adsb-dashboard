@@ -121,6 +121,15 @@ ROTATION_ANALYSIS_MAX_AGE_S = 120.0   # 2 min ≈ 24–40 rotations — sufficie
 # BurstRecord retention: matches the rotation analysis window so _burst_records
 # always covers the full window used by _analyse_burst_records.
 BURST_RECORD_MAX_AGE_S = ROTATION_ANALYSIS_MAX_AGE_S
+# Hard cap on burst records retained per IID. The bounded deque replaces age-only pruning
+# for hot IIDs. Sized for 2-min window at typical Pi density (12–30 sweeps × ≤20 aircraft).
+# Rotation analysis needs MIN_BURSTS=4 per aircraft with MIN_QUALIFYING_ICAOS=4 → ~16 minimum;
+# 400 gives generous headroom without permitting thousands of records per hot IID.
+_BURST_RECORDS_MAX_PER_IID = 400
+# Hard cap on the global _iid_events deque. Age-based pruning (IID_EVENT_MAX_AGE_S) is the
+# primary bound; this maxlen prevents runaway growth during high-rate DF11 bursts between
+# pruning cycles.
+_IID_EVENTS_MAX = 50_000
 STABLE_REANALYZE_INTERVAL_S = 300.0
 
 # Co-sweep window: two bursts within 70ms are considered one radar sweep
@@ -1923,8 +1932,9 @@ class RadarState:
         self._adsb_tracker = AircraftPositionTracker()
 
         # Long-lived DF11 event deque: (arrival_us, iid, icao, signal_dbfs)
-        # Pruned by age in update_rotation_models()
-        self._iid_events: deque[tuple[float, int, str, float | None]] = deque()
+        # Pruned by age in update_rotation_models(); maxlen caps worst-case growth
+        # between pruning cycles at high DF11 rates (oldest events evicted first).
+        self._iid_events: deque[tuple[float, int, str, float | None]] = deque(maxlen=_IID_EVENTS_MAX)
         self._iid_latest_arrival_us: dict[int, float] = {}
 
         # Per-IID compact burst records: {iid: deque[BurstRecord]}
@@ -2230,9 +2240,11 @@ class RadarState:
             return {
                 "models":              len(self._models),
                 "iid_events":          len(self._iid_events),
+                "iid_events_max":      _IID_EVENTS_MAX,
                 "burst_records_total": n_burst_records,
                 "burst_records_iids":  len(non_empty_burst_counts),
                 "burst_records_max_per_iid": max(burst_record_counts, default=0),
+                "burst_records_cap_per_iid": _BURST_RECORDS_MAX_PER_IID,
                 "burst_records_avg_per_iid": (
                     round(n_burst_records / len(non_empty_burst_counts), 1)
                     if non_empty_burst_counts else 0.0
@@ -2289,7 +2301,7 @@ class RadarState:
             n_replies = fired_burst.get("n_replies", 1)
             trigger_arrival_us = fired_burst.get("trigger_arrival_us", burst_centroid_us)
 
-            self._burst_records.setdefault(iid, deque()).append(BurstRecord(
+            self._burst_records.setdefault(iid, deque(maxlen=_BURST_RECORDS_MAX_PER_IID)).append(BurstRecord(
                 iid=iid,
                 icao=fired_icao,
                 centroid_us=burst_centroid_us,
@@ -4677,7 +4689,7 @@ class RadarState:
             self._live_frames[iid] = None
             self._live_completed_frames[iid] = deque(maxlen=self._LIVE_FRAMES_MAX)
             self._live_frame_counters[iid] = 0
-            self._burst_records.setdefault(iid, deque())
+            self._burst_records.setdefault(iid, deque(maxlen=_BURST_RECORDS_MAX_PER_IID))
         if iid not in self._live_burst_diagnostic_replies:
             self._live_burst_diagnostic_replies[iid] = {}
         if iid not in self._live_aligned_burst_obs:
@@ -4705,7 +4717,7 @@ class RadarState:
             # Emit compact BurstRecord for rotation analysis and sync fitting.
             # Core fields only; enrichment (position, family flags) can be layered
             # on separately if needed by other consumers.
-            self._burst_records.setdefault(iid, deque()).append(BurstRecord(
+            self._burst_records.setdefault(iid, deque(maxlen=_BURST_RECORDS_MAX_PER_IID)).append(BurstRecord(
                 iid=iid,
                 icao=fired_icao,
                 centroid_us=burst_centroid_us,
@@ -5015,12 +5027,16 @@ class RadarState:
             now_ts = time.time()
             with self._lock:
                 t_snapshot = time.perf_counter()
-                # Estimate "now" in µs: prefer latest burst centroid, fall back to _iid_events
+                # Estimate "now" in µs: prefer latest burst centroid, fall back to
+                # _iid_latest_arrival_us (avoids scanning the full _iid_events deque).
                 _latest_burst_us = max(
                     (br_deque[-1].centroid_us for br_deque in self._burst_records.values() if br_deque),
                     default=None,
                 )
-                _latest_event_us = self._iid_events[-1][0] if self._iid_events else None
+                _latest_event_us = (
+                    max(self._iid_latest_arrival_us.values())
+                    if self._iid_latest_arrival_us else None
+                )
                 if _latest_burst_us is None and _latest_event_us is None:
                     return
                 now_us = int(max(filter(None, [_latest_burst_us, _latest_event_us])))
@@ -5091,11 +5107,8 @@ class RadarState:
                     })
                     return
                 analysis_cutoff_us = now_us - int(ROTATION_ANALYSIS_MAX_AGE_S * 1_000_000)
-                # Keep events_snapshot for non-analysis consumers (TDOA pair generation etc.)
-                events_snapshot = [
-                    ev for ev in self._iid_events
-                    if ev[0] >= analysis_cutoff_us and ev[1] in due_iids
-                ]
+                # Lightweight observability count — no need to filter the full deque.
+                event_count = len(self._iid_events)
                 # Build burst record snapshot for rotation analysis
                 by_iid_bursts: dict[int, list] = {}
                 for iid in due_iids:
@@ -5105,7 +5118,7 @@ class RadarState:
                         if relevant:
                             by_iid_bursts[iid] = relevant
 
-            event_count = len(events_snapshot)
+
             if not by_iid_bursts:
                 return
 
@@ -5856,17 +5869,17 @@ class RadarState:
             update_history = list(self._live_period_update_history.get(iid) or [])
             slope_history = list(self._live_slope_history.get(iid) or [])
             period_history = list(self._live_period_history.get(iid) or [])
-            # Snapshot recent individual DF11 arrivals for this IID within the window.
-            # Taken under the same lock so the timestamp basis matches the obs snapshot.
             latest_arrival_us_for_iid = self._iid_latest_arrival_us.get(iid)
             _df11_cutoff_us = (latest_arrival_us_for_iid or 0.0) - window_s * 1_000_000.0
-            iid_events_for_df11: list[tuple[float, int, str, float | None]] = []
-            for _ev in reversed(self._iid_events):
-                if _ev[0] < _df11_cutoff_us:
-                    break
-                if _ev[1] == iid:
-                    iid_events_for_df11.append(_ev)
-            iid_events_for_df11.reverse()
+            # Take a fast deque snapshot under lock; filtering happens outside so the
+            # decoder thread is not blocked while we scan 30k+ elements at Python speed.
+            _iid_events_copy = list(self._iid_events)
+
+        # Filter outside the lock — safe since we operate on an immutable snapshot.
+        iid_events_for_df11 = [
+            _ev for _ev in _iid_events_copy
+            if _ev[0] >= _df11_cutoff_us and _ev[1] == iid
+        ]
 
         if not obs_snapshot or sync is None:
             return {
