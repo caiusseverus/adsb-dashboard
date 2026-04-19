@@ -1748,6 +1748,9 @@ app.include_router(interrogators_router)
 timing_router._state = state  # type: ignore[attr-defined]
 app.include_router(timing_router)
 radar_api._state = radar_state  # type: ignore[attr-defined]
+radar_api.register_radar_core_stats_provider(
+    lambda: (_radar_core_client.stats() if _radar_core_client is not None else {})
+)
 app.include_router(radar_api.router)
 radar_aircraft_api._localiser = aircraft_localiser  # type: ignore[attr-defined]
 radar_aircraft_api._msg_queue = _msg_queue  # type: ignore[attr-defined]

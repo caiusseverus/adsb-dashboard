@@ -38,6 +38,7 @@ log = logging.getLogger(__name__)
 _SEND_QUEUE_MAX = 2000
 # Maximum BURST_FIRED messages to buffer for comparison logging.
 _RECV_LOG_MAX = 10_000
+_SNAPSHOT_INTERVAL_S = 5.0
 
 
 class RadarCoreClient:
@@ -91,6 +92,10 @@ class RadarCoreClient:
         self._connect_attempts = 0
         self._latest_health: Optional[dict] = None
         self._latest_health_ts: Optional[float] = None
+        self._snapshot_req_id = 0
+        self._snapshots_requested = 0
+        self._latest_snapshot: Optional[dict] = None
+        self._latest_snapshot_ts: Optional[float] = None
         self._stats_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -166,6 +171,12 @@ class RadarCoreClient:
                 "latest_health_age_s": (
                     round(time.time() - self._latest_health_ts, 1)
                     if self._latest_health_ts is not None else None
+                ),
+                "snapshots_requested": self._snapshots_requested,
+                "latest_snapshot": self._latest_snapshot,
+                "latest_snapshot_age_s": (
+                    round(time.time() - self._latest_snapshot_ts, 1)
+                    if self._latest_snapshot_ts is not None else None
                 ),
             }
 
@@ -248,12 +259,30 @@ class RadarCoreClient:
 
     def _sender_loop(self) -> None:
         """Drain the send queue and write framed msgpack to the socket."""
+        next_snapshot_ts = time.monotonic() + _SNAPSHOT_INTERVAL_S
         while not self._stop_event.is_set():
             conn = self._ensure_connection()
             if conn is None:
                 time.sleep(self._reconnect_delay_s)
                 continue
             generation, _rfile, wfile = conn
+
+            now_mono = time.monotonic()
+            if now_mono >= next_snapshot_ts:
+                try:
+                    with self._stats_lock:
+                        self._snapshot_req_id += 1
+                        req_id = self._snapshot_req_id
+                    with self._send_lock:
+                        P.write_frame(wfile, P.snapshot_req(req_id=req_id, scope="all"))
+                    with self._stats_lock:
+                        self._snapshots_requested += 1
+                    next_snapshot_ts = now_mono + _SNAPSHOT_INTERVAL_S
+                except OSError as e:
+                    log.warning("RadarCoreClient: snapshot request send error: %s", e)
+                    self._drop_connection(generation)
+                    next_snapshot_ts = time.monotonic() + _SNAPSHOT_INTERVAL_S
+                    continue
 
             try:
                 item = self._send_queue.get(timeout=0.5)
@@ -273,6 +302,7 @@ class RadarCoreClient:
             except OSError as e:
                 log.warning("RadarCoreClient: send error: %s", e)
                 self._drop_connection(generation)
+                next_snapshot_ts = time.monotonic() + _SNAPSHOT_INTERVAL_S
 
     def _receiver_loop(self) -> None:
         """Read BURST_FIRED and other outbound messages from radar-core."""
@@ -338,6 +368,10 @@ class RadarCoreClient:
                     with self._stats_lock:
                         self._callback_errors += 1
                     log.debug("RadarCoreClient: FRAME_READY callback failed", exc_info=True)
+        elif msg_type == P.MSG_SNAPSHOT_RESP:
+            with self._stats_lock:
+                self._latest_snapshot = dict(d.get("pl") or {})
+                self._latest_snapshot_ts = time.time()
         # Other types silently ignored in shadow mode.
 
     @staticmethod

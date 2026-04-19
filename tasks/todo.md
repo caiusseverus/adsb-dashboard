@@ -38,7 +38,41 @@ Plan confirmation: proceed with a bounded time-based retention strategy plus hig
 - Verification:
   - `uv run --directory backend pytest tests/test_radar_sweep.py::test_live_sync_observation_buffers_prune_by_age_with_high_count_caps tests/test_radar_sweep.py::test_get_burst_sync_timeline_includes_non_sync_driving_observations tests/test_radar_sweep.py::test_get_sync_debug_payload_compares_predictor_paths_on_same_observation tests/test_radar_sweep.py::test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change tests/test_radar_api.py::test_get_iid_sync_debug_endpoint_exposes_summary_and_observation tests/test_radar_api.py::test_get_iid_sync_snapshot_endpoint_combines_fast_sync_payloads`
   - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py`
-  - Result: all tests passed (`6 passed` focused, `96 passed` combined suite).
+- Result: all tests passed (`6 passed` focused, `96 passed` combined suite).
+
+## 2026-04-19 Stage 3/4 Live Radar Pipeline Recovery (Go Frames + Sync Debug)
+
+- [x] Trace current Go/Python frame and sync-debug paths end-to-end and identify concrete blocking gates
+- [x] Add Go per-IID frame-accumulator gate diagnostics to radar-core snapshot payloads
+- [x] Add Python/API per-IID pipeline-debug payload combining Go snapshot + Python live state
+- [x] Fix Go reference-selection mismatch that can block frame start (`ref_not_dominant`)
+- [x] Fix Go-frame mode sync bootstrap starvation so `_live_sync_states` can populate from `inject_frame_from_go()`
+- [x] Add focused backend + Go unit coverage for new diagnostics and sync/bootstrap behavior
+- [x] Run targeted verification and document results
+
+### Review
+
+- Root causes addressed:
+  - Go frame start could be starved when Stage-3 reference selection picked a non-dominant ICAO while Stage-4 frame start still required dominant-family acceptance (`ref_not_dominant` gate).
+  - In `RADAR_CORE_FRAMES_ENABLED` mode, Python suppressed local frame finalization and did not bootstrap live sync state from Go `FRAME_READY`, leaving `_live_sync_states` empty and causing sync snapshot/debug payloads to stay empty by design.
+- Implementation:
+  - Go:
+    - Added `Accumulator.Diagnostics()` with per-gate counters/state in [accumulator.go](/home/keith/claude/adsb-dashboard/radar-core/frame/accumulator.go).
+    - Added IID debug snapshot and dominant-family-constrained reference selection in [state.go](/home/keith/claude/adsb-dashboard/radar-core/iid/state.go).
+    - Extended snapshot payload generation with per-IID state + accumulator gates in [main.go](/home/keith/claude/adsb-dashboard/radar-core/cmd/radar-core/main.go).
+  - Python:
+    - Added periodic radar-core snapshot requests and storage in [client.py](/home/keith/claude/adsb-dashboard/backend/radar_core/client.py).
+    - Bootstrapped live sync from Go `FRAME_READY` path and tracked per-IID Go injections in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py).
+    - Added per-IID debug API endpoint `/api/radar/iids/{iid}/pipeline-debug` and radar-core stats provider registration in [api.py](/home/keith/claude/adsb-dashboard/backend/radar/api.py) and [main.py](/home/keith/claude/adsb-dashboard/backend/main.py).
+  - Tests:
+    - Added Go tests in [state_test.go](/home/keith/claude/adsb-dashboard/radar-core/iid/state_test.go).
+    - Added backend tests in [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py), [test_radar_api.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_api.py), and [test_radar_core_client.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_core_client.py).
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_core_client.py tests/test_radar_sweep.py::test_radar_core_frame_injection_populates_fm_mailbox_and_completed_buffer tests/test_radar_sweep.py::test_radar_core_frame_injection_bootstraps_live_sync_state_when_missing tests/test_radar_api.py::test_get_iid_pipeline_debug_combines_python_and_go_diagnostics tests/test_radar_api.py::test_get_iid_pipeline_health_reports_live_sweep_frames`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py`
+  - `python3 -m py_compile backend/radar_core/client.py backend/radar/sweep.py backend/radar/api.py backend/main.py backend/tests/test_radar_core_client.py backend/tests/test_radar_sweep.py backend/tests/test_radar_api.py`
+  - Result: targeted tests passed (`9 passed`), radar sweep/API suites passed (`98 passed`), Python compile checks passed.
+  - Limitation: Go toolchain is unavailable in this environment (`go`/`gofmt` not installed), so Go tests/format checks could not be executed here.
 
 ## 2026-04-19 Radar-Core Integration Rectification
 

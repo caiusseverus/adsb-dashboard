@@ -2276,3 +2276,40 @@ def test_radar_core_frames_enabled_suppresses_python_fm_mailbox_injection():
 
     assert metrics["fm_callback_count"] == 0
     assert state.claim_pending_fm_frames() == []
+
+
+def test_radar_core_frame_injection_bootstraps_live_sync_state_when_missing():
+    state = RadarState()
+    state.enable_radar_core_frames(True)
+    state._models[63] = RadarIID(
+        iid=63,
+        status="SINGLE_RADAR",
+        period_s=4.0,
+        fm_lat=51.0,
+        fm_lon=-1.0,
+    )
+
+    state.inject_frame_from_go({
+        "t": 11,
+        "i": 63,
+        "fi": 4,
+        "p": 4.0,
+        "rc": 0xAAAAAA,
+        "rla": 51.2,
+        "rlo": -1.2,
+        "ra": 500_000.0,
+        "obs": [
+            {"c": 0xBBBBBB, "la": 51.3, "lo": -1.3, "a": 500_500.0, "n": 2, "pa": 0.3},
+            {"c": 0xCCCCCC, "la": 51.4, "lo": -1.4, "a": 501_000.0, "n": 2, "pa": 0.4},
+        ],
+        "q": "marginal",
+    })
+
+    sync = state.get_live_sync_state(63)
+    assert sync is not None
+    assert sync.usable is True
+    assert sync.source == "sweep_frame"
+    debug = state.get_live_pipeline_debug(63)
+    assert debug["sync_state_present"] is True
+    assert debug["go_frames_injected_count"] == 1
+    assert debug["completed_frame_count"] == 1

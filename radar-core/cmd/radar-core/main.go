@@ -14,6 +14,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -209,13 +211,75 @@ func (e *engine) onSnapshotReq(msg *protocol.SnapshotReq) {
 	e.writer.Send(&protocol.SnapshotResp{
 		MsgType: protocol.MsgSnapshotResp,
 		ReqID:   msg.ReqID,
-		Payload: map[string]interface{}{
-			"uptime_s":     time.Since(e.start).Seconds(),
-			"events_in":    e.eventsIn.Load(),
-			"bursts_fired": e.burstsFired.Load(),
-			"active_iids":  len(e.builders),
-		},
+		Payload: e.buildSnapshotPayload(msg.Scope),
 	})
+}
+
+func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
+	payload := map[string]interface{}{
+		"uptime_s":       time.Since(e.start).Seconds(),
+		"events_in":      e.eventsIn.Load(),
+		"bursts_fired":   e.burstsFired.Load(),
+		"frames_emitted": e.framesEmitted.Load(),
+		"active_iids":    len(e.builders),
+	}
+	if scope == "health" {
+		return payload
+	}
+
+	var targetIID *uint8
+	scope = strings.TrimSpace(scope)
+	if strings.HasPrefix(scope, "iid:") {
+		if parsed, err := strconv.Atoi(strings.TrimPrefix(scope, "iid:")); err == nil && parsed >= 0 && parsed <= 255 {
+			v := uint8(parsed)
+			targetIID = &v
+		}
+	}
+
+	iidsPayload := map[string]interface{}{}
+	for iidNum, s := range e.states {
+		if targetIID != nil && iidNum != *targetIID {
+			continue
+		}
+		key := strconv.Itoa(int(iidNum))
+		snap := s.DebugStateSnapshot()
+		iidPayload := map[string]interface{}{
+			"status":             snap.Status,
+			"has_period":         snap.HasPeriod,
+			"period_s":           nil,
+			"has_reference_icao": snap.HasRefICAO,
+			"reference_icao":     nil,
+			"sync_state_present": snap.SyncPresent,
+			"sync_quality":       snap.SyncQuality,
+			"sync_state_usable":  snap.SyncUsable,
+			"sync_holdover":      snap.SyncHoldover,
+			"sync_n_frames":      snap.SyncNSyncFrames,
+		}
+		if snap.HasPeriod {
+			iidPayload["period_s"] = snap.PeriodS
+		}
+		if snap.HasRefICAO {
+			iidPayload["reference_icao"] = snap.RefICAO
+		}
+
+		if acc, ok := e.accumulators[iidNum]; ok {
+			accDiag := acc.Diagnostics()
+			iidPayload["frame_accumulator"] = map[string]interface{}{
+				"completed_frames":      accDiag.FrameIndex,
+				"open_frame":            accDiag.OpenFrame,
+				"open_frame_ref_icao":   accDiag.OpenFrameRefICAO,
+				"open_frame_n_aircraft": accDiag.OpenFrameNAircraft,
+				"open_frame_n_obs":      accDiag.OpenFrameNObs,
+				"last_frame_start_us":   accDiag.LastFrameStartUS,
+				"last_gate_reason":      accDiag.LastGateReason,
+				"last_gate_icao":        accDiag.LastGateICAO,
+				"gate_counts":           accDiag.GateCounts,
+			}
+		}
+		iidsPayload[key] = iidPayload
+	}
+	payload["iids"] = iidsPayload
+	return payload
 }
 
 func (e *engine) onResetIID(msg *protocol.ResetIID) {

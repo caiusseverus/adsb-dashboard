@@ -10,7 +10,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from radar import api as radar_api
-from radar.models import BurstRecord, RadarIID, SweepFrame, SweepFrameObservation
+from radar.models import BurstRecord, RadarIID, ReferenceAircraftInfo, SweepFrame, SweepFrameObservation
 from radar.sweep import AlignedBurstSyncObs, LiveSyncState, RadarState
 
 
@@ -419,6 +419,65 @@ def test_get_iid_pipeline_health_reports_live_sweep_frames():
     assert stages["frames"]["detail"] == "1 frames (1 good)"
     assert stages["scoring"]["status"] == "accumulating"
     assert stages["scoring"]["detail"] == "Airport hypothesis not yet run"
+
+
+def test_get_iid_pipeline_debug_combines_python_and_go_diagnostics():
+    state = RadarState()
+    state._models[7] = RadarIID(
+        iid=7,
+        status="SINGLE_RADAR",
+        period_s=4.0,
+        reference_aircraft=ReferenceAircraftInfo(ref_icao="AAAAAA"),
+    )
+    state._live_burst_timeline_obs[7] = deque([], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+
+    prior_state = radar_api._state
+    prior_provider = radar_api._radar_core_stats_provider
+    radar_api._state = state
+    radar_api.register_radar_core_stats_provider(lambda: {
+        "connected": True,
+        "frames_received": 0,
+        "latest_health": {"fe": 0},
+        "latest_health_age_s": 1.0,
+        "latest_snapshot_age_s": 1.0,
+        "latest_snapshot": {
+            "frames_emitted": 0,
+            "iids": {
+                "7": {
+                    "status": "SINGLE_RADAR",
+                    "has_period": True,
+                    "period_s": 4.0,
+                    "has_reference_icao": True,
+                    "reference_icao": int("AAAAAA", 16),
+                    "sync_state_present": False,
+                    "sync_state_usable": False,
+                    "sync_quality": 0.0,
+                    "frame_accumulator": {
+                        "completed_frames": 0,
+                        "open_frame": False,
+                        "gate_counts": {
+                            "ref_not_dominant": 42,
+                            "frame_emitted": 0,
+                        },
+                    },
+                }
+            },
+        },
+    })
+    try:
+        payload = asyncio.run(radar_api.get_iid_pipeline_debug(7))
+    finally:
+        radar_api._state = prior_state
+        radar_api._radar_core_stats_provider = prior_provider
+
+    assert payload["available"] is True
+    assert payload["python"]["has_period"] is True
+    assert payload["python"]["has_reference_icao"] is True
+    assert payload["python"]["sync_state_present"] is False
+    assert payload["go"]["iid_snapshot_available"] is True
+    assert payload["go"]["frame_ready_seen"] is False
+    assert payload["go"]["dominant_blocking_gate"] == "ref_not_dominant"
+    assert payload["inferred_blocker"] == "go_no_frame_ready"
 
 
 def test_get_iid_sweeps_uses_precomputed_sweep_positions_without_relookup(monkeypatch):

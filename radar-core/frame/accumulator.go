@@ -39,6 +39,19 @@ type liveFrame struct {
 	seenICAOs    map[uint32]struct{}
 }
 
+// DiagnosticsSnapshot is a point-in-time view of frame accumulator gates/state.
+type DiagnosticsSnapshot struct {
+	FrameIndex          uint32
+	OpenFrame           bool
+	OpenFrameRefICAO    uint32
+	OpenFrameNAircraft  int
+	OpenFrameNObs       int
+	LastFrameStartUS    float64
+	LastGateReason      string
+	LastGateICAO        uint32
+	GateCounts          map[string]uint64
+}
+
 // Accumulator manages live frame state for one IID.
 type Accumulator struct {
 	iidNum           uint8
@@ -52,6 +65,8 @@ type Accumulator struct {
 	// Per-ICAO centroid history for phase-family checks.
 	centroidHistory  map[uint32][]float64
 	gateCounts       map[string]uint64
+	lastGateReason   string
+	lastGateICAO     uint32
 }
 
 // New returns an Accumulator for the given IID.
@@ -71,6 +86,8 @@ func (a *Accumulator) Reset() {
 	a.lastFrameStartUS = 0
 	a.centroidHistory = make(map[uint32][]float64)
 	a.gateCounts = make(map[string]uint64)
+	a.lastGateReason = ""
+	a.lastGateICAO = 0
 }
 
 // OnBurst processes one fired burst. state provides the current period,
@@ -345,6 +362,8 @@ func (a *Accumulator) shouldSuppressStart(startUS, periodUS float64) bool {
 
 func (a *Accumulator) recordGate(reason string, icao uint32) {
 	a.gateCounts[reason]++
+	a.lastGateReason = reason
+	a.lastGateICAO = icao
 	count := a.gateCounts[reason]
 	if count == 1 || count%1000 == 0 {
 		slog.Info("radar-core: frame accumulator gate",
@@ -354,6 +373,28 @@ func (a *Accumulator) recordGate(reason string, icao uint32) {
 			"icao", icao,
 		)
 	}
+}
+
+// Diagnostics returns a copy of the current gate counters and frame state.
+// Called from the ingest goroutine (same as OnBurst), so no extra locking is needed.
+func (a *Accumulator) Diagnostics() DiagnosticsSnapshot {
+	diag := DiagnosticsSnapshot{
+		FrameIndex:       a.frameIndex,
+		OpenFrame:        a.frame != nil,
+		LastFrameStartUS: a.lastFrameStartUS,
+		LastGateReason:   a.lastGateReason,
+		LastGateICAO:     a.lastGateICAO,
+		GateCounts:       make(map[string]uint64, len(a.gateCounts)),
+	}
+	if a.frame != nil {
+		diag.OpenFrameRefICAO = a.frame.refICAO
+		diag.OpenFrameNAircraft = a.frame.nAircraft
+		diag.OpenFrameNObs = len(a.frame.observations)
+	}
+	for k, v := range a.gateCounts {
+		diag.GateCounts[k] = v
+	}
+	return diag
 }
 
 // --- small helpers ---

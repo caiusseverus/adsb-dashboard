@@ -1934,6 +1934,7 @@ class RadarState:
         self._radar_core_frames_enabled: bool = False
         self._radar_core_frames_injected: int = 0
         self._radar_core_frame_inject_errors: int = 0
+        self._radar_core_frames_injected_by_iid: dict[int, int] = {}
 
         # Lightweight ADS-B position tracker for real-time position capture
         self._adsb_tracker = AircraftPositionTracker()
@@ -2334,6 +2335,7 @@ class RadarState:
                 "radar_core_frames_enabled": self._radar_core_frames_enabled,
                 "radar_core_frames_injected": self._radar_core_frames_injected,
                 "radar_core_frame_inject_errors": self._radar_core_frame_inject_errors,
+                "radar_core_frames_injected_iids": len(self._radar_core_frames_injected_by_iid),
             }
 
     def _process_fired_bursts(self, iid: int, fired_bursts: list[dict]) -> dict:
@@ -3056,6 +3058,38 @@ class RadarState:
             )
             buf.append(frame)
             self._radar_core_frames_injected += 1
+            self._radar_core_frames_injected_by_iid[iid] = (
+                self._radar_core_frames_injected_by_iid.get(iid, 0) + 1
+            )
+
+            # In radar-core frame mode, Python no longer runs _finalize_live_frame(),
+            # so seed sync bootstrap here using the same first-frame criteria.
+            n_aircraft = 1 + len(obs_list)
+            if n_aircraft >= 3 and self._live_sync_states.get(iid) is None:
+                model = self._models.get(iid)
+                if model is not None:
+                    radar_pos = _get_authoritative_radar_position(model)
+                    if (
+                        radar_pos["lat"] is not None
+                        and frame.ref_lat is not None
+                        and frame.ref_lon is not None
+                    ):
+                        sync_quality = _sync_quality_from_model(model)
+                        ref_bearing = _bearing_deg_simple(
+                            radar_pos["lat"], radar_pos["lon"],
+                            frame.ref_lat, frame.ref_lon,
+                        )
+                        self._update_live_sync_state_filtered(
+                            iid=iid,
+                            period_s=period_s,
+                            new_epoch_us=ref_arrival_us,
+                            new_offset_deg=ref_bearing,
+                            sync_quality=sync_quality,
+                            n_aircraft=n_aircraft,
+                            # FRAME_READY does not currently include explicit ref pos age.
+                            # Use 0 as the operationally safe upper bound for bootstrap gating.
+                            ref_pos_age_s=0.0,
+                        )
         except Exception:
             self._radar_core_frame_inject_errors += 1
             log.debug("RadarState: malformed radar-core FRAME_READY ignored", exc_info=True)
@@ -5569,6 +5603,9 @@ class RadarState:
             if iid in self._native_burst_processors:
                 del self._native_burst_processors[iid]
                 had_any = True
+            if iid in self._radar_core_frames_injected_by_iid:
+                del self._radar_core_frames_injected_by_iid[iid]
+                had_any = True
             if self._iid_events:
                 filtered_events = deque(
                     (ev for ev in self._iid_events if ev[1] != iid),
@@ -5643,6 +5680,7 @@ class RadarState:
             self._live_detection_buffer.clear()
             self._native_burst_processors.clear()
             self._dwell_profiles.clear()
+            self._radar_core_frames_injected_by_iid.clear()
             with self._fm_mailbox_lock:
                 self._fm_mailbox.clear()
                 self._fm_mailbox_event.clear()
@@ -8288,6 +8326,74 @@ class RadarState:
             "n_good": n_good,
             "n_marginal": n_marginal,
             "n_usable": n_good + n_marginal,
+        }
+
+    def get_live_pipeline_debug(self, iid: int) -> dict:
+        """Compact per-IID live pipeline diagnostics for frame/sync debugging."""
+        with self._lock:
+            model = self._models.get(iid)
+            sync = self._live_sync_states.get(iid)
+            open_frame = self._live_frames.get(iid)
+            timeline_obs = list(self._live_burst_timeline_obs.get(iid, []))
+            aligned_obs = list(self._live_aligned_burst_obs.get(iid, []))
+            completed = list(self._live_completed_frames.get(iid, []))
+            go_injected = self._radar_core_frames_injected_by_iid.get(iid, 0)
+            latest_arrival_us = self._iid_latest_arrival_us.get(iid)
+
+        has_period = bool(model is not None and model.period_s is not None)
+        reference_icao = None
+        if model is not None and model.reference_aircraft is not None:
+            reference_icao = model.reference_aircraft.ref_icao
+        if reference_icao is None and model is not None and model.reference_aircraft_override is not None:
+            reference_icao = model.reference_aircraft_override
+        has_reference_icao = bool(reference_icao)
+
+        open_frame_n_aircraft = 0
+        open_frame_ref_icao = None
+        if open_frame is not None:
+            open_frame_ref_icao = open_frame.ref_icao
+            open_frame_n_aircraft = 1 + len(getattr(open_frame, "observations", []))
+
+        timeline_count = len(timeline_obs)
+        aligned_count = len(aligned_obs)
+        completed_count = len(completed)
+        sync_state_present = sync is not None
+        sync_state_usable = bool(sync is not None and sync.usable)
+        snapshot_observations_count = 0
+        if sync_state_present:
+            snapshot_observations_count = timeline_count if timeline_count > 0 else aligned_count
+
+        if not sync_state_present:
+            snapshot_empty_reason = "sync_state_absent"
+        elif (timeline_count + aligned_count) <= 0:
+            snapshot_empty_reason = "no_timeline_or_aligned_observations"
+        else:
+            snapshot_empty_reason = None
+
+        return {
+            "iid": iid,
+            "rotation_status": model.status if model is not None else None,
+            "period_s": model.period_s if model is not None else None,
+            "has_period": has_period,
+            "reference_icao": reference_icao,
+            "has_reference_icao": has_reference_icao,
+            "sync_state_present": sync_state_present,
+            "sync_state_usable": sync_state_usable,
+            "sync_state_source": sync.source if sync is not None else None,
+            "sync_quality": sync.sync_quality if sync is not None else None,
+            "open_frame": open_frame is not None,
+            "open_frame_ref_icao": open_frame_ref_icao,
+            "open_frame_n_aircraft": open_frame_n_aircraft,
+            "timeline_observation_count": timeline_count,
+            "aligned_observation_count": aligned_count,
+            "completed_frame_count": completed_count,
+            "go_frames_injected_count": go_injected,
+            "go_frames_enabled": self._radar_core_frames_enabled,
+            "go_frames_injected_total": self._radar_core_frames_injected,
+            "go_frame_inject_errors_total": self._radar_core_frame_inject_errors,
+            "latest_arrival_us": latest_arrival_us,
+            "sync_snapshot_observations_count": snapshot_observations_count,
+            "sync_snapshot_empty_reason": snapshot_empty_reason,
         }
 
     def reset_forward_model(self, iid: int) -> bool:

@@ -55,6 +55,20 @@ type IIDState struct {
 	Sync    *SyncState
 }
 
+// DebugSnapshot is a point-in-time operational view of one IID.
+type DebugSnapshot struct {
+	Status          string
+	HasPeriod       bool
+	PeriodS         float64
+	HasRefICAO      bool
+	RefICAO         uint32
+	SyncPresent     bool
+	SyncQuality     float64
+	SyncUsable      bool
+	SyncHoldover    bool
+	SyncNSyncFrames int
+}
+
 // NewIIDState creates an IIDState for the given IID.
 func NewIIDState(iid uint8) *IIDState {
 	return &IIDState{
@@ -150,9 +164,33 @@ func (s *IIDState) RefreshReference(records []BurstRecord, nowUS float64) {
 	if s.RefICAO != nil {
 		cur = *s.RefICAO
 	}
-	chosen := SelectReference(records, *s.PeriodS, cur, nowUS)
+
+	// Keep reference selection aligned with Stage-4 frame gating:
+	// frames only open when the reference is in the dominant family.
+	filtered := records
+	if s.LastRotationModel != nil && s.LastRotationModel.Family != nil && len(s.LastRotationModel.Family.FoldedICAOs) > 0 {
+		folded := s.LastRotationModel.Family.FoldedICAOs
+		filtered = make([]BurstRecord, 0, len(records))
+		for _, r := range records {
+			if _, ok := folded[r.ICAO]; ok {
+				filtered = append(filtered, r)
+			}
+		}
+		if _, ok := folded[cur]; !ok {
+			cur = 0
+		}
+	}
+
+	chosen := SelectReference(filtered, *s.PeriodS, cur, nowUS)
 	if chosen != 0 {
 		s.RefICAO = &chosen
+		return
+	}
+	// If no dominant-family candidate is available, clear the reference so
+	// downstream gates expose "no_reference" rather than a permanently
+	// non-dominant reference that can never open frames.
+	if len(filtered) == 0 {
+		s.RefICAO = nil
 	}
 }
 
@@ -204,6 +242,31 @@ func (s *IIDState) Snapshot() (status string, periodS *float64, rpm *float64, su
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.Status, s.PeriodS, s.RPM, s.PrimarySupport
+}
+
+// DebugStateSnapshot returns current Stage-2/3 state for observability payloads.
+func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := DebugSnapshot{
+		Status: s.Status,
+	}
+	if s.PeriodS != nil {
+		out.HasPeriod = true
+		out.PeriodS = *s.PeriodS
+	}
+	if s.RefICAO != nil {
+		out.HasRefICAO = true
+		out.RefICAO = *s.RefICAO
+	}
+	if s.Sync != nil {
+		out.SyncPresent = true
+		out.SyncQuality = s.Sync.SyncQuality
+		out.SyncHoldover = s.Sync.Holdover
+		out.SyncNSyncFrames = s.Sync.NSyncFrames
+		out.SyncUsable = s.Sync.SyncQuality >= 0.3 && !s.Sync.Holdover
+	}
+	return out
 }
 
 // --- reinforcement logic (ported from _reinforce_radar_characteristics) ---

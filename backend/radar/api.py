@@ -13,7 +13,7 @@ import math
 import time
 from collections import deque
 from types import SimpleNamespace
-from typing import Optional, TYPE_CHECKING
+from typing import Callable, Optional, TYPE_CHECKING
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
@@ -34,11 +34,18 @@ router = APIRouter(prefix="/api/radar", tags=["radar"])
 
 # Populated by main.py after instantiation
 _state: Optional["RadarState"] = None
+_radar_core_stats_provider: Optional[Callable[[], dict]] = None
 
 # Shared ForwardModel instance — airports are loaded once and cached.
 # Imported lazily so the module can load without scipy installed.
 _fm: Optional[object] = None
 api_timings: deque[dict] = deque(maxlen=400)
+
+
+def register_radar_core_stats_provider(provider: Callable[[], dict]) -> None:
+    """Injected by main.py so radar endpoints can include live radar-core stats."""
+    global _radar_core_stats_provider
+    _radar_core_stats_provider = provider
 
 
 def _record_api_timing(endpoint: str, started_at: float) -> None:
@@ -3128,6 +3135,83 @@ async def get_iid_pipeline_health(iid: int):
         return {"iid": iid, **_state.get_pipeline_health(iid, sweep_frames=lightweight_frames)}
     finally:
         _record_api_timing("iid_pipeline_health", t0)
+
+
+@router.get("/iids/{iid}/pipeline-debug")
+async def get_iid_pipeline_debug(iid: int):
+    """Detailed Stage 3/4 live radar diagnostics for one IID."""
+    t0 = time.perf_counter()
+    try:
+        if _state is None:
+            return {"iid": iid, "available": False, "reason": "radar module not initialised"}
+
+        python_debug = _state.get_live_pipeline_debug(iid)
+
+        radar_core_stats = _radar_core_stats_provider() if _radar_core_stats_provider is not None else {}
+        latest_health = radar_core_stats.get("latest_health") or {}
+        latest_snapshot = radar_core_stats.get("latest_snapshot") or {}
+        go_iids = latest_snapshot.get("iids") or {}
+        go_iid = go_iids.get(str(iid))
+        if go_iid is None:
+            go_iid = go_iids.get(iid)
+
+        go_frame = (go_iid or {}).get("frame_accumulator") or {}
+        go_gate_counts = go_frame.get("gate_counts") or {}
+        go_frames_emitted_total = latest_snapshot.get("frames_emitted", latest_health.get("fe"))
+        python_frames_received = radar_core_stats.get("frames_received")
+        go_iid_completed = go_frame.get("completed_frames", 0)
+        frame_ready_seen = bool((python_frames_received or 0) > 0 or go_iid_completed > 0)
+
+        dominant_blocking_gate = None
+        if not frame_ready_seen and go_gate_counts:
+            non_emit = {
+                key: int(value)
+                for key, value in go_gate_counts.items()
+                if key != "frame_emitted"
+            }
+            if non_emit:
+                dominant_blocking_gate = max(non_emit.items(), key=lambda item: item[1])[0]
+
+        return {
+            "iid": iid,
+            "available": True,
+            "python": python_debug,
+            "go": {
+                "client_connected": bool(radar_core_stats.get("connected", False)),
+                "frames_received_by_python": python_frames_received,
+                "frames_emitted_total": go_frames_emitted_total,
+                "frame_ready_seen": frame_ready_seen,
+                "latest_health_age_s": radar_core_stats.get("latest_health_age_s"),
+                "latest_snapshot_age_s": radar_core_stats.get("latest_snapshot_age_s"),
+                "iid_snapshot_available": go_iid is not None,
+                "iid_state": {
+                    "status": (go_iid or {}).get("status"),
+                    "has_period": bool((go_iid or {}).get("has_period", False)),
+                    "period_s": (go_iid or {}).get("period_s"),
+                    "has_reference_icao": bool((go_iid or {}).get("has_reference_icao", False)),
+                    "reference_icao": (go_iid or {}).get("reference_icao"),
+                    "sync_state_present": bool((go_iid or {}).get("sync_state_present", False)),
+                    "sync_state_usable": bool((go_iid or {}).get("sync_state_usable", False)),
+                    "sync_quality": (go_iid or {}).get("sync_quality"),
+                },
+                "frame_accumulator": go_frame,
+                "dominant_blocking_gate": dominant_blocking_gate,
+            },
+            "inferred_blocker": (
+                "go_iid_snapshot_unavailable" if go_iid is None else
+                "go_missing_period" if not (go_iid or {}).get("has_period") else
+                "go_missing_reference_icao" if not (go_iid or {}).get("has_reference_icao") else
+                "go_no_frame_ready" if not frame_ready_seen else
+                "python_sync_state_absent" if not python_debug.get("sync_state_present") else
+                "python_sync_snapshot_empty" if (
+                    python_debug.get("sync_state_present")
+                    and python_debug.get("sync_snapshot_observations_count", 0) <= 0
+                ) else
+                None
+            ),
+        }
+    finally:
+        _record_api_timing("iid_pipeline_debug", t0)
 
 
 @router.get("/iids/pipeline-health")

@@ -115,6 +115,18 @@ def test_radar_core_client_frame_ready_callback_and_stats():
     assert client.stats()["frames_received"] == 1
 
 
+def test_radar_core_client_records_snapshot_response_in_stats():
+    client = RadarCoreClient("/tmp/unused-radar-core.sock")
+    client._handle_outbound({
+        "t": P.MSG_SNAPSHOT_RESP,
+        "r": 9,
+        "pl": {"frames_emitted": 3, "iids": {"7": {"has_period": True}}},
+    })
+    stats = client.stats()
+    assert stats["latest_snapshot"]["frames_emitted"] == 3
+    assert stats["latest_snapshot"]["iids"]["7"]["has_period"] is True
+
+
 def test_positions_snapshot_exposes_live_radar_core_forwarding_fields():
     state = AircraftState()
     now = time.time()
