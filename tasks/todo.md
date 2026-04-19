@@ -8,6 +8,38 @@ Source inputs:
 Prepared: 2026-04-04
 Updated: 2026-04-06
 
+## 2026-04-19 Live Sync/Alignment Retention Truncation Fix
+
+- [x] Confirm root cause in live sync/alignment buffers and request window mismatch
+- [x] Implement time-window-first retention with high safety caps for `_live_aligned_burst_obs` and `_live_burst_timeline_obs`
+- [x] Add per-IID retention diagnostics (counts, oldest/newest burst timestamp, effective duration)
+- [x] Expose diagnostics through live sync timeline/snapshot/debug payloads
+- [x] Add focused backend tests for retention behavior and diagnostics fields
+- [x] Run targeted backend verification and document results
+
+Plan confirmation: proceed with a bounded time-based retention strategy plus high count caps, preserving existing sync math/diagnostics paths while ensuring requested 60–90s windows are genuinely retainable at operational burst rates.
+
+### Review
+
+- Root cause:
+  - Confirmed `_live_aligned_burst_obs` and `_live_burst_timeline_obs` were both bounded to `200` entries (`_MULTI_SYNC_OBS_MAX` / `_BURST_SYNC_TIMELINE_OBS_MAX`), so retention was effectively count-limited rather than time-window-limited.
+  - Timeline/debug/snapshot payloads filter by requested `window_s` (60/90/etc) but can only return what remains in those deques, so larger requests could not be satisfied when burst rates were high.
+- Implementation:
+  - Updated [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) to use a time-first strategy with safety caps:
+    - `self._LIVE_SYNC_OBS_RETENTION_S = 360.0`
+    - `self._MULTI_SYNC_OBS_MAX = 6_000`
+    - `self._BURST_SYNC_TIMELINE_OBS_MAX = 8_000`
+  - Added active pruning on append for both buffers via `_prune_live_sync_observation_buffer(...)`.
+  - Added per-IID retention diagnostics (`count`, `oldest_burst_centroid_us`, `newest_burst_centroid_us`, `retained_duration_s`, cap) and exposed them in:
+    - `get_burst_sync_timeline(...)`
+    - `get_live_sync_snapshot(...)`
+    - `get_sync_debug_payload(...)` (top-level and summary)
+  - Added/updated focused tests in [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) and [test_radar_api.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_api.py) for pruning behavior and payload diagnostics.
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_sweep.py::test_live_sync_observation_buffers_prune_by_age_with_high_count_caps tests/test_radar_sweep.py::test_get_burst_sync_timeline_includes_non_sync_driving_observations tests/test_radar_sweep.py::test_get_sync_debug_payload_compares_predictor_paths_on_same_observation tests/test_radar_sweep.py::test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change tests/test_radar_api.py::test_get_iid_sync_debug_endpoint_exposes_summary_and_observation tests/test_radar_api.py::test_get_iid_sync_snapshot_endpoint_combines_fast_sync_payloads`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py`
+  - Result: all tests passed (`6 passed` focused, `96 passed` combined suite).
+
 ## 2026-04-19 Radar-Core Integration Rectification
 
 - [x] Refactor `RadarCoreClient` to maintain one shared bidirectional Unix socket for send and receive, with coordinated reconnect and non-blocking enqueue semantics

@@ -2016,16 +2016,23 @@ class RadarState:
         # Per-IID rolling buffer of aligned burst observations for multi-aircraft sync.
         # Each entry is one dominant-family burst with a known ADS-B position and
         # pre-computed geometric bearing.  Used by _update_multi_aircraft_sync_state().
-        # 200 entries per IID ≈ ~50 rotations at 4 aircraft/rotation — sufficient window.
-        self._MULTI_SYNC_OBS_MAX = 200
+        # Retention is time-window-first: keep enough depth to satisfy the largest
+        # supported sync window requests under normal burst rates, then bound memory
+        # with a high count cap.
+        # API/websocket window_s allows up to 300s; keep 6 minutes in-memory so
+        # 300s windows survive normal burst-rate variation and reconnect jitter.
+        self._LIVE_SYNC_OBS_RETENTION_S = 360.0
+        # Hard caps remain as safety bounds.  Sized for ~8–15 burst observations/s
+        # with retention headroom while avoiding unbounded growth.
+        self._MULTI_SYNC_OBS_MAX = 6_000
         self._live_aligned_burst_obs: dict[int, deque] = {}  # {iid: deque[AlignedBurstSyncObs]}
         # Per-IID burst observation buffer for UI timeline rendering. This is broader
         # than _live_aligned_burst_obs: it includes all burst-centre observations that
         # can be compared against the maintained sync model, even when they are not
         # eligible to steer sync updates.
-        # Reduced from 2000: bearing-rate estimation (motion comp) needs ~60s of history per
-        # aircraft; 200 entries covers this at operational density without accumulating UI history.
-        self._BURST_SYNC_TIMELINE_OBS_MAX = 200
+        # Keep a higher cap than sync-maintenance so 60–300s timeline/debug windows
+        # remain populated at real traffic rates.
+        self._BURST_SYNC_TIMELINE_OBS_MAX = 8_000
         self._live_burst_timeline_obs: dict[int, deque] = {}  # {iid: deque[AlignedBurstSyncObs]}
         # Bounded buffer of recent Stage 3-usable live detections.
         # One entry per fired burst; Stage 3 solver queries with max_age_s=30.
@@ -2240,6 +2247,60 @@ class RadarState:
 
         # _adsb_tracker: prune positions older than 2× _ADSB_POSITION_MAX_AGE_S
         self._adsb_tracker.prune_stale()
+
+    def _prune_live_sync_observation_buffer(self, obs_buf: deque, *, now_ts: float) -> None:
+        """Apply time-first retention to one live sync observation buffer."""
+        cutoff_ts = now_ts - self._LIVE_SYNC_OBS_RETENTION_S
+        while obs_buf and getattr(obs_buf[0], "ts", now_ts) < cutoff_ts:
+            obs_buf.popleft()
+        # Safety bound for deques that may have been reconstructed without maxlen.
+        max_entries = obs_buf.maxlen
+        if max_entries is not None and max_entries > 0:
+            while len(obs_buf) > max_entries:
+                obs_buf.popleft()
+
+    @staticmethod
+    def _summarise_live_sync_observation_buffer(obs_snapshot: list[AlignedBurstSyncObs], max_entries: int) -> dict:
+        """Return count/span diagnostics for one retained observation deque snapshot."""
+        count = len(obs_snapshot)
+        if count <= 0:
+            return {
+                "count": 0,
+                "max_entries": max_entries,
+                "oldest_burst_centroid_us": None,
+                "newest_burst_centroid_us": None,
+                "retained_duration_s": 0.0,
+            }
+        oldest_us = float(getattr(obs_snapshot[0], "burst_centroid_us", 0.0))
+        newest_us = float(getattr(obs_snapshot[-1], "burst_centroid_us", oldest_us))
+        retained_duration_s = max(0.0, (newest_us - oldest_us) / 1_000_000.0)
+        return {
+            "count": count,
+            "max_entries": max_entries,
+            "oldest_burst_centroid_us": oldest_us,
+            "newest_burst_centroid_us": newest_us,
+            "retained_duration_s": retained_duration_s,
+        }
+
+    def _build_live_sync_retention_diagnostics(
+        self,
+        iid: int,
+        aligned_snapshot: list[AlignedBurstSyncObs],
+        timeline_snapshot: list[AlignedBurstSyncObs],
+    ) -> dict:
+        """Per-IID retention diagnostics for live sync/alignment observation buffers."""
+        return {
+            "iid": iid,
+            "retention_target_s": self._LIVE_SYNC_OBS_RETENTION_S,
+            "aligned": self._summarise_live_sync_observation_buffer(
+                aligned_snapshot,
+                self._MULTI_SYNC_OBS_MAX,
+            ),
+            "timeline": self._summarise_live_sync_observation_buffer(
+                timeline_snapshot,
+                self._BURST_SYNC_TIMELINE_OBS_MAX,
+            ),
+        }
 
     def get_memory_stats(self) -> dict:
         """Return current sizes of key in-memory structures for observability."""
@@ -3336,6 +3397,7 @@ class RadarState:
             motion_comp_block_reason=motion_block_reason,
         )
         obs_buf.append(obs)
+        self._prune_live_sync_observation_buffer(obs_buf, now_ts=obs.ts)
 
         # Drive sync update — throttled per IID so repeated bursts do not trigger
         # a rolling fit on every single arrival.  Observations keep accumulating
@@ -3450,6 +3512,7 @@ class RadarState:
             truth_position_ts_beast_us=truth_position_ts_beast_us,
         )
         timeline_buf.append(obs)
+        self._prune_live_sync_observation_buffer(timeline_buf, now_ts=obs.ts)
 
     @staticmethod
     def _score_sync_burst_observation(obs: AlignedBurstSyncObs) -> float:
@@ -5955,9 +6018,13 @@ class RadarState:
         """
         with self._lock:
             sync = self._live_sync_states.get(iid)
-            obs_buf = self._live_burst_timeline_obs.get(iid)
+            timeline_obs_buf = self._live_burst_timeline_obs.get(iid)
+            aligned_obs_buf = self._live_aligned_burst_obs.get(iid)
+            timeline_obs_snapshot = list(timeline_obs_buf) if timeline_obs_buf else []
+            aligned_obs_snapshot = list(aligned_obs_buf) if aligned_obs_buf else []
+            obs_buf = timeline_obs_buf
             if obs_buf is None:
-                obs_buf = self._live_aligned_burst_obs.get(iid)
+                obs_buf = aligned_obs_buf
             obs_snapshot = list(obs_buf) if obs_buf else []
             waveform_bins = list(self._live_waveform_bins.get(iid) or [])
             icao_quality = dict(self._live_icao_sync_quality.get(iid) or {})
@@ -5969,6 +6036,12 @@ class RadarState:
             # Take a fast deque snapshot under lock; filtering happens outside so the
             # decoder thread is not blocked while we scan 30k+ elements at Python speed.
             _iid_events_copy = list(self._iid_events)
+
+        retention_diagnostics = self._build_live_sync_retention_diagnostics(
+            iid,
+            aligned_snapshot=aligned_obs_snapshot,
+            timeline_snapshot=timeline_obs_snapshot,
+        )
 
         # Filter outside the lock — safe since we operate on an immutable snapshot.
         iid_events_for_df11 = [
@@ -5991,6 +6064,7 @@ class RadarState:
                 # No sync state → no authoritative residuals possible.
                 "df11_residual_observations": [],
                 "chart_overlay_consistent": False,
+                "retention_diagnostics": retention_diagnostics,
             }
 
         now_ts = time.time()
@@ -6232,6 +6306,7 @@ class RadarState:
             # They are directly comparable on the residual chart.
             "df11_residual_observations": df11_residual_observations,
             "chart_overlay_consistent": True,
+            "retention_diagnostics": retention_diagnostics,
         }
 
     def get_live_sync_snapshot(self, iid: int, window_s: float = 90.0, debug_limit: int = 120) -> dict:
@@ -6343,6 +6418,7 @@ class RadarState:
             "phase_anchor_candidates": burst_timeline.get("phase_anchor_candidates", []),
             "motion_comp_summary": burst_timeline.get("motion_comp_summary"),
             "sync_debug": compact_sync_debug,
+            "retention_diagnostics": burst_timeline.get("retention_diagnostics"),
             "transport": {
                 "source": "shared_snapshot",
                 "cached": False,
@@ -6363,13 +6439,23 @@ class RadarState:
         """
         with self._lock:
             sync = self._live_sync_states.get(iid)
-            obs_buf = self._live_burst_timeline_obs.get(iid)
+            timeline_obs_buf = self._live_burst_timeline_obs.get(iid)
+            aligned_obs_buf = self._live_aligned_burst_obs.get(iid)
+            timeline_obs_snapshot = list(timeline_obs_buf) if timeline_obs_buf else []
+            aligned_obs_snapshot = list(aligned_obs_buf) if aligned_obs_buf else []
+            obs_buf = timeline_obs_buf
             if obs_buf is None:
-                obs_buf = self._live_aligned_burst_obs.get(iid)
+                obs_buf = aligned_obs_buf
             obs_snapshot = list(obs_buf) if obs_buf else []
             waveform_bins = list(self._live_waveform_bins.get(iid) or [])
             icao_quality = dict(self._live_icao_sync_quality.get(iid) or {})
             latest_arrival_beast_us = self._iid_latest_arrival_us.get(iid)
+
+        retention_diagnostics = self._build_live_sync_retention_diagnostics(
+            iid,
+            aligned_snapshot=aligned_obs_snapshot,
+            timeline_snapshot=timeline_obs_snapshot,
+        )
 
         if sync is None:
             return {
@@ -6380,7 +6466,9 @@ class RadarState:
                 "summary": {
                     "iid": iid,
                     "wall_clock_used_operationally": False,
+                    "retention_diagnostics": retention_diagnostics,
                 },
+                "retention_diagnostics": retention_diagnostics,
             }
 
         now_ts = time.time()
@@ -7246,6 +7334,7 @@ class RadarState:
                 "spread_strongest_by": observation_model_diagnostics["spread_strongest_by"],
                 "likely_contributors": likely_contributors,
             },
+            "retention_diagnostics": retention_diagnostics,
         }
 
         return {
@@ -7255,6 +7344,7 @@ class RadarState:
             "summary": summary,
             "observations": observations,
             "observation_model_diagnostics": observation_model_diagnostics,
+            "retention_diagnostics": retention_diagnostics,
         }
 
     def get_dwell_profile(self, iid: int, icao: str, sweep_idx: int | None = None) -> list[dict]:

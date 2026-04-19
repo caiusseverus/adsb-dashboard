@@ -162,6 +162,8 @@ def test_get_iid_sync_debug_endpoint_exposes_summary_and_observation(monkeypatch
         "mixed",
     }
     assert payload["summary"]["operational_burst_timestamp_method"] is not None
+    assert payload["retention_diagnostics"]["timeline"]["count"] == 1
+    assert payload["summary"]["retention_diagnostics"]["timeline"]["count"] == 1
 
 
 def test_get_iid_sync_snapshot_endpoint_combines_fast_sync_payloads(monkeypatch):
@@ -213,6 +215,7 @@ def test_get_iid_sync_snapshot_endpoint_combines_fast_sync_payloads(monkeypatch)
     assert "sync_state" in payload
     assert "sync_debug" in payload
     assert payload["sync_debug"]["summary"]["operational_time_basis"] == "effective_beast_us"
+    assert payload["retention_diagnostics"]["timeline"]["count"] == 1
 
 
 def test_get_iid_timeline_marks_non_primary_family_points_as_residual():

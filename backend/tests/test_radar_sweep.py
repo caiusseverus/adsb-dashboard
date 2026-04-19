@@ -443,6 +443,67 @@ def test_get_burst_sync_timeline_includes_non_sync_driving_observations():
     assert "fit_eligible" in observations[1]
     assert "predicted_corrected_deg" in observations[1]
     assert timeline["predictor_consistency"] is not None
+    retention = timeline["retention_diagnostics"]
+    assert retention["iid"] == 7
+    assert retention["retention_target_s"] >= 300.0
+    assert retention["aligned"]["count"] == 0
+    assert retention["timeline"]["count"] == 2
+    assert retention["timeline"]["oldest_burst_centroid_us"] == pytest.approx(4_100_000.0)
+    assert retention["timeline"]["newest_burst_centroid_us"] == pytest.approx(8_200_000.0)
+    assert retention["timeline"]["retained_duration_s"] == pytest.approx(4.1)
+
+
+def test_live_sync_observation_buffers_prune_by_age_with_high_count_caps(monkeypatch):
+    state = RadarState()
+    assert state._MULTI_SYNC_OBS_MAX > 200
+    assert state._BURST_SYNC_TIMELINE_OBS_MAX > 200
+    state._LIVE_SYNC_OBS_RETENTION_S = 90.0
+
+    now = {"ts": 1_000.0}
+    monkeypatch.setattr("radar.sweep.time.time", lambda: now["ts"])
+
+    samples = [
+        (900.0, 4_000_000.0),
+        (930.0, 7_000_000.0),
+        (1_000.0, 11_000_000.0),
+    ]
+    for wall_ts, burst_us in samples:
+        now["ts"] = wall_ts
+        state._record_aligned_burst_sync_obs(
+            iid=11,
+            icao="AAAAAA",
+            burst_centroid_us=burst_us,
+            radar_lat=51.0,
+            radar_lon=-0.1,
+            aircraft_lat=51.2,
+            aircraft_lon=0.0,
+            n_replies=4,
+            signal_dbfs=-14.0,
+            pos_age_s=0.4,
+            period_s=0.0,
+        )
+        state._record_burst_sync_timeline_obs(
+            iid=11,
+            icao="AAAAAA",
+            burst_centroid_us=burst_us,
+            radar_lat=51.0,
+            radar_lon=-0.1,
+            aircraft_lat=51.2,
+            aircraft_lon=0.0,
+            n_replies=4,
+            signal_dbfs=-14.0,
+            pos_age_s=0.4,
+            sync_update_eligible=True,
+        )
+
+    aligned = list(state._live_aligned_burst_obs[11])
+    timeline = list(state._live_burst_timeline_obs[11])
+    assert len(aligned) == 2
+    assert len(timeline) == 2
+    assert aligned[0].burst_centroid_us == pytest.approx(7_000_000.0)
+    assert timeline[0].burst_centroid_us == pytest.approx(7_000_000.0)
+    assert aligned[-1].burst_centroid_us == pytest.approx(11_000_000.0)
+    assert timeline[-1].burst_centroid_us == pytest.approx(11_000_000.0)
 
 
 def test_get_sync_debug_payload_compares_predictor_paths_on_same_observation(monkeypatch):
@@ -553,6 +614,8 @@ def test_get_sync_debug_payload_compares_predictor_paths_on_same_observation(mon
     assert payload["summary"]["raw_median_abs_residual_deg"] is not None
     assert payload["summary"]["detrended_median_abs_residual_deg"] is not None
     assert payload["summary"]["dominant_error_mode"] == diag["dominant_error_mode"]
+    assert payload["retention_diagnostics"]["timeline"]["count"] == 1
+    assert payload["summary"]["retention_diagnostics"]["timeline"]["count"] == 1
 
 
 def test_native_burst_path_populates_observation_model_timestamp_candidates(monkeypatch):
@@ -836,6 +899,7 @@ def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monke
     assert first["sequence"] == second["sequence"]
     assert first["type"] == "radar_sync"
     assert first["sync_debug"]["summary"]["operational_time_basis"] == "effective_beast_us"
+    assert first["retention_diagnostics"]["timeline"]["count"] == 1
 
 
 def test_phase_anchor_selected_aircraft_recovers_wrong_absolute_branch(monkeypatch):
