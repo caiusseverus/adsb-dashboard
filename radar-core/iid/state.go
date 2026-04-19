@@ -27,6 +27,8 @@ type RotationModel struct {
 	RPM                *float64
 	PeriodStdS         float64
 	PrimaryDirectCount int
+	// ICAO family membership — populated by AnalyseBurstRecords.
+	Family *ICAOFamily
 }
 
 // IIDState holds all runtime state for one interrogator identifier.
@@ -174,6 +176,17 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 		return
 	}
 	s.Sync.UpdateEpoch(epochUS, phaseOffsetDeg, *s.PeriodS, quality, nAircraft, refPosAgeS)
+}
+
+// FamilySnapshot returns the current ICAO family membership (may be nil).
+// The returned pointer is read-only — callers must not mutate it.
+func (s *IIDState) FamilySnapshot() *ICAOFamily {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.LastRotationModel == nil {
+		return nil
+	}
+	return s.LastRotationModel.Family
 }
 
 // SyncSnapshot returns sync state fields for IID_STATE emission.

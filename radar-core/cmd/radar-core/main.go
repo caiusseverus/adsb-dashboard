@@ -20,6 +20,7 @@ import (
 
 	"github.com/caiusseverus/adsb-dashboard/radar-core/burst"
 	rcconfig "github.com/caiusseverus/adsb-dashboard/radar-core/config"
+	"github.com/caiusseverus/adsb-dashboard/radar-core/frame"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/iid"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/ingest"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/output"
@@ -65,27 +66,31 @@ func main() {
 	slog.Info("radar-core: stopped")
 }
 
-// engine wires the ingest, burst, output, IID state, and position cache stages.
+// engine wires the ingest, burst, output, IID state, position cache, and
+// frame accumulator stages.
 type engine struct {
-	writer    *output.Writer
-	builders  map[uint8]*burst.Builder // per IID; only accessed from the ingest goroutine
-	states    map[uint8]*iid.IIDState  // per IID; thread-safe via IIDState.mu
-	revisions map[uint8]uint32         // monotonic IID_STATE revision counter
-	positions *iid.PositionCache       // global ADS-B position cache (thread-safe)
-	start     time.Time
+	writer       *output.Writer
+	builders     map[uint8]*burst.Builder      // per IID; only accessed from the ingest goroutine
+	states       map[uint8]*iid.IIDState       // per IID; thread-safe via IIDState.mu
+	accumulators map[uint8]*frame.Accumulator  // per IID; only accessed from the ingest goroutine
+	revisions    map[uint8]uint32              // monotonic IID_STATE revision counter
+	positions    *iid.PositionCache            // global ADS-B position cache (thread-safe)
+	start        time.Time
 
 	eventsIn    atomic.Uint64
 	burstsFired atomic.Uint64
+	framesEmitted atomic.Uint64
 }
 
 func newEngine() *engine {
 	return &engine{
-		writer:    output.NewWriter(),
-		builders:  make(map[uint8]*burst.Builder),
-		states:    make(map[uint8]*iid.IIDState),
-		revisions: make(map[uint8]uint32),
-		positions: iid.NewPositionCache(),
-		start:     time.Now(),
+		writer:       output.NewWriter(),
+		builders:     make(map[uint8]*burst.Builder),
+		states:       make(map[uint8]*iid.IIDState),
+		accumulators: make(map[uint8]*frame.Accumulator),
+		revisions:    make(map[uint8]uint32),
+		positions:    iid.NewPositionCache(),
+		start:        time.Now(),
 	}
 }
 
@@ -115,6 +120,12 @@ func (e *engine) onRadarEvent(msg *protocol.RadarEvent) {
 		s = iid.NewIIDState(msg.IID)
 		e.states[msg.IID] = s
 	}
+	acc, ok := e.accumulators[msg.IID]
+	if !ok {
+		acc = frame.New(msg.IID, e.writer, e.positions)
+		acc.OnFrameEmitted = func() { e.framesEmitted.Add(1) }
+		e.accumulators[msg.IID] = acc
+	}
 
 	var sigPtr *float64
 	if msg.SignalDBFS != nil {
@@ -128,8 +139,11 @@ func (e *engine) onRadarEvent(msg *protocol.RadarEvent) {
 		e.emitBurstFired(f)
 		s.AddBurst(f.ICAO, f.CentroidUS, f.NReplies)
 
-		// Stage 3: if this is the reference aircraft, advance the sync epoch.
+		// Stage 3: advance sync epoch when reference ICAO fires.
 		e.maybeUpdateSync(s, f)
+
+		// Stage 4: feed the frame accumulator.
+		acc.OnBurst(f.ICAO, f.CentroidUS, f.NReplies, f.SignalDBFS, s)
 	}
 }
 
@@ -210,6 +224,9 @@ func (e *engine) onResetIID(msg *protocol.ResetIID) {
 	}
 	if s, ok := e.states[msg.IID]; ok {
 		s.Reset()
+	}
+	if a, ok := e.accumulators[msg.IID]; ok {
+		a.Reset()
 	}
 	slog.Info("radar-core: IID reset", "iid", msg.IID)
 }
@@ -292,11 +309,12 @@ func (e *engine) runHealthTicker(stop <-chan struct{}) {
 			return
 		case <-ticker.C:
 			e.writer.SendHealth(&protocol.Health{
-				MsgType:     protocol.MsgHealth,
-				UptimeS:     time.Since(e.start).Seconds(),
-				EventsIn:    e.eventsIn.Load(),
-				BurstsFired: e.burstsFired.Load(),
-				ActiveIIDs:  uint8(len(e.builders)),
+				MsgType:       protocol.MsgHealth,
+				UptimeS:       time.Since(e.start).Seconds(),
+				EventsIn:      e.eventsIn.Load(),
+				BurstsFired:   e.burstsFired.Load(),
+				FramesEmitted: e.framesEmitted.Load(),
+				ActiveIIDs:    uint8(len(e.builders)),
 			})
 		}
 	}

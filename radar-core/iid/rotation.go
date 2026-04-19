@@ -54,6 +54,12 @@ type candidateEval struct {
 
 // --- AnalyseBurstRecords — top-level entry point ---
 
+// ICAOFamily classifies an ICAO's family membership relative to the dominant period.
+type ICAOFamily struct {
+	FoldedICAOs  map[uint32]struct{} // ICAOs that fold into the dominant period
+	ResidualICAOs map[uint32]struct{} // ICAOs that don't fit any family
+}
+
 // AnalyseBurstRecords runs the full rotation model derivation on a snapshot
 // of burst records for one IID. Port of _analyse_burst_records() from sweep.py.
 func AnalyseBurstRecords(records []BurstRecord) *RotationModel {
@@ -117,6 +123,17 @@ func AnalyseBurstRecords(records []BurstRecord) *RotationModel {
 		}
 	}
 
+	family := &ICAOFamily{
+		FoldedICAOs:   make(map[uint32]struct{}, len(harm.folded)),
+		ResidualICAOs: make(map[uint32]struct{}, len(harm.residual)),
+	}
+	for icao := range harm.folded {
+		family.FoldedICAOs[icao] = struct{}{}
+	}
+	for icao := range harm.residual {
+		family.ResidualICAOs[icao] = struct{}{}
+	}
+
 	model := &RotationModel{
 		Status:             verdict,
 		NQualifying:        len(icaoResults),
@@ -124,6 +141,7 @@ func AnalyseBurstRecords(records []BurstRecord) *RotationModel {
 		NResidual:          nResidual,
 		PeriodStdS:         round6(stdS),
 		PrimaryDirectCount: harm.directCount,
+		Family:             family,
 	}
 	if harm.dominantPeriodS > 0 {
 		p := harm.dominantPeriodS

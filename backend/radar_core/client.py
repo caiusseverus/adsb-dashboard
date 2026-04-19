@@ -243,14 +243,24 @@ class RadarCoreClient:
                 d.get("up", 0), d.get("ei", 0), d.get("bf", 0),
             )
         elif msg_type == P.MSG_IID_STATE:
-            # Shadow-mode comparison logging for Stage 2 parity verification.
+            # Shadow-mode comparison logging for Stage 2/3 parity verification.
             log.debug(
                 "RadarCoreClient: IID_STATE iid=%d status=%s period_s=%s rpm=%s "
-                "n_burst_records=%d revision=%d",
+                "sync_quality=%.2f n_burst_records=%d revision=%d",
                 d.get("i", "?"), d.get("st", "?"),
                 f"{d['p']:.4f}" if d.get("p") is not None else "None",
                 f"{d['rpm']:.2f}" if d.get("rpm") is not None else "None",
-                d.get("nb", 0), d.get("rv", 0),
+                d.get("sq", 0.0), d.get("nb", 0), d.get("rv", 0),
+            )
+        elif msg_type == P.MSG_FRAME_READY:
+            # Stage 4 shadow mode: log FRAME_READY for comparison.
+            # Stage 5 will route this to the FM worker instead.
+            obs = d.get("obs") or []
+            log.debug(
+                "RadarCoreClient: FRAME_READY iid=%d frame=%d period_s=%.4f "
+                "ref=0x%06X n_obs=%d quality=%s",
+                d.get("i", "?"), d.get("fi", 0), d.get("p", 0.0),
+                d.get("rc", 0), len(obs), d.get("q", "?"),
             )
         # Other types silently ignored in shadow mode.
 
