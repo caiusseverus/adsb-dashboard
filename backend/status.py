@@ -17,7 +17,6 @@ import memory_policy
 from db import stats_db
 
 # Callable registered by main.py at startup to avoid a circular import.
-# Returns {"ws_clients": int, "route_queue_size": int, "route_queue_drops": int}
 _runtime_stats_fn: Callable[[], dict] | None = None
 
 
@@ -97,9 +96,19 @@ async def get_status() -> dict:
         "memory_pressure": mem_status,
         "hires_buffer":    hires_stats,
         "ws_clients":      runtime.get("ws_clients", 0),
-        "route_queue": {
-            "size":  runtime.get("route_queue_size",  0),
-            "drops": runtime.get("route_queue_drops", 0),
+        # Route enrichment queue: async HTTP lookups for origin/dest airports.
+        # Not the live radar delivery path — drops here only affect visit route data.
+        "route_enrichment_queue": {
+            "size":  runtime.get("route_enrichment_queue_size",  0),
+            "drops": runtime.get("route_enrichment_queue_drops", 0),
+        },
+        # Live WebSocket delivery — use these to judge coalescing/push health.
+        "ws_live_delivery": {
+            "main_frame_drops":    runtime.get("ws_main_frame_drops",    0),
+            "sync_rebuilds":       runtime.get("ws_sync_rebuilds",       0),
+            "sync_emissions":      runtime.get("ws_sync_emissions",       0),
+            "live_emissions":      runtime.get("ws_live_emissions",       0),
+            "client_queue_depths": runtime.get("ws_client_queue_depths", []),
         },
         "in_memory_state": {
             "aircraft_state": runtime.get("aircraft_state", {}),

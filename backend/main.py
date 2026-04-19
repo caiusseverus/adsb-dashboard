@@ -188,6 +188,11 @@ _RADAR_SENTINEL = object()
 _radar_thread: threading.Thread | None = None
 _radar_drops: int = 0
 _radar_queue_depth_samples: _deque[int] = _deque(maxlen=120)
+# Live delivery observability — counts since process start.
+_ws_main_frame_drops: int = 0   # per-client send-queue full (main aircraft WS)
+_ws_sync_rebuilds: int = 0      # sync snapshot rebuilds across all /sync sessions
+_ws_sync_emissions: int = 0     # sync snapshots actually sent (sequence changed)
+_ws_live_emissions: int = 0     # radar-live state payloads sent (change-driven)
 _radar_worker_timings: _deque[dict] = _deque(maxlen=400)
 _TIMING_WS_BATCH_LIMIT = 5_000
 _TIMING_PAGE_BATCH_LIMIT = 60_000
@@ -949,6 +954,8 @@ async def _broadcast_loop() -> None:
                     q.put_nowait(payload)
                 except asyncio.QueueFull:
                     ws_frames_dropped += 1
+            global _ws_main_frame_drops
+            _ws_main_frame_drops += ws_frames_dropped
 
             t_done = time.perf_counter()
             push_sample = {
@@ -1571,8 +1578,17 @@ async def lifespan(app: FastAPI):
     health_module.register_context(_msg_queue, _clients)
     register_runtime_stats(lambda: {
         "ws_clients":        len(_clients),
-        "route_queue_size":  len(_route_queue),
-        "route_queue_drops": _route_queue_drops,
+        # route_enrichment_queue: async HTTP lookup queue for adsbdb.com route data.
+        # This is NOT the live radar/WebSocket delivery path — drops here mean some
+        # visit records won't get origin/dest airports, not that live UI is degraded.
+        "route_enrichment_queue_size":  len(_route_queue),
+        "route_enrichment_queue_drops": _route_queue_drops,
+        # Live WebSocket delivery metrics — use these to judge coalescing/delivery health.
+        "ws_main_frame_drops":   _ws_main_frame_drops,
+        "ws_sync_rebuilds":      _ws_sync_rebuilds,
+        "ws_sync_emissions":     _ws_sync_emissions,
+        "ws_live_emissions":     _ws_live_emissions,
+        "ws_client_queue_depths": [q.qsize() for q in _clients.values()],
         "aircraft_state":    state.get_aux_dict_sizes(),
         "cast":              cast.get_cache_stats(),
         "track_store":       track_store.stats(),
@@ -2105,6 +2121,8 @@ async def radar_iid_sync_websocket_endpoint(ws: WebSocket, iid: int) -> None:
             now = time.time()
             sent_kind = "none"
             if now - last_rebuild >= 0.25:
+                global _ws_sync_rebuilds, _ws_sync_emissions
+                _ws_sync_rebuilds += 1
                 payload = radar_api.build_iid_sync_snapshot_payload(
                     radar_state,
                     iid,
@@ -2118,6 +2136,7 @@ async def radar_iid_sync_websocket_endpoint(ws: WebSocket, iid: int) -> None:
                     last_sequence = sequence
                     last_heartbeat = now
                     sent_kind = "snapshot"
+                    _ws_sync_emissions += 1
             if sent_kind == "none" and now - last_heartbeat >= 1.0:
                 await ws.send_text(_json_dumps({
                     "type": "radar_sync_heartbeat",
@@ -2163,6 +2182,8 @@ async def radar_live_websocket_endpoint(ws: WebSocket) -> None:
             now = time.time()
             sig = radar_api._radar_live_signature(radar_state)
             if sig != last_signature and now - last_emission >= _RATE_LIMIT_S:
+                global _ws_live_emissions
+                _ws_live_emissions += 1
                 payload = radar_api.build_radar_live_state_payload(radar_state)
                 await ws.send_text(_json_dumps(payload))
                 last_signature = sig

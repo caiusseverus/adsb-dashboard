@@ -5415,7 +5415,10 @@ class RadarState:
                 del self._native_burst_processors[iid]
                 had_any = True
             if self._iid_events:
-                filtered_events = deque(ev for ev in self._iid_events if ev[1] != iid)
+                filtered_events = deque(
+                    (ev for ev in self._iid_events if ev[1] != iid),
+                    maxlen=_IID_EVENTS_MAX,
+                )
                 had_any = had_any or len(filtered_events) != len(self._iid_events)
                 self._iid_events = filtered_events
             if self._live_detection_buffer:
