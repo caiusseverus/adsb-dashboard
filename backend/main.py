@@ -100,13 +100,20 @@ aircraft_localiser = AircraftLocaliser(
 # Wire live-path config into localiser
 aircraft_localiser._ray_retention_s = config.STAGE3_RAY_RETENTION_S
 
-# radar-core shadow client (Stage 1).
-# Sends unwrapped DF11 events to the radar-core process for comparison.
-# Output (BURST_FIRED) is logged only — it does not affect RadarState.
-_radar_core_socket = getattr(config, "RADAR_CORE_SOCKET", "/run/adsb/radar-core.sock")
+# radar-core IPC client.
+# Sends DF11 events and position updates to the radar-core process.
+# When RADAR_CORE_FRAMES_ENABLED, FRAME_READY messages are routed to the FM
+# mailbox and Python frame-building is suppressed.
 _radar_core_client: RadarCoreClient | None = None
-if getattr(config, "RADAR_CORE_ENABLED", False):
-    _radar_core_client = RadarCoreClient(_radar_core_socket)
+if config.RADAR_CORE_ENABLED:
+    _rc_on_frame_ready = None
+    if config.RADAR_CORE_FRAMES_ENABLED:
+        _rc_on_frame_ready = radar_state.inject_frame_from_go
+        radar_state.enable_radar_core_frames(True)
+    _radar_core_client = RadarCoreClient(
+        config.RADAR_CORE_SOCKET,
+        on_frame_ready=_rc_on_frame_ready,
+    )
     radar_state.radar_core_event_sink = _radar_core_client.send_radar_event
 
 # FM solve runs on a dedicated worker thread that drains RadarState's per-IID
@@ -673,6 +680,21 @@ async def _db_writer() -> None:
                 stats_db.query_sighting_counts_for_icaos, current_icaos
             )
             state.update_sighting_counts(fresh_counts)
+
+        # Forward ADS-B positions to radar-core for reference/observation matching.
+        if _radar_core_client is not None and _radar_core_client.is_connected():
+            now_ts_f = float(int(time.time()))
+            for ac in snapshot.get("aircraft", []):
+                if ac.get("lat") is None or ac.get("lon") is None:
+                    continue
+                if not ac.get("pos_confident"):
+                    continue
+                icao_int = int(ac["icao"], 16)
+                alt_ft: int | None = ac.get("altitude")
+                _radar_core_client.send_position_update(
+                    icao_int, float(ac["lat"]), float(ac["lon"]),
+                    alt_ft, now_ts_f,
+                )
 
         # Write coverage samples for aircraft that have a position
         if config.RECEIVER_LAT is not None and config.RECEIVER_LON is not None:
@@ -1609,7 +1631,10 @@ async def lifespan(app: FastAPI):
 
     if _radar_core_client is not None:
         _radar_core_client.start()
-        log.info("radar-core shadow client started (socket=%s)", _radar_core_socket)
+        log.info(
+            "radar-core client started (socket=%s, frames_enabled=%s)",
+            config.RADAR_CORE_SOCKET, config.RADAR_CORE_FRAMES_ENABLED,
+        )
 
     yield
 

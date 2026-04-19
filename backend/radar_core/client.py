@@ -40,24 +40,29 @@ _RECV_LOG_MAX = 10_000
 
 
 class RadarCoreClient:
-    """Shadow-mode IPC client for radar-core.
+    """IPC client for radar-core.
 
     Thread-safe. All I/O happens in two daemon threads (sender, receiver).
     The Python radar path calls send_radar_event() without blocking — events
     are queued and sent asynchronously.
 
     on_burst_fired: optional callback(dict) called for each received BURST_FIRED.
+    on_frame_ready: optional callback(dict) called for each received FRAME_READY.
+      When RADAR_CORE_FRAMES_ENABLED is True this callback injects the frame
+      into RadarState's FM mailbox.
     """
 
     def __init__(
         self,
         socket_path: str,
         on_burst_fired: Optional[Callable[[dict], None]] = None,
+        on_frame_ready: Optional[Callable[[dict], None]] = None,
         connect_timeout_s: float = 5.0,
         reconnect_delay_s: float = 2.0,
     ):
         self._socket_path = socket_path
         self._on_burst_fired = on_burst_fired
+        self._on_frame_ready = on_frame_ready
         self._connect_timeout_s = connect_timeout_s
         self._reconnect_delay_s = reconnect_delay_s
 
@@ -72,6 +77,7 @@ class RadarCoreClient:
         self._events_sent = 0
         self._events_dropped = 0
         self._bursts_received = 0
+        self._frames_received = 0
         self._connect_attempts = 0
         self._stats_lock = threading.Lock()
 
@@ -137,6 +143,7 @@ class RadarCoreClient:
                 "events_sent": self._events_sent,
                 "events_dropped": self._events_dropped,
                 "bursts_received": self._bursts_received,
+                "frames_received": self._frames_received,
                 "connect_attempts": self._connect_attempts,
                 "connected": self._connected.is_set(),
             }
@@ -253,8 +260,8 @@ class RadarCoreClient:
                 d.get("sq", 0.0), d.get("nb", 0), d.get("rv", 0),
             )
         elif msg_type == P.MSG_FRAME_READY:
-            # Stage 4 shadow mode: log FRAME_READY for comparison.
-            # Stage 5 will route this to the FM worker instead.
+            with self._stats_lock:
+                self._frames_received += 1
             obs = d.get("obs") or []
             log.debug(
                 "RadarCoreClient: FRAME_READY iid=%d frame=%d period_s=%.4f "
@@ -262,6 +269,8 @@ class RadarCoreClient:
                 d.get("i", "?"), d.get("fi", 0), d.get("p", 0.0),
                 d.get("rc", 0), len(obs), d.get("q", "?"),
             )
+            if self._on_frame_ready:
+                self._on_frame_ready(d)
         # Other types silently ignored in shadow mode.
 
     @staticmethod

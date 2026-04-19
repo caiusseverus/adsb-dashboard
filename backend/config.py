@@ -287,3 +287,14 @@ MEMORY_POLICY_ENABLED: bool = os.getenv("MEMORY_POLICY_ENABLED", "true").lower()
 # a full 400 nm radius requires up to ~350 tiles).  When disabled, the terrain
 # button is hidden in the UI and no tile downloads or grid processing occur.
 TERRAIN_ENABLED: bool = os.getenv("TERRAIN_ENABLED", "true").lower() not in ("false", "0", "no")
+
+# ---------------------------------------------------------------------------
+# radar-core Go service integration
+# ---------------------------------------------------------------------------
+# RADAR_CORE_ENABLED: connect to the radar-core Unix socket and send DF11
+# events in shadow mode (BURST_FIRED logged for comparison only).
+RADAR_CORE_ENABLED: bool = _bool("RADAR_CORE_ENABLED", False)
+RADAR_CORE_SOCKET: str = os.getenv("RADAR_CORE_SOCKET", "/run/adsb/radar-core.sock")
+# RADAR_CORE_FRAMES_ENABLED: route FRAME_READY messages from radar-core to
+# the FM worker instead of building frames in Python.  Requires RADAR_CORE_ENABLED.
+RADAR_CORE_FRAMES_ENABLED: bool = _bool("RADAR_CORE_FRAMES_ENABLED", False)

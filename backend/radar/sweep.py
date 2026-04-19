@@ -1928,6 +1928,11 @@ class RadarState:
         except Exception:
             self._diagnostics_enabled = False
 
+        # When True, FRAME_READY messages from radar-core are routed to the FM
+        # mailbox and Python's own frame-finalization step is suppressed.
+        # Set via enable_radar_core_frames() from main.py after startup.
+        self._radar_core_frames_enabled: bool = False
+
         # Lightweight ADS-B position tracker for real-time position capture
         self._adsb_tracker = AircraftPositionTracker()
 
@@ -2858,7 +2863,7 @@ class RadarState:
                 period_s=period_s,
             )
             self._live_completed_frames[iid].append(frame)
-            if quality in ("good", "marginal"):
+            if quality in ("good", "marginal") and not self._radar_core_frames_enabled:
                 metrics["fm_callback_count"] += 1
                 t_fm_callback = time.perf_counter()
                 try:
@@ -2922,6 +2927,57 @@ class RadarState:
     def wait_for_pending_fm_frames(self, timeout: float | None = None) -> bool:
         """Block until the mailbox has pending frames, or timeout."""
         return self._fm_mailbox_event.wait(timeout=timeout)
+
+    def enable_radar_core_frames(self, enabled: bool = True) -> None:
+        """Switch the FM frame source between Python (False) and radar-core (True).
+
+        When enabled, _finalize_live_frame() skips the FM mailbox injection so
+        only FRAME_READY messages from radar-core reach the FM worker.
+        Call once at startup after the RadarCoreClient is connected.
+        """
+        self._radar_core_frames_enabled = enabled
+
+    def inject_frame_from_go(self, frame_dict: dict) -> None:
+        """Convert a FRAME_READY dict from radar-core into a SweepFrame and
+        inject it into the FM worker mailbox.  Called from the RadarCoreClient
+        receiver thread when RADAR_CORE_FRAMES_ENABLED is True.
+        """
+        from .models import SweepFrame, SweepFrameObservation
+        try:
+            iid = int(frame_dict["i"])
+            period_s = float(frame_dict["p"])
+            ref_icao = f"{int(frame_dict['rc']):06X}"
+            ref_arrival_us = float(frame_dict["ra"])
+            quality = str(frame_dict.get("q", "marginal"))
+
+            obs_list = []
+            for obs in (frame_dict.get("obs") or []):
+                obs_list.append(SweepFrameObservation(
+                    icao=f"{int(obs['c']):06X}",
+                    lat=float(obs["la"]),
+                    lon=float(obs["lo"]),
+                    arrival_us=float(obs["a"]),
+                    n_replies=int(obs.get("n", 1)),
+                    position_age_seconds=float(obs.get("pa", 0.0)),
+                ))
+
+            frame = SweepFrame(
+                frame_index=int(frame_dict.get("fi", 0)),
+                sweep_start_us=ref_arrival_us,
+                ref_icao=ref_icao,
+                ref_lat=float(frame_dict["rla"]),
+                ref_lon=float(frame_dict["rlo"]),
+                ref_arrival_us=ref_arrival_us,
+                observations=obs_list,
+                quality=quality,
+                period_s=period_s,
+            )
+
+            with self._fm_mailbox_lock:
+                self._fm_mailbox[iid] = (frame, period_s)
+            self._fm_mailbox_event.set()
+        except Exception:
+            pass  # never let a malformed message affect the main path
 
     def _update_live_sync_state_filtered(
         self,
