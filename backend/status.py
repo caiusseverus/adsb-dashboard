@@ -110,6 +110,7 @@ async def get_status() -> dict:
             "live_emissions":      runtime.get("ws_live_emissions",       0),
             "client_queue_depths": runtime.get("ws_client_queue_depths", []),
         },
+        "radar_core": runtime.get("radar_core", {}),
         "in_memory_state": {
             "aircraft_state": runtime.get("aircraft_state", {}),
             "cast":           runtime.get("cast", {}),

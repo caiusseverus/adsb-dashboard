@@ -218,6 +218,13 @@ _RADAR_IID_REBUILD_INTERVAL_S = max(1.0, config.RADAR_IID_WS_REBUILD_INTERVAL_S)
 _radar_loop_timings: _deque[dict] = _deque(maxlen=240)
 _fm_run_timings: _deque[dict] = _deque(maxlen=240)
 _radar_ws_timings: _deque[dict] = _deque(maxlen=400)
+_RADAR_CORE_POSITION_INTERVAL_S = 2.0
+_RADAR_CORE_POSITION_REFRESH_S = 10.0
+_RADAR_CORE_POSITION_MIN_MOVE_DEG = 0.00005  # ~5 m latitude; cheap flood guard.
+_RADAR_CORE_POSITION_ALT_DELTA_FT = 100
+_radar_core_position_last_sent: dict[str, tuple[float, float, int | None, float]] = {}
+_radar_core_position_sent: int = 0
+_radar_core_position_skipped: int = 0
 _timing_ws_timings: _deque[dict] = _deque(maxlen=400)
 _BACKGROUND_QUEUE_BACKLOG_SKIP = 100
 _FM_MAX_IIDS_PER_CYCLE = 1
@@ -681,21 +688,6 @@ async def _db_writer() -> None:
             )
             state.update_sighting_counts(fresh_counts)
 
-        # Forward ADS-B positions to radar-core for reference/observation matching.
-        if _radar_core_client is not None and _radar_core_client.is_connected():
-            now_ts_f = float(int(time.time()))
-            for ac in snapshot.get("aircraft", []):
-                if ac.get("lat") is None or ac.get("lon") is None:
-                    continue
-                if not ac.get("pos_confident"):
-                    continue
-                icao_int = int(ac["icao"], 16)
-                alt_ft: int | None = ac.get("altitude")
-                _radar_core_client.send_position_update(
-                    icao_int, float(ac["lat"]), float(ac["lon"]),
-                    alt_ft, now_ts_f,
-                )
-
         # Write coverage samples for aircraft that have a position
         if config.RECEIVER_LAT is not None and config.RECEIVER_LON is not None:
             now_ts = int(time.time())
@@ -1010,6 +1002,80 @@ async def _broadcast_loop() -> None:
             _radar_queue_depth_samples.append(_radar_queue.qsize())
         except Exception:
             log.exception("_broadcast_loop: unhandled error in broadcast cycle — continuing")
+
+
+def _should_forward_radar_core_position(ac: dict, now: float) -> bool:
+    """Return True when a live position is fresh, confident, and worth sending."""
+    global _radar_core_position_skipped
+    if ac.get("lat") is None or ac.get("lon") is None:
+        _radar_core_position_skipped += 1
+        return False
+    if not ac.get("pos_confident"):
+        _radar_core_position_skipped += 1
+        return False
+    last_pos_ts = ac.get("last_pos_ts")
+    if not last_pos_ts or now - float(last_pos_ts) > config.POS_FRESH_S:
+        _radar_core_position_skipped += 1
+        return False
+
+    icao = ac.get("icao")
+    if not icao:
+        _radar_core_position_skipped += 1
+        return False
+    lat = float(ac["lat"])
+    lon = float(ac["lon"])
+    alt = ac.get("altitude")
+    alt_ft = int(alt) if alt is not None else None
+    previous = _radar_core_position_last_sent.get(icao)
+    if previous is None:
+        return True
+    prev_lat, prev_lon, prev_alt, prev_sent_ts = previous
+    if now - prev_sent_ts >= _RADAR_CORE_POSITION_REFRESH_S:
+        return True
+    if abs(lat - prev_lat) >= _RADAR_CORE_POSITION_MIN_MOVE_DEG:
+        return True
+    if abs(lon - prev_lon) >= _RADAR_CORE_POSITION_MIN_MOVE_DEG:
+        return True
+    if alt_ft is not None and (prev_alt is None or abs(alt_ft - prev_alt) >= _RADAR_CORE_POSITION_ALT_DELTA_FT):
+        return True
+    _radar_core_position_skipped += 1
+    return False
+
+
+async def _radar_core_position_loop() -> None:
+    """Forward fresh confident ADS-B positions to radar-core at a bounded live cadence."""
+    global _radar_core_position_sent
+    while True:
+        await asyncio.sleep(_RADAR_CORE_POSITION_INTERVAL_S)
+        if _radar_core_client is None:
+            continue
+        try:
+            now = time.time()
+            positions = state.get_positions_snapshot()
+            active_icaos = {str(ac.get("icao")) for ac in positions if ac.get("icao")}
+            for stale_icao in list(_radar_core_position_last_sent):
+                if stale_icao not in active_icaos:
+                    _radar_core_position_last_sent.pop(stale_icao, None)
+
+            for ac in positions:
+                if not _should_forward_radar_core_position(ac, now):
+                    continue
+                try:
+                    icao = str(ac["icao"])
+                    icao_int = int(icao, 16)
+                    lat = float(ac["lat"])
+                    lon = float(ac["lon"])
+                    alt = ac.get("altitude")
+                    alt_ft = int(alt) if alt is not None else None
+                    ts = float(ac.get("last_pos_ts") or now)
+                except (TypeError, ValueError):
+                    continue
+
+                _radar_core_client.send_position_update(icao_int, lat, lon, alt_ft, ts)
+                _radar_core_position_last_sent[icao] = (lat, lon, alt_ft, now)
+                _radar_core_position_sent += 1
+        except Exception:
+            log.exception("_radar_core_position_loop: unhandled error — continuing")
 
 
 async def _hires_writer() -> None:
@@ -1601,6 +1667,8 @@ async def lifespan(app: FastAPI):
     _bg(run_position_quality_checker(position_quality_module._checker))
     _bg(health_module.loop_lag_sampler())
     _bg(_radar_loop())
+    if _radar_core_client is not None:
+        _bg(_radar_core_position_loop())
     if config.RADAR_COINCIDENT_BACKGROUND_ENABLED:
         _bg(_coincident_loop())
     _bg(_fm_loop())
@@ -1625,6 +1693,14 @@ async def lifespan(app: FastAPI):
         "cast":              cast.get_cache_stats(),
         "track_store":       track_store.stats(),
         "radar_state":       radar_state.get_memory_stats(),
+        "radar_core": {
+            "client": _radar_core_client.stats() if _radar_core_client is not None else None,
+            "position_updates_queued": _radar_core_position_sent,
+            "position_updates_skipped": _radar_core_position_skipped,
+            "position_cache_entries": len(_radar_core_position_last_sent),
+            "position_interval_s": _RADAR_CORE_POSITION_INTERVAL_S,
+            "position_refresh_s": _RADAR_CORE_POSITION_REFRESH_S,
+        },
     })
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",
              config.BEAST_HOST, config.BEAST_PORT)

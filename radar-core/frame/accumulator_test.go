@@ -2,6 +2,7 @@ package frame
 
 import (
 	"math"
+	"net"
 	"testing"
 	"time"
 
@@ -89,7 +90,28 @@ func TestAccumulator_NoFrameWithoutRefICAO(t *testing.T) {
 // TestAccumulator_FrameEmitted builds a complete frame and verifies FRAME_READY.
 // This test uses the public IIDState API to set up the state.
 func TestAccumulator_FullFrameFlow(t *testing.T) {
-	acc, _, pos := newTestAccumulator()
+	acc, w, pos := newTestAccumulator()
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	w.SetConn(serverConn)
+
+	received := make(chan *protocol.FrameReady, 1)
+	go func() {
+		framer := protocol.NewFramer(clientConn)
+		payload, err := framer.Read()
+		if err != nil {
+			return
+		}
+		msg, err := protocol.Decode(payload)
+		if err != nil {
+			return
+		}
+		if frameMsg, ok := msg.(*protocol.FrameReady); ok {
+			received <- frameMsg
+		}
+	}()
+
 	now := float64(time.Now().Unix())
 	pos.Update(0xAA, 51.5, -0.1, nil, now) // ref
 	pos.Update(0xBB, 51.6, -0.2, nil, now) // obs 1
@@ -113,7 +135,6 @@ func TestAccumulator_FullFrameFlow(t *testing.T) {
 	}
 
 	emitted := 0
-	var lastFrame *protocol.FrameReady
 	acc.OnFrameEmitted = func() { emitted++ }
 
 	// Ref fires at 40s — opens a frame.
@@ -125,10 +146,35 @@ func TestAccumulator_FullFrameFlow(t *testing.T) {
 
 	// Ref fires again at 44s — closes the frame.
 	acc.OnBurst(0xAA, 44_000_000.0, 2, nil, s)
-	_ = lastFrame
 
 	if emitted != 1 {
 		t.Errorf("emitted %d frames, want 1", emitted)
+	}
+	select {
+	case msg := <-received:
+		if msg.IID != 3 {
+			t.Fatalf("FRAME_READY iid=%d, want 3", msg.IID)
+		}
+		if msg.FrameIndex != 1 {
+			t.Fatalf("FRAME_READY frame=%d, want 1", msg.FrameIndex)
+		}
+		if msg.RefICAO != 0xAA {
+			t.Fatalf("FRAME_READY ref=0x%X, want 0xAA", msg.RefICAO)
+		}
+		if msg.Quality != "good" {
+			t.Fatalf("FRAME_READY quality=%s, want good", msg.Quality)
+		}
+		if math.Abs(msg.PeriodS-period) > 1e-9 {
+			t.Fatalf("FRAME_READY period=%.6f, want %.6f", msg.PeriodS, period)
+		}
+		if len(msg.Observations) != 3 {
+			t.Fatalf("FRAME_READY observations=%d, want 3", len(msg.Observations))
+		}
+		if msg.Observations[0].ICAO != 0xBB || msg.Observations[0].Lat != 51.6 || msg.Observations[0].Lon != -0.2 {
+			t.Fatalf("unexpected first observation: %+v", msg.Observations[0])
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for FRAME_READY payload")
 	}
 }
 

@@ -9,6 +9,7 @@
 package frame
 
 import (
+	"log/slog"
 	"math"
 
 	"github.com/caiusseverus/adsb-dashboard/radar-core/iid"
@@ -50,6 +51,7 @@ type Accumulator struct {
 	OnFrameEmitted func()
 	// Per-ICAO centroid history for phase-family checks.
 	centroidHistory  map[uint32][]float64
+	gateCounts       map[string]uint64
 }
 
 // New returns an Accumulator for the given IID.
@@ -59,6 +61,7 @@ func New(iidNum uint8, writer *output.Writer, positions *iid.PositionCache) *Acc
 		writer:          writer,
 		positions:       positions,
 		centroidHistory: make(map[uint32][]float64),
+		gateCounts:      make(map[string]uint64),
 	}
 }
 
@@ -67,6 +70,7 @@ func (a *Accumulator) Reset() {
 	a.frame = nil
 	a.lastFrameStartUS = 0
 	a.centroidHistory = make(map[uint32][]float64)
+	a.gateCounts = make(map[string]uint64)
 }
 
 // OnBurst processes one fired burst. state provides the current period,
@@ -84,6 +88,7 @@ func (a *Accumulator) OnBurst(
 	status, periodSPtr, _, _ := state.Snapshot()
 	_ = status
 	if periodSPtr == nil {
+		a.recordGate("no_period", icao)
 		return // no period estimate yet — can't accumulate frames
 	}
 	periodS := *periodSPtr
@@ -91,6 +96,7 @@ func (a *Accumulator) OnBurst(
 
 	_, refICAOPtr := state.SyncSnapshot()
 	if refICAOPtr == nil {
+		a.recordGate("no_reference", icao)
 		return // no reference aircraft selected yet
 	}
 	refICAO := *refICAOPtr
@@ -109,15 +115,18 @@ func (a *Accumulator) OnBurst(
 			return // frame already open; don't restart mid-sweep
 		}
 		if !a.matchesDominant(icao, periodS, family) {
+			a.recordGate("ref_not_dominant", icao)
 			return
 		}
 		// Suppress frames that start too close to the previous one.
 		if a.shouldSuppressStart(centroidUS, periodUS) {
+			a.recordGate("start_suppressed", icao)
 			return
 		}
 		pos := a.positions.Get(icao)
 		if pos == nil {
 			a.frame = nil
+			a.recordGate("missing_ref_position", icao)
 			return // can't start frame without ref position
 		}
 		posAgeS := float64(0)
@@ -138,25 +147,32 @@ func (a *Accumulator) OnBurst(
 
 	// Non-reference burst — try to add as observation.
 	if a.frame == nil {
+		a.recordGate("no_open_frame", icao)
 		return
 	}
 	if centroidUS < a.frame.refArrivalUS {
+		a.recordGate("predates_frame", icao)
 		return // burst predates this frame
 	}
 	if centroidUS >= a.frame.refArrivalUS+periodUS {
+		a.recordGate("past_frame_window", icao)
 		return // already past sweep window (would have been caught above)
 	}
 	if _, seen := a.frame.seenICAOs[icao]; seen {
+		a.recordGate("duplicate_icao", icao)
 		return // one observation per aircraft per frame
 	}
 	if !a.matchesDominant(icao, periodS, family) {
+		a.recordGate("obs_not_dominant", icao)
 		return
 	}
 	if !a.matchesPhaseFamily(refICAO, a.frame.refArrivalUS, icao, centroidUS, periodUS) {
+		a.recordGate("phase_mismatch", icao)
 		return
 	}
 	pos := a.positions.Get(icao)
 	if pos == nil {
+		a.recordGate("missing_obs_position", icao)
 		return // no position for this aircraft
 	}
 
@@ -187,6 +203,7 @@ func (a *Accumulator) finalizeFrame(periodS float64) {
 	}
 	nAircraft := f.nAircraft
 	if nAircraft < 3 {
+		a.recordGate("insufficient_aircraft", f.refICAO)
 		return // insufficient — discard without emitting
 	}
 	quality := "marginal"
@@ -198,6 +215,14 @@ func (a *Accumulator) finalizeFrame(periodS float64) {
 	if a.OnFrameEmitted != nil {
 		a.OnFrameEmitted()
 	}
+	a.recordGate("frame_emitted", f.refICAO)
+	slog.Info("radar-core: FRAME_READY emitted",
+		"iid", a.iidNum,
+		"frame", a.frameIndex,
+		"quality", quality,
+		"n_aircraft", nAircraft,
+		"ref_icao", f.refICAO,
+	)
 	a.writer.SendFrameReady(&protocol.FrameReady{
 		MsgType:      protocol.MsgFrameReady,
 		IID:          a.iidNum,
@@ -316,6 +341,19 @@ func (a *Accumulator) shouldSuppressStart(startUS, periodUS float64) bool {
 		return false
 	}
 	return (startUS - a.lastFrameStartUS) < periodUS*minFrameSeparationFraction
+}
+
+func (a *Accumulator) recordGate(reason string, icao uint32) {
+	a.gateCounts[reason]++
+	count := a.gateCounts[reason]
+	if count == 1 || count%1000 == 0 {
+		slog.Info("radar-core: frame accumulator gate",
+			"iid", a.iidNum,
+			"reason", reason,
+			"count", count,
+			"icao", icao,
+		)
+	}
 }
 
 // --- small helpers ---

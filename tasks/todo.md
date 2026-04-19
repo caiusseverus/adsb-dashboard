@@ -8,6 +8,31 @@ Source inputs:
 Prepared: 2026-04-04
 Updated: 2026-04-06
 
+## 2026-04-19 Radar-Core Integration Rectification
+
+- [x] Refactor `RadarCoreClient` to maintain one shared bidirectional Unix socket for send and receive, with coordinated reconnect and non-blocking enqueue semantics
+- [x] Move radar-core `POSITION_UPDATE` forwarding from the once-per-minute DB writer to a bounded live cadence with freshness/confidence filtering and deduplication
+- [x] Add lightweight `FRAME_READY` observability in Go emission, Python reception, and Python FM-mailbox injection paths, including cheap frame-gate reason categories
+- [x] Add focused regression tests for single-socket behavior, live position forwarding, and frame observability/injection counters
+- [x] Run focused backend and radar-core verification, then document results
+
+Plan confirmation: proceeding directly because the user provided a concrete implementation brief and explicitly constrained the scope. The changes stay within the existing one-client radar-core model, preserve the Python hot-path queue boundary, and avoid redesigning frame ownership.
+
+### Review
+
+- Implementation:
+  - Refactored [client.py](/home/keith/claude/adsb-dashboard/backend/radar_core/client.py) so sender and receiver share one bidirectional Unix socket, one connection generation, and one coordinated teardown/reconnect path. The hot radar path remains queue-only and non-blocking.
+  - Moved radar-core position forwarding out of `_db_writer()` in [main.py](/home/keith/claude/adsb-dashboard/backend/main.py) and into a 2-second live loop with confident/fresh-position filtering, movement/altitude dedupe, and a 10-second refresh to keep radar-core's 30-second position cache warm.
+  - Extended [aircraft_state.py](/home/keith/claude/adsb-dashboard/backend/aircraft_state.py) lightweight position snapshots with confidence, freshness, and altitude fields needed by the live radar-core feed.
+  - Added `FRAME_READY` visibility: Go logs emitted frames and frame accumulator gate categories in [accumulator.go](/home/keith/claude/adsb-dashboard/radar-core/frame/accumulator.go); Python client stats now include frames received and latest Go health; RadarState tracks Go-frame injection successes/errors; `/api/status` exposes radar-core runtime stats.
+  - Added focused tests in [test_radar_core_client.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_core_client.py), [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py), and strengthened Go frame payload assertions in [accumulator_test.go](/home/keith/claude/adsb-dashboard/radar-core/frame/accumulator_test.go).
+- Verification:
+  - `python3 -m py_compile backend/radar_core/client.py backend/aircraft_state.py backend/main.py backend/radar/sweep.py backend/status.py backend/tests/test_radar_core_client.py backend/tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest tests/test_radar_core_client.py tests/test_radar_sweep.py::test_radar_core_frame_injection_populates_fm_mailbox_and_completed_buffer tests/test_radar_sweep.py::test_radar_core_frames_enabled_suppresses_python_fm_mailbox_injection`
+  - `uv run --directory backend pytest tests/test_radar_core_protocol.py tests/test_radar_core_client.py tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest`
+  - Result: focused tests passed (`6 passed`), radar-core/radar sweep backend set passed (`90 passed`), full backend passed (`346 passed`). Go-side `gofmt`/`go test` could not be run because `go`/`gofmt` are not installed in this environment.
+
 ## 2026-04-19 Radar Page Lazy Loading Removal
 
 - [x] Inspect Radar page lazy-mounted panels and frame-selection gates

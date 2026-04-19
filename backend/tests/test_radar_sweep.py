@@ -2163,3 +2163,52 @@ def test_fm_mailbox_preserves_distinct_iids():
     assert set(pending.keys()) == {50, 51}
     assert pending[50][1] == 4.0
     assert pending[51][1] == 5.0
+
+
+def test_radar_core_frame_injection_populates_fm_mailbox_and_completed_buffer():
+    state = RadarState()
+    state.enable_radar_core_frames(True)
+
+    state.inject_frame_from_go({
+        "t": 11,
+        "i": 61,
+        "fi": 12,
+        "p": 4.25,
+        "rc": 0xAAAAAA,
+        "rla": 51.0,
+        "rlo": -1.0,
+        "ra": 123_456.0,
+        "obs": [
+            {"c": 0xBBBBBB, "la": 51.1, "lo": -1.1, "a": 124_000.0, "n": 3, "pa": 0.5},
+        ],
+        "q": "marginal",
+    })
+
+    pending = state.claim_pending_fm_frames()
+    assert len(pending) == 1
+    iid, frame, period_s = pending[0]
+    assert iid == 61
+    assert period_s == 4.25
+    assert frame.frame_index == 12
+    assert frame.ref_icao == "AAAAAA"
+    assert frame.ref_lat == 51.0
+    assert frame.ref_lon == -1.0
+    assert frame.quality == "marginal"
+    assert frame.observations[0].icao == "BBBBBB"
+    assert frame.observations[0].position_age_seconds == 0.5
+    assert state.get_live_frame_counts(61)["n_frames"] == 1
+    stats = state.get_memory_stats()
+    assert stats["radar_core_frames_enabled"] is True
+    assert stats["radar_core_frames_injected"] == 1
+    assert stats["radar_core_frame_inject_errors"] == 0
+
+
+def test_radar_core_frames_enabled_suppresses_python_fm_mailbox_injection():
+    state = RadarState()
+    state.enable_radar_core_frames(True)
+    _seed_live_frame(state, iid=62, n_observations=3)
+
+    metrics = state._finalize_live_frame(62, period_s=4.0)
+
+    assert metrics["fm_callback_count"] == 0
+    assert state.claim_pending_fm_frames() == []

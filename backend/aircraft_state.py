@@ -2313,10 +2313,11 @@ class AircraftState:
     def get_positions_snapshot(self) -> list[dict]:
         """Return a lightweight list of current positions for all aircraft.
 
-        Only copies the 5-6 scalar fields needed to feed the radar position
+        Only copies the scalar fields needed to feed the radar position
         tracker.  Holds _lock only for the brief O(N) scalar scan — far cheaper
         than get_snapshot() which builds full per-aircraft dicts.
         """
+        now = time.time()
         with self._lock:
             result = []
             for ac in self._aircraft.values():
@@ -2325,9 +2326,12 @@ class AircraftState:
                         "icao": ac.icao,
                         "lat": ac.lat,
                         "lon": ac.lon,
+                        "altitude": ac.altitude if _alt_baro_reliable(ac) else None,
                         "gs": ac.gs,
                         "track": ac.track,
                         "last_pos_ts": ac.last_pos_ts if ac.last_pos_ts else None,
+                        "last_pos_age": round(now - ac.last_pos_ts, 1) if ac.last_pos_ts > 0 else None,
+                        "pos_confident": _pos_reliable(ac),
                     })
             return result
 

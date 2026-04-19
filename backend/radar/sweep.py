@@ -1932,6 +1932,8 @@ class RadarState:
         # mailbox and Python's own frame-finalization step is suppressed.
         # Set via enable_radar_core_frames() from main.py after startup.
         self._radar_core_frames_enabled: bool = False
+        self._radar_core_frames_injected: int = 0
+        self._radar_core_frame_inject_errors: int = 0
 
         # Lightweight ADS-B position tracker for real-time position capture
         self._adsb_tracker = AircraftPositionTracker()
@@ -2268,6 +2270,9 @@ class RadarState:
                 "live_bursts_total":            n_live_bursts,
                 "live_iids":           len(self._live_bursts),
                 "sweep_history_iids":  len(self._sweep_history),
+                "radar_core_frames_enabled": self._radar_core_frames_enabled,
+                "radar_core_frames_injected": self._radar_core_frames_injected,
+                "radar_core_frame_inject_errors": self._radar_core_frame_inject_errors,
             }
 
     def _process_fired_bursts(self, iid: int, fired_bursts: list[dict]) -> dict:
@@ -2989,8 +2994,10 @@ class RadarState:
                 iid, deque(maxlen=self._LIVE_FRAMES_MAX)
             )
             buf.append(frame)
+            self._radar_core_frames_injected += 1
         except Exception:
-            pass  # never let a malformed message affect the main path
+            self._radar_core_frame_inject_errors += 1
+            log.debug("RadarState: malformed radar-core FRAME_READY ignored", exc_info=True)
 
     def _update_live_sync_state_filtered(
         self,
