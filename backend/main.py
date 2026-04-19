@@ -65,6 +65,7 @@ from radar.sweep import RadarState
 from radar import api as radar_api
 from radar import aircraft_api as radar_aircraft_api
 from radar.aircraft_localiser import AircraftLocaliser
+from radar_core.client import RadarCoreClient
 
 
 
@@ -98,6 +99,15 @@ aircraft_localiser = AircraftLocaliser(
 )
 # Wire live-path config into localiser
 aircraft_localiser._ray_retention_s = config.STAGE3_RAY_RETENTION_S
+
+# radar-core shadow client (Stage 1).
+# Sends unwrapped DF11 events to the radar-core process for comparison.
+# Output (BURST_FIRED) is logged only — it does not affect RadarState.
+_radar_core_socket = getattr(config, "RADAR_CORE_SOCKET", "/run/adsb/radar-core.sock")
+_radar_core_client: RadarCoreClient | None = None
+if getattr(config, "RADAR_CORE_ENABLED", False):
+    _radar_core_client = RadarCoreClient(_radar_core_socket)
+    radar_state.radar_core_event_sink = _radar_core_client.send_radar_event
 
 # FM solve runs on a dedicated worker thread that drains RadarState's per-IID
 # mailbox.  Keeping FM work off the radar worker thread prevents burst
@@ -1597,9 +1607,15 @@ async def lifespan(app: FastAPI):
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",
              config.BEAST_HOST, config.BEAST_PORT)
 
+    if _radar_core_client is not None:
+        _radar_core_client.start()
+        log.info("radar-core shadow client started (socket=%s)", _radar_core_socket)
+
     yield
 
     # --- Graceful shutdown ---
+    if _radar_core_client is not None:
+        _radar_core_client.stop()
     # Cancel background tasks first; the explicit final DB write inside
     # _graceful_shutdown handles persistence — no need for _db_writer to finish.
     await _graceful_shutdown(_bg_tasks)

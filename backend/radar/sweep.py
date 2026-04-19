@@ -2036,6 +2036,12 @@ class RadarState:
         # mailbox below rather than invoking this callback inline.
         self.per_frame_solve_callback = None
 
+        # Shadow tap for radar-core Stage 1.
+        # If set, called with (arrival_us: float, iid: int, icao: int, signal_dbfs: float|None)
+        # for each unwrapped DF11 event, outside any lock.
+        # The tap must be non-blocking; failures are silently swallowed.
+        self.radar_core_event_sink = None
+
         # Per-IID latest-frame mailbox: a background FM worker consumes frames
         # from here so the radar worker thread is never blocked by FM solves.
         # "Latest wins": a newer frame for the same IID overwrites an unsolved
@@ -2718,6 +2724,16 @@ class RadarState:
             prepare_s = time.perf_counter() - t_prepare
             if not prepared:
                 return
+
+            # Shadow tap: forward unwrapped events to radar-core (non-blocking).
+            sink = self.radar_core_event_sink
+            if sink is not None:
+                try:
+                    for iid, icao_hex, signal_dbfs, arrival_us in prepared:
+                        sink(arrival_us, iid, int(icao_hex, 16), signal_dbfs)
+                except Exception:
+                    pass
+
             t_append = time.perf_counter()
             with self._lock:
                 for iid, icao_hex, signal_dbfs, arrival_us in prepared:
