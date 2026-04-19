@@ -27,6 +27,22 @@ Plan confirmation: proceeding directly because the request is a concrete UI work
   - `npm run build`
   - Result: frontend build passed with the existing chunk-size warning.
 
+## 2026-04-19 Frame Geometry OSM Map Fix
+
+- [x] Inspect Frame FM geometry basemap configuration and Leaflet tile-layer options
+- [x] Fix OSM tile layer creation so subdomains are never passed as undefined
+- [x] Build frontend and document verification
+
+Plan confirmation: proceeding directly because this is a concrete browser error with a narrow root cause in the Frame FM geometry map.
+
+### Review
+
+- Implementation:
+  - Updated [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) so Frame FM geometry tile layers only pass `subdomains` to Leaflet when the selected basemap defines it. This fixes OSM, whose URL uses `{s}` but had no `subdomains` option configured.
+- Verification:
+  - `npm run build`
+  - Result: frontend build passed with the existing chunk-size warning.
+
 ## 2026-04-19 Radar BurstRecord Refactor Rectification
 
 - [x] Add native fired-burst `BurstRecord` emission with fields matching the Python fallback path
@@ -4061,3 +4077,24 @@ Plan confirmation: fix the anchor selection gate only. Do not change the period 
   - `uv run --directory backend pytest`
   - `cd frontend && npm run build`
   - Result: focused anchor tests passed, radar sweep/API tests passed (`88 passed`), full backend passed (`303 passed`), frontend build succeeded with the existing chunk-size warning.
+
+## radar-core implementation
+
+Source: `.docs/development/radar-core-design-brief.md`
+Started: 2026-04-19
+
+### Stage 0 — Protocol definition
+- [x] Install Go 1.24.2 to ~/.local/go
+- [x] Scaffold radar-core Go module (`radar-core/`)
+- [x] `protocol/framing.go` — 4-byte length-prefix read/write, ErrFrameTooLarge
+- [x] `protocol/messages.go` — all 10 message types with codec struct tags
+- [x] `protocol/codec.go` — Encode/Decode via ugorji/go/codec (msgpack)
+- [x] `protocol/protocol_test.go` — 14 Go tests, all pass
+- [x] `backend/radar_core/protocol.py` — Python framing + encode/decode + constructors
+- [x] `backend/tests/test_radar_core_protocol.py` — 26 Python tests, all pass
+- [x] Stage 1 — Radar event tap (ingest, burst builder, shadow mode client)
+- [x] Stage 2 — Rotation model parity
+- [x] Stage 3 — Sync model parity
+- [x] Stage 4 — Frame accumulation and mailbox
+- [x] Stage 5 — Python consumption switch
+- [x] Stage 6 — Remove Python operational path
