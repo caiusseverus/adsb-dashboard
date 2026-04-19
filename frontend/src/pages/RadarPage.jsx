@@ -2295,6 +2295,7 @@ function SyncDebugPanel({ debug, iid, windowS }) {
   const predictorOk = Boolean(summary.predictors_consistent_localiser)
     && Boolean(summary.predictors_consistent_position_verification)
     && Boolean(summary.predictors_consistent_burst_sync)
+  const unavailableReason = debug?.available === false ? (debug.reason || 'Sync diagnostics are unavailable.') : null
   const plotW = 720
   const plotH = 190
   const padL = 48
@@ -2363,6 +2364,19 @@ function SyncDebugPanel({ debug, iid, windowS }) {
         </div>
       </div>
 
+      {unavailableReason ? (
+        <div className={styles.empty} style={{ marginBottom: 0 }}>
+          {unavailableReason}
+        </div>
+      ) : null}
+
+      {!unavailableReason && plotRows.length === 0 ? (
+        <div className={styles.empty} style={{ marginBottom: 0 }}>
+          No sync-diagnosis observations in the selected window yet.
+        </div>
+      ) : null}
+
+      {!unavailableReason && plotRows.length > 0 && (
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(330px, 1fr))', gap: '10px', marginBottom: '0.6rem' }}>
         <div>
           <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>Raw residual vs elapsed Beast time</div>
@@ -2397,7 +2411,9 @@ function SyncDebugPanel({ debug, iid, windowS }) {
           )}
         </div>
       </div>
+      )}
 
+      {!unavailableReason && plotRows.length > 0 && (
       <div style={{ marginBottom: '0.6rem' }}>
         <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>Folded per-sweep overlay after detrending</div>
         {plotFrame(
@@ -2425,7 +2441,9 @@ function SyncDebugPanel({ debug, iid, windowS }) {
           `${cycleRows.length} cycles overlaid on 0-360° phase`,
         )}
       </div>
+      )}
 
+      {!unavailableReason && (
       <button
         type="button"
         onClick={() => setShowAdvanced(v => !v)}
@@ -2433,8 +2451,9 @@ function SyncDebugPanel({ debug, iid, windowS }) {
       >
         {showAdvanced ? 'Hide advanced diagnostics' : 'Show advanced diagnostics'}
       </button>
+      )}
 
-      {showAdvanced && (
+      {!unavailableReason && showAdvanced && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '10px' }}>
           <div style={{ overflow: 'auto', border: '1px solid #30363d', background: '#0f141b' }}>
             <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>Observation rows</div>
