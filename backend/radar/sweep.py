@@ -23,7 +23,7 @@ try:
 except Exception:
     _decode_cffi = None
 
-from .models import RadarIID, RotationModel, CalibrationPair
+from .models import RadarIID, RotationModel, CalibrationPair, BurstRecord
 from .aircraft_models import Stage3LiveDetection
 
 try:
@@ -34,6 +34,7 @@ try:
         RADAR_SYNC_MOTION_COMP_PHASE_ENABLED,
         RADAR_SYNC_MOTION_COMP_FIT_ENABLED,
         RADAR_SYNC_WAVEFORM_BIN_COUNT,
+        RADAR_DIAGNOSTICS,
     )
 except Exception:  # pragma: no cover — config not importable in some test harnesses
     RADAR_SYNC_PERIOD_REFINE_ENABLED = True
@@ -42,6 +43,7 @@ except Exception:  # pragma: no cover — config not importable in some test har
     RADAR_SYNC_MOTION_COMP_PHASE_ENABLED = True
     RADAR_SYNC_MOTION_COMP_FIT_ENABLED = True
     RADAR_SYNC_WAVEFORM_BIN_COUNT = 24
+    RADAR_DIAGNOSTICS = False
 
 if TYPE_CHECKING:
     from aircraft_state import AircraftState
@@ -114,8 +116,11 @@ BURST_GAP_US = 200_000
 MIN_BURSTS = 4
 
 # IID event max age for in-memory accumulation (seconds)
-IID_EVENT_MAX_AGE_S = 1800  # 30 minutes — enough for reliable rotation model
+IID_EVENT_MAX_AGE_S = 60  # 60s — sufficient for DF11 residual diagnostics; rotation uses _burst_records
 ROTATION_ANALYSIS_MAX_AGE_S = 120.0   # 2 min ≈ 24–40 rotations — sufficient for period detection
+# BurstRecord retention: matches the rotation analysis window so _burst_records
+# always covers the full window used by _analyse_burst_records.
+BURST_RECORD_MAX_AGE_S = ROTATION_ANALYSIS_MAX_AGE_S
 STABLE_REANALYZE_INTERVAL_S = 300.0
 
 # Co-sweep window: two bursts within 70ms are considered one radar sweep
@@ -1740,6 +1745,73 @@ def _analyse_iid_events(
     )
 
 
+def _analyse_burst_records(records: list[BurstRecord]) -> RotationModel:
+    """Run full rotation analysis for one IID from BurstRecord objects.
+
+    Equivalent to _analyse_iid_events but consumes already-computed burst
+    centroids rather than re-running burst detection on raw arrival timestamps.
+    records: BurstRecord list filtered to one IID, within the analysis window.
+    """
+    icao_bursts: dict[str, list[dict]] = defaultdict(list)
+    for r in records:
+        if r.icao:
+            icao_bursts[r.icao].append({"centroid_us": r.centroid_us, "n_replies": r.n_replies})
+    for bursts in icao_bursts.values():
+        bursts.sort(key=lambda b: b["centroid_us"])
+
+    icao_results: dict[str, dict] = {}
+    for icao, bursts in icao_bursts.items():
+        result = analyse_icao(bursts)
+        if result is not None:
+            icao_results[icao] = result
+
+    if not icao_results:
+        return RotationModel(
+            status="INSUFFICIENT_DATA",
+            n_qualifying=0,
+            last_updated=time.time(),
+        )
+
+    harmonics = _fold_harmonics(icao_results)
+    dominant = harmonics["dominant_period_s"]
+    final_residual = dict(harmonics["residual"])
+    n_residual = len(final_residual)
+
+    folded_periods = [f["folded_period_s"] for f in harmonics["folded"].values()]
+    if not folded_periods:
+        folded_periods = [r["median_period_s"] for r in icao_results.values()]
+
+    spread = max(folded_periods) - min(folded_periods)
+    overall_std = statistics.stdev(folded_periods) if len(folded_periods) > 1 else 0.0
+
+    if n_residual == 0 and spread < 0.1:
+        verdict = "SINGLE_RADAR"
+    elif n_residual == 0 and spread < 0.5:
+        verdict = "LIKELY_SINGLE"
+    else:
+        verdict = "CHECK_MULTI"
+
+    n_harmonic = sum(1 for f in harmonics["folded"].values() if f["multiplier"] > 1)
+    rpm = 60.0 / dominant if dominant and dominant > 0 else None
+
+    return RotationModel(
+        dominant_period_s=dominant,
+        secondary_period_s=None,
+        primary_direct_count=harmonics.get("direct_count", 0),
+        secondary_direct_count=0,
+        period_std_s=round(overall_std, 6),
+        status=verdict,
+        n_qualifying=len(icao_results),
+        n_harmonic=n_harmonic,
+        n_residual=n_residual,
+        rpm=round(rpm, 3) if rpm is not None else None,
+        folded=harmonics["folded"],
+        secondary_folded={},
+        residual=final_residual,
+        last_updated=time.time(),
+    )
+
+
 def _periods_match(period_a: float | None, period_b: float | None, tolerance: float = PERIOD_MATCH_TOLERANCE) -> bool:
     if period_a is None or period_b is None or period_a <= 0 or period_b <= 0:
         return False
@@ -1839,6 +1911,14 @@ class RadarState:
         self._receiver_lat: float = receiver_lat or 0.0
         self._receiver_lon: float = receiver_lon or 0.0
 
+        # Diagnostics flag: controls whether expensive debug structures are populated.
+        # Read once at startup from config so the hot path avoids attribute lookup cost.
+        try:
+            import config as _cfg
+            self._diagnostics_enabled: bool = bool(getattr(_cfg, "RADAR_DIAGNOSTICS", False))
+        except Exception:
+            self._diagnostics_enabled = False
+
         # Lightweight ADS-B position tracker for real-time position capture
         self._adsb_tracker = AircraftPositionTracker()
 
@@ -1846,6 +1926,11 @@ class RadarState:
         # Pruned by age in update_rotation_models()
         self._iid_events: deque[tuple[float, int, str, float | None]] = deque()
         self._iid_latest_arrival_us: dict[int, float] = {}
+
+        # Per-IID compact burst records: {iid: deque[BurstRecord]}
+        # One record per fired burst; replaces _iid_events as the source for
+        # rotation analysis. Pruned to BURST_RECORD_MAX_AGE_S in update_rotation_models().
+        self._burst_records: dict[int, deque] = {}
 
         # Wrap-around unwrapping state (mirrors IIDAccumulator in probe tool)
         self._base_ticks: int | None = None
@@ -1885,9 +1970,9 @@ class RadarState:
         self._live_frames: dict[int, "LiveFrameState | None"] = {}
         # Per-IID last accepted frame-start timestamp to suppress near-duplicate openings.
         self._live_last_frame_start_us: dict[int, float] = {}
-        # Per-IID completed frames: {iid: deque of SweepFrame} — bounded to most recent frames.
-        # 500 frames ≈ 33 minutes at 4s period; keeps memory bounded.
-        self._LIVE_FRAMES_MAX = 500
+        # Per-IID completed frames: {iid: deque of SweepFrame} — bounded to FM working window.
+        # FM scorer uses last 100 frames; 120 gives 20 frames headroom for quality filtering.
+        self._LIVE_FRAMES_MAX = 120
         self._live_completed_frames: dict[int, deque] = {}
         # Monotonically increasing frame counter per IID — never resets when the deque wraps,
         # so frame_index stays unique even after the ring buffer fills.
@@ -1917,11 +2002,14 @@ class RadarState:
         # than _live_aligned_burst_obs: it includes all burst-centre observations that
         # can be compared against the maintained sync model, even when they are not
         # eligible to steer sync updates.
-        self._BURST_SYNC_TIMELINE_OBS_MAX = 2000
+        # Reduced from 2000: bearing-rate estimation (motion comp) needs ~60s of history per
+        # aircraft; 200 entries covers this at operational density without accumulating UI history.
+        self._BURST_SYNC_TIMELINE_OBS_MAX = 200
         self._live_burst_timeline_obs: dict[int, deque] = {}  # {iid: deque[AlignedBurstSyncObs]}
         # Bounded buffer of recent Stage 3-usable live detections.
-        # 10 000 entries ≈ a few minutes of DF11 traffic at moderate density.
-        self._LIVE_DETECTION_BUFFER_MAX = 10_000
+        # One entry per fired burst; Stage 3 solver queries with max_age_s=30.
+        # At Pi density (~50 aircraft, 15 bursts/min each = ~12/s × 30s ≈ 375 entries).
+        self._LIVE_DETECTION_BUFFER_MAX = 2_000
         self._live_detection_buffer: deque[Stage3LiveDetection] = deque(maxlen=self._LIVE_DETECTION_BUFFER_MAX)
 
         import threading
@@ -2042,10 +2130,9 @@ class RadarState:
                 self._iid_latest_arrival_us[iid] = arrival_us
                 self._dirty_iids.add(iid)
 
-            # Real-time flash event — read by the polling endpoint for the sweep diagram.
-            # Written outside _lock to avoid contention; deque.append is GIL-safe.
-            self._flash_seq += 1
-            self._flash_events.append((self._flash_seq, iid, icao_hex, int(arrival_us)))
+            if self._diagnostics_enabled:
+                self._flash_seq += 1
+                self._flash_events.append((self._flash_seq, iid, icao_hex, int(arrival_us)))
 
             # Live frame building — process each DF11 as it arrives.
             self._on_df11_frame_builder(iid, icao_hex, arrival_us, signal_dbfs)
@@ -2595,8 +2682,9 @@ class RadarState:
             t_group = time.perf_counter()
             grouped_events: dict[int, list[tuple[float, str, float | None]]] = defaultdict(list)
             for iid, icao_hex, signal_dbfs, arrival_us in prepared:
-                self._flash_seq += 1
-                self._flash_events.append((self._flash_seq, iid, icao_hex, int(arrival_us)))
+                if self._diagnostics_enabled:
+                    self._flash_seq += 1
+                    self._flash_events.append((self._flash_seq, iid, icao_hex, int(arrival_us)))
                 grouped_events[iid].append((arrival_us, icao_hex, signal_dbfs))
             group_s = time.perf_counter() - t_group
 
@@ -4529,6 +4617,7 @@ class RadarState:
             self._live_frames[iid] = None
             self._live_completed_frames[iid] = deque(maxlen=self._LIVE_FRAMES_MAX)
             self._live_frame_counters[iid] = 0
+            self._burst_records.setdefault(iid, deque())
         if iid not in self._live_burst_diagnostic_replies:
             self._live_burst_diagnostic_replies[iid] = {}
         if iid not in self._live_aligned_burst_obs:
@@ -4551,6 +4640,17 @@ class RadarState:
             fired_icao = fired_burst["icao"]
             burst_centroid_us = fired_burst["burst_centroid_us"]
             burst_signal = fired_burst["burst_signal"]
+
+            # Emit compact BurstRecord for rotation analysis and sync fitting.
+            # Core fields only; enrichment (position, family flags) can be layered
+            # on separately if needed by other consumers.
+            self._burst_records.setdefault(iid, deque()).append(BurstRecord(
+                iid=iid,
+                icao=fired_icao,
+                centroid_us=burst_centroid_us,
+                n_replies=fired_burst["n_replies"],
+                signal_dbfs=burst_signal,
+            ))
 
             current_frame = self._live_frames.get(iid)
             if current_frame is not None and burst_centroid_us >= current_frame.ref_arrival_us + period_us:
@@ -4847,16 +4947,27 @@ class RadarState:
             now_us: int
             now_ts = time.time()
             with self._lock:
-                if not self._iid_events:
-                    return
                 t_snapshot = time.perf_counter()
-                # Estimate "now" in µs from the latest arrival
-                now_us = self._iid_events[-1][0]
+                # Estimate "now" in µs: prefer latest burst centroid, fall back to _iid_events
+                _latest_burst_us = max(
+                    (br_deque[-1].centroid_us for br_deque in self._burst_records.values() if br_deque),
+                    default=None,
+                )
+                _latest_event_us = self._iid_events[-1][0] if self._iid_events else None
+                if _latest_burst_us is None and _latest_event_us is None:
+                    return
+                now_us = int(max(filter(None, [_latest_burst_us, _latest_event_us])))
                 cutoff_us = now_us - int(IID_EVENT_MAX_AGE_S * 1_000_000)
 
                 # Prune old events from the left
                 while self._iid_events and self._iid_events[0][0] < cutoff_us:
                     self._iid_events.popleft()
+
+                # Prune burst records beyond BURST_RECORD_MAX_AGE_S
+                burst_cutoff_us = now_us - int(BURST_RECORD_MAX_AGE_S * 1_000_000)
+                for br_deque in self._burst_records.values():
+                    while br_deque and br_deque[0].centroid_us < burst_cutoff_us:
+                        br_deque.popleft()
 
                 dirty_iids = set(self._dirty_iids)
                 self._dirty_iids.clear()
@@ -4910,28 +5021,32 @@ class RadarState:
                     })
                     return
                 analysis_cutoff_us = now_us - int(ROTATION_ANALYSIS_MAX_AGE_S * 1_000_000)
+                # Keep events_snapshot for non-analysis consumers (TDOA pair generation etc.)
                 events_snapshot = [
                     ev for ev in self._iid_events
                     if ev[0] >= analysis_cutoff_us and ev[1] in due_iids
                 ]
+                # Build burst record snapshot for rotation analysis
+                by_iid_bursts: dict[int, list] = {}
+                for iid in due_iids:
+                    br_deque = self._burst_records.get(iid)
+                    if br_deque:
+                        relevant = [r for r in br_deque if r.centroid_us >= analysis_cutoff_us]
+                        if relevant:
+                            by_iid_bursts[iid] = relevant
 
-            if not events_snapshot:
-                return
             event_count = len(events_snapshot)
+            if not by_iid_bursts:
+                return
 
-            # Group by IID
-            by_iid: dict[int, list] = defaultdict(list)
-            for ev in events_snapshot:
-                if ev[1] in due_iids:
-                    by_iid[ev[1]].append(ev)
-            if max_iids_per_call is not None and max_iids_per_call > 0 and len(by_iid) > max_iids_per_call:
-                ranked_iids = sorted(by_iid, key=lambda iid: len(by_iid[iid]), reverse=True)
+            if max_iids_per_call is not None and max_iids_per_call > 0 and len(by_iid_bursts) > max_iids_per_call:
+                ranked_iids = sorted(by_iid_bursts, key=lambda iid: len(by_iid_bursts[iid]), reverse=True)
                 deferred_iids = set(ranked_iids[max_iids_per_call:])
-                by_iid = {iid: by_iid[iid] for iid in ranked_iids[:max_iids_per_call]}
+                by_iid_bursts = {iid: by_iid_bursts[iid] for iid in ranked_iids[:max_iids_per_call]}
                 with self._lock:
                     self._dirty_iids.update(deferred_iids)
 
-            if not by_iid:
+            if not by_iid_bursts:
                 record_rotation_update_timing({
                     "ts_s": time.time(),
                     "total_ms": round((time.perf_counter() - t0) * 1000, 2),
@@ -4951,7 +5066,7 @@ class RadarState:
                 model = self._models.get(iid)
                 return ((model.last_updated if model is not None else 0.0) or 0.0, iid)
 
-            ordered_iids = sorted(by_iid, key=_iid_priority)
+            ordered_iids = sorted(by_iid_bursts, key=_iid_priority)
 
             # Refresh the live-frame-builder tracker with current aircraft positions.
             # The live path (_on_df11_frame_builder) uses this for real-time burst
@@ -4982,31 +5097,27 @@ class RadarState:
             history_fetch_s = 0.0
             cache_build_s = 0.0
             unprocessed_iids: set[int] = set()
-            event_cap = self._ROTATION_ANALYSIS_MAX_EVENTS_PER_IID
+            burst_cap = self._ROTATION_ANALYSIS_MAX_EVENTS_PER_IID
             min_delta = self._ROTATION_ANALYSIS_MIN_DELTA
             for index, iid in enumerate(ordered_iids):
-                evs = by_iid[iid]
+                burst_list = by_iid_bursts[iid]
                 prev_count, _prev_ts = self._rotation_analysis_meta.get(iid, (0, 0.0))
                 existing_model = self._models.get(iid)
                 # Skip reanalysis when the IID has an established model and the
-                # event delta since the last run is below threshold.  Newly-seen
-                # IIDs (no prev_count) and IIDs without a model always run.
+                # burst delta since the last run is below threshold.
                 if (
                     existing_model is not None
                     and existing_model.rotation_model is not None
                     and prev_count > 0
-                    and (len(evs) - prev_count) < min_delta
+                    and (len(burst_list) - prev_count) < min_delta
                 ):
                     continue
-                # Tail-slice hot IIDs so a single noisy stream cannot dominate
-                # the rotation update cycle.  The most recent events are the
-                # most relevant to the current rotation model anyway.
-                if event_cap > 0 and len(evs) > event_cap:
-                    evs_for_analysis = evs[-event_cap:]
+                if burst_cap > 0 and len(burst_list) > burst_cap:
+                    burst_list_for_analysis = burst_list[-burst_cap:]
                 else:
-                    evs_for_analysis = evs
-                analysed_models[iid] = _analyse_iid_events(evs_for_analysis)
-                self._rotation_analysis_meta[iid] = (len(evs), time.time())
+                    burst_list_for_analysis = burst_list
+                analysed_models[iid] = _analyse_burst_records(burst_list_for_analysis)
+                self._rotation_analysis_meta[iid] = (len(burst_list), time.time())
                 if budget_s is not None and (time.perf_counter() - t_sweeps) >= budget_s:
                     unprocessed_iids.update(ordered_iids[index + 1:])
                     break
@@ -5048,6 +5159,53 @@ class RadarState:
 
     def is_update_active(self) -> bool:
         return self._update_active.is_set()
+
+    def _build_sweeps_from_burst_records(
+        self, burst_records: list[BurstRecord],
+    ) -> list[dict]:
+        """Build sweep summary dicts from BurstRecord objects.
+
+        Equivalent to _build_sweep_data but consumes already-computed burst
+        centroids rather than raw events. Skips position lookup — callers that
+        need positions must resolve them separately.
+        Returns sweep dicts compatible with update_calibration_pairs / get_sweep_history.
+        """
+        if not burst_records:
+            return []
+        sorted_records = sorted(burst_records, key=lambda r: r.centroid_us)
+
+        # Group into sweeps by CO_SWEEP_WINDOW_US gap between burst centroids
+        sweep_groups: list[list[BurstRecord]] = []
+        current_group: list[BurstRecord] = [sorted_records[0]]
+        sweep_anchor = sorted_records[0].centroid_us
+
+        for rec in sorted_records[1:]:
+            if rec.centroid_us - sweep_anchor < CO_SWEEP_WINDOW_US:
+                current_group.append(rec)
+            else:
+                sweep_groups.append(current_group)
+                current_group = [rec]
+                sweep_anchor = rec.centroid_us
+        sweep_groups.append(current_group)
+
+        result = []
+        for group in sweep_groups:
+            centroid = int(sum(r.centroid_us for r in group) / len(group))
+            aircraft_in_sweep = [
+                {
+                    "icao": r.icao,
+                    "arrivals_us": [r.centroid_us],
+                    "beam_center_us": r.centroid_us,
+                    "signal_dbfs": r.signal_dbfs,
+                }
+                for r in group
+            ]
+            result.append({
+                "centroid_us": centroid,
+                "n_aircraft": len(group),
+                "aircraft": aircraft_in_sweep,
+            })
+        return result
 
     def _build_sweep_data(
         self, events: list, position_cache: dict[tuple[str, int], dict | None],
@@ -5375,15 +5533,16 @@ class RadarState:
 
     def _compute_sweep_history_for_iid(self, iid: int) -> list[dict]:
         with self._lock:
-            if not self._iid_events:
+            br_deque = self._burst_records.get(iid)
+            if not br_deque:
                 return []
-            events_snapshot = [ev for ev in self._iid_events if ev[1] == iid]
-            latest_arrival_us = self._iid_events[-1][0]
+            records_snapshot = list(br_deque)
+            latest_arrival_us = br_deque[-1].centroid_us
 
-        if not events_snapshot:
+        if not records_snapshot:
             return []
 
-        active_icaos = {icao for _arrival_us, _iid, icao, _sig in events_snapshot if icao}
+        active_icaos = {r.icao for r in records_snapshot if r.icao}
         pos_histories: dict[str, list[tuple]] = {}
         if self._aircraft_state is not None and active_icaos:
             try:
@@ -5391,20 +5550,21 @@ class RadarState:
             except Exception:
                 pos_histories = {}
 
-        position_cache: dict[tuple[str, int], dict | None] = {}
-        icao_samples: dict[str, list[tuple[int, float | None]]] = defaultdict(list)
-        for arrival_us, _ev_iid, icao, signal_dbfs in events_snapshot:
-            if icao:
-                icao_samples[icao].append((arrival_us, signal_dbfs))
-        for icao, samples in icao_samples.items():
-            for burst in detect_bursts_with_signals(samples):
-                beam_center_us = burst.get("beam_center_us", burst["centroid_us"])
-                key = (icao, beam_center_us)
-                if key not in position_cache:
-                    position_cache[key] = self._nearest_pos_from_histories(
+        sweeps = self._build_sweeps_from_burst_records(records_snapshot)
+        # Enrich with positions from history
+        for sweep in sweeps:
+            for ac_entry in sweep.get("aircraft", []):
+                icao = ac_entry.get("icao")
+                beam_center_us = ac_entry.get("beam_center_us")
+                if icao and beam_center_us is not None:
+                    pos = self._nearest_pos_from_histories(
                         pos_histories, latest_arrival_us, icao, int(beam_center_us)
                     )
-        sweeps = self._build_sweep_data(events_snapshot, position_cache)
+                    if pos and pos.get("lat") is not None:
+                        ac_entry["lat"] = pos["lat"]
+                        ac_entry["lon"] = pos["lon"]
+                        ac_entry["interpolated"] = pos.get("interpolated", False)
+
         with self._lock:
             if iid not in self._sweep_history:
                 self._sweep_history[iid] = deque(maxlen=self._SWEEP_HISTORY_MAX)
@@ -5431,33 +5591,49 @@ class RadarState:
     def get_iid_activity(self, window_s: float = 600.0) -> dict[int, dict]:
         """Return per-IID activity within the last window_s seconds of Beast time."""
         with self._lock:
-            if not self._iid_events:
+            if not self._burst_records:
                 return {}
-            now_us = self._iid_events[-1][0]
+            # Determine "now" from the latest burst centroid across all IIDs
+            now_us = max(
+                (br_deque[-1].centroid_us for br_deque in self._burst_records.values() if br_deque),
+                default=None,
+            )
+            if now_us is None:
+                return {}
             cutoff_us = now_us - int(window_s * 1_000_000)
-            events_snapshot = list(self._iid_events)
+            burst_snapshot = {iid: list(deq) for iid, deq in self._burst_records.items()}
 
         activity: dict[int, dict] = {}
-        for arrival_us, iid, icao, _sig in events_snapshot:
-            if arrival_us < cutoff_us:
-                continue
-            entry = activity.get(iid)
-            if entry is None:
-                activity[iid] = {"count": 1, "last_us": arrival_us, "latest_icao": icao}
-            else:
-                entry["count"] += 1
-                if arrival_us >= entry["last_us"]:
-                    entry["last_us"] = arrival_us
-                    if icao:
-                        entry["latest_icao"] = icao
+        for iid, records in burst_snapshot.items():
+            for rec in records:
+                if rec.centroid_us < cutoff_us:
+                    continue
+                entry = activity.get(iid)
+                if entry is None:
+                    activity[iid] = {
+                        "count": rec.n_replies,
+                        "last_us": rec.centroid_us,
+                        "latest_icao": rec.icao,
+                    }
+                else:
+                    entry["count"] += rec.n_replies
+                    if rec.centroid_us >= entry["last_us"]:
+                        entry["last_us"] = rec.centroid_us
+                        if rec.icao:
+                            entry["latest_icao"] = rec.icao
         return activity
 
     def get_latest_arrival_us(self) -> float | None:
         """Return the latest Beast-relative arrival timestamp seen by the radar state."""
         with self._lock:
-            if not self._iid_events:
-                return None
-            return self._iid_events[-1][0]
+            latest = max(
+                (br_deque[-1].centroid_us for br_deque in self._burst_records.values() if br_deque),
+                default=None,
+            )
+            if latest is not None:
+                return latest
+            # Fallback to raw events while _burst_records is warming up
+            return self._iid_events[-1][0] if self._iid_events else None
 
     def get_iid_latest_arrival_us(self, iid: int) -> float | None:
         """Return the latest Beast-relative arrival timestamp seen for one IID."""
@@ -5465,20 +5641,20 @@ class RadarState:
             return self._iid_latest_arrival_us.get(iid)
 
     def get_iid_timeline(self, iid: int, window_s: float = 30.0) -> dict:
-        """Return per-ICAO arrival timestamps for a single IID."""
-        icao_arrivals: dict[str, list[int]] = defaultdict(list)
+        """Return per-ICAO burst centroid timestamps for a single IID."""
         with self._lock:
-            if not self._iid_events:
+            br_deque = self._burst_records.get(iid)
+            if not br_deque:
                 return {}
-            now_us = self._iid_events[-1][0]
+            now_us = br_deque[-1].centroid_us
             cutoff_us = now_us - int(window_s * 1_000_000)
-            for arrival_us, ev_iid, icao, _sig in reversed(self._iid_events):
-                if arrival_us < cutoff_us:
-                    break
-                if ev_iid == iid and icao:
-                    icao_arrivals[icao].append(arrival_us)
+            records_snapshot = list(br_deque)
 
-        return {icao: list(reversed(arrivals)) for icao, arrivals in icao_arrivals.items()}
+        icao_arrivals: dict[str, list[float]] = defaultdict(list)
+        for rec in records_snapshot:
+            if rec.centroid_us >= cutoff_us and rec.icao:
+                icao_arrivals[rec.icao].append(rec.centroid_us)
+        return dict(icao_arrivals)
 
     def _build_df11_residual_observations(
         self,
@@ -5916,41 +6092,51 @@ class RadarState:
             self._live_sync_snapshot_seq[iid] = sequence
 
         burst_timeline = self.get_burst_sync_timeline(iid, window_s=window_s)
-        sync_debug = self.get_sync_debug_payload(iid, window_s=window_s, limit=debug_limit)
-        compact_debug_observations = []
-        for row in sync_debug.get("observations", []):
-            compact_debug_observations.append({
-                "iid": row.get("iid"),
-                "icao": row.get("icao"),
-                "effective_beast_us": row.get("effective_beast_us"),
-                "burst_center_beast_us": row.get("burst_center_beast_us"),
-                "residual_raw_deg": row.get("residual_raw_deg"),
-                "resid_authoritative_deg": row.get("resid_authoritative_deg"),
-                "fit_slope_deg_per_s": row.get("fit_slope_deg_per_s"),
-                "time_offset_s": row.get("time_offset_s"),
-                "detrend_component_deg": row.get("detrend_component_deg"),
-                "residual_detrended_deg": row.get("residual_detrended_deg"),
-                "phase_deg": row.get("phase_deg"),
-                "phase_authoritative_deg": row.get("phase_authoritative_deg"),
-                "cycle_index": row.get("cycle_index"),
-                "cycle_start_beast_us": row.get("cycle_start_beast_us"),
-                "fit_eligible": row.get("fit_eligible"),
-                "fit_reject_reason": row.get("fit_reject_reason"),
-            })
-        compact_sync_debug = {
-            "iid": sync_debug.get("iid", iid),
-            "available": sync_debug.get("available", False),
-            "reason": sync_debug.get("reason"),
-            "sync_state": sync_debug.get("sync_state"),
-            "summary": sync_debug.get("summary", {}),
-            "observations": compact_debug_observations,
-            "observation_model_diagnostics": {
-                "folded_phase_shape": (
-                    sync_debug.get("observation_model_diagnostics", {}).get("folded_phase_shape", {})
-                ),
-            },
-            "advanced_available_via": f"/api/radar/iids/{iid}/sync-debug",
-        }
+        if RADAR_DIAGNOSTICS:
+            sync_debug = self.get_sync_debug_payload(iid, window_s=window_s, limit=debug_limit)
+            compact_debug_observations = []
+            for row in sync_debug.get("observations", []):
+                compact_debug_observations.append({
+                    "iid": row.get("iid"),
+                    "icao": row.get("icao"),
+                    "effective_beast_us": row.get("effective_beast_us"),
+                    "burst_center_beast_us": row.get("burst_center_beast_us"),
+                    "residual_raw_deg": row.get("residual_raw_deg"),
+                    "resid_authoritative_deg": row.get("resid_authoritative_deg"),
+                    "fit_slope_deg_per_s": row.get("fit_slope_deg_per_s"),
+                    "time_offset_s": row.get("time_offset_s"),
+                    "detrend_component_deg": row.get("detrend_component_deg"),
+                    "residual_detrended_deg": row.get("residual_detrended_deg"),
+                    "phase_deg": row.get("phase_deg"),
+                    "phase_authoritative_deg": row.get("phase_authoritative_deg"),
+                    "cycle_index": row.get("cycle_index"),
+                    "cycle_start_beast_us": row.get("cycle_start_beast_us"),
+                    "fit_eligible": row.get("fit_eligible"),
+                    "fit_reject_reason": row.get("fit_reject_reason"),
+                })
+            compact_sync_debug = {
+                "iid": sync_debug.get("iid", iid),
+                "available": sync_debug.get("available", False),
+                "reason": sync_debug.get("reason"),
+                "sync_state": sync_debug.get("sync_state"),
+                "summary": sync_debug.get("summary", {}),
+                "observations": compact_debug_observations,
+                "observation_model_diagnostics": {
+                    "folded_phase_shape": (
+                        sync_debug.get("observation_model_diagnostics", {}).get("folded_phase_shape", {})
+                    ),
+                },
+                "advanced_available_via": f"/api/radar/iids/{iid}/sync-debug",
+            }
+        else:
+            compact_sync_debug = {
+                "iid": iid,
+                "available": False,
+                "reason": "RADAR_DIAGNOSTICS not enabled",
+                "observations": [],
+                "summary": {},
+                "advanced_available_via": f"/api/radar/iids/{iid}/sync-debug",
+            }
         snapshot = {
             "type": "radar_sync",
             "iid": iid,
@@ -7207,6 +7393,11 @@ class RadarState:
         with self._lock:
             models_snapshot = dict(self._models)
             latest_arrival_us = self._iid_events[-1][0] if self._iid_events else None
+            if latest_arrival_us is None:
+                # Fall back to most recent burst record centroid
+                for br_deque in self._burst_records.values():
+                    if br_deque:
+                        latest_arrival_us = max(latest_arrival_us or 0, br_deque[-1].centroid_us)
             seen_pair_keys = set(self._seen_pair_keys)
             if latest_arrival_us is None:
                 return []
@@ -7226,19 +7417,17 @@ class RadarState:
                         sweep for sweep in history
                         if sweep.get("centroid_us") is not None and sweep["centroid_us"] >= cutoff_us
                     ]
-            recent_events_by_iid: dict[int, list[tuple[float, int, str, float | None]]] = defaultdict(list)
-            for event in reversed(self._iid_events):
-                arrival_us, iid, icao, signal_dbfs = event
-                if arrival_us < cutoff_us:
-                    break
-                if iid in eligible_iids:
-                    recent_events_by_iid[iid].append((arrival_us, iid, icao, signal_dbfs))
+            # Snapshot recent burst records per eligible IID for fallback sweep rebuild
+            recent_bursts_by_iid: dict[int, list] = {}
+            for iid in eligible_iids:
+                br_deque = self._burst_records.get(iid)
+                if br_deque:
+                    relevant = [r for r in br_deque if r.centroid_us >= cutoff_us]
+                    if relevant:
+                        recent_bursts_by_iid[iid] = relevant
 
-        for iid, events in recent_events_by_iid.items():
-            if not events:
-                continue
-            events.reverse()
-            rebuilt_sweeps = self._build_sweep_data(events, {})
+        for iid, burst_list in recent_bursts_by_iid.items():
+            rebuilt_sweeps = self._build_sweeps_from_burst_records(burst_list)
             if rebuilt_sweeps and not sweep_snapshot.get(iid):
                 sweep_snapshot[iid] = rebuilt_sweeps
 

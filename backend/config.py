@@ -222,6 +222,12 @@ RADAR_UPDATE_BUDGET_MS: float = float(os.getenv("RADAR_UPDATE_BUDGET_MS", "750")
 RADAR_IID_WS_REBUILD_INTERVAL_S: float = float(os.getenv("RADAR_IID_WS_REBUILD_INTERVAL_S", "5.0"))
 RADAR_COINCIDENT_BACKGROUND_ENABLED: bool = _bool("RADAR_COINCIDENT_BACKGROUND_ENABLED", False)
 
+# Enable radar diagnostics endpoints and hot-path debug instrumentation.
+# When False (default): flash events, burst sync timeline, and other
+# diagnostics-only structures are not populated, saving CPU and memory.
+# Set to True (or "1") on development/server deployments for full diagnostics.
+RADAR_DIAGNOSTICS: bool = _bool("RADAR_DIAGNOSTICS", False)
+
 # Live radar sync refinement feature flags.
 # period refinement: derive a small correction to period_s from the residual
 # slope of recent multi-aircraft burst observations, on top of the aggregate

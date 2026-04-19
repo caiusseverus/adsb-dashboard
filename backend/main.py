@@ -2133,6 +2133,53 @@ async def radar_iid_sync_websocket_endpoint(ws: WebSocket, iid: int) -> None:
         log.debug("Radar IID sync WebSocket error: %s", exc)
 
 
+@app.websocket("/ws/radar/live")
+async def radar_live_websocket_endpoint(ws: WebSocket) -> None:
+    """Lean change-driven multi-IID live-state stream.
+
+    Emits a payload per changed IID whenever sync or localiser state changes
+    (rate-limited to 500ms per emission). A heartbeat fires every 5s regardless
+    of change so the frontend can detect a stale connection.
+    """
+    await ws.accept()
+    last_signature: tuple = ()
+    last_heartbeat: float = 0.0
+    last_emission: float = 0.0
+    _RATE_LIMIT_S = 0.5
+    _HEARTBEAT_S = 5.0
+    try:
+        # Send current state immediately on connect
+        if radar_state is not None:
+            payload = radar_api.build_radar_live_state_payload(radar_state)
+            await ws.send_text(_json_dumps(payload))
+            last_signature = radar_api._radar_live_signature(radar_state)
+            last_heartbeat = time.time()
+            last_emission = last_heartbeat
+        while True:
+            try:
+                await asyncio.wait_for(ws.receive_text(), timeout=0.2)
+            except asyncio.TimeoutError:
+                pass
+            now = time.time()
+            sig = radar_api._radar_live_signature(radar_state)
+            if sig != last_signature and now - last_emission >= _RATE_LIMIT_S:
+                payload = radar_api.build_radar_live_state_payload(radar_state)
+                await ws.send_text(_json_dumps(payload))
+                last_signature = sig
+                last_emission = now
+                last_heartbeat = now
+            elif now - last_heartbeat >= _HEARTBEAT_S:
+                await ws.send_text(_json_dumps({
+                    "type": "radar_live_heartbeat",
+                    "server_ts": now,
+                }))
+                last_heartbeat = now
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        log.debug("Radar live WebSocket error: %s", exc)
+
+
 @app.get("/api/stats")
 async def get_stats() -> dict:
     """HTTP fallback – returns the same snapshot the WebSocket streams."""

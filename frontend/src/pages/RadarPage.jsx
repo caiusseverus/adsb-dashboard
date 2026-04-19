@@ -57,29 +57,84 @@ function readinessColor(readiness) {
   }
 }
 
-function useRotationRows() {
-  const [refreshKey, setRefreshKey] = useState(0)
-  const [rows, setRows] = useState([])
+const ROLLING_HISTORY_MAX = 300
+
+function useRadarLiveStream() {
+  const [iidMap, setIidMap] = useState({})
+  const rollingHistoryRef = useRef({})
 
   useEffect(() => {
-    let cancelled = false
-    async function poll() {
-      try {
-        const r = await fetch(`${API_BASE}/api/radar/rotation`)
-        if (!r.ok) return
-        const data = await r.json()
-        if (!cancelled) setRows(Array.isArray(data) ? data : [])
-      } catch {}
-    }
-    poll()
-    const id = setInterval(poll, 5000)
-    return () => {
-      cancelled = true
-      clearInterval(id)
-    }
-  }, [refreshKey])
+    let ws = null
+    let closed = false
+    let retryTimeout = null
 
-  return { rows, refresh: () => setRefreshKey(v => v + 1) }
+    function connect() {
+      if (closed) return
+      ws = new WebSocket(`${RADAR_SYNC_WS_BASE}/ws/radar/live`)
+
+      ws.onmessage = event => {
+        try {
+          const msg = JSON.parse(event.data)
+          if (msg.type !== 'radar_live') return
+          const ts = msg.server_ts
+          for (const entry of msg.iids) {
+            const prev = rollingHistoryRef.current[entry.iid] ?? { period: [], jitter: [], residual: [], cep: [] }
+            const push = (arr, v) => v != null ? [...arr.slice(-(ROLLING_HISTORY_MAX - 1)), { ts, v }] : arr
+            rollingHistoryRef.current[entry.iid] = {
+              period:   push(prev.period,   entry.period_s),
+              jitter:   push(prev.jitter,   entry.sync?.sync_jitter_deg),
+              residual: push(prev.residual, entry.sync?.residual_ema_deg),
+              cep:      push(prev.cep,      entry.localiser?.cep_m),
+            }
+          }
+          setIidMap(prev => {
+            const next = { ...prev }
+            for (const entry of msg.iids) next[entry.iid] = entry
+            return next
+          })
+        } catch {}
+      }
+
+      ws.onclose = () => {
+        if (!closed) retryTimeout = setTimeout(connect, 3000)
+      }
+    }
+
+    connect()
+    return () => {
+      closed = true
+      clearTimeout(retryTimeout)
+      ws?.close()
+    }
+  }, [])
+
+  const rows = useMemo(
+    () => Object.values(iidMap).sort((a, b) => a.iid - b.iid).map(entry => {
+      const loc = entry.localiser ?? {}
+      return {
+        iid: entry.iid,
+        status: entry.status,
+        period_s: entry.period_s,
+        period_std_s: entry.period_std_s,
+        rpm: entry.rpm,
+        last_updated: entry.last_updated,
+        ref_icao: entry.ref_icao,
+        fm_cep_m: loc.source !== 'manual' ? loc.cep_m : null,
+        fm_lat: loc.source !== 'manual' ? loc.lat : null,
+        display_lat: loc.lat,
+        display_lon: loc.lon,
+        display_source: loc.source,
+        manual_lat: loc.source === 'manual' ? loc.lat : null,
+        manual_lon: loc.source === 'manual' ? loc.lon : null,
+        manual_note: entry.manual_note,
+        unresolvable_reason: entry.unresolvable_reason,
+        sync: entry.sync,
+      }
+    }),
+    [iidMap],
+  )
+
+  return { rows, iidMap, rollingHistory: rollingHistoryRef }
 }
 
 function smoothAxisMax(nextTarget, axisState, nowMs) {
@@ -4865,7 +4920,7 @@ function ConvergencePlot({ iid }) {
 }
 
 export default function RadarPage() {
-  const { rows, refresh: refreshRows } = useRotationRows()
+  const { rows, iidMap, rollingHistory } = useRadarLiveStream()
   const [selectedIid, setSelectedIid] = useState(null)
   const [selectedIcao, setSelectedIcao] = useState(null)
   const [selectedFrame, setSelectedFrame] = useState(null)
@@ -4904,14 +4959,12 @@ export default function RadarPage() {
       await resetAllRadarLearning()
       setSelectedIid(null)
       setSelectedIcao(null)
-      refreshRows()
       setControlRefreshKey(v => v + 1)
     } catch {}
     setResettingAll(false)
   }
 
   function handleChanged() {
-    refreshRows()
     setControlRefreshKey(v => v + 1)
   }
 

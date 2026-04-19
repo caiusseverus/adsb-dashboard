@@ -1306,6 +1306,9 @@ async def get_burst_sync_timeline(iid: int, window_s: float = Query(default=60.0
     classification against the current sync model. Payloads include observations
     that did not steer sync updates so visual diagnostics are not artificially sparse.
     """
+    import config as _config
+    if not _config.RADAR_DIAGNOSTICS:
+        return {"observations": [], "sync_state": None, "window_s": window_s, "diagnostics_disabled": True}
     t0 = time.perf_counter()
     try:
         if _state is None:
@@ -1328,6 +1331,16 @@ async def get_iid_sync_debug(
     Wall-clock-derived prediction is included only as a diagnostic comparison;
     operational sync math remains Beast-relative.
     """
+    import config as _config
+    if not _config.RADAR_DIAGNOSTICS:
+        return {
+            "iid": iid,
+            "available": False,
+            "reason": "RADAR_DIAGNOSTICS not enabled",
+            "observations": [],
+            "summary": {"iid": iid, "wall_clock_used_operationally": False},
+            "diagnostics_disabled": True,
+        }
     t0 = time.perf_counter()
     try:
         if _state is None:
@@ -1390,7 +1403,14 @@ async def get_iid_control(iid: int):
 
 @router.get("/iids/{iid}/solution-comparison")
 async def get_iid_solution_comparison(iid: int):
-    """Compare available localisation methods and expose the selected final result."""
+    """Compare available localisation methods and expose the selected final result.
+
+    Diagnostics-only: the active position is available from /api/radar/live/latest.
+    """
+    import config as _config
+    if not _config.RADAR_DIAGNOSTICS:
+        return {"iid": iid, "available": False, "reason": "RADAR_DIAGNOSTICS not enabled",
+                "methods": [], "diagnostics_disabled": True}
     t0 = time.perf_counter()
     try:
         if _state is None:
@@ -1637,6 +1657,9 @@ async def get_all_rotation():
 @router.get("/iids/{iid}/sweeps")
 async def get_iid_sweeps(iid: int, n: int = Query(default=30, ge=1, le=200)):
     """Burst centroids per sweep for waterfall visualisation."""
+    import config as _config
+    if not _config.RADAR_DIAGNOSTICS:
+        return {"iid": iid, "sweeps": [], "diagnostics_disabled": True}
     if _state is None:
         return {"iid": iid, "sweeps": []}
 
@@ -2349,7 +2372,12 @@ async def get_iid_fm_location(iid: int):
 
 @router.get("/iids/{iid}/fm-convergence")
 async def get_iid_fm_convergence(iid: int):
-    """Position convergence history for the forward model."""
+    """Position convergence history for the forward model.
+
+    Always-on path returns the last 20 entries (most recent fixes).
+    Full history requires RADAR_DIAGNOSTICS=1.
+    """
+    import config as _config
     if _state is None:
         return {"iid": iid, "history": []}
 
@@ -2357,10 +2385,11 @@ async def get_iid_fm_convergence(iid: int):
     if model is None:
         return {"iid": iid, "history": []}
 
-    return {
-        "iid": iid,
-        "history": model.fm_convergence_history,
-    }
+    history = model.fm_convergence_history
+    if not _config.RADAR_DIAGNOSTICS:
+        history = history[-20:] if len(history) > 20 else history
+
+    return {"iid": iid, "history": history}
 
 
 @router.post("/iids/{iid}/fm-reset")
@@ -3149,6 +3178,9 @@ def get_df11_flash(iid: int, since: int = Query(0)):
     Poll at ~100ms for real-time sweep diagram dot flashing.
     Returns {events: [{seq, icao, ts_us}], seq: <latest_seq>}.
     """
+    import config as _config
+    if not _config.RADAR_DIAGNOSTICS:
+        return {"events": [], "seq": since, "diagnostics_disabled": True}
     if _state is None:
         return {"events": [], "seq": 0}
     events = [
@@ -3157,6 +3189,89 @@ def get_df11_flash(iid: int, since: int = Query(0)):
         if ev_iid == iid and seq > since
     ]
     return {"events": events, "seq": events[-1]["seq"] if events else since}
+
+
+# ---------------------------------------------------------------------------
+# Lean live-state stream (Stage 7)
+# ---------------------------------------------------------------------------
+
+def build_radar_live_state_payload(state: "RadarState" | None) -> dict:
+    """Build the lean multi-IID live-state payload for /ws/radar/live.
+
+    One entry per active IID: current period, sync health, localiser result.
+    No observation arrays — frontend accumulates rolling history from this stream.
+    """
+    server_ts = time.time()
+    if state is None:
+        return {"type": "radar_live", "server_ts": server_ts, "iids": []}
+
+    models = state.get_all_rotation_models()
+    iids_out = []
+    with state._lock:
+        for iid, model in sorted(models.items()):
+            sync = state._live_sync_states.get(iid)
+            entry: dict = {
+                "iid": iid,
+                "status": model.status,
+                "period_s": model.period_s,
+                "period_std_s": model.period_std_s,
+                "rpm": model.rpm,
+                "last_updated": model.last_updated,
+                "ref_icao": model.reference_aircraft.ref_icao if model.reference_aircraft else None,
+                # Localiser best-estimate (first non-None source wins: manual > CI > FM > TDOA)
+                "localiser": _authoritative_position(model),
+                # Operator-set labels (slow-changing, needed for IID table)
+                "manual_note": model.manual_note,
+                "unresolvable_reason": model.unresolvable_reason,
+                # Sync health — None when no sync state yet
+                "sync": None,
+            }
+            if sync is not None:
+                entry["sync"] = {
+                    "period_s": sync.period_s,
+                    "period_correction_ppm": sync.period_correction_ppm,
+                    "period_correction_status": sync.period_correction_status,
+                    "sync_jitter_deg": sync.sync_jitter_deg,
+                    "residual_ema_deg": sync.residual_ema_deg,
+                    "n_sync_frames": sync.n_sync_frames,
+                    "n_rejected_frames": sync.n_rejected_frames,
+                    "holdover": sync.holdover,
+                    "phase_anchor_icao": sync.phase_anchor_icao,
+                    "fit_support_count": sync.n_burst_obs_inliers,
+                    "fit_reject_count": sync.n_burst_obs_rejected,
+                    "usable": sync.usable,
+                }
+            iids_out.append(entry)
+
+    return {"type": "radar_live", "server_ts": server_ts, "iids": iids_out}
+
+
+def _radar_live_signature(state: "RadarState" | None) -> tuple:
+    """Lightweight change-detection signature across all active IIDs."""
+    if state is None:
+        return ()
+    sig_parts = []
+    with state._lock:
+        for iid, model in state._models.items():
+            sync = state._live_sync_states.get(iid)
+            sig_parts.append((
+                iid,
+                model.period_s,
+                model.last_updated,
+                model.lat, model.lon,
+                model.fm_lat, model.fm_lon,
+                getattr(sync, "last_sync_update_ts", None),
+                getattr(sync, "period_s", None),
+                getattr(sync, "n_sync_frames", None),
+                getattr(sync, "holdover", None),
+            ))
+    return tuple(sig_parts)
+
+
+@router.get("/live/latest")
+async def get_radar_live_latest():
+    """Current lean live-state snapshot for all active IIDs (initial page load)."""
+    return build_radar_live_state_payload(_state)
 
 
 @router.get("/adsb-tracker")

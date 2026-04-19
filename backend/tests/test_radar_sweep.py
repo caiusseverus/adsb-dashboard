@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import config
 import pytest
 from radar.sweep import _analyse_iid_events
-from radar.models import LiveFrameState, RadarIID, ReferenceAircraftInfo, RotationModel
+from radar.models import BurstRecord, LiveFrameState, RadarIID, ReferenceAircraftInfo, RotationModel
 from radar.sweep import (
     AlignedBurstSyncObs,
     IcaoSyncQuality,
@@ -351,12 +351,15 @@ def test_get_iid_latest_arrival_us_tracks_and_clears_per_iid():
 
 def test_get_iid_timeline_returns_recent_selected_iid_in_ascending_order():
     state = RadarState()
-    state._iid_events = deque([
-        (1_000_000, 7, "OLD777", None),
-        (8_000_000, 8, "OTHER8", None),
-        (9_000_000, 7, "ABC123", None),
-        (10_000_000, 7, "ABC123", None),
-        (11_000_000, 7, "DEF456", None),
+    # Entries must be in centroid_us order; last entry defines "now" for window cutoff
+    state._burst_records[7] = deque([
+        BurstRecord(iid=7, icao="OLD777", centroid_us=1_000_000, n_replies=1),
+        BurstRecord(iid=7, icao="ABC123", centroid_us=9_000_000, n_replies=1),
+        BurstRecord(iid=7, icao="ABC123", centroid_us=10_000_000, n_replies=1),
+        BurstRecord(iid=7, icao="DEF456", centroid_us=11_000_000, n_replies=1),
+    ])
+    state._burst_records[8] = deque([
+        BurstRecord(iid=8, icao="OTHER8", centroid_us=8_000_000, n_replies=1),
     ])
 
     timeline = state.get_iid_timeline(7, window_s=3.0)
@@ -770,8 +773,11 @@ def test_period_refinement_uses_effective_time_slope_and_correct_sign(monkeypatc
 
 
 def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monkeypatch):
+    import config as _cfg
     import radar.sweep as sweep_module
 
+    monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", True)
+    monkeypatch.setattr("radar.sweep.RADAR_DIAGNOSTICS", True)
     monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
 
     state = RadarState()
@@ -1038,11 +1044,13 @@ def test_update_rotation_models_requeues_iids_left_outside_runtime_budget(monkey
     import radar.sweep as sweep_module
 
     state = RadarState()
-    state._iid_events = deque([
-        (1_000_000, 7, "AAAAAA", None),
-        (2_000_000, 8, "BBBBBB", None),
-        (3_000_000, 7, "AAAAAA", None),
-        (4_000_000, 8, "BBBBBB", None),
+    state._burst_records[7] = deque([
+        BurstRecord(iid=7, icao="AAAAAA", centroid_us=1_000_000, n_replies=1),
+        BurstRecord(iid=7, icao="AAAAAA", centroid_us=3_000_000, n_replies=1),
+    ])
+    state._burst_records[8] = deque([
+        BurstRecord(iid=8, icao="BBBBBB", centroid_us=2_000_000, n_replies=1),
+        BurstRecord(iid=8, icao="BBBBBB", centroid_us=4_000_000, n_replies=1),
     ])
     state._dirty_iids = {7, 8}
     state._models = {
@@ -1052,8 +1060,8 @@ def test_update_rotation_models_requeues_iids_left_outside_runtime_budget(monkey
 
     analysed_iids = []
 
-    def fake_analyse(events):
-        analysed_iids.append(events[0][1])
+    def fake_analyse(records):
+        analysed_iids.append(records[0].iid)
         return RotationModel(dominant_period_s=4.0, primary_direct_count=4, status="LIKELY_SINGLE")
 
     perf_values = iter([
@@ -1068,7 +1076,7 @@ def test_update_rotation_models_requeues_iids_left_outside_runtime_budget(monkey
         11.004, # record total
     ])
 
-    monkeypatch.setattr(sweep_module, "_analyse_iid_events", fake_analyse)
+    monkeypatch.setattr(sweep_module, "_analyse_burst_records", fake_analyse)
     monkeypatch.setattr(sweep_module.time, "perf_counter", lambda: next(perf_values))
 
     state.update_rotation_models(max_runtime_ms=100.0)
@@ -1544,9 +1552,9 @@ def test_update_calibration_pairs_builds_recent_sweeps_from_live_events_when_cac
     monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
 
     state = RadarState(aircraft_state=None, track_store=None)
-    state._iid_events = deque([
-        (5_000_000, 7, "AAAAAA", None),
-        (5_002_000, 7, "BBBBBB", None),
+    state._burst_records[7] = deque([
+        BurstRecord(iid=7, icao="AAAAAA", centroid_us=5_000_000, n_replies=1),
+        BurstRecord(iid=7, icao="BBBBBB", centroid_us=5_002_000, n_replies=1),
     ])
     state._models = {
         7: RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0),

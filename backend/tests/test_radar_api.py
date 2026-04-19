@@ -10,16 +10,18 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from radar import api as radar_api
-from radar.models import RadarIID, SweepFrame, SweepFrameObservation
+from radar.models import BurstRecord, RadarIID, SweepFrame, SweepFrameObservation
 from radar.sweep import AlignedBurstSyncObs, LiveSyncState, RadarState
 
 
 def test_get_iids_reports_per_iid_last_seen_from_event_times():
     state = RadarState()
-    state._iid_events = deque([
-        (1_000_000, 10, "AAAAAA", None),
-        (1_500_000, 11, "BBBBBB", None),
-        (3_000_000, 10, "CCCCCC", None),
+    state._burst_records[10] = deque([
+        BurstRecord(iid=10, icao="AAAAAA", centroid_us=1_000_000, n_replies=1),
+        BurstRecord(iid=10, icao="CCCCCC", centroid_us=3_000_000, n_replies=1),
+    ])
+    state._burst_records[11] = deque([
+        BurstRecord(iid=11, icao="BBBBBB", centroid_us=1_500_000, n_replies=1),
     ])
     state._models = {
         10: RadarIID(iid=10, status="SINGLE_RADAR", period_s=4.0),
@@ -52,13 +54,13 @@ def test_get_iids_reports_per_iid_last_seen_from_event_times():
 
 def test_get_iid_timeline_includes_primary_harmonic_and_residual_classification():
     state = RadarState()
-    state._iid_events = deque([
-        (1_000_000, 21, "AAAAAA", None),
-        (5_000_000, 21, "AAAAAA", None),
-        (1_500_000, 21, "BBBBBB", None),
-        (9_500_000, 21, "BBBBBB", None),
-        (2_000_000, 21, "CCCCCC", None),
-        (4_000_000, 21, "CCCCCC", None),
+    state._burst_records[21] = deque([
+        BurstRecord(iid=21, icao="AAAAAA", centroid_us=1_000_000, n_replies=1),
+        BurstRecord(iid=21, icao="BBBBBB", centroid_us=1_500_000, n_replies=1),
+        BurstRecord(iid=21, icao="CCCCCC", centroid_us=2_000_000, n_replies=1),
+        BurstRecord(iid=21, icao="CCCCCC", centroid_us=4_000_000, n_replies=1),
+        BurstRecord(iid=21, icao="AAAAAA", centroid_us=5_000_000, n_replies=1),
+        BurstRecord(iid=21, icao="BBBBBB", centroid_us=9_500_000, n_replies=1),
     ])
     state._models = {
         21: RadarIID(
@@ -96,6 +98,9 @@ def test_get_iid_timeline_includes_primary_harmonic_and_residual_classification(
 
 
 def test_get_iid_sync_debug_endpoint_exposes_summary_and_observation(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", True)
+    monkeypatch.setattr("radar.sweep.RADAR_DIAGNOSTICS", True)
     state = RadarState()
     now_ts = 1_000.0
     state._iid_latest_arrival_us[23] = 4_100_000.0
@@ -160,6 +165,9 @@ def test_get_iid_sync_debug_endpoint_exposes_summary_and_observation(monkeypatch
 
 
 def test_get_iid_sync_snapshot_endpoint_combines_fast_sync_payloads(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", True)
+    monkeypatch.setattr("radar.sweep.RADAR_DIAGNOSTICS", True)
     state = RadarState()
     now_ts = 1_000.0
     state._models[23] = RadarIID(iid=23, status="SINGLE_RADAR", period_s=4.0)
@@ -209,11 +217,11 @@ def test_get_iid_sync_snapshot_endpoint_combines_fast_sync_payloads(monkeypatch)
 
 def test_get_iid_timeline_marks_non_primary_family_points_as_residual():
     state = RadarState()
-    state._iid_events = deque([
-        (1_000_000, 21, "AAAAAA", None),
-        (5_000_000, 21, "AAAAAA", None),
-        (2_000_000, 21, "BBBBBB", None),
-        (7_000_000, 21, "BBBBBB", None),
+    state._burst_records[21] = deque([
+        BurstRecord(iid=21, icao="AAAAAA", centroid_us=1_000_000, n_replies=1),
+        BurstRecord(iid=21, icao="BBBBBB", centroid_us=2_000_000, n_replies=1),
+        BurstRecord(iid=21, icao="AAAAAA", centroid_us=5_000_000, n_replies=1),
+        BurstRecord(iid=21, icao="BBBBBB", centroid_us=7_000_000, n_replies=1),
     ])
     state._models = {
         21: RadarIID(
@@ -245,12 +253,12 @@ def test_get_iid_timeline_marks_non_primary_family_points_as_residual():
 
 def test_get_iid_timeline_keeps_primary_points_primary_when_row_has_secondary_series():
     state = RadarState()
-    state._iid_events = deque([
-        (1_000_000, 21, "AAAAAA", None),
-        (5_000_000, 21, "AAAAAA", None),
-        (9_000_000, 21, "AAAAAA", None),
-        (2_000_000, 21, "AAAAAA", None),
-        (7_000_000, 21, "AAAAAA", None),
+    state._burst_records[21] = deque([
+        BurstRecord(iid=21, icao="AAAAAA", centroid_us=1_000_000, n_replies=1),
+        BurstRecord(iid=21, icao="AAAAAA", centroid_us=2_000_000, n_replies=1),
+        BurstRecord(iid=21, icao="AAAAAA", centroid_us=5_000_000, n_replies=1),
+        BurstRecord(iid=21, icao="AAAAAA", centroid_us=7_000_000, n_replies=1),
+        BurstRecord(iid=21, icao="AAAAAA", centroid_us=9_000_000, n_replies=1),
     ])
     state._models = {
         21: RadarIID(
@@ -411,6 +419,8 @@ def test_get_iid_pipeline_health_reports_live_sweep_frames():
 
 
 def test_get_iid_sweeps_uses_precomputed_sweep_positions_without_relookup(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", True)
     state = RadarState()
     state._models = {
         7: RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=51.5, lon=-1.5),
@@ -523,7 +533,9 @@ def test_reset_all_radar_learning_clears_memory_and_db(monkeypatch):
     assert list(state._iid_events) == []
 
 
-def test_get_iid_sweeps_includes_range_and_azimuth_when_position_is_available():
+def test_get_iid_sweeps_includes_range_and_azimuth_when_position_is_available(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", True)
     state = RadarState()
     state._sweep_history = {
         7: deque([
@@ -574,7 +586,9 @@ def test_get_iid_sweeps_includes_range_and_azimuth_when_position_is_available():
     assert entry["interpolated"] is True
 
 
-def test_get_iid_sweeps_suppresses_azimuth_for_non_localisable_iid():
+def test_get_iid_sweeps_suppresses_azimuth_for_non_localisable_iid(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", True)
     state = RadarState()
     state._sweep_history = {
         62: deque([
@@ -891,7 +905,9 @@ def test_get_iid_location_prefers_manual_when_locked():
     assert payload["display_source"] == "manual"
 
 
-def test_solution_comparison_prefers_best_automatic_method():
+def test_solution_comparison_prefers_best_automatic_method(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", True)
     state = RadarState()
     state._models = {
         30: RadarIID(
@@ -940,7 +956,9 @@ def test_solution_comparison_prefers_best_automatic_method():
     assert methods["combined"]["status"] == "solved"
 
 
-def test_solution_comparison_reports_tdoa_inactive_when_pairs_exist_but_no_solution():
+def test_solution_comparison_reports_tdoa_inactive_when_pairs_exist_but_no_solution(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", True)
     state = RadarState()
     state._models = {
         30: RadarIID(

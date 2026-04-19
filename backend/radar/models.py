@@ -158,6 +158,32 @@ class RadarIID:
 
 
 @dataclass
+class BurstRecord:
+    """Compact operational record emitted when a burst fires.
+
+    Core fields are always populated immediately when the burst centroid is computed.
+    Enrichment fields are optional and layered on after ADS-B position lookup.
+    Retained per-IID for the operational window needed by rotation analysis,
+    sync fitting, and TDOA pair generation — not as a visual/debug history.
+    """
+    # Core — set when burst fires
+    iid: int
+    icao: str
+    centroid_us: float       # Weighted centroid of reply timestamps (µs, Beast monotonic)
+    n_replies: int
+    signal_dbfs: Optional[float] = None
+
+    # Enrichment — set after ADS-B position lookup, if available
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    bearing_deg: Optional[float] = None
+    range_nm: Optional[float] = None
+    pos_age_s: Optional[float] = None
+    dominant_family: bool = False    # True if ICAO belongs to the dominant period family
+    sync_eligible: bool = False      # True if usable for sync-fit observation
+
+
+@dataclass
 class CalibrationPair:
     """One co-sweep TDOA observation between two ADS-B aircraft."""
     iid: int
