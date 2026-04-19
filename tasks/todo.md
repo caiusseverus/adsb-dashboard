@@ -8,6 +8,31 @@ Source inputs:
 Prepared: 2026-04-04
 Updated: 2026-04-06
 
+## 2026-04-19 Radar BurstRecord Refactor Rectification
+
+- [x] Add native fired-burst `BurstRecord` emission with fields matching the Python fallback path
+- [x] Clear `_burst_records` from per-IID and global reset paths and expose it in reset accounting
+- [x] Preserve dwell replies only through diagnostics-gated retention and make lookup use that source after sweep reconstruction
+- [x] Add `_burst_records` counts to memory observability
+- [x] Add focused regression tests and run backend verification
+
+Plan confirmation: proceeding directly because the requested scope is concrete bug rectification. The patch is limited to the backend radar state implementation and focused backend tests.
+
+### Review
+
+- Implementation:
+  - Added native fired-burst `BurstRecord` emission in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) with `iid`, `icao`, `centroid_us`, `n_replies`, and `signal_dbfs`, matching the Python fallback record shape.
+  - Added diagnostics-gated completed dwell reply retention in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) so `get_dwell_profile()` can serve reply profiles after sweep history is rebuilt from `_burst_records`. When diagnostics are disabled or no retained replies match, dwell returns an empty list.
+  - Updated reset paths in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) to clear `_burst_records` for one IID or all IIDs, with `reset_all()` reporting the cleared burst-record count.
+  - Updated memory observability in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) with total burst records, IID count, max per IID, and average per non-empty IID.
+  - Added focused regression coverage in [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py).
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py::test_fired_burst_processing_emits_burst_records_and_diagnostic_dwell tests/test_radar_sweep.py::test_dwell_profile_uses_diagnostic_replies_after_burst_record_rebuild tests/test_radar_sweep.py::test_memory_stats_include_burst_records tests/test_radar_sweep.py::test_reset_iid_clears_in_memory_learning_state tests/test_radar_sweep.py::test_reset_all_clears_sync_refinement_state`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py`
+  - `uv run --directory backend pytest`
+  - Result: focused tests passed (`5 passed`), radar sweep/API tests passed (`93 passed`), full backend passed (`308 passed`).
+
 ## 2026-04-17 Radar Sync Stream and Period Correction Diagnosis
 
 - [x] Inspect RadarPage sync polling, existing websocket/fallback hooks, radar API routes, and live sync state maintenance

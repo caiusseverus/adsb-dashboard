@@ -175,6 +175,14 @@ def test_reset_iid_clears_in_memory_learning_state():
         10: RadarIID(iid=10, period_s=5.0, primary_support_count=4),
     }
     state._sweep_history = {9: deque([{"centroid_us": 1_000_000}]), 10: deque([{"centroid_us": 2_000_000}])}
+    state._burst_records = {
+        9: deque([BurstRecord(iid=9, icao="AAAAAA", centroid_us=1_000_000, n_replies=2)]),
+        10: deque([BurstRecord(iid=10, icao="CCCCCC", centroid_us=3_000_000, n_replies=1)]),
+    }
+    state._dwell_profiles = {
+        9: deque([{"icao": "AAAAAA", "beam_center_us": 1_000_000, "replies": []}]),
+        10: deque([{"icao": "CCCCCC", "beam_center_us": 3_000_000, "replies": []}]),
+    }
     state._last_multi_sync_update_ts = {9: 100.0, 10: 200.0}
     state._live_waveform_bins = {
         9: [WaveformBin(correction_deg=1.0, weight=2.0, n=3)],
@@ -190,11 +198,15 @@ def test_reset_iid_clears_in_memory_learning_state():
     assert did_reset is True
     assert 9 not in state._models
     assert 9 not in state._sweep_history
+    assert 9 not in state._burst_records
+    assert 9 not in state._dwell_profiles
     assert 9 not in state._last_multi_sync_update_ts
     assert 9 not in state._live_waveform_bins
     assert 9 not in state._live_icao_sync_quality
     assert all(event[1] != 9 for event in state._iid_events)
     assert 10 in state._models
+    assert 10 in state._burst_records
+    assert 10 in state._dwell_profiles
     assert 10 in state._last_multi_sync_update_ts
     assert 10 in state._live_waveform_bins
     assert 10 in state._live_icao_sync_quality
@@ -204,6 +216,12 @@ def test_reset_all_clears_sync_refinement_state():
     state = RadarState()
     state._models = {7: RadarIID(iid=7, period_s=4.0, primary_support_count=6)}
     state._iid_events = deque([(1_000_000, 7, "AAAAAA", None)])
+    state._burst_records = {
+        7: deque([BurstRecord(iid=7, icao="AAAAAA", centroid_us=1_000_000, n_replies=2)]),
+    }
+    state._dwell_profiles = {
+        7: deque([{"icao": "AAAAAA", "beam_center_us": 1_000_000, "replies": []}]),
+    }
     state._last_multi_sync_update_ts = {7: 123.0}
     state._live_waveform_bins = {7: [WaveformBin(correction_deg=1.5, weight=4.0, n=8)]}
     state._live_icao_sync_quality = {7: {"AAAAAA": IcaoSyncQuality(residual_mad_deg=3.0)}}
@@ -224,10 +242,13 @@ def test_reset_all_clears_sync_refinement_state():
     cleared = state.reset_all()
 
     assert cleared["sync_states"] == 1
+    assert cleared["burst_records"] == 1
     assert cleared["waveform_bins"] == 1
     assert cleared["icao_sync_quality"] == 1
     assert cleared["multi_sync_throttle"] == 1
     assert state._live_sync_states == {}
+    assert state._burst_records == {}
+    assert state._dwell_profiles == {}
     assert state._live_waveform_bins == {}
     assert state._live_icao_sync_quality == {}
     assert state._last_multi_sync_update_ts == {}
@@ -1286,6 +1307,102 @@ def test_fired_burst_processing_rescores_once_per_fired_burst_batch():
     assert metrics["reference_select_count"] == 2
     assert metrics["reference_reuse_count"] == 1
     assert metrics["reference_rescore_count"] == 1
+
+
+def test_fired_burst_processing_emits_burst_records_and_diagnostic_dwell():
+    class NativeProcessor:
+        def select_reference(self, **kwargs):
+            return "AAAAAA"
+
+        def matches_dominant_period(self, *args, **kwargs):
+            return True
+
+        def matches_phase_family(self, *args, **kwargs):
+            return True
+
+    state = RadarState()
+    state._diagnostics_enabled = True
+    state._models[25] = RadarIID(
+        iid=25,
+        period_s=4.0,
+        reference_aircraft_override="AAAAAA",
+        rotation_model=RotationModel(folded={"AAAAAA": {"multiplier": 1}}),
+    )
+    state._native_burst_processors[25] = NativeProcessor()
+
+    state._process_fired_bursts(25, [{
+        "icao": "AAAAAA",
+        "burst_centroid_us": 12_345_678.0,
+        "burst_signal": -9.5,
+        "n_replies": 2,
+        "replies": [
+            {"arrival_us": 12_345_000.0, "signal_dbfs": -15.0},
+            {"arrival_us": 12_346_000.0, "signal_dbfs": -9.5},
+        ],
+    }])
+
+    records = list(state._burst_records[25])
+    assert records == [
+        BurstRecord(
+            iid=25,
+            icao="AAAAAA",
+            centroid_us=12_345_678.0,
+            n_replies=2,
+            signal_dbfs=-9.5,
+        )
+    ]
+    assert state._dwell_profiles[25][0]["replies"] == [
+        {"arrival_us": 12_345_000.0, "signal_dbfs": -15.0},
+        {"arrival_us": 12_346_000.0, "signal_dbfs": -9.5},
+    ]
+
+
+def test_dwell_profile_uses_diagnostic_replies_after_burst_record_rebuild():
+    state = RadarState()
+    state._burst_records[25] = deque([
+        BurstRecord(
+            iid=25,
+            icao="AAAAAA",
+            centroid_us=12_345_678.0,
+            n_replies=2,
+            signal_dbfs=-9.5,
+        ),
+    ])
+    state._dwell_profiles[25] = deque([
+        {
+            "icao": "AAAAAA",
+            "beam_center_us": 12_345_678.0,
+            "replies": [
+                {"arrival_us": 12_345_000.0, "signal_dbfs": -15.0},
+                {"arrival_us": 12_346_000.0, "signal_dbfs": -9.5},
+            ],
+        },
+    ])
+
+    replies = state.get_dwell_profile(25, "AAAAAA")
+
+    assert replies == [
+        {"arrival_us": 12_345_000.0, "signal_dbfs": -15.0},
+        {"arrival_us": 12_346_000.0, "signal_dbfs": -9.5},
+    ]
+
+
+def test_memory_stats_include_burst_records():
+    state = RadarState()
+    state._burst_records[25] = deque([
+        BurstRecord(iid=25, icao="AAAAAA", centroid_us=1_000_000.0, n_replies=1),
+        BurstRecord(iid=25, icao="BBBBBB", centroid_us=2_000_000.0, n_replies=2),
+    ])
+    state._burst_records[26] = deque([
+        BurstRecord(iid=26, icao="CCCCCC", centroid_us=3_000_000.0, n_replies=1),
+    ])
+
+    stats = state.get_memory_stats()
+
+    assert stats["burst_records_total"] == 3
+    assert stats["burst_records_iids"] == 2
+    assert stats["burst_records_max_per_iid"] == 2
+    assert stats["burst_records_avg_per_iid"] == 1.5
 
 
 def test_fired_burst_processing_can_start_frame_after_reference_rescore(monkeypatch):

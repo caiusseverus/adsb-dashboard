@@ -1978,6 +1978,10 @@ class RadarState:
         # so frame_index stays unique even after the ring buffer fills.
         self._live_frame_counters: dict[int, int] = {}
         self._native_burst_processors: dict[int, Any] = {}
+        # Diagnostic-only completed burst replies for dwell-profile lookup after
+        # sweep history is rebuilt from compact BurstRecord summaries.
+        self._dwell_profiles: dict[int, deque] = {}
+        self._DWELL_PROFILE_MAX = 1_000
 
         # Real-time DF11 flash events for the sweep diagram.
         # Written from the decoder thread; read from the async event loop.
@@ -2220,9 +2224,19 @@ class RadarState:
             n_icao_quality = sum(len(v) for v in self._live_icao_sync_quality.values())
             n_last_arrival = sum(len(v) for v in self._live_last_arrival.values())
             n_live_bursts  = sum(len(v) for v in self._live_bursts.values())
+            burst_record_counts = [len(v) for v in self._burst_records.values()]
+            non_empty_burst_counts = [count for count in burst_record_counts if count > 0]
+            n_burst_records = sum(burst_record_counts)
             return {
                 "models":              len(self._models),
                 "iid_events":          len(self._iid_events),
+                "burst_records_total": n_burst_records,
+                "burst_records_iids":  len(non_empty_burst_counts),
+                "burst_records_max_per_iid": max(burst_record_counts, default=0),
+                "burst_records_avg_per_iid": (
+                    round(n_burst_records / len(non_empty_burst_counts), 1)
+                    if non_empty_burst_counts else 0.0
+                ),
                 "seen_pair_keys":      len(self._seen_pair_keys),
                 "pending_pairs":       len(self._pending_pairs),
                 "adsb_tracker_positions": self._adsb_tracker.size(),
@@ -2272,7 +2286,22 @@ class RadarState:
             fired_icao = fired_burst["icao"]
             burst_centroid_us = fired_burst["burst_centroid_us"]
             burst_signal = fired_burst["burst_signal"]
+            n_replies = fired_burst.get("n_replies", 1)
             trigger_arrival_us = fired_burst.get("trigger_arrival_us", burst_centroid_us)
+
+            self._burst_records.setdefault(iid, deque()).append(BurstRecord(
+                iid=iid,
+                icao=fired_icao,
+                centroid_us=burst_centroid_us,
+                n_replies=n_replies,
+                signal_dbfs=burst_signal,
+            ))
+            self._record_dwell_profile(
+                iid=iid,
+                icao=fired_icao,
+                beam_center_us=burst_centroid_us,
+                replies=fired_burst.get("replies"),
+            )
 
             t_centroid = time.perf_counter()
             centroid_hist = self._live_burst_centroids[iid].setdefault(fired_icao, [])
@@ -2395,7 +2424,7 @@ class RadarState:
                     radar_lon=_radar_pos_cache["lon"],
                     aircraft_lat=lat,
                     aircraft_lon=lon,
-                    n_replies=fired_burst.get("n_replies", 1),
+                    n_replies=n_replies,
                     signal_dbfs=burst_signal,
                     pos_age_s=position_age_seconds,
                     sync_update_eligible=matches_dominant_for_sync,
@@ -2428,7 +2457,7 @@ class RadarState:
                         radar_lon=_radar_pos_cache["lon"],
                         aircraft_lat=lat,
                         aircraft_lon=lon,
-                        n_replies=fired_burst.get("n_replies", 1),
+                        n_replies=n_replies,
                         signal_dbfs=burst_signal,
                         pos_age_s=position_age_seconds,
                         period_s=period_s,
@@ -2517,7 +2546,7 @@ class RadarState:
                     arrival_us=burst_centroid_us,
                     signal_dbfs=burst_signal,
                     interpolated=interpolated,
-                    n_replies=fired_burst.get("n_replies", 1),
+                    n_replies=n_replies,
                     position_age_seconds=position_age_seconds,
                 ))
                 current_frame.seen_icaos.add(fired_icao)
@@ -2544,7 +2573,7 @@ class RadarState:
         timestamp_candidates = _compute_burst_timestamp_candidates(replies)
         burst_signal = max((s for _, s in replies if s is not None), default=None)
         has_signal = burst_signal is not None
-        return {
+        fired = {
             "icao": icao,
             "trigger_arrival_us": trigger_arrival_us,
             "n_replies": len(replies),
@@ -2555,6 +2584,12 @@ class RadarState:
             "burst_center_delta_us": refinement.get("beam_center_delta_us"),
             **timestamp_candidates,
         }
+        if self._diagnostics_enabled:
+            fired["replies"] = [
+                {"arrival_us": arrival_us, "signal_dbfs": signal_dbfs}
+                for arrival_us, signal_dbfs in replies
+            ]
+        return fired
 
     def _collect_native_burst_diagnostics(
         self,
@@ -4458,7 +4493,7 @@ class RadarState:
         if len(centroid_hist) > 30:
             centroid_hist.pop(0)
 
-        return {
+        fired = {
             "icao": icao,
             "burst_centroid_us": burst_centroid_us,
             "burst_signal": burst_signal,
@@ -4469,6 +4504,12 @@ class RadarState:
             "burst_center_delta_us": refinement.get("beam_center_delta_us"),
             **timestamp_candidates,
         }
+        if self._diagnostics_enabled:
+            fired["replies"] = [
+                {"arrival_us": arrival_us, "signal_dbfs": signal_dbfs}
+                for arrival_us, signal_dbfs in replies
+            ]
+        return fired
 
     def _finalize_expired_pending_bursts(
         self,
@@ -4494,6 +4535,25 @@ class RadarState:
 
         fired_bursts.sort(key=lambda burst: burst["burst_centroid_us"])
         return fired_bursts
+
+    def _record_dwell_profile(
+        self,
+        iid: int,
+        icao: str,
+        beam_center_us: float,
+        replies: list[dict] | None,
+    ) -> None:
+        """Retain completed per-reply dwell data only when diagnostics are enabled."""
+        if not self._diagnostics_enabled or not replies:
+            return
+        self._dwell_profiles.setdefault(
+            iid,
+            deque(maxlen=self._DWELL_PROFILE_MAX),
+        ).append({
+            "icao": icao,
+            "beam_center_us": beam_center_us,
+            "replies": list(replies),
+        })
 
     def _burst_matches_dominant_period_family(
         self,
@@ -4640,6 +4700,7 @@ class RadarState:
             fired_icao = fired_burst["icao"]
             burst_centroid_us = fired_burst["burst_centroid_us"]
             burst_signal = fired_burst["burst_signal"]
+            n_replies = fired_burst.get("n_replies", 1)
 
             # Emit compact BurstRecord for rotation analysis and sync fitting.
             # Core fields only; enrichment (position, family flags) can be layered
@@ -4648,9 +4709,15 @@ class RadarState:
                 iid=iid,
                 icao=fired_icao,
                 centroid_us=burst_centroid_us,
-                n_replies=fired_burst["n_replies"],
+                n_replies=n_replies,
                 signal_dbfs=burst_signal,
             ))
+            self._record_dwell_profile(
+                iid=iid,
+                icao=fired_icao,
+                beam_center_us=burst_centroid_us,
+                replies=fired_burst.get("replies"),
+            )
 
             current_frame = self._live_frames.get(iid)
             if current_frame is not None and burst_centroid_us >= current_frame.ref_arrival_us + period_us:
@@ -4818,7 +4885,7 @@ class RadarState:
                     arrival_us=burst_centroid_us,
                     signal_dbfs=burst_signal,
                     interpolated=interpolated,
-                    n_replies=fired_burst.get("n_replies", 1),
+                    n_replies=n_replies,
                     position_age_seconds=position_age_seconds,
                 ))
                 current_frame.seen_icaos.add(fired_icao)
@@ -4968,6 +5035,9 @@ class RadarState:
                 for br_deque in self._burst_records.values():
                     while br_deque and br_deque[0].centroid_us < burst_cutoff_us:
                         br_deque.popleft()
+                for dwell_deque in self._dwell_profiles.values():
+                    while dwell_deque and dwell_deque[0].get("beam_center_us", 0.0) < burst_cutoff_us:
+                        dwell_deque.popleft()
 
                 dirty_iids = set(self._dirty_iids)
                 self._dirty_iids.clear()
@@ -5316,7 +5386,9 @@ class RadarState:
                                self._live_period_history,
                                self._live_sync_snapshot_cache,
                                self._live_sync_snapshot_seq,
-                               self._rotation_analysis_meta):
+                               self._rotation_analysis_meta,
+                               self._burst_records,
+                               self._dwell_profiles):
                 if iid in live_dict:
                     del live_dict[iid]
                     had_any = True
@@ -5360,6 +5432,7 @@ class RadarState:
                 "models": len(self._models),
                 "sweeps": len(self._sweep_history),
                 "events": len(self._iid_events),
+                "burst_records": sum(len(v) for v in self._burst_records.values()),
                 "pending_pairs": len(self._pending_pairs),
                 "seen_pair_keys": len(self._seen_pair_keys),
                 "sync_states": len(self._live_sync_states),
@@ -5371,6 +5444,7 @@ class RadarState:
             self._models.clear()
             self._sweep_history.clear()
             self._iid_events.clear()
+            self._burst_records.clear()
             self._dirty_iids.clear()
             self._iid_latest_arrival_us.clear()
             self._pending_pairs.clear()
@@ -5397,6 +5471,7 @@ class RadarState:
             self._rotation_analysis_meta.clear()
             self._live_detection_buffer.clear()
             self._native_burst_processors.clear()
+            self._dwell_profiles.clear()
             with self._fm_mailbox_lock:
                 self._fm_mailbox.clear()
                 self._fm_mailbox_event.clear()
@@ -7079,6 +7154,7 @@ class RadarState:
         with self._lock:
             history = self._sweep_history.get(iid)
             sweeps = list(history) if history else []
+            dwell_entries = list(self._dwell_profiles.get(iid, []))
 
         if not sweeps:
             sweeps = self._compute_sweep_history_for_iid(iid)
@@ -7105,7 +7181,20 @@ class RadarState:
         # Find the burst for this ICAO in the sweep
         for aircraft_entry in sweep["aircraft"]:
             if aircraft_entry["icao"] == icao:
-                return list(aircraft_entry.get("replies", []))
+                replies = aircraft_entry.get("replies")
+                if replies:
+                    return list(replies)
+                beam_center_us = aircraft_entry.get("beam_center_us")
+                if beam_center_us is None:
+                    return []
+                matches = [
+                    entry for entry in dwell_entries
+                    if entry.get("icao") == icao
+                    and abs(float(entry.get("beam_center_us", 0.0)) - float(beam_center_us)) <= 1.0
+                ]
+                if not matches:
+                    return []
+                return list(matches[-1].get("replies", []))
         return []
 
     def get_aircraft_burst_position(self, icao: str, ts_us: int) -> dict | None:
