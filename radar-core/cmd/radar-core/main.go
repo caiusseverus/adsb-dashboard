@@ -2,6 +2,7 @@
 //
 // Stage 1: ingest RADAR_EVENT messages, assemble bursts, emit BURST_FIRED.
 // Stage 2: maintain per-IID burst records, run rotation model analysis, emit IID_STATE.
+// Stage 3: position cache, reference aircraft selection, sync epoch tracking.
 // Runs as an independently supervised process (systemd unit) on the Pi.
 //
 // Usage: radar-core [--socket /path/to/radar-core.sock]
@@ -28,6 +29,7 @@ import (
 const (
 	rotationAnalysisInterval = 5 * time.Second
 	healthInterval           = 10 * time.Second
+	positionPruneInterval    = 60 * time.Second
 )
 
 func main() {
@@ -51,6 +53,7 @@ func main() {
 
 	go engine.runRotationTicker(stop)
 	go engine.runHealthTicker(stop)
+	go engine.runPositionPruneTicker(stop)
 
 	os.Remove(*socketPath)
 
@@ -62,13 +65,14 @@ func main() {
 	slog.Info("radar-core: stopped")
 }
 
-// engine wires the ingest, burst, output, and IID state stages.
+// engine wires the ingest, burst, output, IID state, and position cache stages.
 type engine struct {
-	writer   *output.Writer
-	builders map[uint8]*burst.Builder  // per IID; only accessed from the ingest goroutine
-	states   map[uint8]*iid.IIDState   // per IID; AddBurst called from ingest, analysis from ticker
+	writer    *output.Writer
+	builders  map[uint8]*burst.Builder // per IID; only accessed from the ingest goroutine
+	states    map[uint8]*iid.IIDState  // per IID; thread-safe via IIDState.mu
 	revisions map[uint8]uint32         // monotonic IID_STATE revision counter
-	start    time.Time
+	positions *iid.PositionCache       // global ADS-B position cache (thread-safe)
+	start     time.Time
 
 	eventsIn    atomic.Uint64
 	burstsFired atomic.Uint64
@@ -80,6 +84,7 @@ func newEngine() *engine {
 		builders:  make(map[uint8]*burst.Builder),
 		states:    make(map[uint8]*iid.IIDState),
 		revisions: make(map[uint8]uint32),
+		positions: iid.NewPositionCache(),
 		start:     time.Now(),
 	}
 }
@@ -105,8 +110,10 @@ func (e *engine) onRadarEvent(msg *protocol.RadarEvent) {
 		b = burst.NewBuilder(msg.IID)
 		e.builders[msg.IID] = b
 	}
-	if _, ok := e.states[msg.IID]; !ok {
-		e.states[msg.IID] = iid.NewIIDState(msg.IID)
+	s, ok := e.states[msg.IID]
+	if !ok {
+		s = iid.NewIIDState(msg.IID)
+		e.states[msg.IID] = s
 	}
 
 	var sigPtr *float64
@@ -119,9 +126,36 @@ func (e *engine) onRadarEvent(msg *protocol.RadarEvent) {
 	for i := range fired {
 		f := &fired[i]
 		e.emitBurstFired(f)
-		// Record burst for rotation analysis.
-		e.states[msg.IID].AddBurst(f.ICAO, f.CentroidUS, f.NReplies)
+		s.AddBurst(f.ICAO, f.CentroidUS, f.NReplies)
+
+		// Stage 3: if this is the reference aircraft, advance the sync epoch.
+		e.maybeUpdateSync(s, f)
 	}
+}
+
+// maybeUpdateSync advances the sync epoch when the reference aircraft fires.
+func (e *engine) maybeUpdateSync(s *iid.IIDState, f *burst.FiredBurst) {
+	syncQ, refICAO := s.SyncSnapshot()
+	_ = syncQ
+	if refICAO == nil || *refICAO != f.ICAO {
+		return
+	}
+
+	// Look up the reference aircraft's ADS-B position for age estimate.
+	refPosAgeS := 999.0
+	pos := e.positions.Get(f.ICAO)
+	if pos != nil {
+		refPosAgeS = time.Since(pos.TS).Seconds()
+	}
+
+	// nAircraft estimate from builder's active ICAO count (includes the reference).
+	nAircraft := 1
+	if b, ok := e.builders[s.IID]; ok {
+		nAircraft = b.ActiveICAOs()
+	}
+
+	// phaseOffsetDeg = 0 until radar position is known (Stage 4+).
+	s.UpdateSyncEpoch(f.CentroidUS, 0.0, nAircraft, refPosAgeS)
 }
 
 func (e *engine) emitBurstFired(f *burst.FiredBurst) {
@@ -148,8 +182,8 @@ func (e *engine) emitBurstFired(f *burst.FiredBurst) {
 	})
 }
 
-func (e *engine) onPositionUpdate(_ *protocol.PositionUpdate) {
-	// Stage 3: position cache will be populated here.
+func (e *engine) onPositionUpdate(msg *protocol.PositionUpdate) {
+	e.positions.Update(msg.ICAO, msg.Lat, msg.Lon, msg.AltFt, msg.TS)
 }
 
 func (e *engine) onConfigUpdate(msg *protocol.ConfigUpdate) {
@@ -181,7 +215,6 @@ func (e *engine) onResetIID(msg *protocol.ResetIID) {
 }
 
 // runRotationTicker runs every 5s and analyses dirty IID states.
-// Runs in its own goroutine; IIDState.TakeIfDirty is thread-safe.
 func (e *engine) runRotationTicker(stop <-chan struct{}) {
 	ticker := time.NewTicker(rotationAnalysisInterval)
 	defer ticker.Stop()
@@ -201,13 +234,23 @@ func (e *engine) analyseAllIIDs() {
 		if records == nil {
 			continue
 		}
+
+		// Rotation model analysis.
 		model := iid.AnalyseBurstRecords(records)
 		s.ApplyRotation(model)
+
+		// Reference aircraft selection — use the most recent centroid as nowUS.
+		nowUS := 0.0
+		if len(records) > 0 {
+			nowUS = records[len(records)-1].CentroidUS
+		}
+		s.RefreshReference(records, nowUS)
 
 		e.revisions[iidNum]++
 		rev := e.revisions[iidNum]
 
 		status, periodS, rpm, _ := s.Snapshot()
+		syncQuality, refICAO := s.SyncSnapshot()
 
 		var rpmMsg *float32
 		if rpm != nil {
@@ -221,6 +264,8 @@ func (e *engine) analyseAllIIDs() {
 			PeriodS:       periodS,
 			RPM:           rpmMsg,
 			Status:        status,
+			RefICAO:       refICAO,
+			SyncQuality:   syncQuality,
 			NBurstRecords: uint16(len(records)),
 			LastUpdated:   float64(time.Now().UnixMicro()) / 1e6,
 			Revision:      rev,
@@ -253,6 +298,23 @@ func (e *engine) runHealthTicker(stop <-chan struct{}) {
 				BurstsFired: e.burstsFired.Load(),
 				ActiveIIDs:  uint8(len(e.builders)),
 			})
+		}
+	}
+}
+
+// runPositionPruneTicker evicts stale ADS-B positions every minute.
+func (e *engine) runPositionPruneTicker(stop <-chan struct{}) {
+	ticker := time.NewTicker(positionPruneInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			n := e.positions.Prune()
+			if n > 0 {
+				slog.Debug("radar-core: pruned stale positions", "count", n)
+			}
 		}
 	}
 }

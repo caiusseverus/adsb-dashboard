@@ -39,14 +39,18 @@ type IIDState struct {
 	dirty   bool // pending rotation analysis
 
 	// Reinforced period state (updated by reinforce).
-	PeriodS              *float64
-	PrimarySupport       int
-	PeriodStdS           float64
-	RPM                  *float64
-	Status               string
-	MultiRadarFlag       bool
-	LastRotationModel    *RotationModel
-	LastUpdated          time.Time
+	PeriodS           *float64
+	PrimarySupport    int
+	PeriodStdS        float64
+	RPM               *float64
+	Status            string
+	MultiRadarFlag    bool
+	LastRotationModel *RotationModel
+	LastUpdated       time.Time
+
+	// Stage 3: reference aircraft and live sync state.
+	RefICAO *uint32   // selected reference aircraft (nil until stable)
+	Sync    *SyncState
 }
 
 // NewIIDState creates an IIDState for the given IID.
@@ -127,6 +131,59 @@ func (s *IIDState) Reset() {
 	s.Status = "UNKNOWN"
 	s.MultiRadarFlag = false
 	s.LastRotationModel = nil
+	s.RefICAO = nil
+	s.Sync = nil
+}
+
+// RefreshReference re-evaluates reference aircraft selection from current records.
+// Called from the rotation analysis ticker after ApplyRotation.
+// Records must be the same snapshot used for rotation analysis.
+func (s *IIDState) RefreshReference(records []BurstRecord, nowUS float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.PeriodS == nil {
+		return
+	}
+	cur := uint32(0)
+	if s.RefICAO != nil {
+		cur = *s.RefICAO
+	}
+	chosen := SelectReference(records, *s.PeriodS, cur, nowUS)
+	if chosen != 0 {
+		s.RefICAO = &chosen
+	}
+}
+
+// UpdateSyncEpoch advances the sync epoch when the reference aircraft fires.
+// epochUS is its burst centroid; nAircraft is the count of aircraft in the
+// frame window. phaseOffsetDeg is 0 until radar position is known (Stage 4+).
+func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft int, refPosAgeS float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.PeriodS == nil {
+		return
+	}
+	quality := syncQuality(s.Status, s.PeriodS != nil)
+	if s.Sync == nil {
+		// Bootstrap on first reference burst.
+		eligible := nAircraft >= 4 || (nAircraft >= 3 && refPosAgeS <= 2.0)
+		if !eligible {
+			return
+		}
+		s.Sync = NewSyncState(s.IID, *s.PeriodS, epochUS, phaseOffsetDeg, quality)
+		return
+	}
+	s.Sync.UpdateEpoch(epochUS, phaseOffsetDeg, *s.PeriodS, quality, nAircraft, refPosAgeS)
+}
+
+// SyncSnapshot returns sync state fields for IID_STATE emission.
+func (s *IIDState) SyncSnapshot() (quality float32, refICAO *uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Sync != nil {
+		quality = float32(s.Sync.SyncQuality)
+	}
+	return quality, s.RefICAO
 }
 
 // Snapshot returns a safe copy of the current reinforced state.
