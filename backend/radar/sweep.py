@@ -2333,6 +2333,101 @@ class RadarState:
                 centroid_hist.pop(0)
             metrics["centroid_ms"] += (time.perf_counter() - t_centroid) * 1000
 
+            # Position lookup runs unconditionally: needed for sync obs and live
+            # detections regardless of whether Python or Go builds frames.
+            lat = lon = None
+            interpolated = False
+            position_age_seconds = 0.0
+            position_extrapolated = False
+            position_source_age_s = None
+            pos: dict | None = None
+            metrics["position_lookup_count"] += 1
+            t_position_lookup = time.perf_counter()
+            try:
+                wall_ts = self._estimate_wall_time_from_arrival_us(burst_centroid_us, trigger_arrival_us)
+                if wall_ts is not None:
+                    pos = self._adsb_tracker.get_position_at(fired_icao, wall_ts)
+                    if pos:
+                        lat = pos.get("lat")
+                        lon = pos.get("lon")
+                        interpolated = pos.get("interpolated", False)
+                        position_age_seconds = pos.get("position_age_seconds", 0.0)
+                        position_extrapolated = bool(pos.get("extrapolated", False))
+                        position_source_age_s = pos.get("source_age_seconds")
+            except Exception:
+                pass
+            finally:
+                metrics["position_lookup_ms"] += (time.perf_counter() - t_position_lookup) * 1000
+
+            # Record one burst-centre Stage3LiveDetection per fired burst.
+            # This replaces the per-message detection recording in on_df11_batch()
+            # so that bearing observations are built from burst-centre timestamps.
+            self._record_live_burst_detection(iid, fired_icao, burst_centroid_us, burst_signal, pos)
+
+            # Record burst-centre observations for sync timeline plotting.
+            # This is broader than sync maintenance: include all bursts that have
+            # usable geometry so the UI is not limited to only sync-driving updates.
+            if (
+                lat is not None
+                and lon is not None
+                and _radar_pos_cache["lat"] is not None
+                and _radar_pos_cache["lon"] is not None
+            ):
+                matches_dominant_for_sync = _matches_dominant(fired_icao)
+                self._record_burst_sync_timeline_obs(
+                    iid=iid,
+                    icao=fired_icao,
+                    burst_centroid_us=burst_centroid_us,
+                    radar_lat=_radar_pos_cache["lat"],
+                    radar_lon=_radar_pos_cache["lon"],
+                    aircraft_lat=lat,
+                    aircraft_lon=lon,
+                    n_replies=n_replies,
+                    signal_dbfs=burst_signal,
+                    pos_age_s=position_age_seconds,
+                    sync_update_eligible=matches_dominant_for_sync,
+                    burst_center_method=fired_burst.get("burst_center_method", "centroid"),
+                    burst_center_simple_us=fired_burst.get("burst_center_simple_us"),
+                    burst_center_weighted_us=fired_burst.get("burst_center_weighted_us"),
+                    burst_center_delta_us=fired_burst.get("burst_center_delta_us"),
+                    burst_ts_first_reply_beast_us=fired_burst.get("burst_ts_first_reply_beast_us"),
+                    burst_ts_strongest_reply_beast_us=fired_burst.get("burst_ts_strongest_reply_beast_us"),
+                    burst_ts_simple_centroid_beast_us=fired_burst.get("burst_ts_simple_centroid_beast_us"),
+                    burst_ts_weighted_centroid_beast_us=fired_burst.get("burst_ts_weighted_centroid_beast_us"),
+                    burst_ts_mid_strong_window_beast_us=fired_burst.get("burst_ts_mid_strong_window_beast_us"),
+                    burst_ts_last_reply_beast_us=fired_burst.get("burst_ts_last_reply_beast_us"),
+                    burst_span_us=fired_burst.get("burst_span_us"),
+                    peak_amplitude=fired_burst.get("peak_amplitude"),
+                    position_interpolated=interpolated,
+                    position_extrapolated=position_extrapolated,
+                    position_source_age_s=position_source_age_s,
+                    truth_position_ts_beast_us=(
+                        burst_centroid_us - position_source_age_s * 1_000_000.0
+                        if position_source_age_s is not None else None
+                    ),
+                )
+                if matches_dominant_for_sync:
+                    self._record_aligned_burst_sync_obs(
+                        iid=iid,
+                        icao=fired_icao,
+                        burst_centroid_us=burst_centroid_us,
+                        radar_lat=_radar_pos_cache["lat"],
+                        radar_lon=_radar_pos_cache["lon"],
+                        aircraft_lat=lat,
+                        aircraft_lon=lon,
+                        n_replies=n_replies,
+                        signal_dbfs=burst_signal,
+                        pos_age_s=position_age_seconds,
+                        period_s=period_s,
+                    )
+
+            # Frame building: skipped when radar-core is the primary frame source.
+            # Sync obs and live detections (above) still run in all modes.
+            if self._radar_core_frames_enabled:
+                continue
+
+            from .models import SweepFrameObservation, LiveFrameState
+
             current_frame = self._live_frames.get(iid)
             if current_frame is not None and burst_centroid_us >= current_frame.ref_arrival_us + period_us:
                 t_finalize = time.perf_counter()
@@ -2397,94 +2492,6 @@ class RadarState:
                             continue
                 finally:
                     metrics["reference_select_ms"] += (time.perf_counter() - t_reference_select) * 1000
-
-            lat = lon = None
-            interpolated = False
-            position_age_seconds = 0.0
-            position_extrapolated = False
-            position_source_age_s = None
-            pos: dict | None = None
-            metrics["position_lookup_count"] += 1
-            t_position_lookup = time.perf_counter()
-            try:
-                wall_ts = self._estimate_wall_time_from_arrival_us(burst_centroid_us, trigger_arrival_us)
-                if wall_ts is not None:
-                    pos = self._adsb_tracker.get_position_at(fired_icao, wall_ts)
-                    if pos:
-                        lat = pos.get("lat")
-                        lon = pos.get("lon")
-                        interpolated = pos.get("interpolated", False)
-                        position_age_seconds = pos.get("position_age_seconds", 0.0)
-                        position_extrapolated = bool(pos.get("extrapolated", False))
-                        position_source_age_s = pos.get("source_age_seconds")
-            except Exception:
-                pass
-            finally:
-                metrics["position_lookup_ms"] += (time.perf_counter() - t_position_lookup) * 1000
-
-            from .models import SweepFrameObservation, LiveFrameState
-
-            # Record one burst-centre Stage3LiveDetection per fired burst.
-            # This replaces the per-message detection recording in on_df11_batch()
-            # so that bearing observations are built from burst-centre timestamps.
-            self._record_live_burst_detection(iid, fired_icao, burst_centroid_us, burst_signal, pos)
-
-            # Record burst-centre observations for sync timeline plotting.
-            # This is broader than sync maintenance: include all bursts that have
-            # usable geometry so the UI is not limited to only sync-driving updates.
-            if (
-                lat is not None
-                and lon is not None
-                and _radar_pos_cache["lat"] is not None
-                and _radar_pos_cache["lon"] is not None
-            ):
-                matches_dominant_for_sync = _matches_dominant(fired_icao)
-                self._record_burst_sync_timeline_obs(
-                    iid=iid,
-                    icao=fired_icao,
-                    burst_centroid_us=burst_centroid_us,
-                    radar_lat=_radar_pos_cache["lat"],
-                    radar_lon=_radar_pos_cache["lon"],
-                    aircraft_lat=lat,
-                    aircraft_lon=lon,
-                    n_replies=n_replies,
-                    signal_dbfs=burst_signal,
-                    pos_age_s=position_age_seconds,
-                    sync_update_eligible=matches_dominant_for_sync,
-                    burst_center_method=fired_burst.get("burst_center_method", "centroid"),
-                    burst_center_simple_us=fired_burst.get("burst_center_simple_us"),
-                    burst_center_weighted_us=fired_burst.get("burst_center_weighted_us"),
-                    burst_center_delta_us=fired_burst.get("burst_center_delta_us"),
-                    burst_ts_first_reply_beast_us=fired_burst.get("burst_ts_first_reply_beast_us"),
-                    burst_ts_strongest_reply_beast_us=fired_burst.get("burst_ts_strongest_reply_beast_us"),
-                    burst_ts_simple_centroid_beast_us=fired_burst.get("burst_ts_simple_centroid_beast_us"),
-                    burst_ts_weighted_centroid_beast_us=fired_burst.get("burst_ts_weighted_centroid_beast_us"),
-                    burst_ts_mid_strong_window_beast_us=fired_burst.get("burst_ts_mid_strong_window_beast_us"),
-                    burst_ts_last_reply_beast_us=fired_burst.get("burst_ts_last_reply_beast_us"),
-                    burst_span_us=fired_burst.get("burst_span_us"),
-                    peak_amplitude=fired_burst.get("peak_amplitude"),
-                    position_interpolated=interpolated,
-                    position_extrapolated=position_extrapolated,
-                    position_source_age_s=position_source_age_s,
-                    truth_position_ts_beast_us=(
-                        burst_centroid_us - position_source_age_s * 1_000_000.0
-                        if position_source_age_s is not None else None
-                    ),
-                )
-                if matches_dominant_for_sync:
-                    self._record_aligned_burst_sync_obs(
-                        iid=iid,
-                        icao=fired_icao,
-                        burst_centroid_us=burst_centroid_us,
-                        radar_lat=_radar_pos_cache["lat"],
-                        radar_lon=_radar_pos_cache["lon"],
-                        aircraft_lat=lat,
-                        aircraft_lon=lon,
-                        n_replies=n_replies,
-                        signal_dbfs=burst_signal,
-                        pos_age_s=position_age_seconds,
-                        period_s=period_s,
-                    )
 
             if fired_icao == ref_icao:
                 if current_frame is not None:
@@ -2976,6 +2983,12 @@ class RadarState:
             with self._fm_mailbox_lock:
                 self._fm_mailbox[iid] = (frame, period_s)
             self._fm_mailbox_event.set()
+            # Store in the completed-frames buffer so _fm_loop() can count Go
+            # frames and trigger run_full_pipeline() without the Python builder.
+            buf = self._live_completed_frames.setdefault(
+                iid, deque(maxlen=self._LIVE_FRAMES_MAX)
+            )
+            buf.append(frame)
         except Exception:
             pass  # never let a malformed message affect the main path
 
