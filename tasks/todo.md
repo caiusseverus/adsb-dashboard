@@ -8,6 +8,25 @@ Source inputs:
 Prepared: 2026-04-04
 Updated: 2026-04-06
 
+## 2026-04-19 Radar Page Lazy Loading Removal
+
+- [x] Inspect Radar page lazy-mounted panels and frame-selection gates
+- [x] Mount radar panels directly instead of viewport-triggered lazy sections
+- [x] Default sweep-frame geometry diagnostics to the newest displayed frame
+- [x] Build frontend and document verification
+
+Plan confirmation: proceeding directly because the request is a concrete UI workflow fix. Scope is limited to removing Radar page lazy mounting and the extra frame-click requirement for default geometry diagnostics.
+
+### Review
+
+- Implementation:
+  - Removed the Radar page `LazyMountSection` wrapper in [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx).
+  - Mounted Sweep Frames, Evidence Map, and Position Verification directly so they start loading when an IID is selected rather than waiting for viewport intersection.
+  - Changed Sweep Frames to default the detail table and frame-geometry diagnostics to the newest displayed good/marginal frame when no frame is manually selected.
+- Verification:
+  - `npm run build`
+  - Result: frontend build passed with the existing chunk-size warning.
+
 ## 2026-04-19 Radar BurstRecord Refactor Rectification
 
 - [x] Add native fired-burst `BurstRecord` emission with fields matching the Python fallback path

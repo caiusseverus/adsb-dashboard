@@ -189,41 +189,6 @@ function useReceiverPosition() {
   return data
 }
 
-function LazyMountSection({ children, placeholder = 'Loading panel…', minHeight = 220, rootMargin = '600px 0px' }) {
-  const hostRef = useRef(null)
-  const [visible, setVisible] = useState(false)
-
-  useEffect(() => {
-    if (visible) return
-    const node = hostRef.current
-    if (!node) return
-    if (typeof IntersectionObserver !== 'function') {
-      setVisible(true)
-      return
-    }
-    const observer = new IntersectionObserver(entries => {
-      if (entries.some(entry => entry.isIntersecting || entry.intersectionRatio > 0)) {
-        setVisible(true)
-      }
-    }, { rootMargin })
-    observer.observe(node)
-    return () => observer.disconnect()
-  }, [rootMargin, visible])
-
-  if (visible) return children
-
-  return (
-    <section ref={hostRef} className={styles.card} style={{ minHeight }}>
-      <div className={styles.cardHeader}>
-        <div>
-          <div className={styles.cardTitle}>Deferred Panel</div>
-        </div>
-      </div>
-      <div className={styles.empty}>{placeholder}</div>
-    </section>
-  )
-}
-
 /** Shared hook: fetch pipeline health for an IID, polling every 10s. */
 function usePipelineHealth(iid) {
   const [data, setData] = useState(null)
@@ -4670,12 +4635,14 @@ function SweepFrameStrips({ iid, selectedFrame, onSelectFrame }) {
   const qualFrames = allFrames.filter(f => f.quality === 'good' || f.quality === 'marginal')
   // Show last DISPLAY_COUNT quality frames, most recent at top
   const displayFrames = qualFrames.slice(-DISPLAY_COUNT).reverse()
+  const effectiveFrameIndex = selectedFrame ?? displayFrames[0]?.frame_index ?? null
   const nGood = allFrames.filter(f => f.quality === 'good').length
   const nMarginal = allFrames.filter(f => f.quality === 'marginal').length
 
-  // Selected frame detail
-  const detailFrame = selectedFrame != null
-    ? allFrames.find(f => f.frame_index === selectedFrame)
+  // Default to the newest displayed quality frame so geometry diagnostics load
+  // without requiring an explicit frame click.
+  const detailFrame = effectiveFrameIndex != null
+    ? allFrames.find(f => f.frame_index === effectiveFrameIndex)
     : null
 
   if (iid == null || allFrames.length === 0) {
@@ -4703,7 +4670,7 @@ function SweepFrameStrips({ iid, selectedFrame, onSelectFrame }) {
           <div className={styles.cardTitle}>Sweep Frames</div>
           <div className={styles.sectionLead}>
             {allFrames.length} frames · {nGood} good · {nMarginal} marginal
-            {' · '}Last {displayFrames.length} shown · ref at 0°, click for detail
+            {' · '}Last {displayFrames.length} shown · ref at 0°, newest selected by default
           </div>
         </div>
       </div>
@@ -4733,7 +4700,7 @@ function SweepFrameStrips({ iid, selectedFrame, onSelectFrame }) {
         </div>
 
         {displayFrames.map(frame => {
-          const isSelected = selectedFrame === frame.frame_index
+          const isSelected = effectiveFrameIndex === frame.frame_index
           const qualColor = frame.quality === 'good' ? '#3fb950' : '#d29922'
           return (
             <div
@@ -4867,7 +4834,7 @@ function SweepFrameStrips({ iid, selectedFrame, onSelectFrame }) {
           </div>
         </div>
       )}
-      <FrameGeometryDiagnostics iid={iid} frameIndex={selectedFrame} />
+      <FrameGeometryDiagnostics iid={iid} frameIndex={effectiveFrameIndex} />
     </section>
   )
 }
@@ -5015,16 +4982,11 @@ return (
       </div>
 
       <div data-slot="sweep-frames">
-        <LazyMountSection
-          placeholder="Loading sweep frames when visible…"
-          minHeight={320}
-        >
-          <SweepFrameStrips
-            iid={selectedIid}
-            selectedFrame={selectedFrame}
-            onSelectFrame={setSelectedFrame}
-          />
-        </LazyMountSection>
+        <SweepFrameStrips
+          iid={selectedIid}
+          selectedFrame={selectedFrame}
+          onSelectFrame={setSelectedFrame}
+        />
       </div>
 
       {selectedIid != null && (
@@ -5039,15 +5001,10 @@ return (
 
       {selectedIid != null && (
         <div data-slot="evidence-map">
-          <LazyMountSection
-            placeholder="Loading evidence map when visible…"
-            minHeight={420}
-          >
-            <EvidenceMapPanel
-              iid={selectedIid}
-              refreshKey={controlRefreshKey}
-            />
-          </LazyMountSection>
+          <EvidenceMapPanel
+            iid={selectedIid}
+            refreshKey={controlRefreshKey}
+          />
         </div>
       )}
 
@@ -5067,16 +5024,11 @@ return (
       )}
 
       <div data-slot="position-verification">
-        <LazyMountSection
-          placeholder="Loading position verification when visible…"
-          minHeight={760}
-        >
-          <ReceiverCentredRadarField
-            iid={selectedIid}
-            selectedRow={selectedRow}
-            syncSnapshot={syncSnapshot}
-          />
-        </LazyMountSection>
+        <ReceiverCentredRadarField
+          iid={selectedIid}
+          selectedRow={selectedRow}
+          syncSnapshot={syncSnapshot}
+        />
       </div>
     </div>
   </main>
