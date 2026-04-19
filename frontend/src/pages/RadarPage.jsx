@@ -4177,11 +4177,14 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
     if (tileLayerRef.current) {
       tileLayerRef.current.remove()
     }
-    tileLayerRef.current = L.tileLayer(basemap.url, {
+    const tileOptions = {
       attribution: basemap.attribution,
-      subdomains: basemap.subdomains,
       maxZoom: basemap.maxZoom,
-    }).addTo(map)
+    }
+    if (basemap.subdomains) {
+      tileOptions.subdomains = basemap.subdomains
+    }
+    tileLayerRef.current = L.tileLayer(basemap.url, tileOptions).addTo(map)
   }, [basemapKey, mapReady])
 
   // Fit bounds when effective geometry or map readiness changes
