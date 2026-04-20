@@ -3146,6 +3146,7 @@ async def get_iid_pipeline_debug(iid: int):
             return {"iid": iid, "available": False, "reason": "radar module not initialised"}
 
         python_debug = _state.get_live_pipeline_debug(iid)
+        fm_pipeline = _get_fm().get_frame_pipeline_stats(iid)
 
         radar_core_stats = _radar_core_stats_provider() if _radar_core_stats_provider is not None else {}
         client_stats = radar_core_stats.get("client") or radar_core_stats
@@ -3178,6 +3179,24 @@ async def get_iid_pipeline_debug(iid: int):
             "iid": iid,
             "available": True,
             "python": python_debug,
+            "frame_position_pipeline": {
+                "go_frames_received_by_python": int(python_frames_received or 0),
+                "go_frames_injected_into_python": int(python_debug.get("go_frames_injected_count", 0)),
+                "frames_reaching_solver": int(fm_pipeline.get("frames_reaching_solver", 0)),
+                "frames_solved_for_position": int(fm_pipeline.get("solver_success", 0)),
+                "candidate_frame_positions": int(fm_pipeline.get("candidate_positions", 0)),
+                "solver_no_candidate": int(fm_pipeline.get("solver_no_candidate", 0)),
+                "accumulation_rejected": int(fm_pipeline.get("accumulation_rejected", 0)),
+                "accumulation_rejection_reasons": fm_pipeline.get("accumulation_rejection_reasons", {}),
+                "accumulation_accepted": int(fm_pipeline.get("accumulation_accepted", 0)),
+                "accumulation_acceptance_tiers": fm_pipeline.get("accumulation_acceptance_tiers", {}),
+                "accumulation_written": int(fm_pipeline.get("accumulation_written", 0)),
+                "storage_errors": int(fm_pipeline.get("storage_errors", 0)),
+                "accumulated_frame_positions": int(fm_pipeline.get("accumulated_frame_positions", 0)),
+                "centroid_available": bool(fm_pipeline.get("centroid_available", False)),
+                "last_rejection_reason": fm_pipeline.get("last_rejection_reason"),
+                "last_admission_tier": fm_pipeline.get("last_admission_tier"),
+            },
             "go": {
                 "enabled": bool(radar_core_stats.get("enabled", False)),
                 "frames_enabled": bool(radar_core_stats.get("frames_enabled", False)),

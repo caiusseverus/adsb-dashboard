@@ -433,6 +433,25 @@ def test_get_iid_pipeline_debug_combines_python_and_go_diagnostics():
 
     prior_state = radar_api._state
     prior_provider = radar_api._radar_core_stats_provider
+    prior_fm = radar_api._fm
+    radar_api._fm = SimpleNamespace(
+        get_frame_pipeline_stats=lambda iid: {
+            "frames_reaching_solver": 4,
+            "solver_success": 3,
+            "candidate_positions": 3,
+            "solver_no_candidate": 1,
+            "accumulation_rejected": 2,
+            "accumulation_rejection_reasons": {"too_few_inlier_pair_circles": 2},
+            "accumulation_accepted": 1,
+            "accumulation_acceptance_tiers": {"accepted_reduced_arc_high_quality": 1},
+            "accumulation_written": 1,
+            "storage_errors": 0,
+            "accumulated_frame_positions": 1,
+            "centroid_available": False,
+            "last_rejection_reason": "too_few_inlier_pair_circles",
+            "last_admission_tier": "accepted_reduced_arc_high_quality",
+        }
+    )
     radar_api._state = state
     radar_api.register_radar_core_stats_provider(lambda: {
         "connected": True,
@@ -475,6 +494,7 @@ def test_get_iid_pipeline_debug_combines_python_and_go_diagnostics():
     finally:
         radar_api._state = prior_state
         radar_api._radar_core_stats_provider = prior_provider
+        radar_api._fm = prior_fm
 
     assert payload["available"] is True
     assert payload["python"]["has_period"] is True
@@ -484,6 +504,14 @@ def test_get_iid_pipeline_debug_combines_python_and_go_diagnostics():
     assert payload["go"]["frame_ready_seen"] is False
     assert payload["go"]["dominant_blocking_gate"] == "ref_not_dominant"
     assert payload["go"]["retained_state"]["active_aircraft_estimate"] == 100
+    assert payload["frame_position_pipeline"]["go_frames_received_by_python"] == 0
+    assert payload["frame_position_pipeline"]["go_frames_injected_into_python"] == 0
+    assert payload["frame_position_pipeline"]["frames_reaching_solver"] == 4
+    assert payload["frame_position_pipeline"]["accumulation_rejected"] == 2
+    assert payload["frame_position_pipeline"]["accumulation_rejection_reasons"] == {
+        "too_few_inlier_pair_circles": 2
+    }
+    assert payload["frame_position_pipeline"]["accumulated_frame_positions"] == 1
     assert payload["python"]["retained_state"]["burst_records_dynamic_cap"] >= 800
     assert payload["inferred_blocker"] == "go_no_frame_ready"
 
@@ -499,6 +527,25 @@ def test_get_iid_pipeline_debug_supports_nested_runtime_stats_provider():
 
     prior_state = radar_api._state
     prior_provider = radar_api._radar_core_stats_provider
+    prior_fm = radar_api._fm
+    radar_api._fm = SimpleNamespace(
+        get_frame_pipeline_stats=lambda iid: {
+            "frames_reaching_solver": 9,
+            "solver_success": 7,
+            "candidate_positions": 7,
+            "solver_no_candidate": 2,
+            "accumulation_rejected": 3,
+            "accumulation_rejection_reasons": {"poor_support_score": 3},
+            "accumulation_accepted": 4,
+            "accumulation_acceptance_tiers": {"accepted_high_confidence": 4},
+            "accumulation_written": 4,
+            "storage_errors": 0,
+            "accumulated_frame_positions": 4,
+            "centroid_available": True,
+            "last_rejection_reason": "poor_support_score",
+            "last_admission_tier": "accepted_high_confidence",
+        }
+    )
     radar_api._state = state
     radar_api.register_radar_core_stats_provider(lambda: {
         "enabled": True,
@@ -548,6 +595,7 @@ def test_get_iid_pipeline_debug_supports_nested_runtime_stats_provider():
     finally:
         radar_api._state = prior_state
         radar_api._radar_core_stats_provider = prior_provider
+        radar_api._fm = prior_fm
 
     assert payload["go"]["enabled"] is True
     assert payload["go"]["frames_enabled"] is True
@@ -557,6 +605,11 @@ def test_get_iid_pipeline_debug_supports_nested_runtime_stats_provider():
     assert payload["go"]["events_sent_to_worker"] == 123
     assert payload["go"]["position_updates_sent_to_worker"] == 17
     assert payload["go"]["frames_received_by_python"] == 9
+    assert payload["frame_position_pipeline"]["go_frames_received_by_python"] == 9
+    assert payload["frame_position_pipeline"]["frames_solved_for_position"] == 7
+    assert payload["frame_position_pipeline"]["accumulation_accepted"] == 4
+    assert payload["frame_position_pipeline"]["accumulated_frame_positions"] == 4
+    assert payload["frame_position_pipeline"]["centroid_available"] is True
 
 
 def test_get_iid_sweeps_uses_precomputed_sweep_positions_without_relookup(monkeypatch):

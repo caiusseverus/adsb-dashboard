@@ -594,6 +594,96 @@ def _make_frame_estimate(frame_index, lat, lon, cep_km=2.0, n_arcs=8):
 
 # ── run_full_pipeline: centroid fast-path ────────────────────────────────────
 
+def test_classify_frame_for_accumulation_accepts_reduced_arc_high_quality():
+    rejection, tier = ForwardModel._classify_frame_for_accumulation({
+        "centroid_uncertainty_km": 6.0,
+        "n_inlier_pair_circles": 5,
+        "best_cluster_support_score": 1.2,
+        "support_dominance_ratio": 1.4,
+        "pairwise_weighted_rms_deg": 20.0,
+    })
+    assert rejection is None
+    assert tier == "accepted_reduced_arc_high_quality"
+
+
+def test_on_new_frame_rejection_updates_pipeline_stats(monkeypatch):
+    fm = ForwardModel()
+    called = []
+    estimate = SimpleNamespace(frame_index=17, weight=1.0)
+    solve_result = {
+        "result": {
+            "centroid_uncertainty_km": 6.0,
+            "n_inlier_pair_circles": 5,
+            "best_cluster_support_score": 0.5,
+            "support_dominance_ratio": 1.0,
+            "pairwise_weighted_rms_deg": 20.0,
+        }
+    }
+    monkeypatch.setattr(fm, "solve_single_frame_with_result", lambda *args, **kwargs: (estimate, solve_result))
+    monkeypatch.setattr(fm, "_add_frame_position", lambda iid, est: called.append((iid, est)))
+
+    fm.on_new_frame(
+        iid=77,
+        frame=SimpleNamespace(frame_index=17, quality="good"),
+        period_s=4.0,
+        receiver_lat=51.0,
+        receiver_lon=-1.0,
+    )
+
+    assert called == []
+    stats = fm.get_frame_pipeline_stats(77)
+    assert stats["frames_reaching_solver"] == 1
+    assert stats["solver_success"] == 1
+    assert stats["candidate_positions"] == 1
+    assert stats["accumulation_rejected"] == 1
+    assert stats["accumulation_rejection_reasons"] == {"poor_support_score": 1}
+
+
+def test_on_new_frame_acceptance_updates_pipeline_stats_and_buffer(monkeypatch):
+    fm = ForwardModel()
+    iid = 78
+    fm._frame_positions_loaded.add(iid)
+    estimate = SimpleNamespace(
+        frame_index=18,
+        sweep_start_us=1_000_000.0,
+        lat=51.5,
+        lon=-1.2,
+        cep_km=6.0,
+        n_contributing_arcs=5,
+        azimuth_spread_deg=110.0,
+        weight=1.0,
+        cluster_dominance_ratio=2.0,
+        interpolated_position_fraction=0.1,
+        admission_tier="accepted_high_confidence",
+    )
+    solve_result = {
+        "result": {
+            "centroid_uncertainty_km": 6.0,
+            "n_inlier_pair_circles": 5,
+            "best_cluster_support_score": 1.2,
+            "support_dominance_ratio": 1.4,
+            "pairwise_weighted_rms_deg": 20.0,
+        }
+    }
+    monkeypatch.setattr(fm, "solve_single_frame_with_result", lambda *args, **kwargs: (estimate, solve_result))
+    from db import stats_db
+    monkeypatch.setattr(stats_db, "insert_frame_position", lambda *args, **kwargs: None)
+
+    fm.on_new_frame(
+        iid=iid,
+        frame=SimpleNamespace(frame_index=18, quality="good"),
+        period_s=4.0,
+        receiver_lat=51.0,
+        receiver_lon=-1.0,
+    )
+
+    stats = fm.get_frame_pipeline_stats(iid)
+    assert stats["accumulation_accepted"] == 1
+    assert stats["accumulation_written"] == 1
+    assert stats["accumulation_acceptance_tiers"] == {"accepted_reduced_arc_high_quality": 1}
+    assert stats["accumulated_frame_positions"] == 1
+    assert stats["centroid_available"] is False
+
 _TEST_IID = 99901   # high IID unlikely to exist in any real DB
 
 def _isolated_fm(iid=_TEST_IID):

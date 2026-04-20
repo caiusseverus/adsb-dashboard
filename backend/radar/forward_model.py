@@ -17,7 +17,7 @@ Method:
 from __future__ import annotations
 
 import dataclasses
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 import json
 import logging
@@ -72,6 +72,9 @@ high-CEP frame solves are useful to inspect, but should not dilute the
 long-term centroid merely because they claim large uncertainty.
 """
 ACCUM_MIN_INLIER_PAIR_CIRCLES = 6
+ACCUM_MIN_INLIER_PAIR_CIRCLES_RELAXED = 4
+ACCUM_RELAXED_MIN_SUPPORT_SCORE = 1.1
+ACCUM_RELAXED_MAX_PAIRWISE_WEIGHTED_RMS_DEG = 25.0
 ACCUM_MIN_SUPPORT_SCORE = 0.8
 ACCUM_MIN_SUPPORT_DOMINANCE_RATIO = 1.25
 ACCUM_MAX_PAIRWISE_WEIGHTED_RMS_DEG = 35.0
@@ -1906,6 +1909,75 @@ class ForwardModel:
         self._frame_positions: dict[int, deque] = {}
         self._frame_positions_lock = threading.Lock()
         self._frame_positions_loaded: set[int] = set()  # IIDs whose DB rows have been loaded
+        self._frame_pipeline_stats_lock = threading.Lock()
+        self._frame_pipeline_stats: dict[int, dict] = defaultdict(self._new_frame_pipeline_stats)
+
+    @staticmethod
+    def _new_frame_pipeline_stats() -> dict:
+        return {
+            "frames_reaching_solver": 0,
+            "solver_success": 0,
+            "candidate_positions": 0,
+            "solver_no_candidate": 0,
+            "accumulation_rejected": 0,
+            "accumulation_rejection_reasons": {},
+            "accumulation_accepted": 0,
+            "accumulation_acceptance_tiers": {},
+            "accumulation_written": 0,
+            "storage_errors": 0,
+            "last_rejection_reason": None,
+            "last_admission_tier": None,
+        }
+
+    def _record_frame_pipeline_event(
+        self,
+        iid: int,
+        *,
+        rejection_reason: Optional[str] = None,
+        admission_tier: Optional[str] = None,
+        storage_error: bool = False,
+        **increments: int,
+    ) -> None:
+        with self._frame_pipeline_stats_lock:
+            stats = self._frame_pipeline_stats[iid]
+            for key, delta in increments.items():
+                if delta:
+                    stats[key] = int(stats.get(key, 0)) + int(delta)
+            if rejection_reason is not None:
+                reasons = stats.setdefault("accumulation_rejection_reasons", {})
+                reasons[rejection_reason] = int(reasons.get(rejection_reason, 0)) + 1
+                stats["last_rejection_reason"] = rejection_reason
+            if admission_tier is not None:
+                tiers = stats.setdefault("accumulation_acceptance_tiers", {})
+                tiers[admission_tier] = int(tiers.get(admission_tier, 0)) + 1
+                stats["last_admission_tier"] = admission_tier
+            if storage_error:
+                stats["storage_errors"] = int(stats.get("storage_errors", 0)) + 1
+
+    def get_frame_pipeline_stats(self, iid: int) -> dict:
+        with self._frame_pipeline_stats_lock:
+            raw = self._frame_pipeline_stats.get(iid)
+            if raw is None:
+                raw = self._new_frame_pipeline_stats()
+            stats = {
+                "frames_reaching_solver": int(raw.get("frames_reaching_solver", 0)),
+                "solver_success": int(raw.get("solver_success", 0)),
+                "candidate_positions": int(raw.get("candidate_positions", 0)),
+                "solver_no_candidate": int(raw.get("solver_no_candidate", 0)),
+                "accumulation_rejected": int(raw.get("accumulation_rejected", 0)),
+                "accumulation_rejection_reasons": dict(raw.get("accumulation_rejection_reasons", {})),
+                "accumulation_accepted": int(raw.get("accumulation_accepted", 0)),
+                "accumulation_acceptance_tiers": dict(raw.get("accumulation_acceptance_tiers", {})),
+                "accumulation_written": int(raw.get("accumulation_written", 0)),
+                "storage_errors": int(raw.get("storage_errors", 0)),
+                "last_rejection_reason": raw.get("last_rejection_reason"),
+                "last_admission_tier": raw.get("last_admission_tier"),
+            }
+        n_accumulated = len(self.get_frame_positions(iid))
+        centroid = self.compute_weighted_centroid(iid) if n_accumulated > 0 else None
+        stats["accumulated_frame_positions"] = n_accumulated
+        stats["centroid_available"] = centroid is not None
+        return stats
 
     @staticmethod
     def _classify_frame_for_accumulation(result: dict) -> tuple[Optional[str], str]:
@@ -1931,7 +2003,7 @@ class ForwardModel:
         weight_ratio = float(result.get("weight_dominance_ratio", 0.0))
 
         # Hard gates that cannot be bypassed by any tier
-        if n_inliers < ACCUM_MIN_INLIER_PAIR_CIRCLES:
+        if n_inliers < ACCUM_MIN_INLIER_PAIR_CIRCLES_RELAXED:
             return "too_few_inlier_pair_circles", "rejected"
         if not math.isfinite(cep_km) or cep_km >= ACCUM_MAX_FRAME_CEP_KM:
             return "excessive_frame_cep", "rejected"
@@ -1941,8 +2013,16 @@ class ForwardModel:
         # Tier 1: full quality gates pass — high confidence
         support_dom_ok = support_dominance >= ACCUM_MIN_SUPPORT_DOMINANCE_RATIO
         rms_ok = math.isfinite(pairwise_rms) and pairwise_rms <= ACCUM_MAX_PAIRWISE_WEIGHTED_RMS_DEG
-        if support_dom_ok and rms_ok:
+        if n_inliers >= ACCUM_MIN_INLIER_PAIR_CIRCLES and support_dom_ok and rms_ok:
             return None, "accepted_high_confidence"
+        if (
+            n_inliers < ACCUM_MIN_INLIER_PAIR_CIRCLES
+            and support_score >= ACCUM_RELAXED_MIN_SUPPORT_SCORE
+            and support_dom_ok
+            and math.isfinite(pairwise_rms)
+            and pairwise_rms <= ACCUM_RELAXED_MAX_PAIRWISE_WEIGHTED_RMS_DEG
+        ):
+            return None, "accepted_reduced_arc_high_quality"
 
         # Tier 2: geometry-dominant bypass — strong member/weight dominance can override
         # noisy pairwise RMS and borderline support-dominance.
@@ -1996,14 +2076,17 @@ class ForwardModel:
         """
         if receiver_lat is None or receiver_lon is None:
             return
+        self._record_frame_pipeline_event(iid, frames_reaching_solver=1)
 
         est, solve_result = self.solve_single_frame_with_result(
             iid, frame, period_s, receiver_lat, receiver_lon,
         )
         if est is None:
+            self._record_frame_pipeline_event(iid, solver_no_candidate=1)
             if solve_result is not None:
                 n_arcs = solve_result.get("result", {}).get("n_contributing_arcs", 0)
                 cep_km = solve_result.get("result", {}).get("centroid_uncertainty_km", float("inf"))
+                self._record_frame_pipeline_event(iid, solver_success=1)
                 log.info(
                     "ForwardModel: IID %d — frame %d solve succeeded but est is None "
                     "(n_contributing_arcs=%d < %d, cep_km=%.1f >= %.1f)",
@@ -2015,6 +2098,7 @@ class ForwardModel:
                     _PER_FRAME_MAX_CEP_KM,
                 )
             return
+        self._record_frame_pipeline_event(iid, solver_success=1, candidate_positions=1)
 
         # Stricter accumulation admission gate — prevents weak frame solves
         # from entering the long-term buffer while still returning the estimate
@@ -2025,6 +2109,11 @@ class ForwardModel:
             inner = solve_result.get("result", {})
             rejection, tier = self._classify_frame_for_accumulation(inner)
             if rejection is not None:
+                self._record_frame_pipeline_event(
+                    iid,
+                    accumulation_rejected=1,
+                    rejection_reason=rejection,
+                )
                 n_inliers = int(inner.get("n_inlier_pair_circles", inner.get("n_contributing_arcs", 0)))
                 cep_km = float(inner.get("centroid_uncertainty_km", float("inf")))
                 support = float(inner.get("best_cluster_support_score", 0.0))
@@ -2040,6 +2129,11 @@ class ForwardModel:
                 )
                 return
             est.admission_tier = tier
+            self._record_frame_pipeline_event(
+                iid,
+                accumulation_accepted=1,
+                admission_tier=tier,
+            )
             if tier == "accepted_geometry_dominant":
                 est.weight *= ACCUM_GEOM_DOMINANT_WEIGHT_SCALE
                 log.info(
@@ -2194,6 +2288,7 @@ class ForwardModel:
                 self._frame_positions[iid] = deque(maxlen=_PER_FRAME_BUFFER_MAX)
             self._frame_positions[iid].append(estimate)
             n_accumulated = len(self._frame_positions[iid])
+        self._record_frame_pipeline_event(iid, accumulation_written=1)
         log.debug(
             "ForwardModel: IID %d — accumulated frame %d (%.4f, %.4f) cep=%.1f km [%d total in buffer]",
             iid, estimate.frame_index, estimate.lat, estimate.lon, estimate.cep_km, n_accumulated,
@@ -2202,6 +2297,7 @@ class ForwardModel:
             from db import stats_db
             stats_db.insert_frame_position(iid, estimate)
         except Exception:
+            self._record_frame_pipeline_event(iid, storage_error=True)
             log.exception("ForwardModel: IID %d — failed to persist frame position", iid)
 
     def get_frame_positions(self, iid: int) -> list["FramePositionEstimate"]:

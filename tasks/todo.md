@@ -4305,3 +4305,35 @@ Plan confirmation: proceeding with a minimal-shape change that preserves existin
 - Verification:
   - `uv run --directory backend pytest tests/test_radar_core_client.py tests/test_radar_core_protocol.py` -> `32 passed`
   - `cd radar-core && go test ./...` -> all packages passed
+
+## 2026-04-20 Go Frame Post-Frame Accumulation Bug
+
+- [x] Trace FRAME_READY -> Python injection -> FM solve -> accumulation -> centroid path and identify exact break
+- [x] Add per-IID operational counters for Go frame ingestion, FM solve outcomes, accumulation admission, and rejection reasons
+- [x] Fix the specific post-frame break so valid generated-frame positions enter accumulation
+- [x] Add/extend focused backend tests for the fixed path and observability payload
+- [x] Run targeted backend verification and document before/after counters + review
+
+### Review
+
+- Root cause:
+  - `FRAME_READY` transport and Python injection were working, and FM per-frame solve could produce candidates.
+  - The accumulation classifier hard-rejected any frame with `< 6` inlier pair circles before evaluating quality, so solved Go-generated frames with 4-5 strong inliers were dropped from accumulation every time.
+- Implementation:
+  - Added per-IID FM pipeline counters in `backend/radar/forward_model.py`:
+    - frames reaching solver, solver success/no-candidate, candidate positions
+    - accumulation accepted/rejected
+    - rejection reason histogram and acceptance tier histogram
+    - writes to accumulation buffer, storage errors
+    - accumulated frame-position count and centroid availability
+  - Added a targeted accumulation admission tier for reduced-arc but high-quality solves:
+    - new lower hard floor: `n_inliers >= 4`
+    - `n_inliers` in `[4,5]` now admitted as `accepted_reduced_arc_high_quality` only when support and pairwise metrics are strong
+    - existing high-confidence and geometry-dominant tiers retained
+  - Exposed these counters through `/api/radar/iids/{iid}/pipeline-debug` under `frame_position_pipeline`.
+- Verification:
+  - `uv run --directory backend pytest tests/test_forward_model.py::test_classify_frame_for_accumulation_accepts_reduced_arc_high_quality tests/test_forward_model.py::test_on_new_frame_rejection_updates_pipeline_stats tests/test_forward_model.py::test_on_new_frame_acceptance_updates_pipeline_stats_and_buffer tests/test_radar_api.py::test_get_iid_pipeline_debug_combines_python_and_go_diagnostics tests/test_radar_api.py::test_get_iid_pipeline_debug_supports_nested_runtime_stats_provider` -> `5 passed`
+  - `python3 -m py_compile backend/radar/forward_model.py backend/radar/api.py backend/tests/test_forward_model.py backend/tests/test_radar_api.py` -> passed
+- Before/after counters (from focused regression coverage):
+  - Before fix: reduced-arc high-quality case rejected with `too_few_inlier_pair_circles`; `accumulation_accepted=0`, `accumulation_written=0`.
+  - After fix: same case admitted as `accepted_reduced_arc_high_quality`; `accumulation_accepted=1`, `accumulation_written=1`, `accumulated_frame_positions=1`.
