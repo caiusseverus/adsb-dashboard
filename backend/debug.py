@@ -73,6 +73,8 @@ async def get_perf() -> dict:
     radar_ws_t = list(_radar_ws_timings)
     timing_ws_t = list(_timing_ws_timings)
     fm_t = list(_fm_run_timings)
+    _fm_worker_timings = getattr(_main_module, "_fm_worker_timings", [])
+    fm_worker_t = list(_fm_worker_timings)
     decoder_batch_t = list(_benchmark_module.decoder_batch_timings)
     beast_chunk_t = list(_beast_client_module.chunk_timings)
     radar_api_t = list(_radar_api_module.api_timings)
@@ -233,6 +235,12 @@ async def get_perf() -> dict:
             "frame_count_avg": sample_avg(fm_t, "frame_count"),
             "stored_avg": sample_avg(fm_t, "stored"),
             "success_avg": sample_avg(fm_t, "ok"),
+        },
+        "fm_worker_ms": {
+            "samples": len(fm_worker_t),
+            "wall_avg": sample_avg(fm_worker_t, "wall_ms"),
+            "cpu_avg": sample_avg(fm_worker_t, "cpu_ms"),
+            "offcpu_avg": sample_avg(fm_worker_t, "offcpu_ms"),
         },
         "radar_iid_ws_ms": {
             "samples": len(radar_ws_t),

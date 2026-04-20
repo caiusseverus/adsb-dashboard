@@ -57,6 +57,21 @@ class RadarCoreWorker:
         self._stderr_tail: deque[str] = deque(maxlen=80)
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
+        # Cached socket-ready probe; updated by a background thread so stats()
+        # never blocks the asyncio event loop with a connect() call.
+        self._socket_ready_cache: bool = False
+        self._socket_ready_thread: threading.Thread | None = None
+        self._socket_ready_stop = threading.Event()
+
+    def _start_socket_ready_prober(self) -> None:
+        """Start a daemon thread that probes socket_ready every 2s into a cache."""
+        def _probe_loop() -> None:
+            while not self._socket_ready_stop.is_set():
+                self._socket_ready_cache = _socket_is_listening(self._socket_path)
+                self._socket_ready_stop.wait(timeout=2.0)
+        t = threading.Thread(target=_probe_loop, daemon=True, name="rc-socket-probe")
+        t.start()
+        self._socket_ready_thread = t
 
     def start(self) -> bool:
         """Start worker in managed mode, or wait for external readiness."""
@@ -68,15 +83,25 @@ class RadarCoreWorker:
         if _socket_is_listening(self._socket_path):
             with self._lock:
                 self._state = "ready_external_socket"
+            self._socket_ready_cache = True
+            self._start_socket_ready_prober()
             return True
 
         if not self._managed:
-            return self._wait_for_external_socket()
+            ok = self._wait_for_external_socket()
+            self._socket_ready_cache = ok
+            self._start_socket_ready_prober()
+            return ok
 
-        return self._start_managed_worker()
+        ok = self._start_managed_worker()
+        self._socket_ready_cache = ok
+        self._start_socket_ready_prober()
+        return ok
 
     def stop(self) -> None:
         """Stop only if backend started the subprocess."""
+        self._socket_ready_stop.set()
+
         with self._lock:
             process = self._process
             started_by_backend = self._started_by_backend
@@ -105,7 +130,7 @@ class RadarCoreWorker:
         pid = process.pid if process is not None else None
         exit_code = process.poll() if process is not None else None
         socket_exists = os.path.exists(self._socket_path)
-        socket_ready = _socket_is_listening(self._socket_path)
+        socket_ready = self._socket_ready_cache  # updated by background prober; never blocks
 
         return {
             "managed": self._managed,

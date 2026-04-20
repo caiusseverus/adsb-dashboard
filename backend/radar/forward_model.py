@@ -297,6 +297,8 @@ def _dedupe_near_duplicate_clusters(
     merge_events: list[dict] = []
 
     for idx, cluster in enumerate(clusters):
+        if idx % 8 == 0:
+            time.sleep(0)  # yield GIL to decoder thread
         merged_into: Optional[int] = None
         merge_reason: Optional[dict] = None
         for kept_idx, kept in enumerate(merged):
@@ -1940,11 +1942,13 @@ def _build_intersection_clusters(
             merged_cluster_indices=(source_index,),
         )
 
-    neighborhoods = [
-        nb
-        for idx, c in enumerate(candidates)
-        if (nb := _build_neighborhood(c, idx)) is not None
-    ]
+    neighborhoods = []
+    for _nb_idx, _nb_c in enumerate(candidates):
+        if _nb_idx % 16 == 0:
+            time.sleep(0)  # yield GIL to decoder thread
+        _nb = _build_neighborhood(_nb_c, _nb_idx)
+        if _nb is not None:
+            neighborhoods.append(_nb)
     neighborhoods.sort(
         key=lambda cluster: (cluster.total_weight, cluster.member_count, -cluster.rms_km),
         reverse=True,

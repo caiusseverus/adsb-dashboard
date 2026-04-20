@@ -160,11 +160,21 @@ def _start_fm_worker() -> threading.Thread | None:
             # the next drain.
             for iid, frame, period_s in pending:
                 try:
+                    _t0_wall = time.perf_counter()
+                    _t0_cpu = time.thread_time()
                     _get_fm().on_new_frame(
                         iid, frame, period_s,
                         getattr(config, "RECEIVER_LAT", None),
                         getattr(config, "RECEIVER_LON", None),
                     )
+                    _wall_ms = (time.perf_counter() - _t0_wall) * 1000
+                    _cpu_ms = (time.thread_time() - _t0_cpu) * 1000
+                    _fm_worker_timings.append({
+                        "iid": iid,
+                        "wall_ms": round(_wall_ms, 2),
+                        "cpu_ms": round(_cpu_ms, 2),
+                        "offcpu_ms": round(_wall_ms - _cpu_ms, 2),
+                    })
                 except Exception:
                     log.exception("fm-worker: solve failed for IID %d", iid)
 
@@ -229,6 +239,7 @@ _AGGREGATE_REBUILD_INTERVAL_S = 0.25
 _RADAR_IID_REBUILD_INTERVAL_S = max(1.0, config.RADAR_IID_WS_REBUILD_INTERVAL_S)
 _radar_loop_timings: _deque[dict] = _deque(maxlen=240)
 _fm_run_timings: _deque[dict] = _deque(maxlen=240)
+_fm_worker_timings: _deque[dict] = _deque(maxlen=400)
 _radar_ws_timings: _deque[dict] = _deque(maxlen=400)
 _RADAR_CORE_POSITION_INTERVAL_S = 2.0
 _RADAR_CORE_POSITION_REFRESH_S = 10.0
