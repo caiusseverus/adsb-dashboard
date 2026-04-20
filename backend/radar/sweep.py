@@ -121,11 +121,22 @@ ROTATION_ANALYSIS_MAX_AGE_S = 120.0   # 2 min ≈ 24–40 rotations — sufficie
 # BurstRecord retention: matches the rotation analysis window so _burst_records
 # always covers the full window used by _analyse_burst_records.
 BURST_RECORD_MAX_AGE_S = ROTATION_ANALYSIS_MAX_AGE_S
-# Hard cap on burst records retained per IID. The bounded deque replaces age-only pruning
-# for hot IIDs. Sized for 2-min window at typical Pi density (12–30 sweeps × ≤20 aircraft).
-# Rotation analysis needs MIN_BURSTS=4 per aircraft with MIN_QUALIFYING_ICAOS=4 → ~16 minimum;
-# 400 gives generous headroom without permitting thousands of records per hot IID.
-_BURST_RECORDS_MAX_PER_IID = 400
+# Density-aware burst retention policy (bounded):
+# retained_records ~= active_aircraft * target_sweeps_per_aircraft * headroom.
+#
+# The lower bound avoids sparse-history starvation at moderate load; the upper
+# bound keeps RAM safe on Pi-class systems during extreme traffic bursts.
+_BURST_RECORDS_TARGET_SWEEPS_PER_AIRCRAFT = 16.0
+_BURST_RECORDS_HEADROOM = 1.4
+_BURST_RECORDS_MIN_PER_IID = 800
+_BURST_RECORDS_MAX_PER_IID = 8_000
+# Active-aircraft estimate lookback for dynamic retention scaling.
+_ACTIVE_AIRCRAFT_LOOKBACK_S = 180.0
+# Density-aware analysis cap (bounded independently from storage cap).
+_ROTATION_ANALYSIS_TARGET_SWEEPS_PER_AIRCRAFT = 20.0
+_ROTATION_ANALYSIS_HEADROOM = 1.5
+_ROTATION_ANALYSIS_MIN_EVENTS_PER_IID = 1_200
+_ROTATION_ANALYSIS_MAX_EVENTS_PER_IID = 12_000
 # Hard cap on the global _iid_events deque. Age-based pruning (IID_EVENT_MAX_AGE_S) is the
 # primary bound; this maxlen prevents runaway growth during high-rate DF11 bursts between
 # pruning cycles.
@@ -1949,7 +1960,8 @@ class RadarState:
 
         # Per-IID compact burst records: {iid: deque[BurstRecord]}
         # One record per fired burst; replaces _iid_events as the source for
-        # rotation analysis. Pruned to BURST_RECORD_MAX_AGE_S in update_rotation_models().
+        # rotation analysis. Pruned to BURST_RECORD_MAX_AGE_S plus a bounded
+        # density-aware per-IID count cap in _append_burst_record().
         self._burst_records: dict[int, deque] = {}
 
         # Wrap-around unwrapping state (mirrors IIDAccumulator in probe tool)
@@ -2092,9 +2104,13 @@ class RadarState:
         # update_rotation_models() uses these to skip _analyse_iid_events for
         # IIDs whose event stream has not meaningfully grown since last run.
         self._rotation_analysis_meta: dict[int, tuple[int, float]] = {}
-        # Upper bound on events passed to _analyse_iid_events for a single IID.
-        # Protects the rotation loop when a hot IID accumulates many events.
-        self._ROTATION_ANALYSIS_MAX_EVENTS_PER_IID = 4000
+        # Dynamic retention observability for burst-record and analysis caps.
+        self._burst_record_dynamic_cap_by_iid: dict[int, int] = {}
+        self._burst_record_cap_hits_by_iid: dict[int, int] = {}
+        self._burst_record_last_active_aircraft_by_iid: dict[int, int] = {}
+        self._rotation_analysis_dynamic_cap_by_iid: dict[int, int] = {}
+        self._rotation_analysis_cap_hits_by_iid: dict[int, int] = {}
+        self._rotation_analysis_last_active_aircraft_by_iid: dict[int, int] = {}
         # Minimum new-event delta required to re-run analysis for an already
         # established IID.  Lower deltas are deferred until the next cycle.
         self._ROTATION_ANALYSIS_MIN_DELTA = 40
@@ -2199,6 +2215,85 @@ class RadarState:
         if iid not in self._live_burst_timeline_obs:
             self._live_burst_timeline_obs[iid] = deque(maxlen=self._BURST_SYNC_TIMELINE_OBS_MAX)
 
+    @staticmethod
+    def _density_scaled_cap(
+        active_aircraft: int,
+        *,
+        target_sweeps_per_aircraft: float,
+        headroom: float,
+        min_cap: int,
+        max_cap: int,
+    ) -> int:
+        active = max(int(active_aircraft), 1)
+        scaled = int(round(active * target_sweeps_per_aircraft * headroom))
+        return max(min_cap, min(max_cap, scaled))
+
+    def _estimate_active_aircraft_for_iid(self, iid: int, now_us: float | None = None) -> int:
+        """Estimate currently active aircraft for one IID from recent burst activity."""
+        last_arrival = self._live_last_arrival.get(iid, {})
+        pending = self._live_bursts.get(iid, {})
+        try:
+            last_arrivals = list(last_arrival.values())
+        except RuntimeError:
+            last_arrivals = []
+        active = len(last_arrivals)
+        if now_us is not None and now_us > 0 and last_arrivals:
+            cutoff_us = now_us - (_ACTIVE_AIRCRAFT_LOOKBACK_S * 1_000_000.0)
+            active = sum(1 for ts in last_arrivals if ts >= cutoff_us)
+        active = max(active, len(pending))
+        if active <= 0:
+            br_deque = self._burst_records.get(iid)
+            if br_deque:
+                try:
+                    active = len({rec.icao for rec in list(br_deque)})
+                except RuntimeError:
+                    active = 1
+        return max(active, 1)
+
+    def _burst_record_dynamic_cap(self, iid: int, *, now_us: float | None = None) -> int:
+        active = self._estimate_active_aircraft_for_iid(iid, now_us=now_us)
+        cap = self._density_scaled_cap(
+            active,
+            target_sweeps_per_aircraft=_BURST_RECORDS_TARGET_SWEEPS_PER_AIRCRAFT,
+            headroom=_BURST_RECORDS_HEADROOM,
+            min_cap=_BURST_RECORDS_MIN_PER_IID,
+            max_cap=_BURST_RECORDS_MAX_PER_IID,
+        )
+        self._burst_record_dynamic_cap_by_iid[iid] = cap
+        self._burst_record_last_active_aircraft_by_iid[iid] = active
+        return cap
+
+    def _rotation_analysis_dynamic_cap(self, iid: int, *, now_us: float | None = None) -> int:
+        active = self._estimate_active_aircraft_for_iid(iid, now_us=now_us)
+        cap = self._density_scaled_cap(
+            active,
+            target_sweeps_per_aircraft=_ROTATION_ANALYSIS_TARGET_SWEEPS_PER_AIRCRAFT,
+            headroom=_ROTATION_ANALYSIS_HEADROOM,
+            min_cap=_ROTATION_ANALYSIS_MIN_EVENTS_PER_IID,
+            max_cap=_ROTATION_ANALYSIS_MAX_EVENTS_PER_IID,
+        )
+        self._rotation_analysis_dynamic_cap_by_iid[iid] = cap
+        self._rotation_analysis_last_active_aircraft_by_iid[iid] = active
+        return cap
+
+    def _append_burst_record(self, iid: int, record: BurstRecord) -> None:
+        """Append one BurstRecord and enforce age + density-aware bounded retention."""
+        records = self._burst_records.setdefault(iid, deque())
+        records.append(record)
+
+        cutoff_us = record.centroid_us - (BURST_RECORD_MAX_AGE_S * 1_000_000.0)
+        while records and records[0].centroid_us < cutoff_us:
+            records.popleft()
+
+        cap = self._burst_record_dynamic_cap(iid, now_us=record.centroid_us)
+        if len(records) > cap:
+            dropped = len(records) - cap
+            for _ in range(dropped):
+                records.popleft()
+            self._burst_record_cap_hits_by_iid[iid] = (
+                self._burst_record_cap_hits_by_iid.get(iid, 0) + dropped
+            )
+
     _ICAO_STATE_PRUNE_INTERVAL_S = 120.0  # prune at most once every 2 minutes
     _icao_state_last_prune_ts: float = 0.0
 
@@ -2270,6 +2365,7 @@ class RadarState:
             return {
                 "count": 0,
                 "max_entries": max_entries,
+                "cap_hit": False,
                 "oldest_burst_centroid_us": None,
                 "newest_burst_centroid_us": None,
                 "retained_duration_s": 0.0,
@@ -2280,6 +2376,7 @@ class RadarState:
         return {
             "count": count,
             "max_entries": max_entries,
+            "cap_hit": bool(max_entries and count >= max_entries),
             "oldest_burst_centroid_us": oldest_us,
             "newest_burst_centroid_us": newest_us,
             "retained_duration_s": retained_duration_s,
@@ -2314,6 +2411,7 @@ class RadarState:
             burst_record_counts = [len(v) for v in self._burst_records.values()]
             non_empty_burst_counts = [count for count in burst_record_counts if count > 0]
             n_burst_records = sum(burst_record_counts)
+            dynamic_caps = list(self._burst_record_dynamic_cap_by_iid.values())
             return {
                 "models":              len(self._models),
                 "iid_events":          len(self._iid_events),
@@ -2322,6 +2420,9 @@ class RadarState:
                 "burst_records_iids":  len(non_empty_burst_counts),
                 "burst_records_max_per_iid": max(burst_record_counts, default=0),
                 "burst_records_cap_per_iid": _BURST_RECORDS_MAX_PER_IID,
+                "burst_records_dynamic_cap_min": min(dynamic_caps, default=_BURST_RECORDS_MIN_PER_IID),
+                "burst_records_dynamic_cap_max": max(dynamic_caps, default=_BURST_RECORDS_MIN_PER_IID),
+                "burst_records_cap_hits_total": sum(self._burst_record_cap_hits_by_iid.values()),
                 "burst_records_avg_per_iid": (
                     round(n_burst_records / len(non_empty_burst_counts), 1)
                     if non_empty_burst_counts else 0.0
@@ -2388,13 +2489,16 @@ class RadarState:
             n_replies = fired_burst.get("n_replies", 1)
             trigger_arrival_us = fired_burst.get("trigger_arrival_us", burst_centroid_us)
 
-            self._burst_records.setdefault(iid, deque(maxlen=_BURST_RECORDS_MAX_PER_IID)).append(BurstRecord(
-                iid=iid,
-                icao=fired_icao,
-                centroid_us=burst_centroid_us,
-                n_replies=n_replies,
-                signal_dbfs=burst_signal,
-            ))
+            self._append_burst_record(
+                iid,
+                BurstRecord(
+                    iid=iid,
+                    icao=fired_icao,
+                    centroid_us=burst_centroid_us,
+                    n_replies=n_replies,
+                    signal_dbfs=burst_signal,
+                ),
+            )
             self._record_dwell_profile(
                 iid=iid,
                 icao=fired_icao,
@@ -4933,7 +5037,7 @@ class RadarState:
             self._live_frames[iid] = None
             self._live_completed_frames[iid] = deque(maxlen=self._LIVE_FRAMES_MAX)
             self._live_frame_counters[iid] = 0
-            self._burst_records.setdefault(iid, deque(maxlen=_BURST_RECORDS_MAX_PER_IID))
+            self._burst_records.setdefault(iid, deque())
         if iid not in self._live_burst_diagnostic_replies:
             self._live_burst_diagnostic_replies[iid] = {}
         if iid not in self._live_aligned_burst_obs:
@@ -4961,13 +5065,16 @@ class RadarState:
             # Emit compact BurstRecord for rotation analysis and sync fitting.
             # Core fields only; enrichment (position, family flags) can be layered
             # on separately if needed by other consumers.
-            self._burst_records.setdefault(iid, deque(maxlen=_BURST_RECORDS_MAX_PER_IID)).append(BurstRecord(
-                iid=iid,
-                icao=fired_icao,
-                centroid_us=burst_centroid_us,
-                n_replies=n_replies,
-                signal_dbfs=burst_signal,
-            ))
+            self._append_burst_record(
+                iid,
+                BurstRecord(
+                    iid=iid,
+                    icao=fired_icao,
+                    centroid_us=burst_centroid_us,
+                    n_replies=n_replies,
+                    signal_dbfs=burst_signal,
+                ),
+            )
             self._record_dwell_profile(
                 iid=iid,
                 icao=fired_icao,
@@ -5472,9 +5579,9 @@ class RadarState:
             history_fetch_s = 0.0
             cache_build_s = 0.0
             unprocessed_iids: set[int] = set()
-            burst_cap = self._ROTATION_ANALYSIS_MAX_EVENTS_PER_IID
             min_delta = self._ROTATION_ANALYSIS_MIN_DELTA
             for index, iid in enumerate(ordered_iids):
+                analysis_cap = self._rotation_analysis_dynamic_cap(iid, now_us=float(now_us))
                 if iid in by_iid_bursts:
                     burst_list = by_iid_bursts[iid]
                     prev_count, _prev_ts = self._rotation_analysis_meta.get(iid, (0, 0.0))
@@ -5488,8 +5595,12 @@ class RadarState:
                         and (len(burst_list) - prev_count) < min_delta
                     ):
                         continue
-                    if burst_cap > 0 and len(burst_list) > burst_cap:
-                        burst_list_for_analysis = burst_list[-burst_cap:]
+                    if analysis_cap > 0 and len(burst_list) > analysis_cap:
+                        dropped = len(burst_list) - analysis_cap
+                        self._rotation_analysis_cap_hits_by_iid[iid] = (
+                            self._rotation_analysis_cap_hits_by_iid.get(iid, 0) + dropped
+                        )
+                        burst_list_for_analysis = burst_list[-analysis_cap:]
                     else:
                         burst_list_for_analysis = burst_list
                     analysed_models[iid] = _analyse_burst_records(burst_list_for_analysis)
@@ -5499,8 +5610,12 @@ class RadarState:
                     # Analyse raw _iid_events so the first model can be seeded and
                     # the frame builder can start producing burst records.
                     iid_events = by_iid_events[iid]
-                    if burst_cap > 0 and len(iid_events) > burst_cap:
-                        iid_events = iid_events[-burst_cap:]
+                    if analysis_cap > 0 and len(iid_events) > analysis_cap:
+                        dropped = len(iid_events) - analysis_cap
+                        self._rotation_analysis_cap_hits_by_iid[iid] = (
+                            self._rotation_analysis_cap_hits_by_iid.get(iid, 0) + dropped
+                        )
+                        iid_events = iid_events[-analysis_cap:]
                     analysed_models[iid] = _analyse_iid_events(iid_events)
                     # Do not update _rotation_analysis_meta: event count is volatile
                     # and the delta-skip guard must not suppress bootstrap cycles.
@@ -5703,6 +5818,12 @@ class RadarState:
                                self._live_sync_snapshot_cache,
                                self._live_sync_snapshot_seq,
                                self._rotation_analysis_meta,
+                               self._burst_record_dynamic_cap_by_iid,
+                               self._burst_record_cap_hits_by_iid,
+                               self._burst_record_last_active_aircraft_by_iid,
+                               self._rotation_analysis_dynamic_cap_by_iid,
+                               self._rotation_analysis_cap_hits_by_iid,
+                               self._rotation_analysis_last_active_aircraft_by_iid,
                                self._burst_records,
                                self._dwell_profiles):
                 if iid in live_dict:
@@ -5798,6 +5919,12 @@ class RadarState:
             self._live_sync_snapshot_cache.clear()
             self._live_sync_snapshot_seq.clear()
             self._rotation_analysis_meta.clear()
+            self._burst_record_dynamic_cap_by_iid.clear()
+            self._burst_record_cap_hits_by_iid.clear()
+            self._burst_record_last_active_aircraft_by_iid.clear()
+            self._rotation_analysis_dynamic_cap_by_iid.clear()
+            self._rotation_analysis_cap_hits_by_iid.clear()
+            self._rotation_analysis_last_active_aircraft_by_iid.clear()
             self._live_detection_buffer.clear()
             self._native_burst_processors.clear()
             self._dwell_profiles.clear()
@@ -8480,6 +8607,34 @@ class RadarState:
             "n_usable": n_good + n_marginal,
         }
 
+    @staticmethod
+    def _summarise_burst_records_by_icao(records: list[BurstRecord]) -> dict:
+        counts: dict[str, int] = {}
+        for rec in records:
+            counts[rec.icao] = counts.get(rec.icao, 0) + 1
+        per_icao = sorted(counts.values())
+        if not per_icao:
+            return {
+                "icaos": 0,
+                "min": 0,
+                "median": 0.0,
+                "max": 0,
+                "reference_eligible": 0,
+            }
+        return {
+            "icaos": len(per_icao),
+            "min": per_icao[0],
+            "median": statistics.median(per_icao),
+            "max": per_icao[-1],
+            "reference_eligible": sum(1 for c in per_icao if c >= MIN_BURSTS),
+        }
+
+    @staticmethod
+    def _retained_span_s(records: list[BurstRecord]) -> float:
+        if len(records) < 2:
+            return 0.0
+        return max(0.0, (records[-1].centroid_us - records[0].centroid_us) / 1_000_000.0)
+
     def get_live_pipeline_debug(self, iid: int) -> dict:
         """Compact per-IID live pipeline diagnostics for frame/sync debugging."""
         with self._lock:
@@ -8489,9 +8644,17 @@ class RadarState:
             timeline_obs = list(self._live_burst_timeline_obs.get(iid, []))
             aligned_obs = list(self._live_aligned_burst_obs.get(iid, []))
             completed = list(self._live_completed_frames.get(iid, []))
+            burst_records = list(self._burst_records.get(iid, []))
+            last_arrival = dict(self._live_last_arrival.get(iid, {}))
             go_injected = self._radar_core_frames_injected_by_iid.get(iid, 0)
             python_finalized = self._python_frames_finalized_by_iid.get(iid, 0)
             latest_arrival_us = self._iid_latest_arrival_us.get(iid)
+            burst_dynamic_cap = self._burst_record_dynamic_cap_by_iid.get(iid, _BURST_RECORDS_MIN_PER_IID)
+            burst_cap_hits = self._burst_record_cap_hits_by_iid.get(iid, 0)
+            burst_last_active = self._burst_record_last_active_aircraft_by_iid.get(iid, 0)
+            analysis_dynamic_cap = self._rotation_analysis_dynamic_cap_by_iid.get(iid, _ROTATION_ANALYSIS_MIN_EVENTS_PER_IID)
+            analysis_cap_hits = self._rotation_analysis_cap_hits_by_iid.get(iid, 0)
+            analysis_last_active = self._rotation_analysis_last_active_aircraft_by_iid.get(iid, 0)
 
         has_period = bool(model is not None and model.period_s is not None)
         reference_icao = None
@@ -8522,6 +8685,31 @@ class RadarState:
             snapshot_empty_reason = "no_timeline_or_aligned_observations"
         else:
             snapshot_empty_reason = None
+
+        now_us = float(latest_arrival_us) if latest_arrival_us is not None else 0.0
+        if now_us > 0:
+            cutoff_us = now_us - (_ACTIVE_AIRCRAFT_LOOKBACK_S * 1_000_000.0)
+            active_aircraft_est = sum(1 for ts in last_arrival.values() if ts >= cutoff_us)
+        else:
+            active_aircraft_est = len(last_arrival)
+        if active_aircraft_est <= 0:
+            active_aircraft_est = len({rec.icao for rec in burst_records})
+        active_aircraft_est = max(active_aircraft_est, 0)
+
+        burst_summary = self._summarise_burst_records_by_icao(burst_records)
+        dominant_family_count = 0
+        if model is not None and getattr(model, "rotation_model", None) is not None:
+            dominant_family_count = len(getattr(model.rotation_model, "folded", {}) or {})
+        reference_selection_sparse = bool(
+            has_period
+            and not has_reference_icao
+            and burst_summary.get("reference_eligible", 0) <= 0
+        )
+        frame_bootstrap_sparse = bool(
+            has_period
+            and completed_count <= 0
+            and burst_summary.get("median", 0.0) < MIN_BURSTS
+        )
 
         return {
             "iid": iid,
@@ -8560,6 +8748,31 @@ class RadarState:
             "latest_arrival_us": latest_arrival_us,
             "sync_snapshot_observations_count": snapshot_observations_count,
             "sync_snapshot_empty_reason": snapshot_empty_reason,
+            "retained_state": {
+                "active_aircraft_estimate": active_aircraft_est,
+                "burst_records_total": len(burst_records),
+                "burst_records_retained_span_s": self._retained_span_s(burst_records),
+                "burst_records_dynamic_cap": burst_dynamic_cap,
+                "burst_records_cap_hit": len(burst_records) >= burst_dynamic_cap,
+                "burst_records_cap_hits_total": burst_cap_hits,
+                "burst_records_last_active_aircraft": burst_last_active,
+                "burst_records_per_icao": burst_summary,
+                "rotation_analysis_dynamic_cap": analysis_dynamic_cap,
+                "rotation_analysis_cap_hits_total": analysis_cap_hits,
+                "rotation_analysis_last_active_aircraft": analysis_last_active,
+                "reference_eligible_aircraft_count": burst_summary.get("reference_eligible", 0),
+                "dominant_family_aircraft_count": dominant_family_count,
+                "reference_selection_sparse_history": reference_selection_sparse,
+                "frame_bootstrap_sparse_history": frame_bootstrap_sparse,
+                "aligned_observation_count": aligned_count,
+                "timeline_observation_count": timeline_count,
+                "aligned_retained_span_s": self._summarise_live_sync_observation_buffer(
+                    aligned_obs, self._MULTI_SYNC_OBS_MAX
+                )["retained_duration_s"],
+                "timeline_retained_span_s": self._summarise_live_sync_observation_buffer(
+                    timeline_obs, self._BURST_SYNC_TIMELINE_OBS_MAX
+                )["retained_duration_s"],
+            },
         }
 
     def reset_forward_model(self, iid: int) -> bool:

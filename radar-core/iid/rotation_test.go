@@ -141,8 +141,8 @@ func TestIIDState_AddAndTake(t *testing.T) {
 		t.Error("expected nil before any bursts added")
 	}
 
-	s.AddBurst(0xAA, 0, 2)
-	s.AddBurst(0xAA, 4_000_000, 2)
+	s.AddBurst(0xAA, 0, 2, 1)
+	s.AddBurst(0xAA, 4_000_000, 2, 1)
 
 	snap := s.TakeIfDirty()
 	if snap == nil {
@@ -161,7 +161,7 @@ func TestIIDState_AddAndTake(t *testing.T) {
 // TestIIDState_Reset verifies that Reset clears records and status.
 func TestIIDState_Reset(t *testing.T) {
 	s := NewIIDState(5)
-	s.AddBurst(0xAA, 0, 2)
+	s.AddBurst(0xAA, 0, 2, 1)
 	s.Reset()
 
 	if s.TakeIfDirty() != nil {

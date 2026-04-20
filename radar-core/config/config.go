@@ -6,24 +6,24 @@ package config
 import "sync/atomic"
 
 const (
-	DefaultBurstGapUS          = 200_000.0 // 200 ms — replies within this belong to one burst
-	DefaultBurstRecordMaxAgeS  = 120.0
-	DefaultBurstRecordsMaxPerIID = 400
-	DefaultMinBursts           = 4
-	DefaultMinQualifyingICAOs  = 4
-	DefaultSocketPath          = "/run/adsb/radar-core.sock"
+	DefaultBurstGapUS            = 200_000.0 // 200 ms — replies within this belong to one burst
+	DefaultBurstRecordMaxAgeS    = 120.0
+	DefaultBurstRecordsMaxPerIID = 8000
+	DefaultMinBursts             = 4
+	DefaultMinQualifyingICAOs    = 4
+	DefaultSocketPath            = "/run/adsb/radar-core.sock"
 )
 
 // Config holds live-adjustable operational parameters.
 // All float64 fields are read via Load and written via Store on the atomic pointer;
 // integer fields use sync/atomic directly. Reads on the hot path do not need a mutex.
 type Config struct {
-	BurstGapUS           float64
-	BurstRecordMaxAgeS   float64
+	BurstGapUS            float64
+	BurstRecordMaxAgeS    float64
 	BurstRecordsMaxPerIID int
-	MinBursts            int
-	MinQualifyingICAOs   int
-	SocketPath           string
+	MinBursts             int
+	MinQualifyingICAOs    int
+	SocketPath            string
 }
 
 // global is the live config; accessed via Get/Apply.

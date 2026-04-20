@@ -4222,3 +4222,38 @@ Started: 2026-04-19
 - [x] Stage 4 — Frame accumulation and mailbox
 - [x] Stage 5 — Python consumption switch
 - [x] Stage 6 — Remove Python operational path
+
+## 2026-04-20 Peak-Traffic Retained-State Scaling Fix (Radar/Localiser)
+
+- [x] Audit and enumerate all fixed-size retention caps in Python and Go that can starve frame generation at high aircraft density
+- [x] Add per-IID retained-state diagnostics proving whether retention truncation (not throughput) is the active blocker
+- [x] Replace fixed small operational burst-retention caps with bounded density-aware scaling based on active aircraft and target sweeps per aircraft
+- [x] Keep UI retention and operational retention independent so display windows cannot starve frame formation/sync logic
+- [x] Mirror retention scaling and diagnostics in radar-core Go path so stage-2/3/4 behavior remains consistent under RADAR_CORE_FRAMES_ENABLED
+- [x] Add/update focused tests (Python and Go where possible) for scaling rules, cap-hit diagnostics, and high-density behavior
+- [x] Run verification (targeted pytest + Go tests when available) and document root cause, new rules, hard caps, and residual risks
+
+Plan confirmation: proceeding with a minimal-shape change that preserves existing architecture and replaces only density-sensitive fixed caps in operational paths with bounded dynamic caps.
+
+### Review
+
+- Root cause:
+  - Operational burst retention remained fixed at `400` per IID in both Python and Go while peak IIDs reached much higher active-aircraft counts. This thinned retained bursts per ICAO to near/below reference and dominant-family minima, so frame bootstrap/reference continuity collapsed even though queues and worker timings were healthy.
+- Caps that were too small:
+  - Python `_BURST_RECORDS_MAX_PER_IID = 400`.
+  - Go `DefaultBurstRecordsMaxPerIID = 400` (and IIDState cap path).
+  - Python fixed analysis truncation (`_ROTATION_ANALYSIS_MAX_EVENTS_PER_IID = 4000`) became an additional hidden limiter once operational retention was made larger.
+- New scaling rules (bounded):
+  - Burst records per IID: `active_aircraft * 16 * 1.4`, clamped to `[800, 8000]`.
+  - Rotation-analysis events per IID (Python): `active_aircraft * 20 * 1.5`, clamped to `[1200, 12000]`.
+  - Active-aircraft estimate uses recent per-IID arrivals with fallback to retained ICAO set.
+- Safety caps:
+  - Burst hard cap `8000` per IID.
+  - Rotation-analysis hard cap `12000` per IID.
+- Observability added:
+  - Python per-IID retained-state diagnostics now include active-aircraft estimate, retained burst totals, per-ICAO min/median/max, retained span seconds, dynamic cap, cap-hit counters, reference-eligible count, dominant-family count, and sparse-history blocker flags.
+  - Go IID snapshot now includes retained-state diagnostics with equivalent burst-retention metrics; API pipeline-debug now forwards this field.
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py` -> `100 passed`.
+  - `go test ./...` in `radar-core` passed (executed outside sandbox cache restrictions).
+  - Added focused regression tests for density-aware retention behavior in Python and Go.

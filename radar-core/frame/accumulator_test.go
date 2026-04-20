@@ -39,7 +39,7 @@ func makeIIDState(iidNum uint8, periodS float64, status string, refICAO uint32) 
 func injectRef(s *iid.IIDState, refICAO uint32, periodS float64, count int) {
 	now := time.Now()
 	for i := 0; i < count; i++ {
-		s.AddBurst(refICAO, float64(i)*periodS*1_000_000.0, 2)
+		s.AddBurst(refICAO, float64(i)*periodS*1_000_000.0, 2, 1)
 		_ = now
 	}
 	// Build rotation model snapshot so RefreshReference works.

@@ -3210,6 +3210,7 @@ async def get_iid_pipeline_debug(iid: int):
                     "sync_state_usable": bool((go_iid or {}).get("sync_state_usable", False)),
                     "sync_quality": (go_iid or {}).get("sync_quality"),
                 },
+                "retained_state": (go_iid or {}).get("retained_state") or {},
                 "frame_accumulator": go_frame,
                 "frame_gate_counts": go_gate_counts,
                 "dominant_blocking_gate": dominant_blocking_gate,

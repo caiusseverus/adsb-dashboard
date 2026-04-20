@@ -3,6 +3,7 @@ package iid
 
 import (
 	"math"
+	"sort"
 	"sync"
 	"time"
 
@@ -20,7 +21,7 @@ type BurstRecord struct {
 // RotationModel holds the derived rotation model for one IID.
 type RotationModel struct {
 	DominantPeriodS    *float64
-	Status             string  // SINGLE_RADAR, LIKELY_SINGLE, CHECK_MULTI, INSUFFICIENT_DATA
+	Status             string // SINGLE_RADAR, LIKELY_SINGLE, CHECK_MULTI, INSUFFICIENT_DATA
 	NQualifying        int
 	NHarmonic          int
 	NResidual          int
@@ -39,6 +40,10 @@ type IIDState struct {
 	mu      sync.Mutex
 	records []BurstRecord
 	dirty   bool // pending rotation analysis
+	// Dynamic burst-retention diagnostics.
+	burstDynamicCap    int
+	burstCapHitsTotal  uint64
+	lastActiveAircraft int
 
 	// Reinforced period state (updated by reinforce).
 	PeriodS           *float64
@@ -51,23 +56,43 @@ type IIDState struct {
 	LastUpdated       time.Time
 
 	// Stage 3: reference aircraft and live sync state.
-	RefICAO *uint32   // selected reference aircraft (nil until stable)
+	RefICAO *uint32 // selected reference aircraft (nil until stable)
 	Sync    *SyncState
 }
 
 // DebugSnapshot is a point-in-time operational view of one IID.
 type DebugSnapshot struct {
-	Status          string
-	HasPeriod       bool
-	PeriodS         float64
-	HasRefICAO      bool
-	RefICAO         uint32
-	SyncPresent     bool
-	SyncQuality     float64
-	SyncUsable      bool
-	SyncHoldover    bool
-	SyncNSyncFrames int
+	Status                          string
+	HasPeriod                       bool
+	PeriodS                         float64
+	HasRefICAO                      bool
+	RefICAO                         uint32
+	SyncPresent                     bool
+	SyncQuality                     float64
+	SyncUsable                      bool
+	SyncHoldover                    bool
+	SyncNSyncFrames                 int
+	ActiveAircraftEstimate          int
+	BurstRecordsTotal               int
+	BurstRecordsDynamicCap          int
+	BurstRecordsCapHit              bool
+	BurstRecordsCapHitsTotal        uint64
+	BurstRecordsRetainedSpanS       float64
+	BurstRecordsICAOs               int
+	BurstRecordsPerICAOMin          int
+	BurstRecordsPerICAOMedian       float64
+	BurstRecordsPerICAOMax          int
+	ReferenceEligibleAircraft       int
+	DominantFamilyAircraft          int
+	ReferenceSelectionSparseHistory bool
 }
+
+const (
+	burstRecordsTargetSweepsPerAircraft = 16.0
+	burstRecordsHeadroom                = 1.4
+	burstRecordsMinPerIID               = 800
+	burstRecordsMaxPerIID               = 8000
+)
 
 // NewIIDState creates an IIDState for the given IID.
 func NewIIDState(iid uint8) *IIDState {
@@ -77,8 +102,9 @@ func NewIIDState(iid uint8) *IIDState {
 	}
 }
 
-// AddBurst appends a burst record for this IID, enforcing age and count caps.
-func (s *IIDState) AddBurst(icao uint32, centroidUS float64, nReplies int) {
+// AddBurst appends a burst record for this IID, enforcing age and
+// density-aware count caps.
+func (s *IIDState) AddBurst(icao uint32, centroidUS float64, nReplies int, activeAircraft int) {
 	cfg := rcconfig.Get()
 	now := time.Now()
 	cutoff := now.Add(-time.Duration(cfg.BurstRecordMaxAgeS) * time.Second)
@@ -95,9 +121,20 @@ func (s *IIDState) AddBurst(icao uint32, centroidUS float64, nReplies int) {
 		s.records = s.records[i:]
 	}
 
+	cap := dynamicBurstRecordCap(activeAircraft)
+	if cfg.BurstRecordsMaxPerIID > 0 && cfg.BurstRecordsMaxPerIID < cap {
+		cap = cfg.BurstRecordsMaxPerIID
+	}
+	if cap < burstRecordsMinPerIID {
+		cap = burstRecordsMinPerIID
+	}
+	s.burstDynamicCap = cap
+	s.lastActiveAircraft = maxInt(activeAircraft, 1)
+
 	// Cap per-IID count.
-	for len(s.records) >= cfg.BurstRecordsMaxPerIID {
+	for len(s.records) >= cap {
 		s.records = s.records[1:]
+		s.burstCapHitsTotal++
 	}
 
 	s.records = append(s.records, BurstRecord{
@@ -107,6 +144,18 @@ func (s *IIDState) AddBurst(icao uint32, centroidUS float64, nReplies int) {
 		FiredAt:    now,
 	})
 	s.dirty = true
+}
+
+func dynamicBurstRecordCap(activeAircraft int) int {
+	active := maxInt(activeAircraft, 1)
+	scaled := int(math.Round(float64(active) * burstRecordsTargetSweepsPerAircraft * burstRecordsHeadroom))
+	if scaled < burstRecordsMinPerIID {
+		return burstRecordsMinPerIID
+	}
+	if scaled > burstRecordsMaxPerIID {
+		return burstRecordsMaxPerIID
+	}
+	return scaled
 }
 
 // TakeIfDirty returns a snapshot of current records if the state is dirty,
@@ -266,6 +315,44 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.SyncNSyncFrames = s.Sync.NSyncFrames
 		out.SyncUsable = s.Sync.SyncQuality >= 0.3 && !s.Sync.Holdover
 	}
+	out.ActiveAircraftEstimate = s.lastActiveAircraft
+	out.BurstRecordsTotal = len(s.records)
+	out.BurstRecordsDynamicCap = s.burstDynamicCap
+	out.BurstRecordsCapHitsTotal = s.burstCapHitsTotal
+	if out.BurstRecordsDynamicCap > 0 && out.BurstRecordsTotal >= out.BurstRecordsDynamicCap {
+		out.BurstRecordsCapHit = true
+	}
+	if len(s.records) >= 2 {
+		out.BurstRecordsRetainedSpanS = (s.records[len(s.records)-1].CentroidUS - s.records[0].CentroidUS) / 1_000_000.0
+	}
+	if s.LastRotationModel != nil && s.LastRotationModel.Family != nil {
+		out.DominantFamilyAircraft = len(s.LastRotationModel.Family.FoldedICAOs)
+	}
+
+	byICAO := make(map[uint32]int, len(s.records))
+	for _, rec := range s.records {
+		byICAO[rec.ICAO]++
+	}
+	out.BurstRecordsICAOs = len(byICAO)
+	if len(byICAO) > 0 {
+		perICAO := make([]int, 0, len(byICAO))
+		for _, count := range byICAO {
+			perICAO = append(perICAO, count)
+			if count >= 4 {
+				out.ReferenceEligibleAircraft++
+			}
+		}
+		sort.Ints(perICAO)
+		out.BurstRecordsPerICAOMin = perICAO[0]
+		out.BurstRecordsPerICAOMax = perICAO[len(perICAO)-1]
+		if len(perICAO)%2 == 0 {
+			i := len(perICAO) / 2
+			out.BurstRecordsPerICAOMedian = float64(perICAO[i-1]+perICAO[i]) / 2.0
+		} else {
+			out.BurstRecordsPerICAOMedian = float64(perICAO[len(perICAO)/2])
+		}
+	}
+	out.ReferenceSelectionSparseHistory = out.HasPeriod && !out.HasRefICAO && out.ReferenceEligibleAircraft == 0
 	return out
 }
 
@@ -277,6 +364,13 @@ const (
 	periodMatchTolerance    = 0.15
 	minQualifyingICAOs      = 4
 )
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 func periodsMatch(a, b float64) bool {
 	if a <= 0 || b <= 0 {

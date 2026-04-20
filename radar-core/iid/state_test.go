@@ -60,3 +60,25 @@ func TestRefreshReference_ClearsWhenNoDominantCandidates(t *testing.T) {
 		t.Fatalf("reference ICAO not cleared, got 0x%X", *s.RefICAO)
 	}
 }
+
+func TestAddBurst_UsesDensityAwareCap(t *testing.T) {
+	s := NewIIDState(11)
+
+	// active=100 => cap ~= 100 * 16 * 1.4 = 2240 (bounded)
+	for i := 0; i < 2500; i++ {
+		s.AddBurst(0xAAAAAA, float64(i)*1_000_000.0, 2, 100)
+	}
+	snap := s.DebugStateSnapshot()
+	if snap.BurstRecordsDynamicCap != 2240 {
+		t.Fatalf("dynamic cap=%d, want 2240", snap.BurstRecordsDynamicCap)
+	}
+	if snap.BurstRecordsTotal != 2240 {
+		t.Fatalf("retained=%d, want 2240", snap.BurstRecordsTotal)
+	}
+	if !snap.BurstRecordsCapHit {
+		t.Fatal("expected burst_records_cap_hit=true")
+	}
+	if snap.BurstRecordsCapHitsTotal == 0 {
+		t.Fatal("expected burst_records_cap_hits_total > 0")
+	}
+}

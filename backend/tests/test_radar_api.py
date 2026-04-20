@@ -452,6 +452,12 @@ def test_get_iid_pipeline_debug_combines_python_and_go_diagnostics():
                     "sync_state_present": False,
                     "sync_state_usable": False,
                     "sync_quality": 0.0,
+                    "retained_state": {
+                        "active_aircraft_estimate": 100,
+                        "burst_records_total": 2240,
+                        "burst_records_dynamic_cap": 2240,
+                        "burst_records_cap_hit": True,
+                    },
                     "frame_accumulator": {
                         "completed_frames": 0,
                         "open_frame": False,
@@ -477,6 +483,8 @@ def test_get_iid_pipeline_debug_combines_python_and_go_diagnostics():
     assert payload["go"]["iid_snapshot_available"] is True
     assert payload["go"]["frame_ready_seen"] is False
     assert payload["go"]["dominant_blocking_gate"] == "ref_not_dominant"
+    assert payload["go"]["retained_state"]["active_aircraft_estimate"] == 100
+    assert payload["python"]["retained_state"]["burst_records_dynamic_cap"] >= 800
     assert payload["inferred_blocker"] == "go_no_frame_ready"
 
 

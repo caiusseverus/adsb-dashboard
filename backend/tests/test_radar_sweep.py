@@ -1469,6 +1469,39 @@ def test_memory_stats_include_burst_records():
     assert stats["burst_records_avg_per_iid"] == 1.5
 
 
+def test_density_aware_burst_record_retention_scales_with_active_aircraft():
+    state = RadarState()
+    iid = 77
+    state._models[iid] = RadarIID(iid=iid, status="SINGLE_RADAR", period_s=4.0)
+    state._live_last_arrival[iid] = {f"{n:06X}": 10_000_000.0 for n in range(100)}
+    state._live_bursts[iid] = {}
+
+    base_us = 10_000_000.0
+    for n in range(5_000):
+        icao = f"{(n % 100):06X}"
+        state._append_burst_record(
+            iid,
+            BurstRecord(
+                iid=iid,
+                icao=icao,
+                centroid_us=base_us + (n * 1_000.0),
+                n_replies=2,
+                signal_dbfs=-12.0,
+            ),
+        )
+
+    debug = state.get_live_pipeline_debug(iid)
+    retained = debug["retained_state"]
+
+    assert retained["burst_records_dynamic_cap"] == 2240
+    assert retained["burst_records_total"] == 2240
+    assert retained["burst_records_cap_hit"] is True
+    assert retained["burst_records_cap_hits_total"] > 0
+    assert retained["burst_records_per_icao"]["icaos"] == 100
+    assert retained["burst_records_per_icao"]["median"] >= 4.0
+    assert retained["reference_eligible_aircraft_count"] >= 80
+
+
 def test_fired_burst_processing_can_start_frame_after_reference_rescore(monkeypatch):
     monkeypatch.setattr("radar.sweep.time.time", lambda: 1000.0)
 

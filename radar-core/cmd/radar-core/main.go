@@ -81,15 +81,15 @@ func envDebugEnabled(key string) bool {
 // frame accumulator stages.
 type engine struct {
 	writer       *output.Writer
-	builders     map[uint8]*burst.Builder      // per IID; only accessed from the ingest goroutine
-	states       map[uint8]*iid.IIDState       // per IID; thread-safe via IIDState.mu
-	accumulators map[uint8]*frame.Accumulator  // per IID; only accessed from the ingest goroutine
-	revisions    map[uint8]uint32              // monotonic IID_STATE revision counter
-	positions    *iid.PositionCache            // global ADS-B position cache (thread-safe)
+	builders     map[uint8]*burst.Builder     // per IID; only accessed from the ingest goroutine
+	states       map[uint8]*iid.IIDState      // per IID; thread-safe via IIDState.mu
+	accumulators map[uint8]*frame.Accumulator // per IID; only accessed from the ingest goroutine
+	revisions    map[uint8]uint32             // monotonic IID_STATE revision counter
+	positions    *iid.PositionCache           // global ADS-B position cache (thread-safe)
 	start        time.Time
 
-	eventsIn    atomic.Uint64
-	burstsFired atomic.Uint64
+	eventsIn      atomic.Uint64
+	burstsFired   atomic.Uint64
 	framesEmitted atomic.Uint64
 }
 
@@ -148,7 +148,7 @@ func (e *engine) onRadarEvent(msg *protocol.RadarEvent) {
 	for i := range fired {
 		f := &fired[i]
 		e.emitBurstFired(f)
-		s.AddBurst(f.ICAO, f.CentroidUS, f.NReplies)
+		s.AddBurst(f.ICAO, f.CentroidUS, f.NReplies, b.ActiveICAOs())
 
 		// Stage 3: advance sync epoch when reference ICAO fires.
 		e.maybeUpdateSync(s, f)
@@ -263,6 +263,21 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 			"sync_state_usable":  snap.SyncUsable,
 			"sync_holdover":      snap.SyncHoldover,
 			"sync_n_frames":      snap.SyncNSyncFrames,
+			"retained_state": map[string]interface{}{
+				"active_aircraft_estimate":           snap.ActiveAircraftEstimate,
+				"burst_records_total":                snap.BurstRecordsTotal,
+				"burst_records_dynamic_cap":          snap.BurstRecordsDynamicCap,
+				"burst_records_cap_hit":              snap.BurstRecordsCapHit,
+				"burst_records_cap_hits_total":       snap.BurstRecordsCapHitsTotal,
+				"burst_records_retained_span_s":      snap.BurstRecordsRetainedSpanS,
+				"burst_records_icaos":                snap.BurstRecordsICAOs,
+				"burst_records_per_icao_min":         snap.BurstRecordsPerICAOMin,
+				"burst_records_per_icao_median":      snap.BurstRecordsPerICAOMedian,
+				"burst_records_per_icao_max":         snap.BurstRecordsPerICAOMax,
+				"reference_eligible_aircraft_count":  snap.ReferenceEligibleAircraft,
+				"dominant_family_aircraft_count":     snap.DominantFamilyAircraft,
+				"reference_selection_sparse_history": snap.ReferenceSelectionSparseHistory,
+			},
 		}
 		if snap.HasPeriod {
 			iidPayload["period_s"] = snap.PeriodS
