@@ -2,6 +2,8 @@ import socket
 import threading
 import time
 
+import msgpack
+
 from radar_core import protocol as P
 from radar_core.client import RadarCoreClient
 from aircraft_state import Aircraft, AircraftState
@@ -125,6 +127,60 @@ def test_radar_core_client_records_snapshot_response_in_stats():
     stats = client.stats()
     assert stats["latest_snapshot"]["frames_emitted"] == 3
     assert stats["latest_snapshot"]["iids"]["7"]["has_period"] is True
+
+
+def test_radar_core_client_drops_bad_decode_frame_and_recovers_on_reconnect(tmp_path):
+    sock_path = str(tmp_path / "radar-core.sock")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(sock_path)
+    listener.listen(4)
+    listener.settimeout(0.1)
+
+    got_burst = threading.Event()
+
+    def serve() -> None:
+        conn1, _ = listener.accept()
+        wfile1 = conn1.makefile("wb", buffering=0)
+        bad_payload = (
+            msgpack.packb({"t": P.MSG_HEALTH, "up": 1.0}, use_bin_type=True)
+            + msgpack.packb({"t": P.MSG_HEALTH, "up": 2.0}, use_bin_type=True)
+        )
+        P.write_frame(wfile1, bad_payload)
+        conn1.close()
+
+        conn2, _ = listener.accept()
+        wfile2 = conn2.makefile("wb", buffering=0)
+        P.write_frame(wfile2, P.encode({
+            "t": P.MSG_BURST_FIRED,
+            "i": 3,
+            "c": 0xABCDEF,
+            "cu": 44.0,
+            "n": 2,
+            "s": None,
+        }))
+        got_burst.wait(1.0)
+        conn2.close()
+
+    server_thread = threading.Thread(target=serve, daemon=True)
+    server_thread.start()
+
+    callbacks: list[dict] = []
+    client = RadarCoreClient(
+        sock_path,
+        on_burst_fired=lambda msg: (callbacks.append(msg), got_burst.set()),
+        reconnect_delay_s=0.05,
+    )
+    client.start()
+    try:
+        assert got_burst.wait(2.0)
+        stats = client.stats()
+        assert stats["bursts_received"] == 1
+        assert stats["connect_attempts"] >= 2
+        assert callbacks[0]["t"] == P.MSG_BURST_FIRED
+    finally:
+        client.stop()
+        listener.close()
+        server_thread.join(timeout=1.0)
 
 
 def test_positions_snapshot_exposes_live_radar_core_forwarding_fields():

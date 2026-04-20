@@ -27,6 +27,8 @@ import threading
 import time
 from typing import Optional, Callable
 
+import msgpack
+
 from radar_core import protocol as P
 
 log = logging.getLogger(__name__)
@@ -317,10 +319,30 @@ class RadarCoreClient:
 
             try:
                 payload = P.read_frame(rfile)
+            except (OSError, EOFError, P.FrameTooLargeError) as e:
+                log.warning("RadarCoreClient: receiver framing/disconnect error: %s", e)
+                self._drop_connection(generation)
+                continue
+
+            try:
                 d = P.dispatch(payload)
                 self._handle_outbound(d)
-            except (OSError, EOFError) as e:
-                log.debug("RadarCoreClient: receiver disconnected: %s", e)
+            except (
+                msgpack.exceptions.UnpackException,
+                ValueError,
+                TypeError,
+                KeyError,
+            ) as e:
+                head = payload[:16].hex()
+                tail = payload[-16:].hex() if payload else ""
+                log.warning(
+                    "RadarCoreClient: invalid framed payload dropped; reconnecting "
+                    "(len=%d head=%s tail=%s err=%s)",
+                    len(payload),
+                    head,
+                    tail,
+                    e,
+                )
                 self._drop_connection(generation)
 
     def _handle_outbound(self, d: dict) -> None:

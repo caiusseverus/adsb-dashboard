@@ -41,11 +41,10 @@ func WriteFrame(w io.Writer, payload []byte) error {
 	}
 	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
-	if _, err := w.Write(lenBuf[:]); err != nil {
+	if err := writeAll(w, lenBuf[:]); err != nil {
 		return err
 	}
-	_, err := w.Write(payload)
-	return err
+	return writeAll(w, payload)
 }
 
 // Framer wraps a net.Conn with ReadFrame / WriteFrame helpers.
@@ -57,6 +56,20 @@ func NewFramer(conn net.Conn) *Framer {
 	return &Framer{conn: conn}
 }
 
-func (f *Framer) Read() ([]byte, error)        { return ReadFrame(f.conn) }
-func (f *Framer) Write(payload []byte) error   { return WriteFrame(f.conn, payload) }
-func (f *Framer) Close() error                 { return f.conn.Close() }
+func (f *Framer) Read() ([]byte, error)      { return ReadFrame(f.conn) }
+func (f *Framer) Write(payload []byte) error { return WriteFrame(f.conn, payload) }
+func (f *Framer) Close() error               { return f.conn.Close() }
+
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
+}

@@ -4274,3 +4274,34 @@ Plan confirmation: proceeding with a minimal-shape change that preserves existin
 - Verification:
   - `go test ./...` (radar-core) passed.
   - `uv run --directory backend pytest tests/test_radar_api.py::test_get_iid_pipeline_debug_combines_python_and_go_diagnostics tests/test_radar_api.py::test_get_iid_pipeline_debug_supports_nested_runtime_stats_provider` passed.
+
+## 2026-04-20 Radar-core IPC framing/encoding fix (Go + Python hardening)
+
+- [x] Audit all radar-core outbound message paths (HEALTH, IID_STATE, FRAME_READY, BURST_FIRED, SNAPSHOT_RESP and any others) for framing/encoding consistency
+- [x] Identify exact root cause of `msgpack.exceptions.ExtraData` in Python receiver
+- [x] Fix Go outbound sender so one frame always contains exactly one msgpack object, with thread-safe serialized writes
+- [x] Add targeted Go diagnostics for outbound frame writes (type/payload/frame length) behind debug control
+- [x] Harden Python `RadarCoreClient._receiver_loop()` to survive decode/framing failures by dropping connection and reconnecting
+- [x] Add Python decode-failure diagnostics (payload len + head/tail hex)
+- [x] Add/update tests to cover writer serialization and receiver resilience behavior
+- [x] Verify protocol contract end-to-end (all outbound types decode, receiver thread resilience, reconnect path)
+
+### Review
+
+- Root cause:
+  - `radar-core/output.Writer.Send()` encoded outside lock, grabbed the connection pointer under lock, then released the lock before writing. `Send()` is invoked from multiple goroutines (`ingest` path, rotation ticker, health ticker), so concurrent `protocol.WriteFrame()` calls could interleave on the same Unix stream and break frame boundaries.
+- Why this produced `ExtraData`:
+  - Python `read_frame()` can receive bytes where one "payload" region contains multiple concatenated msgpack objects (or mixed frame bytes) due to interleaved writes. `msgpack.unpackb()` decodes the first object then reports trailing bytes as `msgpack.exceptions.ExtraData`.
+- Changes made:
+  - Go `output.Writer.Send()` now keeps its mutex held across connection lookup and `protocol.WriteFrame()`, serializing all outbound writes.
+  - Go `protocol.WriteFrame()` now uses a `writeAll` loop for both header and payload, preventing short-write truncation from violating frame boundaries.
+  - Added optional Go IPC diagnostics in `output.Writer` behind `RADAR_CORE_IPC_DEBUG` (`type`, `payload_len`, `frame_len` per outbound frame).
+  - Python `RadarCoreClient._receiver_loop()` now:
+    - handles framing/disconnect exceptions (`OSError`, `EOFError`, `FrameTooLargeError`) without thread death
+    - handles decode exceptions (`msgpack` unpack errors + dispatch/type errors), logs payload diagnostics (length, head hex, tail hex), drops the connection, and allows reconnect.
+  - Added tests:
+    - `radar-core/output/emitter_test.go::TestWriterSendSerializesFrameWrites`
+    - `backend/tests/test_radar_core_client.py::test_radar_core_client_drops_bad_decode_frame_and_recovers_on_reconnect`
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_core_client.py tests/test_radar_core_protocol.py` -> `32 passed`
+  - `cd radar-core && go test ./...` -> all packages passed
