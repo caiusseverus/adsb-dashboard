@@ -4371,3 +4371,38 @@ Plan confirmation: proceeding with a minimal-shape change that preserves existin
   - `uv run --directory backend pytest tests/test_forward_model.py`
   - `uv run --directory backend pytest tests/test_forward_model_integration.py tests/test_forward_model_stage6.py`
   - Result: all targeted tests passed (`39 + 11` tests).
+
+## 2026-04-20 Forward-Model Cluster Merge Accounting and Pipeline Tightening
+
+- [x] Replace approximate `cluster_count_pre_merge` bookkeeping with authoritative stage counts
+- [x] Remove early distance-only distinctness pruning so overlap-aware merge is the single cluster-identity authority
+- [x] Return explicit cluster-build diagnostics (initial neighborhoods, post-initial stage, post-merge, prune/merge events)
+- [x] Plumb cluster-build diagnostics into ambiguity rejection, selection diagnostics, and solve result payload
+- [x] Update and extend forward-model tests for exact cluster-stage accounting
+- [x] Run targeted backend verification and record outcomes
+
+### Review
+
+- Remaining issues found:
+  - `cluster_count_pre_merge` was inferred as `len(raw_clusters) + len(cluster_merge_events)` rather than carried as an exact stage metric.
+  - `_build_intersection_clusters()` still had an early distance-only dedupe before overlap-aware merge, so some neighborhoods could be dropped before richer same-lobe logic evaluated them.
+- Implementation:
+  - Refactored `_build_intersection_clusters()` to return `(clusters, cluster_build_diagnostics)` with exact stage counts and event lists.
+  - Removed early distance-only distinctness pruning; all generated neighborhoods now flow into overlap-aware merge.
+  - Kept runtime bounded by preserving existing neighborhood generation and a single linear scan merge over sorted neighborhoods (no heavy global redesign).
+  - Added a `cluster_identity_diagnostics` payload block and propagated:
+    - `initial_neighborhood_count`
+    - `post_initial_prune_count`
+    - `post_merge_count`
+    - `initial_pruning_enabled`
+    - `initial_prune_events`
+    - `merge_events`
+  - Updated compatibility fields:
+    - `cluster_count_pre_merge` now equals true initial neighborhood count
+    - `cluster_count_post_initial_prune` now explicit
+    - `cluster_count_post_merge` remains explicit
+- Verification:
+  - `python3 -m py_compile backend/radar/forward_model.py backend/tests/test_forward_model.py`
+  - `uv run --directory backend pytest tests/test_forward_model.py`
+  - `uv run --directory backend pytest tests/test_forward_model_integration.py tests/test_forward_model_stage6.py`
+  - Result: all targeted tests passed (`39 + 11` tests).

@@ -1898,12 +1898,22 @@ def _resolve_intersection_candidates(
 def _build_intersection_clusters(
     candidates: list[_IntersectionCandidate],
     cluster_radius_km: float = _INTERSECTION_CLUSTER_RADIUS_KM,
-) -> tuple[list[_IntersectionCluster], list[dict]]:
+) -> tuple[list[_IntersectionCluster], dict]:
     """Build distinct weighted neighborhoods from candidate intersections."""
     if not candidates:
-        return [], []
+        return [], {
+            "initial_neighborhood_count": 0,
+            "initial_pruning_enabled": False,
+            "post_initial_prune_count": 0,
+            "initial_prune_events": [],
+            "post_merge_count": 0,
+            "merge_events": [],
+        }
 
-    def _build_neighborhood(center: _IntersectionCandidate) -> _IntersectionCluster | None:
+    def _build_neighborhood(
+        center: _IntersectionCandidate,
+        source_index: int,
+    ) -> _IntersectionCluster | None:
         members = [
             c for c in candidates
             if math.hypot(c.x_km - center.x_km, c.y_km - center.y_km) <= cluster_radius_km
@@ -1917,6 +1927,7 @@ def _build_intersection_clusters(
             sum(c.weight * ((c.x_km - mean_x) ** 2 + (c.y_km - mean_y) ** 2) for c in members)
             / total_weight
         )
+        contributing = frozenset(arc for c in members for arc in (c.arc_i, c.arc_j))
         return _IntersectionCluster(
             mean_x_km=mean_x,
             mean_y_km=mean_y,
@@ -1925,42 +1936,34 @@ def _build_intersection_clusters(
             member_count=len(members),
             center_x_km=center.x_km,
             center_y_km=center.y_km,
-            contributing_arc_indices=frozenset(),  # deferred; filled in for distinct clusters only
-            merged_cluster_indices=(),
+            contributing_arc_indices=contributing,
+            merged_cluster_indices=(source_index,),
         )
 
-    neighborhoods = [nb for c in candidates if (nb := _build_neighborhood(c)) is not None]
+    neighborhoods = [
+        nb
+        for idx, c in enumerate(candidates)
+        if (nb := _build_neighborhood(c, idx)) is not None
+    ]
     neighborhoods.sort(
         key=lambda cluster: (cluster.total_weight, cluster.member_count, -cluster.rms_km),
         reverse=True,
     )
 
-    distinct: list[_IntersectionCluster] = []
-    for idx, cluster in enumerate(neighborhoods):
-        if any(
-            math.hypot(
-                cluster.mean_x_km - kept.mean_x_km,
-                cluster.mean_y_km - kept.mean_y_km,
-            ) <= max(1.0, 0.25 * cluster_radius_km)
-            for kept in distinct
-        ):
-            continue
-        # Compute contributing arcs from the final weighted cluster estimate.
-        members = [
-            c for c in candidates
-            if math.hypot(c.x_km - cluster.mean_x_km, c.y_km - cluster.mean_y_km) <= cluster_radius_km
-        ]
-        contributing = frozenset(arc for c in members for arc in (c.arc_i, c.arc_j))
-        distinct.append(
-            dataclasses.replace(
-                cluster,
-                contributing_arc_indices=contributing,
-                merged_cluster_indices=(idx,),
-            )
-        )
-
-    merged, merge_events = _dedupe_near_duplicate_clusters(distinct, cluster_radius_km=cluster_radius_km)
-    return merged, merge_events
+    initial_count = len(neighborhoods)
+    # No early distance-only distinctness pruning: keep all neighborhoods so the
+    # overlap-aware merge stage is the authoritative cluster identity decision.
+    post_initial = neighborhoods
+    merged, merge_events = _dedupe_near_duplicate_clusters(post_initial, cluster_radius_km=cluster_radius_km)
+    diagnostics = {
+        "initial_neighborhood_count": initial_count,
+        "initial_pruning_enabled": False,
+        "post_initial_prune_count": len(post_initial),
+        "initial_prune_events": [],
+        "post_merge_count": len(merged),
+        "merge_events": merge_events,
+    }
+    return merged, diagnostics
 
 
 def _summarize_selected_observations(
@@ -3459,15 +3462,24 @@ class ForwardModel:
                 "all intersection candidates were implausibly distant",
             )
 
-        raw_clusters, cluster_merge_events = _build_intersection_clusters(
+        clusters, cluster_build_diag = _build_intersection_clusters(
             plausible,
             cluster_radius_km=cluster_radius_km,
         )
-        clusters = raw_clusters
-        detail["cluster_count_pre_merge"] = len(raw_clusters) + len(cluster_merge_events)
-        detail["cluster_count_post_merge"] = len(clusters)
-        detail["cluster_count"] = len(clusters)
-        detail["cluster_merge_events"] = cluster_merge_events[:20]
+        detail["cluster_identity_diagnostics"] = {
+            "initial_neighborhood_count": int(cluster_build_diag.get("initial_neighborhood_count", 0)),
+            "initial_pruning_enabled": bool(cluster_build_diag.get("initial_pruning_enabled", False)),
+            "post_initial_prune_count": int(cluster_build_diag.get("post_initial_prune_count", 0)),
+            "initial_prune_events": list(cluster_build_diag.get("initial_prune_events", []))[:20],
+            "post_merge_count": int(cluster_build_diag.get("post_merge_count", len(clusters))),
+            "merge_events": list(cluster_build_diag.get("merge_events", []))[:20],
+        }
+        detail["cluster_count_pre_merge"] = detail["cluster_identity_diagnostics"]["initial_neighborhood_count"]
+        detail["cluster_count_post_initial_prune"] = detail["cluster_identity_diagnostics"]["post_initial_prune_count"]
+        detail["cluster_count_post_merge"] = detail["cluster_identity_diagnostics"]["post_merge_count"]
+        detail["cluster_count"] = detail["cluster_identity_diagnostics"]["post_merge_count"]
+        detail["cluster_initial_prune_events"] = detail["cluster_identity_diagnostics"]["initial_prune_events"]
+        detail["cluster_merge_events"] = detail["cluster_identity_diagnostics"]["merge_events"]
         if not clusters:
             return rejected_payload("rejected_ambiguous", "candidate cloud was ambiguous")
 
@@ -3682,8 +3694,12 @@ class ForwardModel:
                     "second_quality_score": round(second_quality_score, 6),
                     "cluster_count": len(clusters),
                     "cluster_count_pre_merge": detail.get("cluster_count_pre_merge"),
+                    "cluster_count_post_initial_prune": detail.get("cluster_count_post_initial_prune"),
                     "cluster_count_post_merge": detail.get("cluster_count_post_merge"),
+                    "cluster_initial_pruning_enabled": detail.get("cluster_identity_diagnostics", {}).get("initial_pruning_enabled"),
+                    "cluster_initial_prune_events": detail.get("cluster_initial_prune_events", []),
                     "cluster_merge_events": detail.get("cluster_merge_events", []),
+                    "cluster_identity_diagnostics": detail.get("cluster_identity_diagnostics", {}),
                     "top_centroid_separation_km": (
                         round(float(same_lobe_metrics["centroid_separation_km"]), 3)
                         if same_lobe_metrics else None
@@ -3829,8 +3845,12 @@ class ForwardModel:
             "best_cluster_quality_score": round(best_quality_score, 6),
             "best_cluster_support_score": round(best_quality["support_score"], 6),
             "cluster_count_pre_merge": detail.get("cluster_count_pre_merge"),
+            "cluster_count_post_initial_prune": detail.get("cluster_count_post_initial_prune"),
             "cluster_count_post_merge": detail.get("cluster_count_post_merge"),
+            "cluster_initial_pruning_enabled": detail.get("cluster_identity_diagnostics", {}).get("initial_pruning_enabled"),
+            "cluster_initial_prune_events": detail.get("cluster_initial_prune_events", []),
             "cluster_merge_events": detail.get("cluster_merge_events", []),
+            "cluster_identity_diagnostics": detail.get("cluster_identity_diagnostics", {}),
             "top_centroid_separation_km": (
                 round(float(same_lobe_metrics["centroid_separation_km"]), 3)
                 if same_lobe_metrics else None
@@ -3927,8 +3947,12 @@ class ForwardModel:
                 "support_dominance_ratio": support_ratio,
                 "quality_ratio": quality_ratio,
                 "cluster_count_pre_merge": detail.get("cluster_count_pre_merge"),
+                "cluster_count_post_initial_prune": detail.get("cluster_count_post_initial_prune"),
                 "cluster_count_post_merge": detail.get("cluster_count_post_merge"),
+                "cluster_initial_pruning_enabled": detail.get("cluster_identity_diagnostics", {}).get("initial_pruning_enabled"),
+                "cluster_initial_prune_events": detail.get("cluster_initial_prune_events", []),
                 "cluster_merge_events": detail.get("cluster_merge_events", []),
+                "cluster_identity_diagnostics": detail.get("cluster_identity_diagnostics", {}),
                 "top_centroid_separation_km": (
                     round(float(same_lobe_metrics["centroid_separation_km"]), 3)
                     if same_lobe_metrics else None

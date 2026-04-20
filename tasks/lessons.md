@@ -107,3 +107,4 @@
 ## 2026-04-20
 
 - After fixing a major retained-state bottleneck, re-audit adjacent operational caps in the same path (especially hard-coded per-ICAO history limits) before declaring scaling complete.
+- When adding stage diagnostics (for example cluster counts), do not infer earlier-stage counts from later-stage artifacts like merge-event totals. Carry exact per-stage counts through the pipeline, and avoid leaving a simplistic early dedupe stage that can pre-empt richer identity logic.

@@ -588,9 +588,15 @@ def test_build_intersection_clusters_merges_near_duplicate_seed_neighborhoods():
         _IntersectionCandidate(arc_i=5, arc_j=105, x_km=11.0, y_km=0.0, weight=0.5),
     ]
 
-    clusters, merge_events = _build_intersection_clusters(candidates, cluster_radius_km=14.0)
+    clusters, cluster_diag = _build_intersection_clusters(candidates, cluster_radius_km=14.0)
+    merge_events = cluster_diag["merge_events"]
 
     assert len(clusters) == 1
+    assert cluster_diag["initial_neighborhood_count"] == 6
+    assert cluster_diag["post_initial_prune_count"] == 6
+    assert cluster_diag["post_merge_count"] == 1
+    assert cluster_diag["initial_pruning_enabled"] is False
+    assert cluster_diag["initial_prune_events"] == []
     assert len(merge_events) >= 1
     assert merge_events[0]["merge_reason"] == "final_centroid_plus_support_overlap"
     assert len(clusters[0].merged_cluster_indices) >= 2
