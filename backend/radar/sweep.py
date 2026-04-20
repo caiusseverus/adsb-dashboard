@@ -2346,13 +2346,14 @@ class RadarState:
         metrics = _new_fired_burst_phase_metrics()
         t_setup = time.perf_counter()
         model = self._models.get(iid)
-        if model is None or model.period_s is None:
-            return metrics
-        period_s = self._get_authoritative_frame_period_s(iid, model.period_s)
-        if period_s is None:
-            return metrics
-        period_us = period_s * 1_000_000.0
-        native_processor = self._native_burst_processors.get(iid)
+        # Compute authoritative period if a coarse model exists; may be None during
+        # bootstrap before the first rotation model is established.
+        period_s: float | None = None
+        if model is not None and model.period_s is not None:
+            period_s = self._get_authoritative_frame_period_s(iid, model.period_s)
+        period_us = period_s * 1_000_000.0 if period_s is not None else None
+        # native_processor and dominant-family checks require a valid period.
+        native_processor = self._native_burst_processors.get(iid) if period_s is not None else None
 
         def _matches_dominant(icao: str) -> bool:
             rotation_model = getattr(model, "rotation_model", None)
@@ -2374,7 +2375,8 @@ class RadarState:
 
         self._ensure_live_builder_state(iid)
         # Pre-compute radar position once for the batch (used by sync observation recording).
-        _radar_pos_cache = _get_authoritative_radar_position(model)
+        # During bootstrap when no model exists yet, default to no-op position.
+        _radar_pos_cache = _get_authoritative_radar_position(model) if model is not None else {"lat": None, "lon": None}
         metrics["setup_ms"] += (time.perf_counter() - t_setup) * 1000
         batch_ref_icao: str | None = None
 
@@ -2437,6 +2439,10 @@ class RadarState:
             # This replaces the per-message detection recording in on_df11_batch()
             # so that bearing observations are built from burst-centre timestamps.
             self._record_live_burst_detection(iid, fired_icao, burst_centroid_us, burst_signal, pos)
+
+            # Sync obs and frame building require a usable period; skip during bootstrap.
+            if period_us is None:
+                continue
 
             # Record burst-centre observations for sync timeline plotting.
             # This is broader than sync maintenance: include all bursts that have
@@ -2842,9 +2848,10 @@ class RadarState:
             native_available = _decode_cffi is not None and hasattr(_decode_cffi, "RadarBurstProcessor")
             for iid, iid_events in grouped_events.items():
                 model = self._models.get(iid)
-                if model is None or model.period_s is None:
-                    continue
-                active_iid_count += 1
+                # active_iid_count reflects IIDs with a working period (for metrics).
+                # Burst accumulation proceeds even during bootstrap (no model/period yet).
+                if model is not None and model.period_s is not None:
+                    active_iid_count += 1
                 self._ensure_live_builder_state(iid)
                 iid_events.sort(key=lambda event: event[0])
                 if native_available:
@@ -4874,12 +4881,13 @@ class RadarState:
         has accumulated (≥4 bursts per aircraft, ≥2 aircraft with data).
         """
         model = self._models.get(iid)
-        if model is None or model.period_s is None:
-            return
-        period_s = self._get_authoritative_frame_period_s(iid, model.period_s)
-        if period_s is None:
-            return
-        period_us = period_s * 1_000_000.0
+        # Compute authoritative period; may be None during bootstrap.  Burst
+        # accumulation and BurstRecord emission proceed regardless — only frame
+        # timing logic is gated on having a valid period.
+        period_s: float | None = None
+        if model is not None and model.period_s is not None:
+            period_s = self._get_authoritative_frame_period_s(iid, model.period_s)
+        period_us = period_s * 1_000_000.0 if period_s is not None else None
 
         # Ensure per-IID state exists
         if iid not in self._live_bursts:
@@ -4931,6 +4939,11 @@ class RadarState:
                 beam_center_us=burst_centroid_us,
                 replies=fired_burst.get("replies"),
             )
+
+            # All remaining logic requires a usable period; skip during bootstrap
+            # so that burst records and centroid history still accumulate.
+            if period_us is None:
+                continue
 
             current_frame = self._live_frames.get(iid)
             if current_frame is not None and burst_centroid_us >= current_frame.ref_arrival_us + period_us:
@@ -5217,6 +5230,18 @@ class RadarState:
         ):
             return sync.period_s
         return fallback_period_s
+
+    def get_authoritative_display_period_s(self, iid: int) -> float | None:
+        """Return the period currently in use for display in the IID selector.
+
+        Mirrors _get_authoritative_frame_period_s: prefers LiveSyncState.period_s
+        when sync is usable and not in holdover, falls back to the coarse model
+        period.  Used by the /api/radar/iids endpoint so the UI shows the same
+        period the frame builder is actually using rather than the stale coarse value.
+        """
+        model = self._models.get(iid)
+        fallback = model.period_s if model is not None else None
+        return self._get_authoritative_frame_period_s(iid, fallback)
 
     def update_rotation_models(
         self,
@@ -5936,19 +5961,29 @@ class RadarState:
     # ------------------------------------------------------------------
 
     def get_iid_activity(self, window_s: float = 600.0) -> dict[int, dict]:
-        """Return per-IID activity within the last window_s seconds of Beast time."""
+        """Return per-IID activity within the last window_s seconds of Beast time.
+
+        Primary source: _burst_records (preferred; populated once a model exists).
+        Bootstrap fallback: _iid_events (used for IIDs not yet in _burst_records,
+        e.g. after purge/reset, so the IID selector shows activity during bootstrap).
+        """
         with self._lock:
-            if not self._burst_records:
-                return {}
-            # Determine "now" from the latest burst centroid across all IIDs
-            now_us = max(
+            latest_burst_us = max(
                 (br_deque[-1].centroid_us for br_deque in self._burst_records.values() if br_deque),
                 default=None,
             )
-            if now_us is None:
+            latest_event_us = self._iid_events[-1][0] if self._iid_events else None
+            if latest_burst_us is None and latest_event_us is None:
                 return {}
+            now_us = max(x for x in [latest_burst_us, latest_event_us] if x is not None)
             cutoff_us = now_us - int(window_s * 1_000_000)
             burst_snapshot = {iid: list(deq) for iid, deq in self._burst_records.items()}
+            iids_with_bursts = set(burst_snapshot.keys())
+            # Only snapshot raw events for IIDs not already covered by burst records.
+            raw_events_snapshot = (
+                [ev for ev in self._iid_events if ev[1] not in iids_with_bursts]
+                if self._iid_events else []
+            )
 
         activity: dict[int, dict] = {}
         for iid, records in burst_snapshot.items():
@@ -5968,6 +6003,22 @@ class RadarState:
                         entry["last_us"] = rec.centroid_us
                         if rec.icao:
                             entry["latest_icao"] = rec.icao
+
+        # Bootstrap fallback: derive activity from raw events for IIDs that do not
+        # yet have burst records (e.g. immediately after purge/reset).
+        for arrival_us, iid, icao, _sig in raw_events_snapshot:
+            if arrival_us < cutoff_us:
+                continue
+            entry = activity.get(iid)
+            if entry is None:
+                activity[iid] = {"count": 1, "last_us": arrival_us, "latest_icao": icao}
+            else:
+                entry["count"] += 1
+                if arrival_us >= entry["last_us"]:
+                    entry["last_us"] = arrival_us
+                    if icao:
+                        entry["latest_icao"] = icao
+
         return activity
 
     def get_latest_arrival_us(self) -> float | None:

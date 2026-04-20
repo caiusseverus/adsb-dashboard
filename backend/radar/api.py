@@ -1272,7 +1272,7 @@ async def get_iids(window_s: float = Query(default=600.0, ge=10, le=7200)):
             "count": entry["count"],
             "last_seen": round(last_seen, 1),
             "latest_icao": entry.get("latest_icao", ""),
-            "period_s": model.period_s if model else None,
+            "period_s": _state.get_authoritative_display_period_s(iid),
             "status": model.status if model else None,
             # Forward model fields
             "fm_lat": model.fm_lat if model else None,
