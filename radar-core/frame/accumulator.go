@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"math"
 
+	rcconfig "github.com/caiusseverus/adsb-dashboard/radar-core/config"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/iid"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/output"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/protocol"
@@ -19,12 +20,13 @@ import (
 
 // Accumulator constants — match sweep.py.
 const (
-	coSweepWindowUS             = 70_000.0  // max offset for a co-sweep burst
-	phaseFamilyToleranceFraction = 0.15     // period fraction used when coSweepWindow is narrower
-	phaseFamilyHistoryMin        = 2        // minimum historical offsets for phase check
-	periodMatchTolerance         = 0.15     // max period deviation for dominant-family fallback
-	minFrameSeparationFraction   = 0.5      // minimum frame separation as fraction of period
-	centroidHistoryMax           = 30       // max centroid timestamps kept per ICAO
+	coSweepWindowUS               = 70_000.0 // max offset for a co-sweep burst
+	phaseFamilyToleranceFraction  = 0.15     // period fraction used when coSweepWindow is narrower
+	phaseFamilyHistoryMin         = 2        // minimum historical offsets for phase check
+	periodMatchTolerance          = 0.15     // max period deviation for dominant-family fallback
+	minFrameSeparationFraction    = 0.5      // minimum frame separation as fraction of period
+	centroidHistoryMinPerICAO     = 30       // lower bound on retained centroids per ICAO
+	centroidHistoryHardMaxPerICAO = 480      // hard ceiling on retained centroids per ICAO
 )
 
 // liveFrame is an in-progress sweep frame.
@@ -34,22 +36,28 @@ type liveFrame struct {
 	refLon       float64
 	refArrivalUS float64
 	refPosAgeS   float64
-	nAircraft    int       // reference counts as 1
+	nAircraft    int // reference counts as 1
 	observations []protocol.FrameObservation
 	seenICAOs    map[uint32]struct{}
 }
 
 // DiagnosticsSnapshot is a point-in-time view of frame accumulator gates/state.
 type DiagnosticsSnapshot struct {
-	FrameIndex          uint32
-	OpenFrame           bool
-	OpenFrameRefICAO    uint32
-	OpenFrameNAircraft  int
-	OpenFrameNObs       int
-	LastFrameStartUS    float64
-	LastGateReason      string
-	LastGateICAO        uint32
-	GateCounts          map[string]uint64
+	FrameIndex                  uint32
+	OpenFrame                   bool
+	OpenFrameRefICAO            uint32
+	OpenFrameNAircraft          int
+	OpenFrameNObs               int
+	LastFrameStartUS            float64
+	LastGateReason              string
+	LastGateICAO                uint32
+	GateCounts                  map[string]uint64
+	CentroidHistoryICAOCount    int
+	CentroidHistoryTotal        int
+	CentroidHistoryMaxPerICAO   int
+	CentroidHistoryCapPerICAO   int
+	CentroidHistoryCapHit       bool
+	CentroidHistoryCapHitsTotal uint64
 }
 
 // Accumulator manages live frame state for one IID.
@@ -63,10 +71,11 @@ type Accumulator struct {
 	// Optional callback invoked after each FRAME_READY emission.
 	OnFrameEmitted func()
 	// Per-ICAO centroid history for phase-family checks.
-	centroidHistory  map[uint32][]float64
-	gateCounts       map[string]uint64
-	lastGateReason   string
-	lastGateICAO     uint32
+	centroidHistory        map[uint32][]float64
+	centroidHistoryCapHits uint64
+	gateCounts             map[string]uint64
+	lastGateReason         string
+	lastGateICAO           uint32
 }
 
 // New returns an Accumulator for the given IID.
@@ -85,6 +94,7 @@ func (a *Accumulator) Reset() {
 	a.frame = nil
 	a.lastFrameStartUS = 0
 	a.centroidHistory = make(map[uint32][]float64)
+	a.centroidHistoryCapHits = 0
 	a.gateCounts = make(map[string]uint64)
 	a.lastGateReason = ""
 	a.lastGateICAO = 0
@@ -258,10 +268,24 @@ func (a *Accumulator) finalizeFrame(periodS float64) {
 func (a *Accumulator) appendCentroid(icao uint32, centroidUS float64) {
 	hist := a.centroidHistory[icao]
 	hist = append(hist, centroidUS)
-	if len(hist) > centroidHistoryMax {
-		hist = hist[len(hist)-centroidHistoryMax:]
+	capPerICAO := a.centroidHistoryCapPerICAO()
+	if len(hist) > capPerICAO {
+		dropped := len(hist) - capPerICAO
+		hist = hist[dropped:]
+		a.centroidHistoryCapHits += uint64(dropped)
 	}
 	a.centroidHistory[icao] = hist
+}
+
+func (a *Accumulator) centroidHistoryCapPerICAO() int {
+	cfgCap := rcconfig.Get().CentroidHistoryMaxPerICAO
+	if cfgCap < centroidHistoryMinPerICAO {
+		return centroidHistoryMinPerICAO
+	}
+	if cfgCap > centroidHistoryHardMaxPerICAO {
+		return centroidHistoryHardMaxPerICAO
+	}
+	return cfgCap
 }
 
 // matchesDominant checks whether an ICAO belongs to the dominant period family.
@@ -391,6 +415,17 @@ func (a *Accumulator) Diagnostics() DiagnosticsSnapshot {
 		diag.OpenFrameNAircraft = a.frame.nAircraft
 		diag.OpenFrameNObs = len(a.frame.observations)
 	}
+	diag.CentroidHistoryCapPerICAO = a.centroidHistoryCapPerICAO()
+	diag.CentroidHistoryICAOCount = len(a.centroidHistory)
+	diag.CentroidHistoryCapHitsTotal = a.centroidHistoryCapHits
+	for _, hist := range a.centroidHistory {
+		n := len(hist)
+		diag.CentroidHistoryTotal += n
+		if n > diag.CentroidHistoryMaxPerICAO {
+			diag.CentroidHistoryMaxPerICAO = n
+		}
+	}
+	diag.CentroidHistoryCapHit = diag.CentroidHistoryMaxPerICAO >= diag.CentroidHistoryCapPerICAO
 	for k, v := range a.gateCounts {
 		diag.GateCounts[k] = v
 	}
@@ -415,7 +450,7 @@ func nearestInSlice(vals []float64, target float64) float64 {
 func sortedCopy(vals []float64) []float64 {
 	cp := make([]float64, len(vals))
 	copy(cp, vals)
-	// Simple insertion sort — lists are short (max 30).
+	// Simple insertion sort — lists are short (bounded centroid history).
 	for i := 1; i < len(cp); i++ {
 		v := cp[i]
 		j := i - 1

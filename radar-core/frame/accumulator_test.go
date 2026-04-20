@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	rcconfig "github.com/caiusseverus/adsb-dashboard/radar-core/config"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/iid"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/output"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/protocol"
@@ -291,5 +292,37 @@ func TestMedian(t *testing.T) {
 		if math.Abs(got-tc.want) > 1e-9 {
 			t.Errorf("median(%v) = %.2f, want %.2f", tc.vals, got, tc.want)
 		}
+	}
+}
+
+func TestAccumulator_CentroidHistoryCapDiagnostics(t *testing.T) {
+	acc, _, _ := newTestAccumulator()
+
+	// Use a small test cap and restore default after this test.
+	rcconfig.Apply("CENTROID_HISTORY_MAX_PER_ICAO", 35)
+	defer rcconfig.Apply("CENTROID_HISTORY_MAX_PER_ICAO", rcconfig.DefaultCentroidHistoryMaxPerICAO)
+
+	for i := 0; i < 60; i++ {
+		acc.appendCentroid(0xAAAAAA, float64(i)*4_000_000.0)
+	}
+
+	diag := acc.Diagnostics()
+	if diag.CentroidHistoryCapPerICAO != 35 {
+		t.Fatalf("cap_per_icao=%d, want 35", diag.CentroidHistoryCapPerICAO)
+	}
+	if diag.CentroidHistoryICAOCount != 1 {
+		t.Fatalf("icao_count=%d, want 1", diag.CentroidHistoryICAOCount)
+	}
+	if diag.CentroidHistoryTotal != 35 {
+		t.Fatalf("total=%d, want 35", diag.CentroidHistoryTotal)
+	}
+	if diag.CentroidHistoryMaxPerICAO != 35 {
+		t.Fatalf("max_per_icao=%d, want 35", diag.CentroidHistoryMaxPerICAO)
+	}
+	if !diag.CentroidHistoryCapHit {
+		t.Fatal("expected centroid history cap hit")
+	}
+	if diag.CentroidHistoryCapHitsTotal == 0 {
+		t.Fatal("expected centroid history cap hit counter > 0")
 	}
 }

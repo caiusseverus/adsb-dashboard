@@ -6,24 +6,26 @@ package config
 import "sync/atomic"
 
 const (
-	DefaultBurstGapUS            = 200_000.0 // 200 ms — replies within this belong to one burst
-	DefaultBurstRecordMaxAgeS    = 120.0
-	DefaultBurstRecordsMaxPerIID = 8000
-	DefaultMinBursts             = 4
-	DefaultMinQualifyingICAOs    = 4
-	DefaultSocketPath            = "/run/adsb/radar-core.sock"
+	DefaultBurstGapUS                = 200_000.0 // 200 ms — replies within this belong to one burst
+	DefaultBurstRecordMaxAgeS        = 120.0
+	DefaultBurstRecordsMaxPerIID     = 8000
+	DefaultCentroidHistoryMaxPerICAO = 120
+	DefaultMinBursts                 = 4
+	DefaultMinQualifyingICAOs        = 4
+	DefaultSocketPath                = "/run/adsb/radar-core.sock"
 )
 
 // Config holds live-adjustable operational parameters.
 // All float64 fields are read via Load and written via Store on the atomic pointer;
 // integer fields use sync/atomic directly. Reads on the hot path do not need a mutex.
 type Config struct {
-	BurstGapUS            float64
-	BurstRecordMaxAgeS    float64
-	BurstRecordsMaxPerIID int
-	MinBursts             int
-	MinQualifyingICAOs    int
-	SocketPath            string
+	BurstGapUS                float64
+	BurstRecordMaxAgeS        float64
+	BurstRecordsMaxPerIID     int
+	CentroidHistoryMaxPerICAO int
+	MinBursts                 int
+	MinQualifyingICAOs        int
+	SocketPath                string
 }
 
 // global is the live config; accessed via Get/Apply.
@@ -35,12 +37,13 @@ func init() {
 
 func Defaults() *Config {
 	return &Config{
-		BurstGapUS:            DefaultBurstGapUS,
-		BurstRecordMaxAgeS:    DefaultBurstRecordMaxAgeS,
-		BurstRecordsMaxPerIID: DefaultBurstRecordsMaxPerIID,
-		MinBursts:             DefaultMinBursts,
-		MinQualifyingICAOs:    DefaultMinQualifyingICAOs,
-		SocketPath:            DefaultSocketPath,
+		BurstGapUS:                DefaultBurstGapUS,
+		BurstRecordMaxAgeS:        DefaultBurstRecordMaxAgeS,
+		BurstRecordsMaxPerIID:     DefaultBurstRecordsMaxPerIID,
+		CentroidHistoryMaxPerICAO: DefaultCentroidHistoryMaxPerICAO,
+		MinBursts:                 DefaultMinBursts,
+		MinQualifyingICAOs:        DefaultMinQualifyingICAOs,
+		SocketPath:                DefaultSocketPath,
 	}
 }
 
@@ -63,6 +66,10 @@ func Apply(key string, value interface{}) {
 	case "BURST_RECORDS_MAX_PER_IID":
 		if v, ok := toInt(value); ok {
 			next.BurstRecordsMaxPerIID = v
+		}
+	case "CENTROID_HISTORY_MAX_PER_ICAO":
+		if v, ok := toInt(value); ok {
+			next.CentroidHistoryMaxPerICAO = v
 		}
 	case "MIN_BURSTS":
 		if v, ok := toInt(value); ok {

@@ -289,15 +289,21 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 		if acc, ok := e.accumulators[iidNum]; ok {
 			accDiag := acc.Diagnostics()
 			iidPayload["frame_accumulator"] = map[string]interface{}{
-				"completed_frames":      accDiag.FrameIndex,
-				"open_frame":            accDiag.OpenFrame,
-				"open_frame_ref_icao":   accDiag.OpenFrameRefICAO,
-				"open_frame_n_aircraft": accDiag.OpenFrameNAircraft,
-				"open_frame_n_obs":      accDiag.OpenFrameNObs,
-				"last_frame_start_us":   accDiag.LastFrameStartUS,
-				"last_gate_reason":      accDiag.LastGateReason,
-				"last_gate_icao":        accDiag.LastGateICAO,
-				"gate_counts":           accDiag.GateCounts,
+				"completed_frames":                accDiag.FrameIndex,
+				"open_frame":                      accDiag.OpenFrame,
+				"open_frame_ref_icao":             accDiag.OpenFrameRefICAO,
+				"open_frame_n_aircraft":           accDiag.OpenFrameNAircraft,
+				"open_frame_n_obs":                accDiag.OpenFrameNObs,
+				"last_frame_start_us":             accDiag.LastFrameStartUS,
+				"last_gate_reason":                accDiag.LastGateReason,
+				"last_gate_icao":                  accDiag.LastGateICAO,
+				"gate_counts":                     accDiag.GateCounts,
+				"centroid_history_icao_count":     accDiag.CentroidHistoryICAOCount,
+				"centroid_history_total":          accDiag.CentroidHistoryTotal,
+				"centroid_history_max_per_icao":   accDiag.CentroidHistoryMaxPerICAO,
+				"centroid_history_cap_per_icao":   accDiag.CentroidHistoryCapPerICAO,
+				"centroid_history_cap_hit":        accDiag.CentroidHistoryCapHit,
+				"centroid_history_cap_hits_total": accDiag.CentroidHistoryCapHitsTotal,
 			}
 		}
 		iidsPayload[key] = iidPayload

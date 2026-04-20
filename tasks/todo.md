@@ -4257,3 +4257,20 @@ Plan confirmation: proceeding with a minimal-shape change that preserves existin
   - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py` -> `100 passed`.
   - `go test ./...` in `radar-core` passed (executed outside sandbox cache restrictions).
   - Added focused regression tests for density-aware retention behavior in Python and Go.
+
+## 2026-04-20 Go Centroid History Cap Correction
+
+- [x] Replace fixed `centroidHistoryMax = 30` in radar-core frame accumulator with bounded configurable policy
+- [x] Add centroid-history retained-count/cap-hit diagnostics to `frame_accumulator` snapshot payload
+- [x] Add focused Go test coverage for centroid-history cap behavior and diagnostics
+- [x] Run Go and relevant backend verification
+
+### Review
+
+- Changed `radar-core/frame/accumulator.go` to use config-driven centroid history cap (`CENTROID_HISTORY_MAX_PER_ICAO`) with bounds `[30, 480]` instead of hard-coded `30`.
+- Added config field/key in `radar-core/config/config.go` with default `120`.
+- Added accumulator diagnostics fields: ICAO count, total retained centroids, max retained per ICAO, effective cap, cap-hit bool, and cap-hit counter; exposed via radar-core snapshot `frame_accumulator` in `radar-core/cmd/radar-core/main.go`.
+- Added test `TestAccumulator_CentroidHistoryCapDiagnostics` in `radar-core/frame/accumulator_test.go`.
+- Verification:
+  - `go test ./...` (radar-core) passed.
+  - `uv run --directory backend pytest tests/test_radar_api.py::test_get_iid_pipeline_debug_combines_python_and_go_diagnostics tests/test_radar_api.py::test_get_iid_pipeline_debug_supports_nested_runtime_stats_provider` passed.

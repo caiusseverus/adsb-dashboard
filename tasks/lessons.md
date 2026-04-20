@@ -103,3 +103,7 @@
 ## 2026-04-17
 
 - When building recovery logic for a wrong absolute phase branch, do not use residual-quality memory from that wrong branch as a hard eligibility gate. Use it as a score penalty or diagnostic only, otherwise every suitable recovery anchor can be rejected before it gets a chance to correct the branch.
+
+## 2026-04-20
+
+- After fixing a major retained-state bottleneck, re-audit adjacent operational caps in the same path (especially hard-coded per-ICAO history limits) before declaring scaling complete.
