@@ -4406,3 +4406,62 @@ Plan confirmation: proceeding with a minimal-shape change that preserves existin
   - `uv run --directory backend pytest tests/test_forward_model.py`
   - `uv run --directory backend pytest tests/test_forward_model_integration.py tests/test_forward_model_stage6.py`
   - Result: all targeted tests passed (`39 + 11` tests).
+
+
+# Radar-Core FM Migration
+
+Plan confirmation: proceeding because the user supplied a concrete migration brief and the repo instructions require an explicit plan before implementation. Scope is limited to the forward-model compute path and directly related per-IID FM operational state; generic ADS-B aircraft state, API/websocket serving, and persistence orchestration remain in Python.
+
+## Audit / Contract
+
+- [ ] Map `backend/radar/forward_model.py` per-frame solve responsibilities to new Go FM modules.
+- [ ] Map accumulation admission, frame-position buffer, centroid/filtering, and diagnostics responsibilities to Go.
+- [ ] Identify Python call sites that currently make Python FM authoritative and plan the minimal rewiring.
+
+## Go Implementation
+
+- [ ] Add `radar-core/fm` data types for SweepFrame-equivalent inputs, scored circles, clusters, frame estimates, per-IID state, stats, and solved state.
+- [ ] Port pair-circle generation, circle scoring/selection, intersection generation, cluster build/merge, same-lobe ambiguity bypass, best-result selection, and per-frame admission gates.
+- [ ] Port bounded accumulated frame-position storage plus centroid/filtering behavior.
+- [ ] Run FM from Go when `frame.Accumulator` emits a completed frame, without blocking the ingest hot path longer than necessary.
+
+## Protocol / Python Rewire
+
+- [ ] Add compact outbound FM state/result protocol messages and writer/client dispatch support.
+- [ ] Keep `FRAME_READY` available for diagnostics/shadow compatibility, but stop routing it to Python FM solving by default.
+- [ ] Add Python-side storage of Go-authored FM state/results and update `RadarIID.fm_*` from Go FM state.
+- [ ] Disable the default Python FM worker and background Python FM publisher when Go FM is authoritative; keep manual/diagnostic Python endpoints explicitly non-authoritative.
+- [ ] Surface Go FM stats in API/runtime diagnostics with rejection histograms, acceptance tiers, accumulated count, centroid availability, solved position, and CEP.
+
+## Verification
+
+- [ ] Add Go unit tests for accumulation classifier, same-lobe ambiguity, centroid/filtering, and at least one deterministic frame solve.
+- [ ] Add/adjust Python protocol/client tests for FM messages and default non-authoritative Python FM flow.
+- [ ] Run available backend tests and Go tests; if Go toolchain/module version blocks execution, document the blocker precisely.
+- [ ] Compare Python and Go FM behavior on representative deterministic frames for accepted/rejected counts, candidate existence, centroid, and CEP.
+
+## Review
+
+- [ ] Document Python-to-Go responsibility mapping.
+- [ ] Document protocol/API changes and old/new frame flow.
+- [ ] Document diagnostics parity, verification results, performance observations, and remaining gaps.
+
+### Review
+
+- [x] Audited Python FM responsibilities and call sites, including per-frame solving, circle scoring, same-lobe ambiguity, accumulation admission, frame buffer/centroid state, and diagnostics consumers.
+- [x] Added Go `radar-core/fm` package for per-frame FM solve, accumulation admission, bounded per-IID state, centroid/filtering, and FM protocol projection.
+- [x] Wired Go frame emission to an internal bounded FM worker queue; ingest only enqueues completed frames and does not run FM inline.
+- [x] Added `FM_FRAME_RESULT` and `FM_STATE` protocol messages plus snapshot `forward_model` / `frame_position_pipeline` payloads.
+- [x] Rewired Python to consume Go FM state, project it into `RadarIID.fm_*`, and disable Python per-frame/background FM when `RADAR_CORE_FM_ENABLED=true`.
+- [x] Preserved compact operational diagnostics for solve success, candidate existence, accepted/rejected accumulation counts, rejection reasons, acceptance tiers, accumulated frame count, centroid availability, solved position/CEP, same-lobe bypass, cluster membership, support dominance, and pairwise RMS.
+- [x] Verification: `GOCACHE=/tmp/go-build go test ./...` passed for radar-core.
+- [x] Verification: `python3 -m py_compile backend/config.py backend/main.py backend/radar/sweep.py backend/radar/api.py backend/radar_core/protocol.py backend/radar_core/client.py` passed.
+- [x] Verification: targeted backend radar-core/API tests passed (`35 passed`).
+- [x] Verification: full backend test suite passed (`363 passed`).
+- [x] Python-vs-Go deterministic fixture comparison added in `radar-core/fm/fm_test.go`: Go per-frame candidate position stays within 0.05 degrees of the Python fixture output for the same synthetic frame, and classifier/same-lobe fixtures mirror existing Python tests.
+
+Remaining follow-up:
+
+- [ ] Full UI geometry parity payloads (`admitted_pair_circles`, candidate clusters, scored circles) remain Python diagnostic/manual only to avoid large IPC payloads in the operational path.
+- [ ] Persistence of Go accepted frame positions is not yet moved into Go; Python receives solved state for runtime/API use, while DB write orchestration remains a follow-up if long-term retained FM buffers need cross-restart parity.
+- [ ] Live Pi CPU impact must be measured on-device with real traffic; local tests prove correctness/build behavior but do not measure backend load.

@@ -298,6 +298,9 @@ RADAR_CORE_SOCKET: str = os.getenv("RADAR_CORE_SOCKET", "/run/adsb/radar-core.so
 # RADAR_CORE_FRAMES_ENABLED: route FRAME_READY messages from radar-core to
 # the FM worker instead of building frames in Python.  Requires RADAR_CORE_ENABLED.
 RADAR_CORE_FRAMES_ENABLED: bool = _bool("RADAR_CORE_FRAMES_ENABLED", False)
+# RADAR_CORE_FM_ENABLED: make radar-core authoritative for operational FM
+# frame solving/accumulation when RADAR_CORE_ENABLED is true.
+RADAR_CORE_FM_ENABLED: bool = _bool("RADAR_CORE_FM_ENABLED", True)
 # RADAR_CORE_MANAGED: when true, backend launches/stops radar-core itself.
 # When false, backend waits for an externally managed radar-core at RADAR_CORE_SOCKET.
 RADAR_CORE_MANAGED: bool = _bool("RADAR_CORE_MANAGED", True)

@@ -2059,6 +2059,34 @@ async def get_iid_fm_status(iid: int):
 def _build_frame_accumulation_summary(iid: int, model) -> dict:
     """Summarise the per-frame position buffer for one IID."""
     try:
+        if _state is not None:
+            go_stats = _state.get_go_fm_pipeline_stats(iid)
+            if go_stats is not None:
+                centroid = None
+                if model is not None and model.fm_lat is not None and model.fm_lon is not None:
+                    centroid = {
+                        "lat": model.fm_lat,
+                        "lon": model.fm_lon,
+                        "cep_km": (model.fm_cep_m or 0.0) / 1000.0,
+                        "n_estimates": go_stats.get("centroid_inliers", 0),
+                        "n_total": go_stats.get("accumulated_frame_positions", 0),
+                        "n_stage0_survivors": go_stats.get("centroid_stage0_survivors", 0),
+                        "n_inliers": go_stats.get("centroid_inliers", 0),
+                        "rejection_counts": go_stats.get("centroid_rejection_counts", {}),
+                        "source": "go_radar_core",
+                    }
+                error_m = None
+                if centroid and model.manual_lat is not None and model.manual_lon is not None:
+                    error_m = _haversine_m(
+                        centroid["lat"], centroid["lon"],
+                        model.manual_lat, model.manual_lon,
+                    )
+                return {
+                    "n_estimates": go_stats.get("accumulated_frame_positions", 0),
+                    "centroid": centroid,
+                    "error_vs_manual_m": round(error_m) if error_m is not None else None,
+                    "source": "go_radar_core",
+                }
         fm = _get_fm()
         estimates = fm.get_frame_positions(iid)
         centroid = fm.compute_weighted_centroid(iid) if estimates else None
@@ -3146,7 +3174,9 @@ async def get_iid_pipeline_debug(iid: int):
             return {"iid": iid, "available": False, "reason": "radar module not initialised"}
 
         python_debug = _state.get_live_pipeline_debug(iid)
-        fm_pipeline = _get_fm().get_frame_pipeline_stats(iid)
+        fm_pipeline = _state.get_go_fm_pipeline_stats(iid)
+        if fm_pipeline is None:
+            fm_pipeline = _get_fm().get_frame_pipeline_stats(iid)
 
         radar_core_stats = _radar_core_stats_provider() if _radar_core_stats_provider is not None else {}
         client_stats = radar_core_stats.get("client") or radar_core_stats

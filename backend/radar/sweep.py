@@ -1948,6 +1948,8 @@ class RadarState:
         self._radar_core_frames_injected_by_iid: dict[int, int] = {}
         self._python_frames_finalized_total: int = 0
         self._python_frames_finalized_by_iid: dict[int, int] = {}
+        self._go_fm_states: dict[int, dict] = {}
+        self._go_fm_pipeline_stats: dict[int, dict] = {}
 
         # Lightweight ADS-B position tracker for real-time position capture
         self._adsb_tracker = AircraftPositionTracker()
@@ -3170,6 +3172,96 @@ class RadarState:
         except Exception:
             self._radar_core_frame_inject_errors += 1
             log.debug("RadarState: malformed radar-core FRAME_READY ignored", exc_info=True)
+
+    def update_forward_model_from_go(self, state_dict: dict) -> None:
+        """Project radar-core FM_STATE into Python's compatibility model fields.
+
+        Go is authoritative for operational FM when this callback is wired.
+        Python keeps the existing RadarIID.fm_* fields populated so APIs and
+        coincident-illumination seeding do not need a parallel lookup path.
+        """
+        try:
+            iid = int(state_dict["i"])
+            centroid_available = bool(state_dict.get("ca"))
+            lat = state_dict.get("la")
+            lon = state_dict.get("lo")
+            cep_m = state_dict.get("cep")
+            updated_ts = float(state_dict.get("ts") or time.time())
+
+            pipeline = {
+                "frames_reaching_solver": int(state_dict.get("fr", 0)),
+                "solver_success": int(state_dict.get("sc", 0)),
+                "candidate_positions": int(state_dict.get("cp", 0)),
+                "solver_no_candidate": int(state_dict.get("nc", 0)),
+                "accumulation_rejected": int(state_dict.get("ar", 0)),
+                "accumulation_rejection_reasons": dict(state_dict.get("rr") or {}),
+                "accumulation_accepted": int(state_dict.get("aa", 0)),
+                "accumulation_acceptance_tiers": dict(state_dict.get("at") or {}),
+                "accumulation_written": int(state_dict.get("aw", 0)),
+                "storage_errors": 0,
+                "last_rejection_reason": state_dict.get("lr") or None,
+                "last_admission_tier": state_dict.get("lt") or None,
+                "accumulated_frame_positions": int(state_dict.get("af", 0)),
+                "centroid_available": centroid_available,
+                "centroid_rejection_counts": dict(state_dict.get("cr") or {}),
+                "centroid_inliers": int(state_dict.get("ci", 0)),
+                "centroid_stage0_survivors": int(state_dict.get("cs", 0)),
+                "source": "go_radar_core",
+            }
+
+            with self._lock:
+                if iid not in self._models:
+                    self._models[iid] = RadarIID(iid=iid)
+                model = self._models[iid]
+                if centroid_available and lat is not None and lon is not None:
+                    model.fm_lat = float(lat)
+                    model.fm_lon = float(lon)
+                    model.fm_cep_m = float(cep_m) if cep_m is not None else None
+                    model.fm_source = "go_frame_accumulation"
+                    model.fm_n_observations = int(state_dict.get("ci", 0))
+                    model.fm_window_s = 0.0
+                    model.last_updated = updated_ts
+                    entry = {
+                        "ts": updated_ts,
+                        "lat": model.fm_lat,
+                        "lon": model.fm_lon,
+                        "cep_m": model.fm_cep_m,
+                        "n_observations": model.fm_n_observations,
+                        "source": model.fm_source,
+                        "authoritative_engine": "go_radar_core",
+                    }
+                    model.fm_convergence_history.append(entry)
+                    if len(model.fm_convergence_history) > 50:
+                        model.fm_convergence_history = model.fm_convergence_history[-50:]
+                model.fm_last_run = {
+                    "ts": updated_ts,
+                    "success": bool(state_dict.get("fs")),
+                    "stage": state_dict.get("lss") or "go_frame_solve",
+                    "reason": state_dict.get("frr") or state_dict.get("lsr"),
+                    "source": "go_radar_core",
+                    "authoritative_engine": "go_radar_core",
+                    "lat": model.fm_lat,
+                    "lon": model.fm_lon,
+                    "cep_m": model.fm_cep_m,
+                    "detail": {
+                        "last_frame_index": state_dict.get("fi"),
+                        "last_candidate_position": bool(state_dict.get("fh")),
+                        "last_ambiguity_same_lobe_bypass": bool(state_dict.get("lsl")),
+                        "last_cluster_member_count": state_dict.get("lcm"),
+                        "last_second_cluster_member_count": state_dict.get("lsm"),
+                        "last_support_dominance_ratio": state_dict.get("lsd"),
+                        "last_pairwise_rms_deg": state_dict.get("lpr"),
+                    },
+                }
+                self._go_fm_states[iid] = dict(state_dict)
+                self._go_fm_pipeline_stats[iid] = pipeline
+        except Exception:
+            log.debug("RadarState: malformed radar-core FM_STATE ignored", exc_info=True)
+
+    def get_go_fm_pipeline_stats(self, iid: int) -> dict | None:
+        with self._lock:
+            stats = self._go_fm_pipeline_stats.get(iid)
+            return dict(stats) if stats is not None else None
 
     def _seed_live_sync_from_frame(
         self,

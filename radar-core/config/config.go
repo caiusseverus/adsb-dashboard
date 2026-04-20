@@ -3,7 +3,11 @@
 // before any CONFIG_UPDATE messages arrive.
 package config
 
-import "sync/atomic"
+import (
+	"os"
+	"strconv"
+	"sync/atomic"
+)
 
 const (
 	DefaultBurstGapUS                = 200_000.0 // 200 ms — replies within this belong to one burst
@@ -26,6 +30,11 @@ type Config struct {
 	MinBursts                 int
 	MinQualifyingICAOs        int
 	SocketPath                string
+	ReceiverLat               float64
+	ReceiverLon               float64
+	ReceiverLatSet            bool
+	ReceiverLonSet            bool
+	HasReceiver               bool
 }
 
 // global is the live config; accessed via Get/Apply.
@@ -36,6 +45,8 @@ func init() {
 }
 
 func Defaults() *Config {
+	lat, latOK := envFloat("RECEIVER_LAT")
+	lon, lonOK := envFloat("RECEIVER_LON")
 	return &Config{
 		BurstGapUS:                DefaultBurstGapUS,
 		BurstRecordMaxAgeS:        DefaultBurstRecordMaxAgeS,
@@ -44,6 +55,11 @@ func Defaults() *Config {
 		MinBursts:                 DefaultMinBursts,
 		MinQualifyingICAOs:        DefaultMinQualifyingICAOs,
 		SocketPath:                DefaultSocketPath,
+		ReceiverLat:               lat,
+		ReceiverLon:               lon,
+		ReceiverLatSet:            latOK,
+		ReceiverLonSet:            lonOK,
+		HasReceiver:               latOK && lonOK,
 	}
 }
 
@@ -79,8 +95,32 @@ func Apply(key string, value interface{}) {
 		if v, ok := toInt(value); ok {
 			next.MinQualifyingICAOs = v
 		}
+	case "RECEIVER_LAT":
+		if v, ok := toFloat64(value); ok {
+			next.ReceiverLat = v
+			next.ReceiverLatSet = true
+			next.HasReceiver = next.ReceiverLatSet && next.ReceiverLonSet
+		}
+	case "RECEIVER_LON":
+		if v, ok := toFloat64(value); ok {
+			next.ReceiverLon = v
+			next.ReceiverLonSet = true
+			next.HasReceiver = next.ReceiverLatSet && next.ReceiverLonSet
+		}
 	}
 	global.Store(&next)
+}
+
+func envFloat(key string) (float64, bool) {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0, false
+	}
+	parsed, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0, false
+	}
+	return parsed, true
 }
 
 func toFloat64(v interface{}) (float64, bool) {

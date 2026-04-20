@@ -71,6 +71,12 @@ func (w *Writer) SendHealth(msg *protocol.Health) { w.Send(msg) }
 // SendFrameReady is a typed convenience wrapper.
 func (w *Writer) SendFrameReady(msg *protocol.FrameReady) { w.Send(msg) }
 
+// SendFMFrameResult is a typed convenience wrapper.
+func (w *Writer) SendFMFrameResult(msg *protocol.FMFrameResult) { w.Send(msg) }
+
+// SendFMState is a typed convenience wrapper.
+func (w *Writer) SendFMState(msg *protocol.FMState) { w.Send(msg) }
+
 // SendSnapshotResp is a typed convenience wrapper.
 func (w *Writer) SendSnapshotResp(msg *protocol.SnapshotResp) { w.Send(msg) }
 
@@ -91,6 +97,10 @@ func messageTypeLabel(msg interface{}) string {
 		return "SNAPSHOT_RESP"
 	case *protocol.Health:
 		return "HEALTH"
+	case *protocol.FMFrameResult:
+		return "FM_FRAME_RESULT"
+	case *protocol.FMState:
+		return "FM_STATE"
 	case *protocol.RadarEvent:
 		return "RADAR_EVENT"
 	case *protocol.PositionUpdate:

@@ -62,7 +62,7 @@ func TestAccumulator_NoFrameWithoutPeriod(t *testing.T) {
 
 	s := iid.NewIIDState(3) // no period set
 	emitted := 0
-	acc.OnFrameEmitted = func() { emitted++ }
+	acc.OnFrameEmitted = func(_ *protocol.FrameReady) { emitted++ }
 
 	acc.OnBurst(0xAA, 0.0, 2, nil, s)
 	if emitted != 0 {
@@ -81,7 +81,7 @@ func TestAccumulator_NoFrameWithoutRefICAO(t *testing.T) {
 	s.Status = "SINGLE_RADAR"
 	// RefICAO is nil — no reference selected yet.
 	emitted := 0
-	acc.OnFrameEmitted = func() { emitted++ }
+	acc.OnFrameEmitted = func(_ *protocol.FrameReady) { emitted++ }
 	acc.OnBurst(0xAA, 0.0, 2, nil, s)
 	if emitted != 0 {
 		t.Errorf("emitted %d frames, want 0 (no ref ICAO)", emitted)
@@ -136,7 +136,7 @@ func TestAccumulator_FullFrameFlow(t *testing.T) {
 	}
 
 	emitted := 0
-	acc.OnFrameEmitted = func() { emitted++ }
+	acc.OnFrameEmitted = func(_ *protocol.FrameReady) { emitted++ }
 
 	// Ref fires at 40s — opens a frame.
 	acc.OnBurst(0xAA, 40_000_000.0, 2, nil, s)
@@ -198,7 +198,7 @@ func TestAccumulator_InsufficientObservations(t *testing.T) {
 	}
 
 	emitted := 0
-	acc.OnFrameEmitted = func() { emitted++ }
+	acc.OnFrameEmitted = func(_ *protocol.FrameReady) { emitted++ }
 
 	acc.OnBurst(0xAA, 40_000_000.0, 2, nil, s) // open
 	acc.OnBurst(0xBB, 40_500_000.0, 2, nil, s) // 1 obs only

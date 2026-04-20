@@ -69,7 +69,7 @@ type Accumulator struct {
 	frame            *liveFrame
 	lastFrameStartUS float64
 	// Optional callback invoked after each FRAME_READY emission.
-	OnFrameEmitted func()
+	OnFrameEmitted func(*protocol.FrameReady)
 	// Per-ICAO centroid history for phase-family checks.
 	centroidHistory        map[uint32][]float64
 	centroidHistoryCapHits uint64
@@ -239,9 +239,6 @@ func (a *Accumulator) finalizeFrame(periodS float64) {
 	}
 
 	a.frameIndex++
-	if a.OnFrameEmitted != nil {
-		a.OnFrameEmitted()
-	}
 	a.recordGate("frame_emitted", f.refICAO)
 	slog.Info("radar-core: FRAME_READY emitted",
 		"iid", a.iidNum,
@@ -250,7 +247,7 @@ func (a *Accumulator) finalizeFrame(periodS float64) {
 		"n_aircraft", nAircraft,
 		"ref_icao", f.refICAO,
 	)
-	a.writer.SendFrameReady(&protocol.FrameReady{
+	msg := &protocol.FrameReady{
 		MsgType:      protocol.MsgFrameReady,
 		IID:          a.iidNum,
 		FrameIndex:   a.frameIndex,
@@ -261,7 +258,11 @@ func (a *Accumulator) finalizeFrame(periodS float64) {
 		RefArrivalUS: f.refArrivalUS,
 		Observations: f.observations,
 		Quality:      quality,
-	})
+	}
+	a.writer.SendFrameReady(msg)
+	if a.OnFrameEmitted != nil {
+		a.OnFrameEmitted(msg)
+	}
 }
 
 // appendCentroid adds a centroid to the per-ICAO history, capping at max size.

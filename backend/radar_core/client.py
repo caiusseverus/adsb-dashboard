@@ -60,12 +60,14 @@ class RadarCoreClient:
         socket_path: str,
         on_burst_fired: Optional[Callable[[dict], None]] = None,
         on_frame_ready: Optional[Callable[[dict], None]] = None,
+        on_fm_state: Optional[Callable[[dict], None]] = None,
         connect_timeout_s: float = 5.0,
         reconnect_delay_s: float = 2.0,
     ):
         self._socket_path = socket_path
         self._on_burst_fired = on_burst_fired
         self._on_frame_ready = on_frame_ready
+        self._on_fm_state = on_fm_state
         self._connect_timeout_s = connect_timeout_s
         self._reconnect_delay_s = reconnect_delay_s
 
@@ -88,6 +90,8 @@ class RadarCoreClient:
         self._events_dropped = 0
         self._bursts_received = 0
         self._frames_received = 0
+        self._fm_frame_results_received = 0
+        self._fm_states_received = 0
         self._callback_errors = 0
         self._connect_attempts = 0
         self._latest_health: Optional[dict] = None
@@ -152,6 +156,14 @@ class RadarCoreClient:
             with self._stats_lock:
                 self._events_dropped += 1
 
+    def send_config_update(self, key: str, value) -> None:
+        """Queue one CONFIG_UPDATE for sending. Non-blocking; drops if full."""
+        try:
+            self._send_queue.put_nowait(("config_update", key, value))
+        except queue.Full:
+            with self._stats_lock:
+                self._events_dropped += 1
+
     def is_connected(self) -> bool:
         return self._connected.is_set()
 
@@ -166,6 +178,8 @@ class RadarCoreClient:
                 "events_dropped": self._events_dropped,
                 "bursts_received": self._bursts_received,
                 "frames_received": self._frames_received,
+                "fm_frame_results_received": self._fm_frame_results_received,
+                "fm_states_received": self._fm_states_received,
                 "callback_errors": self._callback_errors,
                 "connect_attempts": self._connect_attempts,
                 "connected": self._connected.is_set(),
@@ -396,6 +410,19 @@ class RadarCoreClient:
             with self._stats_lock:
                 self._latest_snapshot = dict(d.get("pl") or {})
                 self._latest_snapshot_ts = time.time()
+        elif msg_type == P.MSG_FM_FRAME_RESULT:
+            with self._stats_lock:
+                self._fm_frame_results_received += 1
+        elif msg_type == P.MSG_FM_STATE:
+            with self._stats_lock:
+                self._fm_states_received += 1
+            if self._on_fm_state:
+                try:
+                    self._on_fm_state(d)
+                except Exception:
+                    with self._stats_lock:
+                        self._callback_errors += 1
+                    log.debug("RadarCoreClient: FM_STATE callback failed", exc_info=True)
         # Other types silently ignored in shadow mode.
 
     @staticmethod
@@ -407,4 +434,7 @@ class RadarCoreClient:
         elif kind == "position_update":
             _, icao, lat, lon, alt_ft, ts = item
             return P.position_update(icao, lat, lon, alt_ft, ts)
+        elif kind == "config_update":
+            _, key, value = item
+            return P.config_update(key, value)
         return None

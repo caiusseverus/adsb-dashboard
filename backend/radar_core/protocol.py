@@ -32,6 +32,8 @@ MSG_FRAME_READY   = 11
 MSG_IID_STATE     = 12
 MSG_SNAPSHOT_RESP = 13
 MSG_HEALTH        = 14
+MSG_FM_FRAME_RESULT = 15
+MSG_FM_STATE        = 16
 
 # ---------------------------------------------------------------------------
 # Framing
@@ -154,13 +156,21 @@ def decode_health(d: dict) -> dict:
     return d
 
 
+def decode_fm_frame_result(d: dict) -> dict:
+    return d
+
+
+def decode_fm_state(d: dict) -> dict:
+    return d
+
+
 def dispatch(payload: bytes) -> dict:
     """Decode a raw payload and return as a dict.  Raises KeyError on unknown type."""
     d = decode(payload)
     msg_type = d["t"]
     if msg_type not in (
         MSG_BURST_FIRED, MSG_FRAME_READY, MSG_IID_STATE,
-        MSG_SNAPSHOT_RESP, MSG_HEALTH,
+        MSG_SNAPSHOT_RESP, MSG_HEALTH, MSG_FM_FRAME_RESULT, MSG_FM_STATE,
         MSG_RADAR_EVENT, MSG_POSITION_UPDATE, MSG_CONFIG_UPDATE,
         MSG_SNAPSHOT_REQ, MSG_RESET_IID,
     ):

@@ -109,7 +109,7 @@ _radar_core_client: RadarCoreClient | None = None
 _radar_core_worker: RadarCoreWorker | None = None
 if config.RADAR_CORE_ENABLED:
     _rc_on_frame_ready = None
-    if config.RADAR_CORE_FRAMES_ENABLED:
+    if config.RADAR_CORE_FRAMES_ENABLED and not config.RADAR_CORE_FM_ENABLED:
         _rc_on_frame_ready = radar_state.inject_frame_from_go
         radar_state.enable_radar_core_frames(True)
     _radar_core_worker = RadarCoreWorker(
@@ -123,6 +123,7 @@ if config.RADAR_CORE_ENABLED:
     _radar_core_client = RadarCoreClient(
         config.RADAR_CORE_SOCKET,
         on_frame_ready=_rc_on_frame_ready,
+        on_fm_state=radar_state.update_forward_model_from_go if config.RADAR_CORE_FM_ENABLED else None,
         connect_timeout_s=config.RADAR_CORE_CONNECT_TIMEOUT_S,
         reconnect_delay_s=config.RADAR_CORE_RECONNECT_DELAY_S,
     )
@@ -138,6 +139,9 @@ _fm_worker_stop = threading.Event()
 
 
 def _start_fm_worker() -> threading.Thread | None:
+    if config.RADAR_CORE_ENABLED and config.RADAR_CORE_FM_ENABLED:
+        log.info("ForwardModel: Python per-frame FM worker disabled; radar-core FM is authoritative")
+        return None
     try:
         from radar.api import _get_fm
     except Exception:
@@ -1431,6 +1435,8 @@ async def _fm_loop() -> None:
 
     while True:
         await asyncio.sleep(30)
+        if config.RADAR_CORE_ENABLED and config.RADAR_CORE_FM_ENABLED:
+            continue
         if radar_state.is_update_active() or _msg_queue.qsize() >= _BACKGROUND_QUEUE_BACKLOG_SKIP:
             continue
         try:
@@ -1708,6 +1714,10 @@ async def lifespan(app: FastAPI):
                 f"radar-core client failed to connect to {config.RADAR_CORE_SOCKET!r} "
                 f"within {config.RADAR_CORE_STARTUP_TIMEOUT_S:.1f}s"
             )
+        if config.RECEIVER_LAT is not None:
+            _radar_core_client.send_config_update("RECEIVER_LAT", config.RECEIVER_LAT)
+        if config.RECEIVER_LON is not None:
+            _radar_core_client.send_config_update("RECEIVER_LON", config.RECEIVER_LON)
 
     global _decoder_thread, _radar_thread
     if config.INGEST_MODE == "beast":

@@ -22,6 +22,7 @@ import (
 
 	"github.com/caiusseverus/adsb-dashboard/radar-core/burst"
 	rcconfig "github.com/caiusseverus/adsb-dashboard/radar-core/config"
+	"github.com/caiusseverus/adsb-dashboard/radar-core/fm"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/frame"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/iid"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/ingest"
@@ -61,6 +62,7 @@ func main() {
 	go engine.runRotationTicker(stop)
 	go engine.runHealthTicker(stop)
 	go engine.runPositionPruneTicker(stop)
+	go engine.runFMWorker(stop)
 
 	os.Remove(*socketPath)
 
@@ -84,8 +86,10 @@ type engine struct {
 	builders     map[uint8]*burst.Builder     // per IID; only accessed from the ingest goroutine
 	states       map[uint8]*iid.IIDState      // per IID; thread-safe via IIDState.mu
 	accumulators map[uint8]*frame.Accumulator // per IID; only accessed from the ingest goroutine
-	revisions    map[uint8]uint32             // monotonic IID_STATE revision counter
-	positions    *iid.PositionCache           // global ADS-B position cache (thread-safe)
+	fmState      *fm.State
+	fmQueue      chan *protocol.FrameReady
+	revisions    map[uint8]uint32   // monotonic IID_STATE revision counter
+	positions    *iid.PositionCache // global ADS-B position cache (thread-safe)
 	start        time.Time
 
 	eventsIn      atomic.Uint64
@@ -99,6 +103,8 @@ func newEngine() *engine {
 		builders:     make(map[uint8]*burst.Builder),
 		states:       make(map[uint8]*iid.IIDState),
 		accumulators: make(map[uint8]*frame.Accumulator),
+		fmState:      fm.NewState(rcconfig.Get().ReceiverLat, rcconfig.Get().ReceiverLon, rcconfig.Get().HasReceiver),
+		fmQueue:      make(chan *protocol.FrameReady, 256),
 		revisions:    make(map[uint8]uint32),
 		positions:    iid.NewPositionCache(),
 		start:        time.Now(),
@@ -134,7 +140,14 @@ func (e *engine) onRadarEvent(msg *protocol.RadarEvent) {
 	acc, ok := e.accumulators[msg.IID]
 	if !ok {
 		acc = frame.New(msg.IID, e.writer, e.positions)
-		acc.OnFrameEmitted = func() { e.framesEmitted.Add(1) }
+		acc.OnFrameEmitted = func(frameMsg *protocol.FrameReady) {
+			e.framesEmitted.Add(1)
+			select {
+			case e.fmQueue <- frameMsg:
+			default:
+				slog.Warn("radar-core: FM queue full; dropping frame", "iid", frameMsg.IID, "frame", frameMsg.FrameIndex)
+			}
+		}
 		e.accumulators[msg.IID] = acc
 	}
 
@@ -213,6 +226,10 @@ func (e *engine) onPositionUpdate(msg *protocol.PositionUpdate) {
 
 func (e *engine) onConfigUpdate(msg *protocol.ConfigUpdate) {
 	rcconfig.Apply(msg.Key, msg.Value)
+	cfg := rcconfig.Get()
+	if cfg.HasReceiver {
+		e.fmState.SetReceiver(cfg.ReceiverLat, cfg.ReceiverLon)
+	}
 	slog.Info("radar-core: config updated", "key", msg.Key)
 }
 
@@ -306,6 +323,44 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 				"centroid_history_cap_hits_total": accDiag.CentroidHistoryCapHitsTotal,
 			}
 		}
+		if fmState := e.fmState.Snapshot(iidNum); fmState != nil {
+			iidPayload["forward_model"] = map[string]interface{}{
+				"has_position":          fmState.CentroidAvailable,
+				"lat":                   fmState.CentroidLat,
+				"lon":                   fmState.CentroidLon,
+				"cep_m":                 fmState.CentroidCEPM,
+				"source":                "go_frame_accumulation",
+				"n_observations":        fmState.CentroidInliers,
+				"window_s":              0.0,
+				"updated_ts":            fmState.UpdatedAt,
+				"last_run":              map[string]interface{}{"ts": fmState.UpdatedAt, "success": fmState.LastFrameSuccess, "stage": fmState.LastSolveStatus, "reason": fmState.LastFrameReason, "source": "go_frame_accumulation", "lat": fmState.CentroidLat, "lon": fmState.CentroidLon, "cep_m": fmState.CentroidCEPM},
+				"coincident_validation": nil,
+			}
+			iidPayload["frame_position_pipeline"] = map[string]interface{}{
+				"frames_reaching_solver":           fmState.FramesReachingSolver,
+				"solver_success":                   fmState.SolverSuccess,
+				"candidate_positions":              fmState.CandidatePositions,
+				"solver_no_candidate":              fmState.SolverNoCandidate,
+				"accumulation_rejected":            fmState.AccumulationRejected,
+				"accumulation_rejection_reasons":   fmState.AccumulationRejectionReasons,
+				"accumulation_accepted":            fmState.AccumulationAccepted,
+				"accumulation_acceptance_tiers":    fmState.AccumulationAcceptanceTiers,
+				"accumulation_written":             fmState.AccumulationWritten,
+				"storage_errors":                   0,
+				"last_rejection_reason":            fmState.LastRejectionReason,
+				"last_admission_tier":              fmState.LastAdmissionTier,
+				"accumulated_frame_positions":      fmState.AccumulatedFramePositions,
+				"centroid_available":               fmState.CentroidAvailable,
+				"centroid_rejection_counts":        fmState.CentroidRejectionCounts,
+				"centroid_inliers":                 fmState.CentroidInliers,
+				"centroid_stage0_survivors":        fmState.CentroidStage0Survivors,
+				"last_ambiguity_same_lobe_bypass":  fmState.LastAmbiguitySameLobeBypass,
+				"last_cluster_member_count":        fmState.LastClusterMemberCount,
+				"last_second_cluster_member_count": fmState.LastSecondClusterMemberCount,
+				"last_support_dominance_ratio":     fmState.LastSupportDominanceRatio,
+				"last_pairwise_rms_deg":            fmState.LastPairwiseRMSDeg,
+			}
+		}
 		iidsPayload[key] = iidPayload
 	}
 	payload["iids"] = iidsPayload
@@ -322,7 +377,25 @@ func (e *engine) onResetIID(msg *protocol.ResetIID) {
 	if a, ok := e.accumulators[msg.IID]; ok {
 		a.Reset()
 	}
+	e.fmState.Reset(msg.IID)
 	slog.Info("radar-core: IID reset", "iid", msg.IID)
+}
+
+func (e *engine) runFMWorker(stop <-chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			return
+		case frameMsg := <-e.fmQueue:
+			frameResult, state := e.fmState.ProcessFrame(frameMsg)
+			if frameResult != nil {
+				e.writer.SendFMFrameResult(frameResult)
+			}
+			if state != nil {
+				e.writer.SendFMState(state)
+			}
+		}
+	}
 }
 
 // runRotationTicker runs every 5s and analyses dirty IID states.

@@ -9,7 +9,7 @@ import (
 // mh is the shared msgpack handle. Configured once; safe for concurrent use.
 var mh = func() *codec.MsgpackHandle {
 	h := &codec.MsgpackHandle{}
-	h.MapType = nil     // decode maps as map[string]interface{}
+	h.MapType = nil // decode maps as map[string]interface{}
 	h.RawToString = true
 	return h
 }()
@@ -69,6 +69,12 @@ func decodeTyped(msgType uint8, payload []byte) (interface{}, error) {
 		return &m, newDec().Decode(&m)
 	case MsgHealth:
 		var m Health
+		return &m, newDec().Decode(&m)
+	case MsgFMFrameResult:
+		var m FMFrameResult
+		return &m, newDec().Decode(&m)
+	case MsgFMState:
+		var m FMState
 		return &m, newDec().Decode(&m)
 	default:
 		return nil, fmt.Errorf("protocol: unknown message type %d", msgType)

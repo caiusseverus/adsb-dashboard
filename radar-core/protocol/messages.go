@@ -2,21 +2,23 @@ package protocol
 
 // Message type constants — inbound (Python → radar-core).
 const (
-	MsgRadarEvent    uint8 = 1
+	MsgRadarEvent     uint8 = 1
 	MsgPositionUpdate uint8 = 2
-	MsgConfigUpdate  uint8 = 3
-	MsgSnapshotReq   uint8 = 4
-	MsgResetIID      uint8 = 5
+	MsgConfigUpdate   uint8 = 3
+	MsgSnapshotReq    uint8 = 4
+	MsgResetIID       uint8 = 5
 	// 6 reserved (was SHUTDOWN — now handled via SIGTERM, not protocol)
 )
 
 // Message type constants — outbound (radar-core → Python).
 const (
-	MsgBurstFired   uint8 = 10
-	MsgFrameReady   uint8 = 11
-	MsgIIDState     uint8 = 12
-	MsgSnapshotResp uint8 = 13
-	MsgHealth       uint8 = 14
+	MsgBurstFired    uint8 = 10
+	MsgFrameReady    uint8 = 11
+	MsgIIDState      uint8 = 12
+	MsgSnapshotResp  uint8 = 13
+	MsgHealth        uint8 = 14
+	MsgFMFrameResult uint8 = 15
+	MsgFMState       uint8 = 16
 )
 
 // --- Inbound messages ---
@@ -34,12 +36,12 @@ type RadarEvent struct {
 // PositionUpdate carries the latest ADS-B position for one aircraft.
 // ts is the wall-clock epoch when the position was last seen.
 type PositionUpdate struct {
-	MsgType uint8    `codec:"t"`
-	ICAO    uint32   `codec:"c"`
-	Lat     float64  `codec:"la"`
-	Lon     float64  `codec:"lo"`
-	AltFt   *int32   `codec:"al"`
-	TS      float64  `codec:"ts"`
+	MsgType uint8   `codec:"t"`
+	ICAO    uint32  `codec:"c"`
+	Lat     float64 `codec:"la"`
+	Lon     float64 `codec:"lo"`
+	AltFt   *int32  `codec:"al"`
+	TS      float64 `codec:"ts"`
 }
 
 // ConfigUpdate sets one operational knob by name.
@@ -69,36 +71,35 @@ type ResetIID struct {
 // BurstFired is emitted when a burst window closes and the centroid is computed.
 // Position fields are nil if no ADS-B fix was available within the freshness window.
 type BurstFired struct {
-	MsgType       uint8    `codec:"t"`
-	IID           uint8    `codec:"i"`
-	ICAO          uint32   `codec:"c"`
-	CentroidUS    float64  `codec:"cu"`
-	NReplies      uint8    `codec:"n"`
-	SignalDBFS    *float32 `codec:"s"`
-	Lat           *float64 `codec:"la"`
-	Lon           *float64 `codec:"lo"`
-	BearingDeg    *float32 `codec:"br"`
-	RangeNM       *float32 `codec:"rn"`
-	PosAgeS       *float32 `codec:"pa"`
-	DominantFamily bool    `codec:"df"`
-	SyncEligible  bool     `codec:"se"`
+	MsgType        uint8    `codec:"t"`
+	IID            uint8    `codec:"i"`
+	ICAO           uint32   `codec:"c"`
+	CentroidUS     float64  `codec:"cu"`
+	NReplies       uint8    `codec:"n"`
+	SignalDBFS     *float32 `codec:"s"`
+	Lat            *float64 `codec:"la"`
+	Lon            *float64 `codec:"lo"`
+	BearingDeg     *float32 `codec:"br"`
+	RangeNM        *float32 `codec:"rn"`
+	PosAgeS        *float32 `codec:"pa"`
+	DominantFamily bool     `codec:"df"`
+	SyncEligible   bool     `codec:"se"`
 }
 
 // FrameObservation is one non-reference aircraft within a SweepFrame.
 type FrameObservation struct {
-	ICAO      uint32   `codec:"c"`
-	Lat       float64  `codec:"la"`
-	Lon       float64  `codec:"lo"`
-	ArrivalUS float64  `codec:"a"`
-	NReplies  uint8    `codec:"n"`
-	PosAgeS   float32  `codec:"pa"`
+	ICAO      uint32  `codec:"c"`
+	Lat       float64 `codec:"la"`
+	Lon       float64 `codec:"lo"`
+	ArrivalUS float64 `codec:"a"`
+	NReplies  uint8   `codec:"n"`
+	PosAgeS   float32 `codec:"pa"`
 }
 
-// FrameReady is emitted when a sweep frame is complete and ready for FM solve.
-// This message is intentionally richer than other operational messages — it
-// carries full per-aircraft position data to allow the Python FM solve to
-// operate without changes. This is a temporary design compromise; see the
-// design brief §2 for the planned long-term replacement.
+// FrameReady is emitted when a sweep frame is complete. The same payload is
+// consumed internally by radar-core's FM worker; Python may still subscribe to
+// it for diagnostics or optional shadow compatibility, but it is no longer the
+// default operational FM solve boundary.
 type FrameReady struct {
 	MsgType      uint8              `codec:"t"`
 	IID          uint8              `codec:"i"`
@@ -138,12 +139,80 @@ type SnapshotResp struct {
 
 // Health is emitted every 10 seconds as a liveness signal.
 type Health struct {
-	MsgType      uint8   `codec:"t"`
-	UptimeS      float64 `codec:"up"`
-	EventsIn     uint64  `codec:"ei"`
-	BurstsFired  uint64  `codec:"bf"`
-	FramesEmitted uint64 `codec:"fe"`
-	QueueDepth   uint16  `codec:"qd"`
-	DropCount    uint32  `codec:"dc"`
-	ActiveIIDs   uint8   `codec:"ai"`
+	MsgType       uint8   `codec:"t"`
+	UptimeS       float64 `codec:"up"`
+	EventsIn      uint64  `codec:"ei"`
+	BurstsFired   uint64  `codec:"bf"`
+	FramesEmitted uint64  `codec:"fe"`
+	QueueDepth    uint16  `codec:"qd"`
+	DropCount     uint32  `codec:"dc"`
+	ActiveIIDs    uint8   `codec:"ai"`
+}
+
+// FMFrameResult is emitted after radar-core solves/adjudicates one sweep frame.
+type FMFrameResult struct {
+	MsgType                  uint8    `codec:"t"`
+	IID                      uint8    `codec:"i"`
+	FrameIndex               uint32   `codec:"fi"`
+	Success                  bool     `codec:"ok"`
+	SolveStatus              string   `codec:"ss"`
+	SolveReason              string   `codec:"sr"`
+	CandidatePosition        bool     `codec:"cp"`
+	AccumAccepted            bool     `codec:"aa"`
+	RejectionReason          string   `codec:"rr"`
+	AdmissionTier            string   `codec:"at"`
+	Lat                      *float64 `codec:"la"`
+	Lon                      *float64 `codec:"lo"`
+	CEPM                     *float64 `codec:"cep"`
+	NContributingArcs        uint16   `codec:"na"`
+	PairwiseRMSDeg           float32  `codec:"rms"`
+	ClusterMemberCount       uint16   `codec:"cm"`
+	SecondClusterMemberCount uint16   `codec:"sm"`
+	MemberDominanceRatio     float32  `codec:"md"`
+	WeightDominanceRatio     float32  `codec:"wd"`
+	SupportDominanceRatio    float32  `codec:"sd"`
+	BestClusterSupportScore  float32  `codec:"bs"`
+	AmbiguitySameLobeBypass  bool     `codec:"sl"`
+	ProcessedAt              float64  `codec:"ts"`
+}
+
+// FMState is the compact per-IID accumulated FM state authored by radar-core.
+type FMState struct {
+	MsgType                       uint8             `codec:"t"`
+	IID                           uint8             `codec:"i"`
+	FramesReachingSolver          uint64            `codec:"fr"`
+	SolverSuccess                 uint64            `codec:"sc"`
+	CandidatePositions            uint64            `codec:"cp"`
+	SolverNoCandidate             uint64            `codec:"nc"`
+	AccumulationRejected          uint64            `codec:"ar"`
+	AccumulationRejectionReasons  map[string]uint64 `codec:"rr"`
+	AccumulationAccepted          uint64            `codec:"aa"`
+	AccumulationAcceptanceTiers   map[string]uint64 `codec:"at"`
+	AccumulationWritten           uint64            `codec:"aw"`
+	LastRejectionReason           string            `codec:"lr"`
+	LastAdmissionTier             string            `codec:"lt"`
+	AccumulatedFramePositions     uint32            `codec:"af"`
+	CentroidAvailable             bool              `codec:"ca"`
+	CentroidLat                   *float64          `codec:"la"`
+	CentroidLon                   *float64          `codec:"lo"`
+	CentroidCEPM                  *float64          `codec:"cep"`
+	CentroidInliers               uint32            `codec:"ci"`
+	CentroidTotal                 uint32            `codec:"ct"`
+	CentroidStage0Survivors       uint32            `codec:"cs"`
+	CentroidRejectionCounts       map[string]int    `codec:"cr"`
+	LastFrameSuccess              bool              `codec:"fs"`
+	LastFrameReason               string            `codec:"frr"`
+	LastFrameIndex                uint32            `codec:"fi"`
+	LastFrameHadCandidatePosition bool              `codec:"fh"`
+	LastSolveStatus               string            `codec:"lss"`
+	LastSolveReason               string            `codec:"lsr"`
+	LastAmbiguitySameLobeBypass   bool              `codec:"lsl"`
+	LastClusterMemberCount        uint16            `codec:"lcm"`
+	LastSecondClusterMemberCount  uint16            `codec:"lsm"`
+	LastSupportDominanceRatio     float32           `codec:"lsd"`
+	LastPairwiseRMSDeg            float32           `codec:"lpr"`
+	LastFrameLat                  *float64          `codec:"fla"`
+	LastFrameLon                  *float64          `codec:"flo"`
+	LastFrameCEPM                 *float64          `codec:"fcep"`
+	UpdatedAt                     float64           `codec:"ts"`
 }
