@@ -2972,30 +2972,9 @@ class RadarState:
         # Once bootstrapped, sync is driven entirely by _record_aligned_burst_sync_obs →
         # _update_multi_aircraft_sync_state, which fires on every aligned burst arrival.
         if n_aircraft >= 3:
-            model = self._models.get(iid)
-            if model is not None:
-                radar_pos = _get_authoritative_radar_position(model)
-                if (
-                    radar_pos["lat"] is not None
-                    and current_frame.ref_lat is not None
-                    and current_frame.ref_lon is not None
-                    and self._live_sync_states.get(iid) is None
-                ):
-                    # Bootstrap: no prior sync state — seed from reference aircraft bearing.
-                    sync_quality = _sync_quality_from_model(model)
-                    ref_bearing = _bearing_deg_simple(
-                        radar_pos["lat"], radar_pos["lon"],
-                        current_frame.ref_lat, current_frame.ref_lon,
-                    )
-                    self._update_live_sync_state_filtered(
-                        iid=iid,
-                        period_s=period_s,
-                        new_epoch_us=current_frame.ref_arrival_us,
-                        new_offset_deg=ref_bearing,
-                        sync_quality=sync_quality,
-                        n_aircraft=n_aircraft,
-                        ref_pos_age_s=current_frame.ref_pos_age_s,
-                    )
+            self._seed_live_sync_from_frame(
+                iid, frame, period_s, ref_pos_age_s=current_frame.ref_pos_age_s
+            )
 
         self._live_frames[iid] = None
         return metrics
@@ -3081,35 +3060,91 @@ class RadarState:
 
             # In radar-core frame mode, Python no longer runs _finalize_live_frame(),
             # so seed sync bootstrap here using the same first-frame criteria.
-            n_aircraft = 1 + len(obs_list)
-            if n_aircraft >= 3 and self._live_sync_states.get(iid) is None:
-                model = self._models.get(iid)
-                if model is not None:
-                    radar_pos = _get_authoritative_radar_position(model)
-                    if (
-                        radar_pos["lat"] is not None
-                        and frame.ref_lat is not None
-                        and frame.ref_lon is not None
-                    ):
-                        sync_quality = _sync_quality_from_model(model)
-                        ref_bearing = _bearing_deg_simple(
-                            radar_pos["lat"], radar_pos["lon"],
-                            frame.ref_lat, frame.ref_lon,
-                        )
-                        self._update_live_sync_state_filtered(
-                            iid=iid,
-                            period_s=period_s,
-                            new_epoch_us=ref_arrival_us,
-                            new_offset_deg=ref_bearing,
-                            sync_quality=sync_quality,
-                            n_aircraft=n_aircraft,
-                            # FRAME_READY does not currently include explicit ref pos age.
-                            # Use 0 as the operationally safe upper bound for bootstrap gating.
-                            ref_pos_age_s=0.0,
-                        )
+            if 1 + len(obs_list) >= 3:
+                # FRAME_READY does not include explicit ref pos age; use 0.0 (bootstrap safe).
+                self._seed_live_sync_from_frame(iid, frame, period_s, ref_pos_age_s=0.0)
         except Exception:
             self._radar_core_frame_inject_errors += 1
             log.debug("RadarState: malformed radar-core FRAME_READY ignored", exc_info=True)
+
+    def _seed_live_sync_from_frame(
+        self,
+        iid: int,
+        frame: "SweepFrame",
+        period_s: float,
+        ref_pos_age_s: float = 0.0,
+    ) -> bool:
+        """Seed the live sync state from a completed SweepFrame.
+
+        Shared bootstrap logic used by _finalize_live_frame, inject_frame_from_go,
+        and _bootstrap_live_sync_from_recent_frame_if_possible.  No-op if sync
+        already exists, radar position is unavailable, ref position is absent, or
+        the frame has fewer than 3 aircraft.  Returns True if sync was seeded.
+        """
+        if self._live_sync_states.get(iid) is not None:
+            return False
+        model = self._models.get(iid)
+        if model is None:
+            return False
+        radar_pos = _get_authoritative_radar_position(model)
+        if radar_pos["lat"] is None or frame.ref_lat is None or frame.ref_lon is None:
+            return False
+        n_aircraft = 1 + len(frame.observations)
+        if n_aircraft < 3:
+            return False
+        sync_quality = _sync_quality_from_model(model)
+        ref_bearing = _bearing_deg_simple(
+            radar_pos["lat"], radar_pos["lon"],
+            frame.ref_lat, frame.ref_lon,
+        )
+        self._update_live_sync_state_filtered(
+            iid=iid,
+            period_s=period_s,
+            new_epoch_us=frame.ref_arrival_us,
+            new_offset_deg=ref_bearing,
+            sync_quality=sync_quality,
+            n_aircraft=n_aircraft,
+            ref_pos_age_s=ref_pos_age_s,
+        )
+        return self._live_sync_states.get(iid) is not None
+
+    def _bootstrap_live_sync_from_recent_frame_if_possible(self, iid: int) -> bool:
+        """Bootstrap live sync immediately from an existing completed frame.
+
+        Called when a radar position becomes available for an IID that has no
+        current sync state.  Without this, refined sync would be absent until
+        the next frame completes — even though FM/CI may already have localised
+        the radar and recent frames already exist in the completed-frames buffer.
+
+        Scans _live_completed_frames[iid] from newest to oldest and seeds sync
+        from the first frame that satisfies:
+          - ref lat/lon present
+          - at least 3 aircraft total (ref + observations)
+          - usable period (frame.period_s, falling back to model.period_s)
+
+        Returns True if sync was bootstrapped.
+        """
+        if self._live_sync_states.get(iid) is not None:
+            return False
+        model = self._models.get(iid)
+        if model is None:
+            return False
+        radar_pos = _get_authoritative_radar_position(model)
+        if radar_pos["lat"] is None:
+            return False
+        frames = self._live_completed_frames.get(iid)
+        if not frames:
+            return False
+        for frame in reversed(frames):
+            if frame.ref_lat is None or frame.ref_lon is None:
+                continue
+            if 1 + len(frame.observations) < 3:
+                continue
+            period_s = frame.period_s if frame.period_s is not None else model.period_s
+            if period_s is None:
+                continue
+            return self._seed_live_sync_from_frame(iid, frame, period_s, ref_pos_age_s=0.0)
+        return False
 
     def _update_live_sync_state_filtered(
         self,
@@ -8058,6 +8093,7 @@ class RadarState:
             # Keep last 50 convergence entries
             if len(model.convergence_history) > 50:
                 model.convergence_history = model.convergence_history[-50:]
+        self._bootstrap_live_sync_from_recent_frame_if_possible(iid)
 
     def update_forward_model_location(
         self,
@@ -8095,6 +8131,7 @@ class RadarState:
             # Keep last 50 convergence entries
             if len(model.fm_convergence_history) > 50:
                 model.fm_convergence_history = model.fm_convergence_history[-50:]
+        self._bootstrap_live_sync_from_recent_frame_if_possible(iid)
 
     def record_forward_model_attempt(self, iid: int, result: dict | None, elapsed_ms: float) -> None:
         """Record the latest FM run outcome for operator diagnostics."""
@@ -8259,6 +8296,7 @@ class RadarState:
             model.ci_source = source
             model.ci_n_pairs = n_pairs
             model.ci_last_updated = time.time()
+        self._bootstrap_live_sync_from_recent_frame_if_possible(iid)
 
     # ------------------------------------------------------------------
     # SweepFrame building and reference aircraft selection
