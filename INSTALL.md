@@ -26,10 +26,10 @@ curl -fsSL https://raw.githubusercontent.com/caiusseverus/adsb-dashboard/main/in
 
 The installer will:
 
-1. Install required packages (`git`, `nodejs`, `npm`, `uv`)
+1. Install required packages (`git`, `nodejs`, `npm`, `uv`) and ensure a compatible Go toolchain is present
 2. Clone the repository to `/opt/adsb-dashboard`
 3. Walk you through every configuration option interactively — you will be asked for things like your receiver's hostname and your coordinates. Required fields will not accept empty input.
-4. Build the frontend and install Python dependencies
+4. Build the frontend, install Python dependencies, and compile/install `radar-core` at `/usr/local/bin/radar-core`
 5. Create an `adsb` system user and install a systemd service that starts the dashboard automatically on boot
 
 When it finishes, open **http://\<your-pi-ip\>:8000** in a browser.
@@ -50,6 +50,7 @@ sudo journalctl -u adsb-dashboard -f
 cd /opt/adsb-dashboard
 sudo git pull
 cd frontend && npm ci --ignore-scripts && npm run build && cd ..
+cd radar-core && sudo /usr/local/bin/go build -trimpath -o /usr/local/bin/radar-core ./cmd/radar-core && cd ..
 sudo systemctl restart adsb-dashboard
 ```
 

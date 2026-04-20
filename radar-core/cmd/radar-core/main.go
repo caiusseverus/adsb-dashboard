@@ -3,7 +3,7 @@
 // Stage 1: ingest RADAR_EVENT messages, assemble bursts, emit BURST_FIRED.
 // Stage 2: maintain per-IID burst records, run rotation model analysis, emit IID_STATE.
 // Stage 3: position cache, reference aircraft selection, sync epoch tracking.
-// Runs as an independently supervised process (systemd unit) on the Pi.
+// Runs either as a backend-managed subprocess or as an externally managed process.
 //
 // Usage: radar-core [--socket /path/to/radar-core.sock]
 package main
@@ -39,8 +39,12 @@ func main() {
 	socketPath := flag.String("socket", rcconfig.DefaultSocketPath, "Unix socket path")
 	flag.Parse()
 
+	logLevel := slog.LevelError
+	if envDebugEnabled("RADAR_CORE_DEBUG") {
+		logLevel = slog.LevelDebug
+	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: logLevel,
 	})))
 
 	engine := newEngine()
@@ -66,6 +70,11 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("radar-core: stopped")
+}
+
+func envDebugEnabled(key string) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
 // engine wires the ingest, burst, output, IID state, position cache, and

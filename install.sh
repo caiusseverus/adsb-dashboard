@@ -9,6 +9,8 @@ VENV_DIR="/var/lib/adsb-dashboard"   # venv lives outside /opt to avoid noexec i
 SERVICE_USER="adsb"
 SERVICE_NAME="adsb-dashboard"
 REPO_URL="https://github.com/caiusseverus/adsb-dashboard.git"
+GO_REQUIRED_VERSION="1.24.2"
+RADAR_CORE_BINARY_PATH="/usr/local/bin/radar-core"
 
 # Colour helpers (silent if not a terminal)
 _red()   { printf '\033[0;31m%s\033[0m\n' "$*"; }
@@ -17,6 +19,56 @@ _bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
 
 _step() { echo; _bold "==> $*"; }
 _die()  { _red "ERROR: $*"; exit 1; }
+
+_version_ge() {
+    # True when $1 >= $2
+    [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
+}
+
+_go_arch_suffix() {
+    case "$(dpkg --print-architecture)" in
+        amd64) echo "amd64" ;;
+        arm64) echo "arm64" ;;
+        armhf|armel) echo "armv6l" ;;
+        *)
+            _die "Unsupported architecture for Go install: $(dpkg --print-architecture)"
+            ;;
+    esac
+}
+
+_install_go_toolchain() {
+    local arch_suffix go_tar_url tmp_tar
+    arch_suffix="$(_go_arch_suffix)"
+    go_tar_url="https://go.dev/dl/go${GO_REQUIRED_VERSION}.linux-${arch_suffix}.tar.gz"
+    tmp_tar="/tmp/go${GO_REQUIRED_VERSION}.tar.gz"
+
+    echo "  Installing Go ${GO_REQUIRED_VERSION} (${arch_suffix}) …"
+    curl -fsSL "$go_tar_url" -o "$tmp_tar" || _die "Failed to download Go toolchain from $go_tar_url"
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf "$tmp_tar" || _die "Failed to extract Go toolchain"
+    ln -sf /usr/local/go/bin/go /usr/local/bin/go
+    ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+    rm -f "$tmp_tar"
+}
+
+_ensure_go_toolchain() {
+    local current_version
+    if command -v go >/dev/null 2>&1; then
+        current_version="$(go version | sed -n 's/^go version go\([0-9.]*\) .*/\1/p')"
+    else
+        current_version=""
+    fi
+
+    if [[ -n "$current_version" ]] && _version_ge "$current_version" "$GO_REQUIRED_VERSION"; then
+        echo "  Go $current_version already installed"
+        return
+    fi
+
+    if [[ -n "$current_version" ]]; then
+        echo "  Go $current_version is older than required $GO_REQUIRED_VERSION"
+    fi
+    _install_go_toolchain
+}
 
 # Detect whether this is a fresh install or an update
 IS_UPDATE=false
@@ -274,6 +326,17 @@ UV_PROJECT_ENVIRONMENT="$VENV_DIR/.venv" bash "$INSTALL_DIR/backend/build_pymode
 make -C "$INSTALL_DIR/backend/native"
 make -C "$INSTALL_DIR/backend/native" install
 
+_step "Building radar-core"
+_ensure_go_toolchain
+_tmp_radar_core_bin="$(mktemp /tmp/radar-core.XXXXXX)"
+if ! (cd "$INSTALL_DIR/radar-core" && /usr/local/bin/go build -trimpath -o "$_tmp_radar_core_bin" ./cmd/radar-core); then
+    rm -f "$_tmp_radar_core_bin"
+    _die "radar-core build failed"
+fi
+install -m 0755 "$_tmp_radar_core_bin" "$RADAR_CORE_BINARY_PATH" || _die "Failed to install radar-core binary"
+rm -f "$_tmp_radar_core_bin"
+echo "  Installed radar-core binary at $RADAR_CORE_BINARY_PATH"
+
 _step "Fetching airport and coastline data"
 DATA_DIR="$INSTALL_DIR/backend/data"
 if [[ ! -f "$DATA_DIR/airports.json" ]]; then
@@ -342,6 +405,8 @@ WorkingDirectory=$INSTALL_DIR/backend
 ExecStart=/bin/sh -c 'exec $VENV_DIR/.venv/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port "\${HOST_PORT:-8000}"'
 
 EnvironmentFile=$INSTALL_DIR/backend/.env
+RuntimeDirectory=adsb
+RuntimeDirectoryMode=0755
 
 Restart=on-failure
 RestartSec=5

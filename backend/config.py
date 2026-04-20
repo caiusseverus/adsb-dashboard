@@ -291,10 +291,36 @@ TERRAIN_ENABLED: bool = os.getenv("TERRAIN_ENABLED", "true").lower() not in ("fa
 # ---------------------------------------------------------------------------
 # radar-core Go service integration
 # ---------------------------------------------------------------------------
-# RADAR_CORE_ENABLED: connect to the radar-core Unix socket and send DF11
-# events in shadow mode (BURST_FIRED logged for comparison only).
+# RADAR_CORE_ENABLED: enable radar-core IPC integration.
 RADAR_CORE_ENABLED: bool = _bool("RADAR_CORE_ENABLED", False)
+# Unix-domain socket used by radar-core and the Python client.
 RADAR_CORE_SOCKET: str = os.getenv("RADAR_CORE_SOCKET", "/run/adsb/radar-core.sock")
 # RADAR_CORE_FRAMES_ENABLED: route FRAME_READY messages from radar-core to
 # the FM worker instead of building frames in Python.  Requires RADAR_CORE_ENABLED.
 RADAR_CORE_FRAMES_ENABLED: bool = _bool("RADAR_CORE_FRAMES_ENABLED", False)
+# RADAR_CORE_MANAGED: when true, backend launches/stops radar-core itself.
+# When false, backend waits for an externally managed radar-core at RADAR_CORE_SOCKET.
+RADAR_CORE_MANAGED: bool = _bool("RADAR_CORE_MANAGED", True)
+
+
+def _default_radar_core_binary() -> str:
+    # Preferred install location from install.sh / Docker image.
+    system_path = Path("/usr/local/bin/radar-core")
+    if system_path.exists():
+        return str(system_path)
+    # Developer fallback: local repo build output.
+    repo_path = Path(__file__).resolve().parents[1] / "radar-core" / "radar-core"
+    if repo_path.exists():
+        return str(repo_path)
+    return str(system_path)
+
+
+# Path to radar-core binary used in backend-managed mode.
+RADAR_CORE_BINARY: str = os.getenv("RADAR_CORE_BINARY", _default_radar_core_binary())
+# Startup readiness timeout for backend-managed or external socket wait.
+RADAR_CORE_STARTUP_TIMEOUT_S: float = float(os.getenv("RADAR_CORE_STARTUP_TIMEOUT_S", "15.0"))
+# Client socket connect timeout and reconnect cadence.
+RADAR_CORE_CONNECT_TIMEOUT_S: float = float(os.getenv("RADAR_CORE_CONNECT_TIMEOUT_S", "5.0"))
+RADAR_CORE_RECONNECT_DELAY_S: float = float(os.getenv("RADAR_CORE_RECONNECT_DELAY_S", "2.0"))
+# Extra radar-core logging (backend bridge + worker stderr/stdout forwarding).
+RADAR_CORE_DEBUG_LOG: bool = _bool("RADAR_CORE_DEBUG_LOG", False)

@@ -3148,8 +3148,10 @@ async def get_iid_pipeline_debug(iid: int):
         python_debug = _state.get_live_pipeline_debug(iid)
 
         radar_core_stats = _radar_core_stats_provider() if _radar_core_stats_provider is not None else {}
-        latest_health = radar_core_stats.get("latest_health") or {}
-        latest_snapshot = radar_core_stats.get("latest_snapshot") or {}
+        client_stats = radar_core_stats.get("client") or radar_core_stats
+        worker_stats = radar_core_stats.get("worker") or {}
+        latest_health = client_stats.get("latest_health") or {}
+        latest_snapshot = client_stats.get("latest_snapshot") or {}
         go_iids = latest_snapshot.get("iids") or {}
         go_iid = go_iids.get(str(iid))
         if go_iid is None:
@@ -3158,7 +3160,7 @@ async def get_iid_pipeline_debug(iid: int):
         go_frame = (go_iid or {}).get("frame_accumulator") or {}
         go_gate_counts = go_frame.get("gate_counts") or {}
         go_frames_emitted_total = latest_snapshot.get("frames_emitted", latest_health.get("fe"))
-        python_frames_received = radar_core_stats.get("frames_received")
+        python_frames_received = client_stats.get("frames_received")
         go_iid_completed = go_frame.get("completed_frames", 0)
         frame_ready_seen = bool((python_frames_received or 0) > 0 or go_iid_completed > 0)
 
@@ -3177,12 +3179,26 @@ async def get_iid_pipeline_debug(iid: int):
             "available": True,
             "python": python_debug,
             "go": {
-                "client_connected": bool(radar_core_stats.get("connected", False)),
+                "enabled": bool(radar_core_stats.get("enabled", False)),
+                "frames_enabled": bool(radar_core_stats.get("frames_enabled", False)),
+                "backend_managed_autostart": bool(
+                    radar_core_stats.get("backend_managed_autostart", False)
+                ),
+                "mode": radar_core_stats.get("mode"),
+                "worker_state": worker_stats.get("state"),
+                "worker_started_by_backend": bool(worker_stats.get("started_by_backend", False)),
+                "worker_pid": worker_stats.get("pid"),
+                "client_connected": bool(client_stats.get("connected", False)),
+                "events_sent_to_worker": client_stats.get("events_sent"),
+                "position_updates_sent_to_worker": client_stats.get("position_updates_sent"),
+                "events_dropped_before_send": client_stats.get("events_dropped"),
                 "frames_received_by_python": python_frames_received,
                 "frames_emitted_total": go_frames_emitted_total,
                 "frame_ready_seen": frame_ready_seen,
-                "latest_health_age_s": radar_core_stats.get("latest_health_age_s"),
-                "latest_snapshot_age_s": radar_core_stats.get("latest_snapshot_age_s"),
+                "go_frames_injected_into_python_total": python_debug.get("go_frames_injected_total"),
+                "go_frame_inject_errors_total": python_debug.get("go_frame_inject_errors_total"),
+                "latest_health_age_s": client_stats.get("latest_health_age_s"),
+                "latest_snapshot_age_s": client_stats.get("latest_snapshot_age_s"),
                 "iid_snapshot_available": go_iid is not None,
                 "iid_state": {
                     "status": (go_iid or {}).get("status"),
@@ -3195,6 +3211,7 @@ async def get_iid_pipeline_debug(iid: int):
                     "sync_quality": (go_iid or {}).get("sync_quality"),
                 },
                 "frame_accumulator": go_frame,
+                "frame_gate_counts": go_gate_counts,
                 "dominant_blocking_gate": dominant_blocking_gate,
             },
             "inferred_blocker": (

@@ -1,5 +1,9 @@
 # Lessons
 
+## 2026-04-20
+
+- When introducing backend-managed subprocess startup, do not hardcode a single install-path default for the worker binary. Use a robust default-resolution order (installed path first, repo-local build fallback) so local/dev and production/service environments both start cleanly without extra manual env edits.
+
 ## 2026-04-04
 
 - When planning a new high-frequency panel, check it against every existing Timing-page visual first. Do not propose another bearing view if the page already has both bucketed and exact bearing displays; make the new panel's informational role distinct up front.

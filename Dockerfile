@@ -12,7 +12,20 @@ COPY frontend/ ./
 RUN npm run build
 
 # ---------------------------------------------------------------------------
-# Stage 2 — Python runtime with the backend + built frontend
+# Stage 2 — build radar-core (Go) binary
+# ---------------------------------------------------------------------------
+FROM golang:1.24.2-bookworm AS radar-core-build
+
+WORKDIR /build/radar-core
+
+COPY radar-core/go.mod radar-core/go.sum ./
+RUN go mod download
+
+COPY radar-core/ ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/radar-core ./cmd/radar-core
+
+# ---------------------------------------------------------------------------
+# Stage 3 — Python runtime with backend + built frontend + radar-core binary
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim AS runtime
 
@@ -49,6 +62,8 @@ RUN apt-get update -qq \
 
 # Copy the built frontend so the backend can serve it as static files
 COPY --from=frontend-build /build/frontend/dist ./frontend/dist
+# Copy the Go radar-core worker binary built in a separate stage.
+COPY --from=radar-core-build /out/radar-core /usr/local/bin/radar-core
 
 # Fetch airports and coastline data into /app/static_data/ (outside the volume).
 # The entrypoint copies them into /app/backend/data/ at startup if missing,
@@ -62,8 +77,9 @@ COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 
 RUN useradd --create-home --shell /bin/false adsb \
     && mkdir -p /app/backend/data \
+    && mkdir -p /run/adsb \
     && chmod +x /app/docker-entrypoint.sh \
-    && chown -R adsb:adsb /app
+    && chown -R adsb:adsb /app /run/adsb
 
 # Persistent data lives in a volume so it survives container restarts
 VOLUME ["/app/backend/data"]

@@ -8,6 +8,39 @@ Source inputs:
 Prepared: 2026-04-04
 Updated: 2026-04-06
 
+## 2026-04-20 Radar-Core Integration and Deployment Completion
+
+- [x] Audit and correct API/runtime radar-core stats so Go-authoritative frame path is explicit and truthful
+- [x] Add backend-managed radar-core worker lifecycle (start, readiness wait, client attach, owned shutdown) with clear managed vs external mode
+- [x] Add config/env controls for radar-core enable flags, worker ownership mode, binary path, socket path, startup timeout, and quiet logging behavior
+- [x] Integrate Go toolchain install and radar-core compile/install into host `install.sh` deployment flow
+- [x] Integrate radar-core compile into Docker build with a Go builder stage and runtime binary copy
+- [x] Add/update focused backend tests for radar-core runtime stats and managed-worker behavior
+- [x] Run targeted verification and document review results
+
+Plan confirmation: proceed with minimum concrete changes only. Keep existing subsystem shape, preserve useful legacy counters but relabel them when Go-frame mode is authoritative, and make backend-managed worker the default operational path without requiring a separate radar-core systemd service.
+
+### Review
+
+- API/runtime stats:
+  - Added explicit radar-core runtime shape in backend stats (`enabled`, `frames_enabled`, `backend_managed_autostart`, mode, worker state, client state, event/position send counters, Go frame emit/receive/inject counters, legacy Python frame-builder counters).
+  - Extended per-IID pipeline debug to include managed-worker state, feature flags, send counters, gate counters, and explicit Go/Python frame-path observability.
+  - Added explicit legacy/suppressed labeling for Python frame-builder counters under Go-authoritative mode.
+- Backend lifecycle:
+  - Added backend-owned `RadarCoreWorker` manager with binary/socket validation, startup timeout, readiness wait, stale socket cleanup, and owned shutdown.
+  - Startup order now enforces worker readiness before `RadarCoreClient` connect.
+  - External mode remains available; backend-managed mode is now the default.
+- Deployment/build:
+  - `install.sh` now ensures a compatible Go toolchain, builds `radar-core`, and installs it to `/usr/local/bin/radar-core`.
+  - Docker now builds `radar-core` in a dedicated Go stage and copies only the binary into runtime.
+  - Systemd service now creates `/run/adsb` via `RuntimeDirectory=adsb` for managed socket creation.
+- Verification:
+  - `python3 -m py_compile backend/main.py backend/config.py backend/status.py backend/radar/api.py backend/radar/sweep.py backend/radar_core/client.py backend/radar_core/worker.py backend/tests/test_radar_core_worker.py backend/tests/test_radar_api.py backend/tests/test_radar_core_client.py`
+  - `uv run --directory backend pytest tests/test_radar_core_worker.py tests/test_radar_core_client.py tests/test_radar_api.py::test_get_iid_pipeline_debug_combines_python_and_go_diagnostics`
+  - `uv run --directory backend pytest tests/test_radar_core_protocol.py tests/test_radar_core_integration.py`
+  - Result: all targeted backend tests passed (`41 passed` total across the runs).
+  - Limitation: `go test ./...` in this sandbox failed due local Go toolchain/cache environment constraints (`package ... is not in std` / read-only cache), so Go unit test verification was not completed here.
+
 ## 2026-04-19 Live Sync/Alignment Retention Truncation Fix
 
 - [x] Confirm root cause in live sync/alignment buffers and request window mismatch

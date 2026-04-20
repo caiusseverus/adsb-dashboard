@@ -62,6 +62,11 @@ services:
       # - MLAT_FUSION=none
       # - DEBUG_LOG=false
       # - DEBUG_ENRICHMENT=false
+      # - RADAR_CORE_ENABLED=true
+      # - RADAR_CORE_FRAMES_ENABLED=true
+      # - RADAR_CORE_MANAGED=true
+      # - RADAR_CORE_BINARY=/usr/local/bin/radar-core
+      # - RADAR_CORE_SOCKET=/run/adsb/radar-core.sock
 
     volumes:
       # Named volume keeps the SQLite database and SRTM terrain tiles across restarts.

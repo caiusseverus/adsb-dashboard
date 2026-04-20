@@ -66,6 +66,7 @@ from radar import api as radar_api
 from radar import aircraft_api as radar_aircraft_api
 from radar.aircraft_localiser import AircraftLocaliser
 from radar_core.client import RadarCoreClient
+from radar_core.worker import RadarCoreWorker
 
 
 
@@ -105,14 +106,25 @@ aircraft_localiser._ray_retention_s = config.STAGE3_RAY_RETENTION_S
 # When RADAR_CORE_FRAMES_ENABLED, FRAME_READY messages are routed to the FM
 # mailbox and Python frame-building is suppressed.
 _radar_core_client: RadarCoreClient | None = None
+_radar_core_worker: RadarCoreWorker | None = None
 if config.RADAR_CORE_ENABLED:
     _rc_on_frame_ready = None
     if config.RADAR_CORE_FRAMES_ENABLED:
         _rc_on_frame_ready = radar_state.inject_frame_from_go
         radar_state.enable_radar_core_frames(True)
+    _radar_core_worker = RadarCoreWorker(
+        binary_path=config.RADAR_CORE_BINARY,
+        socket_path=config.RADAR_CORE_SOCKET,
+        managed=config.RADAR_CORE_MANAGED,
+        startup_timeout_s=config.RADAR_CORE_STARTUP_TIMEOUT_S,
+        debug_logging=(config.DEBUG_LOG or config.RADAR_CORE_DEBUG_LOG),
+        env_debug_flag=(config.DEBUG_LOG or config.RADAR_CORE_DEBUG_LOG),
+    )
     _radar_core_client = RadarCoreClient(
         config.RADAR_CORE_SOCKET,
         on_frame_ready=_rc_on_frame_ready,
+        connect_timeout_s=config.RADAR_CORE_CONNECT_TIMEOUT_S,
+        reconnect_delay_s=config.RADAR_CORE_RECONNECT_DELAY_S,
     )
     radar_state.radar_core_event_sink = _radar_core_client.send_radar_event
 
@@ -249,6 +261,56 @@ _TRAIL_HOUSEKEEPING_INTERVAL_S: float = 10.0
 _trail_housekeeping_last_ts: float = 0.0
 _VISIT_MERGE_INTERVAL_S: float = 86400.0  # once per day
 _visit_merge_last_ts: float = 0.0
+
+
+def _radar_core_runtime_stats(radar_state_stats: dict | None = None) -> dict:
+    enabled = bool(config.RADAR_CORE_ENABLED)
+    frames_enabled = bool(enabled and config.RADAR_CORE_FRAMES_ENABLED)
+    managed_mode = bool(enabled and config.RADAR_CORE_MANAGED)
+
+    client_stats = _radar_core_client.stats() if _radar_core_client is not None else {}
+    worker_stats = _radar_core_worker.stats() if _radar_core_worker is not None else {}
+    latest_health = client_stats.get("latest_health") or {}
+    latest_snapshot = client_stats.get("latest_snapshot") or {}
+    go_frames_emitted = latest_snapshot.get("frames_emitted", latest_health.get("fe"))
+
+    memory_stats = radar_state_stats if radar_state_stats is not None else radar_state.get_memory_stats()
+    python_legacy_total = int(memory_stats.get("python_frames_finalized_total", 0))
+    go_injected_total = int(memory_stats.get("radar_core_frames_injected", 0))
+
+    return {
+        "enabled": enabled,
+        "frames_enabled": frames_enabled,
+        "backend_managed_autostart": managed_mode,
+        "mode": (
+            "disabled"
+            if not enabled else
+            "backend_managed" if managed_mode else
+            "external"
+        ),
+        "socket_path": config.RADAR_CORE_SOCKET,
+        "binary_path": config.RADAR_CORE_BINARY,
+        "client_connected": bool(client_stats.get("connected", False)),
+        "events_sent_to_worker": int(client_stats.get("events_sent", 0)),
+        "position_updates_sent_to_worker": int(client_stats.get("position_updates_sent", 0)),
+        "events_dropped_before_send": int(client_stats.get("events_dropped", 0)),
+        "go_frames_emitted": go_frames_emitted,
+        "go_frames_received_by_python": int(client_stats.get("frames_received", 0)),
+        "go_frames_injected_into_python": go_injected_total,
+        "go_frame_inject_errors": int(memory_stats.get("radar_core_frame_inject_errors", 0)),
+        "python_frame_builder_active": not frames_enabled,
+        "python_frame_builder_status": (
+            "suppressed_by_go_frames" if frames_enabled else "active"
+        ),
+        "python_frame_builder_frames_legacy_total": python_legacy_total,
+        "position_updates_queued": _radar_core_position_sent,
+        "position_updates_skipped": _radar_core_position_skipped,
+        "position_cache_entries": len(_radar_core_position_last_sent),
+        "position_interval_s": _RADAR_CORE_POSITION_INTERVAL_S,
+        "position_refresh_s": _RADAR_CORE_POSITION_REFRESH_S,
+        "client": client_stats,
+        "worker": worker_stats,
+    }
 
 
 def _start_msg_processor() -> threading.Thread:
@@ -1620,6 +1682,22 @@ async def lifespan(app: FastAPI):
         _bg_tasks.append(t)
         return t
 
+    if _radar_core_worker is not None:
+        worker_ready = _radar_core_worker.start()
+        if not worker_ready:
+            worker_error = (_radar_core_worker.stats().get("last_error") or "unknown startup failure")
+            raise RuntimeError(f"radar-core startup failed: {worker_error}")
+    if _radar_core_client is not None:
+        _radar_core_client.start()
+        if not _radar_core_client.wait_until_connected(config.RADAR_CORE_STARTUP_TIMEOUT_S):
+            if _radar_core_worker is not None:
+                _radar_core_worker.stop()
+            _radar_core_client.stop()
+            raise RuntimeError(
+                f"radar-core client failed to connect to {config.RADAR_CORE_SOCKET!r} "
+                f"within {config.RADAR_CORE_STARTUP_TIMEOUT_S:.1f}s"
+            )
+
     global _decoder_thread, _radar_thread
     if config.INGEST_MODE == "beast":
         # Default: decode raw Beast TCP stream in Python
@@ -1676,47 +1754,40 @@ async def lifespan(app: FastAPI):
         _bg(_aircraft_bearing_calibration_loop())
         _bg(_aircraft_localisation_loop())
     health_module.register_context(_msg_queue, _clients)
-    register_runtime_stats(lambda: {
-        "ws_clients":        len(_clients),
-        # route_enrichment_queue: async HTTP lookup queue for adsbdb.com route data.
-        # This is NOT the live radar/WebSocket delivery path — drops here mean some
-        # visit records won't get origin/dest airports, not that live UI is degraded.
-        "route_enrichment_queue_size":  len(_route_queue),
-        "route_enrichment_queue_drops": _route_queue_drops,
-        # Live WebSocket delivery metrics — use these to judge coalescing/delivery health.
-        "ws_main_frame_drops":   _ws_main_frame_drops,
-        "ws_sync_rebuilds":      _ws_sync_rebuilds,
-        "ws_sync_emissions":     _ws_sync_emissions,
-        "ws_live_emissions":     _ws_live_emissions,
-        "ws_client_queue_depths": [q.qsize() for q in _clients.values()],
-        "aircraft_state":    state.get_aux_dict_sizes(),
-        "cast":              cast.get_cache_stats(),
-        "track_store":       track_store.stats(),
-        "radar_state":       radar_state.get_memory_stats(),
-        "radar_core": {
-            "client": _radar_core_client.stats() if _radar_core_client is not None else None,
-            "position_updates_queued": _radar_core_position_sent,
-            "position_updates_skipped": _radar_core_position_skipped,
-            "position_cache_entries": len(_radar_core_position_last_sent),
-            "position_interval_s": _RADAR_CORE_POSITION_INTERVAL_S,
-            "position_refresh_s": _RADAR_CORE_POSITION_REFRESH_S,
-        },
-    })
+
+    def _runtime_stats_payload() -> dict:
+        radar_state_stats = radar_state.get_memory_stats()
+        return {
+            "ws_clients":        len(_clients),
+            # route_enrichment_queue: async HTTP lookup queue for adsbdb.com route data.
+            # This is NOT the live radar/WebSocket delivery path — drops here mean some
+            # visit records won't get origin/dest airports, not that live UI is degraded.
+            "route_enrichment_queue_size":  len(_route_queue),
+            "route_enrichment_queue_drops": _route_queue_drops,
+            # Live WebSocket delivery metrics — use these to judge coalescing/delivery health.
+            "ws_main_frame_drops":   _ws_main_frame_drops,
+            "ws_sync_rebuilds":      _ws_sync_rebuilds,
+            "ws_sync_emissions":     _ws_sync_emissions,
+            "ws_live_emissions":     _ws_live_emissions,
+            "ws_client_queue_depths": [q.qsize() for q in _clients.values()],
+            "aircraft_state":    state.get_aux_dict_sizes(),
+            "cast":              cast.get_cache_stats(),
+            "track_store":       track_store.stats(),
+            "radar_state":       radar_state_stats,
+            "radar_core":        _radar_core_runtime_stats(radar_state_stats),
+        }
+
+    register_runtime_stats(_runtime_stats_payload)
     log.info("ADS-B Dashboard backend started  (Beast: %s:%s)",
              config.BEAST_HOST, config.BEAST_PORT)
-
-    if _radar_core_client is not None:
-        _radar_core_client.start()
-        log.info(
-            "radar-core client started (socket=%s, frames_enabled=%s)",
-            config.RADAR_CORE_SOCKET, config.RADAR_CORE_FRAMES_ENABLED,
-        )
 
     yield
 
     # --- Graceful shutdown ---
     if _radar_core_client is not None:
         _radar_core_client.stop()
+    if _radar_core_worker is not None:
+        _radar_core_worker.stop()
     # Cancel background tasks first; the explicit final DB write inside
     # _graceful_shutdown handles persistence — no need for _db_writer to finish.
     await _graceful_shutdown(_bg_tasks)
@@ -1749,7 +1820,7 @@ timing_router._state = state  # type: ignore[attr-defined]
 app.include_router(timing_router)
 radar_api._state = radar_state  # type: ignore[attr-defined]
 radar_api.register_radar_core_stats_provider(
-    lambda: (_radar_core_client.stats() if _radar_core_client is not None else {})
+    lambda: _radar_core_runtime_stats()
 )
 app.include_router(radar_api.router)
 radar_aircraft_api._localiser = aircraft_localiser  # type: ignore[attr-defined]

@@ -1,13 +1,11 @@
 """
-radar_core/client.py — Shadow-mode client for radar-core (Stage 1).
+radar_core/client.py — IPC client for radar-core.
 
 Connects to the radar-core Unix socket and runs two tasks over one bidirectional
 connection:
   - Sink: accepts (arrival_us, iid, icao_int, signal_dbfs) tuples from the
     existing Python radar path and sends them as RADAR_EVENT messages.
-  - Receiver: reads BURST_FIRED (and other outbound) messages from radar-core
-    and logs them for comparison. In shadow mode the output does NOT feed back
-    into RadarState, the FM worker, or any live state.
+  - Receiver: reads BURST_FIRED, FRAME_READY, HEALTH, and SNAPSHOT_RESP.
 
 Usage (from main.py or tests):
 
@@ -112,7 +110,7 @@ class RadarCoreClient:
         )
         self._sender_thread.start()
         self._receiver_thread.start()
-        log.info("RadarCoreClient: started (socket=%s)", self._socket_path)
+        log.debug("RadarCoreClient: started (socket=%s)", self._socket_path)
 
     def stop(self) -> None:
         """Signal threads to stop and wait up to 2s for them to exit."""
@@ -155,6 +153,9 @@ class RadarCoreClient:
     def is_connected(self) -> bool:
         return self._connected.is_set()
 
+    def wait_until_connected(self, timeout_s: float) -> bool:
+        return self._connected.wait(timeout=timeout_s)
+
     def stats(self) -> dict:
         with self._stats_lock:
             return {
@@ -178,6 +179,7 @@ class RadarCoreClient:
                     round(time.time() - self._latest_snapshot_ts, 1)
                     if self._latest_snapshot_ts is not None else None
                 ),
+                "send_queue_depth": self._send_queue.qsize(),
             }
 
     # ------------------------------------------------------------------
@@ -212,7 +214,7 @@ class RadarCoreClient:
             self._wfile = sock.makefile("wb", buffering=0)
             self._conn_generation += 1
             self._connected.set()
-            log.info("RadarCoreClient: connected to %s", self._socket_path)
+            log.debug("RadarCoreClient: connected to %s", self._socket_path)
             return True
         except OSError as e:
             log.debug("RadarCoreClient: connect failed: %s", e)
@@ -279,7 +281,7 @@ class RadarCoreClient:
                         self._snapshots_requested += 1
                     next_snapshot_ts = now_mono + _SNAPSHOT_INTERVAL_S
                 except OSError as e:
-                    log.warning("RadarCoreClient: snapshot request send error: %s", e)
+                    log.debug("RadarCoreClient: snapshot request send error: %s", e)
                     self._drop_connection(generation)
                     next_snapshot_ts = time.monotonic() + _SNAPSHOT_INTERVAL_S
                     continue
@@ -300,7 +302,7 @@ class RadarCoreClient:
                         else:
                             self._events_sent += 1
             except OSError as e:
-                log.warning("RadarCoreClient: send error: %s", e)
+                log.debug("RadarCoreClient: send error: %s", e)
                 self._drop_connection(generation)
                 next_snapshot_ts = time.monotonic() + _SNAPSHOT_INTERVAL_S
 

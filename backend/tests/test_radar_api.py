@@ -480,6 +480,77 @@ def test_get_iid_pipeline_debug_combines_python_and_go_diagnostics():
     assert payload["inferred_blocker"] == "go_no_frame_ready"
 
 
+def test_get_iid_pipeline_debug_supports_nested_runtime_stats_provider():
+    state = RadarState()
+    state._models[7] = RadarIID(
+        iid=7,
+        status="SINGLE_RADAR",
+        period_s=4.0,
+        reference_aircraft=ReferenceAircraftInfo(ref_icao="AAAAAA"),
+    )
+
+    prior_state = radar_api._state
+    prior_provider = radar_api._radar_core_stats_provider
+    radar_api._state = state
+    radar_api.register_radar_core_stats_provider(lambda: {
+        "enabled": True,
+        "frames_enabled": True,
+        "backend_managed_autostart": True,
+        "mode": "backend_managed",
+        "worker": {
+            "state": "running",
+            "started_by_backend": True,
+            "pid": 4242,
+        },
+        "client": {
+            "connected": True,
+            "events_sent": 123,
+            "position_updates_sent": 17,
+            "events_dropped": 2,
+            "frames_received": 9,
+            "latest_health_age_s": 1.0,
+            "latest_snapshot_age_s": 1.0,
+            "latest_health": {"fe": 9},
+            "latest_snapshot": {
+                "frames_emitted": 9,
+                "iids": {
+                    "7": {
+                        "status": "SINGLE_RADAR",
+                        "has_period": True,
+                        "period_s": 4.0,
+                        "has_reference_icao": True,
+                        "reference_icao": int("AAAAAA", 16),
+                        "sync_state_present": False,
+                        "sync_state_usable": False,
+                        "sync_quality": 0.0,
+                        "frame_accumulator": {
+                            "completed_frames": 0,
+                            "open_frame": False,
+                            "gate_counts": {
+                                "frame_emitted": 9,
+                            },
+                        },
+                    }
+                },
+            },
+        },
+    })
+    try:
+        payload = asyncio.run(radar_api.get_iid_pipeline_debug(7))
+    finally:
+        radar_api._state = prior_state
+        radar_api._radar_core_stats_provider = prior_provider
+
+    assert payload["go"]["enabled"] is True
+    assert payload["go"]["frames_enabled"] is True
+    assert payload["go"]["backend_managed_autostart"] is True
+    assert payload["go"]["worker_state"] == "running"
+    assert payload["go"]["worker_started_by_backend"] is True
+    assert payload["go"]["events_sent_to_worker"] == 123
+    assert payload["go"]["position_updates_sent_to_worker"] == 17
+    assert payload["go"]["frames_received_by_python"] == 9
+
+
 def test_get_iid_sweeps_uses_precomputed_sweep_positions_without_relookup(monkeypatch):
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", True)

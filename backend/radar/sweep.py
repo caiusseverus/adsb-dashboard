@@ -1935,6 +1935,8 @@ class RadarState:
         self._radar_core_frames_injected: int = 0
         self._radar_core_frame_inject_errors: int = 0
         self._radar_core_frames_injected_by_iid: dict[int, int] = {}
+        self._python_frames_finalized_total: int = 0
+        self._python_frames_finalized_by_iid: dict[int, int] = {}
 
         # Lightweight ADS-B position tracker for real-time position capture
         self._adsb_tracker = AircraftPositionTracker()
@@ -2336,6 +2338,8 @@ class RadarState:
                 "radar_core_frames_injected": self._radar_core_frames_injected,
                 "radar_core_frame_inject_errors": self._radar_core_frame_inject_errors,
                 "radar_core_frames_injected_iids": len(self._radar_core_frames_injected_by_iid),
+                "python_frames_finalized_total": self._python_frames_finalized_total,
+                "python_frames_finalized_iids": len(self._python_frames_finalized_by_iid),
             }
 
     def _process_fired_bursts(self, iid: int, fired_bursts: list[dict]) -> dict:
@@ -2938,6 +2942,10 @@ class RadarState:
                 period_s=period_s,
             )
             self._live_completed_frames[iid].append(frame)
+            self._python_frames_finalized_total += 1
+            self._python_frames_finalized_by_iid[iid] = (
+                self._python_frames_finalized_by_iid.get(iid, 0) + 1
+            )
             if quality in ("good", "marginal") and not self._radar_core_frames_enabled:
                 metrics["fm_callback_count"] += 1
                 t_fm_callback = time.perf_counter()
@@ -5606,6 +5614,13 @@ class RadarState:
             if iid in self._radar_core_frames_injected_by_iid:
                 del self._radar_core_frames_injected_by_iid[iid]
                 had_any = True
+            if iid in self._python_frames_finalized_by_iid:
+                self._python_frames_finalized_total = max(
+                    0,
+                    self._python_frames_finalized_total - self._python_frames_finalized_by_iid[iid],
+                )
+                del self._python_frames_finalized_by_iid[iid]
+                had_any = True
             if self._iid_events:
                 filtered_events = deque(
                     (ev for ev in self._iid_events if ev[1] != iid),
@@ -5681,6 +5696,8 @@ class RadarState:
             self._native_burst_processors.clear()
             self._dwell_profiles.clear()
             self._radar_core_frames_injected_by_iid.clear()
+            self._python_frames_finalized_total = 0
+            self._python_frames_finalized_by_iid.clear()
             with self._fm_mailbox_lock:
                 self._fm_mailbox.clear()
                 self._fm_mailbox_event.clear()
@@ -8338,6 +8355,7 @@ class RadarState:
             aligned_obs = list(self._live_aligned_burst_obs.get(iid, []))
             completed = list(self._live_completed_frames.get(iid, []))
             go_injected = self._radar_core_frames_injected_by_iid.get(iid, 0)
+            python_finalized = self._python_frames_finalized_by_iid.get(iid, 0)
             latest_arrival_us = self._iid_latest_arrival_us.get(iid)
 
         has_period = bool(model is not None and model.period_s is not None)
@@ -8391,6 +8409,19 @@ class RadarState:
             "go_frames_enabled": self._radar_core_frames_enabled,
             "go_frames_injected_total": self._radar_core_frames_injected,
             "go_frame_inject_errors_total": self._radar_core_frame_inject_errors,
+            "frame_path_mode": (
+                "go_authoritative"
+                if self._radar_core_frames_enabled else
+                "python_builder_authoritative"
+            ),
+            "python_builder_active": not self._radar_core_frames_enabled,
+            "python_builder_status": (
+                "suppressed_by_go_frames"
+                if self._radar_core_frames_enabled else
+                "active"
+            ),
+            "python_builder_frames_finalized_legacy_count": python_finalized,
+            "python_builder_frames_finalized_legacy_total": self._python_frames_finalized_total,
             "latest_arrival_us": latest_arrival_us,
             "sync_snapshot_observations_count": snapshot_observations_count,
             "sync_snapshot_empty_reason": snapshot_empty_reason,
