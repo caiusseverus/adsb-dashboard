@@ -4337,3 +4337,37 @@ Plan confirmation: proceeding with a minimal-shape change that preserves existin
 - Before/after counters (from focused regression coverage):
   - Before fix: reduced-arc high-quality case rejected with `too_few_inlier_pair_circles`; `accumulation_accepted=0`, `accumulation_written=0`.
   - After fix: same case admitted as `accepted_reduced_arc_high_quality`; `accumulation_accepted=1`, `accumulation_written=1`, `accumulated_frame_positions=1`.
+
+## 2026-04-20 Forward-Model Near-Duplicate Cluster Merge and Ambiguity Fix
+
+- [x] Audit and document exact root cause in `_build_intersection_clusters` and ambiguity flow
+- [x] Add post-build near-duplicate cluster merge using final centroid and support overlap signals
+- [x] Ensure distinctness/competition checks use final cluster estimate (not seed center)
+- [x] Add same-lobe ambiguity bypass for near-overlapping top candidates
+- [x] Add lightweight diagnostics for pre/post merge counts, merge groups/reasons, top separation/overlap, and bypass decision
+- [x] Add focused backend tests covering duplicate-merge acceptance and distinct-lobe ambiguity preservation
+- [x] Run targeted verification and capture review notes
+
+### Review
+
+- Root cause:
+  - `_build_intersection_clusters()` generated one neighborhood per intersection seed and deduplicated by seed-center (`center_x_km/center_y_km`) distance, not by final weighted cluster estimate. Different seeds from the same cloud could survive as distinct clusters when seed points were far apart, even when final centroids and support sets overlapped strongly.
+  - Ambiguity logic compared top-ranked clusters immediately, before any final-estimate merge of same-lobe siblings, so `quality_ratio` could be depressed by near-duplicate competitors.
+- Implementation:
+  - Added final-estimate overlap metrics and same-lobe classification helpers in [forward_model.py](/home/keith/claude/adsb-dashboard/backend/radar/forward_model.py).
+  - Updated `_build_intersection_clusters()` to:
+    - dedupe first-pass neighborhoods using final means (not seed centers),
+    - compute supporting arcs around the final mean,
+    - run a second pass `_dedupe_near_duplicate_clusters()` that merges/deduplicates near-duplicate lobes using centroid distance + support overlap.
+  - Added `_evaluate_cluster_ambiguity()` to centralize ambiguity decisions and apply same-lobe bypass so close same-lobe competitors do not trigger ambiguous rejection.
+  - Added diagnostics:
+    - `cluster_count_pre_merge`, `cluster_count_post_merge`
+    - `cluster_merge_events` with separation/overlap metrics and merge reason
+    - `top_centroid_separation_km`, `top_arc_jaccard`, `top_arc_overlap_min_ratio`
+    - `ambiguity_same_lobe_bypass`
+  - Switched inlier-candidate post-selection gating from `best_cluster.center_*` to `best_cluster.mean_*`.
+- Verification:
+  - `python3 -m py_compile backend/radar/forward_model.py backend/tests/test_forward_model.py`
+  - `uv run --directory backend pytest tests/test_forward_model.py`
+  - `uv run --directory backend pytest tests/test_forward_model_integration.py tests/test_forward_model_stage6.py`
+  - Result: all targeted tests passed (`39 + 11` tests).

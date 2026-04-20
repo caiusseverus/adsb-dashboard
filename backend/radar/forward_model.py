@@ -122,6 +122,15 @@ _QUALITY_GREEDY_MIN_EIGEN_GAIN = 0.005
 _QUALITY_NORMALIZED_RESIDUAL_INLIER = 2.5
 _QUALITY_DUPLICATE_BEARING_TOL_DEG = 3.0
 _QUALITY_PER_AIRCRAFT_CAP = 6
+_CLUSTER_MERGE_DISTANCE_FRACTION = 0.45
+_CLUSTER_MERGE_RMS_DISTANCE_MULT = 1.6
+_CLUSTER_MERGE_MAX_DISTANCE_KM = 18.0
+_CLUSTER_MERGE_MIN_ARC_JACCARD = 0.40
+_CLUSTER_MERGE_MIN_ARC_OVERLAP = 0.60
+_SAME_LOBE_DISTANCE_RMS_MULT = 2.0
+_SAME_LOBE_MAX_DISTANCE_KM = 24.0
+_SAME_LOBE_MIN_ARC_JACCARD = 0.25
+_SAME_LOBE_MIN_ARC_OVERLAP = 0.50
 _REFINE_MAX_MOVE_KM = 80.0
 _REFINE_MIN_IMPROVEMENT_RATIO = 1.05
 _MAX_FINAL_RESIDUAL_SIGMA_DEG = 35.0
@@ -209,6 +218,221 @@ class _IntersectionCluster:
     center_x_km: float
     center_y_km: float
     contributing_arc_indices: frozenset
+    merged_cluster_indices: tuple[int, ...] = ()
+
+
+def _cluster_arc_overlap_metrics(
+    a: _IntersectionCluster,
+    b: _IntersectionCluster,
+) -> tuple[float, float]:
+    """Return (jaccard, min-overlap-ratio) for contributing arc sets."""
+    if not a.contributing_arc_indices or not b.contributing_arc_indices:
+        return 0.0, 0.0
+    intersection = len(a.contributing_arc_indices & b.contributing_arc_indices)
+    union = len(a.contributing_arc_indices | b.contributing_arc_indices)
+    if union <= 0:
+        return 0.0, 0.0
+    min_size = min(len(a.contributing_arc_indices), len(b.contributing_arc_indices))
+    if min_size <= 0:
+        return 0.0, 0.0
+    return intersection / union, intersection / min_size
+
+
+def _cluster_same_lobe_metrics(
+    a: _IntersectionCluster,
+    b: _IntersectionCluster,
+    cluster_radius_km: float,
+) -> dict:
+    """Compute same-lobe proximity/overlap metrics from final cluster estimates."""
+    centroid_separation_km = math.hypot(a.mean_x_km - b.mean_x_km, a.mean_y_km - b.mean_y_km)
+    jaccard, overlap_min = _cluster_arc_overlap_metrics(a, b)
+    rms_scale_km = max(a.rms_km, b.rms_km, 1e-3)
+    merge_distance_limit_km = min(
+        _CLUSTER_MERGE_MAX_DISTANCE_KM,
+        max(
+            _CLUSTER_MERGE_DISTANCE_FRACTION * cluster_radius_km,
+            _CLUSTER_MERGE_RMS_DISTANCE_MULT * rms_scale_km,
+        ),
+    )
+    same_lobe_distance_limit_km = min(
+        _SAME_LOBE_MAX_DISTANCE_KM,
+        max(
+            0.6 * cluster_radius_km,
+            _SAME_LOBE_DISTANCE_RMS_MULT * rms_scale_km,
+        ),
+    )
+    merge_like = (
+        centroid_separation_km <= merge_distance_limit_km
+        and (jaccard >= _CLUSTER_MERGE_MIN_ARC_JACCARD or overlap_min >= _CLUSTER_MERGE_MIN_ARC_OVERLAP)
+    )
+    very_close = centroid_separation_km <= max(1.0, min(a.rms_km, b.rms_km))
+    same_lobe = (
+        centroid_separation_km <= same_lobe_distance_limit_km
+        and (
+            jaccard >= _SAME_LOBE_MIN_ARC_JACCARD
+            or overlap_min >= _SAME_LOBE_MIN_ARC_OVERLAP
+            or very_close
+        )
+    )
+    return {
+        "centroid_separation_km": centroid_separation_km,
+        "arc_jaccard": jaccard,
+        "arc_overlap_min_ratio": overlap_min,
+        "merge_distance_limit_km": merge_distance_limit_km,
+        "same_lobe_distance_limit_km": same_lobe_distance_limit_km,
+        "merge_like": merge_like,
+        "same_lobe": same_lobe,
+    }
+
+
+def _dedupe_near_duplicate_clusters(
+    clusters: list[_IntersectionCluster],
+    cluster_radius_km: float,
+) -> tuple[list[_IntersectionCluster], list[dict]]:
+    """Merge near-duplicate clusters that represent the same candidate lobe."""
+    if not clusters:
+        return [], []
+
+    merged: list[_IntersectionCluster] = []
+    merge_events: list[dict] = []
+
+    for idx, cluster in enumerate(clusters):
+        merged_into: Optional[int] = None
+        merge_reason: Optional[dict] = None
+        for kept_idx, kept in enumerate(merged):
+            metrics = _cluster_same_lobe_metrics(cluster, kept, cluster_radius_km)
+            if not metrics["merge_like"]:
+                continue
+            merged_into = kept_idx
+            merge_reason = metrics
+            break
+        if merged_into is None:
+            merged.append(cluster)
+            continue
+
+        kept = merged[merged_into]
+        # Keep the dominant representative (weight, then members), but preserve support provenance.
+        keep_current = (
+            cluster.total_weight > kept.total_weight
+            or (
+                math.isclose(cluster.total_weight, kept.total_weight, rel_tol=1e-9, abs_tol=1e-9)
+                and cluster.member_count > kept.member_count
+            )
+        )
+        dominant = cluster if keep_current else kept
+        other = kept if keep_current else cluster
+        dominant_sources = set(dominant.merged_cluster_indices or ())
+        dominant_sources.update(other.merged_cluster_indices or ())
+        if not dominant_sources:
+            dominant_sources = {idx, merged_into}
+        merged[merged_into] = dataclasses.replace(
+            dominant,
+            contributing_arc_indices=frozenset(
+                dominant.contributing_arc_indices | other.contributing_arc_indices
+            ),
+            merged_cluster_indices=tuple(sorted(dominant_sources)),
+        )
+        merge_events.append({
+            "source_cluster_index": idx,
+            "target_cluster_index": merged_into,
+            "kept_cluster_source_indices": list(merged[merged_into].merged_cluster_indices),
+            "centroid_separation_km": round(float(merge_reason["centroid_separation_km"]), 3) if merge_reason else None,
+            "arc_jaccard": round(float(merge_reason["arc_jaccard"]), 3) if merge_reason else None,
+            "arc_overlap_min_ratio": round(float(merge_reason["arc_overlap_min_ratio"]), 3) if merge_reason else None,
+            "merge_distance_limit_km": round(float(merge_reason["merge_distance_limit_km"]), 3) if merge_reason else None,
+            "merge_reason": "final_centroid_plus_support_overlap",
+        })
+
+    return merged, merge_events
+
+
+def _evaluate_cluster_ambiguity(
+    best_cluster: _IntersectionCluster,
+    second_cluster: Optional[_IntersectionCluster],
+    best_quality_score: float,
+    second_quality_score: float,
+    best_support_score: float,
+    second_support_score: float,
+    raw_inlier_count: int,
+    cluster_radius_km: float,
+) -> dict:
+    """Evaluate ambiguity with same-lobe bypass on final cluster estimates."""
+    quality_ratio = (
+        best_quality_score / second_quality_score
+        if second_quality_score > 0.0
+        else float("inf")
+    )
+    support_ratio = (
+        best_support_score / second_support_score
+        if second_support_score > 0.0
+        else float("inf")
+    )
+
+    if raw_inlier_count >= 8:
+        effective_threshold = _QUALITY_AMBIGUITY_THRESHOLD
+    elif raw_inlier_count >= 4:
+        t = (raw_inlier_count - 4) / 4.0
+        effective_threshold = 1.15 + t * (_QUALITY_AMBIGUITY_THRESHOLD - 1.15)
+    else:
+        effective_threshold = 1.15
+    if best_quality_score >= 2.0 and quality_ratio >= 1.1:
+        effective_threshold = 1.05
+
+    second_member_count = second_cluster.member_count if second_cluster is not None else 0
+    second_weight = second_cluster.total_weight if second_cluster is not None else 0.0
+    member_ratio = (
+        best_cluster.member_count / second_member_count
+        if second_member_count > 0 else float("inf")
+    )
+    weight_ratio = (
+        best_cluster.total_weight / second_weight
+        if second_weight > 0.0 else float("inf")
+    )
+    is_geometry_dominant = (
+        best_cluster.member_count >= ACCUM_GEOM_DOMINANT_MIN_MEMBER_COUNT
+        and (
+            not math.isfinite(member_ratio)
+            or member_ratio >= ACCUM_GEOM_DOMINANT_MIN_MEMBER_RATIO
+        )
+        and (
+            not math.isfinite(weight_ratio)
+            or weight_ratio >= ACCUM_GEOM_DOMINANT_MIN_WEIGHT_RATIO
+        )
+    )
+
+    same_lobe_metrics: dict = {}
+    same_lobe_bypass = False
+    if second_cluster is not None:
+        same_lobe_metrics = _cluster_same_lobe_metrics(best_cluster, second_cluster, cluster_radius_km)
+        same_lobe_bypass = bool(same_lobe_metrics.get("same_lobe", False))
+
+    is_ambiguous = False
+    ambiguity_reason = ""
+    if not is_geometry_dominant and quality_ratio < effective_threshold:
+        if second_cluster is not None:
+            second_is_competitive = (
+                second_cluster.total_weight
+                >= best_cluster.total_weight * _INTERSECTION_SECONDARY_WEIGHT_FRACTION
+            )
+            if second_is_competitive and not same_lobe_bypass:
+                is_ambiguous = True
+                ambiguity_reason = (
+                    f"quality ratio {quality_ratio:.2f} below threshold {effective_threshold:.2f}"
+                )
+
+    return {
+        "quality_ratio": quality_ratio,
+        "support_ratio": support_ratio,
+        "effective_threshold": effective_threshold,
+        "member_ratio": member_ratio,
+        "weight_ratio": weight_ratio,
+        "second_member_count": second_member_count,
+        "is_geometry_dominant_cluster": is_geometry_dominant,
+        "same_lobe_metrics": same_lobe_metrics,
+        "same_lobe_bypass": same_lobe_bypass,
+        "is_ambiguous": is_ambiguous,
+        "ambiguity_reason": ambiguity_reason,
+    }
 
 
 @dataclass
@@ -1674,10 +1898,10 @@ def _resolve_intersection_candidates(
 def _build_intersection_clusters(
     candidates: list[_IntersectionCandidate],
     cluster_radius_km: float = _INTERSECTION_CLUSTER_RADIUS_KM,
-) -> list[_IntersectionCluster]:
+) -> tuple[list[_IntersectionCluster], list[dict]]:
     """Build distinct weighted neighborhoods from candidate intersections."""
     if not candidates:
-        return []
+        return [], []
 
     def _build_neighborhood(center: _IntersectionCandidate) -> _IntersectionCluster | None:
         members = [
@@ -1702,6 +1926,7 @@ def _build_intersection_clusters(
             center_x_km=center.x_km,
             center_y_km=center.y_km,
             contributing_arc_indices=frozenset(),  # deferred; filled in for distinct clusters only
+            merged_cluster_indices=(),
         )
 
     neighborhoods = [nb for c in candidates if (nb := _build_neighborhood(c)) is not None]
@@ -1711,24 +1936,31 @@ def _build_intersection_clusters(
     )
 
     distinct: list[_IntersectionCluster] = []
-    for cluster in neighborhoods:
+    for idx, cluster in enumerate(neighborhoods):
         if any(
             math.hypot(
-                cluster.center_x_km - kept.center_x_km,
-                cluster.center_y_km - kept.center_y_km,
-            ) <= cluster_radius_km
+                cluster.mean_x_km - kept.mean_x_km,
+                cluster.mean_y_km - kept.mean_y_km,
+            ) <= max(1.0, 0.25 * cluster_radius_km)
             for kept in distinct
         ):
             continue
-        # Compute contributing arcs only for the clusters that survive deduplication.
+        # Compute contributing arcs from the final weighted cluster estimate.
         members = [
             c for c in candidates
-            if math.hypot(c.x_km - cluster.center_x_km, c.y_km - cluster.center_y_km) <= cluster_radius_km
+            if math.hypot(c.x_km - cluster.mean_x_km, c.y_km - cluster.mean_y_km) <= cluster_radius_km
         ]
         contributing = frozenset(arc for c in members for arc in (c.arc_i, c.arc_j))
-        distinct.append(dataclasses.replace(cluster, contributing_arc_indices=contributing))
+        distinct.append(
+            dataclasses.replace(
+                cluster,
+                contributing_arc_indices=contributing,
+                merged_cluster_indices=(idx,),
+            )
+        )
 
-    return distinct
+    merged, merge_events = _dedupe_near_duplicate_clusters(distinct, cluster_radius_km=cluster_radius_km)
+    return merged, merge_events
 
 
 def _summarize_selected_observations(
@@ -3227,8 +3459,15 @@ class ForwardModel:
                 "all intersection candidates were implausibly distant",
             )
 
-        clusters = _build_intersection_clusters(plausible, cluster_radius_km=cluster_radius_km)
+        raw_clusters, cluster_merge_events = _build_intersection_clusters(
+            plausible,
+            cluster_radius_km=cluster_radius_km,
+        )
+        clusters = raw_clusters
+        detail["cluster_count_pre_merge"] = len(raw_clusters) + len(cluster_merge_events)
+        detail["cluster_count_post_merge"] = len(clusters)
         detail["cluster_count"] = len(clusters)
+        detail["cluster_merge_events"] = cluster_merge_events[:20]
         if not clusters:
             return rejected_payload("rejected_ambiguous", "candidate cloud was ambiguous")
 
@@ -3349,6 +3588,7 @@ class ForwardModel:
 
             return {
                 "cluster_rank": rank + 1,
+                "merged_cluster_indices": list(cluster.merged_cluster_indices),
                 "lat": round(cluster_lat, 6),
                 "lon": round(cluster_lon, 6),
                 "cluster_quality_score": round(quality_score, 6),
@@ -3409,84 +3649,27 @@ class ForwardModel:
         second_quality: Optional[dict] = None
         if len(quality_ranked) > 1:
             second_quality_score, _second_rms, _second_fit, second_cluster, second_quality = quality_ranked[1]
-
-        # The ambiguity test now uses the quality-score ratio, not just support ratio.
-        # A cluster is accepted when it is clearly better on the fuller quality measure.
-        quality_ratio = (
-            best_quality_score / second_quality_score
-            if second_quality_score > 0.0
-            else float("inf")
+        ambiguity_eval = _evaluate_cluster_ambiguity(
+            best_cluster=best_cluster,
+            second_cluster=second_cluster,
+            best_quality_score=best_quality_score,
+            second_quality_score=second_quality_score,
+            best_support_score=best_quality["support_score"],
+            second_support_score=second_quality["support_score"] if second_quality else 0.0,
+            raw_inlier_count=best_quality["raw_inlier_count"],
+            cluster_radius_km=cluster_radius_km,
         )
-
-        # Also check support ratio as a secondary guard (preserve backward compatibility)
-        best_support_from_quality = best_quality["support_score"]
-        second_support_from_quality = second_quality["support_score"] if second_quality else 0.0
-        support_ratio = (
-            best_support_from_quality / second_support_from_quality
-            if second_support_from_quality > 0.0
-            else float("inf")
-        )
-
-        # Adaptive ambiguity threshold: for small frames with few inlier circles,
-        # the quality scores of competing clusters are naturally closer.
-        # Lower the threshold when the best cluster has strong absolute quality.
-        raw_inlier_count = best_quality["raw_inlier_count"]
-        if raw_inlier_count >= 8:
-            effective_threshold = _QUALITY_AMBIGUITY_THRESHOLD
-        elif raw_inlier_count >= 4:
-            # Interpolate between 1.15 and _QUALITY_AMBIGUITY_THRESHOLD
-            t = (raw_inlier_count - 4) / 4.0
-            effective_threshold = 1.15 + t * (_QUALITY_AMBIGUITY_THRESHOLD - 1.15)
-        else:
-            effective_threshold = 1.15
-
-        # If best cluster has very strong absolute quality, accept even with closer ratio
-        if best_quality_score >= 2.0 and quality_ratio >= 1.1:
-            effective_threshold = 1.05
-
-        # Determine if the best cluster is geometry-dominant (strong member-count and
-        # weight dominance over the second cluster).  A geometry-dominant cluster bypasses
-        # the quality-ratio ambiguity rejection — the intersection structure itself is
-        # sufficient evidence.
-        _second_member_count_check = second_cluster.member_count if second_cluster is not None else 0
-        _second_weight_check = second_cluster.total_weight if second_cluster is not None else 0.0
-        _member_ratio_for_dom = (
-            best_cluster.member_count / _second_member_count_check
-            if _second_member_count_check > 0 else float("inf")
-        )
-        _weight_ratio_for_dom = (
-            best_cluster.total_weight / _second_weight_check
-            if _second_weight_check > 0.0 else float("inf")
-        )
-        _is_geometry_dominant_cluster = (
-            best_cluster.member_count >= ACCUM_GEOM_DOMINANT_MIN_MEMBER_COUNT
-            and (
-                not math.isfinite(_member_ratio_for_dom)
-                or _member_ratio_for_dom >= ACCUM_GEOM_DOMINANT_MIN_MEMBER_RATIO
-            )
-            and (
-                not math.isfinite(_weight_ratio_for_dom)
-                or _weight_ratio_for_dom >= ACCUM_GEOM_DOMINANT_MIN_WEIGHT_RATIO
-            )
-        )
-
-        # Reject as ambiguous only when BOTH quality and support fail to separate clearly
-        # AND the cluster is not geometry-dominant by member count.
-        # This allows a tight, well-conditioned cluster to win over a broader one even
-        # when raw support is similar.  Geometry-dominant clusters (strong member/weight
-        # dominance) bypass the quality-ratio ambiguity rejection entirely.
-        is_ambiguous = False
-        ambiguity_reason = ""
-
-        if not _is_geometry_dominant_cluster and quality_ratio < effective_threshold:
-            # Quality scores are close — check if the second cluster is actually competitive
-            if second_cluster is not None:
-                # Additional guard: second cluster must also have meaningful total weight
-                if second_cluster.total_weight >= best_cluster.total_weight * _INTERSECTION_SECONDARY_WEIGHT_FRACTION:
-                    is_ambiguous = True
-                    ambiguity_reason = (
-                        f"quality ratio {quality_ratio:.2f} below threshold {effective_threshold:.2f}"
-                    )
+        quality_ratio = ambiguity_eval["quality_ratio"]
+        support_ratio = ambiguity_eval["support_ratio"]
+        effective_threshold = ambiguity_eval["effective_threshold"]
+        _is_geometry_dominant_cluster = ambiguity_eval["is_geometry_dominant_cluster"]
+        _second_member_count_check = ambiguity_eval["second_member_count"]
+        _member_ratio_for_dom = ambiguity_eval["member_ratio"]
+        _weight_ratio_for_dom = ambiguity_eval["weight_ratio"]
+        same_lobe_metrics = ambiguity_eval["same_lobe_metrics"]
+        same_lobe_bypass = ambiguity_eval["same_lobe_bypass"]
+        is_ambiguous = ambiguity_eval["is_ambiguous"]
+        ambiguity_reason = ambiguity_eval["ambiguity_reason"]
 
         if is_ambiguous and not manually_forced_preview:
             return rejected_payload(
@@ -3498,6 +3681,22 @@ class ForwardModel:
                     "best_quality_score": round(best_quality_score, 6),
                     "second_quality_score": round(second_quality_score, 6),
                     "cluster_count": len(clusters),
+                    "cluster_count_pre_merge": detail.get("cluster_count_pre_merge"),
+                    "cluster_count_post_merge": detail.get("cluster_count_post_merge"),
+                    "cluster_merge_events": detail.get("cluster_merge_events", []),
+                    "top_centroid_separation_km": (
+                        round(float(same_lobe_metrics["centroid_separation_km"]), 3)
+                        if same_lobe_metrics else None
+                    ),
+                    "top_arc_jaccard": (
+                        round(float(same_lobe_metrics["arc_jaccard"]), 3)
+                        if same_lobe_metrics else None
+                    ),
+                    "top_arc_overlap_min_ratio": (
+                        round(float(same_lobe_metrics["arc_overlap_min_ratio"]), 3)
+                        if same_lobe_metrics else None
+                    ),
+                    "ambiguity_same_lobe_bypass": same_lobe_bypass,
                     "is_geometry_dominant_cluster": _is_geometry_dominant_cluster,
                     "best_cluster_member_count": best_cluster.member_count,
                     "second_cluster_member_count": _second_member_count_check,
@@ -3524,7 +3723,7 @@ class ForwardModel:
             candidate
             for candidate in plausible
             if candidate.arc_i in inlier_indices_set and candidate.arc_j in inlier_indices_set
-            and math.hypot(candidate.x_km - best_cluster.center_x_km, candidate.y_km - best_cluster.center_y_km) <= cluster_radius_km
+            and math.hypot(candidate.x_km - best_cluster.mean_x_km, candidate.y_km - best_cluster.mean_y_km) <= cluster_radius_km
         ]
         n_contributing_arcs = len(inlier_circles)
         if inlier_candidates:
@@ -3629,6 +3828,22 @@ class ForwardModel:
         detail["selection_diagnostics"].update({
             "best_cluster_quality_score": round(best_quality_score, 6),
             "best_cluster_support_score": round(best_quality["support_score"], 6),
+            "cluster_count_pre_merge": detail.get("cluster_count_pre_merge"),
+            "cluster_count_post_merge": detail.get("cluster_count_post_merge"),
+            "cluster_merge_events": detail.get("cluster_merge_events", []),
+            "top_centroid_separation_km": (
+                round(float(same_lobe_metrics["centroid_separation_km"]), 3)
+                if same_lobe_metrics else None
+            ),
+            "top_arc_jaccard": (
+                round(float(same_lobe_metrics["arc_jaccard"]), 3)
+                if same_lobe_metrics else None
+            ),
+            "top_arc_overlap_min_ratio": (
+                round(float(same_lobe_metrics["arc_overlap_min_ratio"]), 3)
+                if same_lobe_metrics else None
+            ),
+            "ambiguity_same_lobe_bypass": same_lobe_bypass,
             "inlier_circle_count": n_contributing_arcs,
             "total_inlier_pair_circles": n_contributing_arcs,
             "refined_subset_count": len(refined_circle_indices),
@@ -3711,6 +3926,22 @@ class ForwardModel:
                 "dominance_ratio": dominance_ratio,
                 "support_dominance_ratio": support_ratio,
                 "quality_ratio": quality_ratio,
+                "cluster_count_pre_merge": detail.get("cluster_count_pre_merge"),
+                "cluster_count_post_merge": detail.get("cluster_count_post_merge"),
+                "cluster_merge_events": detail.get("cluster_merge_events", []),
+                "top_centroid_separation_km": (
+                    round(float(same_lobe_metrics["centroid_separation_km"]), 3)
+                    if same_lobe_metrics else None
+                ),
+                "top_arc_jaccard": (
+                    round(float(same_lobe_metrics["arc_jaccard"]), 3)
+                    if same_lobe_metrics else None
+                ),
+                "top_arc_overlap_min_ratio": (
+                    round(float(same_lobe_metrics["arc_overlap_min_ratio"]), 3)
+                    if same_lobe_metrics else None
+                ),
+                "ambiguity_same_lobe_bypass": same_lobe_bypass,
                 "is_geometry_dominant_cluster": _is_geometry_dominant_cluster,
                 "receiver_distance_m": receiver_distance_m,
                 "selection_diagnostics": detail["selection_diagnostics"],

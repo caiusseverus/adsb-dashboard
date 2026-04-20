@@ -13,8 +13,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from radar.forward_model import (
     ForwardModel,
     _IntersectionCandidate,
+    _IntersectionCluster,
     _build_residual_replay_diagnostics,
     _build_selected_lookup,
+    _build_intersection_clusters,
+    _cluster_same_lobe_metrics,
+    _evaluate_cluster_ambiguity,
     _prepare_frames_for_solving,
     _observation_quality_weight,
     _preprocess_scoring_frames,
@@ -572,6 +576,146 @@ def test_resolve_intersection_candidates_ignores_far_outliers():
     assert 8.0 <= x_km <= 14.0
     assert 8.0 <= y_km <= 14.0
     assert rms_km < 3.0
+
+
+def test_build_intersection_clusters_merges_near_duplicate_seed_neighborhoods():
+    candidates = [
+        _IntersectionCandidate(arc_i=0, arc_j=100, x_km=-11.0, y_km=0.0, weight=0.5),
+        _IntersectionCandidate(arc_i=1, arc_j=101, x_km=-4.0, y_km=0.3, weight=3.0),
+        _IntersectionCandidate(arc_i=2, arc_j=102, x_km=-3.0, y_km=-0.3, weight=3.0),
+        _IntersectionCandidate(arc_i=3, arc_j=103, x_km=3.0, y_km=0.2, weight=3.0),
+        _IntersectionCandidate(arc_i=4, arc_j=104, x_km=4.0, y_km=-0.4, weight=3.0),
+        _IntersectionCandidate(arc_i=5, arc_j=105, x_km=11.0, y_km=0.0, weight=0.5),
+    ]
+
+    clusters, merge_events = _build_intersection_clusters(candidates, cluster_radius_km=14.0)
+
+    assert len(clusters) == 1
+    assert len(merge_events) >= 1
+    assert merge_events[0]["merge_reason"] == "final_centroid_plus_support_overlap"
+    assert len(clusters[0].merged_cluster_indices) >= 2
+
+
+def test_cluster_same_lobe_metrics_distinguishes_close_overlap_from_distinct_lobes():
+    close_a = _IntersectionCluster(
+        mean_x_km=0.0,
+        mean_y_km=0.0,
+        rms_km=3.0,
+        total_weight=10.0,
+        member_count=24,
+        center_x_km=-8.0,
+        center_y_km=0.5,
+        contributing_arc_indices=frozenset({1, 2, 3, 4, 5, 6}),
+        merged_cluster_indices=(0,),
+    )
+    close_b = _IntersectionCluster(
+        mean_x_km=2.4,
+        mean_y_km=1.2,
+        rms_km=2.8,
+        total_weight=9.7,
+        member_count=22,
+        center_x_km=8.0,
+        center_y_km=-0.2,
+        contributing_arc_indices=frozenset({2, 3, 4, 6, 7, 8}),
+        merged_cluster_indices=(1,),
+    )
+    far_c = _IntersectionCluster(
+        mean_x_km=52.0,
+        mean_y_km=50.0,
+        rms_km=3.2,
+        total_weight=9.5,
+        member_count=20,
+        center_x_km=52.0,
+        center_y_km=49.0,
+        contributing_arc_indices=frozenset({30, 31, 32, 33, 34}),
+        merged_cluster_indices=(2,),
+    )
+
+    close_metrics = _cluster_same_lobe_metrics(close_a, close_b, cluster_radius_km=20.0)
+    far_metrics = _cluster_same_lobe_metrics(close_a, far_c, cluster_radius_km=20.0)
+
+    assert close_metrics["same_lobe"] is True
+    assert close_metrics["merge_like"] is True
+    assert far_metrics["same_lobe"] is False
+    assert far_metrics["merge_like"] is False
+
+
+def test_evaluate_cluster_ambiguity_bypasses_same_lobe_near_duplicates():
+    best = _IntersectionCluster(
+        mean_x_km=0.0,
+        mean_y_km=0.0,
+        rms_km=3.0,
+        total_weight=12.0,
+        member_count=10,
+        center_x_km=-7.0,
+        center_y_km=0.0,
+        contributing_arc_indices=frozenset({1, 2, 3, 4, 5, 6, 7, 8}),
+        merged_cluster_indices=(0,),
+    )
+    second = _IntersectionCluster(
+        mean_x_km=2.0,
+        mean_y_km=1.5,
+        rms_km=2.8,
+        total_weight=10.5,
+        member_count=9,
+        center_x_km=8.0,
+        center_y_km=-0.5,
+        contributing_arc_indices=frozenset({2, 3, 4, 5, 6, 8, 9}),
+        merged_cluster_indices=(1,),
+    )
+    verdict = _evaluate_cluster_ambiguity(
+        best_cluster=best,
+        second_cluster=second,
+        best_quality_score=1.25,
+        second_quality_score=1.23,
+        best_support_score=2.1,
+        second_support_score=2.0,
+        raw_inlier_count=8,
+        cluster_radius_km=20.0,
+    )
+
+    assert verdict["quality_ratio"] < verdict["effective_threshold"]
+    assert verdict["same_lobe_bypass"] is True
+    assert verdict["is_ambiguous"] is False
+
+
+def test_evaluate_cluster_ambiguity_rejects_distinct_near_equal_clusters():
+    best = _IntersectionCluster(
+        mean_x_km=0.0,
+        mean_y_km=0.0,
+        rms_km=2.5,
+        total_weight=12.0,
+        member_count=10,
+        center_x_km=0.0,
+        center_y_km=0.0,
+        contributing_arc_indices=frozenset({1, 2, 3, 4, 5}),
+        merged_cluster_indices=(0,),
+    )
+    second = _IntersectionCluster(
+        mean_x_km=38.0,
+        mean_y_km=34.0,
+        rms_km=2.7,
+        total_weight=10.0,
+        member_count=9,
+        center_x_km=38.0,
+        center_y_km=34.0,
+        contributing_arc_indices=frozenset({40, 41, 42, 43, 44}),
+        merged_cluster_indices=(1,),
+    )
+    verdict = _evaluate_cluster_ambiguity(
+        best_cluster=best,
+        second_cluster=second,
+        best_quality_score=1.24,
+        second_quality_score=1.22,
+        best_support_score=2.1,
+        second_support_score=2.0,
+        raw_inlier_count=8,
+        cluster_radius_km=20.0,
+    )
+
+    assert verdict["quality_ratio"] < verdict["effective_threshold"]
+    assert verdict["same_lobe_bypass"] is False
+    assert verdict["is_ambiguous"] is True
 
 
 def _make_frame_estimate(frame_index, lat, lon, cep_km=2.0, n_arcs=8):
