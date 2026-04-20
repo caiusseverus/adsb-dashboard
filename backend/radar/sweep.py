@@ -2348,7 +2348,9 @@ class RadarState:
         model = self._models.get(iid)
         if model is None or model.period_s is None:
             return metrics
-        period_s = model.period_s
+        period_s = self._get_authoritative_frame_period_s(iid, model.period_s)
+        if period_s is None:
+            return metrics
         period_us = period_s * 1_000_000.0
         native_processor = self._native_burst_processors.get(iid)
 
@@ -4874,7 +4876,9 @@ class RadarState:
         model = self._models.get(iid)
         if model is None or model.period_s is None:
             return
-        period_s = model.period_s
+        period_s = self._get_authoritative_frame_period_s(iid, model.period_s)
+        if period_s is None:
+            return
         period_us = period_s * 1_000_000.0
 
         # Ensure per-IID state exists
@@ -5194,6 +5198,26 @@ class RadarState:
     # Rotation models
     # ------------------------------------------------------------------
 
+    def _get_authoritative_frame_period_s(
+        self, iid: int, fallback_period_s: float | None
+    ) -> float | None:
+        """Return the refined sync period for frame building when available.
+
+        Uses LiveSyncState.period_s when the sync is usable, not in holdover,
+        and the period is positive.  Falls back to the coarse rotation-model
+        period (fallback_period_s) during bootstrap or degraded sync conditions.
+        """
+        sync = self._live_sync_states.get(iid)
+        if (
+            sync is not None
+            and sync.usable
+            and not sync.holdover
+            and sync.period_s
+            and sync.period_s > 0
+        ):
+            return sync.period_s
+        return fallback_period_s
+
     def update_rotation_models(
         self,
         max_iids_per_call: int | None = None,
@@ -5315,8 +5339,19 @@ class RadarState:
                         if relevant:
                             by_iid_bursts[iid] = relevant
 
+                # Bootstrap fallback: IIDs not yet producing burst records (e.g.
+                # after purge/reset) still have raw events in _iid_events.  Scan
+                # the deque once to extract them, breaking the circular dependency:
+                #   burst records → frame builder → model → burst records
+                bootstrap_iids = due_iids - by_iid_bursts.keys()
+                by_iid_events: dict[int, list] = {}
+                if bootstrap_iids and self._iid_events:
+                    for ev in self._iid_events:
+                        ev_iid = ev[1]
+                        if ev_iid in bootstrap_iids and ev[0] >= analysis_cutoff_us:
+                            by_iid_events.setdefault(ev_iid, []).append(ev)
 
-            if not by_iid_bursts:
+            if not by_iid_bursts and not by_iid_events:
                 return
 
             if max_iids_per_call is not None and max_iids_per_call > 0 and len(by_iid_bursts) > max_iids_per_call:
@@ -5326,7 +5361,7 @@ class RadarState:
                 with self._lock:
                     self._dirty_iids.update(deferred_iids)
 
-            if not by_iid_bursts:
+            if not by_iid_bursts and not by_iid_events:
                 record_rotation_update_timing({
                     "ts_s": time.time(),
                     "total_ms": round((time.perf_counter() - t0) * 1000, 2),
@@ -5346,7 +5381,7 @@ class RadarState:
                 model = self._models.get(iid)
                 return ((model.last_updated if model is not None else 0.0) or 0.0, iid)
 
-            ordered_iids = sorted(by_iid_bursts, key=_iid_priority)
+            ordered_iids = sorted(by_iid_bursts.keys() | by_iid_events.keys(), key=_iid_priority)
 
             # Refresh the live-frame-builder tracker with current aircraft positions.
             # The live path (_on_df11_frame_builder) uses this for real-time burst
@@ -5380,24 +5415,35 @@ class RadarState:
             burst_cap = self._ROTATION_ANALYSIS_MAX_EVENTS_PER_IID
             min_delta = self._ROTATION_ANALYSIS_MIN_DELTA
             for index, iid in enumerate(ordered_iids):
-                burst_list = by_iid_bursts[iid]
-                prev_count, _prev_ts = self._rotation_analysis_meta.get(iid, (0, 0.0))
-                existing_model = self._models.get(iid)
-                # Skip reanalysis when the IID has an established model and the
-                # burst delta since the last run is below threshold.
-                if (
-                    existing_model is not None
-                    and existing_model.rotation_model is not None
-                    and prev_count > 0
-                    and (len(burst_list) - prev_count) < min_delta
-                ):
-                    continue
-                if burst_cap > 0 and len(burst_list) > burst_cap:
-                    burst_list_for_analysis = burst_list[-burst_cap:]
+                if iid in by_iid_bursts:
+                    burst_list = by_iid_bursts[iid]
+                    prev_count, _prev_ts = self._rotation_analysis_meta.get(iid, (0, 0.0))
+                    existing_model = self._models.get(iid)
+                    # Skip reanalysis when the IID has an established model and the
+                    # burst delta since the last run is below threshold.
+                    if (
+                        existing_model is not None
+                        and existing_model.rotation_model is not None
+                        and prev_count > 0
+                        and (len(burst_list) - prev_count) < min_delta
+                    ):
+                        continue
+                    if burst_cap > 0 and len(burst_list) > burst_cap:
+                        burst_list_for_analysis = burst_list[-burst_cap:]
+                    else:
+                        burst_list_for_analysis = burst_list
+                    analysed_models[iid] = _analyse_burst_records(burst_list_for_analysis)
+                    self._rotation_analysis_meta[iid] = (len(burst_list), time.time())
                 else:
-                    burst_list_for_analysis = burst_list
-                analysed_models[iid] = _analyse_burst_records(burst_list_for_analysis)
-                self._rotation_analysis_meta[iid] = (len(burst_list), time.time())
+                    # Bootstrap path: no burst records yet (e.g. after purge/reset).
+                    # Analyse raw _iid_events so the first model can be seeded and
+                    # the frame builder can start producing burst records.
+                    iid_events = by_iid_events[iid]
+                    if burst_cap > 0 and len(iid_events) > burst_cap:
+                        iid_events = iid_events[-burst_cap:]
+                    analysed_models[iid] = _analyse_iid_events(iid_events)
+                    # Do not update _rotation_analysis_meta: event count is volatile
+                    # and the delta-skip guard must not suppress bootstrap cycles.
                 if budget_s is not None and (time.perf_counter() - t_sweeps) >= budget_s:
                     unprocessed_iids.update(ordered_iids[index + 1:])
                     break
