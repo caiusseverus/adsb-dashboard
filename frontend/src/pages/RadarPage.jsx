@@ -57,6 +57,12 @@ function readinessColor(readiness) {
   }
 }
 
+function qualityColor(pct) {
+  if (pct >= 80) return '#3fb950'
+  if (pct >= 50) return '#d29922'
+  return '#ff7b72'
+}
+
 const ROLLING_HISTORY_MAX = 300
 
 function useRadarLiveStream() {
@@ -111,6 +117,9 @@ function useRadarLiveStream() {
   const rows = useMemo(
     () => Object.values(iidMap).sort((a, b) => a.iid - b.iid).map(entry => {
       const loc = entry.localiser ?? {}
+      const syncCoherent = entry.sync?.fit_support_count ?? null
+      const syncResidual = entry.sync?.fit_reject_count ?? null
+      const syncTotal = syncCoherent != null && syncResidual != null ? syncCoherent + syncResidual : null
       return {
         iid: entry.iid,
         status: entry.status,
@@ -129,6 +138,10 @@ function useRadarLiveStream() {
         manual_note: entry.manual_note,
         unresolvable_reason: entry.unresolvable_reason,
         sync: entry.sync,
+        quality_pct: syncTotal != null && syncTotal > 0 ? Math.round(100 * syncCoherent / syncTotal) : null,
+        quality_coherent: syncCoherent,
+        quality_residual: syncResidual,
+        quality_low_sample: syncTotal != null && syncTotal < 3,
       }
     }),
     [iidMap],
@@ -807,7 +820,7 @@ function IIDTable({ rows, selectedIid, onSelect, onResetAll, resettingAll }) {
               <tr>
                 <th>IID</th>
                 <th>Location</th>
-                <th title="SINGLE_RADAR = consistent single source; LIKELY_SINGLE = tentatively single; MULTI_RADAR = multiple overlapping radars detected; CHECK_MULTI = possible multi-radar">Rotation</th>
+                <th title="Proportion of burst observations classified as inlier (coherent with the sync model) vs rejected. Low-data entries (fewer than 3 observations) are dimmed. Tooltip shows raw counts.">Quality</th>
                 <th>Period</th>
                 <th title="Period standard deviation">Period σ</th>
                 <th>RPM</th>
@@ -842,16 +855,23 @@ function IIDTable({ rows, selectedIid, onSelect, onResetAll, resettingAll }) {
                       </span>
                     </td>
                     <td>
-                      <span
-                        className={styles.statusBadge}
-                        style={{
-                          background: `${statusColor(row.status)}22`,
-                          color: statusColor(row.status),
-                          borderColor: `${statusColor(row.status)}55`,
-                        }}
-                      >
-                        {row.status ?? '—'}
-                      </span>
+                      {row.quality_pct != null ? (
+                        <span
+                          className={styles.statusBadge}
+                          title={`coherent ${row.quality_coherent ?? 0} / residual ${row.quality_residual ?? 0}`}
+                          style={{
+                            background: row.quality_low_sample ? '#48485822' : `${qualityColor(row.quality_pct)}22`,
+                            color: row.quality_low_sample ? '#8b949e' : qualityColor(row.quality_pct),
+                            borderColor: row.quality_low_sample ? '#48485855' : `${qualityColor(row.quality_pct)}55`,
+                          }}
+                        >
+                          {row.quality_pct}%{row.quality_low_sample ? '?' : ''}
+                        </span>
+                      ) : (
+                        <span className={styles.statusBadge} style={{ background: '#48485822', color: '#484f58', borderColor: '#48485855' }}>
+                          —
+                        </span>
+                      )}
                     </td>
                     <td className={styles.monoCell}>
                       {row.period_s != null ? `${row.period_s.toFixed(3)}s` : '—'}
