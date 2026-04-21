@@ -2148,6 +2148,7 @@ class ForwardModel:
         self._frame_positions: dict[int, deque] = {}
         self._frame_positions_lock = threading.Lock()
         self._frame_positions_loaded: set[int] = set()  # IIDs whose DB rows have been loaded
+        self._frame_positions_revision: dict[int, int] = {}
         self._frame_pipeline_stats_lock = threading.Lock()
         self._frame_pipeline_stats: dict[int, dict] = defaultdict(self._new_frame_pipeline_stats)
 
@@ -2515,6 +2516,7 @@ class ForwardModel:
                     interpolated_position_fraction=r.get("interpolated_position_fraction") or 0.0,
                 ))
             self._frame_positions[iid] = buf
+            self._frame_positions_revision[iid] = self._frame_positions_revision.get(iid, 0) + 1
             log.info("ForwardModel: IID %d — loaded %d frame positions from DB", iid, len(buf))
         except Exception:
             log.exception("ForwardModel: IID %d — failed to load frame positions from DB", iid)
@@ -2526,6 +2528,7 @@ class ForwardModel:
             if iid not in self._frame_positions:
                 self._frame_positions[iid] = deque(maxlen=_PER_FRAME_BUFFER_MAX)
             self._frame_positions[iid].append(estimate)
+            self._frame_positions_revision[iid] = self._frame_positions_revision.get(iid, 0) + 1
             n_accumulated = len(self._frame_positions[iid])
         self._record_frame_pipeline_event(iid, accumulation_written=1)
         log.debug(
@@ -2545,10 +2548,17 @@ class ForwardModel:
                 self._load_db_frame_positions(iid)
             return list(self._frame_positions.get(iid, []))
 
+    def get_frame_positions_revision(self, iid: int) -> int:
+        with self._frame_positions_lock:
+            if iid not in self._frame_positions_loaded:
+                self._load_db_frame_positions(iid)
+            return int(self._frame_positions_revision.get(iid, 0))
+
     def clear_frame_positions(self, iid: int) -> None:
         with self._frame_positions_lock:
             self._frame_positions.pop(iid, None)
             self._frame_positions_loaded.discard(iid)
+            self._frame_positions_revision[iid] = self._frame_positions_revision.get(iid, 0) + 1
         try:
             from db import stats_db
             stats_db.clear_frame_positions(iid)
@@ -2573,6 +2583,7 @@ class ForwardModel:
             if len(new_buf) == len(buf):
                 return False
             self._frame_positions[iid] = new_buf
+            self._frame_positions_revision[iid] = self._frame_positions_revision.get(iid, 0) + 1
         if removed_sweep_start_us is not None:
             try:
                 from db import stats_db
@@ -2598,6 +2609,7 @@ class ForwardModel:
             removed = len(buf) - len(new_buf)
             if removed > 0:
                 self._frame_positions[iid] = new_buf
+                self._frame_positions_revision[iid] = self._frame_positions_revision.get(iid, 0) + 1
         if removed > 0:
             try:
                 from db import stats_db

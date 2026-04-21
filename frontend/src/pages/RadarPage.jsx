@@ -33,11 +33,6 @@ const RADAR_FIELD_AXIS_SHRINK_HOLD_MS = 45_000
 const RADAR_FIELD_AXIS_SHRINK_TIME_CONSTANT_MS = 12_000
 const BURST_SYNC_VIEW_MODE_RESIDUALS = 'burst_sync_residuals'
 const BURST_SYNC_VIEW_MODE_LEGACY = 'legacy_live_df_alignment'
-const EVIDENCE_METHODS = [
-  'forward_model',
-  'coincident_illumination',
-]
-
 function getRadarPageMetricsStore() {
   if (typeof window === 'undefined') return null
   if (!window.__RADAR_PAGE_REQUEST_METRICS__) {
@@ -506,137 +501,6 @@ function useFmDiagnostics(iid, refreshKey = 0) {
   return { data, loading }
 }
 
-function useIidControl(iid, refreshKey = 0) {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(false)
-
-  useEffect(() => {
-    if (iid == null) { setData(null); return }
-    const controller = new AbortController()
-    setLoading(true)
-    async function poll() {
-      const d = await trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/control`, {
-        endpoint: 'iid_control',
-        trigger: refreshKey ? 'control_change_or_poll' : 'iid_change_or_poll',
-        signal: controller.signal,
-      })
-      if (!controller.signal.aborted && d) setData(d)
-      if (!controller.signal.aborted) setLoading(false)
-    }
-    poll()
-    const id = setInterval(poll, 10_000)
-    return () => { controller.abort(); clearInterval(id) }
-  }, [iid, refreshKey])
-
-  return { data, loading }
-}
-
-function useSolutionComparison(iid, refreshKey = 0) {
-  const [data, setData] = useState(null)
-
-  useEffect(() => {
-    if (iid == null) { setData(null); return }
-    const controller = new AbortController()
-    async function poll() {
-      const d = await trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/solution-comparison`, {
-        endpoint: 'iid_solution_comparison',
-        trigger: refreshKey ? 'control_change_or_poll' : 'iid_change_or_poll',
-        signal: controller.signal,
-      })
-      if (!controller.signal.aborted && d) setData(d)
-    }
-    poll()
-    const id = setInterval(poll, 10_000)
-    return () => { controller.abort(); clearInterval(id) }
-  }, [iid, refreshKey])
-
-  return data
-}
-
-function useEvidence(iid, refreshKey = 0) {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(false)
-
-  useEffect(() => {
-    if (iid == null) { setData(null); return }
-    let cancelled = false
-    setLoading(true)
-    async function poll() {
-      try {
-        const r = await fetch(`${API_BASE}/api/radar/iids/${iid}/evidence`)
-        if (!r.ok) return
-        const d = await r.json()
-        if (!cancelled) setData(d)
-      } catch {}
-      finally { if (!cancelled) setLoading(false) }
-    }
-    poll()
-    const id = setInterval(poll, 20_000)
-    return () => { cancelled = true; clearInterval(id) }
-  }, [iid, refreshKey])
-
-  return { data, loading }
-}
-
-function useEvidenceMethods(iid, methods, refreshKey = 0) {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(false)
-  const methodKey = methods.join(',')
-
-  useEffect(() => {
-    if (iid == null || methods.length === 0) {
-      setData(null)
-      setLoading(false)
-      return
-    }
-
-    // Clear stale data immediately so the map does not show previous radar's points
-    setData(null)
-    const controller = new AbortController()
-    setLoading(true)
-
-    async function fetchEvidence() {
-      try {
-        const results = await Promise.all(methods.map(async method => {
-          const r = await trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/evidence/${method}`, {
-            endpoint: `iid_evidence_${method}`,
-            trigger: refreshKey ? 'control_change_or_refresh' : 'iid_change',
-            signal: controller.signal,
-          })
-          return r
-        }))
-        if (controller.signal.aborted) return
-        const evidenceMethods = results.filter(Boolean)
-        const basePayload = evidenceMethods[0] ?? {}
-        const display = evidenceMethods.find(m => m?.display_position)?.display_position ?? null
-        startTransition(() => {
-          setData({
-            ...basePayload,
-            iid,
-            available: true,
-            display_source: display?.source ?? 'none',
-            display_lat: display?.lat ?? null,
-            display_lon: display?.lon ?? null,
-            display_cep_m: display?.cep_m ?? null,
-            methods: evidenceMethods,
-          })
-        })
-      } catch (err) {
-        if (!controller.signal.aborted) {
-          setData(null)
-        }
-      } finally {
-        if (!controller.signal.aborted) setLoading(false)
-      }
-    }
-
-    fetchEvidence()
-    return () => controller.abort()
-  }, [iid, methodKey, refreshKey])
-
-  return { data, loading }
-}
-
 function useTdoaDiagnostics(iid, refreshKey = 0) {
   const [data, setData] = useState(null)
 
@@ -1079,6 +943,11 @@ function LocalisationControlPanel({ iid, onChanged, controlData = null, feedStat
           <span className={styles.metricPill}>
             Feed <span className={styles.metricValue}>{feedStatus?.mode ?? 'idle'}</span>
           </span>
+          <span className={styles.metricPill} title="Sections changed in the latest selected-IID pushed snapshot">
+            Changed <span className={styles.metricValue}>
+              {feedStatus?.changedSections?.length ? feedStatus.changedSections.join(',') : '—'}
+            </span>
+          </span>
           <span className={styles.metricPill}>
             Display <span className={styles.metricValue}>{data?.display_source ?? '—'}</span>
           </span>
@@ -1338,32 +1207,6 @@ function TdoaDiagnosticsPanel({ iid, refreshKey = 0 }) {
   )
 }
 
-function collectEvidencePoints(methods) {
-  const points = []
-  methods.forEach(method => {
-    ;(method.layers ?? []).forEach(layer => {
-      ;(layer.features ?? []).forEach(feature => {
-        const geometry = feature.geometry
-        if (!geometry) return
-        if (geometry.type === 'Point') {
-          const [lon, lat] = geometry.coordinates
-          points.push({ lat, lon, role: feature.properties?.role })
-        } else if (geometry.type === 'LineString') {
-          geometry.coordinates.forEach(([lon, lat]) => points.push({ lat, lon }))
-        } else if (geometry.type === 'Circle') {
-          const [lon, lat] = geometry.center
-          const radiusKm = geometry.radius_km ?? 0
-          const latDeg = radiusKm / 111.32
-          const lonDeg = radiusKm / Math.max(111.32 * Math.cos(lat * Math.PI / 180), 1e-6)
-          points.push({ lat: lat - latDeg, lon: lon - lonDeg })
-          points.push({ lat: lat + latDeg, lon: lon + lonDeg })
-        }
-      })
-    })
-  })
-  return points
-}
-
 function collectFrameGeometryPoints(data) {
   const points = []
   ;(data?.layers ?? []).forEach(layer => {
@@ -1403,7 +1246,7 @@ function niceRingDistances(maxKm) {
   return [100, 200, 500]
 }
 
-function collectSolutionPoints(controlData, methods) {
+function collectSolutionPoints(controlData, fmEstimate) {
   const points = []
   if (controlData?.display_lat != null && controlData?.display_lon != null) {
     points.push({ lat: controlData.display_lat, lon: controlData.display_lon })
@@ -1415,17 +1258,14 @@ function collectSolutionPoints(controlData, methods) {
       points.push({ lat: controlData.display_lat, lon: controlData.display_lon - cepKm / kmPerLonDegree(controlData.display_lat) })
     }
   }
-  methods.forEach(method => {
-    const estimate = method?.layers?.find(layer => layer.active_estimate)?.active_estimate
-    if (estimate?.lat != null && estimate?.lon != null) {
-      points.push({ lat: estimate.lat, lon: estimate.lon })
-      if (estimate.cep_m != null) {
-        const cepKm = estimate.cep_m / 1000
-        points.push({ lat: estimate.lat + cepKm / 111.32, lon: estimate.lon })
-        points.push({ lat: estimate.lat - cepKm / 111.32, lon: estimate.lon })
-      }
+  if (fmEstimate?.lat != null && fmEstimate?.lon != null) {
+    points.push({ lat: fmEstimate.lat, lon: fmEstimate.lon })
+    if (fmEstimate.cep_m != null) {
+      const cepKm = fmEstimate.cep_m / 1000
+      points.push({ lat: fmEstimate.lat + cepKm / 111.32, lon: fmEstimate.lon })
+      points.push({ lat: fmEstimate.lat - cepKm / 111.32, lon: fmEstimate.lon })
     }
-  })
+  }
   return points
 }
 
@@ -1441,22 +1281,15 @@ function formatDistance(distanceM) {
   return `${(distanceM / 1000).toFixed(1)} km`
 }
 
-function EvidenceMapPanel({ iid, refreshKey = 0 }) {
-  const [autoKey, setAutoKey] = useState(0)
-  const [deleteKey, setDeleteKey] = useState(0)
+function EvidenceMapPanel({ iid, controlData = null, evidenceData = null, evidenceRevision = 0 }) {
   const [outlierResult, setOutlierResult] = useState(null)  // null | {outlierSet, n_outliers, n_inliers, n_total, rejection_counts}
   const [analyseRunning, setAnalyseRunning] = useState(false)
   const [deleteRunning, setDeleteRunning] = useState(false)
 
   useEffect(() => {
-    const id = setInterval(() => setAutoKey(k => k + 1), 30_000)
-    return () => clearInterval(id)
-  }, [])
+    setOutlierResult(null)
+  }, [evidenceRevision])
 
-  // Clear analysis whenever data refreshes (auto or after delete)
-  useEffect(() => { setOutlierResult(null) }, [autoKey])
-
-  // Reset radar-specific local state on IID change (belt-and-suspenders alongside key remount)
   useEffect(() => {
     setOutlierResult(null)
     setAnalyseRunning(false)
@@ -1467,7 +1300,6 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
     if (frameIndex == null) return
     try {
       await fetch(`${API_BASE}/api/radar/iids/${iid}/frame-positions/${frameIndex}`, { method: 'DELETE' })
-      setDeleteKey(k => k + 1)
     } catch {}
   }
 
@@ -1497,36 +1329,38 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
         body: JSON.stringify({ sweep_start_us: [...outlierResult.outlierSet] }),
       })
       setOutlierResult(null)
-      setDeleteKey(k => k + 1)
     } catch {}
     setDeleteRunning(false)
   }
 
-  // Radar-level control metadata: manual position, authoritative display position
-  const { data: controlData } = useIidControl(iid, refreshKey + autoKey + deleteKey)
-  // Method evidence: frame scatter points and FM estimate layers only
-  const { data, loading } = useEvidenceMethods(iid, ['forward_model'], refreshKey + autoKey + deleteKey)
-  const loadedMethods = data?.methods ?? []
-  const fmMethod = loadedMethods.find(m => m.method === 'forward_model') ?? { method: 'forward_model', available: false, layers: [] }
-  const activeMethods = fmMethod.available ? [fmMethod] : []
+  const loading = iid != null && evidenceData == null
+  const scatterPoints = Array.isArray(evidenceData?.frame_positions)
+    ? evidenceData.frame_positions
+        .filter(point => point?.lat != null && point?.lon != null)
+        .map(point => ({
+          lat: point.lat,
+          lon: point.lon,
+          frameIndex: point.frame_index,
+          sweepStartUs: point.sweep_start_us,
+        }))
+    : []
+  const fmEstimate = evidenceData?.fm_estimate ?? null
+  const manualEstimate = evidenceData?.manual_position ?? (
+    controlData?.manual_lat != null && controlData?.manual_lon != null
+      ? { lat: controlData.manual_lat, lon: controlData.manual_lon }
+      : null
+  )
 
-  const scatterPoints = collectEvidencePoints(activeMethods).filter(p => p.role === 'frame_position_estimate')
-
-  // Ring anchor: prefer the authoritative display position from control, fall back to FM layer estimate
   const ringAnchor = (() => {
     if (controlData?.display_lat != null) return { lat: controlData.display_lat, lon: controlData.display_lon }
-    const est = fmMethod.layers?.find(l => l.active_estimate)?.active_estimate
-    return est?.lat != null ? { lat: est.lat, lon: est.lon } : null
+    return fmEstimate?.lat != null ? { lat: fmEstimate.lat, lon: fmEstimate.lon } : null
   })()
 
-  // Dynamic ring distances based on actual scatter extent
   const maxDistKm = ringAnchor && scatterPoints.length > 0
-    ? Math.max(...scatterPoints.map(p => flatDistKm(ringAnchor.lat, ringAnchor.lon, p.lat, p.lon)))
+    ? Math.max(...scatterPoints.map(point => flatDistKm(ringAnchor.lat, ringAnchor.lon, point.lat, point.lon)))
     : 0
   const ringDistances = niceRingDistances(maxDistKm)
-
-  // Bounds: scatter + anchor + inner ring context (so innermost ring is visible)
-  const solutionPoints = collectSolutionPoints(controlData, activeMethods)
+  const solutionPoints = collectSolutionPoints(controlData, fmEstimate)
   const innerRing = ringAnchor && ringDistances.length > 0 ? ringDistances[0] : 0
   const ringContextPoints = ringAnchor && innerRing > 0 ? [
     { lat: ringAnchor.lat + innerRing / 111.32, lon: ringAnchor.lon },
@@ -1540,9 +1374,7 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
   const selectedEstimate = controlData?.display_lat != null && controlData?.display_lon != null
     ? { source: controlData.display_source, lat: controlData.display_lat, lon: controlData.display_lon, cep_m: controlData.display_cep_m }
     : null
-  const frameCount = fmMethod.layers?.find(l => l.label === 'Per-Frame Estimates')?.source_count ?? 0
-  const fmEstimate = fmMethod.layers?.find(l => l.active_estimate)?.active_estimate ?? null
-  const manualEstimate = controlData?.manual_lat != null ? { lat: controlData.manual_lat, lon: controlData.manual_lon } : null
+  const frameCount = Number(evidenceData?.frame_position_count ?? scatterPoints.length)
 
   const manualPoint = manualEstimate ? [{ lat: manualEstimate.lat, lon: manualEstimate.lon }] : []
   const points = [...scatterPoints, ...solutionPoints, ...ringContextPoints, ...manualPoint]
@@ -1578,7 +1410,7 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
         <div>
           <div className={styles.cardTitle}>Position Accumulation Map</div>
           <div className={styles.sectionLead}>
-            Each dot is an independent position estimate from one sweep frame. The scatter cloud converges on the radar position as more frames accumulate. Refreshes every 30 s.
+            Each dot is an independent position estimate from one sweep frame. The scatter cloud converges on the radar position as more frames accumulate.
           </div>
         </div>
       </div>
@@ -1671,8 +1503,7 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
       </div>
       {outlierResult && outlierResult.n_inliers < 2 && (
         <div className={styles.sectionLead} style={{ color: '#d29922', marginBottom: '0.75rem' }}>
-          Filter could not find a reliable cluster — data may not have converged yet, or all frames are scattered.
-          Stage 0 rejected {outlierResult.rejection_counts?.stage0 ?? '?'} of {outlierResult.n_total} frames.
+          Filter could not find a reliable cluster. Stage 0 rejected {outlierResult.rejection_counts?.stage0 ?? '?'} of {outlierResult.n_total} frames.
         </div>
       )}
       {loading || !bounds ? (
@@ -1682,7 +1513,6 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
           <svg width="100%" viewBox={`0 0 ${width} ${height}`} style={{ display: 'block', aspectRatio: '1 / 1' }}>
             <rect x="0" y="0" width={width} height={height} fill="#0d131a" />
 
-            {/* Range rings sized to the actual scatter extent — circles using lat-axis px/km scale */}
             {ringAnchor && ringDistances.map(ringKm => {
               const c = project(ringAnchor.lat, ringAnchor.lon, width, height)
               const edgeY = project(ringAnchor.lat + ringKm / 111.32, ringAnchor.lon, width, height)
@@ -1690,44 +1520,30 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
               if (r < 2) return null
               return (
                 <g key={`ring-${ringKm}`}>
-                  <circle cx={c.x} cy={c.y} r={r}
-                    fill="none" stroke="#2d3340" strokeWidth="1" strokeDasharray="3 4" />
-                  <text x={c.x + 3} y={c.y - r - 3} fill="#404858" fontSize="10"
-                    fontFamily="SFMono-Regular, Consolas, monospace">{ringKm} km</text>
+                  <circle cx={c.x} cy={c.y} r={r} fill="none" stroke="#2d3340" strokeWidth="1" strokeDasharray="3 4" />
+                  <text x={c.x + 3} y={c.y - r - 3} fill="#404858" fontSize="10" fontFamily="SFMono-Regular, Consolas, monospace">{ringKm} km</text>
                 </g>
               )
             })}
 
-            {/* Per-frame position estimate dots — outliers highlighted red when analysis is active */}
-            {activeMethods.flatMap(method =>
-              (method.layers ?? []).flatMap((layer, li) =>
-                (layer.features ?? []).map((feature, fi) => {
-                  const geometry = feature.geometry
-                  if (!geometry || geometry.type !== 'Point') return null
-                  if (feature.properties?.role !== 'frame_position_estimate') return null
-                  const [lon, lat] = geometry.coordinates
-                  const p = project(lat, lon, width, height)
-                  const frameIndex = feature.properties.frame_index
-                  const sus = feature.properties.sweep_start_us
-                  const isOutlier = outlierResult != null && outlierResult.outlierSet.has(sus)
-                  const dotColor = isOutlier ? '#ff7b72' : '#58a6ff'
-                  const dotOpacity = isOutlier ? 0.75 : (outlierResult != null ? 0.2 : 0.3)
-                  const dotR = isOutlier ? 3 : 2
-                  return (
-                    <g
-                      key={`${li}-${fi}`}
-                      onClick={() => handleDeletePoint(frameIndex)}
-                      style={{ cursor: 'pointer' }}
-                    >
-                      <circle cx={p.x} cy={p.y} r="7" fill="transparent" />
-                      <circle cx={p.x} cy={p.y} r={dotR} fill={dotColor} opacity={dotOpacity} />
-                    </g>
-                  )
-                })
+            {scatterPoints.map(point => {
+              const p = project(point.lat, point.lon, width, height)
+              const isOutlier = outlierResult != null && outlierResult.outlierSet.has(point.sweepStartUs)
+              const dotColor = isOutlier ? '#ff7b72' : '#58a6ff'
+              const dotOpacity = isOutlier ? 0.75 : (outlierResult != null ? 0.2 : 0.3)
+              const dotR = isOutlier ? 3 : 2
+              return (
+                <g
+                  key={`${point.frameIndex}-${point.sweepStartUs}-${point.lat}-${point.lon}`}
+                  onClick={() => handleDeletePoint(point.frameIndex)}
+                  style={{ cursor: 'pointer' }}
+                >
+                  <circle cx={p.x} cy={p.y} r="7" fill="transparent" />
+                  <circle cx={p.x} cy={p.y} r={dotR} fill={dotColor} opacity={dotOpacity} />
+                </g>
               )
-            )}
+            })}
 
-            {/* FM estimate — blue dot */}
             {fmEstimate && (() => {
               const p = project(fmEstimate.lat, fmEstimate.lon, width, height)
               return (
@@ -1738,7 +1554,6 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
               )
             })()}
 
-            {/* Dashed line from FM estimate to manual position, with error label */}
             {fmEstimate && manualEstimate && (() => {
               const pFm = project(fmEstimate.lat, fmEstimate.lon, width, height)
               const pMan = project(manualEstimate.lat, manualEstimate.lon, width, height)
@@ -1746,22 +1561,29 @@ function EvidenceMapPanel({ iid, refreshKey = 0 }) {
               const my = (pFm.y + pMan.y) / 2
               const errKm = flatDistKm(fmEstimate.lat, fmEstimate.lon, manualEstimate.lat, manualEstimate.lon)
               const errLabel = errKm < 1 ? `${Math.round(errKm * 1000)} m` : `${errKm.toFixed(1)} km`
-              // Perpendicular offset for the label so it doesn't sit on the line
-              const dx = pMan.x - pFm.x, dy = pMan.y - pFm.y
+              const dx = pMan.x - pFm.x
+              const dy = pMan.y - pFm.y
               const len = Math.hypot(dx, dy) || 1
-              const ox = -dy / len * 12, oy = dx / len * 12
+              const ox = -dy / len * 12
+              const oy = dx / len * 12
               return (
                 <g>
-                  <line x1={pFm.x} y1={pFm.y} x2={pMan.x} y2={pMan.y}
-                    stroke="#8b949e" strokeWidth="1" strokeDasharray="5 4" opacity="0.7" />
-                  <text x={mx + ox} y={my + oy} fill="#8b949e" fontSize="10"
+                  <line x1={pFm.x} y1={pFm.y} x2={pMan.x} y2={pMan.y} stroke="#8b949e" strokeWidth="1" strokeDasharray="5 4" opacity="0.7" />
+                  <text
+                    x={mx + ox}
+                    y={my + oy}
+                    fill="#8b949e"
+                    fontSize="10"
                     fontFamily="SFMono-Regular, Consolas, monospace"
-                    textAnchor="middle" dominantBaseline="middle">{errLabel}</text>
+                    textAnchor="middle"
+                    dominantBaseline="middle"
+                  >
+                    {errLabel}
+                  </text>
                 </g>
               )
             })()}
 
-            {/* Manual reference — amber dot */}
             {manualEstimate && (() => {
               const p = project(manualEstimate.lat, manualEstimate.lon, width, height)
               return (
@@ -1831,10 +1653,12 @@ function useSelectedIidPageState(iid, windowS, debugLimit = 120) {
     lastUpdateAt: null,
     sequence: null,
     fallback: false,
+    changedSections: [],
   })
   const retryRef = useRef(null)
   const fallbackRef = useRef(null)
   const lastUpdateRef = useRef(0)
+  const revisionsRef = useRef(null)
 
   useEffect(() => {
     if (iid == null) {
@@ -1845,16 +1669,35 @@ function useSelectedIidPageState(iid, windowS, debugLimit = 120) {
         lastUpdateAt: null,
         sequence: null,
         fallback: false,
+        changedSections: [],
       })
+      revisionsRef.current = null
       return
     }
 
     let closed = false
     let ws = null
+    revisionsRef.current = null
+
+    const getChangedSections = revisions => {
+      const next = revisions && typeof revisions === 'object' ? revisions : {}
+      const prev = revisionsRef.current
+      revisionsRef.current = next
+      if (!prev) return Object.keys(next)
+      return Object.entries(next)
+        .filter(([section, revision]) => prev?.[section] !== revision)
+        .map(([section]) => section)
+    }
 
     const ingestSnapshot = payload => {
       if (!payload || payload.type !== 'radar_selected_iid_state') return
-      recordRadarPageStream('ws_selected_iid_state', 'message', { iid, sequence: payload.sequence ?? null })
+      const changedSections = getChangedSections(payload.revisions)
+      recordRadarPageStream('ws_selected_iid_state', 'message', {
+        iid,
+        sequence: payload.sequence ?? null,
+        changedSections,
+        revisions: payload.revisions ?? null,
+      })
       lastUpdateRef.current = performance.now()
       startTransition(() => setSnapshot(payload))
       setStatus({
@@ -1863,6 +1706,7 @@ function useSelectedIidPageState(iid, windowS, debugLimit = 120) {
         lastUpdateAt: Date.now(),
         sequence: payload.sequence ?? null,
         fallback: false,
+        changedSections,
       })
     }
 
@@ -1874,6 +1718,7 @@ function useSelectedIidPageState(iid, windowS, debugLimit = 120) {
       })
         .then(payload => {
           if (closed || !payload || payload.type !== 'radar_selected_iid_state') return
+          const changedSections = getChangedSections(payload.revisions)
           lastUpdateRef.current = performance.now()
           startTransition(() => setSnapshot(payload))
           setStatus({
@@ -1882,6 +1727,7 @@ function useSelectedIidPageState(iid, windowS, debugLimit = 120) {
             lastUpdateAt: Date.now(),
             sequence: payload.sequence ?? null,
             fallback: true,
+            changedSections,
           })
         })
         .catch(() => {
@@ -1913,6 +1759,7 @@ function useSelectedIidPageState(iid, windowS, debugLimit = 120) {
               mode: 'stream',
               sequence: payload.sequence ?? prev.sequence,
               fallback: false,
+              changedSections: [],
             }))
             return
           }
@@ -1953,218 +1800,6 @@ const legendDotStyle = {
   height: '0.55rem',
   borderRadius: '999px',
   display: 'inline-block',
-}
-
-function SyncDiagnosticsPanel({
-  syncState,
-  waveformBins,
-  perIcaoQuality,
-  observations,
-  periodUpdateHistory,
-  slopeHistory,
-  periodHistory,
-  predictorConsistency,
-}) {
-  if (!syncState) return null
-  const basePeriod = Number(syncState.period_base_s)
-  const livePeriod = Number(syncState.period_s)
-  const ppm = Number(syncState.period_correction_ppm)
-  const slope = Number(syncState.residual_slope_deg_per_s)
-  const wfReduction = Number(syncState.waveform_residual_reduction_deg)
-  const updateProposed = Number(syncState.period_update_proposed_s ?? syncState.period_update_term)
-  const updateApplied = Number(syncState.period_update_applied_s ?? syncState.period_update_applied)
-  const updateGain = Number(syncState.period_update_gain)
-  const updatePpmUnclamped = Number(syncState.period_update_ppm_unclamped)
-  const updatePpmApplied = Number(syncState.period_update_ppm_applied)
-  const fitEligible = Number(syncState.fit_eligible_observations)
-  const fitTotal = Number(syncState.fit_total_observations)
-  const fitSpan = Number(syncState.fit_span_s)
-  const recentSlope = Array.isArray(slopeHistory) ? slopeHistory.slice(-12) : []
-  const recentPeriods = Array.isArray(periodHistory) ? periodHistory.slice(-12) : []
-  const slopeTrend = recentSlope.length >= 2
-    ? Math.abs(Number(recentSlope[recentSlope.length - 1]?.residual_slope_deg_per_s ?? 0))
-      - Math.abs(Number(recentSlope[0]?.residual_slope_deg_per_s ?? 0))
-    : null
-  const recentUpdates = Array.isArray(periodUpdateHistory) ? periodUpdateHistory.slice(-6).reverse() : []
-  const rejectReasons = syncState.fit_reject_reasons && typeof syncState.fit_reject_reasons === 'object'
-    ? Object.entries(syncState.fit_reject_reasons)
-    : []
-  const consistency = predictorConsistency || syncState.predictor_consistency || {}
-  const pillStyle = {
-    display: 'inline-block',
-    padding: '2px 6px',
-    margin: '2px',
-    border: '1px solid #30363d',
-    borderRadius: '3px',
-    fontSize: '0.72rem',
-    color: '#c9d1d9',
-    background: '#0f141b',
-  }
-  const valueStyle = { color: '#d2e4ff', fontFamily: 'SFMono-Regular, Consolas, monospace', marginLeft: '4px' }
-
-  // Residual-vs-phase scatter and residual-vs-range scatter.
-  const phaseW = 520, phaseH = 132
-  const rangeW = 520, rangeH = 132
-  const phaseDots = []
-  const rangeDots = []
-  const absResiduals = []
-  let maxRangeNm = 10
-  for (const obs of observations || []) {
-    const phase = Number(obs?.phase_in_rot_deg)
-    const resRaw = Number(obs?.residual_raw_deg ?? obs?.residual_deg)
-    const resCorr = Number(obs?.residual_corrected_deg ?? obs?.residual_deg)
-    const rangeNm = Number(obs?.range_nm)
-    if (Number.isFinite(phase) && Number.isFinite(resRaw)) {
-      phaseDots.push({ phase, res: resRaw, cls: obs.classification })
-      absResiduals.push(Math.abs(resRaw))
-    }
-    if (Number.isFinite(rangeNm) && Number.isFinite(resCorr)) {
-      rangeDots.push({ r: rangeNm, res: resCorr, cls: obs.classification })
-      if (rangeNm > maxRangeNm) maxRangeNm = rangeNm
-    }
-  }
-  const yAbs = Math.max(10, Math.min(60, Math.ceil(Math.max(1, ...absResiduals) / 5) * 5))
-
-  return (
-    <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '2px' }}>
-        <span style={pillStyle}>Base period<span style={valueStyle}>{Number.isFinite(basePeriod) && basePeriod > 0 ? `${basePeriod.toFixed(4)}s` : '—'}</span></span>
-        <span style={pillStyle}>Refined period<span style={valueStyle}>{Number.isFinite(livePeriod) && livePeriod > 0 ? `${livePeriod.toFixed(4)}s` : '—'}</span></span>
-        <span style={pillStyle}>Period samples<span style={valueStyle}>{recentPeriods.length || '—'}</span></span>
-        <span style={pillStyle}>ppm<span style={valueStyle}>{Number.isFinite(ppm) ? `${ppm >= 0 ? '+' : ''}${ppm.toFixed(1)}` : '—'}</span></span>
-        <span style={pillStyle}>Slope<span style={valueStyle}>{Number.isFinite(slope) ? `${slope.toFixed(3)}°/s` : '—'}</span></span>
-        <span style={pillStyle}>Period status<span style={valueStyle}>{syncState.period_correction_status || 'unknown'}</span></span>
-        <span style={pillStyle}>Slope trend<span style={valueStyle}>{slopeTrend == null ? '—' : (slopeTrend < 0 ? 'shrinking' : slopeTrend > 0 ? 'growing' : 'flat')}</span></span>
-        <span style={pillStyle}>Refine<span style={valueStyle}>{syncState.period_refine_enabled ? 'on' : 'off'}</span></span>
-        <span style={pillStyle}>Proposed ΔT<span style={valueStyle}>{Number.isFinite(updateProposed) ? `${updateProposed >= 0 ? '+' : ''}${(updateProposed * 1e6).toFixed(1)}µs` : '—'}</span></span>
-        <span style={pillStyle}>Applied ΔT<span style={valueStyle}>{Number.isFinite(updateApplied) ? `${updateApplied >= 0 ? '+' : ''}${(updateApplied * 1e6).toFixed(1)}µs` : '—'}</span></span>
-        <span style={pillStyle}>Update ppm<span style={valueStyle}>
-          {Number.isFinite(updatePpmApplied) ? `${Number.isFinite(updatePpmUnclamped) ? `${updatePpmUnclamped.toFixed(1)}→` : ''}${updatePpmApplied.toFixed(1)}` : '—'}
-        </span></span>
-        <span style={pillStyle}>Direction<span style={valueStyle}>{syncState.period_update_direction || '—'}</span></span>
-        <span style={pillStyle}>Gain<span style={valueStyle}>{Number.isFinite(updateGain) ? updateGain.toFixed(2) : '—'}</span></span>
-        <span style={pillStyle}>Block<span style={valueStyle}>{syncState.period_update_block_reason || syncState.period_refine_block_reason || 'none'}</span></span>
-        <span style={pillStyle}>Clamp<span style={valueStyle}>{syncState.period_update_clamp_reason || 'none'}</span></span>
-        <span style={pillStyle}>Fit support<span style={valueStyle}>{Number.isFinite(fitEligible) && Number.isFinite(fitTotal) ? `${fitEligible}/${fitTotal}` : '—'}</span></span>
-        <span style={pillStyle}>Fit span<span style={valueStyle}>{Number.isFinite(fitSpan) ? `${fitSpan.toFixed(1)}s` : '—'}</span></span>
-        <span style={pillStyle}>Waveform<span style={valueStyle}>{syncState.waveform_enabled ? (syncState.waveform_applied ? 'applied' : 'learning') : 'off'}</span></span>
-        <span style={pillStyle}>Waveform learn<span style={valueStyle}>{syncState.waveform_learning_enabled ? 'on' : (syncState.waveform_update_block_reason || 'off')}</span></span>
-        <span style={pillStyle}>Wf Δ|res|<span style={valueStyle}>{Number.isFinite(wfReduction) ? `${wfReduction.toFixed(2)}°` : '—'}</span></span>
-        <span style={pillStyle}>Prop delay<span style={valueStyle}>{syncState.prop_delay_enabled ? 'on' : 'off'}</span></span>
-        <span style={pillStyle}>Contributors<span style={valueStyle}>{syncState.contributing_icao_count ?? '—'}</span></span>
-        <span style={pillStyle}>Predictors<span style={valueStyle}>{Object.values(consistency).every(Boolean) ? 'unified' : 'check'}</span></span>
-      </div>
-
-      {(recentUpdates.length > 0 || rejectReasons.length > 0) && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '8px', marginTop: '0.4rem', fontSize: '0.72rem' }}>
-          {recentUpdates.length > 0 && (
-            <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '4px 6px', overflow: 'auto' }}>
-              <div style={{ color: '#8b949e', marginBottom: '2px' }}>Recent period updates</div>
-              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                <thead><tr style={{ color: '#8b949e' }}><th style={{ textAlign: 'right' }}>slope</th><th style={{ textAlign: 'right' }}>proposed</th><th style={{ textAlign: 'right' }}>applied</th><th style={{ textAlign: 'left' }}>state</th></tr></thead>
-                <tbody>
-                  {recentUpdates.map((u, i) => (
-                    <tr key={`${u.ts}-${i}`}>
-                      <td style={{ textAlign: 'right', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{Number(u.residual_slope_deg_per_s ?? 0).toFixed(3)}</td>
-                      <td style={{ textAlign: 'right', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{(Number(u.period_update_proposed_s ?? u.period_update_term ?? 0) * 1e6).toFixed(1)}</td>
-                      <td style={{ textAlign: 'right', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{(Number(u.period_update_applied_s ?? u.period_update_applied ?? 0) * 1e6).toFixed(1)}</td>
-                      <td>{u.period_update_block_reason || u.period_update_clamp_reason || u.period_correction_status || 'applied'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-          {rejectReasons.length > 0 && (
-            <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '4px 6px' }}>
-              <div style={{ color: '#8b949e', marginBottom: '2px' }}>Fit reject reasons</div>
-              {rejectReasons.map(([reason, count]) => (
-                <span key={reason} style={pillStyle}>{reason}<span style={valueStyle}>{count}</span></span>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '12px', marginTop: '0.4rem' }}>
-        <div style={{ minWidth: 0 }}>
-          <div style={{ fontSize: '0.7rem', color: '#8b949e', marginBottom: '2px' }}>Residual vs phase-in-rotation</div>
-          <svg
-            width="100%"
-            height={phaseH}
-            viewBox={`0 0 ${phaseW} ${phaseH}`}
-            style={{ background: '#0f141b', border: '1px solid #30363d', display: 'block' }}
-          >
-            <line x1={0} y1={phaseH / 2} x2={phaseW} y2={phaseH / 2} stroke="#58a6ff55" />
-            {phaseDots.map((d, i) => (
-              <circle key={i} cx={(d.phase / 360) * phaseW}
-                      cy={phaseH / 2 - (Math.max(-yAbs, Math.min(yAbs, d.res)) / yAbs) * (phaseH / 2 - 3)}
-                      r={1.6} fill={burstSyncClassColor(d.cls)} fillOpacity={0.7} />
-            ))}
-            {Array.isArray(waveformBins) && waveformBins.length > 1 && (
-              <polyline
-                fill="none" stroke="#d29922" strokeWidth={1.2}
-                points={waveformBins.map(b => {
-                  const x = (Number(b.phase_center_deg) / 360) * phaseW
-                  const y = phaseH / 2 - (Math.max(-yAbs, Math.min(yAbs, Number(b.correction_deg))) / yAbs) * (phaseH / 2 - 3)
-                  return `${x.toFixed(1)},${y.toFixed(1)}`
-                }).join(' ')}
-              />
-            )}
-            <text x={2} y={10} fontSize="9" fill="#8b949e">+{yAbs}°</text>
-            <text x={2} y={phaseH - 2} fontSize="9" fill="#8b949e">-{yAbs}°</text>
-            <text x={phaseW - 25} y={phaseH - 2} fontSize="9" fill="#8b949e">360°</text>
-          </svg>
-        </div>
-
-        <div style={{ minWidth: 0 }}>
-          <div style={{ fontSize: '0.7rem', color: '#8b949e', marginBottom: '2px' }}>Residual vs range (corrected)</div>
-          <svg
-            width="100%"
-            height={rangeH}
-            viewBox={`0 0 ${rangeW} ${rangeH}`}
-            style={{ background: '#0f141b', border: '1px solid #30363d', display: 'block' }}
-          >
-            <line x1={0} y1={rangeH / 2} x2={rangeW} y2={rangeH / 2} stroke="#58a6ff55" />
-            {rangeDots.map((d, i) => (
-              <circle key={i} cx={(d.r / maxRangeNm) * rangeW}
-                      cy={rangeH / 2 - (Math.max(-yAbs, Math.min(yAbs, d.res)) / yAbs) * (rangeH / 2 - 3)}
-                      r={1.6} fill={burstSyncClassColor(d.cls)} fillOpacity={0.7} />
-            ))}
-            <text x={2} y={10} fontSize="9" fill="#8b949e">+{yAbs}°</text>
-            <text x={2} y={rangeH - 2} fontSize="9" fill="#8b949e">-{yAbs}°</text>
-            <text x={rangeW - 38} y={rangeH - 2} fontSize="9" fill="#8b949e">{maxRangeNm.toFixed(0)}NM</text>
-          </svg>
-        </div>
-
-        {Array.isArray(perIcaoQuality) && perIcaoQuality.length > 0 && (
-          <div style={{ maxHeight: '150px', overflow: 'auto', fontSize: '0.72rem', minWidth: 0, border: '1px solid #30363d', background: '#0f141b' }}>
-            <div style={{ color: '#8b949e', marginBottom: '2px' }}>Per-aircraft residual quality</div>
-            <table style={{ borderCollapse: 'collapse', width: '100%' }}>
-              <thead>
-                <tr style={{ color: '#8b949e' }}>
-                  <th style={{ textAlign: 'left', padding: '0 6px' }}>icao</th>
-                  <th style={{ textAlign: 'right', padding: '0 6px' }}>median°</th>
-                  <th style={{ textAlign: 'right', padding: '0 6px' }}>mad°</th>
-                  <th style={{ textAlign: 'right', padding: '0 6px' }}>n</th>
-                </tr>
-              </thead>
-              <tbody>
-                {perIcaoQuality.slice(0, 12).map(q => (
-                  <tr key={q.icao}>
-                    <td style={{ padding: '0 6px', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{q.icao}</td>
-                    <td style={{ padding: '0 6px', textAlign: 'right' }}>{Number(q.residual_median_deg).toFixed(2)}</td>
-                    <td style={{ padding: '0 6px', textAlign: 'right' }}>{Number(q.residual_mad_deg).toFixed(2)}</td>
-                    <td style={{ padding: '0 6px', textAlign: 'right' }}>{q.n}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-    </div>
-  )
 }
 
 function PhaseAnchorPanel({ syncState, observations, candidates }) {
@@ -2316,337 +1951,6 @@ function fmtNumber(value, digits = 2, suffix = '') {
   return Number.isFinite(n) ? `${n.toFixed(digits)}${suffix}` : '-'
 }
 
-function fmtUs(value) {
-  const n = Number(value)
-  return Number.isFinite(n) ? `${Math.round(n)}` : '-'
-}
-
-function SyncDebugPanel({ debug, iid, windowS }) {
-  const [showAdvanced, setShowAdvanced] = useState(false)
-  const [advancedDebug, setAdvancedDebug] = useState(null)
-  const summary = debug?.summary ?? null
-  const observations = Array.isArray(debug?.observations) ? debug.observations : []
-  const phaseShape = debug?.observation_model_diagnostics?.folded_phase_shape || {}
-  useEffect(() => {
-    setAdvancedDebug(null)
-    setShowAdvanced(false)
-  }, [iid])
-
-  useEffect(() => {
-    if (!showAdvanced || iid == null || advancedDebug) return
-    const controller = new AbortController()
-    fetch(`${API_BASE}/api/radar/iids/${iid}/sync-debug?window_s=${windowS ?? BURST_SYNC_ALIGNMENT_WINDOW_S}&limit=120`, {
-      signal: controller.signal,
-    })
-      .then(response => response.ok ? response.json() : null)
-      .then(payload => {
-        if (payload) setAdvancedDebug(payload)
-      })
-      .catch(() => {})
-    return () => controller.abort()
-  }, [advancedDebug, iid, showAdvanced, windowS])
-
-  const plotRows = useMemo(() => observations
-    .map(obs => {
-      const t = Number(obs.effective_beast_us)
-      const raw = Number(obs.residual_raw_deg ?? obs.resid_authoritative_deg)
-      const detrended = Number(obs.residual_detrended_deg)
-      const phase = Number(obs.phase_deg ?? obs.phase_authoritative_deg)
-      const cycle = Number(obs.cycle_index)
-      return {
-        ...obs,
-        t,
-        raw,
-        detrended,
-        phase,
-        cycle: Number.isFinite(cycle) ? cycle : null,
-        fit: obs.fit_eligible !== false,
-      }
-    })
-    .filter(row => Number.isFinite(row.t) && Number.isFinite(row.raw)), [observations])
-  const cycleRows = useMemo(() => {
-    const grouped = new Map()
-    for (const row of plotRows) {
-      if (row.cycle == null || !Number.isFinite(row.phase) || !Number.isFinite(row.detrended)) continue
-      if (!grouped.has(row.cycle)) grouped.set(row.cycle, [])
-      grouped.get(row.cycle).push(row)
-    }
-    return Array.from(grouped.entries())
-      .sort((a, b) => a[0] - b[0])
-      .slice(-18)
-      .map(([cycle, rows]) => ({ cycle, rows: rows.slice().sort((a, b) => a.phase - b.phase) }))
-  }, [plotRows])
-  if (!summary) return null
-
-  const fitCount = observations.filter(obs => obs.fit_eligible).length
-  const nonFitCount = observations.length - fitCount
-  const phaseBins = Array.isArray(phaseShape.phase_bins) ? phaseShape.phase_bins : []
-  const advancedSource = advancedDebug ?? debug
-  const observationDiag = advancedSource?.observation_model_diagnostics ?? summary.observation_model_diagnosis ?? {}
-  const methodRows = Array.isArray(observationDiag.method_summary_overall) ? observationDiag.method_summary_overall : []
-  const perIcaoDiag = Array.isArray(observationDiag.per_icao) ? observationDiag.per_icao : []
-  const latestSource = Array.isArray(advancedSource?.observations) ? advancedSource.observations : observations
-  const latest = latestSource.slice(-24)
-  const flagOk = summary.wall_clock_used_operationally === false
-  const predictorOk = Boolean(summary.predictors_consistent_localiser)
-    && Boolean(summary.predictors_consistent_position_verification)
-    && Boolean(summary.predictors_consistent_burst_sync)
-  const unavailableReason = debug?.available === false ? (debug.reason || 'Sync diagnostics are unavailable.') : null
-  const plotW = 720
-  const plotH = 190
-  const padL = 48
-  const padR = 16
-  const padT = 14
-  const padB = 28
-  const plotInnerW = plotW - padL - padR
-  const plotInnerH = plotH - padT - padB
-  const effValues = plotRows.map(row => row.t)
-  const minEff = effValues.length ? Math.min(...effValues) : 0
-  const maxEff = effValues.length ? Math.max(...effValues) : minEff + 1
-  const spanEff = Math.max(1, maxEff - minEff)
-  const residualAbsMax = Math.min(180, Math.max(
-    12,
-    ...plotRows.flatMap(row => [Math.abs(row.raw), Math.abs(row.detrended)].filter(Number.isFinite)),
-  ))
-  const panelStyle = { padding: '8px', marginBottom: '0.7rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }
-  const tableStyle = { width: '100%', borderCollapse: 'collapse', fontSize: '0.7rem' }
-  const thStyle = { textAlign: 'right', padding: '2px 5px', color: '#8b949e', whiteSpace: 'nowrap' }
-  const tdRight = { textAlign: 'right', padding: '2px 5px', fontFamily: 'SFMono-Regular, Consolas, monospace', whiteSpace: 'nowrap' }
-  const tdLeft = { textAlign: 'left', padding: '2px 5px', whiteSpace: 'nowrap' }
-
-  function xEffective(effectiveBeastUs) {
-    return padL + ((Number(effectiveBeastUs) - minEff) / spanEff) * plotInnerW
-  }
-  function xPhase(phaseDeg) {
-    return padL + ((((Number(phaseDeg) % 360) + 360) % 360) / 360) * plotInnerW
-  }
-  function yResidual(residualDeg) {
-    return padT + ((residualAbsMax - Number(residualDeg)) / (2 * residualAbsMax)) * plotInnerH
-  }
-  function plotFrame(children, xLabel) {
-    return (
-      <svg width="100%" height={plotH} viewBox={`0 0 ${plotW} ${plotH}`} style={{ background: '#0f141b', border: '1px solid #30363d', display: 'block' }}>
-        <line x1={padL} y1={yResidual(0)} x2={plotW - padR} y2={yResidual(0)} stroke="#58a6ff88" />
-        {[-0.5, 0.5].map(mult => (
-          <line key={mult} x1={padL} y1={yResidual(mult * residualAbsMax)} x2={plotW - padR} y2={yResidual(mult * residualAbsMax)} stroke="#21262d" strokeDasharray="3 5" />
-        ))}
-        {children}
-        <text x={4} y={12} fill="#8b949e" fontSize="9">±{residualAbsMax.toFixed(0)}°</text>
-        <text x={padL} y={plotH - 8} fill="#8b949e" fontSize="9">{xLabel}</text>
-      </svg>
-    )
-  }
-
-  return (
-    <div style={panelStyle}>
-      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.4rem' }}>
-        <div>
-          <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Sync Diagnosis</div>
-          <div style={{ color: '#8b949e', fontSize: '0.74rem' }}>Beast-time residual drift, folded phase shape, and sweep-to-sweep repeatability.</div>
-        </div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: '4px', fontSize: '0.72rem' }}>
-          <span className={styles.metricPill}>Mode <span className={styles.metricValue}>{summary.dominant_error_mode || '—'}</span></span>
-          <span className={styles.metricPill}>Correction <span className={styles.metricValue}>{summary.period_correction_status || 'unknown'}</span></span>
-          <span className={styles.metricPill}>Period <span className={styles.metricValue}>{fmtNumber(summary.current_period_s, 6, 's')}</span></span>
-          <span className={styles.metricPill}>Slope <span className={styles.metricValue}>{fmtNumber(summary.fit_slope_deg_per_s ?? summary.current_slope_deg_per_s, 4, '°/s')}</span></span>
-          <span className={styles.metricPill}>Proposed ΔT <span className={styles.metricValue}>{fmtNumber(summary.period_update_proposed_us, 1, 'µs')}</span></span>
-          <span className={styles.metricPill}>Applied ΔT <span className={styles.metricValue}>{fmtNumber(summary.period_update_applied_us, 1, 'µs')}</span></span>
-          <span className={styles.metricPill}>Block/clamp <span className={styles.metricValue}>{summary.period_update_block_reason || summary.period_update_clamp_reason || 'none'}</span></span>
-          <span className={styles.metricPill}>Raw median/MAD <span className={styles.metricValue}>{fmtNumber(summary.raw_median_abs_residual_deg, 2, '°')} / {fmtNumber(summary.raw_mad_deg, 2, '°')}</span></span>
-          <span className={styles.metricPill}>Detrended median/MAD <span className={styles.metricValue}>{fmtNumber(summary.detrended_median_abs_residual_deg, 2, '°')} / {fmtNumber(summary.detrended_mad_deg, 2, '°')}</span></span>
-          <span className={styles.metricPill}>Repeatability <span className={styles.metricValue}>{fmtNumber(Number(summary.cycle_to_cycle_repeatability) * 100, 0, '%')}</span></span>
-          <span className={styles.metricPill}>Fit <span className={styles.metricValue}>{fitCount}/{observations.length}</span></span>
-          <span className={styles.metricPill}>Basis <span className={styles.metricValue}>{summary.operational_time_basis || 'effective_beast_us'}</span></span>
-        </div>
-      </div>
-
-      {unavailableReason ? (
-        <div className={styles.empty} style={{ marginBottom: 0 }}>
-          {unavailableReason}
-        </div>
-      ) : null}
-
-      {!unavailableReason && plotRows.length === 0 ? (
-        <div className={styles.empty} style={{ marginBottom: 0 }}>
-          No sync-diagnosis observations in the selected window yet.
-        </div>
-      ) : null}
-
-      {!unavailableReason && plotRows.length > 0 && (
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(330px, 1fr))', gap: '10px', marginBottom: '0.6rem' }}>
-        <div>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>Raw residual vs elapsed Beast time</div>
-          {plotFrame(plotRows.map((row, idx) => (
-            <circle key={idx} cx={xEffective(row.t)} cy={yResidual(row.raw)}
-                    r={row.fit ? 2.6 : 1.8} fill={row.fit ? '#3fb950' : '#8b949e'} opacity={row.fit ? 0.9 : 0.35}>
-              <title>{`${row.icao || '—'} raw ${row.raw.toFixed(2)}°`}</title>
-            </circle>
-          )), `${(spanEff / 1_000_000).toFixed(1)}s Beast-time window`)}
-        </div>
-        <div>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>Detrended residual vs phase-in-rotation</div>
-          {plotFrame(
-            <>
-              {plotRows.filter(row => Number.isFinite(row.phase) && Number.isFinite(row.detrended)).map((row, idx) => (
-                <circle key={idx} cx={xPhase(row.phase)} cy={yResidual(row.detrended)}
-                        r={row.fit ? 2.6 : 1.8} fill={row.fit ? '#58a6ff' : '#8b949e'} opacity={row.fit ? 0.86 : 0.35}>
-                  <title>{`${row.icao || '—'} phase ${row.phase.toFixed(1)}° detrended ${row.detrended.toFixed(2)}°`}</title>
-                </circle>
-              ))}
-              <polyline
-                fill="none"
-                stroke="#ffd166"
-                strokeWidth={1.6}
-                points={phaseBins
-                  .filter(bin => Number.isFinite(Number(bin.median_residual_detrended_deg)))
-                  .map(bin => `${xPhase(bin.phase_center_deg).toFixed(1)},${yResidual(bin.median_residual_detrended_deg).toFixed(1)}`)
-                  .join(' ')}
-              />
-            </>,
-            '0-360° phase',
-          )}
-        </div>
-      </div>
-      )}
-
-      {!unavailableReason && plotRows.length > 0 && (
-      <div style={{ marginBottom: '0.6rem' }}>
-        <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>Folded per-sweep overlay after detrending</div>
-        {plotFrame(
-          <>
-            {cycleRows.map((cycle, idx) => (
-              <polyline
-                key={cycle.cycle}
-                fill="none"
-                stroke={idx === cycleRows.length - 1 ? '#58a6ff' : '#8b949e'}
-                strokeWidth={idx === cycleRows.length - 1 ? 1.2 : 0.8}
-                opacity={idx === cycleRows.length - 1 ? 0.75 : 0.25}
-                points={cycle.rows.map(row => `${xPhase(row.phase).toFixed(1)},${yResidual(row.detrended).toFixed(1)}`).join(' ')}
-              />
-            ))}
-            <polyline
-              fill="none"
-              stroke="#ffd166"
-              strokeWidth={2}
-              points={phaseBins
-                .filter(bin => Number.isFinite(Number(bin.median_residual_detrended_deg)))
-                .map(bin => `${xPhase(bin.phase_center_deg).toFixed(1)},${yResidual(bin.median_residual_detrended_deg).toFixed(1)}`)
-                .join(' ')}
-            />
-          </>,
-          `${cycleRows.length} cycles overlaid on 0-360° phase`,
-        )}
-      </div>
-      )}
-
-      {!unavailableReason && (
-      <button
-        type="button"
-        onClick={() => setShowAdvanced(v => !v)}
-        style={{ marginBottom: showAdvanced ? '0.5rem' : 0, padding: '4px 8px', border: '1px solid #30363d', borderRadius: '4px', background: '#0f141b', color: '#c9d1d9', cursor: 'pointer' }}
-      >
-        {showAdvanced ? 'Hide advanced diagnostics' : 'Show advanced diagnostics'}
-      </button>
-      )}
-
-      {!unavailableReason && showAdvanced && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '10px' }}>
-          <div style={{ overflow: 'auto', border: '1px solid #30363d', background: '#0f141b' }}>
-            <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>Observation rows</div>
-            <table style={tableStyle}>
-              <thead>
-                <tr>
-                  <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
-                  <th style={thStyle}>raw</th>
-                  <th style={thStyle}>trend</th>
-                  <th style={thStyle}>detrended</th>
-                  <th style={thStyle}>phase</th>
-                  <th style={thStyle}>cycle</th>
-                  <th style={{ ...thStyle, textAlign: 'left' }}>fit</th>
-                </tr>
-              </thead>
-              <tbody>
-                {latest.map((obs, idx) => {
-                  const fit = obs.fit_eligible !== false
-                  return (
-                    <tr key={`${obs.icao}-${obs.burst_center_beast_us}-${idx}`} style={{ opacity: fit ? 1 : 0.55, borderTop: '1px solid #21262d' }}>
-                      <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</td>
-                      <td style={tdRight}>{fmtNumber(obs.residual_raw_deg ?? obs.resid_authoritative_deg, 2, '°')}</td>
-                      <td style={tdRight}>{fmtNumber(obs.detrend_component_deg, 2, '°')}</td>
-                      <td style={tdRight}>{fmtNumber(obs.residual_detrended_deg, 2, '°')}</td>
-                      <td style={tdRight}>{fmtNumber(obs.phase_deg ?? obs.phase_authoritative_deg, 1, '°')}</td>
-                      <td style={tdRight}>{obs.cycle_index ?? '—'}</td>
-                      <td style={tdLeft}>{fit ? 'fit' : (obs.fit_reject_reason || 'display')}</td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
-
-          <div style={{ overflow: 'auto', border: '1px solid #30363d', background: '#0f141b' }}>
-            <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>Timestamp and predictor checks</div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', padding: '0 6px 6px', fontSize: '0.72rem' }}>
-              <span className={styles.metricPill}>Wall operational <span className={styles.metricValue}>{flagOk ? 'false' : 'CHECK'}</span></span>
-              <span className={styles.metricPill}>Predictors <span className={styles.metricValue}>{predictorOk ? 'consistent' : 'CHECK'}</span></span>
-              <span className={styles.metricPill}>Display-only <span className={styles.metricValue}>{nonFitCount}</span></span>
-              <span className={styles.metricPill}>Raw/effective max <span className={styles.metricValue}>{fmtNumber(summary.max_raw_vs_effective_prediction_delta_deg, 3, '°')}</span></span>
-              <span className={styles.metricPill}>Wall/effective max <span className={styles.metricValue}>{fmtNumber(summary.max_wall_vs_effective_prediction_delta_deg, 3, '°')}</span></span>
-              <span className={styles.metricPill}>Wall roundtrip max <span className={styles.metricValue}>{fmtNumber(summary.max_wall_roundtrip_error_us, 1, 'µs')}</span></span>
-            </div>
-            <table style={tableStyle}>
-              <thead>
-                <tr>
-                  <th style={{ ...thStyle, textAlign: 'left' }}>method</th>
-                  <th style={thStyle}>n</th>
-                  <th style={thStyle}>median |res|</th>
-                  <th style={thStyle}>MAD</th>
-                </tr>
-              </thead>
-              <tbody>
-                {methodRows.map(row => (
-                  <tr key={row.method}>
-                    <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{row.method}</td>
-                    <td style={tdRight}>{row.count ?? 0}</td>
-                    <td style={tdRight}>{fmtNumber(row.median_abs_residual_deg, 2, '°')}</td>
-                    <td style={tdRight}>{fmtNumber(row.robust_spread_mad_deg, 2, '°')}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          {perIcaoDiag.length > 0 && (
-            <div style={{ overflow: 'auto', border: '1px solid #30363d', background: '#0f141b' }}>
-              <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>Per-aircraft anchor quality</div>
-              <table style={tableStyle}>
-                <thead>
-                  <tr>
-                    <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
-                    <th style={thStyle}>n</th>
-                    <th style={thStyle}>median</th>
-                    <th style={thStyle}>spread</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {perIcaoDiag.slice(0, 12).map(row => (
-                    <tr key={row.icao}>
-                      <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{row.icao}</td>
-                      <td style={tdRight}>{row.count}</td>
-                      <td style={tdRight}>{fmtNumber(row.median_residual_deg, 2, '°')}</td>
-                      <td style={tdRight}>{fmtNumber(row.absolute_residual_spread_deg, 2, '°')}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
-
 function RotationAlignmentPanel({
   iid,
   selectedRow,
@@ -2726,7 +2030,6 @@ function RotationAlignmentPanel({
   }, [iid, alignmentMode])
 
   const burstTimeline = syncSnapshot
-  const syncDebug = syncSnapshot?.sync_debug ?? null
   const rotation = syncSnapshot?.rotation ?? null
   const observations = Array.isArray(burstTimeline?.observations) ? burstTimeline.observations : []
   const legacyIcaosRaw = Array.isArray(legacyTimeline?.icaos) ? legacyTimeline.icaos : []
@@ -2864,10 +2167,58 @@ function RotationAlignmentPanel({
     180,
     Math.max(45, Math.max(maxAbsResidualBursts, maxAbsResidualDf11) * 1.25, Number.isFinite(jitterDeg) ? jitterDeg * 4 : 0),
   )
+  const phaseResidualRows = filteredObservations
+    .map(obs => ({
+      key: `${obs?.icao ?? 'unknown'}-${Number(obs?.beam_center_us ?? obs?.raw_arrival_us ?? 0)}-${Number(obs?.residual_deg ?? 0).toFixed(3)}`,
+      phaseDeg: Number(obs?.bearing_deg),
+      residualDeg: Number(obs?.residual_deg),
+      residualCorrectedDeg: Number(obs?.residual_corrected_deg ?? obs?.residual_deg),
+      classification: obs?.classification,
+      icao: obs?.icao,
+      bearingDeg: Number(obs?.bearing_deg),
+      rangeNm: Number(obs?.range_nm),
+    }))
+    .filter(row => Number.isFinite(row.phaseDeg) && Number.isFinite(row.residualDeg))
+    .sort((a, b) => (a.phaseDeg - b.phaseDeg) || a.key.localeCompare(b.key))
+  const rangeResidualRows = phaseResidualRows
+    .filter(row => Number.isFinite(row.rangeNm) && Number.isFinite(row.residualCorrectedDeg))
+    .sort((a, b) => (a.rangeNm - b.rangeNm) || a.key.localeCompare(b.key))
+  const foldedPhaseCurve = (() => {
+    const bins = Array.from({ length: 24 }, (_, idx) => ({
+      phaseCenterDeg: (idx + 0.5) * (360 / 24),
+      values: [],
+    }))
+    for (const row of phaseResidualRows) {
+      const phaseDeg = ((row.phaseDeg % 360) + 360) % 360
+      const index = Math.min(bins.length - 1, Math.floor((phaseDeg / 360) * bins.length))
+      bins[index].values.push(row.residualDeg)
+    }
+    return bins
+      .filter(bin => bin.values.length > 0)
+      .map(bin => {
+        const sorted = bin.values.slice().sort((a, b) => a - b)
+        const mid = Math.floor(sorted.length / 2)
+        const median = sorted.length % 2 === 1
+          ? sorted[mid]
+          : (sorted[mid - 1] + sorted[mid]) / 2
+        return { phaseCenterDeg: bin.phaseCenterDeg, residualDeg: median }
+      })
+  })()
   const legacyVisibleSpanUs = legacyPeriodUs != null
     ? Math.max(60 * 1_000_000, legacyPeriodUs * 6)
     : null
   const shownPeriodS = alignmentMode === BURST_SYNC_VIEW_MODE_LEGACY ? legacyPeriodS : periodS
+  const phaseChartH = 220
+  const auxChartH = 220
+  const phasePadL = 58
+  const phasePadR = 26
+  const phasePadT = 24
+  const phasePadB = 40
+  const phasePlotW = chartW - phasePadL - phasePadR
+  const phasePlotH = phaseChartH - phasePadT - phasePadB
+  const maxRangeNm = rangeResidualRows.length > 0
+    ? Math.max(10, ...rangeResidualRows.map(row => row.rangeNm))
+    : 10
 
   function sampleUsToX(sampleUs) {
     return padL + ((sampleUs - windowStartUs) / spanUs) * plotW
@@ -2879,6 +2230,19 @@ function RotationAlignmentPanel({
 
   function residualToY(residualDeg) {
     return padT + ((yAbs - residualDeg) / (2 * yAbs)) * plotH
+  }
+
+  function phaseToX(phaseDeg) {
+    const normalized = ((Number(phaseDeg) % 360) + 360) % 360
+    return phasePadL + (normalized / 360) * phasePlotW
+  }
+
+  function phaseResidualToY(residualDeg) {
+    return phasePadT + ((yAbs - residualDeg) / (2 * yAbs)) * phasePlotH
+  }
+
+  function rangeToX(rangeNm) {
+    return phasePadL + (Math.max(0, Number(rangeNm)) / Math.max(1, maxRangeNm)) * phasePlotW
   }
 
   function legacyClassColor(classification, selected) {
@@ -3039,24 +2403,11 @@ function RotationAlignmentPanel({
         </div>
       </div>
 
-      <SyncDiagnosticsPanel
-        syncState={syncState}
-        waveformBins={burstTimeline?.waveform_bins}
-        perIcaoQuality={burstTimeline?.per_icao_quality}
-        observations={filteredObservations}
-        periodUpdateHistory={burstTimeline?.period_update_history}
-        slopeHistory={burstTimeline?.slope_history}
-        periodHistory={burstTimeline?.period_history}
-        predictorConsistency={burstTimeline?.predictor_consistency}
-      />
-
       <PhaseAnchorPanel
         syncState={syncState}
         observations={filteredObservations}
         candidates={burstTimeline?.phase_anchor_candidates}
       />
-
-      <SyncDebugPanel debug={syncDebug} iid={iid} windowS={BURST_SYNC_ALIGNMENT_WINDOW_S} />
 
       {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS ? (
         <>
@@ -3211,6 +2562,147 @@ function RotationAlignmentPanel({
                 {nonSyncDrivingCount > 0 ? ` · Non-sync-driving bursts ${nonSyncDrivingCount}` : ''}
                 {' · '}DF11 early {dfEarlyCount} · on time {dfOnTimeCount} · late {dfLateCount}
                 {syncState?.sync_jitter_deg != null ? ` · Sync jitter ±${syncState.sync_jitter_deg.toFixed(1)}°` : ''}
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))', gap: '12px', marginTop: '0.8rem' }}>
+                <div className={styles.alignmentWrap}>
+                  <svg
+                    width="100%"
+                    height={phaseChartH}
+                    viewBox={`0 0 ${chartW} ${phaseChartH}`}
+                    className={styles.alignmentSvg}
+                  >
+                    {[1, 0.5, 0, -0.5, -1].map(f => {
+                      const residual = yAbs * f
+                      const y = phaseResidualToY(residual)
+                      return (
+                        <g key={`phase-y-${f}`}>
+                          <line
+                            x1={phasePadL}
+                            y1={y}
+                            x2={chartW - phasePadR}
+                            y2={y}
+                            stroke={residual === 0 ? '#58a6ff88' : '#30363d'}
+                            strokeDasharray={residual === 0 ? '0' : '4 4'}
+                          />
+                          <text x={phasePadL - 8} y={y + 4} textAnchor="end" className={styles.axisLabel}>
+                            {residual.toFixed(0)}°
+                          </text>
+                        </g>
+                      )
+                    })}
+                    {[0, 90, 180, 270, 360].map(phaseDeg => {
+                      const x = phasePadL + (phaseDeg / 360) * phasePlotW
+                      return (
+                        <g key={`phase-x-${phaseDeg}`}>
+                          <line
+                            x1={x}
+                            y1={phasePadT}
+                            x2={x}
+                            y2={phaseChartH - phasePadB}
+                            stroke={phaseDeg === 0 || phaseDeg === 360 ? '#58a6ff66' : '#21262d'}
+                            strokeDasharray={phaseDeg === 0 || phaseDeg === 360 ? '0' : '3 5'}
+                          />
+                          <text x={x} y={phaseChartH - 10} textAnchor="middle" className={styles.axisLabel}>
+                            {phaseDeg}°
+                          </text>
+                        </g>
+                      )
+                    })}
+                    <text x={phasePadL + phasePlotW / 2} y={18} textAnchor="middle" className={styles.axisLabel}>
+                      Folded residual vs bearing
+                    </text>
+                    <text x={phasePadL + phasePlotW / 2} y={phaseChartH - 4} textAnchor="middle" className={styles.axisLabel}>
+                      Static 0-360° rotation domain
+                    </text>
+                    {phaseResidualRows.map(row => (
+                      <circle
+                        key={row.key}
+                        cx={phaseToX(row.phaseDeg)}
+                        cy={phaseResidualToY(row.residualDeg)}
+                        r={2.2}
+                        fill={burstSyncClassColor(row.classification)}
+                        opacity={0.78}
+                      >
+                        <title>{`${row.icao ?? '—'} bearing ${row.phaseDeg.toFixed(1)}° residual ${row.residualDeg.toFixed(2)}°`}</title>
+                      </circle>
+                    ))}
+                    {foldedPhaseCurve.length > 1 && (
+                      <polyline
+                        fill="none"
+                        stroke="#ffd166"
+                        strokeWidth={1.9}
+                        points={foldedPhaseCurve
+                          .map(bin => `${phaseToX(bin.phaseCenterDeg).toFixed(1)},${phaseResidualToY(bin.residualDeg).toFixed(1)}`)
+                          .join(' ')}
+                      />
+                    )}
+                  </svg>
+                </div>
+                <div className={styles.alignmentWrap}>
+                  <svg
+                    width="100%"
+                    height={auxChartH}
+                    viewBox={`0 0 ${chartW} ${auxChartH}`}
+                    className={styles.alignmentSvg}
+                  >
+                    {[1, 0.5, 0, -0.5, -1].map(f => {
+                      const residual = yAbs * f
+                      const y = phaseResidualToY(residual)
+                      return (
+                        <g key={`range-y-${f}`}>
+                          <line
+                            x1={phasePadL}
+                            y1={y}
+                            x2={chartW - phasePadR}
+                            y2={y}
+                            stroke={residual === 0 ? '#58a6ff88' : '#30363d'}
+                            strokeDasharray={residual === 0 ? '0' : '4 4'}
+                          />
+                          <text x={phasePadL - 8} y={y + 4} textAnchor="end" className={styles.axisLabel}>
+                            {residual.toFixed(0)}°
+                          </text>
+                        </g>
+                      )
+                    })}
+                    {[0, 0.25, 0.5, 0.75, 1].map(f => {
+                      const rangeNm = maxRangeNm * f
+                      const x = rangeToX(rangeNm)
+                      return (
+                        <g key={`range-x-${f}`}>
+                          <line
+                            x1={x}
+                            y1={phasePadT}
+                            x2={x}
+                            y2={auxChartH - phasePadB}
+                            stroke={f === 0 ? '#58a6ff66' : '#21262d'}
+                            strokeDasharray={f === 0 ? '0' : '3 5'}
+                          />
+                          <text x={x} y={auxChartH - 10} textAnchor="middle" className={styles.axisLabel}>
+                            {rangeNm.toFixed(0)} NM
+                          </text>
+                        </g>
+                      )
+                    })}
+                    <text x={phasePadL + phasePlotW / 2} y={18} textAnchor="middle" className={styles.axisLabel}>
+                      Residual vs range
+                    </text>
+                    <text x={phasePadL + phasePlotW / 2} y={auxChartH - 4} textAnchor="middle" className={styles.axisLabel}>
+                      Corrected residual by aircraft range
+                    </text>
+                    {rangeResidualRows.map(row => (
+                      <circle
+                        key={`range-${row.key}`}
+                        cx={rangeToX(row.rangeNm)}
+                        cy={phaseResidualToY(row.residualCorrectedDeg)}
+                        r={2.2}
+                        fill={burstSyncClassColor(row.classification)}
+                        opacity={0.78}
+                      >
+                        <title>{`${row.icao ?? '—'} range ${row.rangeNm.toFixed(1)} NM residual ${row.residualCorrectedDeg.toFixed(2)}°`}</title>
+                      </circle>
+                    ))}
+                  </svg>
+                </div>
               </div>
             </>
           )}
@@ -5078,7 +4570,6 @@ export default function RadarPage() {
   const [selectedIcao, setSelectedIcao] = useState(null)
   const [selectedFrame, setSelectedFrame] = useState(null)
   const [resettingAll, setResettingAll] = useState(false)
-  const [controlRefreshKey, setControlRefreshKey] = useState(0)
   const selectedRow = rows.find(row => row.iid === selectedIid) ?? null
   const receiverPosition = useReceiverPosition()
   const sharedTimingPacket = useTimingEventStream({
@@ -5097,6 +4588,7 @@ export default function RadarPage() {
   const sharedControl = selectedIidState?.control ?? null
   const sharedSolution = selectedIidState?.solution ?? null
   const sharedFmSummary = selectedIidState?.fm ?? null
+  const sharedEvidence = selectedIidState?.evidence ?? null
   const syncSnapshot = selectedIidState?.sync ?? null
   const syncFeedStatus = selectedIidStateStatus
 
@@ -5127,13 +4619,8 @@ export default function RadarPage() {
       await resetAllRadarLearning()
       setSelectedIid(null)
       setSelectedIcao(null)
-      setControlRefreshKey(v => v + 1)
     } catch {}
     setResettingAll(false)
-  }
-
-  function handleChanged() {
-    setControlRefreshKey(v => v + 1)
   }
 
 return (
@@ -5152,7 +4639,6 @@ return (
       <div data-slot="localisation-control">
         <LocalisationControlPanel
           iid={selectedIid}
-          onChanged={handleChanged}
           controlData={sharedControl}
           feedStatus={selectedIidStateStatus}
         />
@@ -5180,7 +4666,6 @@ return (
             iid={selectedIid}
             panelData={sharedFmSummary}
             loading={selectedIid != null && sharedFmSummary == null}
-            onChanged={handleChanged}
           />
         </div>
       )}
@@ -5189,7 +4674,9 @@ return (
         <div data-slot="evidence-map">
           <EvidenceMapPanel
             iid={selectedIid}
-            refreshKey={controlRefreshKey}
+            controlData={sharedControl}
+            evidenceData={sharedEvidence}
+            evidenceRevision={selectedIidState?.revisions?.evidence ?? 0}
           />
         </div>
       )}

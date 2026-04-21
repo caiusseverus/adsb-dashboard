@@ -108,3 +108,9 @@
 
 - After fixing a major retained-state bottleneck, re-audit adjacent operational caps in the same path (especially hard-coded per-ICAO history limits) before declaring scaling complete.
 - When adding stage diagnostics (for example cluster counts), do not infer earlier-stage counts from later-stage artifacts like merge-event totals. Carry exact per-stage counts through the pipeline, and avoid leaving a simplistic early dedupe stage that can pre-empt richer identity logic.
+
+## 2026-04-21
+
+- When simplifying an operator panel, do not remove a secondary plot that still provides distinct operational value unless the user explicitly asked for that specific removal. In this case the residual-vs-range view should have been preserved.
+- For folded live scatter plots, do not key rendered points by array index when the source window slides over time. Use stable per-observation keys and a static domain ordering, or the chart can visually "flow" like a time series even when the x-axis is phase-only.
+- For a folded residual-by-phase/bearing plot, do not use a live rephased model coordinate for historical observations if the operator expects a visually fixed spatial domain. Use a stable per-observation bearing/rotation position for x, and reserve live model-phase overlays for explicitly diagnostic views.

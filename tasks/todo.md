@@ -1,5 +1,26 @@
 # Deficiency Rectification Plan
 
+## 2026-04-21 Radar Page Cleanup / Push-State Follow-Up
+
+- [x] Audit the remaining sync/alignment panels and identify everything specific to the removable “Sync Diagnosis” UI
+- [x] Remove the Sync Diagnosis panel and any frontend/backend state shaping used only for it
+- [x] Keep one time-domain residual view and add/retain one true folded 0-360° phase-domain residual view that does not scroll like a timeline
+- [x] Audit remaining lightweight selected-IID fetch/poll paths in ordinary live use, especially the Evidence Map path
+- [x] Move remaining lightweight selected-IID live state onto the pushed selected-IID feed and remove redundant fetch hooks
+- [x] Add an explicit lightweight evidence section plus section revision to the selected-IID pushed payload if needed for the live page
+- [x] Refine the selected-IID payload builder so it reads maintained/revisioned cheap state rather than redoing avoidable work in the websocket loop
+- [x] Preserve heavy diagnostics/geometry as explicit on-demand endpoints only
+- [x] Add/update focused verification for UI removal, folded phase plotting, section revisions, and reduced live fetch churn
+
+Plan confirmation: proceed with a cleanup pass, not a redesign. Remove the redundant sync-diagnosis transport/UI, keep the useful live residual and phase-anchor information, and finish consolidating ordinary lightweight selected-IID live data behind the pushed state feed.
+
+### Review
+
+- Removed the frontend Sync Diagnosis and SyncDiagnostics panels plus the live-sync snapshot fields that only existed to feed those panels.
+- Replaced the Evidence Map's forward-model evidence polling with the pushed selected-IID `evidence` section and added explicit evidence revisions backed by forward-model frame-position revisions.
+- Added frontend changed-section visibility for the pushed selected-IID feed and kept heavyweight sync-debug / geometry endpoints on-demand only.
+- Verification: `python3 -m py_compile backend/radar/api.py backend/radar/sweep.py backend/radar/forward_model.py backend/main.py backend/status.py`, `uv run --directory backend pytest tests/test_radar_api.py -q`, `npm run build`.
+
 ## 2026-04-21 Selected-IID Pushed Radar Page State Feed
 
 - [x] Audit the current Radar page selected-IID polling hooks/components and map each lightweight section to a cheap authoritative backend source

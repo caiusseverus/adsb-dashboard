@@ -898,7 +898,8 @@ def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monke
     assert first is second
     assert first["sequence"] == second["sequence"]
     assert first["type"] == "radar_sync"
-    assert first["sync_debug"]["summary"]["operational_time_basis"] == "effective_beast_us"
+    assert "waveform_bins" in first
+    assert "phase_anchor_candidates" in first
     assert first["retention_diagnostics"]["timeline"]["count"] == 1
 
 

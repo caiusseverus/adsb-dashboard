@@ -6764,8 +6764,8 @@ class RadarState:
 
         The snapshot combines the fast-changing sync payloads that previously
         required separate frontend polls.  A signature cache prevents the
-        websocket loop, HTTP fallback, and reconnects from rebuilding expensive
-        diagnostics when no relevant live sync input has changed.
+        websocket loop, HTTP fallback, and reconnects from rebuilding the
+        lightweight live sync state when no relevant input has changed.
         """
         with self._lock:
             sync = self._live_sync_states.get(iid)
@@ -6791,7 +6791,6 @@ class RadarState:
                 obs_len,
                 last_obs_us,
                 last_obs_ts,
-                len(self._live_period_update_history.get(iid) or ()),
             )
             cached = self._live_sync_snapshot_cache.get(iid)
             if cached is not None and cached[0] == signature:
@@ -6802,51 +6801,6 @@ class RadarState:
             self._live_sync_snapshot_last_cache_hit[iid] = False
 
         burst_timeline = self.get_burst_sync_timeline(iid, window_s=window_s)
-        if RADAR_DIAGNOSTICS:
-            sync_debug = self.get_sync_debug_payload(iid, window_s=window_s, limit=debug_limit)
-            compact_debug_observations = []
-            for row in sync_debug.get("observations", []):
-                compact_debug_observations.append({
-                    "iid": row.get("iid"),
-                    "icao": row.get("icao"),
-                    "effective_beast_us": row.get("effective_beast_us"),
-                    "burst_center_beast_us": row.get("burst_center_beast_us"),
-                    "residual_raw_deg": row.get("residual_raw_deg"),
-                    "resid_authoritative_deg": row.get("resid_authoritative_deg"),
-                    "fit_slope_deg_per_s": row.get("fit_slope_deg_per_s"),
-                    "time_offset_s": row.get("time_offset_s"),
-                    "detrend_component_deg": row.get("detrend_component_deg"),
-                    "residual_detrended_deg": row.get("residual_detrended_deg"),
-                    "phase_deg": row.get("phase_deg"),
-                    "phase_authoritative_deg": row.get("phase_authoritative_deg"),
-                    "cycle_index": row.get("cycle_index"),
-                    "cycle_start_beast_us": row.get("cycle_start_beast_us"),
-                    "fit_eligible": row.get("fit_eligible"),
-                    "fit_reject_reason": row.get("fit_reject_reason"),
-                })
-            compact_sync_debug = {
-                "iid": sync_debug.get("iid", iid),
-                "available": sync_debug.get("available", False),
-                "reason": sync_debug.get("reason"),
-                "sync_state": sync_debug.get("sync_state"),
-                "summary": sync_debug.get("summary", {}),
-                "observations": compact_debug_observations,
-                "observation_model_diagnostics": {
-                    "folded_phase_shape": (
-                        sync_debug.get("observation_model_diagnostics", {}).get("folded_phase_shape", {})
-                    ),
-                },
-                "advanced_available_via": f"/api/radar/iids/{iid}/sync-debug",
-            }
-        else:
-            compact_sync_debug = {
-                "iid": iid,
-                "available": False,
-                "reason": "RADAR_DIAGNOSTICS not enabled",
-                "observations": [],
-                "summary": {},
-                "advanced_available_via": f"/api/radar/iids/{iid}/sync-debug",
-            }
         snapshot = {
             "type": "radar_sync",
             "iid": iid,
@@ -6862,14 +6816,8 @@ class RadarState:
             "df11_residual_observations": burst_timeline.get("df11_residual_observations", []),
             "chart_overlay_consistent": burst_timeline.get("chart_overlay_consistent", False),
             "waveform_bins": burst_timeline.get("waveform_bins", []),
-            "per_icao_quality": burst_timeline.get("per_icao_quality", []),
-            "period_update_history": burst_timeline.get("period_update_history", []),
-            "slope_history": burst_timeline.get("slope_history", []),
-            "period_history": burst_timeline.get("period_history", []),
-            "predictor_consistency": burst_timeline.get("predictor_consistency"),
             "phase_anchor_candidates": burst_timeline.get("phase_anchor_candidates", []),
             "motion_comp_summary": burst_timeline.get("motion_comp_summary"),
-            "sync_debug": compact_sync_debug,
             "retention_diagnostics": burst_timeline.get("retention_diagnostics"),
             "transport": {
                 "source": "shared_snapshot",

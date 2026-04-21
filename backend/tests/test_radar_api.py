@@ -213,8 +213,8 @@ def test_get_iid_sync_snapshot_endpoint_combines_fast_sync_payloads(monkeypatch)
     assert payload["rotation"]["iid"] == 23
     assert "observations" in payload
     assert "sync_state" in payload
-    assert "sync_debug" in payload
-    assert payload["sync_debug"]["summary"]["operational_time_basis"] == "effective_beast_us"
+    assert "waveform_bins" in payload
+    assert "phase_anchor_candidates" in payload
     assert payload["retention_diagnostics"]["timeline"]["count"] == 1
 
 
@@ -350,6 +350,9 @@ def test_get_iid_selected_state_combines_lightweight_sections(monkeypatch):
     assert payload["pipeline"]["stages"]["frames"]["status"] == "working"
     assert payload["fm"]["location"]["status"] == "LOCALISED"
     assert payload["solution"]["selected"]["source"] == payload["control"]["display_source"]
+    assert payload["evidence"]["available"] is True
+    assert payload["revisions"]["evidence"] >= 1
+    assert payload["transport"]["sections"]["evidence"]["revision"] == payload["revisions"]["evidence"]
     assert payload["transport"]["sections"]["frames"]["revision"] >= 1
 
 
