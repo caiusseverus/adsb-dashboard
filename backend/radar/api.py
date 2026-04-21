@@ -1273,6 +1273,8 @@ async def get_iids(window_s: float = Query(default=600.0, ge=10, le=7200)):
             "last_seen": round(last_seen, 1),
             "latest_icao": entry.get("latest_icao", ""),
             "period_s": _state.get_authoritative_display_period_s(iid),
+            "period_std_s": _state.get_authoritative_display_period_std_s(iid),
+            "rpm": _state.get_authoritative_display_rpm(iid),
             "status": model.status if model else None,
             # Forward model fields
             "fm_lat": model.fm_lat if model else None,
@@ -3364,9 +3366,9 @@ def build_radar_live_state_payload(state: "RadarState" | None) -> dict:
             entry: dict = {
                 "iid": iid,
                 "status": model.status,
-                "period_s": model.period_s,
-                "period_std_s": model.period_std_s,
-                "rpm": model.rpm,
+                "period_s": state.get_authoritative_display_period_s(iid),
+                "period_std_s": state.get_authoritative_display_period_std_s(iid),
+                "rpm": state.get_authoritative_display_rpm(iid),
                 "last_updated": model.last_updated,
                 "ref_icao": model.reference_aircraft.ref_icao if model.reference_aircraft else None,
                 # Localiser best-estimate (first non-None source wins: manual > CI > FM > TDOA)

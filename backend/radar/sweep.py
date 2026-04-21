@@ -5477,6 +5477,36 @@ class RadarState:
         fallback = model.period_s if model is not None else None
         return self._get_authoritative_frame_period_s(iid, fallback)
 
+    def get_authoritative_display_period_std_s(self, iid: int) -> float | None:
+        """Return the period sigma for display in the IID selector.
+
+        When refined sync is authoritative (usable, not in holdover), converts
+        sync_jitter_deg to period-domain sigma: jitter_deg / 360 * period_s.
+        Falls back to the coarse rotation-model period_std_s otherwise.
+        """
+        sync = self._live_sync_states.get(iid)
+        if (
+            sync is not None
+            and sync.usable
+            and not sync.holdover
+            and sync.period_s
+            and sync.period_s > 0
+        ):
+            return sync.sync_jitter_deg / 360.0 * sync.period_s if sync.sync_jitter_deg else None
+        model = self._models.get(iid)
+        return model.period_std_s if model is not None else None
+
+    def get_authoritative_display_rpm(self, iid: int) -> float | None:
+        """Return the RPM for display in the IID selector.
+
+        Derived from the authoritative period so it always matches period_s.
+        """
+        period_s = self.get_authoritative_display_period_s(iid)
+        if period_s and period_s > 0:
+            return round(60.0 / period_s, 3)
+        model = self._models.get(iid)
+        return model.rpm if model is not None else None
+
     def update_rotation_models(
         self,
         max_iids_per_call: int | None = None,
