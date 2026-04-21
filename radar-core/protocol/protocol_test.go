@@ -145,6 +145,47 @@ func TestBurstFiredRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFMFrameResultRoundTrip(t *testing.T) {
+	orig := &protocol.FMFrameResult{
+		MsgType:                  protocol.MsgFMFrameResult,
+		IID:                      7,
+		FrameIndex:               12,
+		SweepStartUS:             1234567.5,
+		Success:                  true,
+		SolveStatus:              "success",
+		SolveReason:              "accepted",
+		CandidatePosition:        true,
+		AccumAccepted:            true,
+		RejectionReason:          "accepted",
+		AdmissionTier:            "accepted_high_confidence",
+		Lat:                      pf64(51.5),
+		Lon:                      pf64(-0.2),
+		CEPM:                     pf64(950.0),
+		NContributingArcs:        8,
+		AzimuthSpreadDeg:         87.5,
+		Weight:                   2.75,
+		PairwiseRMSDeg:           14.2,
+		ClusterMemberCount:       7,
+		SecondClusterMemberCount: 3,
+		MemberDominanceRatio:     2.1,
+		WeightDominanceRatio:     1.7,
+		SupportDominanceRatio:    1.6,
+		BestClusterSupportScore:  1.4,
+		AmbiguitySameLobeBypass:  false,
+		ProcessedAt:              1714000000.25,
+	}
+	got := roundTrip(t, orig).(*protocol.FMFrameResult)
+	if got.SweepStartUS != orig.SweepStartUS {
+		t.Errorf("SweepStartUS: got %v want %v", got.SweepStartUS, orig.SweepStartUS)
+	}
+	if got.AzimuthSpreadDeg != orig.AzimuthSpreadDeg {
+		t.Errorf("AzimuthSpreadDeg: got %v want %v", got.AzimuthSpreadDeg, orig.AzimuthSpreadDeg)
+	}
+	if got.Weight != orig.Weight {
+		t.Errorf("Weight: got %v want %v", got.Weight, orig.Weight)
+	}
+}
+
 func TestBurstFiredNoPosition(t *testing.T) {
 	orig := &protocol.BurstFired{
 		MsgType:    protocol.MsgBurstFired,

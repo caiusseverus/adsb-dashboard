@@ -390,6 +390,72 @@ def test_get_iid_selected_state_marks_cache_hits(monkeypatch):
     assert second["revisions"] == first["revisions"]
 
 
+def test_get_iid_selected_state_evidence_uses_go_frame_positions_and_revisions(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", False)
+    monkeypatch.setattr("radar.sweep.RADAR_DIAGNOSTICS", False)
+
+    state = RadarState()
+    state._models[93] = RadarIID(
+        iid=93,
+        status="SINGLE_RADAR",
+        period_s=4.0,
+        fm_lat=51.5,
+        fm_lon=-0.2,
+        fm_cep_m=1200.0,
+        fm_source="go_frame_accumulation",
+        last_updated=4_000.0,
+    )
+    state.update_go_snapshot({
+        "iids": {
+            "93": {
+                "iid": 93,
+                "frame_positions": [
+                    {
+                        "frame_index": 5,
+                        "sweep_start_us": 10_000_000.0,
+                        "lat": 51.5005,
+                        "lon": -0.2005,
+                        "cep_km": 1.1,
+                        "n_contributing_arcs": 6,
+                        "azimuth_spread_deg": 78.0,
+                        "weight": 2.25,
+                    }
+                ],
+            }
+        }
+    })
+
+    prior_state = radar_api._state
+    radar_api._state = state
+    try:
+        first = asyncio.run(radar_api.get_iid_selected_state(93, window_s=60.0, debug_limit=20))
+        state.update_go_frame_position_result({
+            "i": 93,
+            "fi": 6,
+            "su": 14_000_000.0,
+            "aa": True,
+            "la": 51.5008,
+            "lo": -0.1998,
+            "cep": 900.0,
+            "na": 7,
+            "az": 92.0,
+            "w": 3.0,
+        })
+        second = asyncio.run(radar_api.get_iid_selected_state(93, window_s=60.0, debug_limit=20))
+    finally:
+        radar_api._state = prior_state
+
+    assert first["evidence"]["frame_position_count"] == 1
+    assert first["evidence"]["frame_positions"][0]["frame_index"] == 5
+    assert first["evidence"]["frame_positions"][0]["sweep_start_us"] == 10_000_000.0
+    assert first["evidence"]["fm_estimate"]["source"] == "fm"
+    assert second["evidence"]["frame_position_count"] == 2
+    assert {row["frame_index"] for row in second["evidence"]["frame_positions"]} == {5, 6}
+    assert second["revisions"]["evidence"] > first["revisions"]["evidence"]
+    assert second["transport"]["sections"]["evidence"]["revision"] == second["revisions"]["evidence"]
+
+
 def test_get_iid_sweep_frame_fm_geometry_uses_cache(monkeypatch):
     state = RadarState()
     state._models[31] = RadarIID(iid=31, status="SINGLE_RADAR", period_s=4.0)

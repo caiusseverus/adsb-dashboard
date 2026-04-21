@@ -154,6 +154,7 @@ type FMFrameResult struct {
 	MsgType                  uint8    `codec:"t"`
 	IID                      uint8    `codec:"i"`
 	FrameIndex               uint32   `codec:"fi"`
+	SweepStartUS             float64  `codec:"su"`
 	Success                  bool     `codec:"ok"`
 	SolveStatus              string   `codec:"ss"`
 	SolveReason              string   `codec:"sr"`
@@ -165,6 +166,8 @@ type FMFrameResult struct {
 	Lon                      *float64 `codec:"lo"`
 	CEPM                     *float64 `codec:"cep"`
 	NContributingArcs        uint16   `codec:"na"`
+	AzimuthSpreadDeg         float32  `codec:"az"`
+	Weight                   float64  `codec:"w"`
 	PairwiseRMSDeg           float32  `codec:"rms"`
 	ClusterMemberCount       uint16   `codec:"cm"`
 	SecondClusterMemberCount uint16   `codec:"sm"`

@@ -181,7 +181,7 @@ func (s *State) ProcessFrame(frame *protocol.FrameReady) (*protocol.FMFrameResul
 	if !s.hasRecv {
 		st.stats.SolverNoCandidate++
 		st.stats.LastFrameReason = "receiver_coordinates_not_configured"
-		return frameResult(frame, false, false, "receiver_coordinates_not_configured", "", nil), s.protocolState(frame.IID, st)
+		return frameResult(frame, nil, false, false, "receiver_coordinates_not_configured", "", nil), s.protocolState(frame.IID, st)
 	}
 
 	est, solved, solve := solveSingleFrame(frame, s.recvLat, s.recvLon)
@@ -196,7 +196,7 @@ func (s *State) ProcessFrame(frame *protocol.FrameReady) (*protocol.FMFrameResul
 			reason = solve.Reason
 		}
 		st.stats.LastFrameReason = reason
-		return frameResult(frame, false, false, reason, "", solve), s.protocolState(frame.IID, st)
+		return frameResult(frame, nil, false, false, reason, "", solve), s.protocolState(frame.IID, st)
 	}
 	st.stats.CandidatePositions++
 	st.stats.LastFrameHadCandidatePosition = true
@@ -207,7 +207,7 @@ func (s *State) ProcessFrame(frame *protocol.FrameReady) (*protocol.FMFrameResul
 		st.stats.AccumulationRejectionReasons[rejection]++
 		st.stats.LastRejectionReason = rejection
 		st.stats.LastFrameReason = rejection
-		return frameResult(frame, true, false, rejection, "rejected", solve), s.protocolState(frame.IID, st)
+		return frameResult(frame, est, true, false, rejection, "rejected", solve), s.protocolState(frame.IID, st)
 	}
 	est.AdmissionTier = tier
 	if tier == "accepted_geometry_dominant" {
@@ -225,7 +225,7 @@ func (s *State) ProcessFrame(frame *protocol.FrameReady) (*protocol.FMFrameResul
 	}
 	st.stats.AccumulationWritten++
 
-	return frameResult(frame, true, true, "accepted", tier, solve), s.protocolState(frame.IID, st)
+	return frameResult(frame, est, true, true, "accepted", tier, solve), s.protocolState(frame.IID, st)
 }
 
 func newStats() Stats {
@@ -244,6 +244,18 @@ func (s *State) Snapshot(iid uint8) *protocol.FMState {
 		return nil
 	}
 	return s.protocolState(iid, st)
+}
+
+func (s *State) SnapshotFrameEstimates(iid uint8) []FrameEstimate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.perIID[iid]
+	if st == nil || len(st.positions) == 0 {
+		return nil
+	}
+	out := make([]FrameEstimate, len(st.positions))
+	copy(out, st.positions)
+	return out
 }
 
 func (s *State) protocolState(iid uint8, st *iidState) *protocol.FMState {
@@ -267,11 +279,12 @@ func (s *State) protocolState(iid uint8, st *iidState) *protocol.FMState {
 	return statsToProtocol(iid, stats)
 }
 
-func frameResult(frame *protocol.FrameReady, candidate, accepted bool, reason, tier string, solve *SolveResult) *protocol.FMFrameResult {
+func frameResult(frame *protocol.FrameReady, est *FrameEstimate, candidate, accepted bool, reason, tier string, solve *SolveResult) *protocol.FMFrameResult {
 	msg := &protocol.FMFrameResult{
 		MsgType:           protocol.MsgFMFrameResult,
 		IID:               frame.IID,
 		FrameIndex:        frame.FrameIndex,
+		SweepStartUS:      frame.RefArrivalUS,
 		Success:           solve != nil && solve.Success,
 		CandidatePosition: candidate,
 		AccumAccepted:     accepted,
@@ -283,6 +296,7 @@ func frameResult(frame *protocol.FrameReady, candidate, accepted bool, reason, t
 		msg.SolveStatus = solve.Status
 		msg.SolveReason = solve.Reason
 		msg.NContributingArcs = uint16(max(0, solve.NContributingArcs))
+		msg.AzimuthSpreadDeg = float32(finiteOrZero(solve.AzimuthSpreadDeg))
 		msg.PairwiseRMSDeg = float32(finiteOrZero(solve.PairwiseWeightedRMSDeg))
 		msg.ClusterMemberCount = uint16(max(0, solve.ClusterMemberCount))
 		msg.SecondClusterMemberCount = uint16(max(0, solve.SecondClusterMemberCount))
@@ -299,6 +313,9 @@ func frameResult(frame *protocol.FrameReady, candidate, accepted bool, reason, t
 			cep := solve.CentroidUncertaintyKM * 1000.0
 			msg.CEPM = &cep
 		}
+	}
+	if est != nil {
+		msg.Weight = finiteOrZero(est.Weight)
 	}
 	return msg
 }

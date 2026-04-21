@@ -1,5 +1,40 @@
 # Deficiency Rectification Plan
 
+## 2026-04-21 Radar Page Selected-IID Evidence Follow-Up
+
+- [x] Trace the authoritative Go frame-accumulation state that should drive the selected-IID evidence map
+- [x] Add a lightweight RadarState getter/revision path for authoritative Go-backed per-frame position estimates
+- [x] Switch selected-IID `evidence` payload and section revisioning off the legacy Python `ForwardModel` frame-position store
+- [x] Inspect for any remaining removed-Sync-Diagnosis-specific live payload/backend work and remove it if truly dead
+- [x] Run targeted verification covering selected-IID evidence population, revision changes, and frontend field compatibility
+
+Plan confirmation: keep the frontend evidence contract stable and fix the backend ownership boundary. The accumulation map should read the already-maintained authoritative Go FM frame-estimate set through `RadarState`, not reconstruct geometry or fall back to the retired Python FM buffer.
+
+### Review
+
+- Root cause: the selected-IID `evidence` section had been moved onto the pushed state feed, but its `frame_positions` and evidence-section signature were still reading the retired Python `ForwardModel` accumulation buffer and revision counter. In Go-FM mode that buffer is no longer authoritative, so the map stayed blank and the section could stay stale.
+- Go-authoritative evidence path:
+  - radar-core now exposes its maintained accumulated frame-estimate list in the periodic snapshot payload.
+  - `FM_FRAME_RESULT` now also carries the lightweight fields needed to mirror accepted per-frame estimates incrementally between snapshots.
+  - [RadarState](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) now maintains a lightweight authoritative Go-backed per-IID frame-position mirror plus a revision counter via `update_go_snapshot()`, `update_go_frame_position_result()`, `get_go_frame_positions()`, and `get_go_frame_positions_revision()`.
+  - [api.py](/home/keith/claude/adsb-dashboard/backend/radar/api.py) now builds selected-IID `evidence.frame_positions` from that RadarState mirror and keys the `evidence` section revision/signature from the Go-backed frame-position revision plus control-state revision.
+- Sync/alignment cleanup audit:
+  - No frontend `Sync Diagnosis` panel remains.
+  - The remaining backend `sync_debug` endpoint is explicit diagnostics only and is not part of the default Radar page transport, so there was no extra live-path work to remove in this pass.
+  - No frontend evidence field-name correction was needed; `EvidenceMapPanel` still reads `selectedIidState?.evidence.frame_positions`, `frame_position_count`, `fm_estimate`, `display_position`, and `manual_position`.
+- Runtime follow-up:
+  - The source changes alone were not enough in this checkout because the backend-managed binary at [radar-core/radar-core](/home/keith/claude/adsb-dashboard/radar-core/radar-core) was stale relative to the protocol/snapshot updates.
+  - Rebuilt the managed binary in place with `env GOCACHE=/tmp/go-build-cache go build -o radar-core ./cmd/radar-core`.
+  - There was no running backend/socket in this sandbox when checked, so no process restart was needed here; a live deployment that was already running would need the backend/radar-core process restarted to pick up the rebuilt binary.
+- Verification:
+  - `python3 -m py_compile backend/radar/api.py backend/radar/sweep.py backend/radar_core/client.py backend/main.py backend/tests/test_radar_api.py`
+  - `uv run --directory backend pytest tests/test_radar_api.py -q`
+  - `gofmt -w protocol/messages.go protocol/protocol_test.go fm/fm.go cmd/radar-core/main.go`
+  - `env GOCACHE=/tmp/go-build-cache go test ./protocol ./fm`
+  - `npm run build`
+  - Result: compile check passed, targeted radar API suite passed (`42 passed`), modified Go protocol/FM packages passed, frontend production build passed.
+  - Added regression coverage in [test_radar_api.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_api.py) proving the selected-IID `evidence` payload is populated from Go-backed frame positions and that `revisions.evidence` advances when authoritative frame positions change.
+
 ## 2026-04-21 Radar Page Cleanup / Push-State Follow-Up
 
 - [x] Audit the remaining sync/alignment panels and identify everything specific to the removable “Sync Diagnosis” UI

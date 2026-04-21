@@ -360,6 +360,22 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 				"last_support_dominance_ratio":     fmState.LastSupportDominanceRatio,
 				"last_pairwise_rms_deg":            fmState.LastPairwiseRMSDeg,
 			}
+			if estimates := e.fmState.SnapshotFrameEstimates(iidNum); len(estimates) > 0 {
+				framePositions := make([]map[string]interface{}, 0, len(estimates))
+				for _, est := range estimates {
+					framePositions = append(framePositions, map[string]interface{}{
+						"frame_index":         est.FrameIndex,
+						"sweep_start_us":      est.SweepStartUS,
+						"lat":                 est.Lat,
+						"lon":                 est.Lon,
+						"cep_km":              est.CEPKM,
+						"n_contributing_arcs": est.NContributingArcs,
+						"azimuth_spread_deg":  est.AzimuthSpreadDeg,
+						"weight":              est.Weight,
+					})
+				}
+				iidPayload["frame_positions"] = framePositions
+			}
 		}
 		iidsPayload[key] = iidPayload
 	}

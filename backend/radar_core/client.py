@@ -53,6 +53,10 @@ class RadarCoreClient:
     on_frame_ready: optional callback(dict) called for each received FRAME_READY.
       When RADAR_CORE_FRAMES_ENABLED is True this callback injects the frame
       into RadarState's FM mailbox.
+    on_fm_frame_result: optional callback(dict) called for each received
+      FM_FRAME_RESULT so Python can mirror the authoritative Go accumulation set.
+    on_snapshot: optional callback(dict) called for each received SNAPSHOT_RESP
+      payload so Python can hydrate/reconcile mirrored Go state after reconnect.
     """
 
     def __init__(
@@ -60,14 +64,18 @@ class RadarCoreClient:
         socket_path: str,
         on_burst_fired: Optional[Callable[[dict], None]] = None,
         on_frame_ready: Optional[Callable[[dict], None]] = None,
+        on_fm_frame_result: Optional[Callable[[dict], None]] = None,
         on_fm_state: Optional[Callable[[dict], None]] = None,
+        on_snapshot: Optional[Callable[[dict], None]] = None,
         connect_timeout_s: float = 5.0,
         reconnect_delay_s: float = 2.0,
     ):
         self._socket_path = socket_path
         self._on_burst_fired = on_burst_fired
         self._on_frame_ready = on_frame_ready
+        self._on_fm_frame_result = on_fm_frame_result
         self._on_fm_state = on_fm_state
+        self._on_snapshot = on_snapshot
         self._connect_timeout_s = connect_timeout_s
         self._reconnect_delay_s = reconnect_delay_s
 
@@ -407,12 +415,27 @@ class RadarCoreClient:
                         self._callback_errors += 1
                     log.debug("RadarCoreClient: FRAME_READY callback failed", exc_info=True)
         elif msg_type == P.MSG_SNAPSHOT_RESP:
+            snapshot_payload = dict(d.get("pl") or {})
             with self._stats_lock:
-                self._latest_snapshot = dict(d.get("pl") or {})
+                self._latest_snapshot = snapshot_payload
                 self._latest_snapshot_ts = time.time()
+            if self._on_snapshot:
+                try:
+                    self._on_snapshot(snapshot_payload)
+                except Exception:
+                    with self._stats_lock:
+                        self._callback_errors += 1
+                    log.debug("RadarCoreClient: SNAPSHOT_RESP callback failed", exc_info=True)
         elif msg_type == P.MSG_FM_FRAME_RESULT:
             with self._stats_lock:
                 self._fm_frame_results_received += 1
+            if self._on_fm_frame_result:
+                try:
+                    self._on_fm_frame_result(d)
+                except Exception:
+                    with self._stats_lock:
+                        self._callback_errors += 1
+                    log.debug("RadarCoreClient: FM_FRAME_RESULT callback failed", exc_info=True)
         elif msg_type == P.MSG_FM_STATE:
             with self._stats_lock:
                 self._fm_states_received += 1

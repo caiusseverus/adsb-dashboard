@@ -2299,8 +2299,7 @@ def _build_selected_iid_fm_summary(iid: int, model, frame_counts: dict) -> dict:
 
 
 def _build_selected_iid_evidence_light(iid: int, model, control_payload: dict) -> dict:
-    fm = _get_fm()
-    frame_positions = fm.get_frame_positions(iid)
+    frame_positions = _state.get_go_frame_positions(iid) if _state is not None else []
     display_position = None
     if control_payload.get("display_lat") is not None and control_payload.get("display_lon") is not None:
         display_position = {
@@ -2329,14 +2328,14 @@ def _build_selected_iid_evidence_light(iid: int, model, control_payload: dict) -
         "available": True,
         "frame_positions": [
             {
-                "frame_index": fp.frame_index,
-                "sweep_start_us": fp.sweep_start_us,
-                "lat": fp.lat,
-                "lon": fp.lon,
-                "cep_km": fp.cep_km,
-                "n_contributing_arcs": fp.n_contributing_arcs,
-                "azimuth_spread_deg": fp.azimuth_spread_deg,
-                "weight": fp.weight,
+                "frame_index": fp.get("frame_index"),
+                "sweep_start_us": fp.get("sweep_start_us"),
+                "lat": fp.get("lat"),
+                "lon": fp.get("lon"),
+                "cep_km": fp.get("cep_km"),
+                "n_contributing_arcs": fp.get("n_contributing_arcs"),
+                "azimuth_spread_deg": fp.get("azimuth_spread_deg"),
+                "weight": fp.get("weight"),
             }
             for fp in frame_positions
         ],
@@ -2583,17 +2582,10 @@ def build_selected_iid_page_state_payload(
         },
     )
 
-    frame_position_revision = _get_fm().get_frame_positions_revision(iid)
+    frame_position_revision = state.get_go_frame_positions_revision(iid)
     evidence_signature = (
         frame_position_revision,
-        control_signature,
-        model.fm_lat if model is not None else None,
-        model.fm_lon if model is not None else None,
-        model.fm_cep_m if model is not None else None,
-        model.fm_source if model is not None else None,
-        model.manual_lat if model is not None else None,
-        model.manual_lon if model is not None else None,
-        model.manual_note if model is not None else None,
+        control_revision,
     )
     evidence_payload, evidence_revision, evidence_cached = _selected_iid_section_entry(
         iid,
@@ -3030,6 +3022,7 @@ async def reset_iid_fm(iid: int):
     if not did_reset:
         return {"iid": iid, "reset": False, "reason": "IID not seen"}
 
+    _state.clear_go_frame_positions(iid)
     _get_fm().clear_frame_positions(iid)
 
     # Flush immediately so the reset survives a server restart.

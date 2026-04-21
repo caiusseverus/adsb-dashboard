@@ -1950,6 +1950,9 @@ class RadarState:
         self._python_frames_finalized_by_iid: dict[int, int] = {}
         self._go_fm_states: dict[int, dict] = {}
         self._go_fm_pipeline_stats: dict[int, dict] = {}
+        self._GO_FRAME_POSITIONS_MAX = 5000
+        self._go_frame_positions: dict[int, deque] = {}
+        self._go_frame_positions_revision: dict[int, int] = {}
 
         # Lightweight ADS-B position tracker for real-time position capture
         self._adsb_tracker = AircraftPositionTracker()
@@ -3267,6 +3270,138 @@ class RadarState:
         with self._lock:
             stats = self._go_fm_pipeline_stats.get(iid)
             return dict(stats) if stats is not None else None
+
+    @staticmethod
+    def _normalise_go_frame_position(entry: dict) -> dict | None:
+        try:
+            lat = entry.get("lat")
+            lon = entry.get("lon")
+            if lat is None or lon is None:
+                return None
+            return {
+                "frame_index": int(entry["frame_index"]),
+                "sweep_start_us": float(entry["sweep_start_us"]),
+                "lat": float(lat),
+                "lon": float(lon),
+                "cep_km": float(entry.get("cep_km") or 0.0),
+                "n_contributing_arcs": int(entry.get("n_contributing_arcs") or 0),
+                "azimuth_spread_deg": float(entry.get("azimuth_spread_deg") or 0.0),
+                "weight": float(entry.get("weight") or 0.0),
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def _go_frame_position_signature(entry: dict) -> tuple:
+        return (
+            entry.get("frame_index"),
+            entry.get("sweep_start_us"),
+            entry.get("lat"),
+            entry.get("lon"),
+            entry.get("cep_km"),
+            entry.get("n_contributing_arcs"),
+            entry.get("azimuth_spread_deg"),
+            entry.get("weight"),
+        )
+
+    def _set_go_frame_positions_locked(self, iid: int, entries: list[dict]) -> bool:
+        existing = list(self._go_frame_positions.get(iid, ()))
+        existing_sig = tuple(self._go_frame_position_signature(entry) for entry in existing)
+        next_sig = tuple(self._go_frame_position_signature(entry) for entry in entries)
+        if existing_sig == next_sig:
+            return False
+        self._go_frame_positions[iid] = deque(entries, maxlen=self._GO_FRAME_POSITIONS_MAX)
+        self._go_frame_positions_revision[iid] = self._go_frame_positions_revision.get(iid, 0) + 1
+        return True
+
+    def update_go_frame_position_result(self, result_dict: dict) -> None:
+        try:
+            iid = int(result_dict["i"])
+        except Exception:
+            log.debug("RadarState: malformed radar-core FM_FRAME_RESULT ignored", exc_info=True)
+            return
+
+        if not bool(result_dict.get("aa")):
+            return
+
+        entry = self._normalise_go_frame_position({
+            "frame_index": result_dict.get("fi"),
+            "sweep_start_us": result_dict.get("su"),
+            "lat": result_dict.get("la"),
+            "lon": result_dict.get("lo"),
+            "cep_km": (
+                (float(result_dict["cep"]) / 1000.0)
+                if result_dict.get("cep") is not None else None
+            ),
+            "n_contributing_arcs": result_dict.get("na"),
+            "azimuth_spread_deg": result_dict.get("az"),
+            "weight": result_dict.get("w"),
+        })
+        if entry is None:
+            return
+
+        with self._lock:
+            buf = self._go_frame_positions.setdefault(
+                iid,
+                deque(maxlen=self._GO_FRAME_POSITIONS_MAX),
+            )
+            for idx, existing in enumerate(buf):
+                if existing.get("frame_index") != entry["frame_index"]:
+                    continue
+                if self._go_frame_position_signature(existing) == self._go_frame_position_signature(entry):
+                    return
+                buf[idx] = entry
+                self._go_frame_positions_revision[iid] = self._go_frame_positions_revision.get(iid, 0) + 1
+                return
+            buf.append(entry)
+            self._go_frame_positions_revision[iid] = self._go_frame_positions_revision.get(iid, 0) + 1
+
+    def update_go_snapshot(self, snapshot: dict) -> None:
+        iids_payload = snapshot.get("iids")
+        if not isinstance(iids_payload, dict):
+            return
+
+        with self._lock:
+            for iid_key, iid_payload in iids_payload.items():
+                if not isinstance(iid_payload, dict):
+                    continue
+                try:
+                    iid = int(iid_payload.get("iid", iid_key))
+                except Exception:
+                    continue
+
+                if "frame_positions" in iid_payload:
+                    entries = []
+                    for raw_entry in iid_payload.get("frame_positions") or []:
+                        if not isinstance(raw_entry, dict):
+                            continue
+                        entry = self._normalise_go_frame_position(raw_entry)
+                        if entry is not None:
+                            entries.append(entry)
+                    self._set_go_frame_positions_locked(iid, entries)
+                elif (
+                    iid in self._go_frame_positions
+                    and (
+                        "frame_position_pipeline" in iid_payload
+                        or "forward_model" in iid_payload
+                    )
+                ):
+                    self._set_go_frame_positions_locked(iid, [])
+
+    def get_go_frame_positions(self, iid: int) -> list[dict]:
+        with self._lock:
+            return [dict(entry) for entry in self._go_frame_positions.get(iid, ())]
+
+    def get_go_frame_positions_revision(self, iid: int) -> int:
+        with self._lock:
+            return int(self._go_frame_positions_revision.get(iid, 0))
+
+    def clear_go_frame_positions(self, iid: int) -> None:
+        with self._lock:
+            existing = self._go_frame_positions.get(iid)
+            if existing:
+                self._go_frame_positions.pop(iid, None)
+                self._go_frame_positions_revision[iid] = self._go_frame_positions_revision.get(iid, 0) + 1
 
     def _seed_live_sync_from_frame(
         self,
@@ -5969,6 +6104,16 @@ class RadarState:
             if iid in self._native_burst_processors:
                 del self._native_burst_processors[iid]
                 had_any = True
+            if iid in self._go_fm_states:
+                del self._go_fm_states[iid]
+                had_any = True
+            if iid in self._go_fm_pipeline_stats:
+                del self._go_fm_pipeline_stats[iid]
+                had_any = True
+            if iid in self._go_frame_positions:
+                del self._go_frame_positions[iid]
+                self._go_frame_positions_revision[iid] = self._go_frame_positions_revision.get(iid, 0) + 1
+                had_any = True
             if iid in self._radar_core_frames_injected_by_iid:
                 del self._radar_core_frames_injected_by_iid[iid]
                 had_any = True
@@ -6064,6 +6209,10 @@ class RadarState:
             self._live_detection_buffer.clear()
             self._native_burst_processors.clear()
             self._dwell_profiles.clear()
+            self._go_fm_states.clear()
+            self._go_fm_pipeline_stats.clear()
+            self._go_frame_positions.clear()
+            self._go_frame_positions_revision.clear()
             self._radar_core_frames_injected_by_iid.clear()
             self._python_frames_finalized_total = 0
             self._python_frames_finalized_by_iid.clear()
@@ -9017,4 +9166,9 @@ class RadarState:
             model.fm_convergence_history = []
             model.fm_last_run = None
             model.fm_coincident_validation = None
+            self._go_fm_states.pop(iid, None)
+            self._go_fm_pipeline_stats.pop(iid, None)
+            if iid in self._go_frame_positions:
+                del self._go_frame_positions[iid]
+                self._go_frame_positions_revision[iid] = self._go_frame_positions_revision.get(iid, 0) + 1
             return True
