@@ -112,6 +112,8 @@ async def get_status() -> dict:
             "main_frame_drops":    runtime.get("ws_main_frame_drops",    0),
             "sync_rebuilds":       runtime.get("ws_sync_rebuilds",       0),
             "sync_emissions":      runtime.get("ws_sync_emissions",       0),
+            "selected_state_rebuilds": runtime.get("ws_selected_state_rebuilds", 0),
+            "selected_state_emissions": runtime.get("ws_selected_state_emissions", 0),
             "live_emissions":      runtime.get("ws_live_emissions",       0),
             "client_queue_depths": runtime.get("ws_client_queue_depths", []),
         },

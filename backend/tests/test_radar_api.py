@@ -265,6 +265,128 @@ def test_get_iid_sync_snapshot_marks_cache_hits(monkeypatch):
     assert second["transport"]["source"] == "shared_snapshot_cache"
 
 
+def test_get_iid_selected_state_combines_lightweight_sections(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", False)
+    monkeypatch.setattr("radar.sweep.RADAR_DIAGNOSTICS", False)
+    state = RadarState()
+    now_ts = 2_000.0
+    model = RadarIID(iid=91, status="SINGLE_RADAR", period_s=4.0, rpm=15.0)
+    model.reference_aircraft = ReferenceAircraftInfo(
+        ref_icao="AAAAAA",
+        ref_score=1.2,
+        ref_since_sweep=4,
+        challengers=[{"icao": "BBBBBB", "score": 0.9, "ratio_to_best": 0.75, "status": "close_skip"}],
+    )
+    model.manual_lat = 51.5
+    model.manual_lon = -0.2
+    model.manual_note = "Known site"
+    model.manual_updated_ts = now_ts - 5.0
+    model.fm_lat = 51.6
+    model.fm_lon = -0.1
+    model.fm_cep_m = 800.0
+    model.fm_source = "fm"
+    model.fm_n_observations = 24
+    model.fm_window_s = 180.0
+    model.last_updated = now_ts
+    model.fm_last_run = {"ts": now_ts, "stage": "complete", "stored": True}
+    state._models[91] = model
+    state._iid_latest_arrival_us[91] = 7_000_000.0
+    state._live_sync_states[91] = LiveSyncState(
+        iid=91,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.5,
+        last_sync_update_ts=now_ts,
+        source="multi_aircraft_burst",
+        usable=True,
+    )
+    state._live_burst_timeline_obs[91] = deque([
+        AlignedBurstSyncObs(
+            burst_centroid_us=7_000_000.0,
+            icao="AAAAAA",
+            bearing_deg=14.0,
+            n_replies=4,
+            signal_dbfs=-16.0,
+            pos_age_s=0.3,
+            range_nm=14.0,
+            ts=now_ts,
+            sync_update_eligible=True,
+            raw_arrival_us=7_000_000.0,
+        )
+    ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+    state._live_completed_frames[91] = deque([
+        SweepFrame(
+            frame_index=3,
+            sweep_start_us=6_000_000.0,
+            ref_icao="AAAAAA",
+            ref_lat=51.5,
+            ref_lon=-0.2,
+            ref_arrival_us=6_000_000.0,
+            observations=[
+                SweepFrameObservation("BBBBBB", 51.6, -0.1, 6_200_000.0),
+            ],
+            quality="marginal",
+            period_s=4.0,
+        )
+    ], maxlen=state._LIVE_FRAMES_MAX)
+    state._live_frame_counters[91] = 4
+
+    prior_state = radar_api._state
+    radar_api._state = state
+    try:
+        payload = asyncio.run(radar_api.get_iid_selected_state(91, window_s=60.0, debug_limit=20))
+    finally:
+        radar_api._state = prior_state
+
+    assert payload["type"] == "radar_selected_iid_state"
+    assert payload["iid"] == 91
+    assert payload["selected"]["available"] is True
+    assert payload["sync"]["type"] == "radar_sync"
+    assert payload["frames"]["n_frames"] == 1
+    assert payload["reference"]["ref_icao"] == "AAAAAA"
+    assert payload["pipeline"]["stages"]["frames"]["status"] == "working"
+    assert payload["fm"]["location"]["status"] == "LOCALISED"
+    assert payload["solution"]["selected"]["source"] == payload["control"]["display_source"]
+    assert payload["transport"]["sections"]["frames"]["revision"] >= 1
+
+
+def test_get_iid_selected_state_marks_cache_hits(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", False)
+    monkeypatch.setattr("radar.sweep.RADAR_DIAGNOSTICS", False)
+    state = RadarState()
+    now_ts = 3_000.0
+    state._models[92] = RadarIID(iid=92, status="SINGLE_RADAR", period_s=4.0, last_updated=now_ts)
+    state._iid_latest_arrival_us[92] = 8_000_000.0
+    state._live_sync_states[92] = LiveSyncState(
+        iid=92,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.5,
+        last_sync_update_ts=now_ts,
+        source="multi_aircraft_burst",
+        usable=True,
+    )
+
+    prior_state = radar_api._state
+    radar_api._state = state
+    try:
+        first = asyncio.run(radar_api.get_iid_selected_state(92, window_s=60.0, debug_limit=20))
+        second = asyncio.run(radar_api.get_iid_selected_state(92, window_s=60.0, debug_limit=20))
+    finally:
+        radar_api._state = prior_state
+
+    assert first["transport"]["cached"] is False
+    assert second["transport"]["cached"] is True
+    assert second["sequence"] == first["sequence"]
+    assert second["revisions"] == first["revisions"]
+
+
 def test_get_iid_sweep_frame_fm_geometry_uses_cache(monkeypatch):
     state = RadarState()
     state._models[31] = RadarIID(iid=31, status="SINGLE_RADAR", period_s=4.0)

@@ -235,6 +235,8 @@ _radar_queue_depth_samples: _deque[int] = _deque(maxlen=120)
 _ws_main_frame_drops: int = 0   # per-client send-queue full (main aircraft WS)
 _ws_sync_rebuilds: int = 0      # sync snapshot rebuilds across all /sync sessions
 _ws_sync_emissions: int = 0     # sync snapshots actually sent (sequence changed)
+_ws_selected_state_rebuilds: int = 0
+_ws_selected_state_emissions: int = 0
 _ws_live_emissions: int = 0     # radar-live state payloads sent (change-driven)
 _radar_worker_timings: _deque[dict] = _deque(maxlen=400)
 _TIMING_WS_BATCH_LIMIT = 5_000
@@ -1789,6 +1791,8 @@ async def lifespan(app: FastAPI):
             "ws_main_frame_drops":   _ws_main_frame_drops,
             "ws_sync_rebuilds":      _ws_sync_rebuilds,
             "ws_sync_emissions":     _ws_sync_emissions,
+            "ws_selected_state_rebuilds": _ws_selected_state_rebuilds,
+            "ws_selected_state_emissions": _ws_selected_state_emissions,
             "ws_live_emissions":     _ws_live_emissions,
             "ws_client_queue_depths": [q.qsize() for q in _clients.values()],
             "aircraft_state":    state.get_aux_dict_sizes(),
@@ -2362,6 +2366,66 @@ async def radar_iid_sync_websocket_endpoint(ws: WebSocket, iid: int) -> None:
         pass
     except Exception as exc:
         log.debug("Radar IID sync WebSocket error: %s", exc)
+
+
+@app.websocket("/ws/radar/iids/{iid}/state")
+async def radar_iid_selected_state_websocket_endpoint(ws: WebSocket, iid: int) -> None:
+    """Selected-IID pushed lightweight page-state feed for RadarPage live use."""
+    await ws.accept()
+    window_s = 90.0
+    debug_limit = 120
+    last_sequence = None
+    last_heartbeat = 0.0
+    last_rebuild = 0.0
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=0.2)
+                try:
+                    request = json.loads(msg)
+                    req_window_s = float(request.get("window_s", window_s))
+                    req_debug_limit = int(request.get("debug_limit", debug_limit))
+                    if 10 <= req_window_s <= 300:
+                        window_s = req_window_s
+                    if 1 <= req_debug_limit <= 300:
+                        debug_limit = req_debug_limit
+                except Exception:
+                    pass
+            except asyncio.TimeoutError:
+                pass
+
+            now = time.time()
+            sent_kind = "none"
+            if now - last_rebuild >= 0.25:
+                global _ws_selected_state_rebuilds, _ws_selected_state_emissions
+                _ws_selected_state_rebuilds += 1
+                payload = radar_api.build_selected_iid_page_state_payload(
+                    radar_state,
+                    iid,
+                    window_s=window_s,
+                    debug_limit=debug_limit,
+                )
+                last_rebuild = now
+                sequence = payload.get("sequence")
+                if sequence != last_sequence:
+                    await ws.send_text(_json_dumps(payload))
+                    last_sequence = sequence
+                    last_heartbeat = now
+                    sent_kind = "snapshot"
+                    _ws_selected_state_emissions += 1
+            if sent_kind == "none" and now - last_heartbeat >= 1.0:
+                await ws.send_text(_json_dumps({
+                    "type": "radar_selected_iid_state_heartbeat",
+                    "iid": iid,
+                    "server_ts": now,
+                    "sequence": last_sequence,
+                }))
+                last_heartbeat = now
+            await asyncio.sleep(0.1)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        log.debug("Radar IID selected-state WebSocket error: %s", exc)
 
 
 @app.websocket("/ws/radar/live")

@@ -1,5 +1,45 @@
 # Deficiency Rectification Plan
 
+## 2026-04-21 Selected-IID Pushed Radar Page State Feed
+
+- [x] Audit the current Radar page selected-IID polling hooks/components and map each lightweight section to a cheap authoritative backend source
+- [x] Add backend-maintained selected-IID page-state snapshots with per-section revisions for control, reference aircraft, pipeline health, FM summary, solution comparison, sync, and lightweight sweep-frame summaries
+- [x] Make the selected-IID sweep-frame list pushable from cached/revisioned summary state rather than rebuilding frame JSON on every websocket tick
+- [x] Add a selected-IID page-state websocket/HTTP snapshot path that emits cached state only when section revisions change, with heartbeat and observability metadata
+- [x] Replace Radar page lightweight selected-IID polling hooks with one pushed selected-IID state source plus graceful websocket fallback
+- [x] Keep heavyweight geometry/debug endpoints explicit and on-demand only (`iid_sweep_frame_fm_geometry`, manual preview geometry, deep diagnostics)
+- [x] Add/update targeted backend/frontend tests and run verification proving materially reduced HTTP polling plus functional equivalence
+
+Plan confirmation: proceed with a focused transport/cache change rather than a page redesign. Reuse the existing sync snapshot cache, add a separate selected-IID page-state cache built from maintained model/frame snapshots, and keep all heavyweight geometry/debug computation off the live pushed feed.
+
+### Review
+
+- Hook replacement audit:
+  - Replaced live page polling/use of `useSweepFrames`, `useReferenceAircraft`, `useFmLocation`, `useIidControl`, and `useSolutionComparison` with one selected-IID pushed state hook backed by `/ws/radar/iids/{iid}/state` and `/api/radar/iids/{iid}/state`.
+  - The page-level sync feed now comes from the same selected-IID pushed payload instead of a separate `useRadarSyncStream` websocket.
+  - `usePipelineHealth` was included in the pushed payload for future/diagnostic use, but the current Radar page still does not mount the pipeline bar.
+  - Heavyweight diagnostics remain separate: `useFrameFmGeometry`, manual preview geometry, evidence methods, TDOA diagnostics, and FM geometry map work are still explicit/on-demand.
+- Backend implementation:
+  - Added cached/revisioned selected-IID page-state assembly in [api.py](/home/keith/claude/adsb-dashboard/backend/radar/api.py) with sections for `selected`, `sync`, `frames`, `reference`, `pipeline`, `fm`, `solution`, and `control`.
+  - Added cached lightweight sweep-frame summary generation in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) so `sweep-frames` JSON is rebuilt only when the frame summary signature changes, not on every websocket tick.
+  - Added `/api/radar/iids/{iid}/state` plus `/ws/radar/iids/{iid}/state`, with per-section revisions, section cache metadata, and process-wide websocket send counters in [main.py](/home/keith/claude/adsb-dashboard/backend/main.py) and [status.py](/home/keith/claude/adsb-dashboard/backend/status.py).
+- Frontend implementation:
+  - Added one selected-IID pushed-state hook in [RadarPage.jsx](/home/keith/claude/adsb-dashboard/frontend/src/pages/RadarPage.jsx) with websocket-first delivery, HTTP fallback, reconnect handling, and dev metrics via `window.__RADAR_PAGE_REQUEST_METRICS__`.
+  - The Radar page now feeds Sweep Frames, Localisation Control, Position Sources, FM Status, sync panels, and receiver-centred verification from the single pushed selected-IID state snapshot.
+  - Added a visible feed-mode pill in Localisation Control so reconnect/fallback state is inspectable during development.
+- Verification:
+  - `python3 -m py_compile backend/radar/api.py backend/radar/sweep.py backend/main.py backend/status.py`
+  - `uv run --directory backend pytest tests/test_radar_api.py -q`
+  - `npm run build`
+  - Result: compile passed, targeted radar API suite passed (`41 passed`), frontend production build passed.
+- Before/after evidence:
+  - Before this change, the live page maintained a selected-IID sync websocket plus repeated HTTP polling for `sweep-frames`, `reference-aircraft`, `fm-location`, `control`, and `solution-comparison`.
+  - After this change, those lightweight sections are delivered by one selected-IID websocket with HTTP fallback, so normal live use no longer needs those repeated selected-IID GET polls.
+  - `window.__RADAR_PAGE_REQUEST_METRICS__` should now show `ws_selected_iid_state` activity plus a sharp drop in repeated `iid_sweep_frames`, `iid_reference_aircraft`, `iid_fm_location`, `iid_control`, and `iid_solution_comparison` requests.
+  - `/api/status` now exposes `ws_selected_state_rebuilds` and `ws_selected_state_emissions` so backend push cadence can be compared against prior poll churn.
+- Residual limitation:
+  - I could not capture real browser-network traces or live ingest counters against receiver traffic in this sandbox, so the before/after request reduction is demonstrated by transport-path replacement and dev metrics instrumentation rather than a recorded live Pi session here.
+
 ## 2026-04-21 Radar Page Interaction/Load Investigation
 
 - [x] Audit Radar page automatic fetch/poll/websocket behaviour and identify the exact request graph for page load and interactions

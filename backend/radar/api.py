@@ -64,6 +64,12 @@ def _record_api_timing(endpoint: str, started_at: float, **meta) -> None:
 _diag_cache: dict[str, tuple[float, dict]] = {}
 _DIAG_CACHE_TTL_S = 30.0
 _frame_geometry_cache: dict[tuple, dict] = {}
+_selected_iid_state_section_cache: dict[int, dict[str, dict]] = {}
+_selected_iid_state_section_signatures: dict[int, dict[str, tuple]] = {}
+_selected_iid_state_section_revisions: dict[int, dict[str, int]] = {}
+_selected_iid_state_snapshot_cache: dict[int, tuple[tuple, dict]] = {}
+_selected_iid_state_snapshot_seq: dict[int, int] = {}
+_selected_iid_state_last_cache_hit: dict[int, bool] = {}
 
 
 def _frame_geometry_signature(frame, period_s: float | None, sweep_direction: int) -> tuple:
@@ -1420,6 +1426,47 @@ async def get_iid_sync_snapshot(
         )
 
 
+@router.get("/iids/{iid}/state")
+async def get_iid_selected_state(
+    iid: int,
+    window_s: float = Query(default=90.0, ge=10, le=300),
+    debug_limit: int = Query(default=120, ge=1, le=300),
+):
+    """Shared selected-IID lightweight page state for RadarPage live use."""
+    t0 = time.perf_counter()
+    cache_hit = False
+    try:
+        payload = build_selected_iid_page_state_payload(
+            _state,
+            iid,
+            window_s=window_s,
+            debug_limit=debug_limit,
+        )
+        section_meta = (payload or {}).get("transport", {}).get("sections", {})
+        cache_hit = get_selected_iid_page_state_last_cache_hit(iid) or (
+            bool(section_meta)
+            and all(bool(meta.get("cached")) for meta in section_meta.values())
+        )
+        if payload is not None:
+            payload = {
+                **payload,
+                "transport": {
+                    **(payload.get("transport") or {}),
+                    "cached": cache_hit,
+                    "source": "selected_iid_state_snapshot_cache" if cache_hit else (
+                        payload.get("transport", {}).get("source") or "selected_iid_state_snapshot"
+                    ),
+                },
+            }
+        return payload
+    finally:
+        _record_api_timing(
+            "iid_selected_state",
+            t0,
+            cache_status="hit" if cache_hit else "miss",
+        )
+
+
 @router.get("/iids/{iid}/rotation")
 async def get_iid_rotation(iid: int):
     """Current rotation model for a single IID."""
@@ -2155,6 +2202,443 @@ _FM_DIAG_CACHE_TTL_S = 3.0
 _fm_diag_cache: dict[int, tuple[float, dict]] = {}
 
 
+def _selected_iid_section_entry(
+    iid: int,
+    section: str,
+    signature: tuple,
+    builder: Callable[[], dict],
+) -> tuple[dict, int, bool]:
+    section_cache = _selected_iid_state_section_cache.setdefault(iid, {})
+    section_signatures = _selected_iid_state_section_signatures.setdefault(iid, {})
+    section_revisions = _selected_iid_state_section_revisions.setdefault(iid, {})
+    cached_payload = section_cache.get(section)
+    if cached_payload is not None and section_signatures.get(section) == signature:
+        return cached_payload, int(section_revisions.get(section, 0)), True
+    revision = int(section_revisions.get(section, 0)) + 1
+    payload = builder()
+    section_cache[section] = payload
+    section_signatures[section] = signature
+    section_revisions[section] = revision
+    return payload, revision, False
+
+
+def _build_selected_iid_fm_summary(iid: int, model, frame_counts: dict, pipeline_debug: dict | None) -> dict:
+    if model is None:
+        return {"iid": iid, "available": False, "reason": "IID not seen"}
+
+    accumulation = _build_frame_accumulation_summary(iid, model)
+    unique_aircraft = None
+    bottleneck = None
+    if pipeline_debug is not None:
+        retained = pipeline_debug.get("retained_state") or {}
+        unique_aircraft = retained.get("active_aircraft_estimate")
+        if unique_aircraft is None:
+            unique_aircraft = ((retained.get("burst_records_per_icao") or {}).get("icaos"))
+    if model.multi_radar_flag:
+        bottleneck = "Multi-radar IID is excluded from FM."
+    elif model.period_s is None:
+        bottleneck = "Waiting for a stable radar period."
+    elif frame_counts.get("n_good", 0) <= 0:
+        usable = frame_counts.get("n_usable", frame_counts.get("n_good", 0))
+        if usable > 0:
+            bottleneck = f"{usable} usable frame(s) available; waiting for a good frame set."
+        elif frame_counts.get("n_frames", 0) > 0:
+            bottleneck = "Sweep frames exist, but none are usable yet."
+        else:
+            bottleneck = "Waiting for sweep frames."
+
+    top_candidate = model.airport_hypothesis[0] if model.airport_hypothesis else None
+    return {
+        "iid": iid,
+        "available": True,
+        "location": {
+            "iid": iid,
+            "lat": model.fm_lat,
+            "lon": model.fm_lon,
+            "cep_m": model.fm_cep_m,
+            "source": model.fm_source,
+            "n_observations": model.fm_n_observations,
+            "window_s": model.fm_window_s,
+            "status": "LOCALISED" if model.fm_lat is not None else "NOT_LOCALISED",
+            "last_updated": model.last_updated,
+            "convergence_history": model.fm_convergence_history[-20:],
+        },
+        "rotation_model": {
+            "period_s": model.period_s,
+            "rpm": model.rpm,
+            "status": model.status,
+            "multi_radar_flag": model.multi_radar_flag,
+        },
+        "data_funnel": {
+            "good_frames": frame_counts.get("n_good", 0),
+            "marginal_frames": frame_counts.get("n_marginal", 0),
+            "sweep_frames_built": frame_counts.get("n_frames", 0),
+            "unique_aircraft": unique_aircraft,
+            "bottleneck": bottleneck,
+        },
+        "forward_model": {
+            "has_position": model.fm_lat is not None,
+            "fm_lat": model.fm_lat,
+            "fm_lon": model.fm_lon,
+            "fm_cep_m": model.fm_cep_m,
+            "fm_source": model.fm_source,
+            "n_observations": model.fm_n_observations,
+            "window_s": model.fm_window_s,
+            "n_convergence_entries": len(model.fm_convergence_history),
+            "n_airport_candidates": len(model.airport_hypothesis),
+            "coincident_validation": getattr(model, "fm_coincident_validation", None),
+            "last_run": getattr(model, "fm_last_run", None),
+            "top_candidate": (
+                {
+                    "airport_icao": top_candidate.get("airport_icao"),
+                    "airport_name": top_candidate.get("airport_name") or top_candidate.get("name"),
+                    "score": top_candidate.get("score"),
+                    "residual_sigma_deg": top_candidate.get("residual_sigma_deg"),
+                    "residual_sigma_ms": top_candidate.get("residual_sigma_ms"),
+                    "n_aircraft": top_candidate.get("n_aircraft"),
+                    "directional_signal": top_candidate.get("directional_signal"),
+                }
+                if top_candidate is not None else None
+            ),
+        },
+        "frame_accumulation": accumulation,
+    }
+
+
+def _build_selected_iid_solution_summary(iid: int, model, fm_summary: dict, control_payload: dict) -> dict:
+    if model is None:
+        return {"iid": iid, "available": False, "reason": "IID not seen", "methods": []}
+
+    methods: list[dict] = []
+    if model.manual_lat is not None and model.manual_lon is not None:
+        methods.append({
+            "source": "manual",
+            "status": "locked" if model.resolution_mode == "locked_position" else "available",
+            "lat": model.manual_lat,
+            "lon": model.manual_lon,
+            "cep_m": None,
+            "updated_ts": model.manual_updated_ts,
+        })
+    else:
+        methods.append({
+            "source": "manual",
+            "status": "unset",
+            "lat": None,
+            "lon": None,
+            "cep_m": None,
+            "updated_ts": None,
+        })
+
+    methods.append({
+        "source": "fm",
+        "status": "solved" if model.fm_lat is not None and model.fm_lon is not None else (
+            "paused" if model.resolution_mode != "auto" else "collecting"
+        ),
+        "lat": model.fm_lat,
+        "lon": model.fm_lon,
+        "cep_m": model.fm_cep_m,
+        "updated_ts": model.last_updated if model.fm_lat is not None else None,
+    })
+
+    accumulation = fm_summary.get("frame_accumulation") or {}
+    centroid = accumulation.get("centroid") or {}
+    methods.append({
+        "source": "frame_accumulation",
+        "status": "available" if centroid.get("lat") is not None and centroid.get("lon") is not None else "collecting",
+        "lat": centroid.get("lat"),
+        "lon": centroid.get("lon"),
+        "cep_m": (centroid.get("cep_km") or 0.0) * 1000.0 if centroid.get("cep_km") is not None else None,
+        "updated_ts": getattr(model, "fm_last_run", {}).get("ts") if getattr(model, "fm_last_run", None) else None,
+    })
+
+    selected = {
+        "source": control_payload.get("display_source"),
+        "lat": control_payload.get("display_lat"),
+        "lon": control_payload.get("display_lon"),
+        "cep_m": control_payload.get("display_cep_m"),
+    }
+    return {
+        "iid": iid,
+        "available": True,
+        "resolution_mode": model.resolution_mode,
+        "selected": selected,
+        "methods": methods,
+    }
+
+
+def build_selected_iid_page_state_payload(
+    state: "RadarState" | None,
+    iid: int,
+    *,
+    window_s: float = 90.0,
+    debug_limit: int = 120,
+) -> dict:
+    if state is None:
+        return {
+            "type": "radar_selected_iid_state",
+            "iid": iid,
+            "sequence": 0,
+            "server_ts": time.time(),
+            "revisions": {
+                "selected": 0,
+                "sync": 0,
+                "frames": 0,
+                "reference": 0,
+                "pipeline": 0,
+                "fm": 0,
+                "solution": 0,
+                "control": 0,
+            },
+            "selected": {"iid": iid, "available": False, "reason": "radar module not initialised"},
+            "sync": build_iid_sync_snapshot_payload(None, iid, window_s=window_s, debug_limit=debug_limit),
+            "frames": {"iid": iid, "n_frames": 0, "frames": []},
+            "reference": {"iid": iid, "status": "NOT_INITIALISED"},
+            "pipeline": {
+                "iid": iid,
+                "stages": {
+                    "period": {"status": "not_started", "detail": "Radar module not initialised"},
+                    "reference": {"status": "not_started", "detail": ""},
+                    "frames": {"status": "not_started", "detail": ""},
+                    "scoring": {"status": "not_started", "detail": ""},
+                    "optimisation": {"status": "not_started", "detail": ""},
+                },
+            },
+            "fm": {"iid": iid, "available": False, "reason": "radar module not initialised"},
+            "solution": {"iid": iid, "available": False, "reason": "radar module not initialised", "methods": []},
+            "control": {"iid": iid, "available": False, "reason": "radar module not initialised"},
+            "transport": {"cached": False, "source": "selected_iid_state_unavailable"},
+        }
+
+    model = state.get_rotation_model(iid)
+    frame_counts = state.get_live_frame_counts(iid)
+    frame_payload_snapshot = state.get_sweep_frame_summary_payload(iid)
+    frame_revision = int((frame_payload_snapshot.get("transport") or {}).get("revision", 0))
+    sync_payload = build_iid_sync_snapshot_payload(state, iid, window_s=window_s, debug_limit=debug_limit)
+    sync_signature = (
+        sync_payload.get("sequence"),
+        sync_payload.get("rotation", {}).get("period_s"),
+        sync_payload.get("rotation", {}).get("status"),
+    )
+
+    selected_payload, selected_revision, selected_cached = _selected_iid_section_entry(
+        iid,
+        "selected",
+        ("present", model is not None),
+        lambda: {
+            "iid": iid,
+            "available": model is not None,
+            "reason": None if model is not None else "IID not seen",
+        },
+    )
+    sync_section, sync_revision, sync_cached = _selected_iid_section_entry(
+        iid,
+        "sync",
+        sync_signature,
+        lambda: sync_payload,
+    )
+    frames_payload, frames_revision, frames_cached = _selected_iid_section_entry(
+        iid,
+        "frames",
+        (frame_revision,),
+        lambda: frame_payload_snapshot,
+    )
+
+    reference = model.reference_aircraft if model is not None else None
+    reference_signature = (
+        reference.ref_icao if reference is not None else None,
+        reference.ref_score if reference is not None else None,
+        reference.ref_since_sweep if reference is not None else None,
+        reference.hysteresis_margin if reference is not None else None,
+        tuple(
+            (
+                challenger.get("icao"),
+                challenger.get("score"),
+                challenger.get("ratio_to_best"),
+                challenger.get("status"),
+            )
+            for challenger in (reference.challengers or [])
+        ) if reference is not None else (),
+    )
+    reference_payload, reference_revision, reference_cached = _selected_iid_section_entry(
+        iid,
+        "reference",
+        reference_signature,
+        lambda: {"iid": iid, **state.get_reference_aircraft(iid)},
+    )
+
+    pipeline_signature = (
+        model.period_s if model is not None else None,
+        model.status if model is not None else None,
+        model.multi_radar_flag if model is not None else None,
+        reference.ref_icao if reference is not None else None,
+        frame_revision,
+        model.fm_lat if model is not None else None,
+        model.fm_lon if model is not None else None,
+        (model.airport_hypothesis[0].get("airport_icao"), model.airport_hypothesis[0].get("score"))
+        if model is not None and model.airport_hypothesis else None,
+    )
+    pipeline_payload, pipeline_revision, pipeline_cached = _selected_iid_section_entry(
+        iid,
+        "pipeline",
+        pipeline_signature,
+        lambda: {"iid": iid, **state.get_pipeline_health(iid, sweep_frames=[
+            SimpleNamespace(quality="good") for _ in range(frame_counts.get("n_good", 0))
+        ] + [
+            SimpleNamespace(quality="marginal") for _ in range(frame_counts.get("n_frames", 0) - frame_counts.get("n_good", 0))
+        ])},
+    )
+
+    fm_signature = (
+        frame_revision,
+        model.fm_lat if model is not None else None,
+        model.fm_lon if model is not None else None,
+        model.fm_cep_m if model is not None else None,
+        model.fm_source if model is not None else None,
+        model.fm_n_observations if model is not None else None,
+        model.fm_window_s if model is not None else None,
+        model.last_updated if model is not None else None,
+        len(model.fm_convergence_history) if model is not None else 0,
+        (getattr(model, "fm_last_run", None) or {}).get("ts") if model is not None else None,
+        (getattr(model, "fm_last_run", None) or {}).get("stage") if model is not None else None,
+        (getattr(model, "fm_last_run", None) or {}).get("stored") if model is not None else None,
+        (model.airport_hypothesis[0].get("airport_icao"), model.airport_hypothesis[0].get("score"))
+        if model is not None and model.airport_hypothesis else None,
+    )
+    fm_payload, fm_revision, fm_cached = _selected_iid_section_entry(
+        iid,
+        "fm",
+        fm_signature,
+        lambda: _build_selected_iid_fm_summary(
+            iid,
+            model,
+            frame_counts,
+            state.get_live_pipeline_debug(iid) if model is not None else None,
+        ),
+    )
+
+    control_signature = (
+        model.resolution_mode if model is not None else None,
+        model.manual_lat if model is not None else None,
+        model.manual_lon if model is not None else None,
+        model.manual_note if model is not None else None,
+        model.manual_updated_ts if model is not None else None,
+        model.unresolvable_reason if model is not None else None,
+        model.unresolvable_updated_ts if model is not None else None,
+        model.lat if model is not None else None,
+        model.lon if model is not None else None,
+        model.cep_m if model is not None else None,
+        model.fm_lat if model is not None else None,
+        model.fm_lon if model is not None else None,
+        model.fm_cep_m if model is not None else None,
+        model.fm_source if model is not None else None,
+        model.last_updated if model is not None else None,
+    )
+    control_payload, control_revision, control_cached = _selected_iid_section_entry(
+        iid,
+        "control",
+        control_signature,
+        lambda: {
+            "iid": iid,
+            "available": model is not None,
+            **_control_payload(model),
+        },
+    )
+
+    solution_signature = (
+        control_signature,
+        fm_signature,
+        frame_revision,
+    )
+    solution_payload, solution_revision, solution_cached = _selected_iid_section_entry(
+        iid,
+        "solution",
+        solution_signature,
+        lambda: _build_selected_iid_solution_summary(iid, model, fm_payload, control_payload),
+    )
+
+    revisions = {
+        "selected": selected_revision,
+        "sync": sync_revision,
+        "frames": frames_revision,
+        "reference": reference_revision,
+        "pipeline": pipeline_revision,
+        "fm": fm_revision,
+        "solution": solution_revision,
+        "control": control_revision,
+    }
+    snapshot_signature = (
+        revisions["selected"],
+        revisions["sync"],
+        revisions["frames"],
+        revisions["reference"],
+        revisions["pipeline"],
+        revisions["fm"],
+        revisions["solution"],
+        revisions["control"],
+    )
+    cached_snapshot = _selected_iid_state_snapshot_cache.get(iid)
+    if cached_snapshot is not None and cached_snapshot[0] == snapshot_signature:
+        _selected_iid_state_last_cache_hit[iid] = True
+        cached_payload = cached_snapshot[1]
+        cached_transport = dict(cached_payload.get("transport") or {})
+        cached_sections = {
+            key: {
+                **(meta or {}),
+                "cached": True,
+            }
+            for key, meta in (cached_transport.get("sections") or {}).items()
+        }
+        cached_payload = {
+            **cached_payload,
+            "transport": {
+                **cached_transport,
+                "cached": True,
+                "sections": cached_sections,
+            },
+        }
+        _selected_iid_state_snapshot_cache[iid] = (snapshot_signature, cached_payload)
+        return cached_payload
+
+    sequence = int(_selected_iid_state_snapshot_seq.get(iid, 0)) + 1
+    _selected_iid_state_snapshot_seq[iid] = sequence
+    payload = {
+        "type": "radar_selected_iid_state",
+        "iid": iid,
+        "sequence": sequence,
+        "server_ts": time.time(),
+        "revisions": revisions,
+        "selected": selected_payload,
+        "sync": sync_section,
+        "frames": frames_payload,
+        "reference": reference_payload,
+        "pipeline": pipeline_payload,
+        "fm": fm_payload,
+        "solution": solution_payload,
+        "control": control_payload,
+        "transport": {
+            "cached": False,
+            "source": "selected_iid_state_cache",
+            "sections": {
+                "selected": {"cached": selected_cached, "revision": selected_revision},
+                "sync": {"cached": sync_cached, "revision": sync_revision},
+                "frames": {"cached": frames_cached, "revision": frames_revision},
+                "reference": {"cached": reference_cached, "revision": reference_revision},
+                "pipeline": {"cached": pipeline_cached, "revision": pipeline_revision},
+                "fm": {"cached": fm_cached, "revision": fm_revision},
+                "solution": {"cached": solution_cached, "revision": solution_revision},
+                "control": {"cached": control_cached, "revision": control_revision},
+            },
+        },
+    }
+    _selected_iid_state_snapshot_cache[iid] = (snapshot_signature, payload)
+    _selected_iid_state_last_cache_hit[iid] = False
+    return payload
+
+
+def get_selected_iid_page_state_last_cache_hit(iid: int) -> bool:
+    return bool(_selected_iid_state_last_cache_hit.get(iid, False))
+
+
 @router.get("/iids/{iid}/fm-diagnostics")
 async def get_iid_fm_diagnostics(iid: int):
     """Show the data funnel: how many burst centroids become usable SweepFrames.
@@ -2569,6 +3053,7 @@ async def delete_frame_position(iid: int, frame_index: int):
 async def get_iid_sweep_frames(iid: int):
     """Return SweepFrames for an IID with per-aircraft phase information."""
     t0 = time.perf_counter()
+    cache_hit = False
     try:
         if _state is None:
             return {"iid": iid, "frames": []}
@@ -2577,54 +3062,26 @@ async def get_iid_sweep_frames(iid: int):
         if model is None:
             return {"iid": iid, "frames": []}
 
-        frames = _state.get_sweep_frames(iid)
-        if not frames:
+        payload = _state.get_sweep_frame_summary_payload(iid)
+        cache_hit = _state.get_sweep_frame_summary_last_cache_hit(iid)
+        if payload.get("n_frames", 0) <= 0:
             return {"iid": iid, "frames": []}
-
-        # Get period for phase computation — use the frame's own period_s
-        out_frames = []
-        for frame in frames:
-            frame_period = frame.period_s
-            out_obs = []
-            for obs in frame.observations:
-                # Compute observed phase relative to reference aircraft (0-360°)
-                dt_us = obs.arrival_us - frame.ref_arrival_us
-                dt_s = dt_us / 1_000_000.0
-                if frame_period and frame_period > 0:
-                    observed_phase = ((dt_s / frame_period) * 360.0) % 360.0
-                else:
-                    observed_phase = None
-
-                out_obs.append({
-                    "icao": obs.icao,
-                    "lat": round(obs.lat, 6),
-                    "lon": round(obs.lon, 6),
-                    "arrival_us": obs.arrival_us,
-                    "observed_phase_deg": round(observed_phase, 2) if observed_phase is not None else None,
-                    "interpolated": obs.interpolated,
-                })
-            out_frames.append({
-                "frame_index": frame.frame_index,
-                "sweep_start_us": frame.sweep_start_us,
-                "ref_icao": frame.ref_icao,
-                "ref_lat": round(frame.ref_lat, 6),
-                "ref_lon": round(frame.ref_lon, 6),
-                "ref_arrival_us": frame.ref_arrival_us,
-                "period_s": frame.period_s,
-                "quality": frame.quality,
-                "n_aircraft": 1 + len(frame.observations),
-                "observations": out_obs,
-            })
-
         return {
-            "iid": iid,
-            "n_frames": len(out_frames),
-            "frames": out_frames,
-            "latest_arrival_us": _state.get_latest_arrival_us(),
-            "last_updated": model.last_updated if model else None,
+            **payload,
+            "transport": {
+                **(payload.get("transport") or {}),
+                "cached": cache_hit,
+                "source": "live_sweep_frame_summary_cache" if cache_hit else (
+                    payload.get("transport", {}).get("source") or "live_sweep_frame_summary"
+                ),
+            },
         }
     finally:
-        _record_api_timing("iid_sweep_frames", t0)
+        _record_api_timing(
+            "iid_sweep_frames",
+            t0,
+            cache_status="hit" if cache_hit else "miss",
+        )
 
 
 @router.get("/iids/{iid}/sweep-frames/{frame_index}/fm-geometry")

@@ -696,6 +696,7 @@ function sourceColor(source) {
     case 'manual': return '#58a6ff'
     case 'combined': return '#3fb950'
     case 'fm': return '#d29922'
+    case 'frame_accumulation': return '#3fb950'
     case 'coincident_illumination': return '#bc8cff'
     case 'tdoa': return '#ff7b72'
     default: return '#8b949e'
@@ -703,8 +704,8 @@ function sourceColor(source) {
 }
 
 /** 5-stage pipeline health bar */
-function PipelineHealthBar({ iid }) {
-  const health = usePipelineHealth(iid)
+function PipelineHealthBar({ iid, healthData = null }) {
+  const health = healthData ?? usePipelineHealth(iid)
 
   if (!health?.stages) {
     return (
@@ -794,8 +795,8 @@ function stageIcon(status) {
 }
 
 /** Reference aircraft panel with challenger table */
-function ReferenceAircraftPanel({ iid }) {
-  const refInfo = useReferenceAircraft(iid)
+function ReferenceAircraftPanel({ iid, referenceData = null }) {
+  const refInfo = referenceData ?? useReferenceAircraft(iid)
 
   if (!refInfo || refInfo.status === 'NO_MODEL' || refInfo.status === 'NOT_INITIALISED') {
     return (
@@ -883,6 +884,7 @@ function formatMethodName(source) {
   switch (source) {
     case 'forward_model': return 'Forward Model'
     case 'fm': return 'Estimated'
+    case 'frame_accumulation': return 'Frame Buffer'
     case 'coincident_illumination': return 'Coincident Rays'
     case 'combined': return 'Combined'
     case 'manual': return 'Manual'
@@ -1011,9 +1013,9 @@ function IIDTable({ rows, selectedIid, onSelect, onResetAll, resettingAll }) {
   )
 }
 
-function LocalisationControlPanel({ iid, onChanged }) {
-  const [refreshKey, setRefreshKey] = useState(0)
-  const { data, loading } = useIidControl(iid, refreshKey)
+function LocalisationControlPanel({ iid, onChanged, controlData = null, feedStatus = null }) {
+  const data = controlData
+  const loading = iid != null && data == null
   const [manualLat, setManualLat] = useState('')
   const [manualLon, setManualLon] = useState('')
   const [manualNote, setManualNote] = useState('')
@@ -1032,7 +1034,6 @@ function LocalisationControlPanel({ iid, onChanged }) {
     setBusy(true)
     try {
       await fetch(`${API_BASE}/api/radar/iids/${iid}${path}`, options)
-      setRefreshKey(v => v + 1)
       onChanged?.()
     } catch {}
     setBusy(false)
@@ -1074,6 +1075,9 @@ function LocalisationControlPanel({ iid, onChanged }) {
         <div className={styles.metricRow}>
           <span className={styles.metricPill}>
             Mode <span className={styles.metricValue}>{data?.resolution_mode ?? (loading ? 'loading' : 'auto')}</span>
+          </span>
+          <span className={styles.metricPill}>
+            Feed <span className={styles.metricValue}>{feedStatus?.mode ?? 'idle'}</span>
           </span>
           <span className={styles.metricPill}>
             Display <span className={styles.metricValue}>{data?.display_source ?? '—'}</span>
@@ -1127,8 +1131,8 @@ function LocalisationControlPanel({ iid, onChanged }) {
   )
 }
 
-function SolutionComparisonPanel({ iid, refreshKey = 0 }) {
-  const comparison = useSolutionComparison(iid, refreshKey)
+function SolutionComparisonPanel({ iid, comparisonData = null }) {
+  const comparison = comparisonData
 
   if (iid == null) {
     return (
@@ -1819,7 +1823,7 @@ function timingClassColor(timingClass) {
   }
 }
 
-function useRadarSyncStream(iid, windowS, debugLimit = 120) {
+function useSelectedIidPageState(iid, windowS, debugLimit = 120) {
   const [snapshot, setSnapshot] = useState(null)
   const [status, setStatus] = useState({
     connected: false,
@@ -1849,8 +1853,8 @@ function useRadarSyncStream(iid, windowS, debugLimit = 120) {
     let ws = null
 
     const ingestSnapshot = payload => {
-      if (!payload || payload.type !== 'radar_sync') return
-      recordRadarPageStream('ws_radar_sync', 'message', { iid, sequence: payload.sequence ?? null })
+      if (!payload || payload.type !== 'radar_selected_iid_state') return
+      recordRadarPageStream('ws_selected_iid_state', 'message', { iid, sequence: payload.sequence ?? null })
       lastUpdateRef.current = performance.now()
       startTransition(() => setSnapshot(payload))
       setStatus({
@@ -1864,12 +1868,12 @@ function useRadarSyncStream(iid, windowS, debugLimit = 120) {
 
     const pollFallback = () => {
       if (closed) return
-      trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/sync-snapshot?window_s=${windowS}&debug_limit=${debugLimit}`, {
-        endpoint: 'sync_snapshot',
-        trigger: 'sync_stream_fallback',
+      trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/state?window_s=${windowS}&debug_limit=${debugLimit}`, {
+        endpoint: 'iid_selected_state',
+        trigger: 'selected_state_stream_fallback',
       })
         .then(payload => {
-          if (closed || !payload) return
+          if (closed || !payload || payload.type !== 'radar_selected_iid_state') return
           lastUpdateRef.current = performance.now()
           startTransition(() => setSnapshot(payload))
           setStatus({
@@ -1889,9 +1893,9 @@ function useRadarSyncStream(iid, windowS, debugLimit = 120) {
 
     const connect = () => {
       if (closed) return
-      ws = new WebSocket(`${RADAR_SYNC_WS_BASE}/ws/radar/iids/${iid}/sync`)
+      ws = new WebSocket(`${RADAR_SYNC_WS_BASE}/ws/radar/iids/${iid}/state`)
       ws.onopen = () => {
-        recordRadarPageStream('ws_radar_sync', 'open', { iid })
+        recordRadarPageStream('ws_selected_iid_state', 'open', { iid })
         try {
           ws.send(JSON.stringify({ window_s: windowS, debug_limit: debugLimit }))
         } catch {}
@@ -1900,8 +1904,8 @@ function useRadarSyncStream(iid, windowS, debugLimit = 120) {
       ws.onmessage = event => {
         try {
           const payload = JSON.parse(event.data)
-          if (payload.type === 'radar_sync_heartbeat') {
-            recordRadarPageStream('ws_radar_sync', 'heartbeat', { iid, sequence: payload.sequence ?? null })
+          if (payload.type === 'radar_selected_iid_state_heartbeat') {
+            recordRadarPageStream('ws_selected_iid_state', 'heartbeat', { iid, sequence: payload.sequence ?? null })
             lastUpdateRef.current = performance.now()
             setStatus(prev => ({
               ...prev,
@@ -1916,7 +1920,7 @@ function useRadarSyncStream(iid, windowS, debugLimit = 120) {
         } catch {}
       }
       ws.onclose = () => {
-        recordRadarPageStream('ws_radar_sync', 'close', { iid })
+        recordRadarPageStream('ws_selected_iid_state', 'close', { iid })
         if (closed) return
         setStatus(prev => ({ ...prev, connected: false, mode: 'reconnecting' }))
         retryRef.current = setTimeout(connect, 1000)
@@ -3923,8 +3927,7 @@ function FMDataFunnel({ iid }) {
   )
 }
 
-function FMStatusPanel({ iid, refreshKey = 0 }) {
-  const { data: panelData, loading } = useFmDiagnostics(iid, refreshKey)
+function FMStatusPanel({ iid, panelData = null, loading = false }) {
 
   if (iid == null) {
     return (
@@ -5077,9 +5080,6 @@ export default function RadarPage() {
   const [resettingAll, setResettingAll] = useState(false)
   const [controlRefreshKey, setControlRefreshKey] = useState(0)
   const selectedRow = rows.find(row => row.iid === selectedIid) ?? null
-  const sharedSweepFrames = useSweepFrames(selectedIid)
-  const sharedReferenceAircraft = useReferenceAircraft(selectedIid)
-  const sharedFmLocation = useFmLocation(selectedIid).data
   const receiverPosition = useReceiverPosition()
   const sharedTimingPacket = useTimingEventStream({
     enabled: selectedIid != null,
@@ -5087,10 +5087,18 @@ export default function RadarPage() {
     df11Only: true,
     debugLabel: 'radar_page_df11',
   })
-  const { snapshot: syncSnapshot, status: syncFeedStatus } = useRadarSyncStream(
+  const { snapshot: selectedIidState, status: selectedIidStateStatus } = useSelectedIidPageState(
     selectedIid,
     BURST_SYNC_ALIGNMENT_WINDOW_S,
   )
+  const sharedSweepFrames = selectedIidState?.frames ?? null
+  const sharedReferenceAircraft = selectedIidState?.reference ?? null
+  const sharedFmLocation = selectedIidState?.fm?.location ?? null
+  const sharedControl = selectedIidState?.control ?? null
+  const sharedSolution = selectedIidState?.solution ?? null
+  const sharedFmSummary = selectedIidState?.fm ?? null
+  const syncSnapshot = selectedIidState?.sync ?? null
+  const syncFeedStatus = selectedIidStateStatus
 
   useEffect(() => {
     if (rows.length === 0) return
@@ -5145,13 +5153,15 @@ return (
         <LocalisationControlPanel
           iid={selectedIid}
           onChanged={handleChanged}
+          controlData={sharedControl}
+          feedStatus={selectedIidStateStatus}
         />
       </div>
 
       <div data-slot="position-sources">
         <SolutionComparisonPanel
           iid={selectedIid}
-          refreshKey={controlRefreshKey}
+          comparisonData={sharedSolution}
         />
       </div>
 
@@ -5168,7 +5178,8 @@ return (
         <div data-slot="fm-status">
           <FMStatusPanel
             iid={selectedIid}
-            refreshKey={controlRefreshKey}
+            panelData={sharedFmSummary}
+            loading={selectedIid != null && sharedFmSummary == null}
             onChanged={handleChanged}
           />
         </div>

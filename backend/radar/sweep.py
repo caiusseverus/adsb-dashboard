@@ -2102,6 +2102,10 @@ class RadarState:
         self._live_sync_snapshot_cache: dict[int, tuple[tuple, dict]] = {}
         self._live_sync_snapshot_seq: dict[int, int] = {}
         self._live_sync_snapshot_last_cache_hit: dict[int, bool] = {}
+        self._live_sweep_frame_summary_cache: dict[int, dict] = {}
+        self._live_sweep_frame_summary_signature: dict[int, tuple] = {}
+        self._live_sweep_frame_summary_revision: dict[int, int] = {}
+        self._live_sweep_frame_summary_last_cache_hit: dict[int, bool] = {}
 
         # Per-IID rotation-analysis gating: (last event count, last run ts).
         # update_rotation_models() uses these to skip _analyse_iid_events for
@@ -5940,6 +5944,10 @@ class RadarState:
                                self._live_period_history,
                                self._live_sync_snapshot_cache,
                                self._live_sync_snapshot_seq,
+                               self._live_sweep_frame_summary_cache,
+                               self._live_sweep_frame_summary_signature,
+                               self._live_sweep_frame_summary_revision,
+                               self._live_sweep_frame_summary_last_cache_hit,
                                self._rotation_analysis_meta,
                                self._burst_record_dynamic_cap_by_iid,
                                self._burst_record_cap_hits_by_iid,
@@ -6042,6 +6050,10 @@ class RadarState:
             self._live_sync_snapshot_cache.clear()
             self._live_sync_snapshot_seq.clear()
             self._live_sync_snapshot_last_cache_hit.clear()
+            self._live_sweep_frame_summary_cache.clear()
+            self._live_sweep_frame_summary_signature.clear()
+            self._live_sweep_frame_summary_revision.clear()
+            self._live_sweep_frame_summary_last_cache_hit.clear()
             self._rotation_analysis_meta.clear()
             self._burst_record_dynamic_cap_by_iid.clear()
             self._burst_record_cap_hits_by_iid.clear()
@@ -8593,6 +8605,139 @@ class RadarState:
                     period_s=None,
                 ))
         return frames
+
+    @staticmethod
+    def _frame_observation_payload(obs, period_s: float | None, ref_arrival_us: float) -> dict:
+        dt_us = obs.arrival_us - ref_arrival_us
+        dt_s = dt_us / 1_000_000.0
+        if period_s and period_s > 0:
+            observed_phase = ((dt_s / period_s) * 360.0) % 360.0
+        else:
+            observed_phase = None
+        return {
+            "icao": obs.icao,
+            "lat": round(obs.lat, 6),
+            "lon": round(obs.lon, 6),
+            "arrival_us": obs.arrival_us,
+            "observed_phase_deg": round(observed_phase, 2) if observed_phase is not None else None,
+            "interpolated": obs.interpolated,
+        }
+
+    def _build_live_sweep_frame_summary_payload_locked(self, iid: int, model: RadarIID | None) -> dict:
+        completed = list(self._live_completed_frames.get(iid, []))
+        in_progress = self._live_frames.get(iid)
+        latest_arrival_us = self._iid_latest_arrival_us.get(iid)
+        if latest_arrival_us is None:
+            latest_arrival_us = self._iid_events[-1][0] if self._iid_events else None
+        out_frames: list[dict] = []
+
+        for frame in completed:
+            out_frames.append({
+                "frame_index": frame.frame_index,
+                "sweep_start_us": frame.sweep_start_us,
+                "ref_icao": frame.ref_icao,
+                "ref_lat": round(frame.ref_lat, 6),
+                "ref_lon": round(frame.ref_lon, 6),
+                "ref_arrival_us": frame.ref_arrival_us,
+                "period_s": frame.period_s,
+                "quality": frame.quality,
+                "n_aircraft": 1 + len(frame.observations),
+                "observations": [
+                    self._frame_observation_payload(obs, frame.period_s, frame.ref_arrival_us)
+                    for obs in frame.observations
+                ],
+            })
+
+        if in_progress is not None:
+            n_aircraft = 1 + len(in_progress.observations)
+            if n_aircraft >= 3:
+                quality = "good" if n_aircraft >= 4 else "marginal"
+                in_progress_index = self._live_frame_counters.get(iid, 0)
+                out_frames.append({
+                    "frame_index": in_progress_index,
+                    "sweep_start_us": in_progress.ref_arrival_us,
+                    "ref_icao": in_progress.ref_icao,
+                    "ref_lat": round(in_progress.ref_lat, 6),
+                    "ref_lon": round(in_progress.ref_lon, 6),
+                    "ref_arrival_us": in_progress.ref_arrival_us,
+                    "period_s": None,
+                    "quality": quality,
+                    "n_aircraft": n_aircraft,
+                    "observations": [
+                        self._frame_observation_payload(obs, None, in_progress.ref_arrival_us)
+                        for obs in in_progress.observations
+                    ],
+                })
+
+        return {
+            "iid": iid,
+            "n_frames": len(out_frames),
+            "frames": out_frames,
+            "latest_arrival_us": latest_arrival_us,
+            "last_updated": model.last_updated if model is not None else None,
+        }
+
+    def get_sweep_frame_summary_payload(self, iid: int) -> dict:
+        """Return cached lightweight SweepFrame JSON for live UI transport."""
+        with self._lock:
+            model = self._models.get(iid)
+            completed = self._live_completed_frames.get(iid)
+            in_progress = self._live_frames.get(iid)
+            frame_counter = self._live_frame_counters.get(iid, 0)
+            completed_len = len(completed) if completed is not None else 0
+            first_completed = completed[0].frame_index if completed_len > 0 else None
+            last_completed = completed[-1].frame_index if completed_len > 0 else None
+            in_progress_signature = None
+            if in_progress is not None:
+                in_progress_signature = (
+                    in_progress.ref_icao,
+                    round(float(in_progress.ref_arrival_us), 3),
+                    len(in_progress.observations),
+                    tuple(
+                        (
+                            obs.icao,
+                            round(float(obs.arrival_us), 3),
+                            round(float(obs.lat), 6),
+                            round(float(obs.lon), 6),
+                            bool(obs.interpolated),
+                        )
+                        for obs in in_progress.observations
+                    ),
+                )
+            signature = (
+                frame_counter,
+                completed_len,
+                first_completed,
+                last_completed,
+                in_progress_signature,
+                self._iid_latest_arrival_us.get(iid),
+                model.last_updated if model is not None else None,
+            )
+            cached = self._live_sweep_frame_summary_cache.get(iid)
+            if cached is not None and self._live_sweep_frame_summary_signature.get(iid) == signature:
+                self._live_sweep_frame_summary_last_cache_hit[iid] = True
+                return cached
+
+            revision = self._live_sweep_frame_summary_revision.get(iid, 0) + 1
+            payload = self._build_live_sweep_frame_summary_payload_locked(iid, model)
+            payload["transport"] = {
+                "cached": False,
+                "source": "live_sweep_frame_summary_cache",
+                "revision": revision,
+            }
+            self._live_sweep_frame_summary_cache[iid] = payload
+            self._live_sweep_frame_summary_signature[iid] = signature
+            self._live_sweep_frame_summary_revision[iid] = revision
+            self._live_sweep_frame_summary_last_cache_hit[iid] = False
+            return payload
+
+    def get_sweep_frame_summary_revision(self, iid: int) -> int:
+        with self._lock:
+            return int(self._live_sweep_frame_summary_revision.get(iid, 0))
+
+    def get_sweep_frame_summary_last_cache_hit(self, iid: int) -> bool:
+        with self._lock:
+            return bool(self._live_sweep_frame_summary_last_cache_hit.get(iid, False))
 
     def get_reference_aircraft(self, iid: int) -> dict:
         """Return current reference aircraft selection state."""
