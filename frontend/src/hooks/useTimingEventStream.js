@@ -8,7 +8,7 @@ const TIMING_WS_URL = import.meta.env.PROD
 const TIMING_POLL_FALLBACK_MS = 1000
 
 export function useTimingEventStream(options = {}) {
-  const { enabled = true, iid = null, df11Only = false } = options
+  const { enabled = true, iid = null, df11Only = false, debugLabel = null } = options
   const [packet, setPacket] = useState(null)
   const retryRef = useRef(null)
   const pollRef = useRef(null)
@@ -58,9 +58,30 @@ export function useTimingEventStream(options = {}) {
     const connect = () => {
       if (closed) return
       ws = new WebSocket(wsUrl)
+      if (typeof window !== 'undefined' && debugLabel) {
+        const store = window.__RADAR_PAGE_REQUEST_METRICS__
+        if (store) {
+          const key = `timing_ws:${debugLabel}`
+          const bucket = store.streams?.[key] ?? { opens: 0, closes: 0, messages: 0, heartbeats: 0, lastEvent: null, lastMeta: null }
+          bucket.opens += 1
+          bucket.lastEvent = 'open'
+          bucket.lastMeta = { iid, df11Only }
+          store.streams[key] = bucket
+        }
+      }
 
       ws.onmessage = event => {
         try {
+          if (typeof window !== 'undefined' && debugLabel) {
+            const store = window.__RADAR_PAGE_REQUEST_METRICS__
+            if (store) {
+              const key = `timing_ws:${debugLabel}`
+              const bucket = store.streams?.[key] ?? { opens: 0, closes: 0, messages: 0, heartbeats: 0, lastEvent: null, lastMeta: null }
+              bucket.messages += 1
+              bucket.lastEvent = 'message'
+              store.streams[key] = bucket
+            }
+          }
           ingestPacket(JSON.parse(event.data))
         } catch {
           // ignore malformed frames
@@ -68,6 +89,16 @@ export function useTimingEventStream(options = {}) {
       }
 
       ws.onclose = () => {
+        if (typeof window !== 'undefined' && debugLabel) {
+          const store = window.__RADAR_PAGE_REQUEST_METRICS__
+          if (store) {
+            const key = `timing_ws:${debugLabel}`
+            const bucket = store.streams?.[key] ?? { opens: 0, closes: 0, messages: 0, heartbeats: 0, lastEvent: null, lastMeta: null }
+            bucket.closes += 1
+            bucket.lastEvent = 'close'
+            store.streams[key] = bucket
+          }
+        }
         if (closed) return
         retryRef.current = setTimeout(connect, 1000)
       }

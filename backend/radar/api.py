@@ -48,11 +48,12 @@ def register_radar_core_stats_provider(provider: Callable[[], dict]) -> None:
     _radar_core_stats_provider = provider
 
 
-def _record_api_timing(endpoint: str, started_at: float) -> None:
+def _record_api_timing(endpoint: str, started_at: float, **meta) -> None:
     api_timings.append({
         "endpoint": endpoint,
         "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
         "ts_s": time.time(),
+        **meta,
     })
 
 
@@ -62,6 +63,28 @@ def _record_api_timing(endpoint: str, started_at: float) -> None:
 # the 15s frontend poll without staleness risk.
 _diag_cache: dict[str, tuple[float, dict]] = {}
 _DIAG_CACHE_TTL_S = 30.0
+_frame_geometry_cache: dict[tuple, dict] = {}
+
+
+def _frame_geometry_signature(frame, period_s: float | None, sweep_direction: int) -> tuple:
+    return (
+        frame.frame_index,
+        frame.ref_icao,
+        round(float(frame.ref_arrival_us), 3),
+        round(float(period_s or 0.0), 9),
+        sweep_direction,
+        frame.quality,
+        tuple(
+            (
+                obs.icao,
+                round(float(obs.arrival_us), 3),
+                round(float(obs.lat), 6),
+                round(float(obs.lon), 6),
+                bool(obs.interpolated),
+            )
+            for obs in frame.observations
+        ),
+    )
 
 
 def _get_diag_cache(key: str) -> dict | None:
@@ -1373,10 +1396,28 @@ async def get_iid_sync_snapshot(
 ):
     """Shared fast-changing Radar sync snapshot used by the pushed UI feed."""
     t0 = time.perf_counter()
+    payload = None
+    cache_hit = False
     try:
-        return build_iid_sync_snapshot_payload(_state, iid, window_s=window_s, debug_limit=debug_limit)
+        payload = build_iid_sync_snapshot_payload(_state, iid, window_s=window_s, debug_limit=debug_limit)
+        if _state is not None and hasattr(_state, "get_live_sync_snapshot_last_cache_hit"):
+            cache_hit = _state.get_live_sync_snapshot_last_cache_hit(iid)
+        if payload is not None:
+            payload = {
+                **payload,
+                "transport": {
+                    **(payload.get("transport") or {}),
+                    "cached": cache_hit,
+                    "source": "shared_snapshot_cache" if cache_hit else payload.get("transport", {}).get("source", "shared_snapshot"),
+                },
+            }
+        return payload
     finally:
-        _record_api_timing("sync_snapshot", t0)
+        _record_api_timing(
+            "sync_snapshot",
+            t0,
+            cache_status="hit" if cache_hit else "miss",
+        )
 
 
 @router.get("/iids/{iid}/rotation")
@@ -2590,6 +2631,7 @@ async def get_iid_sweep_frames(iid: int):
 async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction: int = 1):
     """Return per-frame FM intersection geometry for visual debugging."""
     t0 = time.perf_counter()
+    cache_status = "miss"
     try:
         if _state is None:
             return {"iid": iid, "frame_index": frame_index, "available": False, "reason": "radar module not initialised"}
@@ -2605,6 +2647,18 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
             return {"iid": iid, "frame_index": frame_index, "available": False, "reason": "frame has no observations"}
 
         sweep_direction = 1 if direction >= 0 else -1
+        cache_key = (iid, frame_index, _frame_geometry_signature(frame, model.period_s, sweep_direction))
+        cached_payload = _frame_geometry_cache.get(cache_key)
+        if cached_payload is not None:
+            cache_status = "hit"
+            return {
+                **cached_payload,
+                "transport": {
+                    **(cached_payload.get("transport") or {}),
+                    "cached": True,
+                    "source": "frame_geometry_cache",
+                },
+            }
         import config as _config
         from .forward_model import _PER_FRAME_MIN_CONTRIBUTING_ARCS, _PER_FRAME_MAX_CEP_KM
         recv_lat = getattr(_config, "RECEIVER_LAT", None)
@@ -2828,7 +2882,7 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
             _layer("frame_fm_geometry", "Admitted Pair Circles", "circle", circles, source_count=len(circles)),
         ]
 
-        return _sanitize_floats({
+        payload = _sanitize_floats({
             "iid": iid,
             "frame_index": frame.frame_index,
             "available": True,
@@ -2854,9 +2908,16 @@ async def get_iid_sweep_frame_fm_geometry(iid: int, frame_index: int, direction:
             "accumulation_gate_metrics": accumulation_gate_metrics,
             "candidate_clusters": candidate_clusters,
             "scored_pair_circles": solve_result.get("scored_pair_circles", []) if not solve_result.get("success") else result.get("scored_pair_circles", []),
+            "transport": {
+                "cached": False,
+                "source": "computed",
+                "cache_key": f"{iid}:{frame_index}:{sweep_direction}",
+            },
         })
+        _frame_geometry_cache[cache_key] = payload
+        return payload
     finally:
-        _record_api_timing("iid_sweep_frame_fm_geometry", t0)
+        _record_api_timing("iid_sweep_frame_fm_geometry", t0, cache_status=cache_status)
 
 
 @router.post("/iids/{iid}/sweep-frames/{frame_index}/fm-geometry/manual-preview")

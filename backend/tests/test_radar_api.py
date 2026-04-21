@@ -218,6 +218,122 @@ def test_get_iid_sync_snapshot_endpoint_combines_fast_sync_payloads(monkeypatch)
     assert payload["retention_diagnostics"]["timeline"]["count"] == 1
 
 
+def test_get_iid_sync_snapshot_marks_cache_hits(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", False)
+    monkeypatch.setattr("radar.sweep.RADAR_DIAGNOSTICS", False)
+    state = RadarState()
+    now_ts = 1_000.0
+    state._models[24] = RadarIID(iid=24, status="SINGLE_RADAR", period_s=4.0)
+    state._iid_latest_arrival_us[24] = 5_000_000.0
+    state._live_sync_states[24] = LiveSyncState(
+        iid=24,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=now_ts,
+        source="multi_aircraft_burst",
+        usable=True,
+    )
+    state._live_burst_timeline_obs[24] = deque([
+        AlignedBurstSyncObs(
+            burst_centroid_us=5_000_000.0,
+            icao="AAAAAA",
+            bearing_deg=9.0,
+            n_replies=4,
+            signal_dbfs=-18.0,
+            pos_age_s=0.4,
+            range_nm=12.0,
+            ts=now_ts,
+            sync_update_eligible=True,
+            raw_arrival_us=5_000_000.0,
+        )
+    ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+
+    prior_state = radar_api._state
+    radar_api._state = state
+    try:
+        first = asyncio.run(radar_api.get_iid_sync_snapshot(24, window_s=60.0, debug_limit=20))
+        second = asyncio.run(radar_api.get_iid_sync_snapshot(24, window_s=60.0, debug_limit=20))
+    finally:
+        radar_api._state = prior_state
+
+    assert first["transport"]["cached"] is False
+    assert second["transport"]["cached"] is True
+    assert second["transport"]["source"] == "shared_snapshot_cache"
+
+
+def test_get_iid_sweep_frame_fm_geometry_uses_cache(monkeypatch):
+    state = RadarState()
+    state._models[31] = RadarIID(iid=31, status="SINGLE_RADAR", period_s=4.0)
+    state._live_completed_frames[31] = deque([
+        SweepFrame(
+            frame_index=2,
+            sweep_start_us=10_000_000.0,
+            ref_icao="AAAAAA",
+            ref_lat=51.5,
+            ref_lon=0.1,
+            ref_arrival_us=10_000_100.0,
+            period_s=4.0,
+            quality="good",
+            observations=[
+                SweepFrameObservation(
+                    icao="BBBBBB",
+                    lat=51.6,
+                    lon=0.2,
+                    arrival_us=10_500_000.0,
+                    interpolated=False,
+                ),
+                SweepFrameObservation(
+                    icao="CCCCCC",
+                    lat=51.4,
+                    lon=0.3,
+                    arrival_us=11_000_000.0,
+                    interpolated=False,
+                ),
+            ],
+        )
+    ], maxlen=64)
+
+    call_count = {"value": 0}
+
+    def fake_solve(*args, **kwargs):
+        call_count["value"] += 1
+        return {
+            "success": False,
+            "reason": "synthetic_failure",
+            "detail": {"selection_diagnostics": {"source": "test"}},
+            "admitted_pair_circles": [],
+            "pair_circle_summary": {},
+            "candidate_clusters": [],
+            "scored_pair_circles": [],
+        }
+
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RECEIVER_LAT", 51.5)
+    monkeypatch.setattr(_cfg, "RECEIVER_LON", 0.0)
+    monkeypatch.setattr("radar.forward_model.ForwardModel._solve_by_intersection_attempt", staticmethod(fake_solve))
+
+    prior_state = radar_api._state
+    prior_cache = dict(radar_api._frame_geometry_cache)
+    radar_api._state = state
+    radar_api._frame_geometry_cache.clear()
+    try:
+        first = asyncio.run(radar_api.get_iid_sweep_frame_fm_geometry(31, 2, direction=1))
+        second = asyncio.run(radar_api.get_iid_sweep_frame_fm_geometry(31, 2, direction=1))
+    finally:
+        radar_api._state = prior_state
+        radar_api._frame_geometry_cache.clear()
+        radar_api._frame_geometry_cache.update(prior_cache)
+
+    assert first["transport"]["cached"] is False
+    assert second["transport"]["cached"] is True
+    assert second["transport"]["source"] == "frame_geometry_cache"
+    assert call_count["value"] == 1
+
+
 def test_get_iid_timeline_marks_non_primary_family_points_as_residual():
     state = RadarState()
     state._burst_records[21] = deque([

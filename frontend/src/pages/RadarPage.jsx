@@ -38,6 +38,109 @@ const EVIDENCE_METHODS = [
   'coincident_illumination',
 ]
 
+function getRadarPageMetricsStore() {
+  if (typeof window === 'undefined') return null
+  if (!window.__RADAR_PAGE_REQUEST_METRICS__) {
+    window.__RADAR_PAGE_REQUEST_METRICS__ = {
+      requests: {},
+      streams: {},
+      recent: [],
+    }
+  }
+  return window.__RADAR_PAGE_REQUEST_METRICS__
+}
+
+function recordRadarPageRequest(endpoint, trigger, status, startedAt, meta = {}) {
+  const store = getRadarPageMetricsStore()
+  if (!store || !endpoint) return
+  const bucket = store.requests[endpoint] ?? {
+    started: 0,
+    completed: 0,
+    aborted: 0,
+    failed: 0,
+    inflight: 0,
+    maxInflight: 0,
+    cached: 0,
+    recomputed: 0,
+    triggers: {},
+    lastStatus: null,
+    lastDurationMs: null,
+    lastMeta: null,
+  }
+  if (status === 'start') {
+    bucket.started += 1
+    bucket.inflight += 1
+    bucket.maxInflight = Math.max(bucket.maxInflight, bucket.inflight)
+  } else {
+    bucket.inflight = Math.max(0, bucket.inflight - 1)
+    if (status === 'completed') bucket.completed += 1
+    else if (status === 'aborted') bucket.aborted += 1
+    else bucket.failed += 1
+  }
+  if (trigger) {
+    bucket.triggers[trigger] = (bucket.triggers[trigger] ?? 0) + 1
+  }
+  if (meta.cached === true) bucket.cached += 1
+  if (meta.cached === false) bucket.recomputed += 1
+  bucket.lastStatus = status
+  bucket.lastDurationMs = startedAt != null ? Math.round(performance.now() - startedAt) : null
+  bucket.lastMeta = meta
+  store.requests[endpoint] = bucket
+  store.recent.push({
+    kind: 'request',
+    endpoint,
+    trigger,
+    status,
+    durationMs: bucket.lastDurationMs,
+    at: Date.now(),
+    ...meta,
+  })
+  if (store.recent.length > 100) {
+    store.recent.splice(0, store.recent.length - 100)
+  }
+}
+
+function recordRadarPageStream(endpoint, event, meta = {}) {
+  const store = getRadarPageMetricsStore()
+  if (!store || !endpoint) return
+  const bucket = store.streams[endpoint] ?? {
+    opens: 0,
+    closes: 0,
+    messages: 0,
+    heartbeats: 0,
+    lastEvent: null,
+    lastMeta: null,
+  }
+  if (event === 'open') bucket.opens += 1
+  else if (event === 'close') bucket.closes += 1
+  else if (event === 'message') bucket.messages += 1
+  else if (event === 'heartbeat') bucket.heartbeats += 1
+  bucket.lastEvent = event
+  bucket.lastMeta = meta
+  store.streams[endpoint] = bucket
+}
+
+async function trackedRadarFetchJson(url, { endpoint, trigger, signal, ...options } = {}) {
+  const startedAt = performance.now()
+  recordRadarPageRequest(endpoint, trigger, 'start', startedAt)
+  try {
+    const response = await fetch(url, { ...options, signal })
+    if (!response.ok) {
+      recordRadarPageRequest(endpoint, trigger, 'failed', startedAt, { httpStatus: response.status })
+      return null
+    }
+    const payload = await response.json()
+    recordRadarPageRequest(endpoint, trigger, 'completed', startedAt, {
+      cached: payload?.transport?.cached,
+    })
+    return payload
+  } catch (error) {
+    const aborted = signal?.aborted || error?.name === 'AbortError'
+    recordRadarPageRequest(endpoint, trigger, aborted ? 'aborted' : 'failed', startedAt)
+    return null
+  }
+}
+
 function statusColor(status) {
   switch (status) {
     case 'SINGLE_RADAR': return '#3fb950'
@@ -178,23 +281,23 @@ function useReceiverPosition() {
   const [data, setData] = useState(null)
 
   useEffect(() => {
-    let cancelled = false
+    const controller = new AbortController()
     async function fetchPosition() {
-      try {
-        const r = await fetch(`${API_BASE}/api/status`)
-        if (!r.ok) return
-        const d = await r.json()
-        const lat = d?.config?.receiver_lat
-        const lon = d?.config?.receiver_lon
-        if (!cancelled && lat != null && lon != null) {
-          setData({ lat, lon })
-        }
-      } catch {}
+      const d = await trackedRadarFetchJson(`${API_BASE}/api/status`, {
+        endpoint: 'status',
+        trigger: 'page_load_or_poll',
+        signal: controller.signal,
+      })
+      const lat = d?.config?.receiver_lat
+      const lon = d?.config?.receiver_lon
+      if (!controller.signal.aborted && lat != null && lon != null) {
+        setData({ lat, lon })
+      }
     }
     fetchPosition()
     const id = setInterval(fetchPosition, 60_000)
     return () => {
-      cancelled = true
+      controller.abort()
       clearInterval(id)
     }
   }, [])
@@ -208,18 +311,18 @@ function usePipelineHealth(iid) {
 
   useEffect(() => {
     if (iid == null) { setData(null); return }
-    let cancelled = false
+    const controller = new AbortController()
     async function poll() {
-      try {
-        const r = await fetch(`${API_BASE}/api/radar/iids/${iid}/pipeline-health`)
-        if (!r.ok) return
-        const d = await r.json()
-        if (!cancelled) setData(d)
-      } catch {}
+      const d = await trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/pipeline-health`, {
+        endpoint: 'iid_pipeline_health',
+        trigger: 'iid_change_or_poll',
+        signal: controller.signal,
+      })
+      if (!controller.signal.aborted && d) setData(d)
     }
     poll()
     const id = setInterval(poll, 10_000)
-    return () => { cancelled = true; clearInterval(id) }
+    return () => { controller.abort(); clearInterval(id) }
   }, [iid])
 
   return data
@@ -231,18 +334,18 @@ function useReferenceAircraft(iid) {
 
   useEffect(() => {
     if (iid == null) { setData(null); return }
-    let cancelled = false
+    const controller = new AbortController()
     async function poll() {
-      try {
-        const r = await fetch(`${API_BASE}/api/radar/iids/${iid}/reference-aircraft`)
-        if (!r.ok) return
-        const d = await r.json()
-        if (!cancelled) setData(d)
-      } catch {}
+      const d = await trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/reference-aircraft`, {
+        endpoint: 'iid_reference_aircraft',
+        trigger: 'iid_change_or_poll',
+        signal: controller.signal,
+      })
+      if (!controller.signal.aborted && d) setData(d)
     }
     poll()
     const id = setInterval(poll, 10_000)
-    return () => { cancelled = true; clearInterval(id) }
+    return () => { controller.abort(); clearInterval(id) }
   }, [iid])
 
   return data
@@ -254,18 +357,18 @@ function useSweepFrames(iid) {
 
   useEffect(() => {
     if (iid == null) { setData(null); return }
-    let cancelled = false
+    const controller = new AbortController()
     async function poll() {
-      try {
-        const r = await fetch(`${API_BASE}/api/radar/iids/${iid}/sweep-frames`)
-        if (!r.ok) return
-        const d = await r.json()
-        if (!cancelled) setData(d)
-      } catch {}
+      const d = await trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/sweep-frames`, {
+        endpoint: 'iid_sweep_frames',
+        trigger: 'iid_change_or_poll',
+        signal: controller.signal,
+      })
+      if (!controller.signal.aborted && d) setData(d)
     }
     poll()
     const id = setInterval(poll, 2_000)
-    return () => { cancelled = true; clearInterval(id) }
+    return () => { controller.abort(); clearInterval(id) }
   }, [iid])
 
   return data
@@ -278,22 +381,22 @@ function useFrameFmGeometry(iid, frameIndex, direction = 'cw') {
   useEffect(() => {
     if (iid == null || frameIndex == null) { setData(null); return }
     const controller = new AbortController()
-    let cancelled = false
     setLoading(true)
     async function fetchGeometry() {
-      try {
-        const dir = direction === 'ccw' ? -1 : 1
-        const r = await fetch(`${API_BASE}/api/radar/iids/${iid}/sweep-frames/${frameIndex}/fm-geometry?direction=${dir}`, {
+      const dir = direction === 'ccw' ? -1 : 1
+      const d = await trackedRadarFetchJson(
+        `${API_BASE}/api/radar/iids/${iid}/sweep-frames/${frameIndex}/fm-geometry?direction=${dir}`,
+        {
+          endpoint: 'iid_sweep_frame_fm_geometry',
+          trigger: 'frame_geometry_explicit_load_or_change',
           signal: controller.signal,
-        })
-        if (!r.ok) return
-        const d = await r.json()
-        if (!cancelled) setData(d)
-      } catch {}
-      finally { if (!cancelled) setLoading(false) }
+        },
+      )
+      if (!controller.signal.aborted && d) setData(d)
+      if (!controller.signal.aborted) setLoading(false)
     }
     fetchGeometry()
-    return () => { cancelled = true; controller.abort() }
+    return () => { controller.abort() }
   }, [iid, frameIndex, direction])
 
   return { data, loading }
@@ -359,20 +462,20 @@ function useFmLocation(iid) {
 
   useEffect(() => {
     if (iid == null) { setData(null); return }
-    let cancelled = false
+    const controller = new AbortController()
     setLoading(true)
     async function poll() {
-      try {
-        const r = await fetch(`${API_BASE}/api/radar/iids/${iid}/fm-location`)
-        if (!r.ok) return
-        const d = await r.json()
-        if (!cancelled) setData(d)
-      } catch {}
-      finally { if (!cancelled) setLoading(false) }
+      const d = await trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/fm-location`, {
+        endpoint: 'iid_fm_location',
+        trigger: 'iid_change_or_poll',
+        signal: controller.signal,
+      })
+      if (!controller.signal.aborted && d) setData(d)
+      if (!controller.signal.aborted) setLoading(false)
     }
     poll()
     const id = setInterval(poll, 60_000)
-    return () => { cancelled = true; clearInterval(id) }
+    return () => { controller.abort(); clearInterval(id) }
   }, [iid])
 
   return { data, loading }
@@ -385,22 +488,19 @@ function useFmDiagnostics(iid, refreshKey = 0) {
   useEffect(() => {
     if (iid == null) { setData(null); return }
     const controller = new AbortController()
-    let cancelled = false
     setLoading(true)
     async function poll() {
-      try {
-        const r = await fetch(`${API_BASE}/api/radar/iids/${iid}/fm-diagnostics`, {
-          signal: controller.signal,
-        })
-        if (!r.ok) return
-        const d = await r.json()
-        if (!cancelled) setData(d)
-      } catch {}
-      finally { if (!cancelled) setLoading(false) }
+      const d = await trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/fm-diagnostics`, {
+        endpoint: 'iid_fm_diagnostics',
+        trigger: refreshKey ? 'control_change_or_poll' : 'iid_change_or_poll',
+        signal: controller.signal,
+      })
+      if (!controller.signal.aborted && d) setData(d)
+      if (!controller.signal.aborted) setLoading(false)
     }
     poll()
     const id = setInterval(poll, 10_000)
-    return () => { cancelled = true; controller.abort(); clearInterval(id) }
+    return () => { controller.abort(); clearInterval(id) }
   }, [iid, refreshKey])
 
   return { data, loading }
@@ -412,20 +512,20 @@ function useIidControl(iid, refreshKey = 0) {
 
   useEffect(() => {
     if (iid == null) { setData(null); return }
-    let cancelled = false
+    const controller = new AbortController()
     setLoading(true)
     async function poll() {
-      try {
-        const r = await fetch(`${API_BASE}/api/radar/iids/${iid}/control`)
-        if (!r.ok) return
-        const d = await r.json()
-        if (!cancelled) setData(d)
-      } catch {}
-      finally { if (!cancelled) setLoading(false) }
+      const d = await trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/control`, {
+        endpoint: 'iid_control',
+        trigger: refreshKey ? 'control_change_or_poll' : 'iid_change_or_poll',
+        signal: controller.signal,
+      })
+      if (!controller.signal.aborted && d) setData(d)
+      if (!controller.signal.aborted) setLoading(false)
     }
     poll()
     const id = setInterval(poll, 10_000)
-    return () => { cancelled = true; clearInterval(id) }
+    return () => { controller.abort(); clearInterval(id) }
   }, [iid, refreshKey])
 
   return { data, loading }
@@ -436,18 +536,18 @@ function useSolutionComparison(iid, refreshKey = 0) {
 
   useEffect(() => {
     if (iid == null) { setData(null); return }
-    let cancelled = false
+    const controller = new AbortController()
     async function poll() {
-      try {
-        const r = await fetch(`${API_BASE}/api/radar/iids/${iid}/solution-comparison`)
-        if (!r.ok) return
-        const d = await r.json()
-        if (!cancelled) setData(d)
-      } catch {}
+      const d = await trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/solution-comparison`, {
+        endpoint: 'iid_solution_comparison',
+        trigger: refreshKey ? 'control_change_or_poll' : 'iid_change_or_poll',
+        signal: controller.signal,
+      })
+      if (!controller.signal.aborted && d) setData(d)
     }
     poll()
     const id = setInterval(poll, 10_000)
-    return () => { cancelled = true; clearInterval(id) }
+    return () => { controller.abort(); clearInterval(id) }
   }, [iid, refreshKey])
 
   return data
@@ -498,11 +598,12 @@ function useEvidenceMethods(iid, methods, refreshKey = 0) {
     async function fetchEvidence() {
       try {
         const results = await Promise.all(methods.map(async method => {
-          const r = await fetch(`${API_BASE}/api/radar/iids/${iid}/evidence/${method}`, {
+          const r = await trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/evidence/${method}`, {
+            endpoint: `iid_evidence_${method}`,
+            trigger: refreshKey ? 'control_change_or_refresh' : 'iid_change',
             signal: controller.signal,
           })
-          if (!r.ok) return null
-          return r.json()
+          return r
         }))
         if (controller.signal.aborted) return
         const evidenceMethods = results.filter(Boolean)
@@ -1749,6 +1850,7 @@ function useRadarSyncStream(iid, windowS, debugLimit = 120) {
 
     const ingestSnapshot = payload => {
       if (!payload || payload.type !== 'radar_sync') return
+      recordRadarPageStream('ws_radar_sync', 'message', { iid, sequence: payload.sequence ?? null })
       lastUpdateRef.current = performance.now()
       startTransition(() => setSnapshot(payload))
       setStatus({
@@ -1762,8 +1864,10 @@ function useRadarSyncStream(iid, windowS, debugLimit = 120) {
 
     const pollFallback = () => {
       if (closed) return
-      fetch(`${API_BASE}/api/radar/iids/${iid}/sync-snapshot?window_s=${windowS}&debug_limit=${debugLimit}`)
-        .then(response => response.ok ? response.json() : null)
+      trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/sync-snapshot?window_s=${windowS}&debug_limit=${debugLimit}`, {
+        endpoint: 'sync_snapshot',
+        trigger: 'sync_stream_fallback',
+      })
         .then(payload => {
           if (closed || !payload) return
           lastUpdateRef.current = performance.now()
@@ -1787,6 +1891,7 @@ function useRadarSyncStream(iid, windowS, debugLimit = 120) {
       if (closed) return
       ws = new WebSocket(`${RADAR_SYNC_WS_BASE}/ws/radar/iids/${iid}/sync`)
       ws.onopen = () => {
+        recordRadarPageStream('ws_radar_sync', 'open', { iid })
         try {
           ws.send(JSON.stringify({ window_s: windowS, debug_limit: debugLimit }))
         } catch {}
@@ -1796,6 +1901,7 @@ function useRadarSyncStream(iid, windowS, debugLimit = 120) {
         try {
           const payload = JSON.parse(event.data)
           if (payload.type === 'radar_sync_heartbeat') {
+            recordRadarPageStream('ws_radar_sync', 'heartbeat', { iid, sequence: payload.sequence ?? null })
             lastUpdateRef.current = performance.now()
             setStatus(prev => ({
               ...prev,
@@ -1810,6 +1916,7 @@ function useRadarSyncStream(iid, windowS, debugLimit = 120) {
         } catch {}
       }
       ws.onclose = () => {
+        recordRadarPageStream('ws_radar_sync', 'close', { iid })
         if (closed) return
         setStatus(prev => ({ ...prev, connected: false, mode: 'reconnecting' }))
         retryRef.current = setTimeout(connect, 1000)
@@ -2536,7 +2643,17 @@ function SyncDebugPanel({ debug, iid, windowS }) {
   )
 }
 
-function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, rows, onSelectIid, syncSnapshot, syncFeedStatus }) {
+function RotationAlignmentPanel({
+  iid,
+  selectedRow,
+  selectedIcao,
+  onSelectIcao,
+  rows,
+  onSelectIid,
+  syncSnapshot,
+  syncFeedStatus,
+  timingPacket,
+}) {
   const [alignmentMode, setAlignmentMode] = useState(BURST_SYNC_VIEW_MODE_RESIDUALS)
   const [resetting, setResetting] = useState(false)
   const [legacyTimeline, setLegacyTimeline] = useState(null)
@@ -2551,7 +2668,6 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
     sequence: null,
     fallback: false,
   }
-  const timingPacket = useTimingEventStream({ enabled: iid != null, iid, df11Only: true })
   const timingView = useTimingEventBuffer(
     timingPacket,
     BURST_SYNC_ALIGNMENT_WINDOW_S * 1_000_000,
@@ -2581,15 +2697,18 @@ function RotationAlignmentPanel({ iid, selectedRow, selectedIcao, onSelectIcao, 
     setLegacyLoading(true)
 
     async function pollTimeline() {
-      try {
-        const response = await fetch(`${API_BASE}/api/radar/iids/${iid}/timeline?window_s=${BURST_SYNC_ALIGNMENT_WINDOW_S}`)
-        if (!response.ok) return
-        const payload = await response.json()
-        if (cancelled) return
+      const payload = await trackedRadarFetchJson(
+        `${API_BASE}/api/radar/iids/${iid}/timeline?window_s=${BURST_SYNC_ALIGNMENT_WINDOW_S}`,
+        {
+          endpoint: 'iid_timeline',
+          trigger: 'legacy_alignment_mode_poll',
+        },
+      )
+      if (!cancelled && payload) {
         timelineCacheRef.current.set(iid, payload)
         startTransition(() => setLegacyTimeline(payload))
-      } catch {
-      } finally {
+      }
+      if (!cancelled) {
         if (!cancelled) setLegacyLoading(false)
       }
     }
@@ -3322,7 +3441,16 @@ function beamResidualAtTimestampDeg(bearingDeg, sampleUs, beamAnchor, periodUs) 
 
 const SYNC_STALE_US = 15_000_000  // 15 s without DF11 updates → re-evaluate anchor
 
-function ReceiverCentredRadarField({ iid, selectedRow, syncSnapshot }) {
+function ReceiverCentredRadarField({
+  iid,
+  selectedRow,
+  syncSnapshot,
+  frameData,
+  fmLocationData,
+  refInfo,
+  receiverPos,
+  timingPacket,
+}) {
   const canvasRef = useRef(null)
   const rafRef = useRef(null)
   const rangeAxisMaxRef = useRef(null)
@@ -3332,16 +3460,10 @@ function ReceiverCentredRadarField({ iid, selectedRow, syncSnapshot }) {
   const lastDrawMsRef = useRef(0)
   const canvasSizeRef = useRef({ width: 0, height: 0 })
   const lastSeenUsRef = useRef({})   // icao → latest DF11 arrival_us seen
-  const [liveEnabled] = useState(true)
   const [syncOverrideIcao, setSyncOverrideIcao] = useState(null)
   const [displaySyncIcao, setDisplaySyncIcao] = useState(null)
 
-  const frameData = useSweepFrames(iid)
   const burstTimeline = syncSnapshot
-  const { data: fmLocationData } = useFmLocation(iid)
-  const refInfo = useReferenceAircraft(iid)
-  const receiverPos = useReceiverPosition()
-  const timingPacket = useTimingEventStream({ enabled: liveEnabled, iid, df11Only: true })
   const timingView = useTimingEventBuffer(timingPacket, RADAR_FIELD_PERSISTENCE_US, RADAR_FIELD_BUFFER_MAX)
 
   useEffect(() => {
@@ -3362,7 +3484,6 @@ function ReceiverCentredRadarField({ iid, selectedRow, syncSnapshot }) {
   const preferredRefIcao = refInfo?.ref_icao ?? null
   const effectivePrefIcao = syncOverrideIcao ?? preferredRefIcao
   const radarFieldEvents = useMemo(() => {
-    if (!liveEnabled) return []
     return selectMessageFieldEvents({
       events: timingView?.events ?? [],
       renderNowUs: Number(timingView?.nowUs ?? 0),
@@ -3370,7 +3491,7 @@ function ReceiverCentredRadarField({ iid, selectedRow, syncSnapshot }) {
       trafficFilter: 'df_surveillance',
       iidFilter: iid == null ? 'all' : iid,
     }).filter(ev => Number.isFinite(ev.bearing_deg) && Number.isFinite(ev.range_nm))
-  }, [iid, liveEnabled, timingView?.events, timingView?.nowUs])
+  }, [iid, timingView?.events, timingView?.nowUs])
   const latestFrame = [...frames].reverse().find(f => {
     if (!(f.quality === 'good' || f.quality === 'marginal')) return false
     if (effectivePrefIcao != null) return f.ref_icao === effectivePrefIcao
@@ -3469,7 +3590,6 @@ function ReceiverCentredRadarField({ iid, selectedRow, syncSnapshot }) {
   }
 
   useEffect(() => {
-    if (!liveEnabled) return
     const draw = () => {
       rafRef.current = requestAnimationFrame(draw)
       const canvas = canvasRef.current
@@ -4650,23 +4770,26 @@ function FrameGeometryDiagnostics({ iid, frameIndex }) {
   )
 }
 
-function SweepFrameStrips({ iid, selectedFrame, onSelectFrame }) {
-  const frameData = useSweepFrames(iid)
+function SweepFrameStrips({ iid, selectedFrame, onSelectFrame, frameData }) {
   const DISPLAY_COUNT = 15
+  const [geometryEnabled, setGeometryEnabled] = useState(false)
 
   const allFrames = frameData?.frames ?? []
   const qualFrames = allFrames.filter(f => f.quality === 'good' || f.quality === 'marginal')
   // Show last DISPLAY_COUNT quality frames, most recent at top
   const displayFrames = qualFrames.slice(-DISPLAY_COUNT).reverse()
-  const effectiveFrameIndex = selectedFrame ?? displayFrames[0]?.frame_index ?? null
+  const effectiveFrameIndex = selectedFrame ?? null
   const nGood = allFrames.filter(f => f.quality === 'good').length
   const nMarginal = allFrames.filter(f => f.quality === 'marginal').length
 
-  // Default to the newest displayed quality frame so geometry diagnostics load
-  // without requiring an explicit frame click.
   const detailFrame = effectiveFrameIndex != null
     ? allFrames.find(f => f.frame_index === effectiveFrameIndex)
     : null
+  const geometryFrameIndex = geometryEnabled && detailFrame ? detailFrame.frame_index : null
+
+  useEffect(() => {
+    setGeometryEnabled(false)
+  }, [iid])
 
   if (iid == null || allFrames.length === 0) {
     return (
@@ -4693,7 +4816,7 @@ function SweepFrameStrips({ iid, selectedFrame, onSelectFrame }) {
           <div className={styles.cardTitle}>Sweep Frames</div>
           <div className={styles.sectionLead}>
             {allFrames.length} frames · {nGood} good · {nMarginal} marginal
-            {' · '}Last {displayFrames.length} shown · ref at 0°, newest selected by default
+            {' · '}Last {displayFrames.length} shown · ref at 0°
           </div>
         </div>
       </div>
@@ -4855,9 +4978,27 @@ function SweepFrameStrips({ iid, selectedFrame, onSelectFrame }) {
               </tbody>
             </table>
           </div>
+          <div style={{ marginTop: '0.75rem', display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className={styles.actionButton}
+              onClick={() => setGeometryEnabled(enabled => !enabled)}
+            >
+              {geometryEnabled ? 'Hide FM geometry diagnostics' : 'Load FM geometry diagnostics'}
+            </button>
+            <span style={{ fontSize: '0.74rem', color: '#8b949e' }}>
+              Heavy pair-circle diagnostics are on-demand so normal live browsing does not recompute geometry.
+            </span>
+          </div>
         </div>
       )}
-      <FrameGeometryDiagnostics iid={iid} frameIndex={effectiveFrameIndex} />
+      {geometryEnabled ? (
+        <FrameGeometryDiagnostics iid={iid} frameIndex={geometryFrameIndex} />
+      ) : (
+        <div className={styles.empty} style={{ marginTop: '1rem' }}>
+          Select a frame, then load FM geometry diagnostics explicitly.
+        </div>
+      )}
     </section>
   )
 }
@@ -4936,6 +5077,16 @@ export default function RadarPage() {
   const [resettingAll, setResettingAll] = useState(false)
   const [controlRefreshKey, setControlRefreshKey] = useState(0)
   const selectedRow = rows.find(row => row.iid === selectedIid) ?? null
+  const sharedSweepFrames = useSweepFrames(selectedIid)
+  const sharedReferenceAircraft = useReferenceAircraft(selectedIid)
+  const sharedFmLocation = useFmLocation(selectedIid).data
+  const receiverPosition = useReceiverPosition()
+  const sharedTimingPacket = useTimingEventStream({
+    enabled: selectedIid != null,
+    iid: selectedIid,
+    df11Only: true,
+    debugLabel: 'radar_page_df11',
+  })
   const { snapshot: syncSnapshot, status: syncFeedStatus } = useRadarSyncStream(
     selectedIid,
     BURST_SYNC_ALIGNMENT_WINDOW_S,
@@ -5009,6 +5160,7 @@ return (
           iid={selectedIid}
           selectedFrame={selectedFrame}
           onSelectFrame={setSelectedFrame}
+          frameData={sharedSweepFrames}
         />
       </div>
 
@@ -5042,6 +5194,7 @@ return (
             onSelectIid={handleSelectIid}
             syncSnapshot={syncSnapshot}
             syncFeedStatus={syncFeedStatus}
+            timingPacket={sharedTimingPacket}
           />
         </div>
       )}
@@ -5051,6 +5204,11 @@ return (
           iid={selectedIid}
           selectedRow={selectedRow}
           syncSnapshot={syncSnapshot}
+          frameData={sharedSweepFrames}
+          fmLocationData={sharedFmLocation}
+          refInfo={sharedReferenceAircraft}
+          receiverPos={receiverPosition}
+          timingPacket={sharedTimingPacket}
         />
       </div>
     </div>

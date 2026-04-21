@@ -1,5 +1,40 @@
 # Deficiency Rectification Plan
 
+## 2026-04-21 Radar Page Interaction/Load Investigation
+
+- [x] Audit Radar page automatic fetch/poll/websocket behaviour and identify the exact request graph for page load and interactions
+- [x] Confirm the concrete backend hot paths for live Radar page traffic, especially `sweep-frames`, `fm-geometry`, `sync-snapshot`, timing feeds, and evidence/diagnostic endpoints
+- [x] Decouple heavyweight diagnostics from default live Radar page behaviour without regressing normal live usability
+- [x] Add lightweight request/cache observability so frontend actions can be tied to endpoint load and cache hits vs recomputes
+- [x] Add or update focused backend/frontend tests covering the new gating/caching/transport behaviour
+- [x] Run targeted verification and document before/after evidence and residual risks
+
+Plan confirmation: proceed with a targeted architectural fix, not just slower polling. Keep lightweight live Radar state on by default, move heavyweight frame-geometry/diagnostic work behind explicit demand or stable revision-keyed caching, and add observability that proves whether page interactions still trigger overlapping expensive backend work.
+
+### Review
+
+- Frontend causes confirmed:
+  - The page opened one `ws/radar/live` subscription plus one `ws/radar/iids/{iid}/sync` subscription for the selected IID.
+  - It also opened two independent `ws/timing?iid=...&df11_only=1` consumers: one in Burst Sync Alignment and one in Position Verification.
+  - It polled `GET /api/radar/iids/{iid}/sweep-frames` twice every 2s from two separate components.
+  - It polled `GET /api/radar/iids/{iid}/reference-aircraft` twice every 10s from two separate components.
+  - The Sweep Frames panel defaulted to the newest frame and immediately fetched `GET /api/radar/iids/{iid}/sweep-frames/{frame}/fm-geometry` on normal page open, even before an explicit diagnostics action.
+  - Clicking different sweep frames changed `frameIndex` and repeatedly re-fired the expensive `fm-geometry` fetch path.
+- Main fixes implemented:
+  - Shared the selected-IID DF11 timing stream at the page level so the radar page now uses one timing websocket instead of two.
+  - Shared selected-IID `sweep-frames`, `reference-aircraft`, `fm-location`, and receiver-position fetches across panels instead of letting multiple components poll the same backend endpoints independently.
+  - Changed Sweep Frame FM geometry from automatic/default loading to explicit on-demand loading behind a button after frame selection.
+  - Added frontend request/stream observability via `window.__RADAR_PAGE_REQUEST_METRICS__` so page-triggered request counts, aborts, overlaps, triggers, and websocket opens/messages are inspectable while interacting.
+  - Added backend cache metadata for `iid_sweep_frame_fm_geometry` and `sync_snapshot`, plus debug perf aggregation of cache hits vs misses.
+  - Added revision-keyed backend caching for `iid_sweep_frame_fm_geometry` so repeated requests for an unchanged frame/direction are served from cache.
+- Verification:
+  - `python3 -m py_compile backend/radar/api.py backend/radar/sweep.py backend/debug.py`
+  - `uv run --directory backend pytest tests/test_radar_api.py`
+  - `npm run build`
+  - Result: backend compile passed, `39` radar API tests passed, frontend production build passed.
+- Residual risk / limitation:
+  - I could not reproduce live ingest pressure against the real receiver in this sandbox, so the before/after ingest counters (`radar_queue_depth`, drops, worker wall time) were not re-measured here. The implemented changes remove the confirmed default heavy path and the duplicate selected-IID transports that matched the reported spike pattern.
+
 Source inputs:
 - `.docs/development/deficiency-remediation.md`
 - `.docs/development/combined-deficiency-report.md`

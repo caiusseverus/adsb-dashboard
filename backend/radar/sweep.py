@@ -2101,6 +2101,7 @@ class RadarState:
         self._live_period_history: dict[int, deque] = {}
         self._live_sync_snapshot_cache: dict[int, tuple[tuple, dict]] = {}
         self._live_sync_snapshot_seq: dict[int, int] = {}
+        self._live_sync_snapshot_last_cache_hit: dict[int, bool] = {}
 
         # Per-IID rotation-analysis gating: (last event count, last run ts).
         # update_rotation_models() uses these to skip _analyse_iid_events for
@@ -6040,6 +6041,7 @@ class RadarState:
             self._live_period_history.clear()
             self._live_sync_snapshot_cache.clear()
             self._live_sync_snapshot_seq.clear()
+            self._live_sync_snapshot_last_cache_hit.clear()
             self._rotation_analysis_meta.clear()
             self._burst_record_dynamic_cap_by_iid.clear()
             self._burst_record_cap_hits_by_iid.clear()
@@ -6781,9 +6783,11 @@ class RadarState:
             )
             cached = self._live_sync_snapshot_cache.get(iid)
             if cached is not None and cached[0] == signature:
+                self._live_sync_snapshot_last_cache_hit[iid] = True
                 return cached[1]
             sequence = self._live_sync_snapshot_seq.get(iid, 0) + 1
             self._live_sync_snapshot_seq[iid] = sequence
+            self._live_sync_snapshot_last_cache_hit[iid] = False
 
         burst_timeline = self.get_burst_sync_timeline(iid, window_s=window_s)
         if RADAR_DIAGNOSTICS:
@@ -6863,6 +6867,10 @@ class RadarState:
         with self._lock:
             self._live_sync_snapshot_cache[iid] = (signature, snapshot)
         return snapshot
+
+    def get_live_sync_snapshot_last_cache_hit(self, iid: int) -> bool:
+        with self._lock:
+            return bool(self._live_sync_snapshot_last_cache_hit.get(iid, False))
 
     def get_sync_debug_payload(self, iid: int, window_s: float = 60.0, limit: int = 80) -> dict:
         """Return per-observation sync consistency diagnostics for one IID.

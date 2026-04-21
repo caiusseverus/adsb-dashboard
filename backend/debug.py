@@ -114,15 +114,17 @@ async def get_perf() -> dict:
         return round(sum(float(sample.get(key, 0.0)) for sample in samples) / len(samples), 2)
 
     def endpoint_summary(samples: list[dict]) -> dict:
-        by_name: dict[str, list[float]] = {}
+        by_name: dict[str, list[dict]] = {}
         for sample in samples:
             name = str(sample.get("endpoint", "unknown"))
-            by_name.setdefault(name, []).append(float(sample.get("elapsed_ms", 0.0)))
+            by_name.setdefault(name, []).append(sample)
         return {
             name: {
                 "samples": len(values),
-                "avg_ms": round(sum(values) / len(values), 2) if values else 0.0,
-                "max_ms": round(max(values), 2) if values else 0.0,
+                "avg_ms": round(sum(float(value.get("elapsed_ms", 0.0)) for value in values) / len(values), 2) if values else 0.0,
+                "max_ms": round(max(float(value.get("elapsed_ms", 0.0)) for value in values), 2) if values else 0.0,
+                "cache_hit_count": sum(1 for value in values if value.get("cache_status") == "hit"),
+                "cache_miss_count": sum(1 for value in values if value.get("cache_status") == "miss"),
             }
             for name, values in sorted(by_name.items())
         }
