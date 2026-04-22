@@ -1,5 +1,37 @@
 # Deficiency Rectification Plan
 
+## 2026-04-22 Go Radar Engine Migration Slice 12
+
+- [x] Implement Go `MultiSyncSolver` in `radar-core/iid/multisync.go` with propagation-delay correction, weighted linear regression for period drift, ICAO quality memory, anchor selection via circular mean, period refinement + slope EMA, and wrong-period reacquire state machine
+- [x] Add `BearingAndRangeNM` Haversine helper and `weightedLinearFit` WLS helper
+- [x] Add `MsgMultiSyncState (17)` protocol message and `MultiSyncState` struct in `radar-core/protocol/messages.go`
+- [x] Wire `MultiSync *MultiSyncSolver` into `IIDState` in `radar-core/iid/state.go`; hook `maybeUpdateMultiSync` into the burst processing loop in `radar-core/cmd/radar-core/main.go`
+- [x] Add Python `MSG_MULTI_SYNC_STATE = 17` to `backend/radar_core/protocol.py`
+- [x] Add `on_multi_sync_state` callback to `backend/radar_core/client.py`
+- [x] Add `update_go_multi_sync_state()` to `RadarState` in `backend/radar/sweep.py`, initialise `_go_multi_sync_states_by_iid`, expand Stage 3 sync/waveform accessors to also accept `go_multi_aircraft_burst`
+- [x] Wire `on_multi_sync_state=radar_state.update_go_multi_sync_state` in `backend/main.py`
+- [x] Add focused Go unit tests in `radar-core/iid/multisync_test.go` (10 tests)
+- [x] Run `python3 -m py_compile`, `uv run --directory backend pytest`, and `go test ./...` verification
+
+Plan confirmation: port the full multi-aircraft sync solver computation into Go while keeping Python's richer `multi_aircraft_burst` state authoritative during the transition. Python adopts `go_multi_aircraft_burst` only when no Python solver is running. Stage 3 sync and waveform accessors accept both sources.
+
+### Review
+
+- Added `radar-core/iid/multisync.go` (~400 lines): `MultiSyncSolver`, `MultiSyncObs`, `ICAOSyncQuality`, `MultiSyncSnapshot`. Internal `runFit()` mirrors Python's `_update_multi_aircraft_sync_state()` with propagation-corrected burst residuals, per-ICAO quality EMA weighting, weighted linear fit for period slope, circular-mean anchor selection, slope EMA + persistence gate, and wrong-period reacquire logic.
+- Added `radar-core/iid/multisync_test.go` with 10 tests covering basic fit, throttle, insufficient observations, reset, obs prune, snapshot, weighted linear fit edge cases, bearing/range geometry, and ICAO quality downweighting.
+- Extended `radar-core/protocol/messages.go` with `MsgMultiSyncState = 17` and `MultiSyncState` struct.
+- Extended `radar-core/iid/state.go` with `MultiSync *MultiSyncSolver` field and `SyncStateRef()` accessor.
+- Extended `radar-core/cmd/radar-core/main.go` with `maybeUpdateMultiSync()` (called after `emitBurstFired`) and `emitMultiSyncState()`.
+- Python: added `MSG_MULTI_SYNC_STATE = 17` to `protocol.py`; `on_multi_sync_state` callback to `client.py`; `update_go_multi_sync_state()` + `_go_multi_sync_states_by_iid` init + expanded `_STAGE3_SYNC_SOURCES` frozenset to `sweep.py`; wired callback in `main.py`.
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/radar_core/client.py backend/radar_core/protocol.py backend/main.py` → OK
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_radar_core_client.py -q` → `133 passed`
+  - `go build ./... && go test ./...` in `radar-core/` → `86 tests passed across 11 packages`
+- Remaining migration scope after this slice:
+  - Python `_update_multi_aircraft_sync_state()` still runs when `RADAR_CORE_ENABLED` + Python has observed `multi_aircraft_burst` state; the two solvers run in parallel during the transition.
+  - The natural next step is to gate the Python multi-aircraft solver off when Go is producing authoritative `go_multi_aircraft_burst` state, and then remove the Python solver path entirely.
+  - Waveform learning remains Python-only; a future slice could port it to Go or remove it when Go sync is authoritative.
+
 ## 2026-04-22 Go Radar Engine Migration Slice 1
 
 - [x] Confirm and document the current Python live radar hot path inventory in `backend/radar/sweep.py`, `backend/radar/api.py`, `backend/radar/aircraft_localiser.py`, and `backend/radar/aircraft_api.py`
