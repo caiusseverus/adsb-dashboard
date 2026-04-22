@@ -2857,7 +2857,7 @@ class RadarState:
                             if position_source_age_s is not None else None
                         ),
                     )
-                if matches_dominant_for_sync:
+                if matches_dominant_for_sync and self.radar_core_event_sink is None:
                     self._record_aligned_burst_sync_obs(
                         iid=iid,
                         icao=fired_icao,
@@ -4010,10 +4010,33 @@ class RadarState:
             "dominant_family": burst_dict.get("df"),
             "sync_eligible": burst_dict.get("se"),
         })
+        sync_update_iid = None
+        sync_update_period_s = None
         with self._lock:
             self._go_track_observations.append(entry)
             if evidence is not None:
                 self._go_evidence_events.append(evidence)
+                if evidence.get("sync_eligible"):
+                    iid = int(evidence["iid"])
+                    sync = self._live_sync_states.get(iid)
+                    model = self._models.get(iid)
+                    period_s = None
+                    if sync is not None and sync.period_s > 0:
+                        period_s = float(sync.period_s)
+                    elif model is not None and model.period_s:
+                        period_s = float(model.period_s)
+                    if period_s and period_s > 0:
+                        sync_update_iid = iid
+                        sync_update_period_s = period_s
+        if sync_update_iid is not None and sync_update_period_s is not None:
+            now_mono = time.monotonic()
+            last = self._last_multi_sync_update_ts.get(sync_update_iid, 0.0)
+            if (now_mono - last) >= self._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
+                self._last_multi_sync_update_ts[sync_update_iid] = now_mono
+                self._update_multi_aircraft_sync_state(
+                    iid=sync_update_iid,
+                    period_s=sync_update_period_s,
+                )
 
     def _go_track_observation_snapshot(self) -> list[dict]:
         with self._lock:
@@ -5042,10 +5065,6 @@ class RadarState:
         acceptance: rejected observations do not influence the phase anchor, but
         they do not suppress localisation attempts either.
         """
-        obs_buf = self._live_aligned_burst_obs.get(iid)
-        if not obs_buf:
-            return
-
         existing = self._live_sync_states.get(iid)
         if existing is None:
             # No seed sync state yet — first frame must still initialise via
@@ -5066,8 +5085,15 @@ class RadarState:
         _MULTI_SYNC_WINDOW_ROTATIONS = 6
         window_s = max(live_period_s * _MULTI_SYNC_WINDOW_ROTATIONS, 30.0)
         cutoff_ts = now_ts - window_s
+        if self.radar_core_event_sink is not None:
+            obs_snapshot = self._go_aligned_burst_sync_snapshot(iid, window_s=window_s)
+        else:
+            obs_buf = self._live_aligned_burst_obs.get(iid)
+            if not obs_buf:
+                return
+            obs_snapshot = list(obs_buf)
 
-        recent_obs = [o for o in obs_buf if o.ts >= cutoff_ts]
+        recent_obs = [o for o in obs_snapshot if o.ts >= cutoff_ts]
         if len(recent_obs) < 3:
             # Too few recent observations to fit a robust correction.
             return
@@ -7651,6 +7677,24 @@ class RadarState:
             ))
         return observations
 
+    def _go_aligned_burst_sync_snapshot(
+        self,
+        iid: int,
+        window_s: float | None = None,
+    ) -> list[AlignedBurstSyncObs]:
+        """Rebuild sync-driving aligned observations from Go-owned burst evidence."""
+        observations = self._go_burst_sync_timeline_snapshot(
+            iid,
+            window_s=window_s or 300.0,
+        )
+        aligned = [
+            obs for obs in observations
+            if getattr(obs, "sync_update_eligible", False)
+        ]
+        if len(aligned) > self._MULTI_SYNC_OBS_MAX:
+            aligned = aligned[-self._MULTI_SYNC_OBS_MAX:]
+        return aligned
+
     def _build_compact_burst_sync_timeline_entries(
         self,
         sync: LiveSyncState,
@@ -9870,6 +9914,13 @@ class RadarState:
 
     def get_live_waveform_bins(self, iid: int) -> list[WaveformBin]:
         """Return a snapshot of the learned waveform bins for one IID."""
+        return list(self._live_waveform_bins.get(iid) or [])
+
+    def get_stage3_live_waveform_bins(self, iid: int) -> list[WaveformBin]:
+        """Return waveform bins only when the IID has Stage 3-authoritative sync."""
+        sync = self._live_sync_states.get(iid)
+        if sync is None or sync.source != "multi_aircraft_burst":
+            return []
         return list(self._live_waveform_bins.get(iid) or [])
 
     def update_live_sync_state(self, iid: int, **kwargs) -> None:

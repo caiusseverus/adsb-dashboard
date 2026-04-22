@@ -240,6 +240,60 @@ Plan confirmation: tighten the Stage 3 boundary before moving more solver logic.
   - Python still owns `_update_multi_aircraft_sync_state()` and all anchor/waveform/period-refine mutation logic.
   - Stage 3 is now better isolated from earlier-stage sync sources, but the actual multi-aircraft sync solver boundary has not moved to Go yet.
 
+## 2026-04-22 Go Radar Engine Migration Slice 8
+
+- [x] Add explicit Stage 3 waveform accessors so only Stage-3-authoritative sync state exposes waveform correction state to the localiser
+- [x] Switch localiser live-bearing builders and authoritative selection to use Stage 3 waveform accessors rather than the general radar-state waveform getter
+- [x] Keep general waveform getters intact for radar diagnostics outside Stage 3
+- [x] Add focused verification that Stage 3-localiser paths continue to work and stay isolated from non-Stage-3 sync sources
+- [x] Record the slice review and remaining solver-side migration scope
+
+Plan confirmation: extend the Stage 3 boundary from sync-state selection to the remaining waveform sidecar state that travels with that sync model. This still does not move the multi-aircraft solver itself into Go, but it removes another direct Stage 3 dependency on earlier-stage live radar state.
+
+### Review
+
+- Added `get_stage3_live_waveform_bins(iid)` to [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py). It only exposes waveform bins when the IID currently has `LiveSyncState(source="multi_aircraft_burst")`.
+- Left the existing `get_live_waveform_bins(iid)` untouched for radar diagnostics and non-Stage-3 consumers, so earlier-stage state remains inspectable outside the Stage 3 boundary.
+- Updated [backend/radar/aircraft_localiser.py](/home/keith/claude/adsb-dashboard/backend/radar/aircraft_localiser.py) so both the live-bearing builder path and authoritative observation selection path now request waveform bins through the Stage 3 accessor rather than the general radar-state getter.
+- This keeps the localiser’s waveform sidecar state aligned with the Stage 3-only sync accessors added in the prior slice. Stage 3 no longer reaches into mixed live radar state for either sync or waveform data.
+- Extended [backend/tests/test_aircraft_localiser_target_live.py](/home/keith/claude/adsb-dashboard/backend/tests/test_aircraft_localiser_target_live.py) fake radar state with Stage 3 waveform accessors and kept the targeted Stage 3 selection coverage green, including the non-Stage-3 `sweep_frame_go` rejection case.
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/radar/aircraft_localiser.py backend/tests/test_aircraft_localiser_target_live.py`
+  - `uv run --directory backend pytest tests/test_aircraft_localiser_target_live.py -k 'one_observation_per_radar_newest_wins or stage3_selection_ignores_go_frame_sync_states or stale_observation_produces_rejected_ray_not_accepted or display_set_matches_solver_input_set or untrusted_phase_wrong_source'`
+  - Result: targeted Stage 3 localiser tests passed (`5 passed`).
+- Remaining migration scope after this slice:
+  - Python still owns `_update_multi_aircraft_sync_state()` plus the anchor-selection, period-refine, waveform-learning, and per-ICAO quality mutation logic that feeds `multi_aircraft_burst`.
+  - Stage 3 is now explicitly isolated from earlier-stage sync and waveform state, but the actual multi-aircraft sync solver is still Python-owned.
+
+## 2026-04-22 Go Radar Engine Migration Slice 9
+
+- [x] Add a Go-evidence-backed aligned sync observation snapshot path for `_update_multi_aircraft_sync_state()`
+- [x] Trigger Python multi-aircraft sync updates from `update_go_burst_fired()` when Go burst evidence is authoritative, instead of relying on Python `_live_aligned_burst_obs` hot-path appends
+- [x] Stop appending `_live_aligned_burst_obs` on the Python hot path when radar-core evidence ownership is active
+- [x] Keep the existing Python aligned-burst buffer path intact for non-radar-core / fallback operation
+- [x] Add focused verification for Go-evidence-backed aligned sync observation reconstruction and update triggering
+
+Plan confirmation: move the retained multi-aircraft sync observation input buffer toward Go without moving the multi-aircraft solver itself yet. Python will still run `_update_multi_aircraft_sync_state()`, but it should be able to consume aligned observations reconstructed from Go-owned evidence and stop treating the Python aligned-burst deque as authoritative when radar-core is driving the live path.
+
+### Review
+
+- Added `_go_aligned_burst_sync_snapshot(...)` to [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py), which rebuilds sync-driving aligned observations from Go-owned burst evidence by filtering the existing Go-backed burst timeline reconstruction down to `sync_update_eligible` observations.
+- Updated `_update_multi_aircraft_sync_state()` so when radar-core evidence ownership is active, it no longer reads `_live_aligned_burst_obs` as the authoritative source. It now rebuilds recent aligned observations from Go evidence instead, while keeping the original Python deque path intact for fallback/non-radar-core operation.
+- Updated `update_go_burst_fired()` so sync-eligible Go burst evidence can trigger the Python multi-aircraft sync update loop directly, using the current sync/model period and the existing per-IID throttle.
+- Stopped appending `_live_aligned_burst_obs` on the Python native fired-burst path when `radar_core_event_sink` is active. In radar-core mode, Go evidence now owns the retained aligned observation input buffer for the Python multi-aircraft solver.
+- Left the Python solver logic itself unchanged. `_update_multi_aircraft_sync_state()` still owns anchor selection, period refinement, waveform learning, and rich `multi_aircraft_burst` state mutation; only the retained input buffer ownership moved in this slice.
+- Added focused regressions in [backend/tests/test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) proving:
+  - aligned sync-driving observations can be rebuilt from Go evidence
+  - `update_go_burst_fired()` can trigger the multi-aircraft sync update loop without relying on `_live_aligned_burst_obs`
+  - existing Go-evidence-backed burst timeline behavior remains intact
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -k 'go_aligned_burst_sync_snapshot_rebuilds_sync_driving_observations or update_go_burst_fired_triggers_multi_sync_update_from_go_evidence or get_burst_sync_timeline_prefers_go_evidence_when_available'`
+  - Result: targeted sweep tests passed (`3 passed`).
+- Remaining migration scope after this slice:
+  - Python still owns the actual multi-aircraft sync solver implementation in `_update_multi_aircraft_sync_state()`.
+  - The next substantial boundary is to move parts of that solver logic itself, especially anchor selection / period fit / waveform learning state mutation, into Go with exported parity.
+
 ## 2026-04-22 Wrong-Period Reacquire Refinement Follow-Up
 
 - [x] Re-inspect the current period-failure detector, reacquire recovery gate, and refine-freeze behavior in `backend/radar/sweep.py`
