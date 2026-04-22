@@ -3175,8 +3175,11 @@ class RadarState:
             # In radar-core frame mode, Python no longer runs _finalize_live_frame(),
             # so seed sync bootstrap here using the same first-frame criteria.
             if 1 + len(obs_list) >= 3:
-                # FRAME_READY does not include explicit ref pos age; use 0.0 (bootstrap safe).
-                self._seed_live_sync_from_frame(iid, frame, period_s, ref_pos_age_s=0.0)
+                # Use the reference position age from the wire if Go provided it.
+                # None means unknown — must not qualify the 3-aircraft freshness shortcut.
+                rpa = frame_dict.get("rpa")
+                ref_pos_age_s = float(rpa) if rpa is not None else None
+                self._seed_live_sync_from_frame(iid, frame, period_s, ref_pos_age_s=ref_pos_age_s)
         except Exception:
             self._radar_core_frame_inject_errors += 1
             log.debug("RadarState: malformed radar-core FRAME_READY ignored", exc_info=True)
@@ -3408,7 +3411,7 @@ class RadarState:
         iid: int,
         frame: "SweepFrame",
         period_s: float,
-        ref_pos_age_s: float = 0.0,
+        ref_pos_age_s: float | None = None,
     ) -> bool:
         """Seed the live sync state from a completed SweepFrame.
 
@@ -3479,7 +3482,10 @@ class RadarState:
             period_s = frame.period_s if frame.period_s is not None else model.period_s
             if period_s is None:
                 continue
-            return self._seed_live_sync_from_frame(iid, frame, period_s, ref_pos_age_s=0.0)
+            # Age is unknown for frames in the completed-frames buffer (SweepFrame
+            # does not carry ref_pos_age_s).  Treat as unknown rather than fresh so
+            # the 3-aircraft shortcut does not fire spuriously.
+            return self._seed_live_sync_from_frame(iid, frame, period_s, ref_pos_age_s=None)
         return False
 
     def _update_live_sync_state_filtered(
@@ -3490,7 +3496,7 @@ class RadarState:
         new_offset_deg: float,
         sync_quality: float,
         n_aircraft: int,
-        ref_pos_age_s: float,
+        ref_pos_age_s: float | None,
     ) -> None:
         """Update the live sync state with residual-aware smoothing.
 
@@ -3514,9 +3520,11 @@ class RadarState:
         # Marginal frames (n_aircraft == 3) may still trigger the FM callback and
         # produce live bearing observations; they just do not steer the sync anchor
         # unless the reference position is very fresh.
+        # A None ref_pos_age_s means the age is unknown; it must not qualify the
+        # freshness shortcut (treat as stale for gate purposes).
         sync_eligible = (
             n_aircraft >= 4
-            or (n_aircraft >= 3 and ref_pos_age_s <= 2.0)
+            or (n_aircraft >= 3 and ref_pos_age_s is not None and ref_pos_age_s <= 2.0)
         )
 
         now_ts = time.time()
@@ -4339,6 +4347,15 @@ class RadarState:
         # waveform correction, and uses effective Beast time as the x-axis.  This
         # keeps the fit on the same basis as the predictor and avoids fitting
         # scheduler/wall-clock timing drift.
+        #
+        # Four predict_sync_observation calls are made per observation to produce
+        # four distinct residual decompositions (raw, after-propagation,
+        # without-motion, and fully-corrected).  Each decomposition is stored in
+        # the scored dict and consumed downstream for diagnostics and period fitting.
+        # Collapsing these into fewer calls would require deriving one correction
+        # from another, which depends on implementation details of
+        # predict_sync_observation that are not guaranteed to be additive.  Left
+        # as-is to avoid silent semantic drift.
         scored: list[dict] = []
         fit_reject_reasons: dict[str, int] = defaultdict(int)
         for obs in recent_obs:

@@ -100,6 +100,10 @@ type FrameObservation struct {
 // consumed internally by radar-core's FM worker; Python may still subscribe to
 // it for diagnostics or optional shadow compatibility, but it is no longer the
 // default operational FM solve boundary.
+//
+// RefPosAgeS carries the wall-clock age (in seconds) of the reference
+// aircraft's ADS-B position fix at the time the frame was opened.  Nil means
+// the age was not available (receivers should not treat nil as "fresh").
 type FrameReady struct {
 	MsgType      uint8              `codec:"t"`
 	IID          uint8              `codec:"i"`
@@ -109,6 +113,7 @@ type FrameReady struct {
 	RefLat       float64            `codec:"rla"`
 	RefLon       float64            `codec:"rlo"`
 	RefArrivalUS float64            `codec:"ra"`
+	RefPosAgeS   *float32           `codec:"rpa"`
 	Observations []FrameObservation `codec:"obs"`
 	Quality      string             `codec:"q"`
 }

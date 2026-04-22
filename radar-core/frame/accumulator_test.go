@@ -326,3 +326,86 @@ func TestAccumulator_CentroidHistoryCapDiagnostics(t *testing.T) {
 		t.Fatal("expected centroid history cap hit counter > 0")
 	}
 }
+
+// TestAccumulator_ObservationPosAgeS_NonZero verifies that observations carry the
+// real position age (> 0 when the position was set a few seconds ago).
+func TestAccumulator_ObservationPosAgeS_NonZero(t *testing.T) {
+	acc, _, pos := newTestAccumulator()
+
+	// Set positions several seconds in the past.
+	past := float64(time.Now().Unix() - 5)
+	pos.Update(0xAA, 51.5, -0.1, nil, past)
+	pos.Update(0xBB, 51.6, -0.2, nil, past)
+	pos.Update(0xCC, 51.7, -0.3, nil, past)
+
+	s := iid.NewIIDState(3)
+	period := 4.0
+	injectRef(s, 0xAA, period, 10)
+	_, refICAOPtr := s.SyncSnapshot()
+	if refICAOPtr == nil || *refICAOPtr != 0xAA {
+		t.Skip("reference ICAO not selected")
+	}
+	for i := 0; i < 5; i++ {
+		acc.appendCentroid(0xBB, float64(i)*4_000_000.0)
+		acc.appendCentroid(0xCC, float64(i)*4_000_000.0+500_000.0)
+	}
+
+	acc.OnBurst(0xAA, 40_000_000.0, 2, nil, s)
+	acc.OnBurst(0xBB, 40_500_000.0, 2, nil, s)
+	acc.OnBurst(0xCC, 41_000_000.0, 2, nil, s)
+
+	// Frame not yet finalised — inspect via emitted callback.
+	var emittedFrame *protocol.FrameReady
+	acc.OnFrameEmitted = func(f *protocol.FrameReady) { emittedFrame = f }
+	acc.OnBurst(0xAA, 44_000_000.0, 2, nil, s) // close frame
+
+	if emittedFrame == nil {
+		t.Fatal("no frame emitted")
+	}
+	for _, obs := range emittedFrame.Observations {
+		if obs.PosAgeS < 4.0 {
+			t.Errorf("obs 0x%X PosAgeS=%.2f, want >= 4 (position was 5s old)", obs.ICAO, obs.PosAgeS)
+		}
+	}
+}
+
+// TestAccumulator_FrameReady_RefPosAgeS verifies that FRAME_READY carries the
+// real reference position age, not always 0.
+func TestAccumulator_FrameReady_RefPosAgeS(t *testing.T) {
+	acc, _, pos := newTestAccumulator()
+
+	past := float64(time.Now().Unix() - 3)
+	pos.Update(0xAA, 51.5, -0.1, nil, past)
+	pos.Update(0xBB, 51.6, -0.2, nil, past)
+	pos.Update(0xCC, 51.7, -0.3, nil, past)
+
+	s := iid.NewIIDState(3)
+	period := 4.0
+	injectRef(s, 0xAA, period, 10)
+	_, refICAOPtr := s.SyncSnapshot()
+	if refICAOPtr == nil || *refICAOPtr != 0xAA {
+		t.Skip("reference ICAO not selected")
+	}
+	for i := 0; i < 5; i++ {
+		acc.appendCentroid(0xBB, float64(i)*4_000_000.0)
+		acc.appendCentroid(0xCC, float64(i)*4_000_000.0+500_000.0)
+	}
+
+	var emittedFrame *protocol.FrameReady
+	acc.OnFrameEmitted = func(f *protocol.FrameReady) { emittedFrame = f }
+
+	acc.OnBurst(0xAA, 40_000_000.0, 2, nil, s)
+	acc.OnBurst(0xBB, 40_500_000.0, 2, nil, s)
+	acc.OnBurst(0xCC, 41_000_000.0, 2, nil, s)
+	acc.OnBurst(0xAA, 44_000_000.0, 2, nil, s)
+
+	if emittedFrame == nil {
+		t.Fatal("no frame emitted")
+	}
+	if emittedFrame.RefPosAgeS == nil {
+		t.Fatal("RefPosAgeS is nil, want a real age value")
+	}
+	if *emittedFrame.RefPosAgeS < 2.0 {
+		t.Errorf("RefPosAgeS=%.2f, want >= 2 (position was 3s old)", *emittedFrame.RefPosAgeS)
+	}
+}

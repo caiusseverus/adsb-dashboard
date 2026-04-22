@@ -665,7 +665,9 @@ class RadarLocaliser:
         for sweep_pairs in sweep_groups:
             try:
                 lat, lon, cep_m, n_pairs = self.solve_sweep_group(sweep_pairs, initial_guess)
-            except Exception:
+            except Exception as exc:
+                failure_key = self._classify_sweep_failure(exc)
+                log.debug("RadarLocaliser: sweep solve failed [%s]: %s", failure_key, exc)
                 continue
             sweep_estimates.append({
                 "lat": lat,
@@ -814,11 +816,19 @@ class RadarLocaliser:
     def _build_sweep_observations(self, sweep_pairs: list[CalibrationPair]) -> list[dict]:
         """Reconstruct per-aircraft relative timing observations from one sweep's pairs."""
         aircraft_positions: dict[str, tuple[float, float]] = {}
-        pair_tdoa: dict[tuple[str, str], float] = {}
+        pair_tdoa_all: dict[tuple[str, str], list[float]] = defaultdict(list)
         for pair in sweep_pairs:
             aircraft_positions[pair.icao_a] = (pair.lat_a, pair.lon_a)
             aircraft_positions[pair.icao_b] = (pair.lat_b, pair.lon_b)
-            pair_tdoa[(pair.icao_a, pair.icao_b)] = pair.tdoa_us
+            pair_tdoa_all[(pair.icao_a, pair.icao_b)].append(pair.tdoa_us)
+
+        # Combine duplicate same-sweep pair entries using median TDOA rather than
+        # the last-write-wins overwrite that existed before this fix.
+        pair_tdoa: dict[tuple[str, str], float] = {}
+        for key, tdoa_values in pair_tdoa_all.items():
+            s = sorted(tdoa_values)
+            n = len(s)
+            pair_tdoa[key] = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
 
         if len(aircraft_positions) < MIN_SWEEP_AIRCRAFT:
             raise ValueError(
@@ -932,8 +942,33 @@ class RadarLocaliser:
         x0_x, x0_y = _latlon_to_xy(x0_lat, x0_lon, origin_lat, origin_lon)
 
         search_radius_m = self._estimate_search_radius_m(sweep_pairs, origin_lat, origin_lon)
+
+        # Precompute static per-aircraft ENU coordinates so the residual evaluator
+        # avoids repeated _latlon_to_xy calls on every least-squares evaluation.
+        ref_x, ref_y = _latlon_to_xy(
+            observations[0]["lat"], observations[0]["lon"], origin_lat, origin_lon
+        )
+        ref_recv_m = math.hypot(ref_x, ref_y)
+        obs_precomp = [
+            (*_latlon_to_xy(obs["lat"], obs["lon"], origin_lat, origin_lon), obs["rel_arrival_us"])
+            for obs in observations[1:]
+        ]
+        # Precompute static receiver-path distances for non-reference aircraft.
+        obs_precomp_full = [
+            (ax, ay, math.hypot(ax, ay), rel_us)
+            for ax, ay, rel_us in obs_precomp
+        ]
+
+        def _fast_sweep_residuals(R: list[float]) -> list[float]:
+            rx, ry = R
+            ref_radar_m = math.hypot(rx - ref_x, ry - ref_y)
+            return [
+                ((math.hypot(rx - ax, ry - ay) + recv_m) - (ref_radar_m + ref_recv_m)) / _C_MUS - rel_us
+                for ax, ay, recv_m, rel_us in obs_precomp_full
+            ]
+
         result = least_squares(
-            fun=lambda R: self.sweep_residuals(R, observations, origin_lat, origin_lon),
+            fun=_fast_sweep_residuals,
             x0=[x0_x, x0_y],
             method="trf",
             bounds=(
@@ -1091,8 +1126,29 @@ class RadarLocaliser:
 
         search_radius_m = self._estimate_search_radius_m(pairs, origin_lat, origin_lon)
 
+        # Precompute per-pair ENU coordinates and corrected range-difference targets
+        # so the residual evaluator avoids repeated _latlon_to_xy calls on every
+        # least-squares function evaluation.
+        pairs_precomp = [
+            (
+                *_latlon_to_xy(pair.lat_a, pair.lon_a, origin_lat, origin_lon),
+                *_latlon_to_xy(pair.lat_b, pair.lon_b, origin_lat, origin_lon),
+                self._corrected_range_difference_m(pair),
+            )
+            for pair in pairs
+        ]
+
+        def _fast_tdoa_residuals(R: list[float]) -> list[float]:
+            rx, ry = R
+            return [
+                (math.sqrt((rx - ax) ** 2 + (ry - ay) ** 2)
+                 - math.sqrt((rx - bx) ** 2 + (ry - by) ** 2)
+                 - delta) / _C_MUS
+                for ax, ay, bx, by, delta in pairs_precomp
+            ]
+
         result = least_squares(
-            fun=lambda R: self.tdoa_residuals(R, pairs, origin_lat, origin_lon),
+            fun=_fast_tdoa_residuals,
             x0=[x0_x, x0_y],
             method="trf",
             bounds=(

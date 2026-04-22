@@ -1,5 +1,27 @@
 # Deficiency Rectification Plan
 
+## 2026-04-22 Radar Sync / Frame / Localiser Review
+
+- [x] Inspect current Go sync code for angle normalisation, phase anchoring, and phase-family scaling behavior
+- [x] Inspect current Go to Python frame payloads for reference-age and observation-age defaults
+- [x] Inspect current Python sync maintenance and period-refinement paths for correctness and performance characteristics
+- [x] Inspect current localiser solve and sweep reconstruction paths for SciPy dependency, exception handling, duplicate-pair handling, and residual-cost structure
+- [x] Cross-check tests and runtime call sites where they clarify intended behavior
+- [x] Summarize each reported issue with verdict, evidence, impact, and remediation priority
+
+Plan confirmation: verify each claim directly against the current branch, separate bugs from tuning tradeoffs, and distinguish Python behavior, native Go behavior, and interface-layer defaults.
+
+### Review
+
+- Verified current implementations in `radar-core/iid`, `radar-core/frame`, `radar-core/cmd/radar-core`, `backend/radar/sweep.py`, `backend/radar/localiser.py`, `backend/radar/aircraft_localiser.py`, and `backend/radar/forward_model.py`.
+- Confirmed that the native Go sync path is materially simpler than the Python live sync model: Go currently has reference-burst epoch updates plus frame-family gates, while Python adds propagation correction, motion compensation, waveform correction, multi-aircraft residual fitting, absolute anchor selection/validation, and live period refinement.
+- Confirmed interface-default issues in the Go→Python frame path: injected Go frames use `0.0` for missing observation position ages and also bootstrap Python sync with synthetic `ref_pos_age_s=0.0`.
+- Confirmed localiser sweep reconstruction currently overwrites duplicate pair entries by `(icao_a, icao_b)` key and that sweep accumulation suppresses solve exceptions silently in `solve_static_from_sweeps()`, while diagnostics classify them explicitly in `_diagnose_from_sweep_groups()`.
+- Confirmed localiser solve paths require SciPy at solve time and raise `RuntimeError("scipy is required for radar localisation")` when unavailable; module import itself still succeeds.
+- Verification run:
+  - `uv run --directory backend pytest tests/test_radar_localiser.py tests/test_aircraft_localiser_sync_predictor.py tests/test_forward_model_integration.py`
+  - `GOCACHE=/tmp/go-build-cache go test ./...` in `radar-core/`
+
 ## 2026-04-21 Radar Page Selected-IID Evidence Follow-Up
 
 - [x] Trace the authoritative Go frame-accumulation state that should drive the selected-IID evidence map

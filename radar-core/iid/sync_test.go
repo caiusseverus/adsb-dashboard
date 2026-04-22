@@ -122,6 +122,94 @@ func TestCircularDiff(t *testing.T) {
 	}
 }
 
+func TestWrap360(t *testing.T) {
+	cases := []struct{ in, want float64 }{
+		{0, 0},
+		{360, 0},
+		{361, 1},
+		{-1, 359},
+		{-180, 180},
+		{-360, 0},
+		{720, 0},
+		{-0.001, 359.999},
+		{359.999, 359.999},
+	}
+	for _, tc := range cases {
+		got := wrap360(tc.in)
+		if math.Abs(got-tc.want) > 1e-9 {
+			t.Errorf("wrap360(%.3f) = %.6f, want %.6f", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestSyncState_PredictBearing_NeverNegative verifies PredictBearing always
+// returns a value in [0, 360) regardless of epoch and phase.
+func TestSyncState_PredictBearing_NeverNegative(t *testing.T) {
+	// Phase offset 0°, 4s period, epoch at 0.
+	s := NewSyncState(3, 4.0, 2_000_000.0, 0.0, 1.0)
+
+	// Arrival before epoch — raw formula produces negative intermediate value.
+	b := s.PredictBearing(0.0)
+	if b < 0 || b >= 360 {
+		t.Errorf("PredictBearing(0) = %.4f, want in [0, 360)", b)
+	}
+
+	// Arrival at -1s relative to epoch (would be -90° without wrap).
+	b = s.PredictBearing(1_000_000.0)
+	if b < 0 || b >= 360 {
+		t.Errorf("PredictBearing(1s before period) = %.4f, want in [0, 360)", b)
+	}
+}
+
+// TestSyncState_UpdateEpoch_NeverNegativeOffset verifies PhaseOffsetDeg is always
+// non-negative after UpdateEpoch, even when the blend crosses zero.
+func TestSyncState_UpdateEpoch_NeverNegativeOffset(t *testing.T) {
+	// Start with a small positive offset so blending can push below 0.
+	s := NewSyncState(3, 4.0, 0.0, 2.0, 1.0)
+
+	// New observation slightly negative relative to current model — blending
+	// could produce a negative intermediate value without wrap360.
+	// Provide a new epoch one period later, new offset = 1°.
+	accepted := s.UpdateEpoch(4_000_000.0, 1.0, 4.0, 1.0, 4, 0.5)
+	if !accepted {
+		t.Fatal("expected update to be accepted")
+	}
+	if s.PhaseOffsetDeg < 0 {
+		t.Errorf("PhaseOffsetDeg = %.4f, must be >= 0", s.PhaseOffsetDeg)
+	}
+	if s.PhaseOffsetDeg >= 360 {
+		t.Errorf("PhaseOffsetDeg = %.4f, must be < 360", s.PhaseOffsetDeg)
+	}
+}
+
+// TestSyncState_UpdateEpoch_ResidualBlendCrossesWrap verifies that a blended
+// offset that crosses the 360→0 wrap boundary stays in [0, 360).
+func TestSyncState_UpdateEpoch_ResidualBlendCrossesWrap(t *testing.T) {
+	// Offset near 359°.
+	s := NewSyncState(3, 4.0, 0.0, 359.0, 1.0)
+	// New observation at 1° — residual +2°, blending will push above 360.
+	s.UpdateEpoch(4_000_000.0, 1.0, 4.0, 1.0, 4, 0.5)
+	if s.PhaseOffsetDeg < 0 || s.PhaseOffsetDeg >= 360 {
+		t.Errorf("PhaseOffsetDeg = %.4f, want in [0, 360)", s.PhaseOffsetDeg)
+	}
+}
+
+// TestSyncState_QualityGate_3AircraftUnknownAge verifies that n_aircraft==3
+// with an unknown ref position age (modelled as a very large value) is rejected.
+// Note: Go's UpdateEpoch takes refPosAgeS as float64, so callers representing
+// "unknown" must use a large sentinel rather than a nil.
+func TestSyncState_QualityGate_3Aircraft_LargeAge(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	// n=3, age=999 (well above 2.0 fresh threshold) — must be rejected.
+	accepted := s.UpdateEpoch(4_000_000.0, 0.0, 4.0, 1.0, 3, 999.0)
+	if accepted {
+		t.Error("n_aircraft=3 with age=999 should be rejected by quality gate")
+	}
+	if !s.Holdover {
+		t.Error("Holdover should be set after quality-gate rejection")
+	}
+}
+
 // TestSelectReference verifies the reference aircraft selection scoring.
 func TestSelectReference_BasicSelection(t *testing.T) {
 	// Two ICAOs: 0xAA has a perfect 4s period; 0xBB has a noisy period.

@@ -11,6 +11,7 @@ package frame
 import (
 	"log/slog"
 	"math"
+	"time"
 
 	rcconfig "github.com/caiusseverus/adsb-dashboard/radar-core/config"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/iid"
@@ -156,15 +157,14 @@ func (a *Accumulator) OnBurst(
 			a.recordGate("missing_ref_position", icao)
 			return // can't start frame without ref position
 		}
-		posAgeS := float64(0)
-		// a.positions.Get already filters stale; age is always <= 30s
-		_ = posAgeS
+		refPosAgeS := float64(time.Since(pos.TS).Seconds())
 
 		a.frame = &liveFrame{
 			refICAO:      icao,
 			refLat:       pos.Lat,
 			refLon:       pos.Lon,
 			refArrivalUS: centroidUS,
+			refPosAgeS:   refPosAgeS,
 			nAircraft:    1,
 			seenICAOs:    map[uint32]struct{}{icao: {}},
 		}
@@ -203,8 +203,7 @@ func (a *Accumulator) OnBurst(
 		return // no position for this aircraft
 	}
 
-	var posAgeS float32
-	// pos is fresh (Get() filters stale entries); use 0.0 as the age upper bound.
+	posAgeS := float32(time.Since(pos.TS).Seconds())
 
 	nR := nReplies
 	if nR > 255 {
@@ -247,6 +246,7 @@ func (a *Accumulator) finalizeFrame(periodS float64) {
 		"n_aircraft", nAircraft,
 		"ref_icao", f.refICAO,
 	)
+	refPosAgeF32 := float32(f.refPosAgeS)
 	msg := &protocol.FrameReady{
 		MsgType:      protocol.MsgFrameReady,
 		IID:          a.iidNum,
@@ -256,6 +256,7 @@ func (a *Accumulator) finalizeFrame(periodS float64) {
 		RefLat:       f.refLat,
 		RefLon:       f.refLon,
 		RefArrivalUS: f.refArrivalUS,
+		RefPosAgeS:   &refPosAgeF32,
 		Observations: f.observations,
 		Quality:      quality,
 	}

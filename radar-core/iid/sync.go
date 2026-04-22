@@ -110,10 +110,8 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 	}
 
 	// Re-express existing sync at the new epoch, then blend in the new observation.
-	existingAtNewEpoch := math.Mod(
-		(newEpochUS-s.PhaseEpochUS)/periodUS*360.0+s.PhaseOffsetDeg, 360.0,
-	)
-	blendedOffset := math.Mod(existingAtNewEpoch+alpha*residual, 360.0)
+	existingAtNewEpoch := wrap360((newEpochUS-s.PhaseEpochUS)/periodUS*360.0 + s.PhaseOffsetDeg)
+	blendedOffset := wrap360(existingAtNewEpoch + alpha*residual)
 
 	s.PeriodS = periodS
 	s.PhaseEpochUS = newEpochUS
@@ -128,14 +126,20 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 	return true
 }
 
-// PredictBearing returns the predicted bearing for an arrival at arrivalUS.
-// Returns -1 if no sync state is available.
+// PredictBearing returns the predicted bearing in [0, 360) for an arrival at
+// arrivalUS. Returns -1 if no sync state is available.
+//
+// NOTE: The Go sync state is anchored on a relative phase offset (0.0 until
+// the radar position is known).  This is intentional — Go sync provides a
+// phase-tracking signal, not an absolute bearing engine.  Do not assume the
+// returned value is a geographic bearing unless PhaseOffsetDeg has been
+// properly initialised with a geometric reference.
 func (s *SyncState) PredictBearing(arrivalUS float64) float64 {
 	if s.PeriodS <= 0 {
 		return -1
 	}
 	periodUS := s.PeriodS * 1e6
-	return math.Mod(s.predictBearingAt(arrivalUS, periodUS), 360.0)
+	return wrap360(s.predictBearingAt(arrivalUS, periodUS))
 }
 
 func (s *SyncState) predictBearingAt(arrivalUS, periodUS float64) float64 {
@@ -143,6 +147,16 @@ func (s *SyncState) predictBearingAt(arrivalUS, periodUS float64) float64 {
 		return s.PhaseOffsetDeg
 	}
 	return (arrivalUS-s.PhaseEpochUS)/periodUS*360.0 + s.PhaseOffsetDeg
+}
+
+// wrap360 wraps an angle to [0, 360). Unlike math.Mod, this is always
+// non-negative even for negative inputs.
+func wrap360(deg float64) float64 {
+	r := math.Mod(deg, 360.0)
+	if r < 0 {
+		r += 360.0
+	}
+	return r
 }
 
 // circularDiff returns the signed difference b-a, normalised to (-180, 180].
