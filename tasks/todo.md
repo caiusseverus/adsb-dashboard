@@ -141,6 +141,40 @@ Plan confirmation: move the retained sync-timeline evidence boundary, not the sy
   - Python still owns the aligned-burst sync-maintenance buffer, multi-aircraft sync fit, anchor selection/validation, waveform learning, and authoritative rich sync state.
   - The next substantial boundary is still authoritative per-IID sync maintenance itself: move that fit/anchor/reacquire logic into Go with enough exported parity that Python can stop maintaining duplicate live sync internals while Stage 3 continues to consume exported objects rather than mutable earlier-stage state.
 
+## 2026-04-22 Go Radar Engine Migration Slice 5
+
+- [x] Extend Go `IID_STATE` and snapshot exports with frame-sync bootstrap fields needed to hydrate a compact usable sync state in Python
+- [x] Emit Go `IID_STATE` immediately on sync updates so Python does not need to wait for periodic snapshot refresh before seeing frame-sync bootstrap changes
+- [x] Add Python `RadarCoreClient` callback wiring for `IID_STATE` messages and mirror that Go sync state in `RadarState`
+- [x] Adopt Go-authored frame-sync bootstrap into Python `LiveSyncState` only when Python does not already have a richer multi-aircraft sync owner
+- [x] Remove the old Python `inject_frame_from_go()` sync-seeding path so Go `IID_STATE` becomes the source of frame-sync bootstrap authority
+- [x] Add focused verification for `IID_STATE` client handling, Go-to-Python sync bootstrap, and non-override of Python `multi_aircraft_burst` sync state
+
+Plan confirmation: move only the frame-based sync bootstrap and holdover authority in this slice. Go can seed and maintain the compact per-IID frame sync state, but Python must retain authority for the richer `multi_aircraft_burst` refinement path until that full fit/anchor model is exported safely. Stage 3 remains logically separate and continues to rely on exported observation/sync objects rather than earlier-stage mutable internals.
+
+### Review
+
+- Extended Go `IID_STATE` and stable snapshot `IIDSnapshot` exports with the frame-sync fields Python needs to mirror usable bootstrap state directly from Go: sync present/usable flags, sync period, phase epoch, phase offset, jitter, residual EMA, last residual, frame/rejection counts, and holdover.
+- Updated [radar-core/iid/state.go](/home/keith/claude/adsb-dashboard/radar-core/iid/state.go) with `SyncProtocolSnapshot()` so the existing Go `SyncState` can be exported consistently to both the wire protocol and snapshot payload without adding Python callbacks in the hot path.
+- Updated [radar-core/cmd/radar-core/main.go](/home/keith/claude/adsb-dashboard/radar-core/cmd/radar-core/main.go) so sync updates emit `IID_STATE` immediately after `UpdateSyncEpoch(...)`, not only during the periodic IID analysis pass. That removes the snapshot-poll lag from Python’s sync-bootstrap view.
+- Added `on_iid_state` handling to [backend/radar_core/client.py](/home/keith/claude/adsb-dashboard/backend/radar_core/client.py) and wired it in [backend/main.py](/home/keith/claude/adsb-dashboard/backend/main.py) so `RadarState` receives Go `IID_STATE` messages directly.
+- Added Go sync revision tracking and `update_go_iid_state(...)` in [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py). Python now mirrors the Go compact sync state and hydrates a `LiveSyncState(source="sweep_frame_go")` only when there is no current sync owner or the current owner is not the richer `multi_aircraft_burst` state.
+- Removed the old frame-injection sync seeding path from `inject_frame_from_go(...)`. Go `FRAME_READY` still mirrors frames for read paths and FM compatibility, but sync bootstrap authority now comes from Go `IID_STATE` rather than Python re-deriving it from frame contents.
+- Added focused regressions in:
+  - [backend/tests/test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) proving Go `IID_STATE` bootstrap creates `sweep_frame_go` sync state and does not override existing Python `multi_aircraft_burst` sync state
+  - [backend/tests/test_radar_core_client.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_core_client.py) proving `IID_STATE` callbacks and client stats are wired correctly
+- Verification:
+  - `gofmt -w radar-core/cmd/radar-core/main.go radar-core/iid/state.go radar-core/protocol/messages.go radar-core/export/types.go`
+  - `python3 -m py_compile backend/radar/sweep.py backend/radar_core/client.py backend/main.py backend/tests/test_radar_sweep.py backend/tests/test_radar_core_client.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -k 'go_iid_state or radar_core_frame_injection'`
+  - `uv run --directory backend pytest tests/test_radar_core_client.py -k 'iid_state or frame_ready or burst_fired'`
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./...`
+  - Result: targeted sweep tests passed (`3 passed`), targeted radar-core client tests passed (`3 passed`), and `radar-core` Go tests passed.
+- Remaining migration scope after this slice:
+  - Python still owns the authoritative `multi_aircraft_burst` sync refinement model, anchor selection, waveform learning, and rich sync-debug snapshot path.
+  - Go now owns the compact frame-sync bootstrap boundary, but not yet the richer per-IID sync maintenance needed to retire Python’s duplicate live sync internals.
+  - The next substantial boundary is moving the authoritative multi-aircraft sync fit and exported parity into Go so Python can stop maintaining `LiveSyncState` as a primary mutable model while preserving Stage 3 separation.
+
 ## 2026-04-22 Wrong-Period Reacquire Refinement Follow-Up
 
 - [x] Re-inspect the current period-failure detector, reacquire recovery gate, and refine-freeze behavior in `backend/radar/sweep.py`

@@ -127,6 +127,7 @@ if config.RADAR_CORE_ENABLED:
         config.RADAR_CORE_SOCKET,
         on_burst_fired=radar_state.update_go_burst_fired,
         on_frame_ready=_rc_on_frame_ready,
+        on_iid_state=radar_state.update_go_iid_state,
         on_fm_frame_result=radar_state.update_go_frame_position_result if config.RADAR_CORE_FM_ENABLED else None,
         on_fm_state=radar_state.update_forward_model_from_go if config.RADAR_CORE_FM_ENABLED else None,
         on_snapshot=radar_state.update_go_snapshot,

@@ -131,16 +131,27 @@ type FrameReady struct {
 // Revision is a monotonically increasing counter per IID; Python discards
 // messages with a revision lower than the last seen.
 type IIDState struct {
-	MsgType       uint8    `codec:"t"`
-	IID           uint8    `codec:"i"`
-	PeriodS       *float64 `codec:"p"`
-	RPM           *float32 `codec:"rpm"`
-	Status        string   `codec:"st"`
-	RefICAO       *uint32  `codec:"rc"`
-	SyncQuality   float32  `codec:"sq"`
-	NBurstRecords uint16   `codec:"nb"`
-	LastUpdated   float64  `codec:"lu"`
-	Revision      uint32   `codec:"rv"`
+	MsgType            uint8    `codec:"t"`
+	IID                uint8    `codec:"i"`
+	PeriodS            *float64 `codec:"p"`
+	RPM                *float32 `codec:"rpm"`
+	Status             string   `codec:"st"`
+	RefICAO            *uint32  `codec:"rc"`
+	SyncQuality        float32  `codec:"sq"`
+	SyncStatePresent   bool     `codec:"sp"`
+	SyncStateUsable    bool     `codec:"su"`
+	SyncPeriodS        *float64 `codec:"sps"`
+	SyncPhaseEpochUS   *float64 `codec:"sep"`
+	SyncPhaseOffsetDeg *float64 `codec:"sod"`
+	SyncJitterDeg      *float32 `codec:"sj"`
+	SyncResidualEMA    *float32 `codec:"sre"`
+	SyncLastResidual   *float32 `codec:"slr"`
+	SyncNFrames        uint16   `codec:"snf"`
+	SyncNRejected      uint16   `codec:"snr"`
+	SyncHoldover       bool     `codec:"sh"`
+	NBurstRecords      uint16   `codec:"nb"`
+	LastUpdated        float64  `codec:"lu"`
+	Revision           uint32   `codec:"rv"`
 }
 
 // SnapshotResp is the response to a SnapshotReq.

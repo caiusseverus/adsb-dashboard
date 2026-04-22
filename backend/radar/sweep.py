@@ -2196,6 +2196,7 @@ class RadarState:
         self._GO_EVIDENCE_EVENTS_MAX = 12_000
         self._GO_SWEEP_FRAMES_MAX = 256
         self._go_sync_states_by_iid: dict[int, dict] = {}
+        self._go_iid_state_revision: dict[int, int] = {}
         self._go_track_observations: deque = deque(maxlen=self._GO_TRACK_OBSERVATIONS_MAX)
         self._go_evidence_events: deque = deque(maxlen=self._GO_EVIDENCE_EVENTS_MAX)
         self._go_sweep_frames_by_iid: dict[int, deque] = {}
@@ -3423,14 +3424,6 @@ class RadarState:
                 self._radar_core_frames_injected_by_iid.get(iid, 0) + 1
             )
 
-            # In radar-core frame mode, Python no longer runs _finalize_live_frame(),
-            # so seed sync bootstrap here using the same first-frame criteria.
-            if 1 + len(obs_list) >= 3:
-                # Use the reference position age from the wire if Go provided it.
-                # None means unknown — must not qualify the 3-aircraft freshness shortcut.
-                rpa = frame_dict.get("rpa")
-                ref_pos_age_s = float(rpa) if rpa is not None else None
-                self._seed_live_sync_from_frame(iid, frame, period_s, ref_pos_age_s=ref_pos_age_s)
         except Exception:
             self._radar_core_frame_inject_errors += 1
             log.debug("RadarState: malformed radar-core FRAME_READY ignored", exc_info=True)
@@ -3643,6 +3636,7 @@ class RadarState:
                 go_sync = self._normalise_go_sync_state(iid_payload)
                 if go_sync is not None:
                     self._go_sync_states_by_iid[iid] = go_sync
+                    self._adopt_go_frame_sync_locked(iid, go_sync)
                     seen_go_sync_iids.add(iid)
                 elif iid in self._go_sync_states_by_iid:
                     self._go_sync_states_by_iid.pop(iid, None)
@@ -3720,6 +3714,14 @@ class RadarState:
                     float(entry["sync_period_s"])
                     if entry.get("sync_period_s") is not None else None
                 ),
+                "phase_epoch_us": (
+                    float(entry["sync_phase_epoch_us"])
+                    if entry.get("sync_phase_epoch_us") is not None else None
+                ),
+                "phase_offset_deg": (
+                    float(entry["sync_phase_offset_deg"])
+                    if entry.get("sync_phase_offset_deg") is not None else None
+                ),
                 "sync_quality": float(entry.get("sync_quality") or 0.0),
                 "usable": bool(entry.get("sync_state_usable", False)),
                 "sync_jitter_deg": (
@@ -3729,6 +3731,10 @@ class RadarState:
                 "residual_ema_deg": (
                     float(entry["sync_residual_ema_deg"])
                     if entry.get("sync_residual_ema_deg") is not None else None
+                ),
+                "last_residual_deg": (
+                    float(entry["sync_last_residual_deg"])
+                    if entry.get("sync_last_residual_deg") is not None else None
                 ),
                 "n_sync_frames": int(entry.get("sync_n_frames") or 0),
                 "n_rejected_frames": int(entry.get("sync_n_rejected_frames") or 0),
@@ -4013,6 +4019,68 @@ class RadarState:
             if iid is None:
                 return list(self._go_evidence_events)
             return [entry for entry in self._go_evidence_events if int(entry.get("iid", -1)) == iid]
+
+    def _adopt_go_frame_sync_locked(self, iid: int, go_sync: dict) -> None:
+        existing = self._live_sync_states.get(iid)
+        if existing is not None and existing.source == "multi_aircraft_burst":
+            return
+        if go_sync.get("period_s") is None:
+            return
+        phase_epoch_us = go_sync.get("phase_epoch_us")
+        phase_offset_deg = go_sync.get("phase_offset_deg")
+        if phase_epoch_us is None or phase_offset_deg is None:
+            return
+        last_updated = float(go_sync.get("last_updated") or time.time())
+        self._live_sync_states[iid] = LiveSyncState(
+            iid=iid,
+            period_s=float(go_sync["period_s"]),
+            phase_epoch_us=float(phase_epoch_us),
+            phase_offset_deg=float(phase_offset_deg),
+            sync_quality=float(go_sync.get("sync_quality") or 0.0),
+            sync_jitter_deg=float(go_sync.get("sync_jitter_deg") or 5.0),
+            last_sync_update_ts=last_updated,
+            source="sweep_frame_go",
+            usable=bool(go_sync.get("usable", False)),
+            residual_ema_deg=float(go_sync.get("residual_ema_deg") or 5.0),
+            n_sync_frames=int(go_sync.get("n_sync_frames") or 0),
+            n_rejected_frames=int(go_sync.get("n_rejected_frames") or 0),
+            last_residual_deg=float(go_sync.get("last_residual_deg") or 0.0),
+            holdover=bool(go_sync.get("holdover", False)),
+            period_base_s=float(go_sync["period_s"]),
+        )
+
+    def update_go_iid_state(self, iid_state: dict) -> None:
+        try:
+            iid = int(iid_state["i"])
+        except Exception:
+            log.debug("RadarState: malformed radar-core IID_STATE ignored", exc_info=True)
+            return
+        revision = int(iid_state.get("rv") or 0)
+        with self._lock:
+            if revision and revision < self._go_iid_state_revision.get(iid, 0):
+                return
+            if revision:
+                self._go_iid_state_revision[iid] = revision
+            go_sync = self._normalise_go_sync_state({
+                "sync_state_present": iid_state.get("sp"),
+                "sync_state_usable": iid_state.get("su"),
+                "sync_period_s": iid_state.get("sps"),
+                "sync_phase_epoch_us": iid_state.get("sep"),
+                "sync_phase_offset_deg": iid_state.get("sod"),
+                "sync_quality": iid_state.get("sq"),
+                "sync_jitter_deg": iid_state.get("sj"),
+                "sync_residual_ema_deg": iid_state.get("sre"),
+                "sync_last_residual_deg": iid_state.get("slr"),
+                "sync_n_frames": iid_state.get("snf"),
+                "sync_n_rejected_frames": iid_state.get("snr"),
+                "sync_holdover": iid_state.get("sh"),
+                "sync_last_updated": iid_state.get("lu"),
+            })
+            if go_sync is not None:
+                self._go_sync_states_by_iid[iid] = go_sync
+                self._adopt_go_frame_sync_locked(iid, go_sync)
+            else:
+                self._go_sync_states_by_iid.pop(iid, None)
 
     def _stage3_detection_from_go_observation(self, entry: dict) -> Stage3LiveDetection:
         return Stage3LiveDetection(
@@ -6957,6 +7025,9 @@ class RadarState:
             if iid in self._go_sync_states_by_iid:
                 del self._go_sync_states_by_iid[iid]
                 had_any = True
+            if iid in self._go_iid_state_revision:
+                del self._go_iid_state_revision[iid]
+                had_any = True
             if iid in self._go_reference_aircraft_by_iid:
                 del self._go_reference_aircraft_by_iid[iid]
                 had_any = True
@@ -7077,6 +7148,7 @@ class RadarState:
             self._go_sweep_frames_by_iid.clear()
             self._go_sweep_frames_revision.clear()
             self._go_sync_states_by_iid.clear()
+            self._go_iid_state_revision.clear()
             self._go_reference_aircraft_by_iid.clear()
             self._go_track_observations.clear()
             self._go_evidence_events.clear()

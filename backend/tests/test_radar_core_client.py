@@ -117,6 +117,39 @@ def test_radar_core_client_frame_ready_callback_and_stats():
     assert client.stats()["frames_received"] == 1
 
 
+def test_radar_core_client_iid_state_callback_and_stats():
+    states: list[dict] = []
+    client = RadarCoreClient("/tmp/unused-radar-core.sock", on_iid_state=states.append)
+
+    msg = {
+        "t": P.MSG_IID_STATE,
+        "i": 2,
+        "st": "SINGLE_RADAR",
+        "p": 4.0,
+        "sq": 0.9,
+        "sp": True,
+        "su": True,
+        "sps": 4.0,
+        "sep": 12345.0,
+        "sod": 15.0,
+        "sj": 2.5,
+        "sre": 4.0,
+        "slr": 1.5,
+        "snf": 6,
+        "snr": 1,
+        "sh": False,
+        "nb": 10,
+        "lu": 1000.0,
+        "rv": 3,
+    }
+    client._handle_outbound(msg)
+
+    assert states == [msg]
+    stats = client.stats()
+    assert stats["iid_states_received"] == 1
+    assert stats["callback_errors"] == 0
+
+
 def test_radar_core_client_records_snapshot_response_in_stats():
     client = RadarCoreClient("/tmp/unused-radar-core.sock")
     client._handle_outbound({

@@ -2727,135 +2727,84 @@ def test_radar_core_frames_enabled_suppresses_python_fm_mailbox_injection():
     assert state.claim_pending_fm_frames() == []
 
 
-def test_radar_core_frame_injection_bootstraps_live_sync_state_when_missing():
+def test_go_iid_state_bootstraps_live_sync_state_when_missing():
     state = RadarState()
     state.enable_radar_core_frames(True)
-    state._models[63] = RadarIID(
-        iid=63,
-        status="SINGLE_RADAR",
-        period_s=4.0,
-        fm_lat=51.0,
-        fm_lon=-1.0,
-    )
-
-    state.inject_frame_from_go({
-        "t": 11,
+    state.update_go_iid_state({
+        "t": 12,
         "i": 63,
-        "fi": 4,
+        "st": "SINGLE_RADAR",
         "p": 4.0,
-        "rc": 0xAAAAAA,
-        "rla": 51.2,
-        "rlo": -1.2,
-        "ra": 500_000.0,
-        "rpa": 0.5,  # explicit fresh age required for 3-aircraft frame to seed sync
-        "obs": [
-            {"c": 0xBBBBBB, "la": 51.3, "lo": -1.3, "a": 500_500.0, "n": 2, "pa": 0.3},
-            {"c": 0xCCCCCC, "la": 51.4, "lo": -1.4, "a": 501_000.0, "n": 2, "pa": 0.4},
-        ],
-        "q": "marginal",
+        "sq": 1.0,
+        "sp": True,
+        "su": True,
+        "sps": 4.0,
+        "sep": 500_000.0,
+        "sod": 12.0,
+        "sj": 3.0,
+        "sre": 5.0,
+        "slr": 0.0,
+        "snf": 1,
+        "snr": 0,
+        "sh": False,
+        "lu": 1_000.0,
+        "rv": 1,
     })
 
     sync = state.get_live_sync_state(63)
     assert sync is not None
     assert sync.usable is True
-    assert sync.source == "sweep_frame"
+    assert sync.source == "sweep_frame_go"
+    assert sync.phase_epoch_us == pytest.approx(500_000.0)
+    assert sync.phase_offset_deg == pytest.approx(12.0)
     debug = state.get_live_pipeline_debug(63)
     assert debug["sync_state_present"] is True
-    assert debug["go_frames_injected_count"] == 1
-    assert debug["completed_frame_count"] == 1
+    assert state.get_go_live_sync_state(63)["phase_epoch_us"] == pytest.approx(500_000.0)
 
 
-# --- Fix 2: ref_pos_age_s propagation from Go frames ---
-
-def _make_base_radar_state_for_age_tests():
-    """Return a RadarState seeded with a SINGLE_RADAR model for IID 77 at a known position."""
+def _make_base_radar_state_for_go_sync_seed_tests():
     state = RadarState()
-    from radar.models import RadarIID, RotationModel
-    period = 4.0
-    model = RadarIID(iid=77)
-    model.status = "SINGLE_RADAR"
-    model.period_s = period
-    rot = RotationModel()
-    rot.status = "SINGLE_RADAR"
-    rot.dominant_period_s = period
-    model.rotation_model = rot
-    model.lat = 51.0
-    model.lon = -1.0
-    model.cep_m = 1000.0
-    state._models[77] = model
+    state._models[77] = RadarIID(iid=77, status="SINGLE_RADAR", period_s=4.0)
     return state
 
 
-def test_inject_frame_from_go_3aircraft_fresh_age_seeds_sync():
-    """A 3-aircraft Go frame with rpa <= 2.0 must be eligible to seed sync."""
-    state = _make_base_radar_state_for_age_tests()
-
-    state.inject_frame_from_go({
-        "i": 77,
-        "p": 4.0,
-        "rc": 0xAAAAAA,
-        "rla": 51.2,
-        "rlo": -1.2,
-        "ra": 1_000_000.0,
-        "rpa": 1.5,  # fresh — within 2.0s threshold
-        "obs": [
-            {"c": 0xBBBBBB, "la": 51.3, "lo": -1.3, "a": 1_500_000.0, "n": 2, "pa": 0.5},
-            {"c": 0xCCCCCC, "la": 51.4, "lo": -1.4, "a": 2_000_000.0, "n": 2, "pa": 0.6},
-        ],
-        "q": "marginal",
-    })
-
-    sync = state.get_live_sync_state(77)
-    assert sync is not None, "3-aircraft frame with fresh rpa should seed sync"
-
-
-def test_inject_frame_from_go_3aircraft_missing_age_does_not_seed_sync():
-    """A 3-aircraft Go frame without rpa (unknown age) must not seed sync via the
-    freshness shortcut — only 4+ aircraft frames are eligible when age is unknown."""
-    state = _make_base_radar_state_for_age_tests()
-
-    state.inject_frame_from_go({
-        "i": 77,
-        "p": 4.0,
-        "rc": 0xAAAAAA,
-        "rla": 51.2,
-        "rlo": -1.2,
-        "ra": 1_000_000.0,
-        # "rpa" deliberately absent — unknown age
-        "obs": [
-            {"c": 0xBBBBBB, "la": 51.3, "lo": -1.3, "a": 1_500_000.0, "n": 2, "pa": 0.5},
-            {"c": 0xCCCCCC, "la": 51.4, "lo": -1.4, "a": 2_000_000.0, "n": 2, "pa": 0.6},
-        ],
-        "q": "marginal",
-    })
-
-    sync = state.get_live_sync_state(77)
-    assert sync is None, (
-        "3-aircraft frame with unknown rpa must NOT seed sync (freshness shortcut "
-        "should not fire when age is unknown)"
+def test_go_iid_state_does_not_override_multi_aircraft_sync_state():
+    state = _make_base_radar_state_for_go_sync_seed_tests()
+    state._live_sync_states[77] = LiveSyncState(
+        iid=77,
+        period_s=4.0,
+        phase_epoch_us=123.0,
+        phase_offset_deg=45.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=900.0,
+        source="multi_aircraft_burst",
+        usable=True,
     )
 
-
-def test_inject_frame_from_go_4aircraft_no_rpa_seeds_sync():
-    """A 4-aircraft Go frame with no rpa must still seed sync (4-aircraft path
-    does not require ref position freshness)."""
-    state = _make_base_radar_state_for_age_tests()
-
-    state.inject_frame_from_go({
+    state.update_go_iid_state({
+        "t": 12,
         "i": 77,
+        "st": "SINGLE_RADAR",
         "p": 4.0,
-        "rc": 0xAAAAAA,
-        "rla": 51.2,
-        "rlo": -1.2,
-        "ra": 1_000_000.0,
-        # no "rpa"
-        "obs": [
-            {"c": 0xBBBBBB, "la": 51.3, "lo": -1.3, "a": 1_500_000.0, "n": 2, "pa": 0.5},
-            {"c": 0xCCCCCC, "la": 51.4, "lo": -1.4, "a": 2_000_000.0, "n": 2, "pa": 0.6},
-            {"c": 0xDDDDDD, "la": 51.5, "lo": -1.5, "a": 2_500_000.0, "n": 2, "pa": 0.7},
-        ],
-        "q": "good",
+        "sq": 0.8,
+        "sp": True,
+        "su": True,
+        "sps": 4.0,
+        "sep": 999_000.0,
+        "sod": 10.0,
+        "sj": 4.0,
+        "sre": 6.0,
+        "slr": 1.0,
+        "snf": 5,
+        "snr": 1,
+        "sh": False,
+        "lu": 1_001.0,
+        "rv": 2,
     })
 
     sync = state.get_live_sync_state(77)
-    assert sync is not None, "4-aircraft frame without rpa must still seed sync"
+    assert sync is not None
+    assert sync.source == "multi_aircraft_burst"
+    assert sync.phase_epoch_us == pytest.approx(123.0)
+    assert state.get_go_live_sync_state(77)["phase_epoch_us"] == pytest.approx(999_000.0)

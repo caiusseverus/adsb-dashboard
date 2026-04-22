@@ -64,6 +64,7 @@ class RadarCoreClient:
         socket_path: str,
         on_burst_fired: Optional[Callable[[dict], None]] = None,
         on_frame_ready: Optional[Callable[[dict], None]] = None,
+        on_iid_state: Optional[Callable[[dict], None]] = None,
         on_fm_frame_result: Optional[Callable[[dict], None]] = None,
         on_fm_state: Optional[Callable[[dict], None]] = None,
         on_snapshot: Optional[Callable[[dict], None]] = None,
@@ -73,6 +74,7 @@ class RadarCoreClient:
         self._socket_path = socket_path
         self._on_burst_fired = on_burst_fired
         self._on_frame_ready = on_frame_ready
+        self._on_iid_state = on_iid_state
         self._on_fm_frame_result = on_fm_frame_result
         self._on_fm_state = on_fm_state
         self._on_snapshot = on_snapshot
@@ -98,6 +100,7 @@ class RadarCoreClient:
         self._events_dropped = 0
         self._bursts_received = 0
         self._frames_received = 0
+        self._iid_states_received = 0
         self._fm_frame_results_received = 0
         self._fm_states_received = 0
         self._callback_errors = 0
@@ -186,6 +189,7 @@ class RadarCoreClient:
                 "events_dropped": self._events_dropped,
                 "bursts_received": self._bursts_received,
                 "frames_received": self._frames_received,
+                "iid_states_received": self._iid_states_received,
                 "fm_frame_results_received": self._fm_frame_results_received,
                 "fm_states_received": self._fm_states_received,
                 "callback_errors": self._callback_errors,
@@ -408,6 +412,8 @@ class RadarCoreClient:
                 d.get("up", 0), d.get("ei", 0), d.get("bf", 0),
             )
         elif msg_type == P.MSG_IID_STATE:
+            with self._stats_lock:
+                self._iid_states_received += 1
             # Shadow-mode comparison logging for Stage 2/3 parity verification.
             log.debug(
                 "RadarCoreClient: IID_STATE iid=%d status=%s period_s=%s rpm=%s "
@@ -417,6 +423,13 @@ class RadarCoreClient:
                 f"{d['rpm']:.2f}" if d.get("rpm") is not None else "None",
                 d.get("sq", 0.0), d.get("nb", 0), d.get("rv", 0),
             )
+            if self._on_iid_state:
+                try:
+                    self._on_iid_state(d)
+                except Exception:
+                    with self._stats_lock:
+                        self._callback_errors += 1
+                    log.debug("RadarCoreClient: IID_STATE callback failed", exc_info=True)
         elif msg_type == P.MSG_FRAME_READY:
             with self._stats_lock:
                 self._frames_received += 1

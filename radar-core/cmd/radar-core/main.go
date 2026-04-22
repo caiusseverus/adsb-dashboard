@@ -207,6 +207,8 @@ func (e *engine) maybeUpdateSync(s *iid.IIDState, f *burst.FiredBurst) {
 
 	// phaseOffsetDeg = 0 until radar position is known (Stage 4+).
 	s.UpdateSyncEpoch(f.CentroidUS, 0.0, nAircraft, refPosAgeS)
+	snap := s.DebugStateSnapshot()
+	e.emitIIDState(s.IID, s, uint16(minInt(snap.BurstRecordsTotal, 65535)))
 }
 
 func (e *engine) emitBurstFired(s *iid.IIDState, f *burst.FiredBurst) {
@@ -434,8 +436,11 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 			"sync_quality":           snap.SyncQuality,
 			"sync_state_usable":      snap.SyncUsable,
 			"sync_period_s":          nil,
+			"sync_phase_epoch_us":    nil,
+			"sync_phase_offset_deg":  nil,
 			"sync_jitter_deg":        nil,
 			"sync_residual_ema_deg":  nil,
+			"sync_last_residual_deg": nil,
 			"sync_holdover":          snap.SyncHoldover,
 			"sync_n_frames":          snap.SyncNSyncFrames,
 			"sync_n_rejected_frames": snap.SyncNRejectedFrames,
@@ -464,8 +469,11 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 		}
 		if snap.SyncPresent {
 			iidPayload["sync_period_s"] = snap.SyncPeriodS
+			iidPayload["sync_phase_epoch_us"] = snap.SyncPhaseEpochUS
+			iidPayload["sync_phase_offset_deg"] = snap.SyncPhaseOffsetDeg
 			iidPayload["sync_jitter_deg"] = snap.SyncJitterDeg
 			iidPayload["sync_residual_ema_deg"] = snap.SyncResidualEMA
+			iidPayload["sync_last_residual_deg"] = snap.SyncLastResidualDeg
 			iidPayload["sync_last_updated"] = snap.SyncLastUpdatedUnix
 		}
 		stableIIDs[key] = rcexport.IIDSnapshot{
@@ -495,6 +503,20 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 				}
 				return nil
 			}(),
+			SyncPhaseEpochUS: func() *float64 {
+				if snap.SyncPresent {
+					v := snap.SyncPhaseEpochUS
+					return &v
+				}
+				return nil
+			}(),
+			SyncPhaseOffsetDeg: func() *float64 {
+				if snap.SyncPresent {
+					v := snap.SyncPhaseOffsetDeg
+					return &v
+				}
+				return nil
+			}(),
 			SyncJitterDeg: func() *float64 {
 				if snap.SyncPresent {
 					v := snap.SyncJitterDeg
@@ -505,6 +527,13 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 			SyncResidualEMADeg: func() *float64 {
 				if snap.SyncPresent {
 					v := snap.SyncResidualEMA
+					return &v
+				}
+				return nil
+			}(),
+			SyncLastResidualDeg: func() *float64 {
+				if snap.SyncPresent {
+					v := snap.SyncLastResidualDeg
 					return &v
 				}
 				return nil
@@ -643,6 +672,55 @@ func minInt(a, b int) int {
 	return b
 }
 
+func (e *engine) emitIIDState(iidNum uint8, s *iid.IIDState, nBurstRecords uint16) {
+	e.revisions[iidNum]++
+	rev := e.revisions[iidNum]
+
+	status, periodS, rpm, _ := s.Snapshot()
+	syncQuality, refICAO := s.SyncSnapshot()
+	syncPresent, syncUsable, syncPeriodS, syncPhaseEpochUS, syncPhaseOffsetDeg, syncJitterDeg, syncResidualEMA, syncLastResidual, syncNFrames, syncNRejected, syncHoldover := s.SyncProtocolSnapshot()
+
+	var rpmMsg *float32
+	if rpm != nil {
+		v := float32(*rpm)
+		rpmMsg = &v
+	}
+
+	msg := &protocol.IIDState{
+		MsgType:            protocol.MsgIIDState,
+		IID:                iidNum,
+		PeriodS:            periodS,
+		RPM:                rpmMsg,
+		Status:             status,
+		RefICAO:            refICAO,
+		SyncQuality:        syncQuality,
+		SyncStatePresent:   syncPresent,
+		SyncStateUsable:    syncUsable,
+		SyncPeriodS:        syncPeriodS,
+		SyncPhaseEpochUS:   syncPhaseEpochUS,
+		SyncPhaseOffsetDeg: syncPhaseOffsetDeg,
+		SyncJitterDeg:      syncJitterDeg,
+		SyncResidualEMA:    syncResidualEMA,
+		SyncLastResidual:   syncLastResidual,
+		SyncNFrames:        syncNFrames,
+		SyncNRejected:      syncNRejected,
+		SyncHoldover:       syncHoldover,
+		NBurstRecords:      nBurstRecords,
+		LastUpdated:        float64(time.Now().UnixMicro()) / 1e6,
+		Revision:           rev,
+	}
+	e.writer.SendIIDState(msg)
+
+	slog.Debug("radar-core: IID_STATE emitted",
+		"iid", iidNum,
+		"status", status,
+		"period_s", periodS,
+		"n_records", nBurstRecords,
+		"sync_present", syncPresent,
+		"revision", rev,
+	)
+}
+
 func (e *engine) runFMWorker(stop <-chan struct{}) {
 	for {
 		select {
@@ -692,39 +770,7 @@ func (e *engine) analyseAllIIDs() {
 		}
 		s.RefreshReference(records, nowUS)
 
-		e.revisions[iidNum]++
-		rev := e.revisions[iidNum]
-
-		status, periodS, rpm, _ := s.Snapshot()
-		syncQuality, refICAO := s.SyncSnapshot()
-
-		var rpmMsg *float32
-		if rpm != nil {
-			v := float32(*rpm)
-			rpmMsg = &v
-		}
-
-		msg := &protocol.IIDState{
-			MsgType:       protocol.MsgIIDState,
-			IID:           iidNum,
-			PeriodS:       periodS,
-			RPM:           rpmMsg,
-			Status:        status,
-			RefICAO:       refICAO,
-			SyncQuality:   syncQuality,
-			NBurstRecords: uint16(len(records)),
-			LastUpdated:   float64(time.Now().UnixMicro()) / 1e6,
-			Revision:      rev,
-		}
-		e.writer.SendIIDState(msg)
-
-		slog.Debug("radar-core: IID_STATE emitted",
-			"iid", iidNum,
-			"status", status,
-			"period_s", periodS,
-			"n_records", len(records),
-			"revision", rev,
-		)
+		e.emitIIDState(iidNum, s, uint16(minInt(len(records), 65535)))
 	}
 }
 

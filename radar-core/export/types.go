@@ -25,8 +25,11 @@ type IIDSnapshot struct {
 	SyncStateUsable     bool     `codec:"sync_state_usable" json:"sync_state_usable"`
 	SyncStatePresent    bool     `codec:"sync_state_present" json:"sync_state_present"`
 	SyncPeriodS         *float64 `codec:"sync_period_s" json:"sync_period_s"`
+	SyncPhaseEpochUS    *float64 `codec:"sync_phase_epoch_us" json:"sync_phase_epoch_us"`
+	SyncPhaseOffsetDeg  *float64 `codec:"sync_phase_offset_deg" json:"sync_phase_offset_deg"`
 	SyncJitterDeg       *float64 `codec:"sync_jitter_deg" json:"sync_jitter_deg"`
 	SyncResidualEMADeg  *float64 `codec:"sync_residual_ema_deg" json:"sync_residual_ema_deg"`
+	SyncLastResidualDeg *float64 `codec:"sync_last_residual_deg" json:"sync_last_residual_deg"`
 	SyncNFrames         int      `codec:"sync_n_frames" json:"sync_n_frames"`
 	SyncNRejectedFrames int      `codec:"sync_n_rejected_frames" json:"sync_n_rejected_frames"`
 	SyncHoldover        bool     `codec:"sync_holdover" json:"sync_holdover"`

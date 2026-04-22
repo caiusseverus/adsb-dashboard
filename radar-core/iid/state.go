@@ -71,8 +71,11 @@ type DebugSnapshot struct {
 	SyncQuality                     float64
 	SyncUsable                      bool
 	SyncPeriodS                     float64
+	SyncPhaseEpochUS                float64
+	SyncPhaseOffsetDeg              float64
 	SyncJitterDeg                   float64
 	SyncResidualEMA                 float64
+	SyncLastResidualDeg             float64
 	SyncHoldover                    bool
 	SyncNSyncFrames                 int
 	SyncNRejectedFrames             int
@@ -291,6 +294,57 @@ func (s *IIDState) SyncSnapshot() (quality float32, refICAO *uint32) {
 	return quality, s.RefICAO
 }
 
+// SyncProtocolSnapshot returns compact sync fields for protocol emission.
+func (s *IIDState) SyncProtocolSnapshot() (
+	present bool,
+	usable bool,
+	periodS *float64,
+	phaseEpochUS *float64,
+	phaseOffsetDeg *float64,
+	jitterDeg *float32,
+	residualEMA *float32,
+	lastResidual *float32,
+	nFrames uint16,
+	nRejected uint16,
+	holdover bool,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Sync == nil {
+		return false, false, nil, nil, nil, nil, nil, nil, 0, 0, false
+	}
+	present = true
+	usable = s.Sync.SyncQuality >= 0.3 && !s.Sync.Holdover
+	holdover = s.Sync.Holdover
+	periodValue := s.Sync.PeriodS
+	phaseEpochValue := s.Sync.PhaseEpochUS
+	phaseOffsetValue := s.Sync.PhaseOffsetDeg
+	jitterValue := float32(s.Sync.SyncJitterDeg)
+	residualEMAValue := float32(s.Sync.ResidualEMA)
+	lastResidualValue := float32(s.Sync.LastResidualDeg)
+	periodS = &periodValue
+	phaseEpochUS = &phaseEpochValue
+	phaseOffsetDeg = &phaseOffsetValue
+	jitterDeg = &jitterValue
+	residualEMA = &residualEMAValue
+	lastResidual = &lastResidualValue
+	if s.Sync.NSyncFrames > 0 {
+		if s.Sync.NSyncFrames > math.MaxUint16 {
+			nFrames = math.MaxUint16
+		} else {
+			nFrames = uint16(s.Sync.NSyncFrames)
+		}
+	}
+	if s.Sync.NRejectedFrames > 0 {
+		if s.Sync.NRejectedFrames > math.MaxUint16 {
+			nRejected = math.MaxUint16
+		} else {
+			nRejected = uint16(s.Sync.NRejectedFrames)
+		}
+	}
+	return
+}
+
 // Snapshot returns a safe copy of the current reinforced state.
 func (s *IIDState) Snapshot() (status string, periodS *float64, rpm *float64, support int) {
 	s.mu.Lock()
@@ -317,8 +371,11 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.SyncPresent = true
 		out.SyncQuality = s.Sync.SyncQuality
 		out.SyncPeriodS = s.Sync.PeriodS
+		out.SyncPhaseEpochUS = s.Sync.PhaseEpochUS
+		out.SyncPhaseOffsetDeg = s.Sync.PhaseOffsetDeg
 		out.SyncJitterDeg = s.Sync.SyncJitterDeg
 		out.SyncResidualEMA = s.Sync.ResidualEMA
+		out.SyncLastResidualDeg = s.Sync.LastResidualDeg
 		out.SyncHoldover = s.Sync.Holdover
 		out.SyncNSyncFrames = s.Sync.NSyncFrames
 		out.SyncNRejectedFrames = s.Sync.NRejectedFrames
