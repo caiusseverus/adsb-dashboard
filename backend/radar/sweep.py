@@ -539,6 +539,7 @@ def _assess_period_failure_mode(
     *,
     recent_obs_count: int,
     n_rejected: int,
+    recent_icao_count: int,
     fit_support_count: int,
     fit_contributing_icao_count: int,
     period_update_block_reason: str | None,
@@ -589,28 +590,43 @@ def _assess_period_failure_mode(
         repeatability=phase_shape["cycle_to_cycle_repeatability"],
     )
 
-    triggered_conditions: list[str] = []
+    primary_conditions: list[str] = []
+    secondary_conditions: list[str] = []
     if recent_obs_count > 0 and n_rejected >= max(4, recent_obs_count * 0.4):
-        triggered_conditions.append("high_rejected_fraction")
+        primary_conditions.append("high_rejected_fraction")
     if fit_support_count < 6:
-        triggered_conditions.append("low_fit_support")
+        primary_conditions.append("low_fit_support")
     if fit_contributing_icao_count < 2:
-        triggered_conditions.append("single_icao_fit")
+        primary_conditions.append("single_icao_fit")
+    if fit_span_s < max(2.0 * period_s, 0.0):
+        primary_conditions.append("short_fit_span")
     if period_update_block_reason == "slope_not_persistent":
-        triggered_conditions.append("slope_not_persistent")
-    if abs(float(phase_correction_deg or 0.0)) > 20.0:
-        triggered_conditions.append("large_phase_correction")
+        primary_conditions.append("slope_not_persistent")
     if (
         raw_median_abs is not None
         and raw_median_abs > 12.0
         and detrended_improvement_ratio is not None
         and detrended_improvement_ratio < 0.2
     ):
-        triggered_conditions.append("weak_detrending_improvement")
+        primary_conditions.append("weak_detrending_improvement")
+    if error_mode["dominant_error_mode"] == "mixed":
+        primary_conditions.append(f"error_mode_{error_mode['dominant_error_mode']}")
+    elif (
+        error_mode["dominant_error_mode"] == "unstable_cycle_shape"
+        and recent_icao_count >= 2
+        and (
+            "weak_detrending_improvement" in primary_conditions
+            or (recent_obs_count > 0 and n_rejected >= max(3, recent_obs_count * 0.25))
+            or fit_support_count < 6
+        )
+    ):
+        primary_conditions.append(f"error_mode_{error_mode['dominant_error_mode']}")
     if phase_validation_status == "population_disagrees":
-        triggered_conditions.append("population_disagrees")
+        secondary_conditions.append("population_disagrees")
     if str(phase_anchor_status or "").startswith("fallback_"):
-        triggered_conditions.append("fallback_anchor")
+        secondary_conditions.append("fallback_anchor")
+    if abs(float(phase_correction_deg or 0.0)) > 20.0:
+        secondary_conditions.append("large_phase_correction")
 
     dominant_fit_reject_reason = None
     if fit_reject_reasons:
@@ -618,28 +634,76 @@ def _assess_period_failure_mode(
             fit_reject_reasons.items(),
             key=lambda item: item[1],
         )[0]
+        if dominant_fit_reject_reason in {
+            "residual_gate",
+            "zero_weight",
+            "poor_icao_quality",
+            "near_wrap_residual",
+        }:
+            primary_conditions.append(f"dominant_fit_reject_{dominant_fit_reject_reason}")
 
-    immediate_reacquire = (
-        (recent_obs_count > 0 and (n_rejected / recent_obs_count) > 0.6 and fit_contributing_icao_count < 2)
-        or (
-            phase_validation_status == "population_disagrees"
-            and phase_validation_contributors <= 0
-        )
+    # A single-aircraft anchor-only correction path is primarily an absolute
+    # branch problem, not evidence that the period family is wrong.
+    if (
+        recent_icao_count < 2
+        and phase_validation_status == "anchor_only"
+        and phase_anchor_status in {"anchor_only", "selected"}
+        and error_mode["dominant_error_mode"] == "unstable_cycle_shape"
+    ):
+        primary_conditions = [
+            condition for condition in primary_conditions
+            if condition not in {
+                "high_rejected_fraction",
+                "low_fit_support",
+                "single_icao_fit",
+                "short_fit_span",
+            }
+        ]
+
+    primary_condition_count = len(set(primary_conditions))
+    secondary_condition_count = len(set(secondary_conditions))
+    severe_primary_failure = (
+        recent_obs_count > 0
+        and (n_rejected / recent_obs_count) > 0.6
+        and (fit_contributing_icao_count < 2 or fit_support_count < 4)
+        and error_mode["dominant_error_mode"] != "unstable_cycle_shape"
     )
-    wrong_period_suspect = len(triggered_conditions) >= 2 or immediate_reacquire
+    severe_combined_failure = (
+        severe_primary_failure
+        and phase_validation_status == "population_disagrees"
+        and phase_validation_contributors <= 0
+    )
+    immediate_reacquire = severe_primary_failure or severe_combined_failure
+    wrong_period_suspect = (
+        primary_condition_count >= 2
+        or (primary_condition_count >= 1 and secondary_condition_count >= 1)
+        or immediate_reacquire
+    )
 
-    failure_score = float(len(triggered_conditions))
+    failure_primary_class = "clean"
+    if primary_condition_count >= 1:
+        failure_primary_class = "period_family"
+        if (
+            secondary_condition_count >= 1
+            and phase_validation_status == "population_disagrees"
+            and phase_validation_contributors <= 0
+        ):
+            failure_primary_class = "combined"
+    elif secondary_condition_count >= 1:
+        failure_primary_class = "anchor_branch"
+
+    failure_score = float(primary_condition_count)
+    failure_score += 0.35 * secondary_condition_count
     if immediate_reacquire:
         failure_score += 2.0
     if dominant_fit_reject_reason == "residual_gate":
         failure_score += 0.5
-    if error_mode["dominant_error_mode"] in {"mixed", "unstable_cycle_shape"}:
-        failure_score += 0.5
-
-    if immediate_reacquire and phase_validation_status == "population_disagrees" and phase_validation_contributors <= 0:
-        failure_reason = "population_disagreement_no_validation_support"
-    elif triggered_conditions:
-        failure_reason = ",".join(triggered_conditions[:3])
+    if failure_primary_class == "combined":
+        failure_reason = ",".join((list(dict.fromkeys(primary_conditions + secondary_conditions)))[:3])
+    elif failure_primary_class == "period_family":
+        failure_reason = ",".join((list(dict.fromkeys(primary_conditions)))[:3])
+    elif failure_primary_class == "anchor_branch":
+        failure_reason = ",".join((list(dict.fromkeys(secondary_conditions)))[:3])
     else:
         failure_reason = "clean"
 
@@ -648,7 +712,9 @@ def _assess_period_failure_mode(
         "immediate_reacquire": immediate_reacquire,
         "failure_score": failure_score,
         "failure_reason": failure_reason,
-        "triggered_conditions": triggered_conditions,
+        "failure_primary_class": failure_primary_class,
+        "primary_conditions": list(dict.fromkeys(primary_conditions)),
+        "secondary_conditions": list(dict.fromkeys(secondary_conditions)),
         "raw_residual_stats": raw_stats,
         "detrended_residual_stats": detrended_stats,
         "raw_median_abs_residual_deg": raw_median_abs,
@@ -659,6 +725,41 @@ def _assess_period_failure_mode(
         "fit_reject_reasons": dict(fit_reject_reasons or {}),
         "phase_shape_diagnostics": phase_shape,
         "error_mode": error_mode,
+    }
+
+
+def _assess_anchor_failure_mode(
+    *,
+    phase_anchor_status: str | None,
+    phase_validation_status: str | None,
+    phase_validation_contributors: int,
+    phase_validation_reject_count: int,
+    phase_correction_deg: float | None,
+) -> dict:
+    """Assess whether the current issue is primarily absolute branch/anchor related."""
+    conditions: list[str] = []
+    if str(phase_anchor_status or "").startswith("fallback_"):
+        conditions.append("fallback_anchor")
+    if phase_anchor_status == "population_veto":
+        conditions.append("population_veto")
+    if phase_validation_status == "population_disagrees":
+        conditions.append("population_disagrees")
+    if phase_validation_status == "population_disagrees" and phase_validation_contributors <= 0:
+        conditions.append("no_validation_support")
+    if phase_validation_reject_count >= 2:
+        conditions.append("multiple_validation_rejects")
+    if abs(float(phase_correction_deg or 0.0)) > 20.0:
+        conditions.append("large_phase_correction")
+
+    return {
+        "anchor_branch_suspect": bool(conditions),
+        "anchor_failure_reason": ",".join(conditions[:3]) if conditions else "clean",
+        "anchor_conditions": conditions,
+        "severe_anchor_failure": (
+            phase_validation_status == "population_disagrees"
+            and phase_validation_contributors <= 0
+            and phase_validation_reject_count >= 2
+        ),
     }
 
 
@@ -1124,6 +1225,10 @@ class LiveSyncState:
     period_reacquire_started_ts: float | None = None
     period_refine_mode: str = "normal"
     period_authoritative_source: str = "refined"
+    period_failure_primary_class: str = "clean"
+    period_reacquire_trigger: str | None = None
+    period_recovery_clean_update: bool = False
+    period_recovery_clean_streak: int = 0
 
 
 @_dataclass
@@ -3712,6 +3817,10 @@ class RadarState:
                 period_reacquire_started_ts=None,
                 period_refine_mode="normal",
                 period_authoritative_source="refined",
+                period_failure_primary_class="clean",
+                period_reacquire_trigger=None,
+                period_recovery_clean_update=False,
+                period_recovery_clean_streak=0,
             )
             return
 
@@ -3839,6 +3948,10 @@ class RadarState:
             period_reacquire_started_ts=existing.period_reacquire_started_ts,
             period_refine_mode=existing.period_refine_mode,
             period_authoritative_source=existing.period_authoritative_source,
+            period_failure_primary_class=existing.period_failure_primary_class,
+            period_reacquire_trigger=existing.period_reacquire_trigger,
+            period_recovery_clean_update=existing.period_recovery_clean_update,
+            period_recovery_clean_streak=existing.period_recovery_clean_streak,
         )
 
     def _record_live_burst_detection(
@@ -4835,18 +4948,22 @@ class RadarState:
             _PERIOD_PPM_FROM_BASE_STRONG_MAX
             if adaptive_period_clamp else _PERIOD_PPM_FROM_BASE_MAX
         )
+        freeze_period_refine = bool(existing.period_reacquire_active)
         # persistent_slope is now a hard gate on any period update, not just
         # the strong-clamp path.  Without a persistent smoothed slope the period
         # holds its current value even if the raw fit shows a non-zero slope.
         refine_ok = (
             bool(RADAR_SYNC_PERIOD_REFINE_ENABLED)
+            and not freeze_period_refine
             and not majority_rejected
             and len(fit_scored) >= _PERIOD_REFINE_MIN_INLIERS
             and len(fit_contributing_icaos) >= 2
             and span_s >= _PERIOD_REFINE_MIN_SPAN_ROT * live_period_s
             and persistent_slope
         )
-        if not RADAR_SYNC_PERIOD_REFINE_ENABLED:
+        if freeze_period_refine:
+            period_update_block_reason = "reacquire_active"
+        elif not RADAR_SYNC_PERIOD_REFINE_ENABLED:
             period_update_block_reason = "disabled"
         elif majority_rejected:
             period_update_block_reason = "majority_rejected"
@@ -4916,6 +5033,7 @@ class RadarState:
         period_failure = _assess_period_failure_mode(
             recent_obs_count=len(recent_obs),
             n_rejected=n_rejected,
+            recent_icao_count=len({e["icao"] for e in scored}),
             fit_support_count=len(fit_scored),
             fit_contributing_icao_count=len(fit_contributing_icaos),
             period_update_block_reason=period_update_block_reason,
@@ -4931,6 +5049,13 @@ class RadarState:
             fit_span_s=span_s,
             period_s=live_period_s,
         )
+        anchor_failure = _assess_anchor_failure_mode(
+            phase_anchor_status=phase_anchor_status,
+            phase_validation_status=validation["status"],
+            phase_validation_contributors=validation["contributor_count"],
+            phase_validation_reject_count=validation["reject_count"],
+            phase_correction_deg=phase_correction,
+        )
         wrong_period_suspect = bool(period_failure["wrong_period_suspect"])
         period_failure_streak = existing.period_failure_streak + 1 if wrong_period_suspect else 0
         clean_reacquire_update = (
@@ -4938,18 +5063,21 @@ class RadarState:
             and (n_rejected / len(recent_obs)) < 0.25
             and len(fit_scored) >= 6
             and len(fit_contributing_icaos) >= 2
-            and (period_failure["raw_median_abs_residual_deg"] or 999.0) <= 8.0
+            and (period_failure["detrended_median_abs_residual_deg"] or 999.0) <= 8.0
             and validation["status"] != "population_disagrees"
         )
         reacquire_active = bool(existing.period_reacquire_active)
         reacquire_reason = existing.period_reacquire_reason
         reacquire_started_ts = existing.period_reacquire_started_ts
+        period_reacquire_trigger = existing.period_reacquire_trigger
         period_refine_mode = "suspect" if wrong_period_suspect else "normal"
         period_authoritative_source = "refined"
+        period_failure_primary_class = period_failure["failure_primary_class"]
         clean_reacquire_streak = 0
         if wrong_period_suspect:
             self._live_period_clean_update_streak[iid] = 0
 
+        enter_reacquire = False
         if reacquire_active:
             if clean_reacquire_update:
                 clean_reacquire_streak = self._live_period_clean_update_streak.get(iid, 0) + 1
@@ -4958,6 +5086,7 @@ class RadarState:
                     reacquire_active = False
                     reacquire_reason = None
                     reacquire_started_ts = None
+                    period_reacquire_trigger = None
                     period_refine_mode = "normal"
                     period_authoritative_source = "refined"
                     period_failure_streak = 0
@@ -4972,7 +5101,22 @@ class RadarState:
                 period_authoritative_source = "base"
                 if wrong_period_suspect:
                     reacquire_reason = period_failure["failure_reason"]
-        elif period_failure_streak >= 3 or period_failure["immediate_reacquire"]:
+        else:
+            severe_combined_failure = (
+                period_failure["failure_primary_class"] == "combined"
+                and anchor_failure["severe_anchor_failure"]
+                and wrong_period_suspect
+            )
+            if period_failure_streak >= 3:
+                enter_reacquire = True
+                period_reacquire_trigger = "persistent_period_family_failure"
+            elif period_failure["immediate_reacquire"]:
+                enter_reacquire = True
+                period_reacquire_trigger = "severe_period_family_failure"
+            elif severe_combined_failure:
+                enter_reacquire = True
+                period_reacquire_trigger = "severe_combined_failure"
+        if enter_reacquire:
             reacquire_active = True
             reacquire_reason = period_failure["failure_reason"]
             reacquire_started_ts = now_ts
@@ -4981,10 +5125,33 @@ class RadarState:
             self._live_period_clean_update_streak[iid] = 0
         if reacquire_active:
             refined_period_s = base_period_s if base_period_s > 0 else live_period_s
+            period_update_allowed = False
+            period_update_term = 0.0
+            period_update_applied = 0.0
+            period_update_direction = "none"
+            period_update_ppm_unclamped = 0.0
+            period_update_ppm_applied = 0.0
+            period_update_block_reason = "reacquire_active"
+            period_refine_block_reason = "reacquire_active"
+            period_update_clamp_reason = None
+            period_correction_status = _classify_period_correction_status(
+                False,
+                period_update_block_reason,
+                None,
+                0.0,
+                0.0,
+                b_fit,
+                len(fit_scored),
+                len(recent_obs),
+                span_s,
+            )
             period_correction_ppm = (
                 (refined_period_s - base_period_s) / base_period_s * 1e6
                 if base_period_s > 0 else 0.0
             )
+        elif anchor_failure["anchor_branch_suspect"] and period_failure_primary_class == "clean":
+            period_failure_primary_class = "anchor_branch"
+            period_refine_mode = "normal"
 
         # Waveform bin learning: slow EMA of detrended residuals keyed by
         # phase-in-rotation.  Period refinement sees long-term drift first;
@@ -5238,6 +5405,10 @@ class RadarState:
             period_reacquire_started_ts=reacquire_started_ts,
             period_refine_mode=period_refine_mode,
             period_authoritative_source=period_authoritative_source,
+            period_failure_primary_class=period_failure_primary_class,
+            period_reacquire_trigger=period_reacquire_trigger,
+            period_recovery_clean_update=clean_reacquire_update,
+            period_recovery_clean_streak=clean_reacquire_streak,
         )
         self._live_sync_states[iid] = new_state
 
@@ -5290,13 +5461,17 @@ class RadarState:
             "period_reacquire_started_ts": reacquire_started_ts,
             "period_wrong_family_suspect": wrong_period_suspect,
             "period_failure_reason": period_failure["failure_reason"],
-            "period_failure_conditions": list(period_failure["triggered_conditions"]),
+            "period_failure_primary_class": period_failure_primary_class,
+            "period_failure_conditions": list(period_failure["primary_conditions"]),
+            "period_failure_secondary_conditions": list(period_failure["secondary_conditions"]),
             "raw_median_abs_residual_deg": period_failure["raw_median_abs_residual_deg"],
             "detrended_median_abs_residual_deg": period_failure["detrended_median_abs_residual_deg"],
             "detrended_improvement_ratio": period_failure["detrended_improvement_ratio"],
             "dominant_error_mode": period_failure["dominant_error_mode"],
-            "clean_reacquire_update": clean_reacquire_update,
-            "clean_reacquire_streak": clean_reacquire_streak,
+            "period_anchor_failure_reason": anchor_failure["anchor_failure_reason"],
+            "period_reacquire_trigger": period_reacquire_trigger,
+            "period_recovery_clean_update": clean_reacquire_update,
+            "period_recovery_clean_streak": clean_reacquire_streak,
         }
         self._live_period_update_history.setdefault(iid, deque(maxlen=80)).append(update_entry)
         self._live_slope_history.setdefault(iid, deque(maxlen=80)).append({
@@ -8030,6 +8205,10 @@ class RadarState:
             "period_failure_streak": getattr(sync, "period_failure_streak", None),
             "period_reacquire_active": getattr(sync, "period_reacquire_active", None),
             "period_reacquire_reason": getattr(sync, "period_reacquire_reason", None),
+            "period_failure_primary_class": getattr(sync, "period_failure_primary_class", None),
+            "period_reacquire_trigger": getattr(sync, "period_reacquire_trigger", None),
+            "period_recovery_clean_update": getattr(sync, "period_recovery_clean_update", None),
+            "period_recovery_clean_streak": getattr(sync, "period_recovery_clean_streak", None),
             "current_slope_deg_per_s": getattr(sync, "residual_slope_deg_per_s", None),
             "fit_slope_deg_per_s": fit_slope_deg_per_s,
             "fit_time_origin_beast_us": fit_time_origin_beast_us,

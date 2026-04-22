@@ -1,5 +1,27 @@
 # Deficiency Rectification Plan
 
+## 2026-04-22 Wrong-Period Reacquire Refinement Follow-Up
+
+- [x] Re-inspect the current period-failure detector, reacquire recovery gate, and refine-freeze behavior in `backend/radar/sweep.py`
+- [x] Separate period-family failure assessment from anchor/branch disagreement and make the state-machine transitions explicit
+- [x] Change reacquire recovery to use detrended median absolute residual and freeze refined-period updates while reacquire is active
+- [x] Expose clearer debug/history fields for primary failure class, reacquire trigger, and recovery-clean streak
+- [x] Add focused backend tests proving anchor-only disagreement does not force period fallback, true period-family failure does, recovery uses detrended residual, reacquire freezes refinement, and healthy refinement stays normal
+- [x] Run targeted backend verification and record results
+
+Plan confirmation: keep the change local to the live refined sync path and authoritative-period selection. Period fallback should represent period-family failure or severe combined failure, not ordinary anchor disagreement, and reacquire should freeze the refined period until clean detrended evidence shows recovery.
+
+### Review
+
+- Refined [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) so `_assess_period_failure_mode(...)` now classifies period-family evidence primarily from fit quality, rejection structure, detrending quality, and error mode, while `_assess_anchor_failure_mode(...)` tracks anchor/branch problems separately.
+- `_update_multi_aircraft_sync_state()` now computes period-family and anchor assessments separately, applies explicit `normal` / `suspect` / `reacquire` transitions, and records `period_failure_primary_class`, `period_reacquire_trigger`, `period_recovery_clean_update`, and `period_recovery_clean_streak`.
+- Reacquire recovery now keys off detrended median absolute residual (`<= 8 deg`) rather than raw residual, and active reacquire freezes refinement with `period_update_block_reason = "reacquire_active"` while keeping stored/effective `period_s` pinned to `period_base_s`.
+- Added focused regressions in [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) covering anchor-only disagreement without fallback, true period-family reacquire, detrended-residual recovery, frozen refinement during reacquire, payload exposure, and healthy normal refinement.
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest tests/test_radar_api.py -k 'sync_snapshot or sync_debug'`
+  - Result: `73 passed` in `tests/test_radar_sweep.py`; `3 passed` selected sync API tests in `tests/test_radar_api.py`.
+
 ## 2026-04-22 Wrong-Period Reacquire for Refined Live Sync
 
 - [x] Inspect the current refined sync failure diagnostics and authoritative period-selection path in `backend/radar/sweep.py`
