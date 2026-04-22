@@ -9835,6 +9835,28 @@ class RadarState:
         """Return a snapshot of all current live sync states."""
         return dict(self._live_sync_states)
 
+    def get_stage3_live_sync_state(self, iid: int) -> LiveSyncState | None:
+        """Return the Stage 3-authoritative sync state for one IID.
+
+        Stage 3 aircraft localisation remains logically separate from the
+        earlier radar-localisation stages. Only the richer
+        `multi_aircraft_burst` sync model is eligible Stage 3 input; earlier
+        bootstrap sources such as `sweep_frame_go` remain available through the
+        general live-sync getters but are intentionally excluded here.
+        """
+        sync = self._live_sync_states.get(iid)
+        if sync is None or sync.source != "multi_aircraft_burst":
+            return None
+        return sync
+
+    def get_all_stage3_live_sync_states(self) -> dict[int, LiveSyncState]:
+        """Return a snapshot of Stage 3-authoritative sync states only."""
+        return {
+            iid: sync
+            for iid, sync in self._live_sync_states.items()
+            if sync.source == "multi_aircraft_burst"
+        }
+
     def get_go_live_sync_state(self, iid: int) -> dict | None:
         """Return the compact mirrored Go sync state for one IID, or None."""
         state = self._go_sync_states_by_iid.get(iid)

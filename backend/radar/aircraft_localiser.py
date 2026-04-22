@@ -1077,7 +1077,7 @@ class AircraftLocaliser:
             cals = dict(self._calibrations)
 
         all_obs: list[RadarBearingObservation] = []
-        sync_states = self._radar_state.get_all_live_sync_states()
+        sync_states = self._radar_state.get_all_stage3_live_sync_states()
 
         for iid, auth, _ in self.get_eligible_iids():
             if iid_subset is not None and iid not in iid_subset:
@@ -1206,7 +1206,7 @@ class AircraftLocaliser:
         with self._lock:
             cals = dict(self._calibrations)
 
-        sync_states = self._radar_state.get_all_live_sync_states()
+        sync_states = self._radar_state.get_all_stage3_live_sync_states()
         eligible = self.get_eligible_iids()
 
         accepted: list[RadarBearingObservation] = []

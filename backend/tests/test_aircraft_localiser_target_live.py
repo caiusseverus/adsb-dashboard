@@ -27,6 +27,7 @@ from radar.aircraft_localiser import (
     REASON_BEARING_TRUTH_MISMATCH,
     REASON_NO_FORWARD_INTERSECTIONS,
     REASON_NO_ELIGIBLE_RADARS,
+    REASON_NO_SYNC,
     REASON_STALE_OBSERVATION,
     REASON_SYNC_QUALITY_LOW,
     _ray_intersection_enu,
@@ -117,6 +118,19 @@ class FakeRadarState:
 
     def get_live_sync_state(self, iid):
         return self._syncs.get(iid)
+
+    def get_all_stage3_live_sync_states(self):
+        return {
+            iid: sync
+            for iid, sync in self._syncs.items()
+            if getattr(sync, "source", None) == "multi_aircraft_burst"
+        }
+
+    def get_stage3_live_sync_state(self, iid):
+        sync = self._syncs.get(iid)
+        if sync is None or getattr(sync, "source", None) != "multi_aircraft_burst":
+            return None
+        return sync
 
     def get_live_waveform_bins(self, iid):
         return []
@@ -231,6 +245,23 @@ def test_one_observation_per_radar_newest_wins():
     assert by_iid[1].arrival_us == 999_999_999.0
     assert by_iid[2].arrival_us == 888_888_888.0
     assert sel["per_radar_reasons"] == {}
+
+
+def test_stage3_selection_ignores_go_frame_sync_states():
+    now = __import__("time").time()
+    models = {1: _radar_iid(lat=51.05, lon=-1.05)}
+    syncs = {1: _sync(1, source="sweep_frame_go")}
+    det_by_icao = {
+        "ABC": [
+            _det(1, "ABC", now - 0.5, arrival_us=999_999.0),
+        ],
+    }
+    loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
+
+    sel = loc.select_authoritative_observations("ABC", None, now)
+
+    assert sel["accepted"] == []
+    assert sel["per_radar_reasons"][1] == REASON_NO_SYNC
 
 
 def test_stale_observation_produces_rejected_ray_not_accepted():

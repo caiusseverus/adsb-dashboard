@@ -210,6 +210,36 @@ Plan confirmation: move the read-side diagnostics boundary first, not the full s
   - Python still owns the actual `multi_aircraft_burst` sync refinement update loop, anchor selection, waveform learning, and Stage 3-trusted rich sync state.
   - Go-owned sync reads are now cheaper and more honest about what state exists, but the authoritative multi-aircraft sync solver boundary has not moved yet.
 
+## 2026-04-22 Go Radar Engine Migration Slice 7
+
+- [x] Add explicit Stage 3 sync accessors that expose only `multi_aircraft_burst` sync authority from `RadarState`
+- [x] Switch operational aircraft-localiser selection/build paths to use Stage 3-specific sync accessors instead of the mixed live-sync map
+- [x] Keep general live-sync getters unchanged for radar/operator diagnostics so earlier-stage Go frame-sync state remains inspectable outside Stage 3
+- [x] Add focused tests proving Stage 3 selection ignores `sweep_frame_go` sync state while the normal authoritative live-ray path still works
+- [x] Run targeted verification and record the slice review
+
+Plan confirmation: tighten the Stage 3 boundary before moving more solver logic. The localiser should not iterate over earlier-stage Go frame-sync bootstrap state at all; it should consume only the later multi-aircraft sync model that Stage 3 already treats as authoritative. This preserves the project’s explicit separation between Stage 3 aircraft localisation and the earlier radar-localisation stages.
+
+### Review
+
+- Added explicit Stage 3 sync accessors in [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py):
+  - `get_stage3_live_sync_state(iid)`
+  - `get_all_stage3_live_sync_states()`
+- Those accessors intentionally expose only `LiveSyncState(source="multi_aircraft_burst")`. Earlier-stage sync sources such as `sweep_frame_go` remain available through the existing general live-sync getters for radar diagnostics, but are excluded from Stage 3.
+- Updated [backend/radar/aircraft_localiser.py](/home/keith/claude/adsb-dashboard/backend/radar/aircraft_localiser.py) so the operational live-observation builders and authoritative observation selector now read from `get_all_stage3_live_sync_states()` rather than the mixed `get_all_live_sync_states()` map.
+- This change does not move the multi-aircraft solver into Go yet, but it removes Stage 3’s residual coupling to earlier-stage Go frame-sync bootstrap state and makes the ownership boundary explicit in code.
+- Added focused coverage in [backend/tests/test_aircraft_localiser_target_live.py](/home/keith/claude/adsb-dashboard/backend/tests/test_aircraft_localiser_target_live.py) proving:
+  - ordinary authoritative live-ray selection still works
+  - stale observation rejection still works
+  - `sweep_frame_go` sync is ignored by Stage 3 selection and produces `REASON_NO_SYNC`
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/radar/aircraft_localiser.py backend/tests/test_aircraft_localiser_target_live.py`
+  - `uv run --directory backend pytest tests/test_aircraft_localiser_target_live.py -k 'one_observation_per_radar_newest_wins or stage3_selection_ignores_go_frame_sync_states or stale_observation_produces_rejected_ray_not_accepted or display_set_matches_solver_input_set'`
+  - Result: targeted Stage 3 localiser tests passed (`4 passed`).
+- Remaining migration scope after this slice:
+  - Python still owns `_update_multi_aircraft_sync_state()` and all anchor/waveform/period-refine mutation logic.
+  - Stage 3 is now better isolated from earlier-stage sync sources, but the actual multi-aircraft sync solver boundary has not moved to Go yet.
+
 ## 2026-04-22 Wrong-Period Reacquire Refinement Follow-Up
 
 - [x] Re-inspect the current period-failure detector, reacquire recovery gate, and refine-freeze behavior in `backend/radar/sweep.py`
