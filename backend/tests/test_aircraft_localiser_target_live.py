@@ -135,6 +135,12 @@ class FakeRadarState:
     def get_live_waveform_bins(self, iid):
         return []
 
+    def get_stage3_live_waveform_bins(self, iid):
+        sync = self._syncs.get(iid)
+        if sync is None or getattr(sync, "source", None) != "multi_aircraft_burst":
+            return []
+        return []
+
     def get_recent_live_detections_for_icao(self, icao, max_age_s: float = 30.0):
         # Newest-first, matching the real implementation.
         dets = list(self._detections.get(icao, []))
@@ -236,7 +242,8 @@ def test_one_observation_per_radar_newest_wins():
             _det(2, "ABC", now - 1.0, arrival_us=888_888_888.0),
         ],
     }
-    loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
+    radar_state = FakeRadarState(models, syncs, det_by_icao)
+    loc = _make_localiser(radar_state)
 
     sel = loc.select_authoritative_observations("ABC", None, now)
     accepted = sel["accepted"]
@@ -256,12 +263,14 @@ def test_stage3_selection_ignores_go_frame_sync_states():
             _det(1, "ABC", now - 0.5, arrival_us=999_999.0),
         ],
     }
-    loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
+    radar_state = FakeRadarState(models, syncs, det_by_icao)
+    loc = _make_localiser(radar_state)
 
     sel = loc.select_authoritative_observations("ABC", None, now)
 
     assert sel["accepted"] == []
-    assert sel["per_radar_reasons"][1] == REASON_NO_SYNC
+    assert sel["per_radar_reasons"][1] == REASON_ABSOLUTE_PHASE_UNTRUSTED
+    assert radar_state.get_stage3_live_waveform_bins(1) == []
 
 
 def test_stale_observation_produces_rejected_ray_not_accepted():

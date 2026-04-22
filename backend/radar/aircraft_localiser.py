@@ -1048,7 +1048,7 @@ class AircraftLocaliser:
             return []
 
         obs_out: list[RadarBearingObservation] = []
-        waveform_bins = self._radar_state.get_live_waveform_bins(iid)
+        waveform_bins = self._radar_state.get_stage3_live_waveform_bins(iid)
         for det in detections:
             ob = self._bearing_from_live_detection(
                 det, sync_state, radar_lat, radar_lon, calibration, waveform_bins,
@@ -1207,6 +1207,7 @@ class AircraftLocaliser:
             cals = dict(self._calibrations)
 
         sync_states = self._radar_state.get_all_stage3_live_sync_states()
+        all_sync_states = self._radar_state.get_all_live_sync_states()
         eligible = self.get_eligible_iids()
 
         accepted: list[RadarBearingObservation] = []
@@ -1224,7 +1225,13 @@ class AircraftLocaliser:
 
             sync_state = sync_states.get(iid)
             if sync_state is None:
-                per_radar_reasons[iid] = REASON_NO_SYNC
+                raw_sync_state = all_sync_states.get(iid)
+                if raw_sync_state is None or raw_sync_state.period_s <= 0:
+                    per_radar_reasons[iid] = REASON_NO_SYNC
+                elif not raw_sync_state.usable:
+                    per_radar_reasons[iid] = REASON_SYNC_QUALITY_LOW
+                else:
+                    per_radar_reasons[iid] = REASON_ABSOLUTE_PHASE_UNTRUSTED
                 continue
             if not sync_state.usable:
                 per_radar_reasons[iid] = REASON_SYNC_QUALITY_LOW
@@ -1264,7 +1271,7 @@ class AircraftLocaliser:
             # the jitter here: clamping it down to the calibration sigma would
             # systematically under-estimate uncertainty when sync jitter is the
             # dominant term.  Shared sync state is never mutated.
-            waveform_bins = self._radar_state.get_live_waveform_bins(iid)
+            waveform_bins = self._radar_state.get_stage3_live_waveform_bins(iid)
 
             if chosen is None:
                 per_radar_reasons[iid] = REASON_STALE_OBSERVATION

@@ -16,6 +16,10 @@ from radar.sweep import (
     LiveSyncState,
     RadarState,
     WaveformBin,
+    _icao_quality_anchor_warning,
+    _icao_quality_reject_reason,
+    _icao_quality_memory_score,
+    _update_icao_sync_quality_memory,
     predict_sync_observation,
     _reinforce_radar_characteristics,
     detect_bursts,
@@ -135,6 +139,32 @@ def test_reinforce_radar_characteristics_builds_long_term_primary_and_secondary_
     assert iid_model.secondary_support_count == 0
     assert iid_model.status == "LIKELY_SINGLE"
     assert iid_model.multi_radar_flag is False
+
+
+def test_icao_quality_memory_helpers_keep_warning_and_reject_thresholds_aligned():
+    quality = IcaoSyncQuality(
+        residual_median_deg=50.0,
+        residual_mad_deg=26.0,
+        n_recent=6,
+        last_ts=1000.0,
+    )
+    quality_dict = {"AAAAAA": quality}
+    scored = [{
+        "residual": 6.0,
+        "weight": 1.0,
+        "status": "inlier",
+        "icao": "AAAAAA",
+        "obs_ts": 1001.0,
+    }]
+
+    assert _icao_quality_memory_score(quality) == pytest.approx(0.0)
+    assert _icao_quality_reject_reason(quality) == "poor_icao_quality"
+    assert _icao_quality_anchor_warning(quality) == "poor_icao_quality_memory"
+
+    _update_icao_sync_quality_memory(quality_dict, scored)
+
+    assert quality_dict["AAAAAA"].n_recent == 7
+    assert quality_dict["AAAAAA"].last_ts == pytest.approx(1001.0)
 
 
 def test_reinforce_radar_characteristics_ignores_tentative_secondary_family():
@@ -1639,6 +1669,68 @@ def test_phase_anchor_uses_population_only_as_small_validation_nudge(monkeypatch
     assert sync.phase_validation_contributors == 1
     assert sync.phase_validation_median_error_deg == pytest.approx(8.0)
     assert sync.phase_offset_deg == pytest.approx(25.2)
+
+
+def test_resolve_phase_anchor_state_population_veto_keeps_mixed_fallback(monkeypatch):
+    state = RadarState()
+    existing = LiveSyncState(
+        iid=7,
+        period_s=10.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=15.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=10.0,
+        phase_anchor_icao="OLD111",
+        phase_anchor_since_ts=900.0,
+    )
+    selection = {
+        "selected": {"icao": "NEW222", "score": 88.0},
+        "candidates": [{"icao": "NEW222", "score": 88.0, "status": "selected"}],
+        "replacement_reason": "better_candidate",
+    }
+    solution = {
+        "obs_count": 4,
+        "offset_raw_deg": 120.0,
+        "offset_smoothed_deg": 102.0,
+        "spread_deg": 3.5,
+        "delta_from_existing_deg": 20.0,
+    }
+    veto = {
+        "contributors": [],
+        "rejected": [{"icao": "BBBBBB", "error_deg": 60.0}, {"icao": "CCCCCC", "error_deg": -58.0}],
+        "contributor_count": 0,
+        "reject_count": 2,
+        "median_error_deg": None,
+        "nudge_deg": 2.0,
+        "status": "population_disagrees",
+    }
+
+    monkeypatch.setattr(state, "_select_phase_anchor_aircraft", lambda **_: selection)
+    monkeypatch.setattr(state, "_solve_phase_anchor_from_icao", lambda *args, **kwargs: solution)
+    monkeypatch.setattr(state, "_validate_phase_anchor_against_population", lambda *args, **kwargs: veto)
+
+    resolved = state._resolve_phase_anchor_state(
+        iid=7,
+        scored=[],
+        existing=existing,
+        epoch_us=40_000_000.0,
+        now_ts=1_000.0,
+        mixed_fallback_offset=47.0,
+    )
+
+    assert resolved["offset_deg"] == pytest.approx(47.0)
+    assert resolved["phase_anchor_icao"] == "NEW222"
+    assert resolved["phase_anchor_status"] == "population_veto"
+    assert resolved["phase_anchor_replacement_reason"] == "population_veto"
+    assert resolved["phase_anchor_since_ts"] == pytest.approx(1_000.0)
+    assert resolved["phase_anchor_offset_raw_deg"] == pytest.approx(120.0)
+    assert resolved["phase_anchor_offset_smoothed_deg"] == pytest.approx(102.0)
+    assert resolved["phase_anchor_obs_count"] == 4
+    assert resolved["validation"] == veto
 
 
 def test_period_fit_rejects_large_residuals_without_hiding_timeline(monkeypatch):

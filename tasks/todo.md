@@ -294,6 +294,60 @@ Plan confirmation: move the retained multi-aircraft sync observation input buffe
   - Python still owns the actual multi-aircraft sync solver implementation in `_update_multi_aircraft_sync_state()`.
   - The next substantial boundary is to move parts of that solver logic itself, especially anchor selection / period fit / waveform learning state mutation, into Go with exported parity.
 
+## 2026-04-22 Go Radar Engine Migration Slice 10
+
+- [x] Extract per-ICAO sync quality memory scoring and update logic behind explicit helpers in `backend/radar/sweep.py`
+- [x] Switch multi-aircraft fit scoring, anchor candidate scoring, and sync-debug payload generation to use the shared helpers instead of duplicating inline threshold logic
+- [x] Keep behaviour stable while making the per-ICAO quality state a clearer ownership unit for a later Go port
+- [x] Add focused regression coverage for the extracted quality-memory helpers / behaviour
+- [x] Record the slice review and remaining solver-side migration scope
+
+Plan confirmation: take a solver-side cleanup slice that isolates one mutable sub-state rather than trying to move the whole multi-aircraft sync solver in one jump. Per-ICAO residual quality memory is a good boundary because it is used by fit weighting, anchor selection, and diagnostics, but can be centralised without changing the broader solver contract.
+
+### Review
+
+- Added explicit helpers in [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) for the per-ICAO residual quality memory sub-state:
+  - `_icao_quality_memory_score(...)`
+  - `_icao_quality_reject_reason(...)`
+  - `_icao_quality_anchor_warning(...)`
+  - `_update_icao_sync_quality_memory(...)`
+- Switched the multi-aircraft solver path to use those helpers instead of repeating quality-memory threshold logic inline:
+  - fit scoring / reject gating in `_update_multi_aircraft_sync_state()`
+  - anchor candidate warning and score calculation in `_select_phase_anchor_aircraft()`
+  - sync timeline/debug payload fit-reject reporting
+- This did not change the solver boundary yet, but it isolated one mutable sub-state that is currently shared across fit weighting, anchor selection, and diagnostics. That makes the later Go port cleaner because the quality-memory rules now live behind one small API surface instead of being reimplemented at each call site.
+- Added focused coverage in [backend/tests/test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) proving the extracted helper thresholds stay aligned, and kept the existing anchor-quality regression green.
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -k 'icao_quality_memory_helpers_keep_warning_and_reject_thresholds_aligned or phase_anchor_quality_memory_is_warning_not_hard_reject or go_aligned_burst_sync_snapshot_rebuilds_sync_driving_observations'`
+  - Result: targeted sweep tests passed (`3 passed`).
+- Remaining migration scope after this slice:
+  - Python still owns the broader multi-aircraft sync solver state machine in `_update_multi_aircraft_sync_state()`.
+  - The next substantial solver-side boundary is still anchor selection / absolute-phase solve and then period-refinement / waveform-learning state mutation.
+
+## 2026-04-22 Go Radar Engine Migration Slice 11
+
+- [x] Extract the absolute-phase anchor select/solve/validate branch in `backend/radar/sweep.py` behind a single helper boundary
+- [x] Keep the surrounding period-fit / reacquire logic unchanged while making `_update_multi_aircraft_sync_state()` consume one resolved anchor result object
+- [x] Add focused regression coverage for the extracted anchor-resolution fallback/veto path
+- [x] Run targeted verification and record the slice review
+
+Plan confirmation: move the absolute-phase anchor branch into one explicit unit before attempting any Go port of solver internals. This keeps Stage 3 separation intact and reduces `_update_multi_aircraft_sync_state()` to consuming a stable anchor-resolution result instead of owning the select/solve/validate/fallback flow inline.
+
+### Review
+
+- Added `_resolve_phase_anchor_state(...)` to [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) so absolute-phase anchor candidate selection, per-aircraft anchor solve, population validation, veto handling, and fallback-offset choice now live behind one helper boundary.
+- Simplified `_update_multi_aircraft_sync_state()` to call that helper and consume a single anchor-resolution object while leaving the surrounding period-fit, reacquire, waveform, and quality-memory logic unchanged.
+- This does not move anchor logic into Go yet, but it creates the coherent ownership unit needed for that later port: one input surface (`iid`, scored observations, existing state, epoch/fallback context) and one resolved output surface (selected anchor metadata, validation result, final offset choice).
+- Added focused regression coverage in [backend/tests/test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) proving the extracted helper preserves the population-veto fallback path.
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -k 'resolve_phase_anchor_state_population_veto_keeps_mixed_fallback or phase_anchor_quality_memory_is_warning_not_hard_reject or phase_anchor_uses_population_only_as_small_validation_nudge'`
+  - Result: targeted sweep tests passed (`3 passed`).
+- Remaining migration scope after this slice:
+  - Python still owns period refinement, reacquire state transitions, waveform learning, and the broader multi-aircraft sync state machine.
+  - The next substantial solver-side boundary is period-fit / reacquire mutation, followed by waveform-learning state mutation.
+
 ## 2026-04-22 Wrong-Period Reacquire Refinement Follow-Up
 
 - [x] Re-inspect the current period-failure detector, reacquire recovery gate, and refine-freeze behavior in `backend/radar/sweep.py`

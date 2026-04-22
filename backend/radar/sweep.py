@@ -1119,6 +1119,67 @@ class IcaoSyncQuality:
     last_ts: float = 0.0
 
 
+def _icao_quality_memory_score(entry: IcaoSyncQuality | None) -> float:
+    """Return a 0-1 quality multiplier derived from residual spread memory."""
+    if entry is None:
+        return 1.0
+    return max(0.0, min(1.0, 1.0 - entry.residual_mad_deg / 25.0))
+
+
+def _icao_quality_reject_reason(entry: IcaoSyncQuality | None) -> str | None:
+    """Return the hard-reject reason for poor ICAO quality memory, if any."""
+    if entry is None or entry.n_recent < 6:
+        return None
+    if entry.residual_mad_deg > 25.0 or abs(entry.residual_median_deg) > 45.0:
+        return "poor_icao_quality"
+    return None
+
+
+def _icao_quality_anchor_warning(entry: IcaoSyncQuality | None) -> str | None:
+    """Return the anchor-selection warning for degraded ICAO quality memory, if any."""
+    if entry is None or entry.n_recent < 6:
+        return None
+    if entry.residual_mad_deg > 25.0 or abs(entry.residual_median_deg) > 60.0:
+        return "poor_icao_quality_memory"
+    return None
+
+
+def _update_icao_sync_quality_memory(
+    quality_dict: dict[str, IcaoSyncQuality],
+    scored: list[dict],
+) -> None:
+    """Update per-ICAO residual quality memory from scored sync observations."""
+    quality_alpha = 0.1
+    for entry in scored:
+        residual_c = entry["residual"]
+        weight = entry["weight"]
+        status = entry["status"]
+        icao = entry["icao"]
+        ts_obs = entry["obs_ts"]
+        if weight <= 0 or status == "rejected":
+            continue
+        q_entry = quality_dict.get(icao)
+        if q_entry is None:
+            quality_dict[icao] = IcaoSyncQuality(
+                residual_median_deg=residual_c,
+                residual_mad_deg=abs(residual_c),
+                n_recent=1,
+                last_ts=ts_obs,
+            )
+            continue
+        q_entry.residual_median_deg = (
+            (1.0 - quality_alpha) * q_entry.residual_median_deg
+            + quality_alpha * residual_c
+        )
+        dev = abs(residual_c - q_entry.residual_median_deg)
+        q_entry.residual_mad_deg = (
+            (1.0 - quality_alpha) * q_entry.residual_mad_deg
+            + quality_alpha * dev
+        )
+        q_entry.n_recent += 1
+        q_entry.last_ts = ts_obs
+
+
 @_dataclass
 class LiveSyncState:
     """Per-IID live synchronisation state for Stage 3 bearing computation.
@@ -4823,18 +4884,15 @@ class RadarState:
                 reject_reasons.append("stale_anchor_observations")
             elif last_age_s > 12.0:
                 warning_reasons.append("anchor_observations_aging")
-            if q_entry is not None and q_entry.n_recent >= 6 and (
-                q_entry.residual_mad_deg > 25.0 or abs(q_entry.residual_median_deg) > 60.0
-            ):
-                warning_reasons.append("poor_icao_quality_memory")
+            quality_warning = _icao_quality_anchor_warning(q_entry)
+            if quality_warning is not None:
+                warning_reasons.append(quality_warning)
 
             count_score = min(count / 8.0, 1.0)
             spread_score = 0.0 if spread is None else max(0.0, min(1.0, 1.0 - spread / 30.0))
             age_score = 0.5 if median_pos_age is None else max(0.0, min(1.0, 1.0 - median_pos_age / 15.0))
             signal_score = 0.6 if mean_signal is None else max(0.0, min(1.0, (mean_signal + 50.0) / 35.0))
-            quality_score = 1.0
-            if q_mad is not None:
-                quality_score = max(0.0, min(1.0, 1.0 - q_mad / 25.0))
+            quality_score = _icao_quality_memory_score(q_entry)
             score = 100.0 * (
                 0.28 * count_score
                 + 0.30 * spread_score
@@ -5043,6 +5101,104 @@ class RadarState:
             "status": status,
         }
 
+    def _resolve_phase_anchor_state(
+        self,
+        iid: int,
+        scored: list[dict],
+        existing: LiveSyncState,
+        epoch_us: float,
+        now_ts: float,
+        mixed_fallback_offset: float,
+    ) -> dict:
+        """Resolve absolute-phase anchor selection, solve, and validation.
+
+        This keeps the absolute-phase branch as one coherent unit separate from
+        the broader multi-aircraft period-fit state machine.
+        """
+        anchor_selection = self._select_phase_anchor_aircraft(
+            iid=iid,
+            scored=scored,
+            existing=existing,
+            epoch_us=epoch_us,
+            now_ts=now_ts,
+        )
+        selected_anchor = anchor_selection.get("selected")
+        anchor_solution = None
+        validation = {
+            "contributors": [],
+            "rejected": [],
+            "contributor_count": 0,
+            "reject_count": 0,
+            "median_error_deg": None,
+            "nudge_deg": 0.0,
+            "status": "unavailable",
+        }
+        phase_anchor_status = "fallback_mixed"
+        phase_anchor_icao = existing.phase_anchor_icao
+        phase_anchor_score = 0.0
+        phase_anchor_obs_count = 0
+        phase_anchor_raw = None
+        phase_anchor_smoothed = None
+        phase_anchor_spread = None
+        phase_anchor_since_ts = existing.phase_anchor_since_ts
+        phase_anchor_replacement_reason = anchor_selection.get("replacement_reason")
+        new_offset = mixed_fallback_offset
+
+        if selected_anchor is not None:
+            phase_anchor_icao = selected_anchor["icao"]
+            anchor_solution = self._solve_phase_anchor_from_icao(
+                phase_anchor_icao,
+                scored,
+                existing,
+                epoch_us,
+            )
+            if anchor_solution is not None:
+                phase_anchor_score = selected_anchor["score"]
+                phase_anchor_obs_count = anchor_solution["obs_count"]
+                phase_anchor_raw = anchor_solution["offset_raw_deg"]
+                phase_anchor_smoothed = anchor_solution["offset_smoothed_deg"]
+                phase_anchor_spread = anchor_solution["spread_deg"]
+                if existing.phase_anchor_icao != phase_anchor_icao or existing.phase_anchor_since_ts is None:
+                    phase_anchor_since_ts = now_ts
+                validation = self._validate_phase_anchor_against_population(
+                    phase_anchor_icao,
+                    phase_anchor_raw,
+                    scored,
+                    existing,
+                    epoch_us,
+                )
+                if (
+                    validation["status"] == "population_disagrees"
+                    and validation["reject_count"] >= 2
+                    and validation["contributor_count"] == 0
+                ):
+                    phase_anchor_status = "population_veto"
+                    phase_anchor_replacement_reason = "population_veto"
+                    new_offset = mixed_fallback_offset
+                else:
+                    new_offset = (phase_anchor_smoothed + validation["nudge_deg"]) % 360.0
+                    phase_anchor_status = "selected" if validation["status"] != "anchor_only" else "anchor_only"
+            else:
+                phase_anchor_status = "fallback_mixed_anchor_solve_failed"
+                phase_anchor_replacement_reason = "anchor_solve_failed"
+
+        return {
+            "anchor_selection": anchor_selection,
+            "selected_anchor": selected_anchor,
+            "anchor_solution": anchor_solution,
+            "validation": validation,
+            "offset_deg": new_offset,
+            "phase_anchor_icao": phase_anchor_icao,
+            "phase_anchor_score": phase_anchor_score,
+            "phase_anchor_obs_count": phase_anchor_obs_count,
+            "phase_anchor_offset_raw_deg": phase_anchor_raw,
+            "phase_anchor_offset_smoothed_deg": phase_anchor_smoothed,
+            "phase_anchor_spread_deg": phase_anchor_spread,
+            "phase_anchor_status": phase_anchor_status,
+            "phase_anchor_since_ts": phase_anchor_since_ts,
+            "phase_anchor_replacement_reason": phase_anchor_replacement_reason,
+        }
+
     def _update_multi_aircraft_sync_state(
         self,
         iid: int,
@@ -5170,12 +5326,10 @@ class RadarState:
             base_w = self._score_sync_burst_observation(obs)
             # Per-ICAO quality downweight: noisy aircraft get smaller influence.
             q_entry = icao_quality.get(obs.icao)
-            q_reject = None
+            q_reject = _icao_quality_reject_reason(q_entry)
             if q_entry is not None:
                 mad = max(q_entry.residual_mad_deg, 0.5)
                 q_multiplier = max(0.1, min(1.0, 1.0 / (1.0 + mad / 3.0)))
-                if q_entry.n_recent >= 6 and (q_entry.residual_mad_deg > 25.0 or abs(q_entry.residual_median_deg) > 45.0):
-                    q_reject = "poor_icao_quality"
             else:
                 q_multiplier = 1.0
             if status == "rejected":
@@ -5297,71 +5451,27 @@ class RadarState:
             + existing.phase_offset_deg
         ) % 360.0
         mixed_fallback_offset = (existing_at_new + limited_correction) % 360.0
-        anchor_selection = self._select_phase_anchor_aircraft(
+        anchor_resolution = self._resolve_phase_anchor_state(
             iid=iid,
             scored=scored,
             existing=existing,
-            epoch_us=new_epoch_us,
             now_ts=now_ts,
+            epoch_us=new_epoch_us,
+            mixed_fallback_offset=mixed_fallback_offset,
         )
-        selected_anchor = anchor_selection.get("selected")
-        anchor_solution = None
-        validation = {
-            "contributors": [],
-            "rejected": [],
-            "contributor_count": 0,
-            "reject_count": 0,
-            "median_error_deg": None,
-            "nudge_deg": 0.0,
-            "status": "unavailable",
-        }
-        phase_anchor_status = "fallback_mixed"
-        phase_anchor_icao = existing.phase_anchor_icao
-        phase_anchor_score = 0.0
-        phase_anchor_obs_count = 0
-        phase_anchor_raw = None
-        phase_anchor_smoothed = None
-        phase_anchor_spread = None
-        phase_anchor_since_ts = existing.phase_anchor_since_ts
-        phase_anchor_replacement_reason = anchor_selection.get("replacement_reason")
-        new_offset = mixed_fallback_offset
-        if selected_anchor is not None:
-            phase_anchor_icao = selected_anchor["icao"]
-            anchor_solution = self._solve_phase_anchor_from_icao(
-                phase_anchor_icao,
-                scored,
-                existing,
-                new_epoch_us,
-            )
-            if anchor_solution is not None:
-                phase_anchor_score = selected_anchor["score"]
-                phase_anchor_obs_count = anchor_solution["obs_count"]
-                phase_anchor_raw = anchor_solution["offset_raw_deg"]
-                phase_anchor_smoothed = anchor_solution["offset_smoothed_deg"]
-                phase_anchor_spread = anchor_solution["spread_deg"]
-                if existing.phase_anchor_icao != phase_anchor_icao or existing.phase_anchor_since_ts is None:
-                    phase_anchor_since_ts = now_ts
-                validation = self._validate_phase_anchor_against_population(
-                    phase_anchor_icao,
-                    phase_anchor_raw,
-                    scored,
-                    existing,
-                    new_epoch_us,
-                )
-                if (
-                    validation["status"] == "population_disagrees"
-                    and validation["reject_count"] >= 2
-                    and validation["contributor_count"] == 0
-                ):
-                    phase_anchor_status = "population_veto"
-                    phase_anchor_replacement_reason = "population_veto"
-                    new_offset = mixed_fallback_offset
-                else:
-                    new_offset = (phase_anchor_smoothed + validation["nudge_deg"]) % 360.0
-                    phase_anchor_status = "selected" if validation["status"] != "anchor_only" else "anchor_only"
-            else:
-                phase_anchor_status = "fallback_mixed_anchor_solve_failed"
-                phase_anchor_replacement_reason = "anchor_solve_failed"
+        anchor_selection = anchor_resolution["anchor_selection"]
+        anchor_solution = anchor_resolution["anchor_solution"]
+        validation = anchor_resolution["validation"]
+        new_offset = anchor_resolution["offset_deg"]
+        phase_anchor_icao = anchor_resolution["phase_anchor_icao"]
+        phase_anchor_score = anchor_resolution["phase_anchor_score"]
+        phase_anchor_obs_count = anchor_resolution["phase_anchor_obs_count"]
+        phase_anchor_raw = anchor_resolution["phase_anchor_offset_raw_deg"]
+        phase_anchor_smoothed = anchor_resolution["phase_anchor_offset_smoothed_deg"]
+        phase_anchor_spread = anchor_resolution["phase_anchor_spread_deg"]
+        phase_anchor_status = anchor_resolution["phase_anchor_status"]
+        phase_anchor_since_ts = anchor_resolution["phase_anchor_since_ts"]
+        phase_anchor_replacement_reason = anchor_resolution["phase_anchor_replacement_reason"]
         phase_correction = _circular_delta_deg(new_offset, existing_at_new) or 0.0
 
         # Live period refinement from slope.
@@ -5737,36 +5847,7 @@ class RadarState:
 
         # Per-ICAO quality memory update: EMA of signed residual (bias) and
         # |residual − bias| (spread).  Used as a downweight multiplier above.
-        _ICAO_QUALITY_ALPHA = 0.1
-        for e in scored:
-            residual_c = e["residual"]
-            w = e["weight"]
-            status = e["status"]
-            icao = e["icao"]
-            ts_obs = e["obs_ts"]
-            if w <= 0 or status == "rejected":
-                continue
-            q_entry = icao_quality.get(icao)
-            if q_entry is None:
-                q_entry = IcaoSyncQuality(
-                    residual_median_deg=residual_c,
-                    residual_mad_deg=abs(residual_c),
-                    n_recent=1,
-                    last_ts=ts_obs,
-                )
-                icao_quality[icao] = q_entry
-                continue
-            q_entry.residual_median_deg = (
-                (1.0 - _ICAO_QUALITY_ALPHA) * q_entry.residual_median_deg
-                + _ICAO_QUALITY_ALPHA * residual_c
-            )
-            dev = abs(residual_c - q_entry.residual_median_deg)
-            q_entry.residual_mad_deg = (
-                (1.0 - _ICAO_QUALITY_ALPHA) * q_entry.residual_mad_deg
-                + _ICAO_QUALITY_ALPHA * dev
-            )
-            q_entry.n_recent += 1
-            q_entry.last_ts = ts_obs
+        _update_icao_sync_quality_memory(icao_quality, scored)
 
         # Derive sync_jitter_deg from the spread of inlier residuals.
         # This ties jitter to actual recent behaviour rather than a fixed constant.
@@ -8038,10 +8119,8 @@ class RadarState:
                 fit_reject_reason = "residual_gate"
             elif obs.pos_age_s > 8.0:
                 fit_reject_reason = "stale_position"
-            elif q_entry is not None and q_entry.n_recent >= 6 and (
-                q_entry.residual_mad_deg > 25.0 or abs(q_entry.residual_median_deg) > 45.0
-            ):
-                fit_reject_reason = "poor_icao_quality"
+            elif _icao_quality_reject_reason(q_entry) is not None:
+                fit_reject_reason = _icao_quality_reject_reason(q_entry)
             elif classification == "rejected" or weight <= 0:
                 fit_reject_reason = "zero_weight"
             fit_eligible = fit_reject_reason is None
@@ -8524,10 +8603,8 @@ class RadarState:
                 fit_reject_reason = "residual_gate"
             elif obs.pos_age_s > 8.0:
                 fit_reject_reason = "stale_position"
-            elif q_entry is not None and q_entry.n_recent >= 6 and (
-                q_entry.residual_mad_deg > 25.0 or abs(q_entry.residual_median_deg) > 45.0
-            ):
-                fit_reject_reason = "poor_icao_quality"
+            elif _icao_quality_reject_reason(q_entry) is not None:
+                fit_reject_reason = _icao_quality_reject_reason(q_entry)
             elif classification == "rejected" or weight <= 0:
                 fit_reject_reason = "zero_weight"
 
