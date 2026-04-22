@@ -3130,3 +3130,26 @@ def test_reset_iid_clears_go_multi_sync_state():
 
     assert 5 not in state._go_multi_sync_states_by_iid
     assert 6 in state._go_multi_sync_states_by_iid  # unaffected IID
+
+
+def test_go_sync_burst_timeline_includes_python_waveform_bins():
+    """Compact Go sync timeline must include Python-learned waveform bins when present."""
+    state = RadarState()
+    state._live_sync_states[9] = LiveSyncState(
+        iid=9, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=0.0,
+        sync_quality=0.9, sync_jitter_deg=3.0, last_sync_update_ts=1_000.0,
+        source="go_multi_aircraft_burst", usable=True,
+    )
+    # Populate Python-learned waveform bins (24 bins).
+    from radar.sweep import WaveformBin
+    bins = [WaveformBin(correction_deg=float(i), weight=1.0, n=5) for i in range(24)]
+    state._live_waveform_bins[9] = bins
+
+    timeline = state.get_burst_sync_timeline(9, window_s=60.0)
+
+    # Waveform bins must be included even for the compact Go sync path.
+    waveform_bins = timeline.get("waveform_bins", [])
+    assert len(waveform_bins) == 24, f"expected 24 bins, got {len(waveform_bins)}"
+    # phase_center_deg should be (i + 0.5) * 15 for 24 bins.
+    assert waveform_bins[0]["phase_center_deg"] == pytest.approx(7.5)
+    assert waveform_bins[1]["correction_deg"] == pytest.approx(1.0)

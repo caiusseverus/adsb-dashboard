@@ -282,6 +282,23 @@ def _sync_source_has_rich_python_diagnostics(sync: "LiveSyncState | None") -> bo
     return bool(sync is not None and getattr(sync, "source", None) == "multi_aircraft_burst")
 
 
+def _serialise_waveform_bins(bins: list) -> list[dict]:
+    """Serialise a list of WaveformBin objects to JSON-safe dicts."""
+    n = len(bins)
+    if not n:
+        return []
+    bin_width = 360.0 / n
+    return [
+        {
+            "phase_center_deg": (i + 0.5) * bin_width,
+            "correction_deg": b.correction_deg,
+            "weight": b.weight,
+            "n": b.n,
+        }
+        for i, b in enumerate(bins)
+    ]
+
+
 def _classify_period_correction_status(
     allowed: bool,
     block_reason: str | None,
@@ -8020,7 +8037,7 @@ class RadarState:
                 "observations": [],
                 "sync_state": _live_sync_state_to_dict(sync) if sync else None,
                 "window_s": window_s,
-                "waveform_bins": [],
+                "waveform_bins": _serialise_waveform_bins(waveform_bins),
                 "per_icao_quality": [],
                 "period_update_history": update_history,
                 "slope_history": slope_history,
@@ -8062,7 +8079,7 @@ class RadarState:
 
             df11_residual_observations = self._build_df11_residual_observations(
                 sync=sync,
-                waveform_bins=[],
+                waveform_bins=waveform_bins,
                 iid_events=iid_events_for_df11,
                 latest_arrival_us=latest_arrival_us_for_iid,
             )
@@ -8071,7 +8088,7 @@ class RadarState:
                 "observations": entries,
                 "sync_state": _live_sync_state_to_dict(sync),
                 "window_s": window_s,
-                "waveform_bins": [],
+                "waveform_bins": _serialise_waveform_bins(waveform_bins),
                 "per_icao_quality": [],
                 "period_update_history": [],
                 "slope_history": [],
@@ -8249,18 +8266,7 @@ class RadarState:
             if e.get("motion_comp_improvement_deg") is not None
         ]
 
-        # Serialise waveform bins.
-        n_bins = len(waveform_bins)
-        bin_width = (360.0 / n_bins) if n_bins else 0.0
-        waveform_payload = [
-            {
-                "phase_center_deg": (i + 0.5) * bin_width,
-                "correction_deg": bin_entry.correction_deg,
-                "weight": bin_entry.weight,
-                "n": bin_entry.n,
-            }
-            for i, bin_entry in enumerate(waveform_bins)
-        ]
+        waveform_payload = _serialise_waveform_bins(waveform_bins)
 
         # Serialise per-ICAO quality memory.
         quality_payload = [

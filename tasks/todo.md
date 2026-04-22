@@ -1,5 +1,29 @@
 # Deficiency Rectification Plan
 
+## 2026-04-22 Go Radar Engine Migration Slice 14
+
+- [x] Extract inline waveform-bin serialization from `get_burst_sync_timeline()` rich path into a shared `_serialise_waveform_bins()` module-level helper
+- [x] Update the compact Go sync path in `get_burst_sync_timeline()` (both the early no-obs return and the compact branch return) to include Python-learned waveform bins via the shared helper
+- [x] Pass Python-learned waveform bins to `_build_df11_residual_observations()` in the compact path so DF11 residual observations also benefit from waveform correction when Go is authoritative
+- [x] Add a focused test proving waveform bins are included in the compact Go sync timeline output
+
+Plan confirmation: waveform bins learned by Python before Go took over sync authority are still valid. Serving them in the compact Go sync debug path gives operators visibility into the waveform shape without requiring Python to run its solver. This is a diagnostic improvement only — no behavior change to sync state or Stage 3.
+
+### Review
+
+- Extracted `_serialise_waveform_bins(bins)` as a module-level helper (replaces the inline waveform-bin serialization loop in the rich `get_burst_sync_timeline()` return).
+- Updated the compact Go sync return in `get_burst_sync_timeline()` to use `_serialise_waveform_bins(waveform_bins)` instead of `[]` — covers both the early no-observations return and the compact-path return.
+- Updated `_build_df11_residual_observations()` call in the compact path to pass `waveform_bins=waveform_bins` instead of `waveform_bins=[]`, so waveform correction is applied to DF11 residual observations even when Go owns sync.
+- Added `test_go_sync_burst_timeline_includes_python_waveform_bins` in `test_radar_sweep.py` proving 24 Python-learned bins appear in the compact timeline output with correct `phase_center_deg` and `correction_deg`.
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py` → OK
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_radar_core_client.py -q` → `137 passed`
+  - `go build ./... && go test ./...` in `radar-core/` → `86 tests passed`
+- Remaining migration scope after this slice:
+  - Python `_update_multi_aircraft_sync_state()` still exists as fallback for non-radar-core deployments.
+  - Waveform learning (the solver that updates `_live_waveform_bins`) is still Python-only. Bins are now served correctly in Go sync diagnostics, but no new bins are learned once Go takes over (since Python's solver is gated off).
+  - The primary remaining Python hot-path work in radar-core mode is `_on_df11_frame_builder()` running (most work gated off) and periodic `update_rotation_models()` for period estimation.
+
 ## 2026-04-22 Go Radar Engine Migration Slice 13
 
 - [x] Remove the Python-priority guard in `update_go_multi_sync_state()` so Go's fit immediately replaces Python's `multi_aircraft_burst` state once Go has a valid result
