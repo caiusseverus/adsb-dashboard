@@ -88,6 +88,8 @@ REASON_SOLVE_FAILED = "solve_failed"
 REASON_EXCESSIVE_UNCERTAINTY = "excessive_uncertainty"
 REASON_POOR_GEOMETRY = "poor_geometry"
 REASON_NO_ELIGIBLE_RADARS = "no_eligible_radars"
+REASON_ABSOLUTE_PHASE_UNTRUSTED = "absolute_phase_untrusted"
+REASON_BEARING_TRUTH_MISMATCH = "bearing_truth_mismatch"
 
 # Weight floor (prevents single observation from dominating)
 _MIN_OBS_WEIGHT = 0.01
@@ -1104,6 +1106,74 @@ class AircraftLocaliser:
         return all_obs
 
     # ------------------------------------------------------------------
+    # Phase-trust and bearing-sanity helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sync_state_has_trusted_absolute_phase(sync_state) -> bool:
+        """Return True iff sync_state carries a trustworthy absolute phase anchor."""
+        if sync_state.source != "multi_aircraft_burst":
+            return False
+        if sync_state.phase_anchor_status not in {"selected", "anchor_only"}:
+            return False
+        if sync_state.phase_anchor_icao is None:
+            return False
+        if sync_state.phase_validation_status == "population_disagrees":
+            return False
+        if (sync_state.phase_anchor_spread_deg is not None
+                and sync_state.phase_anchor_spread_deg > 25.0):
+            return False
+        if (sync_state.phase_validation_contributors > 0
+                and sync_state.phase_validation_median_error_deg is not None
+                and abs(sync_state.phase_validation_median_error_deg) > 20.0):
+            return False
+        return True
+
+    @staticmethod
+    def _bearing_matches_current_truth(
+        obs: "RadarBearingObservation",
+        detection,
+        radar_lat: float,
+        radar_lon: float,
+    ) -> bool:
+        """Return True iff the observed bearing is within 45° of the truth bearing.
+
+        Only applied when the detection carries a fresh (≤3 s) ADS-B position.
+        Returns True (pass) when truth is unavailable or stale so the gate is
+        strictly fail-closed on confirmed bad bearings, not on unknowns.
+        """
+        if (detection.truth_lat is None or detection.truth_lon is None
+                or detection.position_age_seconds is None
+                or detection.position_age_seconds > 3.0):
+            return True
+        true_bearing = _bearing_deg(radar_lat, radar_lon, detection.truth_lat, detection.truth_lon)
+        err = abs(_wrap_deg(obs.bearing_obs_deg - true_bearing))
+        return err <= 45.0
+
+    @staticmethod
+    def _derive_global_rejection_reason(per_radar_reasons: dict) -> str:
+        """Choose the most informative global rejection reason from per-radar reasons."""
+        if not per_radar_reasons:
+            return REASON_NO_ELIGIBLE_RADARS
+        reasons = set(per_radar_reasons.values())
+        if len(reasons) == 1:
+            return next(iter(reasons))
+        priority = [
+            REASON_BEARING_TRUTH_MISMATCH,
+            REASON_ABSOLUTE_PHASE_UNTRUSTED,
+            REASON_STALE_OBSERVATION,
+            REASON_SYNC_QUALITY_LOW,
+            REASON_NO_SYNC,
+            REASON_NO_CALIBRATION,
+            REASON_NO_DETECTIONS,
+            REASON_OBS_BUILD_FAILED,
+        ]
+        for reason in priority:
+            if reason in reasons:
+                return reason
+        return REASON_NO_ELIGIBLE_RADARS
+
+    # ------------------------------------------------------------------
     # Authoritative per-radar observation selection (new operational path)
     # ------------------------------------------------------------------
 
@@ -1163,6 +1233,10 @@ class AircraftLocaliser:
                 per_radar_reasons[iid] = REASON_NO_SYNC
                 continue
 
+            if not self._sync_state_has_trusted_absolute_phase(sync_state):
+                per_radar_reasons[iid] = REASON_ABSOLUTE_PHASE_UNTRUSTED
+                continue
+
             # Pull all recent detections for this ICAO from the shared buffer.
             detections = self._radar_state.get_recent_live_detections_for_icao(
                 icao, max_age_s=self._ray_retention_s,
@@ -1212,6 +1286,14 @@ class AircraftLocaliser:
             )
             if obs is None:
                 per_radar_reasons[iid] = REASON_OBS_BUILD_FAILED
+                continue
+
+            if not self._bearing_matches_current_truth(obs, chosen, auth["lat"], auth["lon"]):
+                per_radar_reasons[iid] = REASON_BEARING_TRUTH_MISMATCH
+                rejected_rays.append(self._obs_to_live_ray(
+                    obs, icao, now_ts,
+                    accepted=False, rejection_reason=REASON_BEARING_TRUTH_MISMATCH,
+                ))
                 continue
 
             accepted.append(obs)
@@ -1298,7 +1380,7 @@ class AircraftLocaliser:
                 hist_buf.extend(accepted_rays)
 
         if not accepted_obs:
-            reasons["global"] = REASON_NO_ELIGIBLE_RADARS
+            reasons["global"] = self._derive_global_rejection_reason(per_radar_reasons)
             return None
 
         if len({o.iid for o in accepted_obs}) < self._min_radars_for_fix:

@@ -23,8 +23,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from radar.aircraft_localiser import (
     AircraftLocaliser,
+    REASON_ABSOLUTE_PHASE_UNTRUSTED,
+    REASON_BEARING_TRUTH_MISMATCH,
     REASON_NO_FORWARD_INTERSECTIONS,
+    REASON_NO_ELIGIBLE_RADARS,
     REASON_STALE_OBSERVATION,
+    REASON_SYNC_QUALITY_LOW,
     _ray_intersection_enu,
     _select_best_live_ray_per_radar,
     generate_seeds,
@@ -59,7 +63,17 @@ def _radar_iid(*, period_s: float = 10.0, lat: float, lon: float):
     )
 
 
-def _sync(iid: int, *, usable: bool = True, period_s: float = 10.0) -> LiveSyncState:
+def _sync(
+    iid: int,
+    *,
+    usable: bool = True,
+    period_s: float = 10.0,
+    phase_anchor_status: str = "selected",
+    phase_anchor_icao: str | None = "TEST01",
+    phase_validation_status: str = "ok",
+    phase_anchor_spread_deg: float | None = None,
+    source: str = "multi_aircraft_burst",
+) -> LiveSyncState:
     return LiveSyncState(
         iid=iid,
         period_s=period_s,
@@ -68,8 +82,12 @@ def _sync(iid: int, *, usable: bool = True, period_s: float = 10.0) -> LiveSyncS
         sync_quality=1.0,
         sync_jitter_deg=2.0,
         last_sync_update_ts=0.0,
-        source="multi_aircraft_burst",
+        source=source,
         usable=usable,
+        phase_anchor_status=phase_anchor_status,
+        phase_anchor_icao=phase_anchor_icao,
+        phase_validation_status=phase_validation_status,
+        phase_anchor_spread_deg=phase_anchor_spread_deg,
     )
 
 
@@ -167,7 +185,9 @@ def test_generate_seeds_filters_backward_cases():
 def _det(
     iid: int, icao: str, wall_ts: float, *,
     arrival_us: float | None = None,
-    truth_lat: float = 51.1, truth_lon: float = -0.9,
+    truth_lat: float | None = None,
+    truth_lon: float | None = None,
+    position_age_seconds: float = 0.2,
 ) -> Stage3LiveDetection:
     return Stage3LiveDetection(
         iid=iid,
@@ -180,7 +200,7 @@ def _det(
         receiver_lon=-1.0,
         truth_lat=truth_lat,
         truth_lon=truth_lon,
-        position_age_seconds=0.2,
+        position_age_seconds=position_age_seconds,
         association_confidence=1.0,
     )
 
@@ -394,3 +414,175 @@ def test_collapse_display_selector_unique_per_iid():
     assert len(out) == 2
     by_iid = {r.iid: r for r in out}
     assert by_iid[1].arrival_us == 2.0
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed: absolute phase untrusted
+# ---------------------------------------------------------------------------
+
+def test_untrusted_absolute_phase_rejected():
+    now = __import__("time").time()
+    models = {1: _radar_iid(lat=51.0, lon=-1.0)}
+    # phase_anchor_status is not in {"selected", "anchor_only"} → untrusted
+    syncs = {1: _sync(1, phase_anchor_status="fallback_mixed")}
+    det_by_icao = {"XYZ": [_det(1, "XYZ", now - 0.2)]}
+    loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
+
+    sel = loc.select_authoritative_observations("XYZ", None, now)
+    assert sel["accepted"] == []
+    assert sel["per_radar_reasons"].get(1) == REASON_ABSOLUTE_PHASE_UNTRUSTED
+
+
+def test_untrusted_phase_population_disagrees():
+    now = __import__("time").time()
+    models = {1: _radar_iid(lat=51.0, lon=-1.0)}
+    syncs = {1: _sync(1, phase_validation_status="population_disagrees")}
+    det_by_icao = {"XYZ": [_det(1, "XYZ", now - 0.2)]}
+    loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
+
+    sel = loc.select_authoritative_observations("XYZ", None, now)
+    assert sel["accepted"] == []
+    assert sel["per_radar_reasons"].get(1) == REASON_ABSOLUTE_PHASE_UNTRUSTED
+
+
+def test_untrusted_phase_spread_too_large():
+    now = __import__("time").time()
+    models = {1: _radar_iid(lat=51.0, lon=-1.0)}
+    syncs = {1: _sync(1, phase_anchor_spread_deg=30.0)}
+    det_by_icao = {"XYZ": [_det(1, "XYZ", now - 0.2)]}
+    loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
+
+    sel = loc.select_authoritative_observations("XYZ", None, now)
+    assert sel["accepted"] == []
+    assert sel["per_radar_reasons"].get(1) == REASON_ABSOLUTE_PHASE_UNTRUSTED
+
+
+def test_untrusted_phase_wrong_source():
+    now = __import__("time").time()
+    models = {1: _radar_iid(lat=51.0, lon=-1.0)}
+    syncs = {1: _sync(1, source="sweep_frame")}
+    det_by_icao = {"XYZ": [_det(1, "XYZ", now - 0.2)]}
+    loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
+
+    sel = loc.select_authoritative_observations("XYZ", None, now)
+    assert sel["accepted"] == []
+    assert sel["per_radar_reasons"].get(1) == REASON_ABSOLUTE_PHASE_UNTRUSTED
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed: bearing-truth mismatch
+# ---------------------------------------------------------------------------
+
+def test_bearing_truth_mismatch_rejected():
+    now = __import__("time").time()
+    # Radar at (51.0, -1.0). Truth at (51.1, -1.0) → bearing ~0° (north).
+    # With phase_epoch_us=0, phase_offset_deg=0, period_s=10.0:
+    #   arrival_us = 2.5e6 → phase = 90° → predicted bearing = 90° (east).
+    # Error = |wrap(90° - 0°)| = 90° > 45° → mismatch.
+    models = {1: _radar_iid(lat=51.0, lon=-1.0)}
+    syncs = {1: _sync(1, period_s=10.0)}
+    det = Stage3LiveDetection(
+        iid=1,
+        icao="XYZ",
+        arrival_us=2_500_000.0,   # quarter-period → 90° phase
+        wall_ts=now - 0.2,
+        df=11,
+        signal_dbfs=-20.0,
+        receiver_lat=51.0,
+        receiver_lon=-1.0,
+        truth_lat=51.1,           # due north of radar
+        truth_lon=-1.0,
+        position_age_seconds=0.2,
+        association_confidence=1.0,
+    )
+    det_by_icao = {"XYZ": [det]}
+    loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
+
+    sel = loc.select_authoritative_observations("XYZ", None, now)
+    assert sel["accepted"] == []
+    assert sel["per_radar_reasons"].get(1) == REASON_BEARING_TRUTH_MISMATCH
+    assert len(sel["rejected_rays"]) == 1
+    assert sel["rejected_rays"][0].rejection_reason == REASON_BEARING_TRUTH_MISMATCH
+    assert sel["rejected_rays"][0].iid == 1
+
+
+def test_bearing_truth_mismatch_not_applied_to_stale_truth():
+    now = __import__("time").time()
+    # Same 90° mismatch setup as above but position_age_seconds > 3.0 → gate skipped.
+    models = {1: _radar_iid(lat=51.0, lon=-1.0)}
+    syncs = {1: _sync(1, period_s=10.0)}
+    det = Stage3LiveDetection(
+        iid=1,
+        icao="XYZ",
+        arrival_us=2_500_000.0,
+        wall_ts=now - 0.2,
+        df=11,
+        signal_dbfs=-20.0,
+        receiver_lat=51.0,
+        receiver_lon=-1.0,
+        truth_lat=51.1,
+        truth_lon=-1.0,
+        position_age_seconds=5.0,  # stale truth → gate bypassed
+        association_confidence=1.0,
+    )
+    det_by_icao = {"XYZ": [det]}
+    loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
+
+    sel = loc.select_authoritative_observations("XYZ", None, now)
+    # Should be accepted because position_age is too old for the gate to fire.
+    assert len(sel["accepted"]) == 1
+    assert sel["per_radar_reasons"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Global rejection reason derivation
+# ---------------------------------------------------------------------------
+
+def test_global_reason_prefers_real_failure_not_no_eligible_radars():
+    # All stale → reason should be stale, not no_eligible_radars
+    reasons_stale = {1: REASON_STALE_OBSERVATION, 2: REASON_STALE_OBSERVATION}
+    assert AircraftLocaliser._derive_global_rejection_reason(reasons_stale) == REASON_STALE_OBSERVATION
+
+    # Mixed with REASON_ABSOLUTE_PHASE_UNTRUSTED → that wins over stale
+    reasons_mixed = {
+        1: REASON_STALE_OBSERVATION,
+        2: REASON_ABSOLUTE_PHASE_UNTRUSTED,
+    }
+    assert AircraftLocaliser._derive_global_rejection_reason(reasons_mixed) == REASON_ABSOLUTE_PHASE_UNTRUSTED
+
+    # With REASON_BEARING_TRUTH_MISMATCH → that wins over everything
+    reasons_mismatch = {
+        1: REASON_STALE_OBSERVATION,
+        2: REASON_ABSOLUTE_PHASE_UNTRUSTED,
+        3: REASON_BEARING_TRUTH_MISMATCH,
+    }
+    assert AircraftLocaliser._derive_global_rejection_reason(reasons_mismatch) == REASON_BEARING_TRUTH_MISMATCH
+
+    # Empty → REASON_NO_ELIGIBLE_RADARS
+    assert AircraftLocaliser._derive_global_rejection_reason({}) == REASON_NO_ELIGIBLE_RADARS
+
+    # Single sync-quality-low reason
+    assert AircraftLocaliser._derive_global_rejection_reason(
+        {1: REASON_SYNC_QUALITY_LOW}
+    ) == REASON_SYNC_QUALITY_LOW
+
+
+def test_solve_for_icao_global_reason_uses_derive():
+    now = __import__("time").time()
+    # Both radars stale → global reason should be stale_observation, not no_eligible_radars
+    models = {
+        1: _radar_iid(lat=51.05, lon=-1.05),
+        2: _radar_iid(lat=51.10, lon=-0.95),
+    }
+    syncs = {1: _sync(1, period_s=3.0), 2: _sync(2, period_s=3.0)}
+    det_by_icao = {
+        "ABC": [
+            _det(1, "ABC", now - 20.0),
+            _det(2, "ABC", now - 20.0),
+        ],
+    }
+    loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
+    fix = loc._solve_for_icao("ABC")
+    assert fix is None
+    reasons = loc._last_rejection_reasons_by_icao["ABC"]
+    assert reasons["global"] == REASON_STALE_OBSERVATION
