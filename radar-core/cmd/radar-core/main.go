@@ -22,11 +22,13 @@ import (
 
 	"github.com/caiusseverus/adsb-dashboard/radar-core/burst"
 	rcconfig "github.com/caiusseverus/adsb-dashboard/radar-core/config"
+	rcexport "github.com/caiusseverus/adsb-dashboard/radar-core/export"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/fm"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/frame"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/iid"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/ingest"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/output"
+	rcprofile "github.com/caiusseverus/adsb-dashboard/radar-core/profile"
 	"github.com/caiusseverus/adsb-dashboard/radar-core/protocol"
 )
 
@@ -90,6 +92,8 @@ type engine struct {
 	fmQueue      chan *protocol.FrameReady
 	revisions    map[uint8]uint32   // monotonic IID_STATE revision counter
 	positions    *iid.PositionCache // global ADS-B position cache (thread-safe)
+	exports      *rcexport.Store
+	profiler     *rcprofile.Collector
 	start        time.Time
 
 	eventsIn      atomic.Uint64
@@ -107,6 +111,8 @@ func newEngine() *engine {
 		fmQueue:      make(chan *protocol.FrameReady, 256),
 		revisions:    make(map[uint8]uint32),
 		positions:    iid.NewPositionCache(),
+		exports:      rcexport.NewStore(4096, 8192, 512, 180.0),
+		profiler:     rcprofile.NewCollector(),
 		start:        time.Now(),
 	}
 }
@@ -140,8 +146,10 @@ func (e *engine) onRadarEvent(msg *protocol.RadarEvent) {
 	acc, ok := e.accumulators[msg.IID]
 	if !ok {
 		acc = frame.New(msg.IID, e.writer, e.positions)
+		acc.ObserveStage = e.profiler.Observe
 		acc.OnFrameEmitted = func(frameMsg *protocol.FrameReady) {
 			e.framesEmitted.Add(1)
+			e.recordSweepFrame(frameMsg)
 			select {
 			case e.fmQueue <- frameMsg:
 			default:
@@ -160,14 +168,19 @@ func (e *engine) onRadarEvent(msg *protocol.RadarEvent) {
 	fired := b.OnEvent(msg.ArrivalUS, msg.ICAO, sigPtr, rcconfig.Get().BurstGapUS)
 	for i := range fired {
 		f := &fired[i]
-		e.emitBurstFired(f)
+		tBurst := time.Now()
 		s.AddBurst(f.ICAO, f.CentroidUS, f.NReplies, b.ActiveICAOs())
 
 		// Stage 3: advance sync epoch when reference ICAO fires.
+		tSync := time.Now()
 		e.maybeUpdateSync(s, f)
+		e.profiler.Observe("sync_update", time.Since(tSync))
 
 		// Stage 4: feed the frame accumulator.
 		acc.OnBurst(f.ICAO, f.CentroidUS, f.NReplies, f.SignalDBFS, s)
+		e.recordObservationExports(s, f)
+		e.emitBurstFired(s, f)
+		e.profiler.Observe("burst_processing", time.Since(tBurst))
 	}
 }
 
@@ -196,7 +209,7 @@ func (e *engine) maybeUpdateSync(s *iid.IIDState, f *burst.FiredBurst) {
 	s.UpdateSyncEpoch(f.CentroidUS, 0.0, nAircraft, refPosAgeS)
 }
 
-func (e *engine) emitBurstFired(f *burst.FiredBurst) {
+func (e *engine) emitBurstFired(s *iid.IIDState, f *burst.FiredBurst) {
 	e.burstsFired.Add(1)
 
 	var sig *float32
@@ -210,13 +223,150 @@ func (e *engine) emitBurstFired(f *burst.FiredBurst) {
 		nReplies = 255
 	}
 
+	var latPtr, lonPtr *float64
+	var posAgePtr *float32
+	var assoc float32
+	if pos := e.positions.Get(f.ICAO); pos != nil {
+		lat, lon := pos.Lat, pos.Lon
+		latPtr, lonPtr = &lat, &lon
+		posAge := float32(time.Since(pos.TS).Seconds())
+		posAgePtr = &posAge
+		assoc = 1.0
+	}
+	dominantFamily := false
+	if family := s.FamilySnapshot(); family != nil && family.FoldedICAOs != nil {
+		_, dominantFamily = family.FoldedICAOs[f.ICAO]
+	}
+	syncQuality, _ := s.SyncSnapshot()
+	simpleCentroid := f.SimpleCentroidUS
+	centroidDelta := f.CentroidDeltaUS
+	firstReply := f.FirstReplyUS
+	lastReply := f.LastReplyUS
+	spanUS := f.SpanUS
+	var peakAmplitude *float32
+	if f.PeakAmplitude != nil {
+		v := float32(*f.PeakAmplitude)
+		peakAmplitude = &v
+	}
+
 	e.writer.Send(&protocol.BurstFired{
-		MsgType:    protocol.MsgBurstFired,
-		IID:        f.IID,
-		ICAO:       f.ICAO,
-		CentroidUS: f.CentroidUS,
-		NReplies:   uint8(nReplies),
-		SignalDBFS: sig,
+		MsgType:            protocol.MsgBurstFired,
+		IID:                f.IID,
+		ICAO:               f.ICAO,
+		CentroidUS:         f.CentroidUS,
+		SimpleCentroidUS:   &simpleCentroid,
+		WeightedCentroidUS: f.WeightedCentroidUS,
+		CentroidDeltaUS:    &centroidDelta,
+		FirstReplyUS:       &firstReply,
+		StrongestReplyUS:   f.StrongestReplyUS,
+		MidStrongWindowUS:  f.MidStrongWindowUS,
+		LastReplyUS:        &lastReply,
+		SpanUS:             &spanUS,
+		PeakAmplitude:      peakAmplitude,
+		NReplies:           uint8(nReplies),
+		SignalDBFS:         sig,
+		Lat:                latPtr,
+		Lon:                lonPtr,
+		PosAgeS:            posAgePtr,
+		DominantFamily:     dominantFamily,
+		SyncEligible:       dominantFamily && assoc > 0.0 && syncQuality >= 0.3,
+	})
+}
+
+func (e *engine) recordObservationExports(s *iid.IIDState, f *burst.FiredBurst) {
+	var sig *float32
+	if f.SignalDBFS != nil {
+		v := float32(*f.SignalDBFS)
+		sig = &v
+	}
+	var latPtr, lonPtr *float64
+	var posAgePtr *float32
+	assoc := float32(0.0)
+	if pos := e.positions.Get(f.ICAO); pos != nil {
+		lat, lon := pos.Lat, pos.Lon
+		latPtr, lonPtr = &lat, &lon
+		posAge := float32(time.Since(pos.TS).Seconds())
+		posAgePtr = &posAge
+		assoc = 1.0
+	}
+	dominantFamily := false
+	if family := s.FamilySnapshot(); family != nil && family.FoldedICAOs != nil {
+		_, dominantFamily = family.FoldedICAOs[f.ICAO]
+	}
+	syncQuality, _ := s.SyncSnapshot()
+	wallTS := float64(time.Now().UnixNano()) / float64(time.Second)
+	track := rcexport.TrackObservation{
+		IID:                   f.IID,
+		ICAO:                  f.ICAO,
+		ArrivalUS:             f.CentroidUS,
+		WallTS:                wallTS,
+		SignalDBFS:            sig,
+		TruthLat:              latPtr,
+		TruthLon:              lonPtr,
+		PositionAgeS:          posAgePtr,
+		AssociationConfidence: assoc,
+		DominantFamily:        dominantFamily,
+		SyncEligible:          dominantFamily && assoc > 0.0 && syncQuality >= 0.3,
+	}
+	tExport := time.Now()
+	e.exports.RecordTrackObservation(track)
+	e.exports.RecordEvidenceEvent(rcexport.EvidenceEvent{
+		Kind:               "burst_fired",
+		IID:                f.IID,
+		ICAO:               f.ICAO,
+		ArrivalUS:          f.CentroidUS,
+		SimpleCentroidUS:   &f.SimpleCentroidUS,
+		WeightedCentroidUS: f.WeightedCentroidUS,
+		CentroidDeltaUS:    &f.CentroidDeltaUS,
+		FirstReplyUS:       &f.FirstReplyUS,
+		StrongestReplyUS:   f.StrongestReplyUS,
+		MidStrongWindowUS:  f.MidStrongWindowUS,
+		LastReplyUS:        &f.LastReplyUS,
+		SpanUS:             &f.SpanUS,
+		PeakAmplitude: func() *float32 {
+			if f.PeakAmplitude == nil {
+				return nil
+			}
+			v := float32(*f.PeakAmplitude)
+			return &v
+		}(),
+		WallTS:                wallTS,
+		NReplies:              uint8(minInt(f.NReplies, 255)),
+		SignalDBFS:            sig,
+		TruthLat:              latPtr,
+		TruthLon:              lonPtr,
+		PositionAgeS:          posAgePtr,
+		DominantFamily:        dominantFamily,
+		SyncEligible:          track.SyncEligible,
+		AssociationConfidence: assoc,
+	})
+	e.profiler.Observe("evidence_export", time.Since(tExport))
+}
+
+func (e *engine) recordSweepFrame(frameMsg *protocol.FrameReady) {
+	obs := make([]rcexport.SweepFrameObservation, 0, len(frameMsg.Observations))
+	for _, entry := range frameMsg.Observations {
+		obs = append(obs, rcexport.SweepFrameObservation{
+			ICAO:      entry.ICAO,
+			Lat:       entry.Lat,
+			Lon:       entry.Lon,
+			ArrivalUS: entry.ArrivalUS,
+			NReplies:  entry.NReplies,
+			PosAgeS:   entry.PosAgeS,
+		})
+	}
+	e.exports.RecordSweepFrame(rcexport.SweepFrame{
+		IID:          frameMsg.IID,
+		FrameIndex:   frameMsg.FrameIndex,
+		PeriodS:      frameMsg.PeriodS,
+		RefICAO:      frameMsg.RefICAO,
+		RefLat:       frameMsg.RefLat,
+		RefLon:       frameMsg.RefLon,
+		RefArrivalUS: frameMsg.RefArrivalUS,
+		RefPosAgeS:   frameMsg.RefPosAgeS,
+		Quality:      frameMsg.Quality,
+		ExportedAt:   float64(time.Now().UnixNano()) / float64(time.Second),
+		Observations: obs,
 	})
 }
 
@@ -242,6 +392,10 @@ func (e *engine) onSnapshotReq(msg *protocol.SnapshotReq) {
 }
 
 func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
+	tSnapshot := time.Now()
+	defer func() {
+		e.profiler.Observe("snapshot_export", time.Since(tSnapshot))
+	}()
 	payload := map[string]interface{}{
 		"uptime_s":       time.Since(e.start).Seconds(),
 		"events_in":      e.eventsIn.Load(),
@@ -263,6 +417,7 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 	}
 
 	iidsPayload := map[string]interface{}{}
+	stableIIDs := map[string]rcexport.IIDSnapshot{}
 	for iidNum, s := range e.states {
 		if targetIID != nil && iidNum != *targetIID {
 			continue
@@ -270,16 +425,21 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 		key := strconv.Itoa(int(iidNum))
 		snap := s.DebugStateSnapshot()
 		iidPayload := map[string]interface{}{
-			"status":             snap.Status,
-			"has_period":         snap.HasPeriod,
-			"period_s":           nil,
-			"has_reference_icao": snap.HasRefICAO,
-			"reference_icao":     nil,
-			"sync_state_present": snap.SyncPresent,
-			"sync_quality":       snap.SyncQuality,
-			"sync_state_usable":  snap.SyncUsable,
-			"sync_holdover":      snap.SyncHoldover,
-			"sync_n_frames":      snap.SyncNSyncFrames,
+			"status":                 snap.Status,
+			"has_period":             snap.HasPeriod,
+			"period_s":               nil,
+			"has_reference_icao":     snap.HasRefICAO,
+			"reference_icao":         nil,
+			"sync_state_present":     snap.SyncPresent,
+			"sync_quality":           snap.SyncQuality,
+			"sync_state_usable":      snap.SyncUsable,
+			"sync_period_s":          nil,
+			"sync_jitter_deg":        nil,
+			"sync_residual_ema_deg":  nil,
+			"sync_holdover":          snap.SyncHoldover,
+			"sync_n_frames":          snap.SyncNSyncFrames,
+			"sync_n_rejected_frames": snap.SyncNRejectedFrames,
+			"sync_last_updated":      nil,
 			"retained_state": map[string]interface{}{
 				"active_aircraft_estimate":           snap.ActiveAircraftEstimate,
 				"burst_records_total":                snap.BurstRecordsTotal,
@@ -301,6 +461,65 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 		}
 		if snap.HasRefICAO {
 			iidPayload["reference_icao"] = snap.RefICAO
+		}
+		if snap.SyncPresent {
+			iidPayload["sync_period_s"] = snap.SyncPeriodS
+			iidPayload["sync_jitter_deg"] = snap.SyncJitterDeg
+			iidPayload["sync_residual_ema_deg"] = snap.SyncResidualEMA
+			iidPayload["sync_last_updated"] = snap.SyncLastUpdatedUnix
+		}
+		stableIIDs[key] = rcexport.IIDSnapshot{
+			IID:    iidNum,
+			Status: snap.Status,
+			PeriodS: func() *float64 {
+				if snap.HasPeriod {
+					v := snap.PeriodS
+					return &v
+				}
+				return nil
+			}(),
+			ReferenceICAO: func() *uint32 {
+				if snap.HasRefICAO {
+					v := snap.RefICAO
+					return &v
+				}
+				return nil
+			}(),
+			SyncQuality:      snap.SyncQuality,
+			SyncStateUsable:  snap.SyncUsable,
+			SyncStatePresent: snap.SyncPresent,
+			SyncPeriodS: func() *float64 {
+				if snap.SyncPresent {
+					v := snap.SyncPeriodS
+					return &v
+				}
+				return nil
+			}(),
+			SyncJitterDeg: func() *float64 {
+				if snap.SyncPresent {
+					v := snap.SyncJitterDeg
+					return &v
+				}
+				return nil
+			}(),
+			SyncResidualEMADeg: func() *float64 {
+				if snap.SyncPresent {
+					v := snap.SyncResidualEMA
+					return &v
+				}
+				return nil
+			}(),
+			SyncNFrames:         snap.SyncNSyncFrames,
+			SyncNRejectedFrames: snap.SyncNRejectedFrames,
+			SyncHoldover:        snap.SyncHoldover,
+			SyncLastUpdated: func() *float64 {
+				if snap.SyncPresent {
+					v := snap.SyncLastUpdatedUnix
+					return &v
+				}
+				return nil
+			}(),
+			RetainedBurstSpan: snap.BurstRecordsRetainedSpanS,
 		}
 
 		if acc, ok := e.accumulators[iidNum]; ok {
@@ -380,6 +599,25 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 		iidsPayload[key] = iidPayload
 	}
 	payload["iids"] = iidsPayload
+	trackObservations, evidenceEvents, sweepFrames := e.exports.Snapshot(targetIID)
+	stableSnapshot := rcexport.RadarSnapshot{
+		GeneratedAt:       float64(time.Now().UnixNano()) / float64(time.Second),
+		UptimeS:           payload["uptime_s"].(float64),
+		EventsIn:          payload["events_in"].(uint64),
+		BurstsFired:       payload["bursts_fired"].(uint64),
+		FramesEmitted:     payload["frames_emitted"].(uint64),
+		ActiveIIDs:        payload["active_iids"].(int),
+		IIDs:              stableIIDs,
+		SweepFrames:       sweepFrames,
+		EvidenceEvents:    evidenceEvents,
+		TrackObservations: trackObservations,
+		Profile:           e.profiler.Snapshot(),
+	}
+	payload["radar_snapshot"] = stableSnapshot
+	payload["track_observations"] = trackObservations
+	payload["evidence_events"] = evidenceEvents
+	payload["sweep_frames"] = sweepFrames
+	payload["profile"] = stableSnapshot.Profile
 	return payload
 }
 
@@ -394,7 +632,15 @@ func (e *engine) onResetIID(msg *protocol.ResetIID) {
 		a.Reset()
 	}
 	e.fmState.Reset(msg.IID)
+	e.exports.ResetIID(msg.IID)
 	slog.Info("radar-core: IID reset", "iid", msg.IID)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (e *engine) runFMWorker(stop <-chan struct{}) {

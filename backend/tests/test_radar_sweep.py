@@ -481,6 +481,74 @@ def test_get_burst_sync_timeline_includes_non_sync_driving_observations():
     assert retention["timeline"]["retained_duration_s"] == pytest.approx(4.1)
 
 
+def test_get_burst_sync_timeline_prefers_go_evidence_when_available(monkeypatch):
+    state = RadarState()
+    now_ts = 1_000.0
+    state._models[7] = RadarIID(
+        iid=7,
+        status="SINGLE_RADAR",
+        period_s=4.0,
+        lat=51.0,
+        lon=0.0,
+    )
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=now_ts,
+        source="multi_aircraft_burst",
+        usable=True,
+    )
+    state.update_go_snapshot({
+        "iids": {},
+        "evidence_events": [
+            {
+                "kind": "burst_fired",
+                "iid": 7,
+                "icao": int("BBBBBB", 16),
+                "arrival_us": 8_200_000.0,
+                "simple_centroid_us": 8_198_000.0,
+                "weighted_centroid_us": 8_200_000.0,
+                "centroid_delta_us": 2_000.0,
+                "first_reply_us": 8_190_000.0,
+                "strongest_reply_us": 8_200_000.0,
+                "mid_strong_window_us": 8_200_000.0,
+                "last_reply_us": 8_206_000.0,
+                "span_us": 16_000.0,
+                "peak_amplitude": -12.0,
+                "wall_ts": now_ts,
+                "n_replies": 4,
+                "signal_dbfs": -15.0,
+                "truth_lat": 51.1,
+                "truth_lon": 0.2,
+                "position_age_s": 0.3,
+                "dominant_family": True,
+                "sync_eligible": True,
+                "association_confidence": 1.0,
+            }
+        ],
+    })
+
+    monkeypatch.setattr("radar.sweep.time.time", lambda: now_ts)
+    timeline = state.get_burst_sync_timeline(7, window_s=60.0)
+
+    observations = timeline["observations"]
+    assert len(observations) == 1
+    obs = observations[0]
+    assert obs["icao"] == "BBBBBB"
+    assert obs["sync_update_eligible"] is True
+    assert obs["burst_center_method"] == "amplitude_weighted"
+    assert obs["burst_center_simple_us"] == pytest.approx(8_198_000.0)
+    assert obs["burst_center_weighted_us"] == pytest.approx(8_200_000.0)
+    assert obs["burst_center_delta_us"] == pytest.approx(2_000.0)
+    retention = timeline["retention_diagnostics"]
+    assert retention["timeline"]["count"] == 1
+    assert retention["timeline"]["newest_burst_centroid_us"] == pytest.approx(8_200_000.0)
+
+
 def test_live_sync_observation_buffers_prune_by_age_with_high_count_caps(monkeypatch):
     state = RadarState()
     assert state._MULTI_SYNC_OBS_MAX > 200

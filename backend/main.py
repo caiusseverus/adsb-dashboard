@@ -108,9 +108,12 @@ aircraft_localiser._ray_retention_s = config.STAGE3_RAY_RETENTION_S
 _radar_core_client: RadarCoreClient | None = None
 _radar_core_worker: RadarCoreWorker | None = None
 if config.RADAR_CORE_ENABLED:
-    _rc_on_frame_ready = None
+    def _rc_on_frame_ready(frame_dict: dict) -> None:
+        radar_state.update_go_frame_ready(frame_dict)
+        if config.RADAR_CORE_FRAMES_ENABLED and not config.RADAR_CORE_FM_ENABLED:
+            radar_state.inject_frame_from_go(frame_dict)
+
     if config.RADAR_CORE_FRAMES_ENABLED and not config.RADAR_CORE_FM_ENABLED:
-        _rc_on_frame_ready = radar_state.inject_frame_from_go
         radar_state.enable_radar_core_frames(True)
     _radar_core_worker = RadarCoreWorker(
         binary_path=config.RADAR_CORE_BINARY,
@@ -122,10 +125,11 @@ if config.RADAR_CORE_ENABLED:
     )
     _radar_core_client = RadarCoreClient(
         config.RADAR_CORE_SOCKET,
+        on_burst_fired=radar_state.update_go_burst_fired,
         on_frame_ready=_rc_on_frame_ready,
         on_fm_frame_result=radar_state.update_go_frame_position_result if config.RADAR_CORE_FM_ENABLED else None,
         on_fm_state=radar_state.update_forward_model_from_go if config.RADAR_CORE_FM_ENABLED else None,
-        on_snapshot=radar_state.update_go_snapshot if config.RADAR_CORE_FM_ENABLED else None,
+        on_snapshot=radar_state.update_go_snapshot,
         connect_timeout_s=config.RADAR_CORE_CONNECT_TIMEOUT_S,
         reconnect_delay_s=config.RADAR_CORE_RECONNECT_DELAY_S,
     )

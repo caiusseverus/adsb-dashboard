@@ -2192,6 +2192,16 @@ class RadarState:
         self._GO_FRAME_POSITIONS_MAX = 5000
         self._go_frame_positions: dict[int, deque] = {}
         self._go_frame_positions_revision: dict[int, int] = {}
+        self._GO_TRACK_OBSERVATIONS_MAX = 8_000
+        self._GO_EVIDENCE_EVENTS_MAX = 12_000
+        self._GO_SWEEP_FRAMES_MAX = 256
+        self._go_sync_states_by_iid: dict[int, dict] = {}
+        self._go_track_observations: deque = deque(maxlen=self._GO_TRACK_OBSERVATIONS_MAX)
+        self._go_evidence_events: deque = deque(maxlen=self._GO_EVIDENCE_EVENTS_MAX)
+        self._go_sweep_frames_by_iid: dict[int, deque] = {}
+        self._go_sweep_frames_revision: dict[int, int] = {}
+        self._go_reference_aircraft_by_iid: dict[int, dict] = {}
+        self._go_snapshot_payload: dict | None = None
 
         # Lightweight ADS-B position tracker for real-time position capture
         self._adsb_tracker = AircraftPositionTracker()
@@ -2808,38 +2818,39 @@ class RadarState:
                 and _radar_pos_cache["lon"] is not None
             ):
                 matches_dominant_for_sync = _matches_dominant(fired_icao)
-                self._record_burst_sync_timeline_obs(
-                    iid=iid,
-                    icao=fired_icao,
-                    burst_centroid_us=burst_centroid_us,
-                    radar_lat=_radar_pos_cache["lat"],
-                    radar_lon=_radar_pos_cache["lon"],
-                    aircraft_lat=lat,
-                    aircraft_lon=lon,
-                    n_replies=n_replies,
-                    signal_dbfs=burst_signal,
-                    pos_age_s=position_age_seconds,
-                    sync_update_eligible=matches_dominant_for_sync,
-                    burst_center_method=fired_burst.get("burst_center_method", "centroid"),
-                    burst_center_simple_us=fired_burst.get("burst_center_simple_us"),
-                    burst_center_weighted_us=fired_burst.get("burst_center_weighted_us"),
-                    burst_center_delta_us=fired_burst.get("burst_center_delta_us"),
-                    burst_ts_first_reply_beast_us=fired_burst.get("burst_ts_first_reply_beast_us"),
-                    burst_ts_strongest_reply_beast_us=fired_burst.get("burst_ts_strongest_reply_beast_us"),
-                    burst_ts_simple_centroid_beast_us=fired_burst.get("burst_ts_simple_centroid_beast_us"),
-                    burst_ts_weighted_centroid_beast_us=fired_burst.get("burst_ts_weighted_centroid_beast_us"),
-                    burst_ts_mid_strong_window_beast_us=fired_burst.get("burst_ts_mid_strong_window_beast_us"),
-                    burst_ts_last_reply_beast_us=fired_burst.get("burst_ts_last_reply_beast_us"),
-                    burst_span_us=fired_burst.get("burst_span_us"),
-                    peak_amplitude=fired_burst.get("peak_amplitude"),
-                    position_interpolated=interpolated,
-                    position_extrapolated=position_extrapolated,
-                    position_source_age_s=position_source_age_s,
-                    truth_position_ts_beast_us=(
-                        burst_centroid_us - position_source_age_s * 1_000_000.0
-                        if position_source_age_s is not None else None
-                    ),
-                )
+                if self.radar_core_event_sink is None:
+                    self._record_burst_sync_timeline_obs(
+                        iid=iid,
+                        icao=fired_icao,
+                        burst_centroid_us=burst_centroid_us,
+                        radar_lat=_radar_pos_cache["lat"],
+                        radar_lon=_radar_pos_cache["lon"],
+                        aircraft_lat=lat,
+                        aircraft_lon=lon,
+                        n_replies=n_replies,
+                        signal_dbfs=burst_signal,
+                        pos_age_s=position_age_seconds,
+                        sync_update_eligible=matches_dominant_for_sync,
+                        burst_center_method=fired_burst.get("burst_center_method", "centroid"),
+                        burst_center_simple_us=fired_burst.get("burst_center_simple_us"),
+                        burst_center_weighted_us=fired_burst.get("burst_center_weighted_us"),
+                        burst_center_delta_us=fired_burst.get("burst_center_delta_us"),
+                        burst_ts_first_reply_beast_us=fired_burst.get("burst_ts_first_reply_beast_us"),
+                        burst_ts_strongest_reply_beast_us=fired_burst.get("burst_ts_strongest_reply_beast_us"),
+                        burst_ts_simple_centroid_beast_us=fired_burst.get("burst_ts_simple_centroid_beast_us"),
+                        burst_ts_weighted_centroid_beast_us=fired_burst.get("burst_ts_weighted_centroid_beast_us"),
+                        burst_ts_mid_strong_window_beast_us=fired_burst.get("burst_ts_mid_strong_window_beast_us"),
+                        burst_ts_last_reply_beast_us=fired_burst.get("burst_ts_last_reply_beast_us"),
+                        burst_span_us=fired_burst.get("burst_span_us"),
+                        peak_amplitude=fired_burst.get("peak_amplitude"),
+                        position_interpolated=interpolated,
+                        position_extrapolated=position_extrapolated,
+                        position_source_age_s=position_source_age_s,
+                        truth_position_ts_beast_us=(
+                            burst_centroid_us - position_source_age_s * 1_000_000.0
+                            if position_source_age_s is not None else None
+                        ),
+                    )
                 if matches_dominant_for_sync:
                     self._record_aligned_burst_sync_obs(
                         iid=iid,
@@ -3602,9 +3613,11 @@ class RadarState:
     def update_go_snapshot(self, snapshot: dict) -> None:
         iids_payload = snapshot.get("iids")
         if not isinstance(iids_payload, dict):
-            return
+            iids_payload = {}
 
         with self._lock:
+            self._go_snapshot_payload = dict(snapshot)
+            seen_go_sync_iids: set[int] = set()
             for iid_key, iid_payload in iids_payload.items():
                 if not isinstance(iid_payload, dict):
                     continue
@@ -3612,6 +3625,27 @@ class RadarState:
                     iid = int(iid_payload.get("iid", iid_key))
                 except Exception:
                     continue
+                ref_icao = iid_payload.get("reference_icao")
+                has_ref = bool(iid_payload.get("has_reference_icao")) and ref_icao is not None
+                if has_ref:
+                    self._go_reference_aircraft_by_iid[iid] = {
+                        "status": "SELECTED",
+                        "ref_icao": f"{int(ref_icao):06X}" if not isinstance(ref_icao, str) else ref_icao.upper(),
+                        "ref_score": None,
+                        "ref_since_sweep": None,
+                        "hysteresis_margin": None,
+                        "challengers": [],
+                        "source": "go_snapshot",
+                    }
+                elif iid in self._go_reference_aircraft_by_iid:
+                    self._go_reference_aircraft_by_iid.pop(iid, None)
+
+                go_sync = self._normalise_go_sync_state(iid_payload)
+                if go_sync is not None:
+                    self._go_sync_states_by_iid[iid] = go_sync
+                    seen_go_sync_iids.add(iid)
+                elif iid in self._go_sync_states_by_iid:
+                    self._go_sync_states_by_iid.pop(iid, None)
 
                 if "frame_positions" in iid_payload:
                     entries = []
@@ -3630,6 +3664,371 @@ class RadarState:
                     )
                 ):
                     self._set_go_frame_positions_locked(iid, [])
+            track_entries = []
+            for raw_entry in snapshot.get("track_observations") or []:
+                entry = self._normalise_go_track_observation(raw_entry)
+                if entry is not None:
+                    track_entries.append(entry)
+            if "track_observations" in snapshot:
+                self._go_track_observations = deque(
+                    track_entries[-self._GO_TRACK_OBSERVATIONS_MAX:],
+                    maxlen=self._GO_TRACK_OBSERVATIONS_MAX,
+                )
+            evidence_entries = []
+            for raw_entry in snapshot.get("evidence_events") or []:
+                entry = self._normalise_go_evidence_event(raw_entry)
+                if entry is not None:
+                    evidence_entries.append(entry)
+            if "evidence_events" in snapshot:
+                self._go_evidence_events = deque(
+                    evidence_entries[-self._GO_EVIDENCE_EVENTS_MAX:],
+                    maxlen=self._GO_EVIDENCE_EVENTS_MAX,
+                )
+            sweep_frames_payload = snapshot.get("sweep_frames")
+            if sweep_frames_payload is None and isinstance(snapshot.get("radar_snapshot"), dict):
+                sweep_frames_payload = snapshot["radar_snapshot"].get("sweep_frames")
+            if sweep_frames_payload is not None:
+                frames_by_iid: dict[int, list] = defaultdict(list)
+                for raw_entry in sweep_frames_payload or []:
+                    frame = self._normalise_go_sweep_frame(raw_entry)
+                    if frame is not None:
+                        frames_by_iid[frame.iid].append(frame.frame)
+                seen_iids = set(self._go_sweep_frames_by_iid.keys()) | set(frames_by_iid.keys())
+                for iid in seen_iids:
+                    next_frames = frames_by_iid.get(iid, [])
+                    next_sig = self._go_sweep_frame_signature(next_frames)
+                    existing = list(self._go_sweep_frames_by_iid.get(iid, ()))
+                    existing_sig = self._go_sweep_frame_signature(existing)
+                    if existing_sig == next_sig:
+                        continue
+                    self._go_sweep_frames_by_iid[iid] = deque(
+                        next_frames[-self._GO_SWEEP_FRAMES_MAX:],
+                        maxlen=self._GO_SWEEP_FRAMES_MAX,
+                    )
+                    self._go_sweep_frames_revision[iid] = self._go_sweep_frames_revision.get(iid, 0) + 1
+            stale_go_sync_iids = set(self._go_sync_states_by_iid.keys()) - seen_go_sync_iids
+            for iid in stale_go_sync_iids:
+                self._go_sync_states_by_iid.pop(iid, None)
+
+    @staticmethod
+    def _normalise_go_sync_state(entry: dict) -> dict | None:
+        if not isinstance(entry, dict) or not bool(entry.get("sync_state_present")):
+            return None
+        try:
+            return {
+                "period_s": (
+                    float(entry["sync_period_s"])
+                    if entry.get("sync_period_s") is not None else None
+                ),
+                "sync_quality": float(entry.get("sync_quality") or 0.0),
+                "usable": bool(entry.get("sync_state_usable", False)),
+                "sync_jitter_deg": (
+                    float(entry["sync_jitter_deg"])
+                    if entry.get("sync_jitter_deg") is not None else None
+                ),
+                "residual_ema_deg": (
+                    float(entry["sync_residual_ema_deg"])
+                    if entry.get("sync_residual_ema_deg") is not None else None
+                ),
+                "n_sync_frames": int(entry.get("sync_n_frames") or 0),
+                "n_rejected_frames": int(entry.get("sync_n_rejected_frames") or 0),
+                "holdover": bool(entry.get("sync_holdover", False)),
+                "last_updated": (
+                    float(entry["sync_last_updated"])
+                    if entry.get("sync_last_updated") is not None else None
+                ),
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalise_go_track_observation(entry: dict) -> dict | None:
+        if not isinstance(entry, dict):
+            return None
+        try:
+            return {
+                "iid": int(entry["iid"]),
+                "icao": f"{int(entry['icao']):06X}",
+                "arrival_us": float(entry["arrival_us"]),
+                "wall_ts": float(entry["wall_ts"]),
+                "signal_dbfs": (
+                    float(entry["signal_dbfs"])
+                    if entry.get("signal_dbfs") is not None else None
+                ),
+                "truth_lat": (
+                    float(entry["truth_lat"])
+                    if entry.get("truth_lat") is not None else None
+                ),
+                "truth_lon": (
+                    float(entry["truth_lon"])
+                    if entry.get("truth_lon") is not None else None
+                ),
+                "position_age_seconds": (
+                    float(entry["position_age_s"])
+                    if entry.get("position_age_s") is not None else None
+                ),
+                "association_confidence": float(entry.get("association_confidence") or 0.0),
+                "dominant_family": bool(entry.get("dominant_family")),
+                "sync_eligible": bool(entry.get("sync_eligible")),
+            }
+        except Exception:
+            return None
+
+    @_dataclass
+    class _GoSweepFrame:
+        iid: int
+        frame: Any
+
+    @staticmethod
+    def _normalise_go_sweep_frame(entry: dict) -> "RadarState._GoSweepFrame | None":
+        if not isinstance(entry, dict):
+            return None
+        try:
+            from .models import SweepFrame, SweepFrameObservation
+
+            iid = int(entry["iid"])
+            observations = []
+            for obs in entry.get("observations") or []:
+                observations.append(SweepFrameObservation(
+                    icao=f"{int(obs['icao']):06X}" if not isinstance(obs.get("icao"), str) else str(obs.get("icao")).upper(),
+                    lat=float(obs["lat"]),
+                    lon=float(obs["lon"]),
+                    arrival_us=float(obs["arrival_us"]),
+                    n_replies=int(obs.get("n_replies") or 1),
+                    position_age_seconds=float(obs.get("position_age_s") or 0.0),
+                ))
+            frame = SweepFrame(
+                frame_index=int(entry["frame_index"]),
+                sweep_start_us=float(entry["ref_arrival_us"]),
+                ref_icao=f"{int(entry['ref_icao']):06X}" if not isinstance(entry.get("ref_icao"), str) else str(entry.get("ref_icao")).upper(),
+                ref_lat=float(entry["ref_lat"]),
+                ref_lon=float(entry["ref_lon"]),
+                ref_arrival_us=float(entry["ref_arrival_us"]),
+                observations=observations,
+                quality=str(entry.get("quality") or "marginal"),
+                period_s=float(entry["period_s"]) if entry.get("period_s") is not None else None,
+            )
+            return RadarState._GoSweepFrame(iid=iid, frame=frame)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _go_sweep_frame_signature(frames: list) -> tuple:
+        return tuple(
+            (
+                int(frame.frame_index),
+                str(frame.ref_icao),
+                round(float(frame.ref_arrival_us), 3),
+                str(frame.quality),
+                round(float(frame.period_s or 0.0), 9),
+                tuple(
+                    (
+                        str(obs.icao),
+                        round(float(obs.arrival_us), 3),
+                        round(float(obs.lat), 6),
+                        round(float(obs.lon), 6),
+                        int(getattr(obs, "n_replies", 1)),
+                        round(float(getattr(obs, "position_age_seconds", 0.0)), 3),
+                    )
+                    for obs in frame.observations
+                ),
+            )
+            for frame in frames
+        )
+
+    def _store_go_sweep_frame_locked(self, iid: int, frame) -> None:
+        buf = self._go_sweep_frames_by_iid.setdefault(
+            iid,
+            deque(maxlen=self._GO_SWEEP_FRAMES_MAX),
+        )
+        for idx, existing in enumerate(buf):
+            if int(existing.frame_index) != int(frame.frame_index):
+                continue
+            if self._go_sweep_frame_signature([existing]) == self._go_sweep_frame_signature([frame]):
+                return
+            buf[idx] = frame
+            self._go_sweep_frames_revision[iid] = self._go_sweep_frames_revision.get(iid, 0) + 1
+            return
+        buf.append(frame)
+        self._go_sweep_frames_revision[iid] = self._go_sweep_frames_revision.get(iid, 0) + 1
+
+    def update_go_frame_ready(self, frame_dict: dict) -> None:
+        normalised = self._normalise_go_sweep_frame({
+            "iid": frame_dict.get("i"),
+            "frame_index": frame_dict.get("fi"),
+            "period_s": frame_dict.get("p"),
+            "ref_icao": frame_dict.get("rc"),
+            "ref_lat": frame_dict.get("rla"),
+            "ref_lon": frame_dict.get("rlo"),
+            "ref_arrival_us": frame_dict.get("ra"),
+            "quality": frame_dict.get("q"),
+            "observations": [
+                {
+                    "icao": obs.get("c"),
+                    "lat": obs.get("la"),
+                    "lon": obs.get("lo"),
+                    "arrival_us": obs.get("a"),
+                    "n_replies": obs.get("n"),
+                    "position_age_s": obs.get("pa"),
+                }
+                for obs in (frame_dict.get("obs") or [])
+            ],
+        })
+        if normalised is None:
+            return
+        with self._lock:
+            self._store_go_sweep_frame_locked(normalised.iid, normalised.frame)
+            self._go_reference_aircraft_by_iid[normalised.iid] = {
+                "status": "SELECTED",
+                "ref_icao": normalised.frame.ref_icao,
+                "ref_score": None,
+                "ref_since_sweep": normalised.frame.frame_index,
+                "hysteresis_margin": None,
+                "challengers": [],
+                "source": "go_frame_ready",
+            }
+
+    @staticmethod
+    def _normalise_go_evidence_event(entry: dict) -> dict | None:
+        if not isinstance(entry, dict):
+            return None
+        try:
+            return {
+                "kind": str(entry.get("kind") or "burst_fired"),
+                "iid": int(entry["iid"]),
+                "icao": f"{int(entry['icao']):06X}",
+                "arrival_us": float(entry["arrival_us"]),
+                "simple_centroid_us": (
+                    float(entry["simple_centroid_us"])
+                    if entry.get("simple_centroid_us") is not None else None
+                ),
+                "weighted_centroid_us": (
+                    float(entry["weighted_centroid_us"])
+                    if entry.get("weighted_centroid_us") is not None else None
+                ),
+                "centroid_delta_us": (
+                    float(entry["centroid_delta_us"])
+                    if entry.get("centroid_delta_us") is not None else None
+                ),
+                "first_reply_us": (
+                    float(entry["first_reply_us"])
+                    if entry.get("first_reply_us") is not None else None
+                ),
+                "strongest_reply_us": (
+                    float(entry["strongest_reply_us"])
+                    if entry.get("strongest_reply_us") is not None else None
+                ),
+                "mid_strong_window_us": (
+                    float(entry["mid_strong_window_us"])
+                    if entry.get("mid_strong_window_us") is not None else None
+                ),
+                "last_reply_us": (
+                    float(entry["last_reply_us"])
+                    if entry.get("last_reply_us") is not None else None
+                ),
+                "span_us": (
+                    float(entry["span_us"])
+                    if entry.get("span_us") is not None else None
+                ),
+                "peak_amplitude": (
+                    float(entry["peak_amplitude"])
+                    if entry.get("peak_amplitude") is not None else None
+                ),
+                "wall_ts": float(entry["wall_ts"]),
+                "n_replies": int(entry.get("n_replies") or 0),
+                "signal_dbfs": (
+                    float(entry["signal_dbfs"])
+                    if entry.get("signal_dbfs") is not None else None
+                ),
+                "truth_lat": (
+                    float(entry["truth_lat"])
+                    if entry.get("truth_lat") is not None else None
+                ),
+                "truth_lon": (
+                    float(entry["truth_lon"])
+                    if entry.get("truth_lon") is not None else None
+                ),
+                "position_age_seconds": (
+                    float(entry["position_age_s"])
+                    if entry.get("position_age_s") is not None else None
+                ),
+                "association_confidence": float(entry.get("association_confidence") or 0.0),
+                "dominant_family": bool(entry.get("dominant_family")),
+                "sync_eligible": bool(entry.get("sync_eligible")),
+            }
+        except Exception:
+            return None
+
+    def update_go_burst_fired(self, burst_dict: dict) -> None:
+        entry = self._normalise_go_track_observation({
+            "iid": burst_dict.get("i"),
+            "icao": burst_dict.get("c"),
+            "arrival_us": burst_dict.get("cu"),
+            "wall_ts": time.time(),
+            "signal_dbfs": burst_dict.get("s"),
+            "truth_lat": burst_dict.get("la"),
+            "truth_lon": burst_dict.get("lo"),
+            "position_age_s": burst_dict.get("pa"),
+            "association_confidence": 1.0 if burst_dict.get("la") is not None and burst_dict.get("lo") is not None else 0.0,
+            "dominant_family": burst_dict.get("df"),
+            "sync_eligible": burst_dict.get("se"),
+        })
+        if entry is None:
+            return
+        evidence = self._normalise_go_evidence_event({
+            "kind": "burst_fired",
+            "iid": burst_dict.get("i"),
+            "icao": burst_dict.get("c"),
+            "arrival_us": burst_dict.get("cu"),
+            "simple_centroid_us": burst_dict.get("cs"),
+            "weighted_centroid_us": burst_dict.get("cw"),
+            "centroid_delta_us": burst_dict.get("cd"),
+            "first_reply_us": burst_dict.get("cf"),
+            "strongest_reply_us": burst_dict.get("ct"),
+            "mid_strong_window_us": burst_dict.get("cm"),
+            "last_reply_us": burst_dict.get("cl"),
+            "span_us": burst_dict.get("cp"),
+            "peak_amplitude": burst_dict.get("pk"),
+            "wall_ts": entry["wall_ts"],
+            "n_replies": burst_dict.get("n"),
+            "signal_dbfs": burst_dict.get("s"),
+            "truth_lat": burst_dict.get("la"),
+            "truth_lon": burst_dict.get("lo"),
+            "position_age_s": burst_dict.get("pa"),
+            "association_confidence": entry["association_confidence"],
+            "dominant_family": burst_dict.get("df"),
+            "sync_eligible": burst_dict.get("se"),
+        })
+        with self._lock:
+            self._go_track_observations.append(entry)
+            if evidence is not None:
+                self._go_evidence_events.append(evidence)
+
+    def _go_track_observation_snapshot(self) -> list[dict]:
+        with self._lock:
+            return list(self._go_track_observations)
+
+    def _go_evidence_event_snapshot(self, iid: int | None = None) -> list[dict]:
+        with self._lock:
+            if iid is None:
+                return list(self._go_evidence_events)
+            return [entry for entry in self._go_evidence_events if int(entry.get("iid", -1)) == iid]
+
+    def _stage3_detection_from_go_observation(self, entry: dict) -> Stage3LiveDetection:
+        return Stage3LiveDetection(
+            iid=int(entry["iid"]),
+            icao=entry.get("icao"),
+            arrival_us=float(entry["arrival_us"]),
+            wall_ts=float(entry["wall_ts"]),
+            df=11,
+            signal_dbfs=entry.get("signal_dbfs"),
+            receiver_lat=self._receiver_lat,
+            receiver_lon=self._receiver_lon,
+            truth_lat=entry.get("truth_lat"),
+            truth_lon=entry.get("truth_lon"),
+            position_age_seconds=entry.get("position_age_seconds"),
+            association_confidence=float(entry.get("association_confidence") or 0.0),
+        )
 
     def get_go_frame_positions(self, iid: int) -> list[dict]:
         with self._lock:
@@ -6551,6 +6950,16 @@ class RadarState:
                 del self._go_frame_positions[iid]
                 self._go_frame_positions_revision[iid] = self._go_frame_positions_revision.get(iid, 0) + 1
                 had_any = True
+            if iid in self._go_sweep_frames_by_iid:
+                del self._go_sweep_frames_by_iid[iid]
+                self._go_sweep_frames_revision[iid] = self._go_sweep_frames_revision.get(iid, 0) + 1
+                had_any = True
+            if iid in self._go_sync_states_by_iid:
+                del self._go_sync_states_by_iid[iid]
+                had_any = True
+            if iid in self._go_reference_aircraft_by_iid:
+                del self._go_reference_aircraft_by_iid[iid]
+                had_any = True
             if iid in self._radar_core_frames_injected_by_iid:
                 del self._radar_core_frames_injected_by_iid[iid]
                 had_any = True
@@ -6575,6 +6984,20 @@ class RadarState:
                 )
                 had_any = had_any or len(filtered_detections) != len(self._live_detection_buffer)
                 self._live_detection_buffer = filtered_detections
+            if self._go_track_observations:
+                filtered_go_detections = deque(
+                    (det for det in self._go_track_observations if int(det.get("iid", -1)) != iid),
+                    maxlen=self._GO_TRACK_OBSERVATIONS_MAX,
+                )
+                had_any = had_any or len(filtered_go_detections) != len(self._go_track_observations)
+                self._go_track_observations = filtered_go_detections
+            if self._go_evidence_events:
+                filtered_go_evidence = deque(
+                    (det for det in self._go_evidence_events if int(det.get("iid", -1)) != iid),
+                    maxlen=self._GO_EVIDENCE_EVENTS_MAX,
+                )
+                had_any = had_any or len(filtered_go_evidence) != len(self._go_evidence_events)
+                self._go_evidence_events = filtered_go_evidence
             if iid in self._iid_latest_arrival_us:
                 del self._iid_latest_arrival_us[iid]
                 had_any = True
@@ -6651,6 +7074,12 @@ class RadarState:
             self._go_fm_pipeline_stats.clear()
             self._go_frame_positions.clear()
             self._go_frame_positions_revision.clear()
+            self._go_sweep_frames_by_iid.clear()
+            self._go_sweep_frames_revision.clear()
+            self._go_sync_states_by_iid.clear()
+            self._go_reference_aircraft_by_iid.clear()
+            self._go_track_observations.clear()
+            self._go_evidence_events.clear()
             self._radar_core_frames_injected_by_iid.clear()
             self._python_frames_finalized_total = 0
             self._python_frames_finalized_by_iid.clear()
@@ -7040,6 +7469,111 @@ class RadarState:
             })
         return results
 
+    def _go_burst_sync_timeline_snapshot(
+        self,
+        iid: int,
+        window_s: float,
+    ) -> list[AlignedBurstSyncObs]:
+        """Rebuild timeline observations lazily from Go-owned burst evidence."""
+        evidence = self._go_evidence_event_snapshot(iid)
+        if not evidence:
+            return []
+
+        with self._lock:
+            model = self._models.get(iid)
+            sync = self._live_sync_states.get(iid)
+        radar_pos = _get_authoritative_radar_position(model) if model is not None else {"lat": None, "lon": None}
+        radar_lat = radar_pos.get("lat")
+        radar_lon = radar_pos.get("lon")
+        if radar_lat is None or radar_lon is None:
+            return []
+
+        cutoff_ts = time.time() - window_s
+        period_s = sync.period_s if sync is not None and sync.period_s > 0 else 0.0
+        observations: list[AlignedBurstSyncObs] = []
+        for entry in sorted(evidence, key=lambda row: (float(row.get("wall_ts") or 0.0), float(row.get("arrival_us") or 0.0))):
+            if str(entry.get("kind") or "burst_fired") != "burst_fired":
+                continue
+            wall_ts = float(entry.get("wall_ts") or 0.0)
+            if wall_ts < cutoff_ts:
+                continue
+            truth_lat = entry.get("truth_lat")
+            truth_lon = entry.get("truth_lon")
+            if truth_lat is None or truth_lon is None:
+                continue
+            bearing_deg = _bearing_deg_simple(radar_lat, radar_lon, float(truth_lat), float(truth_lon))
+            range_nm = _haversine_nm_simple(radar_lat, radar_lon, float(truth_lat), float(truth_lon))
+            pos_age_s = float(entry.get("position_age_seconds") or 0.0)
+            motion_estimate = _estimate_aircraft_bearing_rate(
+                icao=str(entry["icao"]),
+                bearing_deg=bearing_deg,
+                burst_centroid_us=float(entry["arrival_us"]),
+                pos_age_s=pos_age_s,
+                history=observations,
+            )
+            bearing_rate_deg_s = motion_estimate.get("bearing_rate_deg_s")
+            motion_comp_dt_us = _compute_motion_comp_dt_us(period_s, bearing_rate_deg_s) if period_s > 0 else None
+            motion_block_reason = motion_estimate.get("motion_comp_block_reason")
+            motion_applied = bool(
+                RADAR_SYNC_MOTION_COMP_PHASE_ENABLED
+                and motion_comp_dt_us is not None
+                and motion_block_reason is None
+            )
+            if not RADAR_SYNC_MOTION_COMP_PHASE_ENABLED:
+                motion_block_reason = "disabled"
+            elif motion_comp_dt_us is None and motion_block_reason is None:
+                motion_block_reason = "bearing_rate_unavailable"
+            prop_delay_us = _compute_propagation_delay_us(range_nm)
+            prop_corrected_us = (
+                float(entry["arrival_us"]) - prop_delay_us
+                if RADAR_SYNC_PROP_DELAY_ENABLED else float(entry["arrival_us"])
+            )
+            effective_us = prop_corrected_us - motion_comp_dt_us if motion_applied else prop_corrected_us
+            observations.append(AlignedBurstSyncObs(
+                burst_centroid_us=float(entry["arrival_us"]),
+                icao=str(entry["icao"]),
+                bearing_deg=bearing_deg,
+                n_replies=int(entry.get("n_replies") or 0),
+                signal_dbfs=entry.get("signal_dbfs"),
+                pos_age_s=pos_age_s,
+                range_nm=range_nm,
+                ts=wall_ts,
+                sync_update_eligible=bool(entry.get("sync_eligible", False)),
+                raw_arrival_us=float(entry["arrival_us"]),
+                prop_delay_aircraft_to_receiver_us=prop_delay_us,
+                prop_delay_radar_to_aircraft_us=None,
+                effective_arrival_us=effective_us,
+                bearing_rate_deg_s=bearing_rate_deg_s,
+                motion_comp_dt_us=motion_comp_dt_us,
+                motion_corrected_beast_us=effective_us,
+                motion_comp_applied=motion_applied,
+                motion_comp_block_reason=motion_block_reason,
+                burst_center_simple_us=entry.get("simple_centroid_us"),
+                burst_center_weighted_us=entry.get("weighted_centroid_us"),
+                burst_center_delta_us=entry.get("centroid_delta_us"),
+                burst_center_method=(
+                    "amplitude_weighted"
+                    if entry.get("weighted_centroid_us") is not None
+                    else "centroid"
+                ),
+                burst_ts_first_reply_beast_us=entry.get("first_reply_us"),
+                burst_ts_strongest_reply_beast_us=entry.get("strongest_reply_us"),
+                burst_ts_simple_centroid_beast_us=entry.get("simple_centroid_us"),
+                burst_ts_weighted_centroid_beast_us=entry.get("weighted_centroid_us"),
+                burst_ts_mid_strong_window_beast_us=entry.get("mid_strong_window_us"),
+                burst_ts_last_reply_beast_us=entry.get("last_reply_us"),
+                burst_span_us=entry.get("span_us"),
+                peak_amplitude=entry.get("peak_amplitude"),
+                position_interpolated=False,
+                position_extrapolated=False,
+                position_source_age_s=pos_age_s,
+                truth_position_ts_beast_us=(
+                    float(entry["arrival_us"]) - pos_age_s * 1_000_000.0
+                    if pos_age_s > 0 else float(entry["arrival_us"])
+                ),
+            ))
+        return observations
+
     def get_burst_sync_timeline(self, iid: int, window_s: float = 60.0) -> dict:
         """Return burst-centre sync observations with residuals for verification plotting.
 
@@ -7057,12 +7591,13 @@ class RadarState:
             sync = self._live_sync_states.get(iid)
             timeline_obs_buf = self._live_burst_timeline_obs.get(iid)
             aligned_obs_buf = self._live_aligned_burst_obs.get(iid)
-            timeline_obs_snapshot = list(timeline_obs_buf) if timeline_obs_buf else []
+            has_go_evidence = any(int(entry.get("iid", -1)) == iid for entry in self._go_evidence_events)
+            timeline_obs_snapshot = [] if has_go_evidence else (list(timeline_obs_buf) if timeline_obs_buf else [])
             aligned_obs_snapshot = list(aligned_obs_buf) if aligned_obs_buf else []
             obs_buf = timeline_obs_buf
             if obs_buf is None:
                 obs_buf = aligned_obs_buf
-            obs_snapshot = list(obs_buf) if obs_buf else []
+            obs_snapshot = [] if has_go_evidence else (list(obs_buf) if obs_buf else [])
             waveform_bins = list(self._live_waveform_bins.get(iid) or [])
             icao_quality = dict(self._live_icao_sync_quality.get(iid) or {})
             update_history = list(self._live_period_update_history.get(iid) or [])
@@ -7073,6 +7608,10 @@ class RadarState:
             # Take a fast deque snapshot under lock; filtering happens outside so the
             # decoder thread is not blocked while we scan 30k+ elements at Python speed.
             _iid_events_copy = list(self._iid_events)
+
+        if has_go_evidence:
+            timeline_obs_snapshot = self._go_burst_sync_timeline_snapshot(iid, window_s=window_s)
+            obs_snapshot = timeline_obs_snapshot or aligned_obs_snapshot
 
         retention_diagnostics = self._build_live_sync_retention_diagnostics(
             iid,
@@ -7357,11 +7896,16 @@ class RadarState:
         with self._lock:
             sync = self._live_sync_states.get(iid)
             model = self._models.get(iid)
-            obs_buf = self._live_burst_timeline_obs.get(iid) or self._live_aligned_burst_obs.get(iid)
-            obs_len = len(obs_buf) if obs_buf else 0
+            go_evidence = [entry for entry in self._go_evidence_events if int(entry.get("iid", -1)) == iid]
+            obs_buf = None if go_evidence else (self._live_burst_timeline_obs.get(iid) or self._live_aligned_burst_obs.get(iid))
+            obs_len = len(go_evidence) if go_evidence else (len(obs_buf) if obs_buf else 0)
             last_obs_us = None
             last_obs_ts = None
-            if obs_buf:
+            if go_evidence:
+                last_obs = go_evidence[-1]
+                last_obs_us = last_obs.get("arrival_us")
+                last_obs_ts = last_obs.get("wall_ts")
+            elif obs_buf:
                 last_obs = obs_buf[-1]
                 last_obs_us = getattr(last_obs, "burst_centroid_us", None)
                 last_obs_ts = getattr(last_obs, "ts", None)
@@ -7432,15 +7976,20 @@ class RadarState:
             sync = self._live_sync_states.get(iid)
             timeline_obs_buf = self._live_burst_timeline_obs.get(iid)
             aligned_obs_buf = self._live_aligned_burst_obs.get(iid)
-            timeline_obs_snapshot = list(timeline_obs_buf) if timeline_obs_buf else []
+            has_go_evidence = any(int(entry.get("iid", -1)) == iid for entry in self._go_evidence_events)
+            timeline_obs_snapshot = [] if has_go_evidence else (list(timeline_obs_buf) if timeline_obs_buf else [])
             aligned_obs_snapshot = list(aligned_obs_buf) if aligned_obs_buf else []
             obs_buf = timeline_obs_buf
             if obs_buf is None:
                 obs_buf = aligned_obs_buf
-            obs_snapshot = list(obs_buf) if obs_buf else []
+            obs_snapshot = [] if has_go_evidence else (list(obs_buf) if obs_buf else [])
             waveform_bins = list(self._live_waveform_bins.get(iid) or [])
             icao_quality = dict(self._live_icao_sync_quality.get(iid) or {})
             latest_arrival_beast_us = self._iid_latest_arrival_us.get(iid)
+
+        if has_go_evidence:
+            timeline_obs_snapshot = self._go_burst_sync_timeline_snapshot(iid, window_s=window_s)
+            obs_snapshot = timeline_obs_snapshot or aligned_obs_snapshot
 
         retention_diagnostics = self._build_live_sync_retention_diagnostics(
             iid,
@@ -9007,6 +9556,17 @@ class RadarState:
         """Return a snapshot of all current live sync states."""
         return dict(self._live_sync_states)
 
+    def get_go_live_sync_state(self, iid: int) -> dict | None:
+        """Return the compact mirrored Go sync state for one IID, or None."""
+        state = self._go_sync_states_by_iid.get(iid)
+        if state is None:
+            return None
+        return dict(state)
+
+    def get_all_go_live_sync_states(self) -> dict[int, dict]:
+        """Return a snapshot of compact mirrored Go sync state for all IIDs."""
+        return {iid: dict(state) for iid, state in self._go_sync_states_by_iid.items()}
+
     def get_live_waveform_bins(self, iid: int) -> list[WaveformBin]:
         """Return a snapshot of the learned waveform bins for one IID."""
         return list(self._live_waveform_bins.get(iid) or [])
@@ -9031,6 +9591,13 @@ class RadarState:
     ) -> list[Stage3LiveDetection]:
         """Return recent live detections for one IID, newest first."""
         cutoff = time.time() - max_age_s
+        go_snapshot = self._go_track_observation_snapshot()
+        if go_snapshot:
+            return [
+                self._stage3_detection_from_go_observation(entry)
+                for entry in reversed(go_snapshot)
+                if int(entry["iid"]) == iid and float(entry["wall_ts"]) >= cutoff
+            ]
         with self._lock:
             snapshot = list(self._live_detection_buffer)
         return [d for d in reversed(snapshot) if d.iid == iid and d.wall_ts >= cutoff]
@@ -9042,6 +9609,13 @@ class RadarState:
     ) -> list[Stage3LiveDetection]:
         """Return recent live detections for one ICAO across all IIDs, newest first."""
         cutoff = time.time() - max_age_s
+        go_snapshot = self._go_track_observation_snapshot()
+        if go_snapshot:
+            return [
+                self._stage3_detection_from_go_observation(entry)
+                for entry in reversed(go_snapshot)
+                if entry.get("icao") == icao and float(entry["wall_ts"]) >= cutoff
+            ]
         with self._lock:
             snapshot = list(self._live_detection_buffer)
         return [d for d in reversed(snapshot) if d.icao == icao and d.wall_ts >= cutoff]
@@ -9053,6 +9627,13 @@ class RadarState:
     ) -> list[Stage3LiveDetection]:
         """Return recent live detections, optionally filtered to a set of IIDs."""
         cutoff = time.time() - max_age_s
+        go_snapshot = self._go_track_observation_snapshot()
+        if go_snapshot:
+            return [
+                self._stage3_detection_from_go_observation(entry)
+                for entry in reversed(go_snapshot)
+                if float(entry["wall_ts"]) >= cutoff and (iid_subset is None or int(entry["iid"]) in iid_subset)
+            ]
         with self._lock:
             snapshot = list(self._live_detection_buffer)
         return [
@@ -9126,6 +9707,9 @@ class RadarState:
 
     def get_sweep_frames(self, iid: int) -> list:
         """Return live accumulated SweepFrames for an IID, including in-progress frame."""
+        go_frames = list(self._go_sweep_frames_by_iid.get(iid, ()))
+        if go_frames:
+            return go_frames
         frames = list(self._live_completed_frames.get(iid, []))
         # Include the in-progress frame if any
         in_progress = self._live_frames.get(iid)
@@ -9169,8 +9753,9 @@ class RadarState:
         }
 
     def _build_live_sweep_frame_summary_payload_locked(self, iid: int, model: RadarIID | None) -> dict:
-        completed = list(self._live_completed_frames.get(iid, []))
-        in_progress = self._live_frames.get(iid)
+        go_frames = list(self._go_sweep_frames_by_iid.get(iid, ()))
+        completed = go_frames if go_frames else list(self._live_completed_frames.get(iid, []))
+        in_progress = None if go_frames else self._live_frames.get(iid)
         latest_arrival_us = self._iid_latest_arrival_us.get(iid)
         if latest_arrival_us is None:
             latest_arrival_us = self._iid_events[-1][0] if self._iid_events else None
@@ -9226,38 +9811,48 @@ class RadarState:
         """Return cached lightweight SweepFrame JSON for live UI transport."""
         with self._lock:
             model = self._models.get(iid)
-            completed = self._live_completed_frames.get(iid)
-            in_progress = self._live_frames.get(iid)
-            frame_counter = self._live_frame_counters.get(iid, 0)
-            completed_len = len(completed) if completed is not None else 0
-            first_completed = completed[0].frame_index if completed_len > 0 else None
-            last_completed = completed[-1].frame_index if completed_len > 0 else None
-            in_progress_signature = None
-            if in_progress is not None:
-                in_progress_signature = (
-                    in_progress.ref_icao,
-                    round(float(in_progress.ref_arrival_us), 3),
-                    len(in_progress.observations),
-                    tuple(
-                        (
-                            obs.icao,
-                            round(float(obs.arrival_us), 3),
-                            round(float(obs.lat), 6),
-                            round(float(obs.lon), 6),
-                            bool(obs.interpolated),
-                        )
-                        for obs in in_progress.observations
-                    ),
+            go_frames = list(self._go_sweep_frames_by_iid.get(iid, ()))
+            if go_frames:
+                signature = (
+                    "go",
+                    self._go_sweep_frames_revision.get(iid, 0),
+                    self._iid_latest_arrival_us.get(iid),
+                    model.last_updated if model is not None else None,
                 )
-            signature = (
-                frame_counter,
-                completed_len,
-                first_completed,
-                last_completed,
-                in_progress_signature,
-                self._iid_latest_arrival_us.get(iid),
-                model.last_updated if model is not None else None,
-            )
+            else:
+                completed = self._live_completed_frames.get(iid)
+                in_progress = self._live_frames.get(iid)
+                frame_counter = self._live_frame_counters.get(iid, 0)
+                completed_len = len(completed) if completed is not None else 0
+                first_completed = completed[0].frame_index if completed_len > 0 else None
+                last_completed = completed[-1].frame_index if completed_len > 0 else None
+                in_progress_signature = None
+                if in_progress is not None:
+                    in_progress_signature = (
+                        in_progress.ref_icao,
+                        round(float(in_progress.ref_arrival_us), 3),
+                        len(in_progress.observations),
+                        tuple(
+                            (
+                                obs.icao,
+                                round(float(obs.arrival_us), 3),
+                                round(float(obs.lat), 6),
+                                round(float(obs.lon), 6),
+                                bool(obs.interpolated),
+                            )
+                            for obs in in_progress.observations
+                        ),
+                    )
+                signature = (
+                    "python",
+                    frame_counter,
+                    completed_len,
+                    first_completed,
+                    last_completed,
+                    in_progress_signature,
+                    self._iid_latest_arrival_us.get(iid),
+                    model.last_updated if model is not None else None,
+                )
             cached = self._live_sweep_frame_summary_cache.get(iid)
             if cached is not None and self._live_sweep_frame_summary_signature.get(iid) == signature:
                 self._live_sweep_frame_summary_last_cache_hit[iid] = True
@@ -9286,6 +9881,9 @@ class RadarState:
 
     def get_reference_aircraft(self, iid: int) -> dict:
         """Return current reference aircraft selection state."""
+        go_ref = self._go_reference_aircraft_by_iid.get(iid)
+        if go_ref is not None:
+            return dict(go_ref)
         model = self._models.get(iid)
         if model is None:
             return {"status": "NO_MODEL"}

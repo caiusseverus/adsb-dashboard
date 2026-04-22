@@ -70,8 +70,13 @@ type DebugSnapshot struct {
 	SyncPresent                     bool
 	SyncQuality                     float64
 	SyncUsable                      bool
+	SyncPeriodS                     float64
+	SyncJitterDeg                   float64
+	SyncResidualEMA                 float64
 	SyncHoldover                    bool
 	SyncNSyncFrames                 int
+	SyncNRejectedFrames             int
+	SyncLastUpdatedUnix             float64
 	ActiveAircraftEstimate          int
 	BurstRecordsTotal               int
 	BurstRecordsDynamicCap          int
@@ -311,8 +316,13 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 	if s.Sync != nil {
 		out.SyncPresent = true
 		out.SyncQuality = s.Sync.SyncQuality
+		out.SyncPeriodS = s.Sync.PeriodS
+		out.SyncJitterDeg = s.Sync.SyncJitterDeg
+		out.SyncResidualEMA = s.Sync.ResidualEMA
 		out.SyncHoldover = s.Sync.Holdover
 		out.SyncNSyncFrames = s.Sync.NSyncFrames
+		out.SyncNRejectedFrames = s.Sync.NRejectedFrames
+		out.SyncLastUpdatedUnix = float64(s.Sync.LastUpdated.UnixNano()) / 1e9
 		out.SyncUsable = s.Sync.SyncQuality >= 0.3 && !s.Sync.Holdover
 	}
 	out.ActiveAircraftEstimate = s.lastActiveAircraft

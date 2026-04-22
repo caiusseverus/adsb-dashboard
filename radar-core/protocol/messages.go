@@ -71,19 +71,28 @@ type ResetIID struct {
 // BurstFired is emitted when a burst window closes and the centroid is computed.
 // Position fields are nil if no ADS-B fix was available within the freshness window.
 type BurstFired struct {
-	MsgType        uint8    `codec:"t"`
-	IID            uint8    `codec:"i"`
-	ICAO           uint32   `codec:"c"`
-	CentroidUS     float64  `codec:"cu"`
-	NReplies       uint8    `codec:"n"`
-	SignalDBFS     *float32 `codec:"s"`
-	Lat            *float64 `codec:"la"`
-	Lon            *float64 `codec:"lo"`
-	BearingDeg     *float32 `codec:"br"`
-	RangeNM        *float32 `codec:"rn"`
-	PosAgeS        *float32 `codec:"pa"`
-	DominantFamily bool     `codec:"df"`
-	SyncEligible   bool     `codec:"se"`
+	MsgType            uint8    `codec:"t"`
+	IID                uint8    `codec:"i"`
+	ICAO               uint32   `codec:"c"`
+	CentroidUS         float64  `codec:"cu"`
+	SimpleCentroidUS   *float64 `codec:"cs"`
+	WeightedCentroidUS *float64 `codec:"cw"`
+	CentroidDeltaUS    *float64 `codec:"cd"`
+	FirstReplyUS       *float64 `codec:"cf"`
+	StrongestReplyUS   *float64 `codec:"ct"`
+	MidStrongWindowUS  *float64 `codec:"cm"`
+	LastReplyUS        *float64 `codec:"cl"`
+	SpanUS             *float64 `codec:"cp"`
+	PeakAmplitude      *float32 `codec:"pk"`
+	NReplies           uint8    `codec:"n"`
+	SignalDBFS         *float32 `codec:"s"`
+	Lat                *float64 `codec:"la"`
+	Lon                *float64 `codec:"lo"`
+	BearingDeg         *float32 `codec:"br"`
+	RangeNM            *float32 `codec:"rn"`
+	PosAgeS            *float32 `codec:"pa"`
+	DominantFamily     bool     `codec:"df"`
+	SyncEligible       bool     `codec:"se"`
 }
 
 // FrameObservation is one non-reference aircraft within a SweepFrame.

@@ -77,6 +77,7 @@ type Accumulator struct {
 	gateCounts             map[string]uint64
 	lastGateReason         string
 	lastGateICAO           uint32
+	ObserveStage           func(stage string, dur time.Duration)
 }
 
 // New returns an Accumulator for the given IID.
@@ -142,7 +143,12 @@ func (a *Accumulator) OnBurst(
 		if a.frame != nil {
 			return // frame already open; don't restart mid-sweep
 		}
-		if !a.matchesDominant(icao, periodS, family) {
+		tDominant := time.Now()
+		matchesDominant := a.matchesDominant(icao, periodS, family)
+		if a.ObserveStage != nil {
+			a.ObserveStage("dominant_check", time.Since(tDominant))
+		}
+		if !matchesDominant {
 			a.recordGate("ref_not_dominant", icao)
 			return
 		}
@@ -159,6 +165,7 @@ func (a *Accumulator) OnBurst(
 		}
 		refPosAgeS := float64(time.Since(pos.TS).Seconds())
 
+		tMutation := time.Now()
 		a.frame = &liveFrame{
 			refICAO:      icao,
 			refLat:       pos.Lat,
@@ -167,6 +174,9 @@ func (a *Accumulator) OnBurst(
 			refPosAgeS:   refPosAgeS,
 			nAircraft:    1,
 			seenICAOs:    map[uint32]struct{}{icao: {}},
+		}
+		if a.ObserveStage != nil {
+			a.ObserveStage("frame_mutation", time.Since(tMutation))
 		}
 		a.lastFrameStartUS = centroidUS
 		return
@@ -189,11 +199,21 @@ func (a *Accumulator) OnBurst(
 		a.recordGate("duplicate_icao", icao)
 		return // one observation per aircraft per frame
 	}
-	if !a.matchesDominant(icao, periodS, family) {
+	tDominant := time.Now()
+	matchesDominant := a.matchesDominant(icao, periodS, family)
+	if a.ObserveStage != nil {
+		a.ObserveStage("dominant_check", time.Since(tDominant))
+	}
+	if !matchesDominant {
 		a.recordGate("obs_not_dominant", icao)
 		return
 	}
-	if !a.matchesPhaseFamily(refICAO, a.frame.refArrivalUS, icao, centroidUS, periodUS) {
+	tPhase := time.Now()
+	matchesPhase := a.matchesPhaseFamily(refICAO, a.frame.refArrivalUS, icao, centroidUS, periodUS)
+	if a.ObserveStage != nil {
+		a.ObserveStage("phase_check", time.Since(tPhase))
+	}
+	if !matchesPhase {
 		a.recordGate("phase_mismatch", icao)
 		return
 	}
@@ -209,6 +229,7 @@ func (a *Accumulator) OnBurst(
 	if nR > 255 {
 		nR = 255
 	}
+	tMutation := time.Now()
 	a.frame.observations = append(a.frame.observations, protocol.FrameObservation{
 		ICAO:      icao,
 		Lat:       pos.Lat,
@@ -219,10 +240,19 @@ func (a *Accumulator) OnBurst(
 	})
 	a.frame.seenICAOs[icao] = struct{}{}
 	a.frame.nAircraft++
+	if a.ObserveStage != nil {
+		a.ObserveStage("frame_mutation", time.Since(tMutation))
+	}
 }
 
 // finalizeFrame closes the current frame and emits FRAME_READY if sufficient.
 func (a *Accumulator) finalizeFrame(periodS float64) {
+	tFinalize := time.Now()
+	defer func() {
+		if a.ObserveStage != nil {
+			a.ObserveStage("frame_finalisation", time.Since(tFinalize))
+		}
+	}()
 	f := a.frame
 	if f == nil {
 		return

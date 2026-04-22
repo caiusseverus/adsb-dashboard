@@ -1,5 +1,146 @@
 # Deficiency Rectification Plan
 
+## 2026-04-22 Go Radar Engine Migration Slice 1
+
+- [x] Confirm and document the current Python live radar hot path inventory in `backend/radar/sweep.py`, `backend/radar/api.py`, `backend/radar/aircraft_localiser.py`, and `backend/radar/aircraft_api.py`
+- [x] Formalise Go-owned exported DTOs for the migration boundary in `radar-core/export/` and `radar-core/protocol/messages.go`: `RadarSnapshot`, `SweepFrame`, `EvidenceEvent`, and `TrackObservation`
+- [x] Add Go-side profiling/timing aggregation for the live burst/export path in `radar-core/profile/` and expose it through snapshot payloads
+- [x] Implement one end-to-end migrated hot-path component in Go: bounded `TrackObservation` export and retention driven directly from fired bursts, without Python-side rebuild of that object
+- [x] Add Python radar-core wrapper/client accessors for Go snapshot exports in `backend/radar_core/client.py` and thin `RadarState` bridge methods in `backend/radar/sweep.py`
+- [x] Switch Stage 3 live-detection consumers to prefer Go-produced observation objects when radar-core is enabled, while keeping Stage 3 logically separate from Stage 1/2 internals
+- [x] Add focused verification for DTO export, client parsing, and Stage 3 consumption fallback behavior
+
+Plan confirmation: extend the existing `radar-core` service as the Go radar engine boundary instead of adding a second competing daemon. Keep Stage 3 separate by migrating Go-produced observation objects first, not by moving the Stage 3 solver itself or by wiring Stage 3 directly into earlier-stage mutable Go internals.
+
+### Current Python Hot-Path Inventory
+
+- `backend/radar/sweep.py:2391` `RadarState.on_frame()` and `:3145` `on_df11_batch()` still ingest live DF11 events and drive the live radar path
+- `backend/radar/sweep.py:2721` `_process_fired_bursts()` still owns burst-history append, ADS-B position lookup, live detection assembly, timeline/aligned sync observation recording, reference selection/reuse, dominant-family checks, phase-family checks, frame mutation, and frame finalisation dispatch
+- `backend/radar/sweep.py:3282` `_finalize_live_frame()` still builds authoritative Python `SweepFrame` objects and seeds sync bootstrap
+- `backend/radar/sweep.py:3965` `_record_live_burst_detection()` still builds Stage 3 live detection objects in Python
+- `backend/radar/sweep.py:4020` `_record_aligned_burst_sync_obs()` and `:4120` `_record_burst_sync_timeline_obs()` still assemble sync/evidence observations and retention buffers in Python
+- `backend/radar/sweep.py:4560` `_update_multi_aircraft_sync_state()` still owns the expensive live sync refinement path: residual scoring, anchor selection, dominant-family/phase validation, period refinement, waveform handling, and sync snapshot state mutation
+- `backend/radar/sweep.py:9027` `get_recent_live_detections*()` still serve Stage 3 live input from Python-owned buffers
+- `backend/radar/api.py` still reads Python `RadarState` structures for radar snapshot/debug endpoints, including sweep-frame and sync views
+- `backend/radar/aircraft_localiser.py:1180` `select_authoritative_observations()` still consumes Python `Stage3LiveDetection` objects for Stage 3 live localisation input
+- `backend/radar/aircraft_api.py:267` `_get_active_icaos()` still discovers Stage 3 targets from Python live detection buffers
+
+### Review
+
+- Added stable Go export DTOs in `radar-core/export/`:
+  - `RadarSnapshot` as the top-level exported object
+  - `SweepFrame` as the stable frame DTO
+  - `EvidenceEvent` as the compact burst/evidence DTO
+  - `TrackObservation` as the Stage 3-facing live observation DTO
+- Added Go retention for exported live objects in `radar-core/export/store.go` so reconnects and snapshot consumers can query bounded authoritative Go-owned state rather than forcing Python to rebuild that object from hot-path internals.
+- Added Go timing aggregation in `radar-core/profile/collector.go` and instrumented the migrated export path plus frame accumulator stages currently available in Go (`burst_processing`, `dominant_check`, `phase_check`, `frame_mutation`, `frame_finalisation`, `sync_update`, `snapshot_export`, `evidence_export`).
+- Extended `radar-core/cmd/radar-core/main.go` so fired bursts now populate exported `TrackObservation` and `EvidenceEvent` rings, emitted `SweepFrame` objects are retained for snapshot export, and the snapshot payload now includes both the new stable `radar_snapshot` object and compatibility top-level arrays (`track_observations`, `evidence_events`, `sweep_frames`, `profile`).
+- Extended `backend/radar_core/client.py` with snapshot accessors for Go observation/evidence exports.
+- Extended `backend/radar/sweep.py` with Go burst/snapshot bridge methods and changed `get_recent_live_detections*()` to prefer Go-produced `TrackObservation` objects when available, falling back to the legacy Python buffer otherwise.
+- Wired `backend/main.py` to always feed Go burst and snapshot exports back into `RadarState`, independent of whether Go FM is authoritative.
+- Verification:
+  - `python3 -m py_compile backend/radar_core/client.py backend/radar/sweep.py backend/main.py backend/tests/test_radar_core_client.py`
+  - `uv run --directory backend pytest tests/test_radar_core_client.py tests/test_aircraft_localiser_target_live.py`
+  - `go test ./...` in `radar-core` with writable local caches and escalated network/toolchain access
+  - Result: Python compile passed, `27 passed` in the targeted backend test run, and all `radar-core` Go tests passed.
+- Remaining migration scope after this slice:
+  - Go is not yet authoritative for Python’s full live sync refinement state.
+  - Python still owns the expensive multi-aircraft sync update logic, sweep snapshot/debug assembly, and most radar API shaping.
+  - Stage 3 still solves in Python; this slice only moved its live observation object production onto a Go-owned path.
+
+## 2026-04-22 Go Radar Engine Migration Slice 2
+
+- [x] Make Go-exported `SweepFrame` state authoritative for Python consumer reads in `backend/radar/sweep.py`
+- [x] Feed live `FRAME_READY` messages into a Go-frame mirror even when Python FM injection is disabled, so Python readers are not gated on periodic snapshot polling
+- [x] Reconcile Go snapshot `sweep_frames` and `reference_icao` into bounded Python-side mirrors for reconnect recovery
+- [x] Switch `get_sweep_frames()`, sweep-frame summary payloads, and reference-aircraft reads to prefer Go-authored state with Python fallback
+- [x] Add focused tests proving Go frame reads override Python frame buffers when present and that selected/reference state follows Go snapshot data
+- [x] Run targeted verification for radar-core client/state bridging and radar API frame consumers
+
+Plan confirmation: keep this slice on the consumer boundary, not the solver boundary. Go already owns the operational frame accumulator; this stage makes Python read that Go-authored frame/reference state directly instead of treating the Python frame buffers as the primary source. Stage 3 remains logically separate and still consumes exported objects rather than early-stage mutable internals.
+
+### Review
+
+- Added Go-frame mirror state to [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py):
+  - bounded per-IID Go `SweepFrame` mirrors plus revisions
+  - Go-backed reference-aircraft mirror
+  - snapshot reconciliation for `sweep_frames` and `reference_icao`
+  - live `FRAME_READY` mirroring via `update_go_frame_ready(...)`
+- Switched `get_sweep_frames()` to prefer Go-authored frames whenever they exist for an IID, with Python frame buffers retained only as fallback.
+- Switched lightweight sweep-frame summary payload generation/cache signatures to track Go frame revisions when Go frames exist, so selected-IID live state no longer rebuilds from Python-only frame buffers in that mode.
+- Switched `get_reference_aircraft()` to prefer the Go-backed mirror, with Python model state retained as fallback.
+- Updated [backend/main.py](/home/keith/claude/adsb-dashboard/backend/main.py) so `FRAME_READY` always updates the Go-read mirror path, and only conditionally injects the same frame into the Python FM mailbox when that compatibility mode is enabled.
+- Added reset hygiene so IID resets and full radar resets clear the new Go frame/reference mirrors as well as Go observation/evidence mirrors.
+- Added focused regressions in [backend/tests/test_radar_core_client.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_core_client.py) proving:
+  - Go `FRAME_READY` immediately overrides Python frame reads
+  - Go snapshot `reference_icao` drives `get_reference_aircraft()`
+  - Go snapshot `sweep_frames` drives sweep-frame summary payloads
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/main.py backend/tests/test_radar_core_client.py`
+  - `uv run --directory backend pytest tests/test_radar_core_client.py tests/test_radar_api.py -k 'selected_state or sweep_frame or reference_aircraft or radar_state_prefers_go'`
+  - Result: compile passed; `10 passed, 42 deselected`.
+- Remaining migration scope after this slice:
+  - Python still owns the expensive live multi-aircraft sync update/refinement path.
+  - Python still performs live burst timeline/aligned observation assembly and sync debug reconstruction.
+  - Reference selection is now read from Go when available, but the broader sync/snapshot/debug authority boundary is not yet fully moved.
+
+## 2026-04-22 Go Radar Engine Migration Slice 3
+
+- [x] Add a compact Go-sync mirror to `backend/radar/sweep.py` that is hydrated from radar-core snapshot payloads and cleared correctly on IID/global reset
+- [x] Keep `get_live_sync_state()`, `get_all_live_sync_states()`, and `get_live_sync_snapshot()` on the existing Python rich sync state so Stage 3 and sync diagnostics remain logically separate from this slice
+- [x] Switch lightweight live radar state payloads in `backend/radar/api.py` to prefer compact Go sync values when present, with Python fallback for fields Go does not yet export
+- [x] Add focused backend tests proving `/api/radar/live/latest` prefers Go sync mirrors without changing the rich Python sync snapshot path
+- [x] Run targeted verification and record the slice review
+
+Plan confirmation: move only the compact consumer-facing sync summary boundary in this slice. Do not redirect Stage 3 or the rich sync-debug/snapshot paths onto the current Go sync model yet, because Go does not yet export the anchor/refinement fields those paths rely on.
+
+### Review
+
+- Extended `radar-core` compact IID snapshot exports so Go now publishes a usable sync summary for each IID: `sync_period_s`, `sync_jitter_deg`, `sync_residual_ema_deg`, `sync_n_frames`, `sync_n_rejected_frames`, `sync_holdover`, and `sync_last_updated`, sourced from the existing Go `SyncState`.
+- Added a bounded Python mirror for that compact Go sync state in [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py), hydrated from snapshot reconciliation and cleared on IID/global reset alongside the other Go-owned mirrors.
+- Switched [backend/radar/api.py](/home/keith/claude/adsb-dashboard/backend/radar/api.py) lightweight live-state payloads and live-stream change signatures to prefer Go sync period/jitter/residual/frame-count/holdover state when present, while still falling back to Python for fields Go does not yet export such as anchor/refinement details.
+- Explicitly left `get_live_sync_state()`, `get_all_live_sync_states()`, and `get_live_sync_snapshot()` on the Python rich sync model so Stage 3 and sync diagnostics continue to see the existing anchor/refinement state without regression.
+- Added focused regressions in [backend/tests/test_radar_api.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_api.py) proving:
+  - `/api/radar/live/latest`-style payload assembly prefers Go sync summaries when available
+  - rich sync snapshot payloads remain Python-backed even when Go sync mirrors exist
+- Verification:
+  - `gofmt -w radar-core/export/types.go radar-core/iid/state.go radar-core/cmd/radar-core/main.go`
+  - `python3 -m py_compile backend/radar/sweep.py backend/radar/api.py backend/tests/test_radar_api.py`
+  - `uv run --directory backend pytest tests/test_radar_api.py -k 'build_radar_live_state_payload_prefers_go_sync_summary or get_iid_sync_snapshot_stays_python_backed_when_go_sync_exists or get_iid_sync_snapshot_endpoint_combines_fast_sync_payloads or get_iid_sync_snapshot_marks_cache_hits or pipeline_debug'`
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./...`
+  - Result: Python compile passed, targeted radar API tests passed (`6 passed, 38 deselected`), and `radar-core` Go tests passed.
+- Remaining migration scope after this slice:
+  - Python still owns authoritative multi-aircraft sync refinement, anchor selection, waveform learning, and sync-debug/timeline assembly.
+  - Stage 3 still consumes the Python rich sync model and solver inputs remain intentionally separate from this compact Go sync summary path.
+  - The next substantial boundary is to move authoritative per-IID sync maintenance itself into Go with enough exported parity for Python to stop maintaining duplicate live sync internals.
+
+## 2026-04-22 Go Radar Engine Migration Slice 4
+
+- [x] Extend Go burst/evidence exports with the burst timestamp diagnostics needed to rebuild sync timeline observations lazily
+- [x] Mirror richer Go evidence in `backend/radar/sweep.py` and make sync timeline reads prefer Go-owned evidence when available
+- [x] Stop Python from appending the broad `_live_burst_timeline_obs` buffer on the hot path when Go evidence ownership is active
+- [x] Keep Python aligned-burst sync maintenance and rich `LiveSyncState` authority intact so Stage 3 separation is unchanged
+- [x] Add focused verification for Go-backed sync timeline reconstruction and record the slice review
+
+Plan confirmation: move the retained sync-timeline evidence boundary, not the sync solver boundary. In Go mode, Go should own the burst evidence history used for sync snapshot/timeline reads, while Python continues to own the richer aligned-burst fit and Stage 3-facing sync state until Go exports enough parity to replace that safely.
+
+### Review
+
+- Extended the Go burst/evidence path so `burst.FiredBurst`, `protocol.BurstFired`, and exported `EvidenceEvent` now carry burst timestamp diagnostics needed by the sync timeline path: simple/weighted centroid, centroid delta, first/strongest/last reply timestamps, mid-strong-window timestamp, burst span, and peak amplitude.
+- Updated [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) to mirror those richer Go evidence fields and added lazy Go-backed timeline reconstruction for `get_burst_sync_timeline(...)` and `get_sync_debug_payload(...)`.
+- Changed the native Python hot path so `_process_fired_bursts(...)` no longer appends the broader `_live_burst_timeline_obs` buffer when radar-core evidence ownership is active. In Go mode, Python still records the aligned dominant-family sync-maintenance buffer, but the broader sync timeline history now comes from Go-owned evidence.
+- Kept authoritative aligned-burst sync maintenance and rich `LiveSyncState` updates in Python. Stage 3 still reads the same rich sync model and remains logically separate from the earlier radar-localisation stages.
+- Added focused coverage in [backend/tests/test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) proving a sync timeline can be rebuilt from Go evidence even with no Python timeline buffer.
+- Verification:
+  - `gofmt -w radar-core/burst/centroid.go radar-core/burst/builder.go radar-core/protocol/messages.go radar-core/export/types.go radar-core/cmd/radar-core/main.go`
+  - `python3 -m py_compile backend/radar/sweep.py backend/tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -k 'burst_sync_timeline or sync_debug_payload'`
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./...`
+  - Result: Python compile passed, targeted sweep tests passed (`3 passed, 71 deselected`), and `radar-core` Go tests passed.
+- Remaining migration scope after this slice:
+  - Python still owns the aligned-burst sync-maintenance buffer, multi-aircraft sync fit, anchor selection/validation, waveform learning, and authoritative rich sync state.
+  - The next substantial boundary is still authoritative per-IID sync maintenance itself: move that fit/anchor/reacquire logic into Go with enough exported parity that Python can stop maintaining duplicate live sync internals while Stage 3 continues to consume exported objects rather than mutable earlier-stage state.
+
 ## 2026-04-22 Wrong-Period Reacquire Refinement Follow-Up
 
 - [x] Re-inspect the current period-failure detector, reacquire recovery gate, and refine-freeze behavior in `backend/radar/sweep.py`

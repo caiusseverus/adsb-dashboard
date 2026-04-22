@@ -206,6 +206,26 @@ class RadarCoreClient:
                 "send_queue_depth": self._send_queue.qsize(),
             }
 
+    def latest_snapshot(self) -> dict | None:
+        with self._stats_lock:
+            if self._latest_snapshot is None:
+                return None
+            return dict(self._latest_snapshot)
+
+    def latest_track_observations(self, iid: int | None = None) -> list[dict]:
+        snapshot = self.latest_snapshot() or {}
+        observations = list(snapshot.get("track_observations") or [])
+        if iid is None:
+            return observations
+        return [entry for entry in observations if int(entry.get("iid", -1)) == iid]
+
+    def latest_evidence_events(self, iid: int | None = None) -> list[dict]:
+        snapshot = self.latest_snapshot() or {}
+        events = list(snapshot.get("evidence_events") or [])
+        if iid is None:
+            return events
+        return [entry for entry in events if int(entry.get("iid", -1)) == iid]
+
     # ------------------------------------------------------------------
     # Internal threads
     # ------------------------------------------------------------------

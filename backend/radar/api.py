@@ -3936,6 +3936,7 @@ def build_radar_live_state_payload(state: "RadarState" | None) -> dict:
     with state._lock:
         for iid, model in sorted(models.items()):
             sync = state._live_sync_states.get(iid)
+            go_sync = state._go_sync_states_by_iid.get(iid)
             entry: dict = {
                 "iid": iid,
                 "status": model.status,
@@ -3952,20 +3953,53 @@ def build_radar_live_state_payload(state: "RadarState" | None) -> dict:
                 # Sync health — None when no sync state yet
                 "sync": None,
             }
-            if sync is not None:
+            if sync is not None or go_sync is not None:
                 entry["sync"] = {
-                    "period_s": sync.period_s,
-                    "period_correction_ppm": sync.period_correction_ppm,
-                    "period_correction_status": sync.period_correction_status,
-                    "sync_jitter_deg": sync.sync_jitter_deg,
-                    "residual_ema_deg": sync.residual_ema_deg,
-                    "n_sync_frames": sync.n_sync_frames,
-                    "n_rejected_frames": sync.n_rejected_frames,
-                    "holdover": sync.holdover,
-                    "phase_anchor_icao": sync.phase_anchor_icao,
-                    "fit_support_count": sync.n_burst_obs_inliers,
-                    "fit_reject_count": sync.n_burst_obs_rejected,
-                    "usable": sync.usable,
+                    "period_s": (
+                        go_sync.get("period_s")
+                        if go_sync is not None and go_sync.get("period_s") is not None
+                        else (sync.period_s if sync is not None else None)
+                    ),
+                    "period_correction_ppm": sync.period_correction_ppm if sync is not None else None,
+                    "period_correction_status": sync.period_correction_status if sync is not None else None,
+                    "sync_jitter_deg": (
+                        go_sync.get("sync_jitter_deg")
+                        if go_sync is not None and go_sync.get("sync_jitter_deg") is not None
+                        else (sync.sync_jitter_deg if sync is not None else None)
+                    ),
+                    "residual_ema_deg": (
+                        go_sync.get("residual_ema_deg")
+                        if go_sync is not None and go_sync.get("residual_ema_deg") is not None
+                        else (sync.residual_ema_deg if sync is not None else None)
+                    ),
+                    "n_sync_frames": (
+                        go_sync.get("n_sync_frames")
+                        if go_sync is not None
+                        else (sync.n_sync_frames if sync is not None else None)
+                    ),
+                    "n_rejected_frames": (
+                        go_sync.get("n_rejected_frames")
+                        if go_sync is not None
+                        else (sync.n_rejected_frames if sync is not None else None)
+                    ),
+                    "holdover": (
+                        go_sync.get("holdover")
+                        if go_sync is not None
+                        else (sync.holdover if sync is not None else None)
+                    ),
+                    "phase_anchor_icao": sync.phase_anchor_icao if sync is not None else None,
+                    "fit_support_count": sync.n_burst_obs_inliers if sync is not None else None,
+                    "fit_reject_count": sync.n_burst_obs_rejected if sync is not None else None,
+                    "usable": (
+                        go_sync.get("usable")
+                        if go_sync is not None
+                        else (sync.usable if sync is not None else None)
+                    ),
+                    "sync_quality": (
+                        go_sync.get("sync_quality")
+                        if go_sync is not None
+                        else (sync.sync_quality if sync is not None else None)
+                    ),
                 }
             iids_out.append(entry)
 
@@ -3980,16 +4014,33 @@ def _radar_live_signature(state: "RadarState" | None) -> tuple:
     with state._lock:
         for iid, model in state._models.items():
             sync = state._live_sync_states.get(iid)
+            go_sync = state._go_sync_states_by_iid.get(iid)
             sig_parts.append((
                 iid,
                 model.period_s,
                 model.last_updated,
                 model.lat, model.lon,
                 model.fm_lat, model.fm_lon,
-                getattr(sync, "last_sync_update_ts", None),
-                getattr(sync, "period_s", None),
-                getattr(sync, "n_sync_frames", None),
-                getattr(sync, "holdover", None),
+                (
+                    go_sync.get("last_updated")
+                    if go_sync is not None
+                    else getattr(sync, "last_sync_update_ts", None)
+                ),
+                (
+                    go_sync.get("period_s")
+                    if go_sync is not None
+                    else getattr(sync, "period_s", None)
+                ),
+                (
+                    go_sync.get("n_sync_frames")
+                    if go_sync is not None
+                    else getattr(sync, "n_sync_frames", None)
+                ),
+                (
+                    go_sync.get("holdover")
+                    if go_sync is not None
+                    else getattr(sync, "holdover", None)
+                ),
             ))
     return tuple(sig_parts)
 

@@ -7,12 +7,21 @@ import (
 
 // FiredBurst is emitted when a burst window closes.
 type FiredBurst struct {
-	IID        uint8
-	ICAO       uint32
-	CentroidUS float64
-	NReplies   int
-	SignalDBFS *float64 // nil if no signal in any reply
-	FiredAt    time.Time
+	IID                uint8
+	ICAO               uint32
+	CentroidUS         float64
+	NReplies           int
+	SignalDBFS         *float64 // nil if no signal in any reply
+	SimpleCentroidUS   float64
+	WeightedCentroidUS *float64
+	CentroidDeltaUS    float64
+	FirstReplyUS       float64
+	StrongestReplyUS   *float64
+	MidStrongWindowUS  *float64
+	LastReplyUS        float64
+	SpanUS             float64
+	PeakAmplitude      *float64
+	FiredAt            time.Time
 }
 
 // pendingBurst tracks in-flight replies for one (IID, ICAO) pair.
@@ -51,13 +60,23 @@ func (b *Builder) OnEvent(arrivalUS float64, icao uint32, signalDBFS *float64, b
 	for _, pb := range b.pending {
 		if len(pb.replies) > 0 && (arrivalUS-pb.lastArrivalUS) > burstGapUS {
 			centroidUS, sig, n := Centroid(pb.replies)
+			diag := ComputeDiagnostics(pb.replies)
 			fired = append(fired, FiredBurst{
-				IID:        b.iid,
-				ICAO:       pb.icao,
-				CentroidUS: centroidUS,
-				NReplies:   n,
-				SignalDBFS: sig,
-				FiredAt:    time.Now(),
+				IID:                b.iid,
+				ICAO:               pb.icao,
+				CentroidUS:         centroidUS,
+				NReplies:           n,
+				SignalDBFS:         sig,
+				SimpleCentroidUS:   diag.SimpleCentroidUS,
+				WeightedCentroidUS: diag.WeightedCentroidUS,
+				CentroidDeltaUS:    diag.CentroidDeltaUS,
+				FirstReplyUS:       diag.FirstReplyUS,
+				StrongestReplyUS:   diag.StrongestReplyUS,
+				MidStrongWindowUS:  diag.MidStrongWindowUS,
+				LastReplyUS:        diag.LastReplyUS,
+				SpanUS:             diag.SpanUS,
+				PeakAmplitude:      diag.PeakAmplitude,
+				FiredAt:            time.Now(),
 			})
 			pb.replies = pb.replies[:0]
 			pb.lastArrivalUS = arrivalUS

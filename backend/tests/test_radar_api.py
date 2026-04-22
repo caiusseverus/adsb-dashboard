@@ -218,6 +218,124 @@ def test_get_iid_sync_snapshot_endpoint_combines_fast_sync_payloads(monkeypatch)
     assert payload["retention_diagnostics"]["timeline"]["count"] == 1
 
 
+def test_build_radar_live_state_payload_prefers_go_sync_summary():
+    state = RadarState()
+    state._models[23] = RadarIID(iid=23, status="SINGLE_RADAR", period_s=4.0)
+    state._live_sync_states[23] = LiveSyncState(
+        iid=23,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.35,
+        sync_jitter_deg=9.0,
+        residual_ema_deg=12.0,
+        n_sync_frames=2,
+        n_rejected_frames=5,
+        holdover=True,
+        n_burst_obs_inliers=7,
+        n_burst_obs_rejected=4,
+        phase_anchor_icao="AAAAAA",
+        last_sync_update_ts=1000.0,
+        source="multi_aircraft_burst",
+        usable=False,
+    )
+    state.update_go_snapshot({
+        "iids": {
+            "23": {
+                "iid": 23,
+                "sync_state_present": True,
+                "sync_state_usable": True,
+                "sync_quality": 0.82,
+                "sync_period_s": 4.25,
+                "sync_jitter_deg": 1.5,
+                "sync_residual_ema_deg": 2.5,
+                "sync_n_frames": 17,
+                "sync_n_rejected_frames": 3,
+                "sync_holdover": False,
+                "sync_last_updated": 1234.5,
+            }
+        }
+    })
+
+    payload = radar_api.build_radar_live_state_payload(state)
+    row = payload["iids"][0]
+
+    assert row["sync"]["period_s"] == 4.25
+    assert row["sync"]["sync_jitter_deg"] == 1.5
+    assert row["sync"]["residual_ema_deg"] == 2.5
+    assert row["sync"]["n_sync_frames"] == 17
+    assert row["sync"]["n_rejected_frames"] == 3
+    assert row["sync"]["holdover"] is False
+    assert row["sync"]["usable"] is True
+    assert row["sync"]["sync_quality"] == 0.82
+    assert row["sync"]["phase_anchor_icao"] == "AAAAAA"
+    assert row["sync"]["fit_support_count"] == 7
+    assert row["sync"]["fit_reject_count"] == 4
+
+
+def test_get_iid_sync_snapshot_stays_python_backed_when_go_sync_exists(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", False)
+    monkeypatch.setattr("radar.sweep.RADAR_DIAGNOSTICS", False)
+    state = RadarState()
+    now_ts = 1_000.0
+    state._models[23] = RadarIID(iid=23, status="SINGLE_RADAR", period_s=4.0)
+    state._iid_latest_arrival_us[23] = 4_100_000.0
+    state._live_sync_states[23] = LiveSyncState(
+        iid=23,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        residual_ema_deg=4.0,
+        n_sync_frames=6,
+        n_rejected_frames=1,
+        last_sync_update_ts=now_ts,
+        source="multi_aircraft_burst",
+        usable=True,
+    )
+    state._live_burst_timeline_obs[23] = deque([
+        AlignedBurstSyncObs(
+            burst_centroid_us=4_100_000.0,
+            icao="AAAAAA",
+            bearing_deg=9.0,
+            n_replies=4,
+            signal_dbfs=-18.0,
+            pos_age_s=0.4,
+            range_nm=12.0,
+            ts=now_ts,
+            sync_update_eligible=True,
+            raw_arrival_us=4_100_000.0,
+        )
+    ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+    state.update_go_snapshot({
+        "iids": {
+            "23": {
+                "iid": 23,
+                "sync_state_present": True,
+                "sync_state_usable": True,
+                "sync_quality": 0.82,
+                "sync_period_s": 4.25,
+                "sync_jitter_deg": 1.5,
+                "sync_residual_ema_deg": 2.5,
+                "sync_n_frames": 17,
+                "sync_n_rejected_frames": 3,
+                "sync_holdover": False,
+                "sync_last_updated": 1234.5,
+            }
+        }
+    })
+
+    payload = radar_api.build_iid_sync_snapshot_payload(state, 23, window_s=60.0, debug_limit=20)
+
+    assert payload["sync_state"]["period_s"] == 4.0
+    assert payload["sync_state"]["sync_jitter_deg"] == 3.0
+    assert payload["sync_state"]["residual_ema_deg"] == 4.0
+    assert payload["sync_state"]["n_sync_frames"] == 6
+    assert payload["sync_state"]["n_rejected_frames"] == 1
+
+
 def test_get_iid_sync_snapshot_marks_cache_hits(monkeypatch):
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", False)
