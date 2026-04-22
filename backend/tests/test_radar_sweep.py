@@ -3061,3 +3061,72 @@ def test_go_iid_state_does_not_override_multi_aircraft_sync_state():
     assert sync.source == "multi_aircraft_burst"
     assert sync.phase_epoch_us == pytest.approx(123.0)
     assert state.get_go_live_sync_state(77)["phase_epoch_us"] == pytest.approx(999_000.0)
+
+
+def test_update_go_burst_fired_skips_python_solver_when_go_multi_sync_present(monkeypatch):
+    """Python solver must not run when Go has established multi-sync state for the IID."""
+    state = RadarState()
+    state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=51.0, lon=0.0)
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=0.0,
+        sync_quality=1.0, sync_jitter_deg=3.0, last_sync_update_ts=1_000.0,
+        source="go_multi_aircraft_burst", usable=True,
+    )
+    # Simulate Go having already produced multi-sync state for IID 7.
+    state._go_multi_sync_states_by_iid[7] = {"pr": True, "p": 4.0}
+
+    calls: list[tuple[int, float]] = []
+
+    def fake_update(iid: int, period_s: float, **_kw):
+        calls.append((iid, period_s))
+
+    monkeypatch.setattr(state, "_update_multi_aircraft_sync_state", fake_update)
+    monkeypatch.setattr("radar.sweep.time.monotonic", lambda: 10.0)
+
+    state.update_go_burst_fired({
+        "i": 7, "c": int("AAAAAA", 16), "cu": 4_000_000.0,
+        "n": 4, "s": -15.0, "la": 51.1, "lo": 0.1, "pa": 0.2,
+        "df": True, "se": True,
+    })
+
+    # Python solver must not have been called.
+    assert calls == []
+
+
+def test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst(monkeypatch):
+    """Go MULTI_SYNC_STATE must replace Python multi_aircraft_burst sync once Go has a fit."""
+    import time as _time
+    state = RadarState()
+    state._live_sync_states[3] = LiveSyncState(
+        iid=3, period_s=4.0, phase_epoch_us=123.0, phase_offset_deg=10.0,
+        sync_quality=1.0, sync_jitter_deg=2.0, last_sync_update_ts=1_000.0,
+        source="multi_aircraft_burst", usable=True,
+    )
+
+    monkeypatch.setattr("radar.sweep.time.time", lambda: 2_000.0)
+
+    state.update_go_multi_sync_state({
+        "i": 3, "pr": True, "us": True,
+        "p": 4.01, "pb": 4.0,
+        "pe": 888_000.0, "po": 22.5,
+        "jd": 3.0, "re": 4.0, "nu": 10,
+        "ho": False, "ra": False, "ts": 2_000.0,
+    })
+
+    sync = state.get_live_sync_state(3)
+    assert sync is not None
+    assert sync.source == "go_multi_aircraft_burst"
+    assert sync.phase_epoch_us == pytest.approx(888_000.0)
+    assert sync.phase_offset_deg == pytest.approx(22.5)
+
+
+def test_reset_iid_clears_go_multi_sync_state():
+    """Per-IID reset must clear _go_multi_sync_states_by_iid so Python solver can resume."""
+    state = RadarState()
+    state._go_multi_sync_states_by_iid[5] = {"pr": True, "p": 4.0}
+    state._go_multi_sync_states_by_iid[6] = {"pr": True, "p": 4.0}
+
+    state.reset_iid(5)
+
+    assert 5 not in state._go_multi_sync_states_by_iid
+    assert 6 in state._go_multi_sync_states_by_iid  # unaffected IID

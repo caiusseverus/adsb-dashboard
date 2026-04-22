@@ -4091,14 +4091,18 @@ class RadarState:
                         sync_update_iid = iid
                         sync_update_period_s = period_s
         if sync_update_iid is not None and sync_update_period_s is not None:
-            now_mono = time.monotonic()
-            last = self._last_multi_sync_update_ts.get(sync_update_iid, 0.0)
-            if (now_mono - last) >= self._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
-                self._last_multi_sync_update_ts[sync_update_iid] = now_mono
-                self._update_multi_aircraft_sync_state(
-                    iid=sync_update_iid,
-                    period_s=sync_update_period_s,
-                )
+            # Skip Python solver when Go has established authoritative multi-sync
+            # state for this IID.  Go's MultiSyncSolver takes over once it has
+            # produced its first valid fit; Python resumes if radar-core resets.
+            if not self._go_multi_sync_states_by_iid.get(sync_update_iid):
+                now_mono = time.monotonic()
+                last = self._last_multi_sync_update_ts.get(sync_update_iid, 0.0)
+                if (now_mono - last) >= self._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
+                    self._last_multi_sync_update_ts[sync_update_iid] = now_mono
+                    self._update_multi_aircraft_sync_state(
+                        iid=sync_update_iid,
+                        period_s=sync_update_period_s,
+                    )
 
     def _go_track_observation_snapshot(self) -> list[dict]:
         with self._lock:
@@ -4205,15 +4209,6 @@ class RadarState:
         last_updated = float(msg.get("ts") or time.time())
 
         with self._lock:
-            existing = self._live_sync_states.get(iid)
-            # Do not override a Python multi_aircraft_burst state — Go and Python
-            # are running the same solver; the Python state is authoritative while
-            # the Python solver is still running.  When Python eventually defers to
-            # Go (RADAR_CORE_ENABLED + solver stopped), Go becomes the authority.
-            if existing is not None and existing.source == "multi_aircraft_burst":
-                # Update compact mirror for diagnostics but keep Python state primary.
-                self._go_multi_sync_states_by_iid[iid] = dict(msg)
-                return
             self._go_multi_sync_states_by_iid[iid] = dict(msg)
             self._live_sync_states[iid] = LiveSyncState(
                 iid=iid,
@@ -7199,6 +7194,9 @@ class RadarState:
             if iid in self._go_sync_states_by_iid:
                 del self._go_sync_states_by_iid[iid]
                 had_any = True
+            if iid in self._go_multi_sync_states_by_iid:
+                del self._go_multi_sync_states_by_iid[iid]
+                had_any = True
             if iid in self._go_iid_state_revision:
                 del self._go_iid_state_revision[iid]
                 had_any = True
@@ -7322,6 +7320,7 @@ class RadarState:
             self._go_sweep_frames_by_iid.clear()
             self._go_sweep_frames_revision.clear()
             self._go_sync_states_by_iid.clear()
+            self._go_multi_sync_states_by_iid.clear()
             self._go_iid_state_revision.clear()
             self._go_reference_aircraft_by_iid.clear()
             self._go_track_observations.clear()

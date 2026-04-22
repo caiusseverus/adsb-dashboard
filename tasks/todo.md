@@ -1,5 +1,32 @@
 # Deficiency Rectification Plan
 
+## 2026-04-22 Go Radar Engine Migration Slice 13
+
+- [x] Remove the Python-priority guard in `update_go_multi_sync_state()` so Go's fit immediately replaces Python's `multi_aircraft_burst` state once Go has a valid result
+- [x] Gate the Python `_update_multi_aircraft_sync_state()` call in `update_go_burst_fired()` behind a check for existing Go multi-sync state so both solvers don't run simultaneously
+- [x] Add `_go_multi_sync_states_by_iid` clearing to the per-IID reset (`reset_iid()`) and global reset so Python resumes when radar-core reconnects or an IID is reset
+- [x] Add focused backend tests proving the solver gate, Go override, and reset clearing all work correctly
+
+Plan confirmation: this is the transition slice — once Go produces its first valid multi-sync fit for an IID, Go becomes the sole authority for that IID's sync state. Python resumes only if `_go_multi_sync_states_by_iid` is cleared by a radar-core reset or IID reset. No new config flag; the gate is implicit in `_go_multi_sync_states_by_iid` presence.
+
+### Review
+
+- Removed the Python-priority guard block in `update_go_multi_sync_state()` that had been preventing Go from overriding Python's `multi_aircraft_burst` state. Go now always writes `_go_multi_sync_states_by_iid[iid]` and immediately sets the `_live_sync_states` entry to `go_multi_aircraft_burst` when it has a valid fit.
+- In `update_go_burst_fired()`, wrapped the `_update_multi_aircraft_sync_state()` call in a gate: `if not self._go_multi_sync_states_by_iid.get(sync_update_iid):`. Python solver only runs when Go has no established multi-sync state for that IID.
+- Added `_go_multi_sync_states_by_iid` to per-IID reset in `reset_iid()` (alongside `_go_sync_states_by_iid`) and to global reset (alongside `_go_sync_states_by_iid`), so Python solver resumes after reconnect or explicit IID reset.
+- Added 3 focused regressions in `test_radar_sweep.py`:
+  - `test_update_go_burst_fired_skips_python_solver_when_go_multi_sync_present` — Python solver not called when Go has state
+  - `test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst` — Go replaces Python sync unconditionally
+  - `test_reset_iid_clears_go_multi_sync_state` — per-IID reset clears Go state, unaffected IIDs unchanged
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/main.py` → OK
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_radar_core_client.py -q` → `136 passed`
+- Remaining migration scope after this slice:
+  - Go is now the authoritative multi-sync solver for any IID where it has produced a valid fit.
+  - Python's `_update_multi_aircraft_sync_state()` still exists as dead code / fallback for non-radar-core deployments and radar-core reconnect bootstrapping.
+  - Waveform learning (`_live_waveform_bins`) is still Python-only; waveform bins remain served from the last Python-learned state when Go is authoritative.
+  - The rich Python sync-debug path (`multi_aircraft_burst` anchor/waveform diagnostics) is now functionally unreachable in radar-core mode.
+
 ## 2026-04-22 Go Radar Engine Migration Slice 12
 
 - [x] Implement Go `MultiSyncSolver` in `radar-core/iid/multisync.go` with propagation-delay correction, weighted linear regression for period drift, ICAO quality memory, anchor selection via circular mean, period refinement + slope EMA, and wrong-period reacquire state machine
