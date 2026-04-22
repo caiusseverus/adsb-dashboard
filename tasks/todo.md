@@ -1,5 +1,28 @@
 # Deficiency Rectification Plan
 
+## 2026-04-22 Wrong-Period Reacquire for Refined Live Sync
+
+- [x] Inspect the current refined sync failure diagnostics and authoritative period-selection path in `backend/radar/sweep.py`
+- [x] Add period-family failure assessment plus `normal` / `suspect` / `reacquire` state to `LiveSyncState` and `_update_multi_aircraft_sync_state()`
+- [x] Force frame-building authoritative period fallback to `period_base_s` while reacquire is active
+- [x] Expose new period-mode diagnostics through sync snapshot/debug payloads used by the radar UI
+- [x] Add focused backend tests covering wrong-period reacquire entry, base-period authority during reacquire, clean recovery, and non-flapping normal refinement
+- [x] Run targeted backend verification and record results
+
+Plan confirmation: keep the change local to the refined sync path and authoritative period-selection path. Treat strong wrong-period evidence as fail-safe fallback to `period_base_s`, preserve existing small-signal refinement behavior in normal conditions, and require explicit clean evidence before leaving reacquire.
+
+### Review
+
+- Added `_assess_period_failure_mode(...)` plus new `LiveSyncState` period-failure/reacquire fields in [sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py).
+- `_update_multi_aircraft_sync_state()` now classifies wrong-period suspicion, escalates to `reacquire` on persistent or severe failure, forces `period_s` back to `period_base_s` while reacquiring, and only restores refined authority after two consecutive clean updates.
+- `_get_authoritative_frame_period_s()` and display-period helpers now return `period_base_s` whenever reacquire is active or the sync marks the base period as authoritative, breaking the bad-refined-period feedback loop during frame building.
+- Sync snapshot/debug payloads now expose `period_refine_mode`, `period_authoritative_source`, `period_failure_score`, `period_failure_streak`, `period_reacquire_active`, and `period_reacquire_reason`.
+- Added focused regressions in [test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) covering immediate reacquire, repeated suspect escalation, base-period authority during reacquire, two-clean-update recovery, mild-noise stability, and payload exposure.
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_sweep.py`
+  - `uv run --directory backend pytest tests/test_radar_api.py -k 'sync_snapshot or sync_debug'`
+  - Result: `71 passed` in `tests/test_radar_sweep.py`; `3 passed` selected sync API tests in `tests/test_radar_api.py`.
+
 ## 2026-04-22 Radar Sync / Frame / Localiser Review
 
 - [x] Inspect current Go sync code for angle normalisation, phase anchoring, and phase-family scaling behavior

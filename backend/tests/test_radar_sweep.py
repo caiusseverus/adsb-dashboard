@@ -30,6 +30,34 @@ def _make_events(iid: int, icao: str, arrivals_s: list[float]) -> list[tuple[int
     ]
 
 
+def _make_aligned_sync_obs(
+    state: RadarState,
+    *,
+    period_s: float,
+    residuals_deg: list[float],
+    start_s: float = 0.0,
+    step_s: float = 4.0,
+    icaos: tuple[str, ...] = ("AAAAAA", "BBBBBB"),
+    ts_start: float = 995.0,
+) -> deque:
+    obs = deque(maxlen=state._MULTI_SYNC_OBS_MAX)
+    for idx, residual_deg in enumerate(residuals_deg):
+        t_s = start_s + idx * step_s
+        predicted = ((t_s / period_s) * 360.0) % 360.0
+        obs.append(AlignedBurstSyncObs(
+            burst_centroid_us=t_s * 1_000_000.0,
+            icao=icaos[idx % len(icaos)],
+            bearing_deg=(predicted + residual_deg) % 360.0,
+            n_replies=4,
+            signal_dbfs=-12.0,
+            pos_age_s=0.2,
+            range_nm=0.0,
+            ts=ts_start + idx * 0.5,
+            sync_update_eligible=True,
+        ))
+    return obs
+
+
 def test_analyse_iid_events_prefers_dominant_family_over_half_period_clutter():
     events = []
     events.extend(_make_events(6, "AAAAAA", [0.0, 4.0, 8.0, 12.0, 16.0]))
@@ -848,12 +876,202 @@ def test_period_refinement_uses_effective_time_slope_and_correct_sign(monkeypatc
     assert sync.period_update_gain == pytest.approx(0.12)
     assert sync.fit_eligible_observations == 8
     assert sync.fit_time_basis == "effective_beast_time_s"
+    assert sync.period_refine_mode == "normal"
+    assert sync.period_authoritative_source == "refined"
+    assert sync.period_reacquire_active is False
     timeline = state.get_burst_sync_timeline(7, window_s=60.0)
     assert timeline["period_update_history"]
     update = timeline["period_update_history"][-1]
     assert update["period_s_before"] == pytest.approx(10.0)
     assert update["period_s_after"] == pytest.approx(sync.period_s)
     assert "period_update_clamp_reason" in update
+
+
+def test_period_failure_immediately_reacquires_on_high_reject_fraction_and_low_fit_support(monkeypatch):
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=10.3,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=10.0,
+    )
+    state._live_aligned_burst_obs[7] = _make_aligned_sync_obs(
+        state,
+        period_s=10.0,
+        residuals_deg=[90.0, 90.0, 90.0, 90.0, 90.0],
+        icaos=("AAAAAA",),
+    )
+
+    state._update_multi_aircraft_sync_state(7, period_s=10.0)
+
+    sync = state.get_live_sync_state(7)
+    assert sync.period_reacquire_active is True
+    assert sync.period_refine_mode == "reacquire"
+    assert sync.period_authoritative_source == "base"
+    assert sync.period_reacquire_reason == "high_rejected_fraction,low_fit_support,single_icao_fit"
+    assert sync.period_s == pytest.approx(10.0)
+    assert sync.period_failure_score >= 5.0
+
+
+def test_period_failure_reacquires_after_repeated_suspect_updates(monkeypatch):
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=10.2,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=10.0,
+        residual_slope_deg_per_s=0.0,
+    )
+
+    streaks = []
+    modes = []
+    reacquire_flags = []
+    for attempt in range(3):
+        state._live_aligned_burst_obs[7] = _make_aligned_sync_obs(
+            state,
+            period_s=10.0,
+            residuals_deg=[25.0] * 8,
+            start_s=attempt * 40.0,
+        )
+        state.update_live_sync_state(7, phase_epoch_us=0.0, phase_offset_deg=0.0)
+        state._update_multi_aircraft_sync_state(7, period_s=10.0)
+        sync = state.get_live_sync_state(7)
+        streaks.append(sync.period_failure_streak)
+        modes.append(sync.period_refine_mode)
+        reacquire_flags.append(sync.period_reacquire_active)
+
+    sync = state.get_live_sync_state(7)
+    assert streaks[0] == 1
+    assert modes[0] == "suspect"
+    assert reacquire_flags[0] is False
+    assert sync.period_reacquire_active is True
+    assert sync.period_refine_mode == "reacquire"
+    assert sync.period_authoritative_source == "base"
+    assert sync.period_s == pytest.approx(10.0)
+
+
+def test_authoritative_frame_period_uses_base_while_reacquiring():
+    state = RadarState()
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=10.4,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=10.0,
+        period_reacquire_active=True,
+        period_refine_mode="reacquire",
+        period_authoritative_source="base",
+    )
+
+    assert state._get_authoritative_frame_period_s(7, 9.8) == pytest.approx(10.0)
+    assert state.get_authoritative_display_period_s(7) == pytest.approx(10.0)
+    assert state.get_authoritative_display_period_std_s(7) == pytest.approx((2.0 / 360.0) * 10.0)
+
+
+def test_period_reacquire_exits_only_after_two_clean_updates(monkeypatch):
+    import radar.sweep as sweep_module
+
+    now = {"ts": 1_000.0}
+    monkeypatch.setattr(sweep_module.time, "time", lambda: now["ts"])
+
+    state = RadarState()
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=10.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=10.0,
+        period_failure_streak=3,
+        period_reacquire_active=True,
+        period_reacquire_reason="high_rejected_fraction",
+        period_reacquire_started_ts=990.0,
+        period_refine_mode="reacquire",
+        period_authoritative_source="base",
+    )
+    clean_obs = _make_aligned_sync_obs(
+        state,
+        period_s=10.0,
+        residuals_deg=[3.0, 2.0, 4.0, 3.0, 2.0, 4.0, 3.0, 2.0],
+    )
+    state._live_aligned_burst_obs[7] = clean_obs
+
+    state._update_multi_aircraft_sync_state(7, period_s=10.0)
+    first = state.get_live_sync_state(7)
+    assert first.period_reacquire_active is True
+    assert first.period_authoritative_source == "base"
+    assert first.period_reacquire_reason == "high_rejected_fraction"
+
+    now["ts"] = 1_001.0
+    state._update_multi_aircraft_sync_state(7, period_s=10.0)
+    second = state.get_live_sync_state(7)
+    assert second.period_reacquire_active is False
+    assert second.period_refine_mode == "normal"
+    assert second.period_authoritative_source == "refined"
+    assert second.period_reacquire_reason is None
+    assert second.period_failure_streak == 0
+
+
+def test_mild_noise_does_not_flap_into_reacquire(monkeypatch):
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=10.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=10.0,
+    )
+    state._live_aligned_burst_obs[7] = _make_aligned_sync_obs(
+        state,
+        period_s=10.0,
+        residuals_deg=[2.0, -3.0, 4.0, -2.0, 3.0, -4.0, 2.0, -1.0],
+    )
+
+    state._update_multi_aircraft_sync_state(7, period_s=10.0)
+
+    sync = state.get_live_sync_state(7)
+    assert sync.period_update_block_reason == "slope_not_persistent"
+    assert sync.period_refine_mode == "normal"
+    assert sync.period_reacquire_active is False
+    assert sync.period_failure_streak == 0
 
 
 def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monkeypatch):
@@ -901,6 +1119,10 @@ def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monke
     assert "waveform_bins" in first
     assert "phase_anchor_candidates" in first
     assert first["retention_diagnostics"]["timeline"]["count"] == 1
+    assert "period_refine_mode" in first["sync_state"]
+    assert "period_authoritative_source" in first["sync_state"]
+    assert "period_failure_score" in first["sync_state"]
+    assert "period_reacquire_active" in first["sync_state"]
 
 
 def test_phase_anchor_selected_aircraft_recovers_wrong_absolute_branch(monkeypatch):

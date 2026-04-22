@@ -535,6 +535,133 @@ def _waveform_bin_index(phase_deg: float, n_bins: int) -> int:
     return idx
 
 
+def _assess_period_failure_mode(
+    *,
+    recent_obs_count: int,
+    n_rejected: int,
+    fit_support_count: int,
+    fit_contributing_icao_count: int,
+    period_update_block_reason: str | None,
+    phase_correction_deg: float | None,
+    phase_anchor_status: str | None,
+    phase_validation_status: str | None,
+    phase_validation_contributors: int,
+    fit_reject_reasons: dict[str, int] | None,
+    scored: list[dict],
+    fit_origin_s: float,
+    fit_intercept_deg: float,
+    fit_slope_deg_per_s: float,
+    fit_span_s: float,
+    period_s: float,
+) -> dict:
+    """Assess whether the refined live period likely converged to a wrong family."""
+    rows = []
+    for entry in scored:
+        effective_us = float(entry.get("effective_us") or 0.0)
+        x_s = effective_us / 1_000_000.0 - fit_origin_s
+        detrended_residual = entry.get("residual")
+        if detrended_residual is not None:
+            detrended_residual = float(detrended_residual) - (
+                fit_intercept_deg + fit_slope_deg_per_s * x_s
+            )
+        cycle_index = int(x_s / period_s) if period_s > 0 else None
+        rows.append({
+            "phase_deg": entry.get("phase_in_rot"),
+            "residual_detrended_deg": detrended_residual,
+            "cycle_index": cycle_index,
+        })
+
+    raw_stats = _residual_stats([entry.get("residual") for entry in scored])
+    detrended_stats = _residual_stats([row.get("residual_detrended_deg") for row in rows])
+    raw_median_abs = raw_stats["median_abs_residual_deg"]
+    detrended_median_abs = detrended_stats["median_abs_residual_deg"]
+    detrended_improvement_ratio = None
+    if raw_median_abs is not None and detrended_median_abs is not None and raw_median_abs > 0:
+        detrended_improvement_ratio = (raw_median_abs - detrended_median_abs) / raw_median_abs
+
+    phase_shape = _compute_folded_phase_shape(rows)
+    error_mode = _classify_sync_error_mode(
+        slope_deg_per_s=fit_slope_deg_per_s,
+        time_span_s=fit_span_s,
+        raw_mad_deg=raw_stats["robust_spread_mad_deg"],
+        detrended_mad_deg=detrended_stats["robust_spread_mad_deg"],
+        phase_shape_strength_deg=phase_shape["phase_shape_strength_deg"],
+        repeatability=phase_shape["cycle_to_cycle_repeatability"],
+    )
+
+    triggered_conditions: list[str] = []
+    if recent_obs_count > 0 and n_rejected >= max(4, recent_obs_count * 0.4):
+        triggered_conditions.append("high_rejected_fraction")
+    if fit_support_count < 6:
+        triggered_conditions.append("low_fit_support")
+    if fit_contributing_icao_count < 2:
+        triggered_conditions.append("single_icao_fit")
+    if period_update_block_reason == "slope_not_persistent":
+        triggered_conditions.append("slope_not_persistent")
+    if abs(float(phase_correction_deg or 0.0)) > 20.0:
+        triggered_conditions.append("large_phase_correction")
+    if (
+        raw_median_abs is not None
+        and raw_median_abs > 12.0
+        and detrended_improvement_ratio is not None
+        and detrended_improvement_ratio < 0.2
+    ):
+        triggered_conditions.append("weak_detrending_improvement")
+    if phase_validation_status == "population_disagrees":
+        triggered_conditions.append("population_disagrees")
+    if str(phase_anchor_status or "").startswith("fallback_"):
+        triggered_conditions.append("fallback_anchor")
+
+    dominant_fit_reject_reason = None
+    if fit_reject_reasons:
+        dominant_fit_reject_reason = max(
+            fit_reject_reasons.items(),
+            key=lambda item: item[1],
+        )[0]
+
+    immediate_reacquire = (
+        (recent_obs_count > 0 and (n_rejected / recent_obs_count) > 0.6 and fit_contributing_icao_count < 2)
+        or (
+            phase_validation_status == "population_disagrees"
+            and phase_validation_contributors <= 0
+        )
+    )
+    wrong_period_suspect = len(triggered_conditions) >= 2 or immediate_reacquire
+
+    failure_score = float(len(triggered_conditions))
+    if immediate_reacquire:
+        failure_score += 2.0
+    if dominant_fit_reject_reason == "residual_gate":
+        failure_score += 0.5
+    if error_mode["dominant_error_mode"] in {"mixed", "unstable_cycle_shape"}:
+        failure_score += 0.5
+
+    if immediate_reacquire and phase_validation_status == "population_disagrees" and phase_validation_contributors <= 0:
+        failure_reason = "population_disagreement_no_validation_support"
+    elif triggered_conditions:
+        failure_reason = ",".join(triggered_conditions[:3])
+    else:
+        failure_reason = "clean"
+
+    return {
+        "wrong_period_suspect": wrong_period_suspect,
+        "immediate_reacquire": immediate_reacquire,
+        "failure_score": failure_score,
+        "failure_reason": failure_reason,
+        "triggered_conditions": triggered_conditions,
+        "raw_residual_stats": raw_stats,
+        "detrended_residual_stats": detrended_stats,
+        "raw_median_abs_residual_deg": raw_median_abs,
+        "detrended_median_abs_residual_deg": detrended_median_abs,
+        "detrended_improvement_ratio": detrended_improvement_ratio,
+        "dominant_error_mode": error_mode["dominant_error_mode"],
+        "dominant_fit_reject_reason": dominant_fit_reject_reason,
+        "fit_reject_reasons": dict(fit_reject_reasons or {}),
+        "phase_shape_diagnostics": phase_shape,
+        "error_mode": error_mode,
+    }
+
+
 def _apply_phase_waveform_correction(
     bins: list[WaveformBin] | None,
     phase_deg: float,
@@ -990,6 +1117,13 @@ class LiveSyncState:
     phase_validation_median_error_deg: float | None = None
     phase_validation_status: str = "unavailable"
     phase_anchor_candidates: list[dict] = _field(default_factory=list)
+    period_failure_score: float = 0.0
+    period_failure_streak: int = 0
+    period_reacquire_active: bool = False
+    period_reacquire_reason: str | None = None
+    period_reacquire_started_ts: float | None = None
+    period_refine_mode: str = "normal"
+    period_authoritative_source: str = "refined"
 
 
 @_dataclass
@@ -2102,6 +2236,7 @@ class RadarState:
         self._live_period_update_history: dict[int, deque] = {}
         self._live_slope_history: dict[int, deque] = {}
         self._live_period_history: dict[int, deque] = {}
+        self._live_period_clean_update_streak: dict[int, int] = {}
         self._live_sync_snapshot_cache: dict[int, tuple[tuple, dict]] = {}
         self._live_sync_snapshot_seq: dict[int, int] = {}
         self._live_sync_snapshot_last_cache_hit: dict[int, bool] = {}
@@ -3570,6 +3705,13 @@ class RadarState:
                 prop_delay_enabled=bool(RADAR_SYNC_PROP_DELAY_ENABLED),
                 motion_comp_phase_enabled=bool(RADAR_SYNC_MOTION_COMP_PHASE_ENABLED),
                 motion_comp_fit_enabled=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
+                period_failure_score=0.0,
+                period_failure_streak=0,
+                period_reacquire_active=False,
+                period_reacquire_reason=None,
+                period_reacquire_started_ts=None,
+                period_refine_mode="normal",
+                period_authoritative_source="refined",
             )
             return
 
@@ -3690,6 +3832,13 @@ class RadarState:
             phase_validation_median_error_deg=existing.phase_validation_median_error_deg,
             phase_validation_status=existing.phase_validation_status,
             phase_anchor_candidates=list(existing.phase_anchor_candidates),
+            period_failure_score=existing.period_failure_score,
+            period_failure_streak=existing.period_failure_streak,
+            period_reacquire_active=existing.period_reacquire_active,
+            period_reacquire_reason=existing.period_reacquire_reason,
+            period_reacquire_started_ts=existing.period_reacquire_started_ts,
+            period_refine_mode=existing.period_refine_mode,
+            period_authoritative_source=existing.period_authoritative_source,
         )
 
     def _record_live_burst_detection(
@@ -4593,15 +4742,12 @@ class RadarState:
                     and validation["reject_count"] >= 2
                     and validation["contributor_count"] == 0
                 ):
-                    existing.holdover = True
-                    existing.usable = False
-                    existing.phase_anchor_status = "population_veto"
-                    existing.phase_anchor_replacement_reason = "population_veto"
-                    existing.phase_validation_status = validation["status"]
-                    existing.phase_validation_reject_count = validation["reject_count"]
-                    return
-                new_offset = (phase_anchor_smoothed + validation["nudge_deg"]) % 360.0
-                phase_anchor_status = "selected" if validation["status"] != "anchor_only" else "anchor_only"
+                    phase_anchor_status = "population_veto"
+                    phase_anchor_replacement_reason = "population_veto"
+                    new_offset = mixed_fallback_offset
+                else:
+                    new_offset = (phase_anchor_smoothed + validation["nudge_deg"]) % 360.0
+                    phase_anchor_status = "selected" if validation["status"] != "anchor_only" else "anchor_only"
             else:
                 phase_anchor_status = "fallback_mixed_anchor_solve_failed"
                 phase_anchor_replacement_reason = "anchor_solve_failed"
@@ -4767,6 +4913,78 @@ class RadarState:
             (refined_period_s - base_period_s) / base_period_s * 1e6
             if base_period_s > 0 else 0.0
         )
+        period_failure = _assess_period_failure_mode(
+            recent_obs_count=len(recent_obs),
+            n_rejected=n_rejected,
+            fit_support_count=len(fit_scored),
+            fit_contributing_icao_count=len(fit_contributing_icaos),
+            period_update_block_reason=period_update_block_reason,
+            phase_correction_deg=phase_correction,
+            phase_anchor_status=phase_anchor_status,
+            phase_validation_status=validation["status"],
+            phase_validation_contributors=validation["contributor_count"],
+            fit_reject_reasons=dict(fit_reject_reasons),
+            scored=scored,
+            fit_origin_s=t_ref,
+            fit_intercept_deg=a_fit,
+            fit_slope_deg_per_s=b_fit,
+            fit_span_s=span_s,
+            period_s=live_period_s,
+        )
+        wrong_period_suspect = bool(period_failure["wrong_period_suspect"])
+        period_failure_streak = existing.period_failure_streak + 1 if wrong_period_suspect else 0
+        clean_reacquire_update = (
+            len(recent_obs) > 0
+            and (n_rejected / len(recent_obs)) < 0.25
+            and len(fit_scored) >= 6
+            and len(fit_contributing_icaos) >= 2
+            and (period_failure["raw_median_abs_residual_deg"] or 999.0) <= 8.0
+            and validation["status"] != "population_disagrees"
+        )
+        reacquire_active = bool(existing.period_reacquire_active)
+        reacquire_reason = existing.period_reacquire_reason
+        reacquire_started_ts = existing.period_reacquire_started_ts
+        period_refine_mode = "suspect" if wrong_period_suspect else "normal"
+        period_authoritative_source = "refined"
+        clean_reacquire_streak = 0
+        if wrong_period_suspect:
+            self._live_period_clean_update_streak[iid] = 0
+
+        if reacquire_active:
+            if clean_reacquire_update:
+                clean_reacquire_streak = self._live_period_clean_update_streak.get(iid, 0) + 1
+                self._live_period_clean_update_streak[iid] = clean_reacquire_streak
+                if clean_reacquire_streak >= 2:
+                    reacquire_active = False
+                    reacquire_reason = None
+                    reacquire_started_ts = None
+                    period_refine_mode = "normal"
+                    period_authoritative_source = "refined"
+                    period_failure_streak = 0
+                    self._live_period_clean_update_streak[iid] = 0
+                else:
+                    period_refine_mode = "reacquire"
+                    period_authoritative_source = "base"
+            else:
+                self._live_period_clean_update_streak[iid] = 0
+                clean_reacquire_streak = 0
+                period_refine_mode = "reacquire"
+                period_authoritative_source = "base"
+                if wrong_period_suspect:
+                    reacquire_reason = period_failure["failure_reason"]
+        elif period_failure_streak >= 3 or period_failure["immediate_reacquire"]:
+            reacquire_active = True
+            reacquire_reason = period_failure["failure_reason"]
+            reacquire_started_ts = now_ts
+            period_refine_mode = "reacquire"
+            period_authoritative_source = "base"
+            self._live_period_clean_update_streak[iid] = 0
+        if reacquire_active:
+            refined_period_s = base_period_s if base_period_s > 0 else live_period_s
+            period_correction_ppm = (
+                (refined_period_s - base_period_s) / base_period_s * 1e6
+                if base_period_s > 0 else 0.0
+            )
 
         # Waveform bin learning: slow EMA of detrended residuals keyed by
         # phase-in-rotation.  Period refinement sees long-term drift first;
@@ -5013,6 +5231,13 @@ class RadarState:
             phase_validation_median_error_deg=validation["median_error_deg"],
             phase_validation_status=validation["status"],
             phase_anchor_candidates=anchor_selection.get("candidates") or [],
+            period_failure_score=period_failure["failure_score"],
+            period_failure_streak=period_failure_streak,
+            period_reacquire_active=reacquire_active,
+            period_reacquire_reason=reacquire_reason,
+            period_reacquire_started_ts=reacquire_started_ts,
+            period_refine_mode=period_refine_mode,
+            period_authoritative_source=period_authoritative_source,
         )
         self._live_sync_states[iid] = new_state
 
@@ -5056,6 +5281,22 @@ class RadarState:
             "phase_validation_contributors": validation["contributor_count"],
             "phase_validation_reject_count": validation["reject_count"],
             "phase_validation_median_error_deg": validation["median_error_deg"],
+            "period_failure_score": period_failure["failure_score"],
+            "period_failure_streak": period_failure_streak,
+            "period_refine_mode": period_refine_mode,
+            "period_authoritative_source": period_authoritative_source,
+            "period_reacquire_active": reacquire_active,
+            "period_reacquire_reason": reacquire_reason,
+            "period_reacquire_started_ts": reacquire_started_ts,
+            "period_wrong_family_suspect": wrong_period_suspect,
+            "period_failure_reason": period_failure["failure_reason"],
+            "period_failure_conditions": list(period_failure["triggered_conditions"]),
+            "raw_median_abs_residual_deg": period_failure["raw_median_abs_residual_deg"],
+            "detrended_median_abs_residual_deg": period_failure["detrended_median_abs_residual_deg"],
+            "detrended_improvement_ratio": period_failure["detrended_improvement_ratio"],
+            "dominant_error_mode": period_failure["dominant_error_mode"],
+            "clean_reacquire_update": clean_reacquire_update,
+            "clean_reacquire_streak": clean_reacquire_streak,
         }
         self._live_period_update_history.setdefault(iid, deque(maxlen=80)).append(update_entry)
         self._live_slope_history.setdefault(iid, deque(maxlen=80)).append({
@@ -5616,10 +5857,12 @@ class RadarState:
             sync is not None
             and sync.usable
             and not sync.holdover
-            and sync.period_s
-            and sync.period_s > 0
         ):
-            return sync.period_s
+            if sync.period_reacquire_active or sync.period_authoritative_source == "base":
+                if sync.period_base_s and sync.period_base_s > 0:
+                    return sync.period_base_s
+            if sync.period_s and sync.period_s > 0:
+                return sync.period_s
         return fallback_period_s
 
     def get_authoritative_display_period_s(self, iid: int) -> float | None:
@@ -5646,10 +5889,12 @@ class RadarState:
             sync is not None
             and sync.usable
             and not sync.holdover
-            and sync.period_s
-            and sync.period_s > 0
         ):
-            return sync.sync_jitter_deg / 360.0 * sync.period_s if sync.sync_jitter_deg else None
+            effective_period_s = sync.period_s
+            if sync.period_reacquire_active or sync.period_authoritative_source == "base":
+                effective_period_s = sync.period_base_s
+            if effective_period_s and effective_period_s > 0:
+                return sync.sync_jitter_deg / 360.0 * effective_period_s if sync.sync_jitter_deg else None
         model = self._models.get(iid)
         return model.period_std_s if model is not None else None
 
@@ -6209,6 +6454,7 @@ class RadarState:
             self._live_period_update_history.clear()
             self._live_slope_history.clear()
             self._live_period_history.clear()
+            self._live_period_clean_update_streak.clear()
             self._live_sync_snapshot_cache.clear()
             self._live_sync_snapshot_seq.clear()
             self._live_sync_snapshot_last_cache_hit.clear()
@@ -7778,6 +8024,12 @@ class RadarState:
             "best_vs_operational_median_abs_improvement_deg": best_improvement,
             "current_period_s": sync.period_s,
             "base_period_s": getattr(sync, "period_base_s", None),
+            "period_refine_mode": getattr(sync, "period_refine_mode", None),
+            "period_authoritative_source": getattr(sync, "period_authoritative_source", None),
+            "period_failure_score": getattr(sync, "period_failure_score", None),
+            "period_failure_streak": getattr(sync, "period_failure_streak", None),
+            "period_reacquire_active": getattr(sync, "period_reacquire_active", None),
+            "period_reacquire_reason": getattr(sync, "period_reacquire_reason", None),
             "current_slope_deg_per_s": getattr(sync, "residual_slope_deg_per_s", None),
             "fit_slope_deg_per_s": fit_slope_deg_per_s,
             "fit_time_origin_beast_us": fit_time_origin_beast_us,
