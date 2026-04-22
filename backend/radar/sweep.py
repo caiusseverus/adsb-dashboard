@@ -3284,52 +3284,57 @@ class RadarState:
                     self._dirty_iids.add(iid)
             append_s = time.perf_counter() - t_append
 
-            t_group = time.perf_counter()
-            grouped_events: dict[int, list[tuple[float, str, float | None]]] = defaultdict(list)
-            for iid, icao_hex, signal_dbfs, arrival_us in prepared:
-                if self._diagnostics_enabled:
-                    self._flash_seq += 1
-                    self._flash_events.append((self._flash_seq, iid, icao_hex, int(arrival_us)))
-                grouped_events[iid].append((arrival_us, icao_hex, signal_dbfs))
-            group_s = time.perf_counter() - t_group
+            # In radar-core mode Go owns DF11 burst detection; skip Python's
+            # accumulator entirely.  _iid_events and _dirty_iids (above) are
+            # still populated so update_rotation_models() continues to run via
+            # its raw-event bootstrap path.
+            if self.radar_core_event_sink is None:
+                t_group = time.perf_counter()
+                grouped_events: dict[int, list[tuple[float, str, float | None]]] = defaultdict(list)
+                for iid, icao_hex, signal_dbfs, arrival_us in prepared:
+                    if self._diagnostics_enabled:
+                        self._flash_seq += 1
+                        self._flash_events.append((self._flash_seq, iid, icao_hex, int(arrival_us)))
+                    grouped_events[iid].append((arrival_us, icao_hex, signal_dbfs))
+                group_s = time.perf_counter() - t_group
 
-            t_builder = time.perf_counter()
-            t_builder_cpu = time.thread_time()
-            native_available = _decode_cffi is not None and hasattr(_decode_cffi, "RadarBurstProcessor")
-            for iid, iid_events in grouped_events.items():
-                model = self._models.get(iid)
-                # active_iid_count reflects IIDs with a working period (for metrics).
-                # Burst accumulation proceeds even during bootstrap (no model/period yet).
-                if model is not None and model.period_s is not None:
-                    active_iid_count += 1
-                self._ensure_live_builder_state(iid)
-                iid_events.sort(key=lambda event: event[0])
-                if native_available:
-                    processor = self._native_burst_processors.get(iid)
-                    if processor is None:
-                        processor = _decode_cffi.RadarBurstProcessor()
-                        self._native_burst_processors[iid] = processor
-                    diagnostic_bursts = self._collect_native_burst_diagnostics(iid, iid_events)
-                    t_native_burst = time.perf_counter()
-                    fired_bursts = processor.process_batch(iid_events, BURST_GAP_US)
-                    fired_bursts = self._enrich_native_fired_bursts_with_diagnostics(
-                        fired_bursts,
-                        diagnostic_bursts,
-                    )
-                    native_burst_s += time.perf_counter() - t_native_burst
-                    fired_burst_count += len(fired_bursts)
-                    t_process_burst = time.perf_counter()
-                    iid_fired_phase_metrics = self._process_fired_bursts(iid, fired_bursts)
-                    process_burst_s += time.perf_counter() - t_process_burst
-                    _add_fired_burst_phase_metrics(fired_phase_metrics, iid_fired_phase_metrics)
-                else:
-                    t_process_burst = time.perf_counter()
-                    for arrival_us, icao_hex, signal_dbfs in iid_events:
-                        self._on_df11_frame_builder(iid, icao_hex, arrival_us, signal_dbfs)
-                    process_burst_s += time.perf_counter() - t_process_burst
-                processed_count += len(iid_events)
-            builder_s = time.perf_counter() - t_builder
-            builder_cpu_s = time.thread_time() - t_builder_cpu
+                t_builder = time.perf_counter()
+                t_builder_cpu = time.thread_time()
+                native_available = _decode_cffi is not None and hasattr(_decode_cffi, "RadarBurstProcessor")
+                for iid, iid_events in grouped_events.items():
+                    model = self._models.get(iid)
+                    # active_iid_count reflects IIDs with a working period (for metrics).
+                    # Burst accumulation proceeds even during bootstrap (no model/period yet).
+                    if model is not None and model.period_s is not None:
+                        active_iid_count += 1
+                    self._ensure_live_builder_state(iid)
+                    iid_events.sort(key=lambda event: event[0])
+                    if native_available:
+                        processor = self._native_burst_processors.get(iid)
+                        if processor is None:
+                            processor = _decode_cffi.RadarBurstProcessor()
+                            self._native_burst_processors[iid] = processor
+                        diagnostic_bursts = self._collect_native_burst_diagnostics(iid, iid_events)
+                        t_native_burst = time.perf_counter()
+                        fired_bursts = processor.process_batch(iid_events, BURST_GAP_US)
+                        fired_bursts = self._enrich_native_fired_bursts_with_diagnostics(
+                            fired_bursts,
+                            diagnostic_bursts,
+                        )
+                        native_burst_s += time.perf_counter() - t_native_burst
+                        fired_burst_count += len(fired_bursts)
+                        t_process_burst = time.perf_counter()
+                        iid_fired_phase_metrics = self._process_fired_bursts(iid, fired_bursts)
+                        process_burst_s += time.perf_counter() - t_process_burst
+                        _add_fired_burst_phase_metrics(fired_phase_metrics, iid_fired_phase_metrics)
+                    else:
+                        t_process_burst = time.perf_counter()
+                        for arrival_us, icao_hex, signal_dbfs in iid_events:
+                            self._on_df11_frame_builder(iid, icao_hex, arrival_us, signal_dbfs)
+                        process_burst_s += time.perf_counter() - t_process_burst
+                    processed_count += len(iid_events)
+                builder_s = time.perf_counter() - t_builder
+                builder_cpu_s = time.thread_time() - t_builder_cpu
 
             # Stage 3 live detections are now recorded at burst-fire time inside
             # _process_fired_bursts() (native path) and _on_df11_frame_builder()

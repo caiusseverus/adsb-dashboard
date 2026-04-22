@@ -1,5 +1,24 @@
 # Deficiency Rectification Plan
 
+## 2026-04-22 Go Radar Engine Migration Slice 15
+
+- [x] Gate the Python burst-accumulation and burst-processing section in `on_df11_batch()` behind `radar_core_event_sink is None` so it does not run in radar-core mode
+- [x] Preserve the event-sink forward and `_iid_events` / `_dirty_iids` appends so `update_rotation_models()` continues to run via its raw-event bootstrap path
+- [x] Add focused tests proving the builder is skipped in radar-core mode and still runs in Python-only mode
+
+Plan confirmation: Go owns DF11 burst detection in radar-core mode; Python running its own accumulator in parallel is pure wasted work. The `_iid_events` appends kept outside the gate are sufficient for `update_rotation_models()` to maintain IID period estimates via the existing bootstrap fallback (raw events → `_analyse_iid_events()`).
+
+### Review
+
+- Wrapped the grouped-event construction, native-burst-processor path, and `_on_df11_frame_builder` fallback path in `on_df11_batch()` inside `if self.radar_core_event_sink is None:`. The event-sink forward and `_iid_events`/`_dirty_iids` appends remain outside the gate.
+- `processed_count` stays 0 when the builder is skipped; the existing `finally` clamp (`max(1, len(events))`) handles this correctly.
+- Added `test_on_df11_batch_skips_burst_builder_in_radar_core_mode` and `test_on_df11_batch_runs_burst_builder_without_radar_core`.
+- Verification: `python3 -m py_compile backend/radar/sweep.py` → OK; `uv run --directory backend pytest -q` → `422 passed`.
+- Remaining migration scope after this slice:
+  - `update_rotation_models()` still runs periodically via raw-event bootstrap; period estimates are lower-fidelity than burst-record-based but still functional for API diagnostics.
+  - Python's `_update_multi_aircraft_sync_state()` and waveform-learning code still exist as fallback for non-radar-core deployments.
+  - Go now owns all significant live radar hot-path compute; Python's remaining burst-path work in radar-core mode is the event-sink forward and `_iid_events` appends only.
+
 ## 2026-04-22 Go Radar Engine Migration Slice 14
 
 - [x] Extract inline waveform-bin serialization from `get_burst_sync_timeline()` rich path into a shared `_serialise_waveform_bins()` module-level helper

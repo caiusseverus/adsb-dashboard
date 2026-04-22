@@ -3153,3 +3153,56 @@ def test_go_sync_burst_timeline_includes_python_waveform_bins():
     # phase_center_deg should be (i + 0.5) * 15 for 24 bins.
     assert waveform_bins[0]["phase_center_deg"] == pytest.approx(7.5)
     assert waveform_bins[1]["correction_deg"] == pytest.approx(1.0)
+
+
+def test_on_df11_batch_skips_burst_builder_in_radar_core_mode(monkeypatch):
+    """Python burst accumulator must not run when radar-core event sink is active."""
+    state = RadarState()
+    # Set a non-None sink to signal radar-core mode.
+    state.radar_core_event_sink = lambda *a, **kw: None
+
+    builder_calls: list[tuple] = []
+
+    def fake_builder(iid, icao, arrival_us, signal_dbfs):
+        builder_calls.append((iid, icao, arrival_us))
+
+    monkeypatch.setattr(state, "_on_df11_frame_builder", fake_builder)
+
+    # Patch _unwrap to return the timestamp unchanged (no Beast tick conversion).
+    monkeypatch.setattr(state, "_unwrap", lambda ts: ts)
+
+    # Feed a batch of synthetic DF11 events (timestamp, iid, icao, signal_dbfs).
+    events = [
+        (4_000_000, 7, "AAAAAA", -15.0),
+        (4_001_000, 7, "BBBBBB", -20.0),
+    ]
+    state.on_df11_batch(events)
+
+    # Builder must not have been called.
+    assert builder_calls == [], f"expected no builder calls, got {builder_calls}"
+    # _iid_events must still be populated for update_rotation_models().
+    assert len(state._iid_events) == 2
+    assert 7 in state._dirty_iids
+
+
+def test_on_df11_batch_runs_burst_builder_without_radar_core(monkeypatch):
+    """Python burst accumulator must run when radar-core is not active."""
+    state = RadarState()
+    # No event sink → Python-only mode.
+    assert state.radar_core_event_sink is None
+
+    builder_calls: list[tuple] = []
+
+    def fake_builder(iid, icao, arrival_us, signal_dbfs):
+        builder_calls.append((iid, icao))
+
+    monkeypatch.setattr(state, "_on_df11_frame_builder", fake_builder)
+    monkeypatch.setattr(state, "_unwrap", lambda ts: ts)
+    # Disable native burst processor so Python fallback path runs.
+    monkeypatch.setattr("radar.sweep._decode_cffi", None)
+
+    events = [(4_000_000, 7, "AAAAAA", -15.0)]
+    state.on_df11_batch(events)
+
+    assert len(builder_calls) == 1
+    assert builder_calls[0] == (7, "AAAAAA")
