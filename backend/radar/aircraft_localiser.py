@@ -64,6 +64,31 @@ _TRACK_TIMEOUT_S = 120.0
 # Minimum observations to attempt a solve
 _MIN_OBS_FOR_SOLVE = 2
 
+# Freshness gating for live observations used as authoritative per-radar rays.
+# A detection older than either gate is considered historical, not operational.
+# Wall-clock gate catches long stalls; period-multiple gate catches radars with
+# slow rotations where even one missed sweep is already operationally wrong.
+_MAX_OBS_AGE_S = 5.0
+_MAX_OBS_AGE_PERIODS = 1.5
+
+# Minimum angular separation for seeds already covered by _MIN_INTERSECTION_ANGLE_DEG.
+
+# Structured rejection reasons emitted by the selection / solve pipeline.
+REASON_NO_SYNC = "no_usable_sync"
+REASON_NO_CALIBRATION = "no_calibration"
+REASON_SYNC_QUALITY_LOW = "sync_quality_below_threshold"
+REASON_NO_DETECTIONS = "no_detections_for_icao"
+REASON_STALE_OBSERVATION = "stale_observation"
+REASON_PHASE_OUT_OF_RANGE = "phase_out_of_range"
+REASON_OBS_BUILD_FAILED = "observation_build_failed"
+REASON_RADAR_NOT_ELIGIBLE = "radar_not_eligible"
+REASON_INSUFFICIENT_RADARS = "insufficient_distinct_radars"
+REASON_NO_FORWARD_INTERSECTIONS = "no_valid_forward_intersections"
+REASON_SOLVE_FAILED = "solve_failed"
+REASON_EXCESSIVE_UNCERTAINTY = "excessive_uncertainty"
+REASON_POOR_GEOMETRY = "poor_geometry"
+REASON_NO_ELIGIBLE_RADARS = "no_eligible_radars"
+
 # Weight floor (prevents single observation from dominating)
 _MIN_OBS_WEIGHT = 0.01
 
@@ -240,7 +265,12 @@ def _ray_intersection_enu(
     x1: float, y1: float, theta1_deg: float,
     x2: float, y2: float, theta2_deg: float,
 ) -> tuple[float, float] | None:
-    """Intersect two rays in ENU space. Returns (x, y) or None if near-parallel."""
+    """Intersect two forward rays in ENU space.
+
+    Each ray starts at its radar origin and extends in the direction of the
+    observed bearing.  Intersections behind either radar origin are rejected
+    so the seed pool is built from physically plausible crossings only.
+    """
     t1 = math.radians(90.0 - theta1_deg)  # bearing → trig angle
     t2 = math.radians(90.0 - theta2_deg)
     dx1, dy1 = math.cos(t1), math.sin(t1)
@@ -252,6 +282,10 @@ def _ray_intersection_enu(
         return None
 
     t = ((x2 - x1) * dy2 - (y2 - y1) * dx2) / denom
+    s = ((x2 - x1) * dy1 - (y2 - y1) * dx1) / denom
+    # Forward-ray constraint: both parameters must be non-negative.
+    if t < 0.0 or s < 0.0:
+        return None
     xi = x1 + t * dx1
     yi = y1 + t * dy1
     return xi, yi
@@ -385,17 +419,17 @@ def solve_snapshot(
 ) -> AircraftFix | None:
     """Robust nonlinear bearing-only solve.
 
-    Returns AircraftFix on success, None if insufficient observations.
+    Caller is expected to pass an already-selected authoritative observation
+    set (one per radar).  A trust-but-verify deduplication step is retained
+    so older callers that pass multi-candidate lists do not silently mix
+    observations; when duplicates exist the newest arrival_us wins.  This
+    keeps the solver input identical to the display set produced upstream.
     """
-    # Deduplicate: one observation per radar (most recent / best)
     by_iid: dict[int, RadarBearingObservation] = {}
     for obs in observations:
-        if obs.iid not in by_iid:
+        existing = by_iid.get(obs.iid)
+        if existing is None or obs.arrival_us > existing.arrival_us:
             by_iid[obs.iid] = obs
-        else:
-            existing = by_iid[obs.iid]
-            if obs.association_confidence > existing.association_confidence:
-                by_iid[obs.iid] = obs
 
     obs_list = [o for o in by_iid.values() if o.iid in calibrations]
     n_radars = len(obs_list)
@@ -448,8 +482,8 @@ def solve_snapshot(
     sol_x, sol_y = result.x
     sol_lat, sol_lon = _enu_to_latlon(sol_x, sol_y, origin_lat, origin_lon)
 
-    # Estimate CEP from Jacobian
-    cep_m = _estimate_cep(result.jac, len(obs_list))
+    # Estimate CEP from the bearing geometry at the solved position.
+    cep_m = _estimate_cep_from_geometry(obs_list, sol_lat, sol_lon)
 
     geo_score = _geometry_score(obs_list, sol_lat, sol_lon)
 
@@ -476,20 +510,41 @@ def solve_snapshot(
     )
 
 
-def _estimate_cep(jac: np.ndarray | None, n_obs: int) -> float:
-    """Estimate CEP50 in metres from the least-squares Jacobian."""
-    if jac is None or n_obs < 3:
+def _estimate_cep_from_geometry(
+    obs_list: list[RadarBearingObservation],
+    sol_lat: float,
+    sol_lon: float,
+) -> float:
+    """CEP50 estimate in metres from a physically-grounded bearing-only Fisher model.
+
+    For each radar the bearing gradient with respect to the target ENU position
+    is H_i = (-sin(az_i), cos(az_i)) / r_i, with units [1/m].  The Fisher
+    information in rad^-2·m^-2 is F = sum(H_i H_i^T / sigma_rad_i^2), so the
+    position covariance is C = F^-1 [m^2].  CEP50 ≈ 0.59*(sigma_major + sigma_minor)
+    (Grubbs' approximation for a bivariate normal).
+    """
+    if len(obs_list) < 2:
         return float("inf")
     try:
-        J = np.array(jac)
-        if J.shape[0] < 2 or J.shape[1] < 2:
+        F = np.zeros((2, 2), dtype=float)
+        for o in obs_list:
+            r_m = _haversine_m(o.radar_lat, o.radar_lon, sol_lat, sol_lon)
+            if r_m < 1.0:
+                continue
+            az = _bearing_deg(o.radar_lat, o.radar_lon, sol_lat, sol_lon)
+            az_rad = math.radians(az)
+            # Gradient of bearing (rad) with respect to ENU (east, north).
+            h = np.array([-math.sin(az_rad), math.cos(az_rad)]) / r_m
+            sigma_rad = math.radians(max(o.bearing_sigma_deg, 0.1))
+            F += np.outer(h, h) / (sigma_rad ** 2)
+        if np.linalg.matrix_rank(F) < 2:
             return float("inf")
-        JTJ = J.T @ J
-        cov = np.linalg.inv(JTJ)
+        cov = np.linalg.inv(F)
         eigvals = np.linalg.eigvalsh(cov)
         eigvals = np.maximum(eigvals, 0.0)
-        # CEP50 for 2D Gaussian ~ 1.1774 * sqrt(mean eigenvalue)
-        return float(1.1774 * math.sqrt(float(np.mean(eigvals))))
+        sigma_major = math.sqrt(float(eigvals[-1]))
+        sigma_minor = math.sqrt(float(eigvals[0]))
+        return float(0.59 * (sigma_major + sigma_minor))
     except Exception:
         return float("inf")
 
@@ -689,12 +744,37 @@ class AircraftLocaliser:
         self._last_localisation_ts = 0.0
         self._backlog_skips = 0
 
-        # Live ray/seed evidence buffers — keyed by ICAO, bounded deques.
-        # Written during _solve_for_icao; read by build_evidence().
-        _RAY_BUF = 100
-        self._recent_rays_by_icao: dict[str, deque] = {}
-        self._recent_rejected_rays_by_icao: dict[str, deque] = {}
+        # Evidence buffers, keyed by ICAO.  Populated during _solve_for_icao;
+        # read by build_evidence().
+        #
+        #   _current_rays_by_icao
+        #     The authoritative live bearing ray set from the most recent
+        #     solve cycle — exactly one per contributing radar, the identical
+        #     set used as solver input.  This is what the primary
+        #     "Bearing Rays" display layer renders.
+        #
+        #   _current_rejected_rays_by_icao
+        #     Rays from the most recent solve cycle that were built but
+        #     rejected (stale, no sync, no calibration, etc.), each with a
+        #     populated rejection_reason.
+        #
+        #   _historical_rays_by_icao
+        #     Rolling deque of accepted rays from prior solve cycles, used
+        #     only for the separate "Recent Ray History" evidence layer.
+        #     Never used as solver input.
+        #
+        #   _recent_seed_points_by_icao
+        #     Seed points generated from forward-ray intersections.
+        #
+        #   _last_rejection_reasons_by_icao
+        #     Structured rejection state from the most recent solve: per-radar
+        #     reasons and an optional global failure reason.
+        _RAY_BUF = 200
+        self._current_rays_by_icao: dict[str, list[Stage3LiveRay]] = {}
+        self._current_rejected_rays_by_icao: dict[str, list[Stage3LiveRay]] = {}
+        self._historical_rays_by_icao: dict[str, deque] = {}
         self._recent_seed_points_by_icao: dict[str, deque] = {}
+        self._last_rejection_reasons_by_icao: dict[str, dict] = {}
         self._RAY_BUFFER_MAX = _RAY_BUF
         self._ray_retention_s: float = 30.0   # overridden by config in main.py
 
@@ -871,6 +951,7 @@ class AircraftLocaliser:
         radar_lon: float,
         calibration: RadarBearingCalibration,
         waveform_bins: list | None = None,
+        effective_sync_jitter_deg: float | None = None,
     ) -> "RadarBearingObservation | None":
         """Convert one live detection to a bearing observation.
 
@@ -902,9 +983,16 @@ class AircraftLocaliser:
         bearing_obs = _wrap_deg(bearing_raw + calibration.bearing_offset_deg)
         bearing_obs = (bearing_obs + 360.0) % 360.0
 
-        # Observation sigma: calibration residual + sync jitter + association penalty
+        # Observation sigma: calibration residual + sync jitter + association penalty.
+        # The effective sync jitter may be overridden locally (e.g. tightened by
+        # a well-fitted calibration sigma) without mutating shared sync state.
         sigma = max(calibration.bearing_sigma_deg, 0.5)
-        sigma = math.sqrt(sigma ** 2 + sync_state.sync_jitter_deg ** 2)
+        jitter = (
+            effective_sync_jitter_deg
+            if effective_sync_jitter_deg is not None
+            else sync_state.sync_jitter_deg
+        )
+        sigma = math.sqrt(sigma ** 2 + jitter ** 2)
         if detection.position_age_seconds is not None:
             age_factor = 1.0 + detection.position_age_seconds / _MAX_POSITION_AGE_S
             sigma = sigma * age_factor
@@ -979,8 +1067,9 @@ class AircraftLocaliser:
     ) -> list["RadarBearingObservation"]:
         """Build live bearing observations for a target across all calibrated radars.
 
-        This is the live-path replacement for build_bearing_observations().
-        Uses live detections + live sync state instead of completed sweep frames.
+        Legacy helper retained for callers that want the multi-candidate pool
+        (not used by the operational solve path, which uses
+        select_authoritative_observations()).  No shared sync state is mutated.
         """
         with self._lock:
             cals = dict(self._calibrations)
@@ -1000,10 +1089,6 @@ class AircraftLocaliser:
             if sync_state is None or not sync_state.usable:
                 continue
 
-            # Propagate calibration sigma into sync state jitter if it provides tighter bound
-            if cal.bearing_sigma_deg < sync_state.sync_jitter_deg:
-                sync_state.sync_jitter_deg = cal.bearing_sigma_deg
-
             obs = self._build_live_observations_for_icao(
                 icao=icao,
                 iid=iid,
@@ -1019,6 +1104,150 @@ class AircraftLocaliser:
         return all_obs
 
     # ------------------------------------------------------------------
+    # Authoritative per-radar observation selection (new operational path)
+    # ------------------------------------------------------------------
+
+    def select_authoritative_observations(
+        self,
+        icao: str,
+        iid_subset: set[int] | None,
+        now_ts: float,
+    ) -> dict:
+        """Select exactly one live bearing observation per eligible radar.
+
+        Rules:
+          * A contributing radar must have an authoritative position, a usable
+            live sync state, and a bearing calibration.
+          * The chosen detection is the newest one whose wall-clock age does
+            not exceed _MAX_OBS_AGE_S AND whose age does not exceed
+            _MAX_OBS_AGE_PERIODS * period_s.
+          * A stale-but-present detection is emitted as a rejected ray with
+            rejection_reason set to REASON_STALE_OBSERVATION.
+          * Radars that fail any gate are recorded in per_radar_reasons but
+            contribute nothing to the accepted set.
+
+        Returns:
+            {
+              "accepted":   list[RadarBearingObservation],   # one per radar
+              "rejected_rays": list[Stage3LiveRay],          # with reason
+              "per_radar_reasons": dict[int, str],
+            }
+        """
+        with self._lock:
+            cals = dict(self._calibrations)
+
+        sync_states = self._radar_state.get_all_live_sync_states()
+        eligible = self.get_eligible_iids()
+
+        accepted: list[RadarBearingObservation] = []
+        rejected_rays: list[Stage3LiveRay] = []
+        per_radar_reasons: dict[int, str] = {}
+
+        for iid, auth, _model in eligible:
+            if iid_subset is not None and iid not in iid_subset:
+                continue
+
+            cal = cals.get(iid)
+            if cal is None or cal.quality == "none":
+                per_radar_reasons[iid] = REASON_NO_CALIBRATION
+                continue
+
+            sync_state = sync_states.get(iid)
+            if sync_state is None:
+                per_radar_reasons[iid] = REASON_NO_SYNC
+                continue
+            if not sync_state.usable:
+                per_radar_reasons[iid] = REASON_SYNC_QUALITY_LOW
+                continue
+            if sync_state.period_s <= 0:
+                per_radar_reasons[iid] = REASON_NO_SYNC
+                continue
+
+            # Pull all recent detections for this ICAO from the shared buffer.
+            detections = self._radar_state.get_recent_live_detections_for_icao(
+                icao, max_age_s=self._ray_retention_s,
+            )
+            detections = [d for d in detections if d.iid == iid]
+            if not detections:
+                per_radar_reasons[iid] = REASON_NO_DETECTIONS
+                continue
+
+            # detections are returned newest-first — select the newest that passes
+            # both freshness gates (wall-clock and period-multiple).
+            period_s = sync_state.period_s
+            max_age_periods_s = _MAX_OBS_AGE_PERIODS * period_s
+            effective_gate = min(_MAX_OBS_AGE_S, max_age_periods_s)
+
+            chosen = None
+            for det in detections:
+                age_s = now_ts - det.wall_ts
+                if age_s <= effective_gate:
+                    chosen = det
+                    break
+
+            # The observation sigma is computed inside _bearing_from_live_detection
+            # as quadrature(calibration_sigma, sync_jitter).  We do not override
+            # the jitter here: clamping it down to the calibration sigma would
+            # systematically under-estimate uncertainty when sync jitter is the
+            # dominant term.  Shared sync state is never mutated.
+            waveform_bins = self._radar_state.get_live_waveform_bins(iid)
+
+            if chosen is None:
+                per_radar_reasons[iid] = REASON_STALE_OBSERVATION
+                # Emit a rejection ray from the newest stale detection so the
+                # evidence layer can show operators which radars fell behind.
+                stale = detections[0]
+                stale_obs = self._bearing_from_live_detection(
+                    stale, sync_state, auth["lat"], auth["lon"], cal, waveform_bins,
+                )
+                if stale_obs is not None:
+                    rejected_rays.append(self._obs_to_live_ray(
+                        stale_obs, icao, now_ts,
+                        accepted=False, rejection_reason=REASON_STALE_OBSERVATION,
+                    ))
+                continue
+
+            obs = self._bearing_from_live_detection(
+                chosen, sync_state, auth["lat"], auth["lon"], cal, waveform_bins,
+            )
+            if obs is None:
+                per_radar_reasons[iid] = REASON_OBS_BUILD_FAILED
+                continue
+
+            accepted.append(obs)
+
+        return {
+            "accepted": accepted,
+            "rejected_rays": rejected_rays,
+            "per_radar_reasons": per_radar_reasons,
+        }
+
+    @staticmethod
+    def _obs_to_live_ray(
+        obs: "RadarBearingObservation",
+        icao: str,
+        ts: float,
+        *,
+        accepted: bool,
+        rejection_reason: str | None = None,
+    ) -> Stage3LiveRay:
+        """Wrap one observation as a display-layer Stage3LiveRay."""
+        return Stage3LiveRay(
+            track_id=icao,
+            icao=icao,
+            iid=obs.iid,
+            ts=ts,
+            radar_lat=obs.radar_lat,
+            radar_lon=obs.radar_lon,
+            bearing_deg=obs.bearing_obs_deg,
+            bearing_sigma_deg=obs.bearing_sigma_deg,
+            accepted=accepted,
+            rejection_reason=rejection_reason,
+            arrival_us=obs.arrival_us,
+            association_confidence=obs.association_confidence,
+        )
+
+    # ------------------------------------------------------------------
     # Stage 3: Combined solve for one target
     # ------------------------------------------------------------------
 
@@ -1028,76 +1257,81 @@ class AircraftLocaliser:
         iid_subset: set[int] | None = None,
         max_cep_m: float | None = None,
     ) -> AircraftFix | None:
-        """Full pipeline for one aircraft: build live obs → emit rays → seed → solve."""
+        """Run the full per-aircraft localisation pipeline.
+
+        Selects exactly one authoritative live bearing observation per
+        contributing radar, publishes that identical set as both the
+        "Bearing Rays" display layer and the solver input, and records a
+        structured rejection reason if any stage fails.
+        """
         max_cep_m = max_cep_m or self._max_cep_m
-
-        # Live path: use live detections instead of sweep frames
-        observations = self.build_live_bearing_observations(
-            icao, iid_subset, detection_retention_s=self._ray_retention_s
-        )
-
-        with self._lock:
-            cals = dict(self._calibrations)
-
         now_ts = time.time()
 
-        # Collapse to one observation per radar IID for display and seed generation.
-        # This prevents a single radar with several retained detections from
-        # producing many competing rays in the evidence layer and inflating
-        # pairwise seed intersections.  The full observation list is still passed
-        # to solve_snapshot(), which has its own per-IID deduplication.
-        display_obs = _collapse_candidates_by_iid(observations)
+        selection = self.select_authoritative_observations(icao, iid_subset, now_ts)
+        accepted_obs: list[RadarBearingObservation] = selection["accepted"]
+        rejected_rays: list[Stage3LiveRay] = selection["rejected_rays"]
+        per_radar_reasons: dict[int, str] = selection["per_radar_reasons"]
 
-        # Emit exactly one display ray per radar IID (burst-centre bearing).
-        accepted_rays: list[Stage3LiveRay] = []
-        for obs in display_obs:
-            accepted_rays.append(Stage3LiveRay(
-                track_id=icao,
-                icao=icao,
-                iid=obs.iid,
-                ts=now_ts,
-                radar_lat=obs.radar_lat,
-                radar_lon=obs.radar_lon,
-                bearing_deg=obs.bearing_obs_deg,
-                bearing_sigma_deg=obs.bearing_sigma_deg,
-                accepted=True,
-                arrival_us=obs.arrival_us,
-                association_confidence=obs.association_confidence,
-            ))
+        # Build the authoritative display rays.  The accepted set is also the
+        # solver input; the two paths cannot diverge by construction.
+        accepted_rays = [
+            self._obs_to_live_ray(o, icao, now_ts, accepted=True)
+            for o in accepted_obs
+        ]
 
-        # Store accepted rays — one per IID per solve cycle.
-        if accepted_rays:
-            ray_buf = self._recent_rays_by_icao.setdefault(icao, deque(maxlen=self._RAY_BUFFER_MAX))
-            ray_buf.extend(accepted_rays)
+        reasons = {
+            "ts": now_ts,
+            "per_radar": per_radar_reasons,
+            "global": None,
+        }
 
-        # Need at least 2 different radars
-        unique_iids = {o.iid for o in display_obs}
-        if len(unique_iids) < self._min_radars_for_fix:
+        # Publish current-cycle evidence buffers under the same lock used by
+        # build_evidence() so readers never see torn state mid-update.
+        with self._lock:
+            self._current_rays_by_icao[icao] = accepted_rays
+            self._current_rejected_rays_by_icao[icao] = rejected_rays
+            self._last_rejection_reasons_by_icao[icao] = reasons
+            if accepted_rays:
+                hist_buf = self._historical_rays_by_icao.setdefault(
+                    icao, deque(maxlen=self._RAY_BUFFER_MAX),
+                )
+                hist_buf.extend(accepted_rays)
+
+        if not accepted_obs:
+            reasons["global"] = REASON_NO_ELIGIBLE_RADARS
             return None
 
-        # Use collapsed observation list for seed generation so one radar cannot
-        # generate multiple pairwise intersections.
-        seeds = generate_seeds(display_obs)
+        if len({o.iid for o in accepted_obs}) < self._min_radars_for_fix:
+            reasons["global"] = REASON_INSUFFICIENT_RADARS
+            return None
+
+        seeds = generate_seeds(accepted_obs)
         if not seeds:
+            reasons["global"] = REASON_NO_FORWARD_INTERSECTIONS
             return None
 
         seed_lat, seed_lon = seeds[0]
+        with self._lock:
+            seed_buf = self._recent_seed_points_by_icao.setdefault(
+                icao, deque(maxlen=20),
+            )
+            seed_buf.append({"lat": seed_lat, "lon": seed_lon, "ts": now_ts})
+            cals = dict(self._calibrations)
 
-        # Store seed point
-        seed_buf = self._recent_seed_points_by_icao.setdefault(icao, deque(maxlen=20))
-        seed_buf.append({"lat": seed_lat, "lon": seed_lon, "ts": now_ts})
-
-        fix = solve_snapshot(observations, cals, seed_lat, seed_lon)
+        fix = solve_snapshot(accepted_obs, cals, seed_lat, seed_lon)
         if fix is None:
+            reasons["global"] = REASON_SOLVE_FAILED
             return None
 
-        # Quality gate
-        if fix.solver_status not in ("ok",) and fix.cep_m > max_cep_m:
-            return None
         if fix.cep_m > max_cep_m:
-            log.debug("Stage3: fix for %s rejected — CEP %.0f m > limit %.0f m", icao, fix.cep_m, max_cep_m)
+            reasons["global"] = REASON_EXCESSIVE_UNCERTAINTY
+            log.debug(
+                "Stage3: fix for %s rejected — CEP %.0f m > limit %.0f m",
+                icao, fix.cep_m, max_cep_m,
+            )
             return None
         if fix.geometry_score < 0.05:
+            reasons["global"] = REASON_POOR_GEOMETRY
             return None
 
         return fix
@@ -1258,26 +1492,45 @@ class AircraftLocaliser:
         with self._lock:
             cals = dict(self._calibrations)
             track = self._tracks.get(icao)
-            # Snapshot evidence buffers under the same lock for consistency
-            recent_rays: list[Stage3LiveRay] = list(self._recent_rays_by_icao.get(icao, []))
-            recent_rejected: list[Stage3LiveRay] = list(self._recent_rejected_rays_by_icao.get(icao, []))
+            # Snapshot evidence buffers under the same lock for consistency.
+            current_rays: list[Stage3LiveRay] = list(
+                self._current_rays_by_icao.get(icao, [])
+            )
+            current_rejected: list[Stage3LiveRay] = list(
+                self._current_rejected_rays_by_icao.get(icao, [])
+            )
+            historical_rays: list[Stage3LiveRay] = list(
+                self._historical_rays_by_icao.get(icao, [])
+            )
             recent_seeds: list[dict] = list(self._recent_seed_points_by_icao.get(icao, []))
+            rejection_reasons: dict = dict(
+                self._last_rejection_reasons_by_icao.get(icao, {})
+            )
 
-        # Filter to time window
+        # Filter history + seeds to retention window (current-cycle buffers
+        # are already from the latest solve cycle, so no time filter).
         cutoff = time.time() - self._ray_retention_s
-        recent_rays = [r for r in recent_rays if r.ts >= cutoff]
-        recent_rejected = [r for r in recent_rejected if r.ts >= cutoff]
+        historical_rays = [r for r in historical_rays if r.ts >= cutoff]
         recent_seeds = [s for s in recent_seeds if s["ts"] >= cutoff]
 
-        # Apply IID filter
+        # Apply IID filter.
         if iid_subset:
-            recent_rays = [r for r in recent_rays if r.iid in iid_subset]
-            recent_rejected = [r for r in recent_rejected if r.iid in iid_subset]
+            current_rays = [r for r in current_rays if r.iid in iid_subset]
+            current_rejected = [r for r in current_rejected if r.iid in iid_subset]
+            historical_rays = [r for r in historical_rays if r.iid in iid_subset]
 
-        unique_iids = {r.iid for r in recent_rays} | {r.iid for r in recent_rejected}
+        unique_iids = (
+            {r.iid for r in current_rays}
+            | {r.iid for r in current_rejected}
+        )
 
-        if not recent_rays and track is None:
-            return {"available": False, "reason": "no_observations", "layers": []}
+        if not current_rays and not current_rejected and track is None:
+            return {
+                "available": False,
+                "reason": "no_observations",
+                "layers": [],
+                "rejection_reasons": rejection_reasons,
+            }
 
         layers = []
 
@@ -1344,13 +1597,10 @@ class AircraftLocaliser:
                 },
             }
 
-        # Collapse to one display ray per radar IID: newest burst-centre bearing.
-        # The buffer may hold rays from multiple solve cycles; collapsing here
-        # ensures the evidence page renders exactly one bearing ray per radar.
-        display_rays = _select_best_live_ray_per_radar(recent_rays)
-        ray_features = [_ray_to_feature(r, "bearing_ray") for r in display_rays]
-        rejected_features = [_ray_to_feature(r, "rejected_ray") for r in recent_rejected]
-
+        # Primary "Bearing Rays" layer: exactly the authoritative live rays
+        # from the most recent solve cycle, one per contributing radar.  By
+        # construction this matches the solver's input set.
+        ray_features = [_ray_to_feature(r, "bearing_ray") for r in current_rays]
         layers.append({
             "method": "bearing_rays",
             "label": "Bearing Rays",
@@ -1360,6 +1610,13 @@ class AircraftLocaliser:
             "features": ray_features,
         })
 
+        # Rejected rays (current cycle only).  Each ray carries its rejection
+        # reason so the map can colour-code why each one failed the gates.
+        rejected_features = []
+        for r in current_rejected:
+            feat = _ray_to_feature(r, "rejected_ray")
+            feat["properties"]["rejection_reason"] = r.rejection_reason
+            rejected_features.append(feat)
         layers.append({
             "method": "rejected_rays",
             "label": "Rejected Rays",
@@ -1367,6 +1624,25 @@ class AircraftLocaliser:
             "source_count": len(rejected_features),
             "active_estimate": None,
             "features": rejected_features,
+        })
+
+        # Separate historical ray layer (older accepted rays) — clearly named
+        # so operators never confuse it with the current live ray set.
+        current_ids = {(r.iid, r.arrival_us) for r in current_rays}
+        historical_only = [
+            r for r in historical_rays
+            if (r.iid, r.arrival_us) not in current_ids
+        ]
+        historical_features = [
+            _ray_to_feature(r, "historical_ray") for r in historical_only
+        ]
+        layers.append({
+            "method": "historical_bearing_rays",
+            "label": "Historical Bearing Rays",
+            "geometry_type": "line",
+            "source_count": len(historical_features),
+            "active_estimate": None,
+            "features": historical_features,
         })
 
         # --- Layer: Seed Intersections (from live buffer) ---
@@ -1410,6 +1686,42 @@ class AircraftLocaliser:
             "source_count": len(fix_features),
             "active_estimate": {"lat": track.lat, "lon": track.lon} if track else None,
             "features": fix_features,
+        })
+
+        # --- Layer: Fix History ---
+        # Expose recent localiser fixes from the track history as both a
+        # LineString and a set of points so the map can render either.
+        history_features: list[dict] = []
+        if track and track.history:
+            coords = [[f.lon, f.lat] for f in track.history]
+            if len(coords) >= 2:
+                history_features.append({
+                    "type": "Feature",
+                    "geometry": {"type": "LineString", "coordinates": coords},
+                    "properties": {
+                        "role": "fix_history_track",
+                        "n_points": len(coords),
+                    },
+                })
+            for f in track.history[-10:]:
+                history_features.append({
+                    "type": "Feature",
+                    "geometry": {"type": "Point", "coordinates": [f.lon, f.lat]},
+                    "properties": {
+                        "role": "fix_history_point",
+                        "ts": f.ts,
+                        "cep_m": f.cep_m,
+                        "geometry_score": f.geometry_score,
+                        "n_radars": f.n_radars,
+                    },
+                })
+        layers.append({
+            "method": "fix_history",
+            "label": "Fix History",
+            "geometry_type": "mixed",
+            "source_count": len(history_features),
+            "active_estimate": None,
+            "features": history_features,
         })
 
         # --- Layer: Fix Uncertainty (CEP circle) ---
@@ -1464,9 +1776,10 @@ class AircraftLocaliser:
             "reason": "ok",
             "layers": layers,
             "icao": icao,
-            "n_observations": len(recent_rays),
+            "n_observations": len(current_rays),
             "n_radars": n_radars_out,
             "sync_diagnostics": sync_summary,
+            "rejection_reasons": rejection_reasons,
         }
 
     def get_sync_diagnostics(self, iid_subset: set[int] | None = None) -> dict:
