@@ -336,6 +336,57 @@ def test_get_iid_sync_snapshot_stays_python_backed_when_go_sync_exists(monkeypat
     assert payload["sync_state"]["n_rejected_frames"] == 1
 
 
+def test_get_iid_sync_snapshot_uses_compact_go_sync_diagnostics_for_go_owned_sync(monkeypatch):
+    import config as _cfg
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", True)
+    monkeypatch.setattr("radar.sweep.RADAR_DIAGNOSTICS", True)
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+    state = RadarState()
+    now_ts = 1_000.0
+    state._models[23] = RadarIID(iid=23, status="SINGLE_RADAR", period_s=4.0)
+    state._iid_latest_arrival_us[23] = 4_100_000.0
+    state._live_sync_states[23] = LiveSyncState(
+        iid=23,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        residual_ema_deg=4.0,
+        n_sync_frames=6,
+        n_rejected_frames=1,
+        last_sync_update_ts=now_ts,
+        source="sweep_frame_go",
+        usable=True,
+    )
+    state._live_burst_timeline_obs[23] = deque([
+        AlignedBurstSyncObs(
+            burst_centroid_us=4_100_000.0,
+            icao="AAAAAA",
+            bearing_deg=9.0,
+            n_replies=4,
+            signal_dbfs=-18.0,
+            pos_age_s=0.4,
+            range_nm=12.0,
+            ts=now_ts,
+            sync_update_eligible=True,
+            raw_arrival_us=4_100_000.0,
+        )
+    ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+
+    payload = radar_api.build_iid_sync_snapshot_payload(state, 23, window_s=60.0, debug_limit=20)
+    debug_payload = state.get_sync_debug_payload(23, window_s=60.0, limit=20)
+
+    assert payload["sync_state"]["source"] == "sweep_frame_go"
+    assert payload["waveform_bins"] == []
+    assert payload["phase_anchor_candidates"] == []
+    assert payload["observations"][0]["phase_anchor_contributor"] is False
+    assert debug_payload["summary"]["diagnostics_mode"] == "compact_go_sync"
+    assert debug_payload["summary"]["rich_diagnostics_available"] is False
+
+
 def test_get_iid_sync_snapshot_marks_cache_hits(monkeypatch):
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", False)

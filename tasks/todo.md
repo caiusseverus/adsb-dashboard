@@ -175,6 +175,41 @@ Plan confirmation: move only the frame-based sync bootstrap and holdover authori
   - Go now owns the compact frame-sync bootstrap boundary, but not yet the richer per-IID sync maintenance needed to retire Python’s duplicate live sync internals.
   - The next substantial boundary is moving the authoritative multi-aircraft sync fit and exported parity into Go so Python can stop maintaining `LiveSyncState` as a primary mutable model while preserving Stage 3 separation.
 
+## 2026-04-22 Go Radar Engine Migration Slice 6
+
+- [x] Identify the sync timeline/snapshot/debug read paths that still rebuild Python-only multi-aircraft diagnostics for Go-owned sync states
+- [x] Add a compact sync diagnostics path for non-`multi_aircraft_burst` sources so Go-owned `sweep_frame_go` sync reads do not trigger rich Python anchor/waveform recomputation
+- [x] Keep the existing rich sync snapshot/debug path for `multi_aircraft_burst` so Stage 3 and operator diagnostics remain logically separate from earlier radar-localisation stages
+- [x] Add focused backend tests proving Go-owned sync snapshot/debug payloads take the compact path while Python multi-aircraft sync remains on the rich path
+- [x] Run targeted verification and record the slice review
+
+Plan confirmation: move the read-side diagnostics boundary first, not the full solver. For Go-owned frame-sync states, Python should stop pretending it still has rich anchor/waveform state worth rebuilding. The rich sync-debug path stays Python-only for `multi_aircraft_burst`, while non-rich sources use a compact payload built from exported sync state and retained evidence.
+
+### Review
+
+- Identified the remaining read-side duplication in [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py): `get_burst_sync_timeline()`, `get_live_sync_snapshot()`, and `get_sync_debug_payload()` were still rebuilding Python-only anchor, waveform, per-ICAO quality, and multi-predictor diagnostics even when the active sync source was Go-owned `sweep_frame_go`.
+- Added a source gate so only `LiveSyncState(source="multi_aircraft_burst")` takes the rich Python diagnostics path. Non-rich sources now use a compact sync view.
+- Added compact helpers in [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py):
+  - `_build_compact_burst_sync_timeline_entries(...)` builds one-predictor residual entries without Python anchor/waveform recomputation
+  - `_build_compact_sync_debug_payload(...)` returns a stable compact debug payload for Go-owned sync sources
+- Updated `get_burst_sync_timeline()` so Go-owned `sweep_frame_go` states return:
+  - compact burst observations
+  - empty `waveform_bins`, `phase_anchor_candidates`, per-ICAO quality, and period-fit histories
+  - retained DF11 residual overlay support and retention diagnostics
+- Updated `get_sync_debug_payload()` so non-`multi_aircraft_burst` sources no longer execute the expensive multi-predictor/anchor/waveform comparison path. They now return `diagnostics_mode = "compact_go_sync"` with a reduced but still useful payload.
+- Left the rich Python path untouched for `multi_aircraft_burst`, so Stage 3 separation and operator-facing anchor/waveform diagnostics remain tied only to the later multi-aircraft localisation stage.
+- Added focused regressions in:
+  - [backend/tests/test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) proving Go-owned sync snapshot/debug reads take the compact path
+  - [backend/tests/test_radar_api.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_api.py) proving the API-facing sync snapshot still stays rich for `multi_aircraft_burst` but compact for `sweep_frame_go`
+- Verification:
+  - `python3 -m py_compile backend/radar/sweep.py backend/tests/test_radar_sweep.py backend/tests/test_radar_api.py`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -k 'go_sync_snapshot_and_debug_use_compact_diagnostics_path or live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change'`
+  - `uv run --directory backend pytest tests/test_radar_api.py -k 'get_iid_sync_snapshot_uses_compact_go_sync_diagnostics_for_go_owned_sync or get_iid_sync_snapshot_stays_python_backed_when_go_sync_exists or get_iid_sync_snapshot_endpoint_combines_fast_sync_payloads or get_iid_sync_debug_endpoint_exposes_summary_and_observation'`
+  - Result: targeted sweep tests passed (`2 passed`), targeted radar API tests passed (`4 passed`).
+- Remaining migration scope after this slice:
+  - Python still owns the actual `multi_aircraft_burst` sync refinement update loop, anchor selection, waveform learning, and Stage 3-trusted rich sync state.
+  - Go-owned sync reads are now cheaper and more honest about what state exists, but the authoritative multi-aircraft sync solver boundary has not moved yet.
+
 ## 2026-04-22 Wrong-Period Reacquire Refinement Follow-Up
 
 - [x] Re-inspect the current period-failure detector, reacquire recovery gate, and refine-freeze behavior in `backend/radar/sweep.py`

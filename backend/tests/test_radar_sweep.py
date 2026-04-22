@@ -1318,6 +1318,57 @@ def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monke
     assert "period_recovery_clean_streak" in first["sync_state"]
 
 
+def test_go_sync_snapshot_and_debug_use_compact_diagnostics_path(monkeypatch):
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    state._iid_latest_arrival_us[7] = 4_000_000.0
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="sweep_frame_go",
+        usable=True,
+        period_base_s=4.0,
+    )
+    state._live_burst_timeline_obs[7] = deque([
+        AlignedBurstSyncObs(
+            burst_centroid_us=4_000_000.0,
+            icao="AAAAAA",
+            bearing_deg=0.0,
+            n_replies=4,
+            signal_dbfs=-12.0,
+            pos_age_s=0.2,
+            range_nm=0.0,
+            ts=999.0,
+            sync_update_eligible=True,
+        )
+    ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+
+    snapshot = state.get_live_sync_snapshot(7, window_s=90.0, debug_limit=20)
+    debug_payload = state.get_sync_debug_payload(7, window_s=60.0, limit=20)
+
+    assert snapshot["sync_state"]["source"] == "sweep_frame_go"
+    assert snapshot["waveform_bins"] == []
+    assert snapshot["phase_anchor_candidates"] == []
+    assert snapshot["observations"][0]["phase_anchor_contributor"] is False
+    assert snapshot["observations"][0]["waveform_applied"] is False
+    assert snapshot["retention_diagnostics"]["timeline"]["count"] == 1
+
+    assert debug_payload["available"] is True
+    assert debug_payload["summary"]["diagnostics_mode"] == "compact_go_sync"
+    assert debug_payload["summary"]["rich_diagnostics_available"] is False
+    assert debug_payload["summary"]["sync_source"] == "sweep_frame_go"
+    assert debug_payload["observation_model_diagnostics"]["mode"] == "compact_go_sync"
+    assert debug_payload["observations"][0]["icao"] == "AAAAAA"
+
+
 def test_phase_anchor_selected_aircraft_recovers_wrong_absolute_branch(monkeypatch):
     import radar.sweep as sweep_module
 

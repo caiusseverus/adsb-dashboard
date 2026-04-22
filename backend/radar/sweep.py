@@ -277,6 +277,11 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
     return dataclasses.asdict(sync)
 
 
+def _sync_source_has_rich_python_diagnostics(sync: "LiveSyncState | None") -> bool:
+    """Return True when the current sync source carries Python-only rich diagnostics."""
+    return bool(sync is not None and getattr(sync, "source", None) == "multi_aircraft_burst")
+
+
 def _classify_period_correction_status(
     allowed: bool,
     block_reason: str | None,
@@ -7646,6 +7651,133 @@ class RadarState:
             ))
         return observations
 
+    def _build_compact_burst_sync_timeline_entries(
+        self,
+        sync: LiveSyncState,
+        obs_snapshot: list[AlignedBurstSyncObs],
+        window_s: float,
+    ) -> list[dict]:
+        """Build a compact burst timeline for Go-owned sync sources.
+
+        Non-`multi_aircraft_burst` sources do not carry Python's richer anchor,
+        waveform, or fit-history state. Avoid rebuilding those diagnostics and
+        expose only the compact predictor/residual view that is still valid.
+        """
+        now_ts = time.time()
+        cutoff_ts = now_ts - window_s
+        entries: list[dict] = []
+        for obs in obs_snapshot:
+            if obs.ts < cutoff_ts:
+                continue
+            prediction = predict_sync_observation(
+                sync,
+                obs.burst_centroid_us,
+                range_nm=getattr(obs, "range_nm", None),
+                waveform_bins=None,
+                bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
+                motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
+                motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
+            )
+            residual_deg = (
+                obs.bearing_deg - prediction.predicted_bearing_deg + 540.0
+            ) % 360.0 - 180.0
+            classification = self._classify_sync_residual(abs(residual_deg))
+            weight = self._score_sync_burst_observation(obs)
+            fit_eligible = bool(getattr(obs, "sync_update_eligible", True)) and classification != "rejected" and weight > 0
+            entries.append({
+                "beam_center_us": obs.burst_centroid_us,
+                "wall_ts": obs.ts,
+                "icao": obs.icao,
+                "bearing_deg": obs.bearing_deg,
+                "predicted_deg": prediction.predicted_bearing_deg,
+                "predicted_raw_deg": prediction.predicted_bearing_raw_deg,
+                "predicted_after_prop_deg": prediction.predicted_bearing_deg,
+                "pred_without_motion_deg": prediction.predicted_bearing_deg,
+                "pred_with_motion_deg": prediction.predicted_bearing_deg,
+                "predicted_corrected_deg": prediction.predicted_bearing_deg,
+                "residual_deg": residual_deg,
+                "residual_raw_deg": residual_deg,
+                "residual_after_prop_deg": residual_deg,
+                "residual_without_motion_deg": residual_deg,
+                "residual_with_motion_deg": residual_deg,
+                "residual_after_waveform_deg": residual_deg,
+                "residual_corrected_deg": residual_deg,
+                "motion_comp_improvement_deg": 0.0,
+                "residual_for_period_fit_deg": residual_deg if fit_eligible else None,
+                "implied_phase_offset_deg": None,
+                "anchor_relative_phase_error_deg": None,
+                "phase_anchor_contributor": False,
+                "phase_anchor_reject_reason": None,
+                "phase_in_rot_deg": prediction.phase_in_rot_deg,
+                "raw_arrival_us": getattr(obs, "raw_arrival_us", obs.burst_centroid_us),
+                "prop_corrected_beast_us": prediction.prop_corrected_beast_us,
+                "effective_arrival_us": prediction.effective_arrival_us,
+                "motion_corrected_beast_us": prediction.motion_corrected_beast_us,
+                "prop_delay_us": prediction.propagation_correction_us,
+                "bearing_rate_deg_s": prediction.bearing_rate_deg_s,
+                "motion_comp_dt_us": prediction.motion_comp_dt_us,
+                "motion_comp_enabled": prediction.motion_comp_enabled,
+                "motion_comp_applied": prediction.motion_comp_applied,
+                "motion_comp_block_reason": prediction.motion_comp_block_reason,
+                "waveform_correction_deg": prediction.waveform_correction_deg,
+                "waveform_applied": prediction.waveform_applied,
+                "prediction_path": prediction.predictor_version,
+                "weight": weight,
+                "classification": classification,
+                "fit_eligible": fit_eligible,
+                "fit_reject_reason": None if fit_eligible else "compact_go_sync",
+                "n_replies": obs.n_replies,
+                "signal_dbfs": obs.signal_dbfs,
+                "pos_age_s": obs.pos_age_s,
+                "range_nm": obs.range_nm,
+                "sync_update_eligible": bool(getattr(obs, "sync_update_eligible", True)),
+                "burst_center_method": getattr(obs, "burst_center_method", "centroid"),
+                "burst_center_simple_us": getattr(obs, "burst_center_simple_us", None),
+                "burst_center_weighted_us": getattr(obs, "burst_center_weighted_us", None),
+                "burst_center_delta_us": getattr(obs, "burst_center_delta_us", None),
+            })
+        entries.sort(key=lambda e: e["beam_center_us"])
+        return entries
+
+    def _build_compact_sync_debug_payload(
+        self,
+        iid: int,
+        sync: LiveSyncState,
+        burst_timeline: dict,
+        limit: int,
+    ) -> dict:
+        """Return a compact sync-debug payload for Go-owned sync sources."""
+        observations = list(burst_timeline.get("observations") or [])
+        if limit > 0:
+            observations = observations[-limit:]
+        motion_summary = burst_timeline.get("motion_comp_summary") or {}
+        retention_diagnostics = burst_timeline.get("retention_diagnostics")
+        fit_eligible_count = sum(1 for row in observations if row.get("fit_eligible"))
+        sync_update_eligible_count = sum(1 for row in observations if row.get("sync_update_eligible"))
+        return {
+            "iid": iid,
+            "available": True,
+            "observations": observations,
+            "summary": {
+                "iid": iid,
+                "sync_source": getattr(sync, "source", None),
+                "diagnostics_mode": "compact_go_sync",
+                "rich_diagnostics_available": False,
+                "compact_reason": "sync_source_not_multi_aircraft",
+                "wall_clock_used_operationally": False,
+                "observation_count": len(observations),
+                "fit_eligible_count": fit_eligible_count,
+                "sync_update_eligible_count": sync_update_eligible_count,
+                "motion_comp_applied_count": int(motion_summary.get("applied_count") or 0),
+                "retention_diagnostics": retention_diagnostics,
+            },
+            "retention_diagnostics": retention_diagnostics,
+            "observation_model_diagnostics": {
+                "mode": "compact_go_sync",
+                "reason": "rich_python_multi_aircraft_diagnostics_unavailable_for_sync_source",
+            },
+        }
+
     def get_burst_sync_timeline(self, iid: int, window_s: float = 60.0) -> dict:
         """Return burst-centre sync observations with residuals for verification plotting.
 
@@ -7713,6 +7845,71 @@ class RadarState:
                 "df11_residual_observations": [],
                 "chart_overlay_consistent": False,
                 "retention_diagnostics": retention_diagnostics,
+            }
+
+        if not _sync_source_has_rich_python_diagnostics(sync):
+            entries = self._build_compact_burst_sync_timeline_entries(
+                sync=sync,
+                obs_snapshot=obs_snapshot,
+                window_s=window_s,
+            )
+            motion_applied_entries = [e for e in entries if e.get("motion_comp_applied")]
+            motion_improvements = [
+                e.get("motion_comp_improvement_deg")
+                for e in motion_applied_entries
+                if e.get("motion_comp_improvement_deg") is not None
+            ]
+
+            if self._aircraft_state is not None:
+                try:
+                    for _pos in self._aircraft_state.get_positions_snapshot():
+                        self._adsb_tracker.update(
+                            _pos["icao"],
+                            _pos["lat"],
+                            _pos["lon"],
+                            _pos.get("gs"),
+                            _pos.get("track"),
+                            ts=_pos.get("last_pos_ts") or time.time(),
+                        )
+                except Exception:
+                    pass
+
+            df11_residual_observations = self._build_df11_residual_observations(
+                sync=sync,
+                waveform_bins=[],
+                iid_events=iid_events_for_df11,
+                latest_arrival_us=latest_arrival_us_for_iid,
+            )
+
+            return {
+                "observations": entries,
+                "sync_state": _live_sync_state_to_dict(sync),
+                "window_s": window_s,
+                "waveform_bins": [],
+                "per_icao_quality": [],
+                "period_update_history": [],
+                "slope_history": [],
+                "period_history": [],
+                "predictor_consistency": getattr(sync, "predictor_consistency", None),
+                "phase_anchor_candidates": [],
+                "motion_comp_summary": {
+                    "phase_enabled": bool(getattr(sync, "motion_comp_phase_enabled", False)),
+                    "fit_enabled": bool(getattr(sync, "motion_comp_fit_enabled", False)),
+                    "applied_count": len(motion_applied_entries),
+                    "blocked_count": sum(1 for e in entries if e.get("motion_comp_enabled") and not e.get("motion_comp_applied")),
+                    "mean_motion_comp_dt_us": (
+                        sum(e.get("motion_comp_dt_us") or 0.0 for e in motion_applied_entries) / len(motion_applied_entries)
+                        if motion_applied_entries else 0.0
+                    ),
+                    "mean_residual_improvement_deg": (
+                        sum(motion_improvements) / len(motion_improvements)
+                        if motion_improvements else None
+                    ),
+                },
+                "df11_residual_observations": df11_residual_observations,
+                "chart_overlay_consistent": True,
+                "retention_diagnostics": retention_diagnostics,
+                "diagnostics_mode": "compact_go_sync",
             }
 
         now_ts = time.time()
@@ -8082,6 +8279,16 @@ class RadarState:
                 },
                 "retention_diagnostics": retention_diagnostics,
             }
+
+        if not _sync_source_has_rich_python_diagnostics(sync):
+            burst_timeline = self.get_burst_sync_timeline(iid, window_s=window_s)
+            payload = self._build_compact_sync_debug_payload(
+                iid=iid,
+                sync=sync,
+                burst_timeline=burst_timeline,
+                limit=limit,
+            )
+            return payload
 
         now_ts = time.time()
         cutoff_ts = now_ts - window_s
