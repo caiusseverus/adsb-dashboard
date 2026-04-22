@@ -56,8 +56,9 @@ type IIDState struct {
 	LastUpdated       time.Time
 
 	// Stage 3: reference aircraft and live sync state.
-	RefICAO *uint32 // selected reference aircraft (nil until stable)
-	Sync    *SyncState
+	RefICAO   *uint32 // selected reference aircraft (nil until stable)
+	Sync      *SyncState
+	MultiSync *MultiSyncSolver // multi-aircraft sync refinement solver
 }
 
 // DebugSnapshot is a point-in-time operational view of one IID.
@@ -105,8 +106,9 @@ const (
 // NewIIDState creates an IIDState for the given IID.
 func NewIIDState(iid uint8) *IIDState {
 	return &IIDState{
-		IID:    iid,
-		Status: "UNKNOWN",
+		IID:       iid,
+		Status:    "UNKNOWN",
+		MultiSync: NewMultiSyncSolver(iid),
 	}
 }
 
@@ -206,6 +208,9 @@ func (s *IIDState) Reset() {
 	s.LastRotationModel = nil
 	s.RefICAO = nil
 	s.Sync = nil
+	if s.MultiSync != nil {
+		s.MultiSync.Reset()
+	}
 }
 
 // RefreshReference re-evaluates reference aircraft selection from current records.
@@ -292,6 +297,15 @@ func (s *IIDState) SyncSnapshot() (quality float32, refICAO *uint32) {
 		quality = float32(s.Sync.SyncQuality)
 	}
 	return quality, s.RefICAO
+}
+
+// SyncStateRef returns the current SyncState pointer (may be nil).
+// Used by MultiSyncSolver.TryUpdate to seed the solver when no multi-sync
+// state exists yet.  The caller must not mutate the returned value.
+func (s *IIDState) SyncStateRef() *SyncState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Sync
 }
 
 // SyncProtocolSnapshot returns compact sync fields for protocol emission.

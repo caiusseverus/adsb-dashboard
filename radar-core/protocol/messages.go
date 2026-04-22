@@ -12,13 +12,14 @@ const (
 
 // Message type constants — outbound (radar-core → Python).
 const (
-	MsgBurstFired    uint8 = 10
-	MsgFrameReady    uint8 = 11
-	MsgIIDState      uint8 = 12
-	MsgSnapshotResp  uint8 = 13
-	MsgHealth        uint8 = 14
-	MsgFMFrameResult uint8 = 15
-	MsgFMState       uint8 = 16
+	MsgBurstFired      uint8 = 10
+	MsgFrameReady      uint8 = 11
+	MsgIIDState        uint8 = 12
+	MsgSnapshotResp    uint8 = 13
+	MsgHealth          uint8 = 14
+	MsgFMFrameResult   uint8 = 15
+	MsgFMState         uint8 = 16
+	MsgMultiSyncState  uint8 = 17 // per-IID multi-aircraft sync refinement state
 )
 
 // --- Inbound messages ---
@@ -243,4 +244,29 @@ type FMState struct {
 	LastFrameLon                  *float64          `codec:"flo"`
 	LastFrameCEPM                 *float64          `codec:"fcep"`
 	UpdatedAt                     float64           `codec:"ts"`
+}
+
+// MultiSyncState is emitted after each multi-aircraft sync solver run.
+// It carries the full per-IID refined sync state so Python can mirror it
+// as LiveSyncState(source="go_multi_aircraft_burst") without running the
+// Python multi-aircraft sync solver.
+type MultiSyncState struct {
+	MsgType               uint8    `codec:"t"`
+	IID                   uint8    `codec:"i"`
+	Present               bool     `codec:"pr"`
+	Usable                bool     `codec:"us"`
+	PeriodS               float64  `codec:"p"`
+	PeriodBaseS           float64  `codec:"pb"`
+	PhaseEpochUS          float64  `codec:"pe"`
+	PhaseOffsetDeg        float64  `codec:"po"`
+	JitterDeg             float64  `codec:"jd"`
+	ResidualEMADeg        float64  `codec:"re"`
+	NSyncUpdates          uint32   `codec:"nu"`
+	Holdover              bool     `codec:"ho"`
+	PeriodReacquireActive bool     `codec:"ra"`
+	PeriodReacquireReason string   `codec:"rr"`
+	AnchorICAO            *uint32  `codec:"ai"`
+	AnchorPhaseDeg        float64  `codec:"ap"`
+	AnchorScore           float64  `codec:"as"`
+	UpdatedAt             float64  `codec:"ts"`
 }

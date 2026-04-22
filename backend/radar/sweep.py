@@ -2262,6 +2262,7 @@ class RadarState:
         self._GO_EVIDENCE_EVENTS_MAX = 12_000
         self._GO_SWEEP_FRAMES_MAX = 256
         self._go_sync_states_by_iid: dict[int, dict] = {}
+        self._go_multi_sync_states_by_iid: dict[int, dict] = {}
         self._go_iid_state_revision: dict[int, int] = {}
         self._go_track_observations: deque = deque(maxlen=self._GO_TRACK_OBSERVATIONS_MAX)
         self._go_evidence_events: deque = deque(maxlen=self._GO_EVIDENCE_EVENTS_MAX)
@@ -4170,6 +4171,67 @@ class RadarState:
                 self._adopt_go_frame_sync_locked(iid, go_sync)
             else:
                 self._go_sync_states_by_iid.pop(iid, None)
+
+    def update_go_multi_sync_state(self, msg: dict) -> None:
+        """Mirror a Go MULTI_SYNC_STATE into a Python LiveSyncState.
+
+        Go's multi-aircraft sync solver runs the same weighted phase fit as the
+        Python _update_multi_aircraft_sync_state() path.  When Go is authoritative,
+        Python adopts the Go-produced sync state as
+        LiveSyncState(source="go_multi_aircraft_burst") so Stage 3 can use it
+        without running the Python solver.
+        """
+        try:
+            iid = int(msg["i"])
+        except Exception:
+            log.debug("RadarState: malformed MULTI_SYNC_STATE ignored", exc_info=True)
+            return
+        if not bool(msg.get("pr")):
+            return  # solver ran but produced no state yet
+
+        period_s = msg.get("p")
+        phase_epoch_us = msg.get("pe")
+        phase_offset_deg = msg.get("po")
+        if period_s is None or phase_epoch_us is None or phase_offset_deg is None:
+            return
+
+        period_base_s = float(msg.get("pb") or period_s)
+        jitter_deg = float(msg.get("jd") or 5.0)
+        residual_ema_deg = float(msg.get("re") or 5.0)
+        usable = bool(msg.get("us", False))
+        holdover = bool(msg.get("ho", False))
+        n_sync_updates = int(msg.get("nu") or 0)
+        reacquire_active = bool(msg.get("ra", False))
+        last_updated = float(msg.get("ts") or time.time())
+
+        with self._lock:
+            existing = self._live_sync_states.get(iid)
+            # Do not override a Python multi_aircraft_burst state — Go and Python
+            # are running the same solver; the Python state is authoritative while
+            # the Python solver is still running.  When Python eventually defers to
+            # Go (RADAR_CORE_ENABLED + solver stopped), Go becomes the authority.
+            if existing is not None and existing.source == "multi_aircraft_burst":
+                # Update compact mirror for diagnostics but keep Python state primary.
+                self._go_multi_sync_states_by_iid[iid] = dict(msg)
+                return
+            self._go_multi_sync_states_by_iid[iid] = dict(msg)
+            self._live_sync_states[iid] = LiveSyncState(
+                iid=iid,
+                period_s=float(period_s),
+                period_base_s=period_base_s,
+                phase_epoch_us=float(phase_epoch_us),
+                phase_offset_deg=float(phase_offset_deg),
+                sync_quality=0.8 if usable else 0.4,
+                sync_jitter_deg=jitter_deg,
+                last_sync_update_ts=last_updated,
+                source="go_multi_aircraft_burst",
+                usable=usable,
+                residual_ema_deg=residual_ema_deg,
+                n_sync_frames=n_sync_updates,
+                n_rejected_frames=0,
+                last_residual_deg=0.0,
+                holdover=holdover,
+            )
 
     def _stage3_detection_from_go_observation(self, entry: dict) -> Stage3LiveDetection:
         return Stage3LiveDetection(
@@ -9956,17 +10018,19 @@ class RadarState:
         """Return a snapshot of all current live sync states."""
         return dict(self._live_sync_states)
 
+    _STAGE3_SYNC_SOURCES = frozenset({"multi_aircraft_burst", "go_multi_aircraft_burst"})
+
     def get_stage3_live_sync_state(self, iid: int) -> LiveSyncState | None:
         """Return the Stage 3-authoritative sync state for one IID.
 
         Stage 3 aircraft localisation remains logically separate from the
         earlier radar-localisation stages. Only the richer
-        `multi_aircraft_burst` sync model is eligible Stage 3 input; earlier
-        bootstrap sources such as `sweep_frame_go` remain available through the
-        general live-sync getters but are intentionally excluded here.
+        `multi_aircraft_burst` / `go_multi_aircraft_burst` sync models are
+        eligible Stage 3 input; earlier bootstrap sources remain available
+        through the general live-sync getters but are intentionally excluded.
         """
         sync = self._live_sync_states.get(iid)
-        if sync is None or sync.source != "multi_aircraft_burst":
+        if sync is None or sync.source not in self._STAGE3_SYNC_SOURCES:
             return None
         return sync
 
@@ -9975,7 +10039,7 @@ class RadarState:
         return {
             iid: sync
             for iid, sync in self._live_sync_states.items()
-            if sync.source == "multi_aircraft_burst"
+            if sync.source in self._STAGE3_SYNC_SOURCES
         }
 
     def get_go_live_sync_state(self, iid: int) -> dict | None:
@@ -9996,7 +10060,7 @@ class RadarState:
     def get_stage3_live_waveform_bins(self, iid: int) -> list[WaveformBin]:
         """Return waveform bins only when the IID has Stage 3-authoritative sync."""
         sync = self._live_sync_states.get(iid)
-        if sync is None or sync.source != "multi_aircraft_burst":
+        if sync is None or sync.source not in self._STAGE3_SYNC_SOURCES:
             return []
         return list(self._live_waveform_bins.get(iid) or [])
 

@@ -180,6 +180,10 @@ func (e *engine) onRadarEvent(msg *protocol.RadarEvent) {
 		acc.OnBurst(f.ICAO, f.CentroidUS, f.NReplies, f.SignalDBFS, s)
 		e.recordObservationExports(s, f)
 		e.emitBurstFired(s, f)
+
+		// Multi-aircraft sync refinement: feed sync-eligible bursts and run solver.
+		e.maybeUpdateMultiSync(s, f)
+
 		e.profiler.Observe("burst_processing", time.Since(tBurst))
 	}
 }
@@ -209,6 +213,91 @@ func (e *engine) maybeUpdateSync(s *iid.IIDState, f *burst.FiredBurst) {
 	s.UpdateSyncEpoch(f.CentroidUS, 0.0, nAircraft, refPosAgeS)
 	snap := s.DebugStateSnapshot()
 	e.emitIIDState(s.IID, s, uint16(minInt(snap.BurstRecordsTotal, 65535)))
+}
+
+// maybeUpdateMultiSync feeds sync-eligible bursts into the per-IID multi-aircraft
+// sync solver and emits a MultiSyncState when a solver run completes.
+func (e *engine) maybeUpdateMultiSync(s *iid.IIDState, f *burst.FiredBurst) {
+	if s.MultiSync == nil {
+		return
+	}
+	// Only feed dominant-family bursts with a known ADS-B position.
+	dominantFamily := false
+	if family := s.FamilySnapshot(); family != nil && family.FoldedICAOs != nil {
+		_, dominantFamily = family.FoldedICAOs[f.ICAO]
+	}
+	if !dominantFamily {
+		return
+	}
+	pos := e.positions.Get(f.ICAO)
+	if pos == nil {
+		return
+	}
+
+	// Compute bearing and range from receiver to aircraft.
+	cfg := rcconfig.Get()
+	if !cfg.HasReceiver {
+		return
+	}
+	bearing, rangeNM := iid.BearingAndRangeNM(
+		cfg.ReceiverLat, cfg.ReceiverLon, pos.Lat, pos.Lon,
+	)
+
+	posAgeS := float32(time.Since(pos.TS).Seconds())
+	var sig *float32
+	if f.SignalDBFS != nil {
+		v := float32(*f.SignalDBFS)
+		sig = &v
+	}
+
+	obs := iid.MultiSyncObs{
+		CentroidUS: f.CentroidUS,
+		ICAO:       f.ICAO,
+		BearingDeg: bearing,
+		RangeNM:    float32(rangeNM),
+		PosAgeS:    posAgeS,
+		NReplies:   f.NReplies,
+		SignalDBFS:  sig,
+		WallTS:     float64(time.Now().UnixMicro()) / 1e6,
+	}
+	s.MultiSync.AddObs(obs)
+
+	// Run the solver if the throttle interval has elapsed.
+	syncSnap, _ := s.SyncSnapshot()
+	_ = syncSnap
+	sync := s.SyncStateRef()
+	if updated := s.MultiSync.TryUpdate(sync); updated {
+		e.emitMultiSyncState(s)
+	}
+}
+
+// emitMultiSyncState sends the current multi-aircraft sync state for one IID.
+func (e *engine) emitMultiSyncState(s *iid.IIDState) {
+	snap := s.MultiSync.Snapshot()
+	if !snap.Present {
+		return
+	}
+	msg := &protocol.MultiSyncState{
+		MsgType:               protocol.MsgMultiSyncState,
+		IID:                   s.IID,
+		Present:               snap.Present,
+		Usable:                snap.Usable,
+		PeriodS:               snap.PeriodS,
+		PeriodBaseS:           snap.PeriodBaseS,
+		PhaseEpochUS:          snap.PhaseEpochUS,
+		PhaseOffsetDeg:        snap.PhaseOffsetDeg,
+		JitterDeg:             snap.JitterDeg,
+		ResidualEMADeg:        snap.ResidualEMADeg,
+		NSyncUpdates:          uint32(snap.NSyncUpdates),
+		Holdover:              snap.Holdover,
+		PeriodReacquireActive: snap.PeriodReacquireActive,
+		PeriodReacquireReason: snap.PeriodReacquireReason,
+		AnchorICAO:            snap.AnchorICAO,
+		AnchorPhaseDeg:        snap.AnchorPhaseDeg,
+		AnchorScore:           snap.AnchorScore,
+		UpdatedAt:             snap.LastUpdated,
+	}
+	e.writer.Send(msg)
 }
 
 func (e *engine) emitBurstFired(s *iid.IIDState, f *burst.FiredBurst) {

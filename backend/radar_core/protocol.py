@@ -32,8 +32,9 @@ MSG_FRAME_READY   = 11
 MSG_IID_STATE     = 12
 MSG_SNAPSHOT_RESP = 13
 MSG_HEALTH        = 14
-MSG_FM_FRAME_RESULT = 15
-MSG_FM_STATE        = 16
+MSG_FM_FRAME_RESULT  = 15
+MSG_FM_STATE         = 16
+MSG_MULTI_SYNC_STATE = 17  # per-IID multi-aircraft sync refinement state
 
 # ---------------------------------------------------------------------------
 # Framing
@@ -171,6 +172,7 @@ def dispatch(payload: bytes) -> dict:
     if msg_type not in (
         MSG_BURST_FIRED, MSG_FRAME_READY, MSG_IID_STATE,
         MSG_SNAPSHOT_RESP, MSG_HEALTH, MSG_FM_FRAME_RESULT, MSG_FM_STATE,
+        MSG_MULTI_SYNC_STATE,
         MSG_RADAR_EVENT, MSG_POSITION_UPDATE, MSG_CONFIG_UPDATE,
         MSG_SNAPSHOT_REQ, MSG_RESET_IID,
     ):

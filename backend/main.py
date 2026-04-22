@@ -131,6 +131,7 @@ if config.RADAR_CORE_ENABLED:
         on_fm_frame_result=radar_state.update_go_frame_position_result if config.RADAR_CORE_FM_ENABLED else None,
         on_fm_state=radar_state.update_forward_model_from_go if config.RADAR_CORE_FM_ENABLED else None,
         on_snapshot=radar_state.update_go_snapshot,
+        on_multi_sync_state=radar_state.update_go_multi_sync_state,
         connect_timeout_s=config.RADAR_CORE_CONNECT_TIMEOUT_S,
         reconnect_delay_s=config.RADAR_CORE_RECONNECT_DELAY_S,
     )

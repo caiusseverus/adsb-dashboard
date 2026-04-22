@@ -67,6 +67,7 @@ class RadarCoreClient:
         on_iid_state: Optional[Callable[[dict], None]] = None,
         on_fm_frame_result: Optional[Callable[[dict], None]] = None,
         on_fm_state: Optional[Callable[[dict], None]] = None,
+        on_multi_sync_state: Optional[Callable[[dict], None]] = None,
         on_snapshot: Optional[Callable[[dict], None]] = None,
         connect_timeout_s: float = 5.0,
         reconnect_delay_s: float = 2.0,
@@ -77,6 +78,7 @@ class RadarCoreClient:
         self._on_iid_state = on_iid_state
         self._on_fm_frame_result = on_fm_frame_result
         self._on_fm_state = on_fm_state
+        self._on_multi_sync_state = on_multi_sync_state
         self._on_snapshot = on_snapshot
         self._connect_timeout_s = connect_timeout_s
         self._reconnect_delay_s = reconnect_delay_s
@@ -103,6 +105,7 @@ class RadarCoreClient:
         self._iid_states_received = 0
         self._fm_frame_results_received = 0
         self._fm_states_received = 0
+        self._multi_sync_states_received = 0
         self._callback_errors = 0
         self._connect_attempts = 0
         self._latest_health: Optional[dict] = None
@@ -192,6 +195,7 @@ class RadarCoreClient:
                 "iid_states_received": self._iid_states_received,
                 "fm_frame_results_received": self._fm_frame_results_received,
                 "fm_states_received": self._fm_states_received,
+                "multi_sync_states_received": self._multi_sync_states_received,
                 "callback_errors": self._callback_errors,
                 "connect_attempts": self._connect_attempts,
                 "connected": self._connected.is_set(),
@@ -479,6 +483,16 @@ class RadarCoreClient:
                     with self._stats_lock:
                         self._callback_errors += 1
                     log.debug("RadarCoreClient: FM_STATE callback failed", exc_info=True)
+        elif msg_type == P.MSG_MULTI_SYNC_STATE:
+            with self._stats_lock:
+                self._multi_sync_states_received += 1
+            if self._on_multi_sync_state:
+                try:
+                    self._on_multi_sync_state(d)
+                except Exception:
+                    with self._stats_lock:
+                        self._callback_errors += 1
+                    log.debug("RadarCoreClient: MULTI_SYNC_STATE callback failed", exc_info=True)
         # Other types silently ignored in shadow mode.
 
     @staticmethod
