@@ -4557,6 +4557,25 @@ class RadarState:
 
         with self._lock:
             self._go_multi_sync_states_by_iid[iid] = dict(msg)
+            # Carry forward anchor stability state from existing sync when anchor ICAO
+            # hasn't changed — prevents phase_anchor_since_ts from resetting each update.
+            existing_sync = self._live_sync_states.get(iid)
+            prev_anchor_icao = getattr(existing_sync, "phase_anchor_icao", None)
+            prev_anchor_since_ts = getattr(existing_sync, "phase_anchor_since_ts", None)
+            anchor_since_ts = prev_anchor_since_ts if (
+                anchor_icao is not None and anchor_icao == prev_anchor_icao and prev_anchor_since_ts is not None
+            ) else (last_updated if anchor_icao else None)
+            # Derive phase_validation_status from Go fields that are already being decoded.
+            validation_score = float(msg.get("avs") or msg.get("cvs") or 0.0)
+            validator_agreement = int(msg.get("vac") or 0)
+            validator_disagree = int(msg.get("vdc") or 0)
+            branch_ambiguity = float(msg.get("bas") or 1.0)
+            if validation_score >= 0.7 and validator_agreement >= 2 and branch_ambiguity < 0.9:
+                phase_validation_status = "validated"
+            elif validation_score >= 0.45:
+                phase_validation_status = "partial"
+            else:
+                phase_validation_status = "unavailable"
             self._live_sync_states[iid] = LiveSyncState(
                 iid=iid,
                 period_s=float(period_s),
@@ -4587,9 +4606,13 @@ class RadarState:
                 phase_anchor_obs_count=int((anchor_row or {}).get("obs_count") or 0),
                 phase_anchor_spread_deg=((anchor_row or {}).get("spread_deg")),
                 phase_anchor_status=("selected" if anchor_icao else "unavailable"),
+                phase_anchor_since_ts=anchor_since_ts,
                 phase_anchor_candidate_count=int(msg.get("ac") or 0),
                 phase_anchor_no_candidate_reason=msg.get("anr"),
                 phase_anchor_candidates=anchor_candidates,
+                phase_validation_status=phase_validation_status,
+                phase_validation_contributors=validator_agreement,
+                phase_validation_reject_count=validator_disagree,
                 dominant_period_s=(float(msg["dp"]) if msg.get("dp") not in (None, 0) else None),
                 dominant_prior_period_s=(float(msg["dp"]) if msg.get("dp") not in (None, 0) else None),
                 trusted_refined_period_s=(float(msg["trp"]) if msg.get("trp") not in (None, 0) else None),

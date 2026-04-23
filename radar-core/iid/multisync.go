@@ -88,17 +88,33 @@ const (
 	recoveryEntryFailureStreak       = 2
 	recoveryAnchorStarvedCandidates  = 0
 	recoveryAnchorStarvedFitEligible = 2
-	authorityPromoteRefinedStreak    = 3
-	authorityRefinedFailureStreak    = 3
-	authorityCompactReclaimStreak    = 5
+	// Authority hysteresis: longer streaks + minimum hold time prevent flapping.
+	authorityPromoteRefinedStreak    = 6     // was 3 — need sustained health before promoting
+	authorityRefinedFailureStreak    = 5     // was 3 — need sustained failure before dropping
+	authorityCompactReclaimStreak    = 8     // was 5 — compact needs long healthy window to reclaim
 	authorityRecoveryEntryStreak     = 2
-	authorityRecoveryExitStreak      = 4
+	authorityRecoveryExitStreak      = 6     // was 4 — longer clean window to exit recovery
 	authorityCompactHealthyDeltaPPM  = 1000.0
+	authorityMinModeHoldS            = 15.0  // min seconds in any mode before switching (recovery exempt)
+
 	anchorSwitchMinScoreDelta        = 0.12
 	anchorSwitchMinScoreRatio        = 1.25
 	anchorHoldMinUpdates             = 3
 	anchorPoorSpreadDeg              = 18.0
 	anchorPoorFitFraction            = 0.55
+
+	// Anchor candidate hard-gates — tighter than the legacy score-only check.
+	anchorMinScore       = 0.15  // was 0.1 — reject weak anchors earlier
+	anchorMinFitEligible = 2     // at least 2 fit-eligible observations required
+	anchorMinFitFraction = 0.18  // at least 18% of observations must be fit-eligible
+	anchorMaxSpreadDeg   = 32.0  // circular spread ceiling for anchor candidates
+
+	// Global branch clustering: reject anchors that diverge from the population consensus.
+	// This breaks wrong-branch self-reinforcement where all ICAOs locally agree on a bad phase.
+	globalBranchMatchDeg    = 35.0 // ICAO mean more than this from global center → rejected
+	globalBranchMinObs      = 3    // minimum observations to trust global branch estimate
+	globalBranchMaxSpreadDeg = 42.0 // global spread above this → multi-cluster / branch-ambiguous
+
 	candidateStablePeriodPPM         = 300.0
 	candidateStablePhaseDeg          = 10.0
 	candidatePromotionMinStreak      = 6
@@ -1309,6 +1325,13 @@ func (ms *MultiSyncSolver) setAuthorityMode(mode, reason string, nowUnix float64
 	if ms.ActiveAuthorityMode == mode {
 		return
 	}
+	// Enforce minimum hold time to prevent run-to-run flapping.
+	// Recovery entry is exempt — it is urgent and must override the lockout.
+	if mode != authorityModeRecovery && ms.LastAuthoritySwitchTS > 0 {
+		if nowUnix-ms.LastAuthoritySwitchTS < authorityMinModeHoldS {
+			return
+		}
+	}
 	ms.ActiveAuthorityMode = mode
 	ms.AuthoritySwitchCount++
 	ms.LastAuthoritySwitchTS = nowUnix
@@ -1548,12 +1571,58 @@ func (ms *MultiSyncSolver) evaluatePhaseValidation(
 	}
 	summary.circularDispersion = selectedSpread
 
+	// Global phase analysis: compute circular mean and spread across ALL
+	// fit-eligible observations to detect wrong-branch self-reinforcement.
+	// If all ICAOs are on the same wrong branch they will all "validate" the
+	// wrong anchor, so we need an independent global check here.
+	periodUS := estimate.periodS * 1e6
+	var gSinSum, gCosSum float64
+	gN := 0
+	for _, se := range scored {
+		if !se.fitEligible {
+			continue
+		}
+		phaseRel := math.Mod((se.effectiveUS-estimate.epochUS)/periodUS*360.0, 360.0)
+		if phaseRel < 0 {
+			phaseRel += 360.0
+		}
+		implied := math.Mod(se.o.BearingDeg-phaseRel+360.0, 360.0)
+		rad := implied * math.Pi / 180.0
+		gSinSum += math.Sin(rad)
+		gCosSum += math.Cos(rad)
+		gN++
+	}
+	globalCohesionBonus := 0.0
+	if gN >= globalBranchMinObs {
+		globalMeanDeg := math.Mod(math.Atan2(gSinSum, gCosSum)*180.0/math.Pi+360.0, 360.0)
+		gR := math.Hypot(gSinSum, gCosSum) / float64(gN)
+		globalSpread := 999.0
+		if gR >= 1 {
+			globalSpread = 0
+		} else if gR > 0 {
+			globalSpread = math.Sqrt(-2.0*math.Log(gR)) * 180.0 / math.Pi
+		}
+		// If global spread is large the phase population is multi-modal → raise ambiguity.
+		if globalSpread > globalBranchMaxSpreadDeg {
+			summary.branchAmbiguity = math.Max(summary.branchAmbiguity, 0.75)
+		} else if globalSpread > 25.0 {
+			summary.branchAmbiguity = math.Max(summary.branchAmbiguity, 0.55)
+		}
+		// If the estimate offset is near the global mean, give a cohesion bonus.
+		anchorVsGlobal := math.Abs(circularDiff(estimate.offsetDeg, globalMeanDeg))
+		if anchorVsGlobal <= 12.0 && globalSpread <= 20.0 {
+			globalCohesionBonus = 0.15
+		} else if anchorVsGlobal > 30.0 {
+			// Estimate is far from global mean — likely wrong branch.
+			summary.branchAmbiguity = math.Max(summary.branchAmbiguity, 0.7)
+		}
+	}
+
 	type validatorAccum struct {
 		count int
 		sin   float64
 		cos   float64
 	}
-	periodUS := estimate.periodS * 1e6
 	byICAO := make(map[uint32]*validatorAccum)
 	for _, se := range scored {
 		if !se.fitEligible || se.o.ICAO == *estimate.anchorICAO {
@@ -1595,7 +1664,7 @@ func (ms *MultiSyncSolver) evaluatePhaseValidation(
 		dispersionScore = clamp(1.0-selectedSpread/30.0, 0, 1)
 	}
 	ambiguityScore := 1.0 - summary.branchAmbiguity
-	summary.score = clamp(0.45*agreementScore+0.30*dispersionScore+0.25*ambiguityScore-0.35*disagreementPenalty, 0, 1)
+	summary.score = clamp(0.40*agreementScore+0.25*dispersionScore+0.20*ambiguityScore+globalCohesionBonus-0.35*disagreementPenalty, 0, 1)
 	summary.strong = summary.validatorAgreement >= validatorAgreementMinCount &&
 		summary.branchAmbiguity < branchAmbiguityRejectThreshold &&
 		summary.score >= authoritativeValidationStrong
@@ -1796,10 +1865,36 @@ func (ms *MultiSyncSolver) selectAnchor(
 		}
 	}
 
+	// Compute the global phase branch center from all per-ICAO accumulators.
+	// ICAOs whose circular mean diverges from this center are on a competing branch
+	// and must be rejected to prevent wrong-branch self-reinforcement.
+	var gSinSum, gCosSum float64
+	gN := 0
+	for _, a := range byICAO {
+		if a.nObs > 0 {
+			gSinSum += a.sinSum
+			gCosSum += a.cosSum
+			gN += a.nObs
+		}
+	}
+	globalMeanDeg := 0.0
+	globalSpreadDeg := 999.0
+	globalBranchValid := false
+	if gN >= globalBranchMinObs {
+		globalMeanDeg = math.Mod(math.Atan2(gSinSum, gCosSum)*180.0/math.Pi+360.0, 360.0)
+		gR := math.Hypot(gSinSum, gCosSum) / float64(gN)
+		if gR >= 1 {
+			globalSpreadDeg = 0
+		} else if gR > 0 {
+			globalSpreadDeg = math.Sqrt(-2.0*math.Log(gR)) * 180.0 / math.Pi
+		}
+		globalBranchValid = globalSpreadDeg <= globalBranchMaxSpreadDeg
+	}
+
 	var best *icaoAnchor
 	for _, a := range byICAO {
 		a.score = msAnchorScore(ms.ICAOQuality[a.icao], a.maxBaseW)
-		rejectReasons := make([]string, 0, len(a.rejectReasons)+2)
+		rejectReasons := make([]string, 0, len(a.rejectReasons)+3)
 		for reason := range a.rejectReasons {
 			rejectReasons = append(rejectReasons, reason)
 		}
@@ -1809,19 +1904,8 @@ func (ms *MultiSyncSolver) selectAnchor(
 			fitFraction = float64(a.fitEligibleCount) / float64(a.totalObs)
 		}
 		a.fitFraction = fitFraction
-		status := "candidate"
-		if a.fitEligibleCount == 0 {
-			status = "rejected"
-			if len(rejectReasons) == 0 {
-				rejectReasons = append(rejectReasons, "no_fit_eligible_observations")
-			}
-		} else if a.nObs == 0 {
-			status = "rejected"
-			rejectReasons = append(rejectReasons, "no_anchor_pool_observations")
-		} else if a.score < 0.1 {
-			status = "rejected"
-			rejectReasons = append(rejectReasons, "anchor_score_below_threshold")
-		}
+
+		// Compute circular spread before status check so it can gate rejection.
 		spreadDeg := 0.0
 		if a.nObs > 1 {
 			r := math.Hypot(a.sinSum, a.cosSum) / float64(a.nObs)
@@ -1830,6 +1914,39 @@ func (ms *MultiSyncSolver) selectAnchor(
 			}
 		}
 		a.spreadDeg = spreadDeg
+
+		status := "candidate"
+		if a.fitEligibleCount == 0 {
+			status = "rejected"
+			if len(rejectReasons) == 0 {
+				rejectReasons = append(rejectReasons, "no_fit_eligible_observations")
+			}
+		} else if a.fitEligibleCount < anchorMinFitEligible {
+			status = "rejected"
+			rejectReasons = append(rejectReasons, "insufficient_fit_eligible")
+		} else if a.nObs == 0 {
+			status = "rejected"
+			rejectReasons = append(rejectReasons, "no_anchor_pool_observations")
+		} else if a.score < anchorMinScore {
+			status = "rejected"
+			rejectReasons = append(rejectReasons, "anchor_score_below_threshold")
+		} else if fitFraction < anchorMinFitFraction && a.fitEligibleCount < 4 {
+			status = "rejected"
+			rejectReasons = append(rejectReasons, "fit_fraction_below_threshold")
+		} else if spreadDeg >= anchorMaxSpreadDeg && a.nObs >= 3 {
+			status = "rejected"
+			rejectReasons = append(rejectReasons, "spread_too_large")
+		}
+		// Reject ICAOs diverged from the global phase branch.
+		// This prevents wrong-branch self-reinforcement where all ICAOs
+		// cluster locally around an incorrect phase offset.
+		if status == "candidate" && globalBranchValid && a.nObs > 0 {
+			icaoMeanDeg := math.Mod(math.Atan2(a.sinSum, a.cosSum)*180.0/math.Pi+360.0, 360.0)
+			if math.Abs(circularDiff(icaoMeanDeg, globalMeanDeg)) > globalBranchMatchDeg {
+				status = "rejected"
+				rejectReasons = append(rejectReasons, "diverges_from_global_branch")
+			}
+		}
 		candidates = append(candidates, AnchorCandidateSnapshot{
 			ICAO:                a.icao,
 			Score:               a.score,
@@ -1859,7 +1976,7 @@ func (ms *MultiSyncSolver) selectAnchor(
 		}
 		return candidates[i].ICAO < candidates[j].ICAO
 	})
-	if best == nil || best.score < 0.1 {
+	if best == nil || best.score < anchorMinScore {
 		if len(candidates) == 0 {
 			noCandidateReason = "no_scored_aircraft"
 		} else if candidateCount == 0 {
@@ -1879,7 +1996,7 @@ func (ms *MultiSyncSolver) selectAnchor(
 				break
 			}
 		}
-		if current != nil && current.fitEligibleCount > 0 && current.nObs > 0 && current.score >= 0.1 {
+		if current != nil && current.fitEligibleCount > 0 && current.nObs > 0 && current.score >= anchorMinScore {
 			materiallyBetter := best.score >= current.score+anchorSwitchMinScoreDelta &&
 				best.score >= current.score*anchorSwitchMinScoreRatio
 			currentPoor := current.spreadDeg >= anchorPoorSpreadDeg ||
