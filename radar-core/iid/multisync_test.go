@@ -52,7 +52,7 @@ func scoreObsForSeed(ms *MultiSyncSolver, obs []MultiSyncObs, seedEpochUS, seedO
 		case "soft":
 			effectiveW = baseW * 0.2 * qMult
 		}
-		fitRejectReason := msFitRejectReason(o, status, absR, qEntry)
+		fitRejectReason := msFitRejectReason(o, status, absR, qEntry, false)
 		scored = append(scored, scoredObs{
 			o:               o,
 			residual:        residual,
@@ -107,7 +107,7 @@ func TestMultiSyncSolver_BasicFit(t *testing.T) {
 
 	// Force a solver run by setting lastRunTS to 0.
 	ms.lastRunTS = 0.0
-	ran := ms.TryUpdate(sync)
+	ran := ms.TryUpdate(sync, 0)
 	if !ran {
 		t.Fatal("expected TryUpdate to run the solver")
 	}
@@ -141,13 +141,13 @@ func TestMultiSyncSolver_Throttle(t *testing.T) {
 
 	// First call: throttle time is 0 so it should run.
 	ms.lastRunTS = 0.0
-	ran := ms.TryUpdate(sync)
+	ran := ms.TryUpdate(sync, 0)
 	if !ran {
 		t.Error("expected first TryUpdate to run")
 	}
 
 	// Second call immediately: should be throttled.
-	ran = ms.TryUpdate(sync)
+	ran = ms.TryUpdate(sync, 0)
 	if ran {
 		t.Error("expected second immediate TryUpdate to be throttled")
 	}
@@ -163,7 +163,7 @@ func TestMultiSyncSolver_InsufficientObservations(t *testing.T) {
 	ms.obs = append(ms.obs, buildObs(2e6, 180.0, 0xABC002, now))
 
 	ms.lastRunTS = 0.0
-	ms.TryUpdate(sync)
+	ms.TryUpdate(sync, 0)
 
 	if ms.Present {
 		t.Error("expected Present=false with insufficient observations")
@@ -181,7 +181,7 @@ func TestMultiSyncSolver_Reset(t *testing.T) {
 		ms.obs = append(ms.obs, buildObs(float64(i)*4e5, float64(i*18), 0xABC001, now))
 	}
 	ms.lastRunTS = 0.0
-	ms.TryUpdate(sync)
+	ms.TryUpdate(sync, 0)
 	if !ms.Present {
 		t.Skip("solver did not produce a state — skipping reset assertions")
 	}
@@ -232,7 +232,7 @@ func TestMultiSyncSolver_Snapshot(t *testing.T) {
 		ms.obs = append(ms.obs, buildObs(us, bearing, uint32(0xABC001+i%3), now-60.0+float64(i)*2.0))
 	}
 	ms.lastRunTS = 0.0
-	ms.TryUpdate(sync)
+	ms.TryUpdate(sync, 0)
 
 	snap := ms.Snapshot()
 	if snap.Present != ms.Present {
@@ -289,7 +289,7 @@ func TestMultiSyncSolver_BootstrapRecorded(t *testing.T) {
 		ms.obs = append(ms.obs, buildObs(us, bearing, uint32(0xABC001+i%3), now-60.0+float64(i)*2.0))
 	}
 	ms.lastRunTS = 0.0
-	ms.TryUpdate(sync)
+	ms.TryUpdate(sync, 0)
 
 	if ms.BootstrapPeriodS != 4.0 {
 		t.Errorf("expected BootstrapPeriodS=4.0 after first run, got %.4f", ms.BootstrapPeriodS)
@@ -298,7 +298,7 @@ func TestMultiSyncSolver_BootstrapRecorded(t *testing.T) {
 	// A second run with a different compact-sync period must not overwrite BootstrapPeriodS.
 	sync2 := NewSyncState(1, 5.0, 0.0, 45.0, 0.8)
 	ms.lastRunTS = 0.0
-	ms.TryUpdate(sync2)
+	ms.TryUpdate(sync2, 0)
 	if ms.BootstrapPeriodS != 4.0 {
 		t.Errorf("BootstrapPeriodS must not change on subsequent runs: got %.4f", ms.BootstrapPeriodS)
 	}
@@ -323,7 +323,7 @@ func TestMultiSyncSolver_TrustPromotion(t *testing.T) {
 			ms.obs = append(ms.obs, buildObs(us, bearing, uint32(0xABC001+i%4), now+float64(run)*periodS))
 		}
 		ms.lastRunTS = 0.0
-		ms.TryUpdate(sync)
+		ms.TryUpdate(sync, 0)
 		if ms.TrustedBasePeriodS > 0 {
 			promoted = true
 			break
@@ -414,7 +414,7 @@ func TestMultiSyncSolver_NoDriftOnWeakEvidence(t *testing.T) {
 			uint32(0xABC001+i%2), now))
 	}
 	ms.lastRunTS = 0.0
-	ms.TryUpdate(sync)
+	ms.TryUpdate(sync, 0)
 
 	if ms.TrustUpdateStreak > 0 {
 		t.Errorf("trust streak should not advance on weak evidence: got %d", ms.TrustUpdateStreak)
@@ -437,7 +437,7 @@ func TestMultiSyncSolver_TrustStreakResetsOnNonEligibleUpdate(t *testing.T) {
 			ms.obs = append(ms.obs, buildObs(us, bearing, uint32(0xABC100+i%4), now+float64(run)))
 		}
 		ms.lastRunTS = 0.0
-		ms.TryUpdate(sync)
+		ms.TryUpdate(sync, 0)
 	}
 	if ms.TrustUpdateStreak == 0 {
 		t.Fatal("expected streak to advance on clean updates")
@@ -451,7 +451,7 @@ func TestMultiSyncSolver_TrustStreakResetsOnNonEligibleUpdate(t *testing.T) {
 		ms.obs = append(ms.obs, buildObs(us, bearing, uint32(0xABC200+i%2), now+10.0))
 	}
 	ms.lastRunTS = 0.0
-	ms.TryUpdate(sync)
+	ms.TryUpdate(sync, 0)
 
 	if ms.TrustUpdateStreak != 0 {
 		t.Fatalf("expected non-trust-eligible update to reset streak, got %d", ms.TrustUpdateStreak)
@@ -482,7 +482,7 @@ func TestMultiSyncSolver_ReacquireCandidateSearch(t *testing.T) {
 	ms.BootstrapPeriodS = wrongSeedS
 
 	ms.lastRunTS = 0.0
-	ms.TryUpdate(sync)
+	ms.TryUpdate(sync, 0)
 
 	// Candidate search must have run and produced a non-zero result.
 	if ms.LastReacquireCandidateP <= 0 {
@@ -522,7 +522,7 @@ func TestMultiSyncSolver_ReacquirePublishesConsistentCandidateFamily(t *testing.
 		case "soft":
 			effectiveW = baseW * 0.2 * qMult
 		}
-		fitRejectReason := msFitRejectReason(obs, status, absR, ms.ICAOQuality[obs.ICAO])
+		fitRejectReason := msFitRejectReason(obs, status, absR, ms.ICAOQuality[obs.ICAO], false)
 		scored = append(scored, scoredObs{
 			o:               obs,
 			residual:        residual,
@@ -548,7 +548,7 @@ func TestMultiSyncSolver_ReacquirePublishesConsistentCandidateFamily(t *testing.
 	expected := ms.searchBestCandidate(scored, 0.0)
 
 	ms.lastRunTS = 0.0
-	ms.TryUpdate(sync)
+	ms.TryUpdate(sync, 0)
 
 	if math.Abs(ms.PeriodS-ms.LastReacquireCandidateP) > 1e-9 {
 		t.Fatalf("published period %.6f should match candidate %.6f", ms.PeriodS, ms.LastReacquireCandidateP)
@@ -586,7 +586,7 @@ func TestMultiSyncSolver_NormalRefinementPublishesAlignmentFromRefinedPeriod(t *
 	}
 
 	ms.lastRunTS = 0.0
-	ms.TryUpdate(sync)
+	ms.TryUpdate(sync, 0)
 
 	if ms.PeriodReacquireActive {
 		t.Fatal("expected normal refinement path, not reacquire")
@@ -634,7 +634,7 @@ func TestMultiSyncSolver_PeriodBaseReflectsSameRunTrustPromotion(t *testing.T) {
 	}
 
 	ms.lastRunTS = 0.0
-	ms.TryUpdate(sync)
+	ms.TryUpdate(sync, 0)
 
 	if ms.TrustedBasePeriodS <= 0 {
 		t.Fatal("expected trusted base promotion on this run")
@@ -693,7 +693,7 @@ func TestMultiSyncSolver_TrustResetOnReacquire(t *testing.T) {
 	// Pre-set failure streak so reacquire entry is triggered (PeriodFailureStreak++ makes it ≥3).
 	ms.PeriodFailureStreak = 2
 	ms.lastRunTS = 0.0
-	ms.TryUpdate(sync)
+	ms.TryUpdate(sync, 0)
 
 	// After reacquire fires, TrustUpdateStreak must have been reset.
 	if ms.TrustUpdateStreak != 0 {
@@ -717,7 +717,7 @@ func TestMultiSyncSolver_GoodSeedConverges(t *testing.T) {
 			ms.obs = append(ms.obs, buildObs(us, bearing, uint32(0xABC001+i%3), now+float64(run)*periodS))
 		}
 		ms.lastRunTS = 0.0
-		ms.TryUpdate(sync)
+		ms.TryUpdate(sync, 0)
 	}
 
 	if !ms.Present || !ms.Usable {
@@ -811,6 +811,106 @@ func TestEvalCandidatePeriod_CorrectPeriodScoresHigher(t *testing.T) {
 	}
 	if correctResult.inlierCount < 20 {
 		t.Errorf("expected most obs to be inliers for correct period, got %d", correctResult.inlierCount)
+	}
+}
+
+func TestMultiSyncSolver_UsesDominantPriorDuringRecovery(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	truePeriodS := 4.0
+	badCompactPeriodS := 4.16
+	sync := NewSyncState(1, badCompactPeriodS, 0.0, 45.0, 0.8)
+
+	now := float64(time.Now().UnixMicro()) / 1e6
+	for i := 0; i < 24; i++ {
+		us := float64(i) * truePeriodS / 4.0 * 1e6
+		icao := uint32(0xABC001 + i%3)
+		bearing := simulatedBearing(us, 0.0, 45.0, truePeriodS)
+		ms.obs = append(ms.obs, buildObs(us, bearing, icao, now-20.0+float64(i)*0.5))
+	}
+
+	ms.lastRunTS = 0.0
+	if !ms.TryUpdate(sync, truePeriodS) {
+		t.Fatal("expected solver to run")
+	}
+
+	snap := ms.Snapshot()
+	if !snap.RecoveryModeActive {
+		t.Fatal("expected recovery mode to activate when compact period diverges from dominant period")
+	}
+	if snap.ActiveFamilyPriorSource != "dominant_live_df" {
+		t.Fatalf("expected dominant prior source during recovery, got %q", snap.ActiveFamilyPriorSource)
+	}
+	if !snap.DominantPriorActive {
+		t.Fatal("expected dominant prior to be marked active")
+	}
+	if math.Abs(snap.ActiveFamilyPriorPeriodS-truePeriodS) > 0.01 {
+		t.Fatalf("expected dominant prior period %.3f, got %.6f", truePeriodS, snap.ActiveFamilyPriorPeriodS)
+	}
+	if snap.AnchorCandidateCount == 0 || snap.AnchorICAO == nil {
+		t.Fatalf("expected recovery to rebuild anchor candidates, got count=%d anchor=%v", snap.AnchorCandidateCount, snap.AnchorICAO)
+	}
+	if math.Abs(snap.PeriodS-truePeriodS) >= math.Abs(badCompactPeriodS-truePeriodS) {
+		t.Fatalf("expected refined period %.6f to move closer to dominant %.3f than compact %.3f", snap.PeriodS, truePeriodS, badCompactPeriodS)
+	}
+}
+
+func TestMultiSyncSolver_HealthyCompactStaysOutOfRecovery(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	periodS := 4.0
+	sync := NewSyncState(1, periodS, 0.0, 45.0, 0.9)
+
+	now := float64(time.Now().UnixMicro()) / 1e6
+	for i := 0; i < 18; i++ {
+		us := float64(i) * periodS / 3.0 * 1e6
+		icao := uint32(0xABC100 + i%3)
+		bearing := simulatedBearing(us, 0.0, 45.0, periodS)
+		ms.obs = append(ms.obs, buildObs(us, bearing, icao, now-15.0+float64(i)*0.4))
+	}
+
+	ms.lastRunTS = 0.0
+	ms.TryUpdate(sync, periodS)
+	snap := ms.Snapshot()
+	if snap.RecoveryModeActive {
+		t.Fatal("did not expect recovery mode for healthy compact sync")
+	}
+	if snap.ActiveFamilyPriorSource != "compact_seed" {
+		t.Fatalf("expected compact seed to remain the active prior in normal mode, got %q", snap.ActiveFamilyPriorSource)
+	}
+	if snap.CompactGatingBypassed {
+		t.Fatal("did not expect compact gating bypass outside recovery")
+	}
+}
+
+func TestMultiSyncSolver_RecoveryRelaxesAdmission(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	truePeriodS := 4.0
+	sync := NewSyncState(1, 4.16, 0.0, 45.0, 0.8)
+
+	now := float64(time.Now().UnixMicro()) / 1e6
+	for i := 0; i < 18; i++ {
+		us := float64(i) * truePeriodS / 3.0 * 1e6
+		icao := uint32(0xABC200 + i%3)
+		bearing := simulatedBearing(us, 0.0, 45.0, truePeriodS)
+		if i%4 == 0 {
+			bearing = math.Mod(bearing+42.0, 360.0)
+		}
+		ms.obs = append(ms.obs, buildObs(us, bearing, icao, now-15.0+float64(i)*0.4))
+	}
+
+	ms.lastRunTS = 0.0
+	ms.TryUpdate(sync, truePeriodS)
+	snap := ms.Snapshot()
+	if !snap.RecoveryModeActive {
+		t.Fatal("expected recovery mode to activate")
+	}
+	if !snap.CompactGatingBypassed {
+		t.Fatal("expected compact gating to be bypassed in recovery")
+	}
+	if snap.RecoveryRelaxedAdmissions == 0 {
+		t.Fatal("expected some observations to be admitted only because recovery relaxed gates")
+	}
+	if snap.FitEligibleObservations < recoveryFitEligibleMin {
+		t.Fatalf("expected relaxed recovery admissions to rebuild fit pool, got %d eligible observations", snap.FitEligibleObservations)
 	}
 }
 

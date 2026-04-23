@@ -1,3 +1,36 @@
+## 2026-04-23 Dominant-Period-Led Refined Sync Recovery
+
+- [x] Trace the current compact/bootstrap, dominant rotation, and refined multi-sync dependency chain in Go/Python and confirm where compact sync still seeds, clamps, and hard-gates recovery
+- [x] Refactor `radar-core/iid/multisync.go` so the solver carries separate compact seed, dominant prior, trusted refined period, and explicit recovery-mode state, with dominant period as the primary family prior during recovery
+- [x] Relax or bypass compact-sync mismatch gating during recovery so the refined fit pool and anchor search can rebuild from dominant-family observations instead of staying starved behind `compact_go_sync`
+- [x] Add explicit failure detection that compares compact/refined sync against the dominant rotation period and enters recovery mode only when dominant divergence combines with other bad-sync signals
+- [x] Export additive diagnostics through Go protocol emission and Python snapshot shaping for dominant period, active family prior, period delta to dominant, recovery mode, trigger reasons, compact gating bypass, and recovery-admitted observations
+- [x] Update any API/debug payloads needed by the radar UI so operators can see whether the solver is following compact bootstrap, trusted refined state, or dominant-period-led recovery
+- [x] Add focused Go and backend tests for wrong-compact/correct-dominant recovery, healthy compact normal mode, recovery admission, anchor recovery, and diagnostics payload semantics
+- [x] Run verification, capture exact commands/results, and record a review summary below
+
+Plan confirmation:
+- The redesign stays in the Go hot path. Python remains a consumer/normaliser of exported solver state and diagnostics.
+- Compact/sweep-frame sync remains a useful signal, but it stops being the authoritative recovery foundation when dominant rotation evidence is healthier.
+- The change should be incremental and reviewable: explicit new state/diagnostics first, then admission/recovery logic, then payload/UI shaping, then focused verification.
+
+### Review
+- Root cause confirmed:
+  - `radar-core/iid/multisync.go` still chose its live fit family from the current refined period if present, else compact sync, and captured bootstrap from compact sync unless refined state already existed. That meant the fit window, clamp base, and candidate search all inherited the compact family by default.
+  - Recovery was expressed only as wrong-period reacquire inside the same solver, not as an explicit “dominant-family-led recovery mode”. The solver had no first-class dominant-period prior from the live DF alignment / rotation model.
+  - Fit eligibility itself was not keyed on an explicit compact gate in Go, but the wrong compact family still starved the fit pool indirectly because residuals were scored against the wrong period family, which then tripped residual rejection and left anchors empty.
+- Implemented:
+  - `radar-core/iid/state.go` now exposes the current dominant rotation period to Stage 3 via `DominantPeriodSnapshot()`, and `radar-core/cmd/radar-core/main.go` passes that period into the Go multi-sync solver on each update.
+  - `radar-core/iid/multisync.go` now chooses an explicit active family prior per run, tracks dominant prior vs compact period vs trusted refined base separately, and enters recovery mode when dominant-period divergence combines with bad-sync signals such as holdover, residual EMA, fit starvation, missing anchors, or repeated failures.
+  - In recovery mode the solver now recentres on the dominant live DF period, uses it as the active family prior/clamp basis, widens admission enough to rebuild anchors, and counts observations admitted only because recovery relaxed the gates.
+  - Protocol/export payloads now carry dominant prior, active family prior, compact-vs-dominant delta, refined-vs-dominant delta, compact unreliability, recovery mode, trigger reasons, compact-gating bypass, and relaxed-admission counts.
+  - Python normalisation and sync-mode diagnostics now surface those fields through `LiveSyncState`, burst-sync diagnostics, and API/debug snapshots.
+- Verification:
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid -run 'TestMultiSyncSolver_(UsesDominantPriorDuringRecovery|HealthyCompactStaysOutOfRecovery|RecoveryRelaxesAdmission|BasicFit|DiagnosticsExposedInSnapshot)' -count=1` → passed
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid ./cmd/radar-core ./protocol -count=1` → passed
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -q -k 'go_multi_sync_state or sync_mode_diagnostics_report_dominant_recovery_fields'` → `3 passed, 84 deselected`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_radar_core_client.py -q` → `145 passed`
+
 ## 2026-04-23 Burst Sync Mode Clarity And Anchor Diagnostics
 
 - [x] Trace the current burst sync alignment payload path end to end and document what actually drives the chart, anchor list, and existing status fields

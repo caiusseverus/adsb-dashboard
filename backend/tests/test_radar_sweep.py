@@ -3234,6 +3234,22 @@ def test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst(monkey
         "pe": 888_000.0, "po": 22.5,
         "jd": 3.0, "re": 4.0, "nu": 10,
         "ho": False, "ra": False, "ts": 2_000.0,
+        "bp": 4.0,
+        "trp": 4.005,
+        "dp": 4.0,
+        "afp": 4.0,
+        "afs": "dominant_live_df",
+        "dpa": True,
+        "pds": 0.01,
+        "pdp": 2500.0,
+        "cp": 4.16,
+        "cds": 0.16,
+        "cdp": 40000.0,
+        "cu": True,
+        "rma": True,
+        "rtr": ["compact_dominant_delta", "fit_pool_starved"],
+        "cgb": True,
+        "rla": 5,
         "ai": int("AAAAAA", 16),
         "as": 0.8,
         "ft": 11,
@@ -3262,6 +3278,65 @@ def test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst(monkey
     assert sync.phase_anchor_no_candidate_reason == "no_anchor_candidates"
     assert sync.phase_anchor_candidates[0]["icao"] == "AAAAAA"
     assert sync.phase_anchor_candidates[1]["reject_reasons"] == ["no_fit_eligible_aircraft"]
+    assert sync.dominant_period_s == pytest.approx(4.0)
+    assert sync.active_family_prior_s == pytest.approx(4.0)
+    assert sync.active_family_prior_source == "dominant_live_df"
+    assert sync.dominant_prior_active is True
+    assert sync.compact_period_s == pytest.approx(4.16)
+    assert sync.compact_sync_unreliable is True
+    assert sync.recovery_mode_active is True
+    assert sync.recovery_trigger_reasons == ["compact_dominant_delta", "fit_pool_starved"]
+    assert sync.compact_gating_bypassed is True
+    assert sync.recovery_relaxed_admitted_observations == 5
+
+
+def test_go_multi_sync_mode_diagnostics_report_dominant_recovery_fields():
+    state = RadarState()
+    state._live_sync_states[11] = LiveSyncState(
+        iid=11,
+        period_s=4.01,
+        phase_epoch_us=500_000.0,
+        phase_offset_deg=20.0,
+        sync_quality=0.8,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=2_000.0,
+        source="go_multi_aircraft_burst",
+        usable=True,
+        dominant_period_s=4.0,
+        active_family_prior_s=4.0,
+        active_family_prior_source="dominant_live_df",
+        dominant_prior_active=True,
+        dominant_period_delta_s=0.01,
+        dominant_period_delta_ppm=2500.0,
+        compact_period_s=4.16,
+        compact_period_delta_to_dominant_s=0.16,
+        compact_period_delta_to_dominant_ppm=40000.0,
+        compact_sync_unreliable=True,
+        recovery_mode_active=True,
+        recovery_trigger_reasons=["compact_dominant_delta", "fit_pool_starved"],
+        compact_gating_bypassed=True,
+        recovery_relaxed_admitted_observations=4,
+        fit_total_observations=12,
+        fit_eligible_observations=8,
+        fit_rejected_observations=4,
+        fit_reject_reasons={"residual_gate": 4},
+        phase_anchor_candidate_count=2,
+        phase_anchor_icao="AAAAAA",
+    )
+
+    diagnostics = state._build_sync_mode_diagnostics(11, state._live_sync_states[11], None)
+
+    assert diagnostics["dominant_period_s"] == pytest.approx(4.0)
+    assert diagnostics["active_family_prior_s"] == pytest.approx(4.0)
+    assert diagnostics["active_family_prior_source"] == "dominant_live_df"
+    assert diagnostics["dominant_prior_active"] is True
+    assert diagnostics["recovery_mode_active"] is True
+    assert diagnostics["recovery_trigger_reasons"] == ["compact_dominant_delta", "fit_pool_starved"]
+    assert diagnostics["compact_gating_bypassed"] is True
+    assert diagnostics["recovery_relaxed_admitted_observations"] == 4
+    assert diagnostics["compact"]["period_s"] == pytest.approx(4.16)
+    assert diagnostics["compact"]["unreliable"] is True
+    assert diagnostics["refined"]["period_delta_to_dominant_ppm"] == pytest.approx(2500.0)
 
 
 def test_reset_iid_clears_go_multi_sync_state():

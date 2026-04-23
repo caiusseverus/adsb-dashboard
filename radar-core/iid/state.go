@@ -353,6 +353,21 @@ func (s *IIDState) SyncStateRef() *SyncState {
 	return s.Sync
 }
 
+// DominantPeriodSnapshot returns the most recent live dominant rotation period.
+// Falls back to the reinforced single-period estimate when no fresh rotation
+// model dominant period is available.
+func (s *IIDState) DominantPeriodSnapshot() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.LastRotationModel != nil && s.LastRotationModel.DominantPeriodS != nil {
+		return *s.LastRotationModel.DominantPeriodS
+	}
+	if s.PeriodS != nil {
+		return *s.PeriodS
+	}
+	return 0
+}
+
 // SyncProtocolSnapshot returns compact sync fields for protocol emission.
 func (s *IIDState) SyncProtocolSnapshot() (
 	present bool,

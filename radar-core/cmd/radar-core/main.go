@@ -278,7 +278,8 @@ func (e *engine) maybeUpdateMultiSync(s *iid.IIDState, f *burst.FiredBurst) {
 	syncSnap, _ := s.SyncSnapshot()
 	_ = syncSnap
 	sync := s.SyncStateRef()
-	if updated := s.MultiSync.TryUpdate(sync); updated {
+	dominantPeriodS := s.DominantPeriodSnapshot()
+	if updated := s.MultiSync.TryUpdate(sync, dominantPeriodS); updated {
 		e.emitMultiSyncState(s)
 	} else {
 		s.RecordMultiSyncAdmission("solver_throttled_or_no_update", f.ICAO, nowUnix)
@@ -324,22 +325,37 @@ func (e *engine) emitMultiSyncState(s *iid.IIDState) {
 		AnchorScore:           snap.AnchorScore,
 		UpdatedAt:             snap.LastUpdated,
 		// Bootstrap / trust diagnostics.
-		BootstrapPeriodS:         snap.BootstrapPeriodS,
-		TrustedBasePeriodS:       snap.TrustedBasePeriodS,
-		TrustUpdateStreak:        uint16(snap.TrustUpdateStreak),
-		BaseClamped:              snap.BaseClamped,
-		BaseClampDiffPPM:         snap.BaseClampDiffPPM,
-		WrongPeriodSuspect:       snap.WrongPeriodSuspect,
-		ReacquireCandidatePeriod: snap.ReacquireCandidatePeriod,
-		ReacquireCandidateScore:  snap.ReacquireCandidateScore,
-		FitTotalObservations:     uint32(snap.FitTotalObservations),
-		FitEligibleObservations:  uint32(snap.FitEligibleObservations),
-		FitRejectedObservations:  uint32(snap.FitRejectedObservations),
-		FitContributingICAOs:     uint16(snap.FitContributingICAOs),
-		FitRejectReasons:         snap.FitRejectReasons,
-		AnchorCandidateCount:     uint16(snap.AnchorCandidateCount),
-		AnchorNoCandidateReason:  snap.AnchorNoCandidateReason,
-		AnchorCandidates:         candidates,
+		BootstrapPeriodS:          snap.BootstrapPeriodS,
+		TrustedBasePeriodS:        snap.TrustedBasePeriodS,
+		TrustUpdateStreak:         uint16(snap.TrustUpdateStreak),
+		BaseClamped:               snap.BaseClamped,
+		BaseClampDiffPPM:          snap.BaseClampDiffPPM,
+		WrongPeriodSuspect:        snap.WrongPeriodSuspect,
+		ReacquireCandidatePeriod:  snap.ReacquireCandidatePeriod,
+		ReacquireCandidateScore:   snap.ReacquireCandidateScore,
+		FitTotalObservations:      uint32(snap.FitTotalObservations),
+		FitEligibleObservations:   uint32(snap.FitEligibleObservations),
+		FitRejectedObservations:   uint32(snap.FitRejectedObservations),
+		FitContributingICAOs:      uint16(snap.FitContributingICAOs),
+		FitRejectReasons:          snap.FitRejectReasons,
+		AnchorCandidateCount:      uint16(snap.AnchorCandidateCount),
+		AnchorNoCandidateReason:   snap.AnchorNoCandidateReason,
+		AnchorCandidates:          candidates,
+		DominantPriorPeriodS:      snap.DominantPriorPeriodS,
+		TrustedRefinedPeriodS:     snap.TrustedRefinedPeriodS,
+		ActiveFamilyPriorPeriodS:  snap.ActiveFamilyPriorPeriodS,
+		ActiveFamilyPriorSource:   snap.ActiveFamilyPriorSource,
+		DominantPriorActive:       snap.DominantPriorActive,
+		CompactPeriodS:            snap.CompactPeriodS,
+		PeriodDeltaToDominantS:    snap.PeriodDeltaToDominantS,
+		PeriodDeltaToDominantPPM:  snap.PeriodDeltaToDominantPPM,
+		CompactDeltaToDominantS:   snap.CompactDeltaToDominantS,
+		CompactDeltaToDominantPPM: snap.CompactDeltaToDominantPPM,
+		CompactSyncUnreliable:     snap.CompactSyncUnreliable,
+		RecoveryModeActive:        snap.RecoveryModeActive,
+		RecoveryTriggerReasons:    snap.RecoveryTriggerReasons,
+		CompactGatingBypassed:     snap.CompactGatingBypassed,
+		RecoveryRelaxedAdmissions: uint32(snap.RecoveryRelaxedAdmissions),
 	}
 	e.writer.Send(msg)
 }

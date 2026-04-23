@@ -79,6 +79,16 @@ const (
 	reacquireMADThreshold = 8.0 // deg — detrended MAD for recovery
 	reacquireMinClean     = 2   // consecutive clean updates to exit reacquire
 
+	recoveryResidualEMAThreshold     = 18.0
+	recoveryRejectedFrameThreshold   = 4
+	recoveryFitEligibleMin           = 4
+	recoveryPeriodDeltaPPM           = 2500.0
+	recoveryResidualRejectGate       = 55.0
+	recoveryPositionAgeMaxS          = 15.0
+	recoveryEntryFailureStreak       = 2
+	recoveryAnchorStarvedCandidates  = 0
+	recoveryAnchorStarvedFitEligible = 2
+
 	// ICAO quality memory.
 	icaoQualityMADAlpha  = 0.15
 	icaoQualityRejectMAD = 20.0 // deg — ICAO gets rejected from fit above this
@@ -178,22 +188,37 @@ type MultiSyncSnapshot struct {
 	AnchorPhaseDeg        float64
 	AnchorScore           float64
 	// Bootstrap / trust diagnostics.
-	BootstrapPeriodS         float64 // compact-sync seed captured at first run
-	TrustedBasePeriodS       float64 // promoted from refined period after trustMinStreak updates; 0=not yet trusted
-	TrustUpdateStreak        int     // consecutive updates meeting trust criteria
-	BaseClamped              bool    // true if the base-period clamp fired on the last run
-	BaseClampDiffPPM         float64 // raw PPM deviation that triggered (or would have triggered) the clamp
-	WrongPeriodSuspect       bool    // true if wrong-period suspicion was raised on the last run
-	ReacquireCandidatePeriod float64 // period chosen by candidate search during reacquire (0 if not active)
-	ReacquireCandidateScore  float64 // score of that candidate
-	FitTotalObservations     int
-	FitEligibleObservations  int
-	FitRejectedObservations  int
-	FitContributingICAOs     int
-	FitRejectReasons         map[string]uint64
-	AnchorCandidateCount     int
-	AnchorNoCandidateReason  string
-	AnchorCandidates         []AnchorCandidateSnapshot
+	BootstrapPeriodS          float64 // compact-sync seed captured at first run
+	TrustedBasePeriodS        float64 // promoted from refined period after trustMinStreak updates; 0=not yet trusted
+	TrustUpdateStreak         int     // consecutive updates meeting trust criteria
+	BaseClamped               bool    // true if the base-period clamp fired on the last run
+	BaseClampDiffPPM          float64 // raw PPM deviation that triggered (or would have triggered) the clamp
+	WrongPeriodSuspect        bool    // true if wrong-period suspicion was raised on the last run
+	ReacquireCandidatePeriod  float64 // period chosen by candidate search during reacquire (0 if not active)
+	ReacquireCandidateScore   float64 // score of that candidate
+	FitTotalObservations      int
+	FitEligibleObservations   int
+	FitRejectedObservations   int
+	FitContributingICAOs      int
+	FitRejectReasons          map[string]uint64
+	AnchorCandidateCount      int
+	AnchorNoCandidateReason   string
+	AnchorCandidates          []AnchorCandidateSnapshot
+	DominantPriorPeriodS      float64
+	TrustedRefinedPeriodS     float64
+	ActiveFamilyPriorPeriodS  float64
+	ActiveFamilyPriorSource   string
+	DominantPriorActive       bool
+	CompactPeriodS            float64
+	PeriodDeltaToDominantS    float64
+	PeriodDeltaToDominantPPM  float64
+	CompactDeltaToDominantS   float64
+	CompactDeltaToDominantPPM float64
+	CompactSyncUnreliable     bool
+	RecoveryModeActive        bool
+	RecoveryTriggerReasons    []string
+	CompactGatingBypassed     bool
+	RecoveryRelaxedAdmissions int
 }
 
 // MultiSyncSolver holds per-IID multi-aircraft sync refinement state.
@@ -244,19 +269,33 @@ type MultiSyncSolver struct {
 	TrustUpdateStreak  int
 
 	// Per-run diagnostics (updated each solver run, readable via Snapshot).
-	LastBaseClamped          bool    // true if base-period clamp fired on the last run
-	LastBaseClampDiffPPM     float64 // raw PPM deviation that triggered (or would have triggered) the clamp
-	LastWrongPeriodSuspect   bool    // true if wrong-period suspicion was raised on the last run
-	LastReacquireCandidateP  float64 // period chosen by candidate search during reacquire (0 if not active)
-	LastReacquireCandidateSc float64 // score of that candidate period
-	LastFitTotalObs          int
-	LastFitEligibleObs       int
-	LastFitRejectedObs       int
-	LastFitContributingICAOs int
-	LastFitRejectReasons     map[string]uint64
-	LastAnchorCandidateCount int
-	LastAnchorNoCandidate    string
-	LastAnchorCandidates     []AnchorCandidateSnapshot
+	LastBaseClamped               bool    // true if base-period clamp fired on the last run
+	LastBaseClampDiffPPM          float64 // raw PPM deviation that triggered (or would have triggered) the clamp
+	LastWrongPeriodSuspect        bool    // true if wrong-period suspicion was raised on the last run
+	LastReacquireCandidateP       float64 // period chosen by candidate search during reacquire (0 if not active)
+	LastReacquireCandidateSc      float64 // score of that candidate period
+	LastFitTotalObs               int
+	LastFitEligibleObs            int
+	LastFitRejectedObs            int
+	LastFitContributingICAOs      int
+	LastFitRejectReasons          map[string]uint64
+	LastAnchorCandidateCount      int
+	LastAnchorNoCandidate         string
+	LastAnchorCandidates          []AnchorCandidateSnapshot
+	LastDominantPriorPeriodS      float64
+	LastActiveFamilyPriorPeriodS  float64
+	LastActiveFamilyPriorSource   string
+	LastDominantPriorActive       bool
+	LastCompactPeriodS            float64
+	LastPeriodDeltaToDominantS    float64
+	LastPeriodDeltaToDominantPPM  float64
+	LastCompactDeltaToDominantS   float64
+	LastCompactDeltaToDominantPPM float64
+	LastCompactSyncUnreliable     bool
+	LastRecoveryModeActive        bool
+	LastRecoveryTriggerReasons    []string
+	LastCompactGatingBypassed     bool
+	LastRecoveryRelaxedAdmissions int
 
 	// Throttle.
 	lastRunTS float64
@@ -295,7 +334,7 @@ func (ms *MultiSyncSolver) pruneObs() {
 // TryUpdate attempts to run the solver if the throttle interval has elapsed.
 // sync is the current compact frame-sync state for this IID (provides the seed
 // period/phase when no multi-sync state exists yet).  Returns true if a run occurred.
-func (ms *MultiSyncSolver) TryUpdate(sync *SyncState) bool {
+func (ms *MultiSyncSolver) TryUpdate(sync *SyncState, dominantPeriodS float64) bool {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 	now := float64(time.Now().UnixMicro()) / 1e6
@@ -303,7 +342,7 @@ func (ms *MultiSyncSolver) TryUpdate(sync *SyncState) bool {
 		return false
 	}
 	ms.lastRunTS = now
-	ms.runFit(sync, now)
+	ms.runFit(sync, dominantPeriodS, now)
 	return true
 }
 
@@ -351,6 +390,20 @@ func (ms *MultiSyncSolver) Reset() {
 	ms.LastAnchorCandidateCount = 0
 	ms.LastAnchorNoCandidate = ""
 	ms.LastAnchorCandidates = nil
+	ms.LastDominantPriorPeriodS = 0
+	ms.LastActiveFamilyPriorPeriodS = 0
+	ms.LastActiveFamilyPriorSource = ""
+	ms.LastDominantPriorActive = false
+	ms.LastCompactPeriodS = 0
+	ms.LastPeriodDeltaToDominantS = 0
+	ms.LastPeriodDeltaToDominantPPM = 0
+	ms.LastCompactDeltaToDominantS = 0
+	ms.LastCompactDeltaToDominantPPM = 0
+	ms.LastCompactSyncUnreliable = false
+	ms.LastRecoveryModeActive = false
+	ms.LastRecoveryTriggerReasons = nil
+	ms.LastCompactGatingBypassed = false
+	ms.LastRecoveryRelaxedAdmissions = 0
 }
 
 // Snapshot returns a copy of the published state for protocol emission.
@@ -372,22 +425,37 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 		PeriodReacquireActive: ms.PeriodReacquireActive,
 		PeriodReacquireReason: ms.PeriodReacquireReason,
 		// Bootstrap / trust diagnostics.
-		BootstrapPeriodS:         ms.BootstrapPeriodS,
-		TrustedBasePeriodS:       ms.TrustedBasePeriodS,
-		TrustUpdateStreak:        ms.TrustUpdateStreak,
-		BaseClamped:              ms.LastBaseClamped,
-		BaseClampDiffPPM:         ms.LastBaseClampDiffPPM,
-		WrongPeriodSuspect:       ms.LastWrongPeriodSuspect,
-		ReacquireCandidatePeriod: ms.LastReacquireCandidateP,
-		ReacquireCandidateScore:  ms.LastReacquireCandidateSc,
-		FitTotalObservations:     ms.LastFitTotalObs,
-		FitEligibleObservations:  ms.LastFitEligibleObs,
-		FitRejectedObservations:  ms.LastFitRejectedObs,
-		FitContributingICAOs:     ms.LastFitContributingICAOs,
-		FitRejectReasons:         make(map[string]uint64, len(ms.LastFitRejectReasons)),
-		AnchorCandidateCount:     ms.LastAnchorCandidateCount,
-		AnchorNoCandidateReason:  ms.LastAnchorNoCandidate,
-		AnchorCandidates:         make([]AnchorCandidateSnapshot, len(ms.LastAnchorCandidates)),
+		BootstrapPeriodS:          ms.BootstrapPeriodS,
+		TrustedBasePeriodS:        ms.TrustedBasePeriodS,
+		TrustUpdateStreak:         ms.TrustUpdateStreak,
+		BaseClamped:               ms.LastBaseClamped,
+		BaseClampDiffPPM:          ms.LastBaseClampDiffPPM,
+		WrongPeriodSuspect:        ms.LastWrongPeriodSuspect,
+		ReacquireCandidatePeriod:  ms.LastReacquireCandidateP,
+		ReacquireCandidateScore:   ms.LastReacquireCandidateSc,
+		FitTotalObservations:      ms.LastFitTotalObs,
+		FitEligibleObservations:   ms.LastFitEligibleObs,
+		FitRejectedObservations:   ms.LastFitRejectedObs,
+		FitContributingICAOs:      ms.LastFitContributingICAOs,
+		FitRejectReasons:          make(map[string]uint64, len(ms.LastFitRejectReasons)),
+		AnchorCandidateCount:      ms.LastAnchorCandidateCount,
+		AnchorNoCandidateReason:   ms.LastAnchorNoCandidate,
+		AnchorCandidates:          make([]AnchorCandidateSnapshot, len(ms.LastAnchorCandidates)),
+		DominantPriorPeriodS:      ms.LastDominantPriorPeriodS,
+		TrustedRefinedPeriodS:     ms.TrustedBasePeriodS,
+		ActiveFamilyPriorPeriodS:  ms.LastActiveFamilyPriorPeriodS,
+		ActiveFamilyPriorSource:   ms.LastActiveFamilyPriorSource,
+		DominantPriorActive:       ms.LastDominantPriorActive,
+		CompactPeriodS:            ms.LastCompactPeriodS,
+		PeriodDeltaToDominantS:    ms.LastPeriodDeltaToDominantS,
+		PeriodDeltaToDominantPPM:  ms.LastPeriodDeltaToDominantPPM,
+		CompactDeltaToDominantS:   ms.LastCompactDeltaToDominantS,
+		CompactDeltaToDominantPPM: ms.LastCompactDeltaToDominantPPM,
+		CompactSyncUnreliable:     ms.LastCompactSyncUnreliable,
+		RecoveryModeActive:        ms.LastRecoveryModeActive,
+		RecoveryTriggerReasons:    append([]string(nil), ms.LastRecoveryTriggerReasons...),
+		CompactGatingBypassed:     ms.LastCompactGatingBypassed,
+		RecoveryRelaxedAdmissions: ms.LastRecoveryRelaxedAdmissions,
 	}
 	for k, v := range ms.LastFitRejectReasons {
 		snap.FitRejectReasons[k] = v
@@ -404,47 +472,74 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 
 // ─── internal solver ──────────────────────────────────────────────────────────
 
-func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
-	// Determine seed period/phase from existing multi-sync state or frame sync.
-	var seedPeriodS, seedEpochUS, seedOffsetDeg float64
-	if ms.Present && ms.PeriodS > 0 {
-		seedPeriodS = ms.PeriodS
+func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix float64) {
+	// Determine seed phase from existing multi-sync state or frame sync.
+	var seedEpochUS, seedOffsetDeg float64
+	if ms.Present && ms.PhaseEpochUS > 0 {
 		seedEpochUS = ms.PhaseEpochUS
 		seedOffsetDeg = ms.PhaseOffsetDeg
 	} else if sync != nil && sync.PeriodS > 0 {
-		seedPeriodS = sync.PeriodS
 		seedEpochUS = sync.PhaseEpochUS
 		seedOffsetDeg = sync.PhaseOffsetDeg
+	} else if ms.Present && ms.PeriodS > 0 {
+		seedEpochUS = ms.PhaseEpochUS
+		seedOffsetDeg = ms.PhaseOffsetDeg
 	} else {
-		return // no seed available yet
+		return // no phase seed available yet
+	}
+
+	compactPeriodS := 0.0
+	if sync != nil && sync.PeriodS > 0 {
+		compactPeriodS = sync.PeriodS
 	}
 
 	// Record the compact-sync bootstrap period on the very first run.  This is never
 	// overwritten so the solver always knows what family it started in, even after the
 	// refined period has diverged considerably from it.
 	if ms.BootstrapPeriodS <= 0 {
-		if ms.Present && ms.PeriodS > 0 {
+		if dominantPeriodS > 0 {
+			ms.BootstrapPeriodS = dominantPeriodS
+		} else if compactPeriodS > 0 {
+			ms.BootstrapPeriodS = compactPeriodS
+		} else if ms.Present && ms.PeriodS > 0 {
 			// First run after a live restart — treat the existing refined period as bootstrap.
 			ms.BootstrapPeriodS = ms.PeriodS
-		} else if sync != nil && sync.PeriodS > 0 {
-			ms.BootstrapPeriodS = sync.PeriodS
 		}
 	}
+
+	recoveryActive, compactUnreliable, recoveryReasons := ms.assessRecoveryMode(sync, dominantPeriodS)
+	activeFamilyPriorS, activeFamilyPriorSource := ms.selectActiveFamilyPrior(compactPeriodS, dominantPeriodS, recoveryActive)
+	if activeFamilyPriorS <= 0 {
+		return
+	}
+	livePeriodS := activeFamilyPriorS
+	periodUS := livePeriodS * 1e6
+	ms.LastDominantPriorPeriodS = dominantPeriodS
+	ms.LastActiveFamilyPriorPeriodS = activeFamilyPriorS
+	ms.LastActiveFamilyPriorSource = activeFamilyPriorSource
+	ms.LastDominantPriorActive = dominantPeriodS > 0 && activeFamilyPriorSource == "dominant_live_df"
+	ms.LastCompactPeriodS = compactPeriodS
+	ms.LastCompactSyncUnreliable = compactUnreliable
+	ms.LastRecoveryModeActive = recoveryActive
+	ms.LastRecoveryTriggerReasons = append([]string(nil), recoveryReasons...)
+	ms.LastCompactGatingBypassed = recoveryActive
+	ms.LastRecoveryRelaxedAdmissions = 0
 
 	// Determine the effective clamp base and whether it is trusted.
 	// TrustedBasePeriodS is promoted from the refined period only after trustMinStreak
 	// consistent multi-aircraft updates; until then we clamp loosely against
 	// BootstrapPeriodS so the solver can escape an incorrect seed family.
-	trusted := ms.TrustedBasePeriodS > 0
-	basePeriodS := ms.TrustedBasePeriodS
-	if basePeriodS <= 0 {
+	trusted := ms.TrustedBasePeriodS > 0 && !recoveryActive
+	basePeriodS := activeFamilyPriorS
+	if trusted && ms.TrustedBasePeriodS > 0 {
+		basePeriodS = ms.TrustedBasePeriodS
+	} else if recoveryActive && dominantPeriodS > 0 {
+		basePeriodS = dominantPeriodS
+	} else if compactPeriodS > 0 {
+		basePeriodS = compactPeriodS
+	} else if ms.BootstrapPeriodS > 0 {
 		basePeriodS = ms.BootstrapPeriodS
-		if basePeriodS <= 0 {
-			basePeriodS = seedPeriodS
-		}
 	}
-	livePeriodS := seedPeriodS
-	periodUS := livePeriodS * 1e6
 
 	// Rolling observation window.
 	windowS := math.Max(livePeriodS*multiSyncWindowRotations, multiSyncWindowMinS)
@@ -464,6 +559,7 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 	scored := make([]scoredObs, 0, len(recent))
 	fitRejectReasons := make(map[string]uint64)
 	fitEligibleObs := 0
+	recoveryRelaxedAdmissions := 0
 	for _, o := range recent {
 		effectiveUS := msPropCorrectedUS(float64(o.CentroidUS), float64(o.RangeNM))
 		predicted := msPredictBearing(seedEpochUS, seedOffsetDeg, periodUS, effectiveUS)
@@ -477,14 +573,19 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 		baseW := msScoreObs(o)
 		qEntry := ms.ICAOQuality[o.ICAO]
 		qMult := msICAOQualityMult(qEntry)
+		normalRejectReason := msFitRejectReason(o, status, absR, qEntry, false)
+		fitRejectReason := msFitRejectReason(o, status, absR, qEntry, recoveryActive)
 		var effectiveW float64
 		switch status {
 		case "inlier":
 			effectiveW = baseW * qMult
 		case "soft":
 			effectiveW = baseW * 0.2 * qMult
+		case "rejected":
+			if recoveryActive && absR <= recoveryResidualRejectGate {
+				effectiveW = baseW * 0.1 * qMult
+			}
 		}
-		fitRejectReason := msFitRejectReason(o, status, absR, qEntry)
 		scored = append(scored, scoredObs{
 			o:               o,
 			residual:        residual,
@@ -498,10 +599,14 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 		})
 		if fitRejectReason == "" {
 			fitEligibleObs++
+			if recoveryActive && normalRejectReason != "" {
+				recoveryRelaxedAdmissions++
+			}
 		} else {
 			fitRejectReasons[fitRejectReason]++
 		}
 	}
+	ms.LastRecoveryRelaxedAdmissions = recoveryRelaxedAdmissions
 
 	// Update ICAO quality memory from fit-eligible observations.
 	ms.updateICAOQuality(scored)
@@ -625,13 +730,17 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 		len(fitICAOs) >= 2 &&
 		detrended <= reacquireMADThreshold
 
-	if ms.PeriodReacquireActive {
+	if recoveryActive {
+		ms.PeriodReacquireActive = true
+		ms.PeriodReacquireReason = joinReasons(recoveryReasons)
 		if cleanUpdate {
 			ms.CleanReacquireStreak++
 			if ms.CleanReacquireStreak >= reacquireMinClean {
 				ms.PeriodReacquireActive = false
 				ms.PeriodReacquireReason = ""
 				ms.PeriodFailureStreak = 0
+				ms.LastRecoveryModeActive = false
+				ms.LastRecoveryTriggerReasons = nil
 			}
 			// On a clean update, let the solver's refined period pass through rather than
 			// holding the bootstrap base — the candidate search already guided us to a
@@ -661,6 +770,8 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 			ms.PeriodReacquireActive = true
 			ms.PeriodReacquireReason = "failure_streak"
 			ms.TrustUpdateStreak = 0
+			ms.LastRecoveryModeActive = true
+			ms.LastRecoveryTriggerReasons = appendUniqueStrings(ms.LastRecoveryTriggerReasons, "failure_streak")
 			// On entering reacquire, search candidate periods immediately.  This allows the
 			// solver to jump to the correct family rather than holding the incorrect bootstrap.
 			best := ms.searchBestCandidate(scored, seedEpochUS)
@@ -700,10 +811,14 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 
 	if ms.TrustedBasePeriodS > 0 {
 		basePeriodS = ms.TrustedBasePeriodS
+	} else if recoveryActive && dominantPeriodS > 0 {
+		basePeriodS = dominantPeriodS
+	} else if compactPeriodS > 0 {
+		basePeriodS = compactPeriodS
 	} else if ms.BootstrapPeriodS > 0 {
 		basePeriodS = ms.BootstrapPeriodS
 	} else {
-		basePeriodS = seedPeriodS
+		basePeriodS = livePeriodS
 	}
 
 	if !finalAlignmentReady {
@@ -754,6 +869,102 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 		ms.AnchorPhaseDeg = finalAlignment.anchorPhaseDeg
 		ms.AnchorScore = finalAlignment.anchorScore
 	}
+	ms.LastPeriodDeltaToDominantS, ms.LastPeriodDeltaToDominantPPM = periodDeltaToDominant(finalPeriodS, dominantPeriodS)
+	ms.LastCompactDeltaToDominantS, ms.LastCompactDeltaToDominantPPM = periodDeltaToDominant(compactPeriodS, dominantPeriodS)
+}
+
+func (ms *MultiSyncSolver) selectActiveFamilyPrior(compactPeriodS, dominantPeriodS float64, recoveryActive bool) (float64, string) {
+	if recoveryActive && dominantPeriodS > 0 {
+		return dominantPeriodS, "dominant_live_df"
+	}
+	if ms.TrustedBasePeriodS > 0 {
+		return ms.TrustedBasePeriodS, "trusted_refined"
+	}
+	if ms.Present && ms.PeriodS > 0 && !ms.Holdover {
+		return ms.PeriodS, "current_refined"
+	}
+	if compactPeriodS > 0 {
+		return compactPeriodS, "compact_seed"
+	}
+	if dominantPeriodS > 0 {
+		return dominantPeriodS, "dominant_live_df"
+	}
+	if ms.BootstrapPeriodS > 0 {
+		return ms.BootstrapPeriodS, "bootstrap_seed"
+	}
+	return 0, ""
+}
+
+func (ms *MultiSyncSolver) assessRecoveryMode(sync *SyncState, dominantPeriodS float64) (bool, bool, []string) {
+	reasons := make([]string, 0, 8)
+	compactUnreliable := false
+	compactPeriodS := 0.0
+	if sync != nil && sync.PeriodS > 0 {
+		compactPeriodS = sync.PeriodS
+	}
+	if sync == nil || compactPeriodS <= 0 {
+		reasons = append(reasons, "compact_missing")
+		compactUnreliable = true
+	}
+	if sync != nil {
+		if sync.Holdover {
+			reasons = append(reasons, "compact_holdover")
+			compactUnreliable = true
+		}
+		if sync.ResidualEMA >= recoveryResidualEMAThreshold {
+			reasons = append(reasons, "compact_residual_ema")
+			compactUnreliable = true
+		}
+		if sync.NRejectedFrames >= recoveryRejectedFrameThreshold {
+			reasons = append(reasons, "compact_rejected_frames")
+			compactUnreliable = true
+		}
+	}
+	if ms.Holdover {
+		reasons = append(reasons, "refined_holdover")
+	}
+	if ms.ResidualEMADeg >= recoveryResidualEMAThreshold {
+		reasons = append(reasons, "refined_residual_ema")
+	}
+	if ms.Present && ms.LastAnchorCandidateCount <= recoveryAnchorStarvedCandidates {
+		reasons = append(reasons, "no_anchor_candidates")
+	}
+	if ms.Present && ms.LastFitEligibleObs <= recoveryAnchorStarvedFitEligible {
+		reasons = append(reasons, "fit_pool_starved")
+	}
+	if ms.PeriodFailureStreak >= recoveryEntryFailureStreak {
+		reasons = append(reasons, "failure_streak")
+	}
+	if dominantPeriodS > 0 {
+		_, compactDeltaPPM := periodDeltaToDominant(compactPeriodS, dominantPeriodS)
+		if math.Abs(compactDeltaPPM) >= recoveryPeriodDeltaPPM {
+			reasons = append(reasons, "compact_dominant_delta")
+			compactUnreliable = true
+		}
+		if ms.Present && ms.PeriodS > 0 {
+			_, refinedDeltaPPM := periodDeltaToDominant(ms.PeriodS, dominantPeriodS)
+			if math.Abs(refinedDeltaPPM) >= recoveryPeriodDeltaPPM {
+				reasons = append(reasons, "refined_dominant_delta")
+			}
+		}
+	}
+	if ms.PeriodReacquireActive {
+		reasons = append(reasons, "recovery_in_progress")
+	}
+	if dominantPeriodS <= 0 {
+		return ms.PeriodReacquireActive, compactUnreliable, uniqueStrings(reasons)
+	}
+	hasFailure := compactUnreliable ||
+		ms.Holdover ||
+		ms.ResidualEMADeg >= recoveryResidualEMAThreshold ||
+		(ms.Present && ms.LastAnchorCandidateCount <= recoveryAnchorStarvedCandidates) ||
+		(ms.Present && ms.LastFitEligibleObs <= recoveryAnchorStarvedFitEligible) ||
+		ms.PeriodFailureStreak >= recoveryEntryFailureStreak ||
+		ms.PeriodReacquireActive
+	_, compactDeltaPPM := periodDeltaToDominant(compactPeriodS, dominantPeriodS)
+	_, refinedDeltaPPM := periodDeltaToDominant(ms.PeriodS, dominantPeriodS)
+	largeDelta := math.Abs(compactDeltaPPM) >= recoveryPeriodDeltaPPM || math.Abs(refinedDeltaPPM) >= recoveryPeriodDeltaPPM
+	return hasFailure && largeDelta, compactUnreliable, uniqueStrings(reasons)
 }
 
 func (ms *MultiSyncSolver) applyTrustedBaseUpdate(finalPeriodS float64, trustedEnough, wrongPeriodSuspect bool) {
@@ -1197,7 +1408,7 @@ func (ms *MultiSyncSolver) buildCandidatePeriods() []float64 {
 		candidates = append(candidates, p)
 	}
 
-	anchors := [3]float64{ms.PeriodS, ms.BootstrapPeriodS, ms.TrustedBasePeriodS}
+	anchors := [4]float64{ms.PeriodS, ms.BootstrapPeriodS, ms.TrustedBasePeriodS, ms.LastDominantPriorPeriodS}
 	for _, anchor := range anchors {
 		if anchor <= 0 {
 			continue
@@ -1356,23 +1567,68 @@ func msICAOQualityMult(q *ICAOSyncQuality) float64 {
 	return math.Max(0.1, math.Min(1.0, 1.0/(1.0+mad/3.0)))
 }
 
-func msFitRejectReason(o MultiSyncObs, status string, absR float64, q *ICAOSyncQuality) string {
+func msFitRejectReason(o MultiSyncObs, status string, absR float64, q *ICAOSyncQuality, recoveryMode bool) string {
 	if absR >= residualWrapDeg {
 		return "near_wrap_residual"
 	}
-	if absR > residualRejectGate {
+	rejectGate := residualRejectGate
+	if recoveryMode {
+		rejectGate = recoveryResidualRejectGate
+	}
+	if absR > rejectGate {
 		return "residual_gate"
 	}
-	if float64(o.PosAgeS) > 8.0 {
+	maxPosAgeS := 8.0
+	if recoveryMode {
+		maxPosAgeS = recoveryPositionAgeMaxS
+	}
+	if float64(o.PosAgeS) > maxPosAgeS {
 		return "stale_position"
 	}
-	if q != nil && q.ResidualMADDeg >= icaoQualityRejectMAD {
+	if q != nil && q.ResidualMADDeg >= icaoQualityRejectMAD && !recoveryMode {
 		return "icao_quality_reject"
 	}
-	if status == "rejected" {
+	if status == "rejected" && !recoveryMode {
 		return "residual_gate"
 	}
 	return ""
+}
+
+func periodDeltaToDominant(periodS, dominantPeriodS float64) (float64, float64) {
+	if periodS <= 0 || dominantPeriodS <= 0 {
+		return 0, 0
+	}
+	deltaS := periodS - dominantPeriodS
+	return deltaS, deltaS / dominantPeriodS * 1e6
+}
+
+func uniqueStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func appendUniqueStrings(values []string, extras ...string) []string {
+	out := append(append([]string(nil), values...), extras...)
+	return uniqueStrings(out)
+}
+
+func joinReasons(reasons []string) string {
+	if len(reasons) == 0 {
+		return ""
+	}
+	return reasons[0]
 }
 
 func msAnchorScore(q *ICAOSyncQuality, baseW float64) float64 {

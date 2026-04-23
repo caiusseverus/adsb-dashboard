@@ -276,22 +276,37 @@ type MultiSyncState struct {
 	AnchorScore           float64 `codec:"as"`
 	UpdatedAt             float64 `codec:"ts"`
 	// Bootstrap / trust diagnostics (added for wrong-period escape tracking).
-	BootstrapPeriodS         float64                    `codec:"bp"`
-	TrustedBasePeriodS       float64                    `codec:"tb"`
-	TrustUpdateStreak        uint16                     `codec:"tu"`
-	BaseClamped              bool                       `codec:"bc"`
-	BaseClampDiffPPM         float64                    `codec:"bd"`
-	WrongPeriodSuspect       bool                       `codec:"ws"`
-	ReacquireCandidatePeriod float64                    `codec:"rcp"`
-	ReacquireCandidateScore  float64                    `codec:"rcs"`
-	FitTotalObservations     uint32                     `codec:"ft"`
-	FitEligibleObservations  uint32                     `codec:"fe"`
-	FitRejectedObservations  uint32                     `codec:"fr"`
-	FitContributingICAOs     uint16                     `codec:"fc"`
-	FitRejectReasons         map[string]uint64          `codec:"frr"`
-	AnchorCandidateCount     uint16                     `codec:"ac"`
-	AnchorNoCandidateReason  string                     `codec:"anr"`
-	AnchorCandidates         []MultiSyncAnchorCandidate `codec:"acs"`
+	BootstrapPeriodS          float64                    `codec:"bp"`
+	TrustedBasePeriodS        float64                    `codec:"tb"`
+	TrustUpdateStreak         uint16                     `codec:"tu"`
+	BaseClamped               bool                       `codec:"bc"`
+	BaseClampDiffPPM          float64                    `codec:"bd"`
+	WrongPeriodSuspect        bool                       `codec:"ws"`
+	ReacquireCandidatePeriod  float64                    `codec:"rcp"`
+	ReacquireCandidateScore   float64                    `codec:"rcs"`
+	FitTotalObservations      uint32                     `codec:"ft"`
+	FitEligibleObservations   uint32                     `codec:"fe"`
+	FitRejectedObservations   uint32                     `codec:"fr"`
+	FitContributingICAOs      uint16                     `codec:"fc"`
+	FitRejectReasons          map[string]uint64          `codec:"frr"`
+	AnchorCandidateCount      uint16                     `codec:"ac"`
+	AnchorNoCandidateReason   string                     `codec:"anr"`
+	AnchorCandidates          []MultiSyncAnchorCandidate `codec:"acs"`
+	DominantPriorPeriodS      float64                    `codec:"dp"`
+	TrustedRefinedPeriodS     float64                    `codec:"trp"`
+	ActiveFamilyPriorPeriodS  float64                    `codec:"afp"`
+	ActiveFamilyPriorSource   string                     `codec:"afs"`
+	DominantPriorActive       bool                       `codec:"dpa"`
+	CompactPeriodS            float64                    `codec:"cp"`
+	PeriodDeltaToDominantS    float64                    `codec:"pds"`
+	PeriodDeltaToDominantPPM  float64                    `codec:"pdp"`
+	CompactDeltaToDominantS   float64                    `codec:"cds"`
+	CompactDeltaToDominantPPM float64                    `codec:"cdp"`
+	CompactSyncUnreliable     bool                       `codec:"cu"`
+	RecoveryModeActive        bool                       `codec:"rma"`
+	RecoveryTriggerReasons    []string                   `codec:"rtr"`
+	CompactGatingBypassed     bool                       `codec:"cgb"`
+	RecoveryRelaxedAdmissions uint32                     `codec:"rla"`
 }
 
 type MultiSyncAnchorCandidate struct {

@@ -1317,6 +1317,23 @@ class LiveSyncState:
     period_reacquire_trigger: str | None = None
     period_recovery_clean_update: bool = False
     period_recovery_clean_streak: int = 0
+    dominant_period_s: float | None = None
+    dominant_prior_period_s: float | None = None
+    trusted_refined_period_s: float | None = None
+    bootstrap_period_s: float | None = None
+    active_family_prior_s: float | None = None
+    active_family_prior_source: str | None = None
+    dominant_prior_active: bool = False
+    dominant_period_delta_s: float | None = None
+    dominant_period_delta_ppm: float | None = None
+    compact_period_s: float | None = None
+    compact_period_delta_to_dominant_s: float | None = None
+    compact_period_delta_to_dominant_ppm: float | None = None
+    compact_sync_unreliable: bool = False
+    recovery_mode_active: bool = False
+    recovery_trigger_reasons: list[str] = _field(default_factory=list)
+    compact_gating_bypassed: bool = False
+    recovery_relaxed_admitted_observations: int = 0
 
 
 @_dataclass
@@ -4487,6 +4504,9 @@ class RadarState:
             for key, value in fit_reject_reasons_raw.items()
             if key is not None
         }
+        recovery_trigger_reasons = [
+            str(reason) for reason in (msg.get("rtr") or []) if reason is not None
+        ]
 
         with self._lock:
             self._go_multi_sync_states_by_iid[iid] = dict(msg)
@@ -4513,6 +4533,8 @@ class RadarState:
                 fit_contributing_icao_count=int(msg.get("fc") or 0),
                 period_reacquire_active=reacquire_active,
                 period_reacquire_reason=msg.get("rr"),
+                recovery_mode_active=bool(msg.get("rma", reacquire_active)),
+                recovery_trigger_reasons=recovery_trigger_reasons,
                 phase_anchor_icao=anchor_icao,
                 phase_anchor_score=float(msg.get("as") or 0.0),
                 phase_anchor_obs_count=int((anchor_row or {}).get("obs_count") or 0),
@@ -4521,6 +4543,21 @@ class RadarState:
                 phase_anchor_candidate_count=int(msg.get("ac") or 0),
                 phase_anchor_no_candidate_reason=msg.get("anr"),
                 phase_anchor_candidates=anchor_candidates,
+                dominant_period_s=(float(msg["dp"]) if msg.get("dp") not in (None, 0) else None),
+                dominant_prior_period_s=(float(msg["dp"]) if msg.get("dp") not in (None, 0) else None),
+                trusted_refined_period_s=(float(msg["trp"]) if msg.get("trp") not in (None, 0) else None),
+                bootstrap_period_s=(float(msg["bp"]) if msg.get("bp") not in (None, 0) else None),
+                active_family_prior_s=(float(msg["afp"]) if msg.get("afp") not in (None, 0) else None),
+                active_family_prior_source=msg.get("afs"),
+                dominant_prior_active=bool(msg.get("dpa", False)),
+                dominant_period_delta_s=(float(msg["pds"]) if msg.get("pds") is not None else None),
+                dominant_period_delta_ppm=(float(msg["pdp"]) if msg.get("pdp") is not None else None),
+                compact_period_s=(float(msg["cp"]) if msg.get("cp") not in (None, 0) else None),
+                compact_period_delta_to_dominant_s=(float(msg["cds"]) if msg.get("cds") is not None else None),
+                compact_period_delta_to_dominant_ppm=(float(msg["cdp"]) if msg.get("cdp") is not None else None),
+                compact_sync_unreliable=bool(msg.get("cu", False)),
+                compact_gating_bypassed=bool(msg.get("cgb", False)),
+                recovery_relaxed_admitted_observations=int(msg.get("rla") or 0),
                 period_authoritative_source="refined",
             )
 
@@ -8454,8 +8491,33 @@ class RadarState:
                 "Refined sync (multi-aircraft)"
                 if refined_active else "Compact sync (sweep-frame)"
             ),
+            "dominant_period_s": getattr(sync, "dominant_period_s", None) if sync is not None else None,
+            "active_family_prior_s": getattr(sync, "active_family_prior_s", None) if sync is not None else None,
+            "active_family_prior_source": getattr(sync, "active_family_prior_source", None) if sync is not None else None,
+            "dominant_prior_active": bool(getattr(sync, "dominant_prior_active", False)) if sync is not None else False,
+            "recovery_mode_active": bool(
+                getattr(sync, "recovery_mode_active", getattr(sync, "period_reacquire_active", False))
+            ) if sync is not None else False,
+            "recovery_trigger_reasons": (
+                list(getattr(sync, "recovery_trigger_reasons", []) or [])
+                if sync is not None else []
+            ),
+            "compact_gating_bypassed": bool(getattr(sync, "compact_gating_bypassed", False)) if sync is not None else False,
+            "recovery_relaxed_admitted_observations": int(
+                getattr(sync, "recovery_relaxed_admitted_observations", 0) or 0
+            ) if sync is not None else 0,
             "compact": {
                 "active": not refined_active,
+                "period_s": getattr(sync, "compact_period_s", None) if sync is not None else None,
+                "period_delta_to_dominant_s": (
+                    getattr(sync, "compact_period_delta_to_dominant_s", None)
+                    if sync is not None else None
+                ),
+                "period_delta_to_dominant_ppm": (
+                    getattr(sync, "compact_period_delta_to_dominant_ppm", None)
+                    if sync is not None else None
+                ),
+                "unreliable": bool(getattr(sync, "compact_sync_unreliable", False)) if sync is not None else False,
                 "reference_icao": compact_debug.get("current_reference_icao"),
                 "last_reference_icao": compact_debug.get("last_reference_icao"),
                 "reference_changed_recently": bool(compact_debug.get("reference_changed_recently")),
@@ -8475,6 +8537,13 @@ class RadarState:
                 "present": refined_present,
                 "active": refined_active,
                 "usable": refined_usable,
+                "period_s": getattr(sync, "period_s", None) if refined_active else None,
+                "period_delta_to_dominant_s": (
+                    getattr(sync, "dominant_period_delta_s", None) if refined_active else None
+                ),
+                "period_delta_to_dominant_ppm": (
+                    getattr(sync, "dominant_period_delta_ppm", None) if refined_active else None
+                ),
                 "anchor_icao": getattr(sync, "phase_anchor_icao", None) if refined_active else None,
                 "anchor_candidate_count": int(getattr(sync, "phase_anchor_candidate_count", 0) or 0) if refined_active else 0,
                 "fit_total_observations": int(getattr(sync, "fit_total_observations", 0) or 0) if refined_active else 0,
@@ -9804,6 +9873,23 @@ class RadarState:
             "best_vs_operational_median_abs_improvement_deg": best_improvement,
             "current_period_s": sync.period_s,
             "base_period_s": getattr(sync, "period_base_s", None),
+            "dominant_period_s": getattr(sync, "dominant_period_s", None),
+            "dominant_prior_period_s": getattr(sync, "dominant_prior_period_s", None),
+            "trusted_refined_period_s": getattr(sync, "trusted_refined_period_s", None),
+            "bootstrap_period_s": getattr(sync, "bootstrap_period_s", None),
+            "active_family_prior_s": getattr(sync, "active_family_prior_s", None),
+            "active_family_prior_source": getattr(sync, "active_family_prior_source", None),
+            "dominant_prior_active": getattr(sync, "dominant_prior_active", None),
+            "period_delta_to_dominant_s": getattr(sync, "dominant_period_delta_s", None),
+            "period_delta_to_dominant_ppm": getattr(sync, "dominant_period_delta_ppm", None),
+            "compact_period_s": getattr(sync, "compact_period_s", None),
+            "compact_period_delta_to_dominant_s": getattr(sync, "compact_period_delta_to_dominant_s", None),
+            "compact_period_delta_to_dominant_ppm": getattr(sync, "compact_period_delta_to_dominant_ppm", None),
+            "compact_sync_unreliable": getattr(sync, "compact_sync_unreliable", None),
+            "recovery_mode_active": getattr(sync, "recovery_mode_active", None),
+            "recovery_trigger_reasons": getattr(sync, "recovery_trigger_reasons", None),
+            "compact_gating_bypassed": getattr(sync, "compact_gating_bypassed", None),
+            "recovery_relaxed_admitted_observations": getattr(sync, "recovery_relaxed_admitted_observations", None),
             "period_refine_mode": getattr(sync, "period_refine_mode", None),
             "period_authoritative_source": getattr(sync, "period_authoritative_source", None),
             "period_failure_score": getattr(sync, "period_failure_score", None),
