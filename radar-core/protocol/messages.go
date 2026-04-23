@@ -269,4 +269,13 @@ type MultiSyncState struct {
 	AnchorPhaseDeg        float64  `codec:"ap"`
 	AnchorScore           float64  `codec:"as"`
 	UpdatedAt             float64  `codec:"ts"`
+	// Bootstrap / trust diagnostics (added for wrong-period escape tracking).
+	BootstrapPeriodS        float64 `codec:"bp"`
+	TrustedBasePeriodS      float64 `codec:"tb"`
+	TrustUpdateStreak       uint16  `codec:"tu"`
+	BaseClamped             bool    `codec:"bc"`
+	BaseClampDiffPPM        float64 `codec:"bd"`
+	WrongPeriodSuspect      bool    `codec:"ws"`
+	ReacquireCandidatePeriod float64 `codec:"rcp"`
+	ReacquireCandidateScore  float64 `codec:"rcs"`
 }

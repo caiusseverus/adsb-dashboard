@@ -296,6 +296,15 @@ func (e *engine) emitMultiSyncState(s *iid.IIDState) {
 		AnchorPhaseDeg:        snap.AnchorPhaseDeg,
 		AnchorScore:           snap.AnchorScore,
 		UpdatedAt:             snap.LastUpdated,
+		// Bootstrap / trust diagnostics.
+		BootstrapPeriodS:         snap.BootstrapPeriodS,
+		TrustedBasePeriodS:       snap.TrustedBasePeriodS,
+		TrustUpdateStreak:        uint16(snap.TrustUpdateStreak),
+		BaseClamped:              snap.BaseClamped,
+		BaseClampDiffPPM:         snap.BaseClampDiffPPM,
+		WrongPeriodSuspect:       snap.WrongPeriodSuspect,
+		ReacquireCandidatePeriod: snap.ReacquireCandidatePeriod,
+		ReacquireCandidateScore:  snap.ReacquireCandidateScore,
 	}
 	e.writer.Send(msg)
 }

@@ -61,6 +61,20 @@ const (
 	periodRefineMinSpanRot = 2.0
 	periodGain            = 0.12
 
+	// Trust promotion thresholds — the refined solver must earn a stable run streak
+	// before its period is promoted to the trusted base.  Until then the clamp is
+	// applied loosely against the bootstrap (compact-sync) seed.
+	trustMinStreak      = 8    // consecutive updates required to promote the period
+	trustMinFitPool     = 8    // min fit-pool entries per update to count toward streak
+	trustMinICAOs       = 3    // min distinct ICAOs per update to count toward streak
+	trustMaxResidualDeg = 8.0  // detrended MAD ceiling for a trust-eligible update (deg)
+	trustMaxRejFrac     = 0.15 // rejection fraction ceiling for a trust-eligible update
+
+	// Period clamp limits during the untrusted bootstrap phase.
+	// Wider than the trusted-base limits so the solver can escape an incorrect seed family.
+	periodPPMFromBootstrap       = 10000.0 // ±1% from bootstrap — bootstrap phase wide gate
+	periodPPMFromBootstrapStrong = 30000.0 // ±3% under strong fit in bootstrap phase
+
 	// Reacquire / failure detection.
 	reacquireMADThreshold = 8.0 // deg — detrended MAD for recovery
 	reacquireMinClean     = 2   // consecutive clean updates to exit reacquire
@@ -106,6 +120,17 @@ type scoredObs struct {
 	fitRejectReason string
 }
 
+// candidateEvalResult holds the scoring result for one candidate period
+// evaluated during wrong-period reacquire search.
+type candidateEvalResult struct {
+	periodS     float64
+	inlierCount int
+	icaoCount   int
+	madDeg      float64
+	rejFrac     float64
+	score       float64
+}
+
 // MultiSyncSnapshot is a point-in-time view for protocol emission.
 type MultiSyncSnapshot struct {
 	Present               bool
@@ -124,6 +149,15 @@ type MultiSyncSnapshot struct {
 	AnchorICAO            *uint32
 	AnchorPhaseDeg        float64
 	AnchorScore           float64
+	// Bootstrap / trust diagnostics.
+	BootstrapPeriodS        float64 // compact-sync seed captured at first run
+	TrustedBasePeriodS      float64 // promoted from refined period after trustMinStreak updates; 0=not yet trusted
+	TrustUpdateStreak       int     // consecutive updates meeting trust criteria
+	BaseClamped             bool    // true if the base-period clamp fired on the last run
+	BaseClampDiffPPM        float64 // raw PPM deviation that triggered (or would have triggered) the clamp
+	WrongPeriodSuspect      bool    // true if wrong-period suspicion was raised on the last run
+	ReacquireCandidatePeriod float64 // period chosen by candidate search during reacquire (0 if not active)
+	ReacquireCandidateScore  float64 // score of that candidate
 }
 
 // MultiSyncSolver holds per-IID multi-aircraft sync refinement state.
@@ -163,6 +197,22 @@ type MultiSyncSolver struct {
 
 	// Per-ICAO quality memory.
 	ICAOQuality map[uint32]*ICAOSyncQuality
+
+	// Bootstrap vs trusted base separation.
+	// BootstrapPeriodS is the compact-sync period captured on first run and never overwritten.
+	// TrustedBasePeriodS is promoted from the refined period after trustMinStreak consistent
+	// multi-aircraft updates.  Until trust is established, the clamp is applied loosely
+	// against BootstrapPeriodS so the solver can escape an incorrect seed family.
+	BootstrapPeriodS  float64
+	TrustedBasePeriodS float64
+	TrustUpdateStreak int
+
+	// Per-run diagnostics (updated each solver run, readable via Snapshot).
+	LastBaseClamped          bool    // true if base-period clamp fired on the last run
+	LastBaseClampDiffPPM     float64 // raw PPM deviation that triggered (or would have triggered) the clamp
+	LastWrongPeriodSuspect   bool    // true if wrong-period suspicion was raised on the last run
+	LastReacquireCandidateP  float64 // period chosen by candidate search during reacquire (0 if not active)
+	LastReacquireCandidateSc float64 // score of that candidate period
 
 	// Throttle.
 	lastRunTS float64
@@ -241,6 +291,14 @@ func (ms *MultiSyncSolver) Reset() {
 	for k := range ms.ICAOQuality {
 		delete(ms.ICAOQuality, k)
 	}
+	ms.BootstrapPeriodS = 0
+	ms.TrustedBasePeriodS = 0
+	ms.TrustUpdateStreak = 0
+	ms.LastBaseClamped = false
+	ms.LastBaseClampDiffPPM = 0
+	ms.LastWrongPeriodSuspect = false
+	ms.LastReacquireCandidateP = 0
+	ms.LastReacquireCandidateSc = 0
 }
 
 // Snapshot returns a copy of the published state for protocol emission.
@@ -261,6 +319,15 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 		LastUpdated:           ms.LastUpdated,
 		PeriodReacquireActive: ms.PeriodReacquireActive,
 		PeriodReacquireReason: ms.PeriodReacquireReason,
+		// Bootstrap / trust diagnostics.
+		BootstrapPeriodS:        ms.BootstrapPeriodS,
+		TrustedBasePeriodS:      ms.TrustedBasePeriodS,
+		TrustUpdateStreak:       ms.TrustUpdateStreak,
+		BaseClamped:             ms.LastBaseClamped,
+		BaseClampDiffPPM:        ms.LastBaseClampDiffPPM,
+		WrongPeriodSuspect:      ms.LastWrongPeriodSuspect,
+		ReacquireCandidatePeriod: ms.LastReacquireCandidateP,
+		ReacquireCandidateScore:  ms.LastReacquireCandidateSc,
 	}
 	if ms.AnchorICAO != nil {
 		v := *ms.AnchorICAO
@@ -288,9 +355,29 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 		return // no seed available yet
 	}
 
-	basePeriodS := ms.PeriodBaseS
+	// Record the compact-sync bootstrap period on the very first run.  This is never
+	// overwritten so the solver always knows what family it started in, even after the
+	// refined period has diverged considerably from it.
+	if ms.BootstrapPeriodS <= 0 {
+		if ms.Present && ms.PeriodS > 0 {
+			// First run after a live restart — treat the existing refined period as bootstrap.
+			ms.BootstrapPeriodS = ms.PeriodS
+		} else if sync != nil && sync.PeriodS > 0 {
+			ms.BootstrapPeriodS = sync.PeriodS
+		}
+	}
+
+	// Determine the effective clamp base and whether it is trusted.
+	// TrustedBasePeriodS is promoted from the refined period only after trustMinStreak
+	// consistent multi-aircraft updates; until then we clamp loosely against
+	// BootstrapPeriodS so the solver can escape an incorrect seed family.
+	trusted := ms.TrustedBasePeriodS > 0
+	basePeriodS := ms.TrustedBasePeriodS
 	if basePeriodS <= 0 {
-		basePeriodS = seedPeriodS
+		basePeriodS = ms.BootstrapPeriodS
+		if basePeriodS <= 0 {
+			basePeriodS = seedPeriodS
+		}
 	}
 	livePeriodS := seedPeriodS
 	periodUS := livePeriodS * 1e6
@@ -460,9 +547,10 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 		ms.SlopeHistory = ms.SlopeHistory[len(ms.SlopeHistory)-12:]
 	}
 
-	refinedPeriodS, _, _ := ms.refinePeriod(
+	refinedPeriodS, _, _, clampedByBase, clampDiffPPM := ms.refinePeriod(
 		livePeriodS, basePeriodS, smoothedSlope,
 		len(fitPool), len(fitICAOs), spanS, majorityRejected,
+		trusted,
 	)
 
 	// Wrong-period detection.
@@ -473,6 +561,7 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 	} else {
 		ms.PeriodFailureStreak = 0
 	}
+	ms.LastWrongPeriodSuspect = wrongPeriodSuspect
 
 	cleanUpdate := len(recent) > 0 &&
 		float64(nRejected)/float64(len(recent)) < 0.25 &&
@@ -488,18 +577,67 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 				ms.PeriodReacquireReason = ""
 				ms.PeriodFailureStreak = 0
 			}
+			// On a clean update, let the solver's refined period pass through rather than
+			// holding the bootstrap base — the candidate search already guided us to a
+			// plausible family and this update is confirming it.
 		} else {
 			ms.CleanReacquireStreak = 0
+			// Search for the best-scoring period family instead of snapping back to the
+			// bootstrap base, which may itself be the wrong family.
+			bestP, bestSc := ms.searchBestCandidate(scored, seedEpochUS)
+			ms.LastReacquireCandidateP = bestP
+			ms.LastReacquireCandidateSc = bestSc
+			refinedPeriodS = bestP
 		}
-		refinedPeriodS = basePeriodS // hold base period during reacquire
 	} else {
 		ms.CleanReacquireStreak = 0
 		if ms.PeriodFailureStreak >= 3 || (ms.PeriodFailureStreak >= 2 && wrongPeriodSuspect) {
 			ms.PeriodReacquireActive = true
 			ms.PeriodReacquireReason = "failure_streak"
-			refinedPeriodS = basePeriodS
+			ms.TrustUpdateStreak = 0
+			// On entering reacquire, search candidate periods immediately.  This allows the
+			// solver to jump to the correct family rather than holding the incorrect bootstrap.
+			bestP, bestSc := ms.searchBestCandidate(scored, seedEpochUS)
+			ms.LastReacquireCandidateP = bestP
+			ms.LastReacquireCandidateSc = bestSc
+			refinedPeriodS = bestP
+		} else {
+			// Not in reacquire; clear stale candidate diagnostics.
+			ms.LastReacquireCandidateP = 0
+			ms.LastReacquireCandidateSc = 0
 		}
 	}
+
+	// Trust promotion: once the solver has accumulated enough consistent multi-aircraft
+	// evidence, promote the current refined period to TrustedBasePeriodS.  From that
+	// point the clamp tightens against the trusted base rather than the bootstrap seed.
+	trustedEnough := !majorityRejected &&
+		len(recent) > 0 &&
+		float64(nRejected)/float64(len(recent)) < trustMaxRejFrac &&
+		len(fitPool) >= trustMinFitPool &&
+		len(fitICAOs) >= trustMinICAOs &&
+		detrended <= trustMaxResidualDeg
+
+	if ms.PeriodReacquireActive || wrongPeriodSuspect {
+		// Problem detected — reset trust streak; do not promote.
+		ms.TrustUpdateStreak = 0
+	} else if trustedEnough {
+		ms.TrustUpdateStreak++
+		if ms.TrustUpdateStreak >= trustMinStreak {
+			if ms.TrustedBasePeriodS <= 0 {
+				// First promotion: adopt the refined period as the trusted base.
+				ms.TrustedBasePeriodS = refinedPeriodS
+			} else {
+				// Slow EMA keeps the trusted base tracking a genuinely stable family
+				// without snapping to transient fluctuations.
+				ms.TrustedBasePeriodS = 0.98*ms.TrustedBasePeriodS + 0.02*refinedPeriodS
+			}
+		}
+	}
+
+	// Capture per-run clamp diagnostics (after refinePeriod returned them).
+	ms.LastBaseClamped = clampedByBase
+	ms.LastBaseClampDiffPPM = clampDiffPPM
 
 	// Residual EMA update from fit pool.
 	var newResidualEMA float64
@@ -626,7 +764,8 @@ func (ms *MultiSyncSolver) selectAnchor(
 func (ms *MultiSyncSolver) refinePeriod(
 	livePeriodS, basePeriodS, smoothedSlope float64,
 	nFit, nFitICAOs int, spanS float64, majorityRejected bool,
-) (refined float64, blockReason, reacquireReason string) {
+	trusted bool, // true = tight clamp from promoted trusted base; false = wide clamp from bootstrap seed
+) (refined float64, blockReason, reacquireReason string, clamped bool, clampDiffPPM float64) {
 	refined = livePeriodS
 	absSmoothed := math.Abs(smoothedSlope)
 	slopeSign := 0
@@ -678,10 +817,22 @@ func (ms *MultiSyncSolver) refinePeriod(
 
 	strongFit := nFit >= 12 && nFitICAOs >= 3 && spanS >= 4.0*livePeriodS
 	ppmPerUpdate := periodPPMPerUpdate
-	ppmFromBase := periodPPMFromBase
-	if strongFit && persistent {
-		ppmPerUpdate = periodPPMStrong
-		ppmFromBase = periodPPMBaseStrong
+	// Choose clamp limits based on whether the base period is trusted.
+	// In the bootstrap phase (trusted=false) we allow a much wider excursion so the
+	// solver can migrate to the correct period family without being held in the wrong one.
+	var ppmFromBase float64
+	if trusted {
+		ppmFromBase = periodPPMFromBase
+		if strongFit && persistent {
+			ppmPerUpdate = periodPPMStrong
+			ppmFromBase = periodPPMBaseStrong
+		}
+	} else {
+		ppmFromBase = periodPPMFromBootstrap
+		if strongFit && persistent {
+			ppmPerUpdate = periodPPMStrong
+			ppmFromBase = periodPPMFromBootstrapStrong
+		}
 	}
 	deltaPPM := (candidate - livePeriodS) / livePeriodS * 1e6
 	if deltaPPM > ppmPerUpdate {
@@ -690,11 +841,14 @@ func (ms *MultiSyncSolver) refinePeriod(
 		candidate = livePeriodS * (1.0 - ppmPerUpdate*1e-6)
 	}
 	if basePeriodS > 0 {
-		absPPM := (candidate - basePeriodS) / basePeriodS * 1e6
-		if absPPM > ppmFromBase {
+		rawPPM := (candidate - basePeriodS) / basePeriodS * 1e6
+		clampDiffPPM = rawPPM // capture for diagnostics even when clamp does not fire
+		if rawPPM > ppmFromBase {
 			candidate = basePeriodS * (1.0 + ppmFromBase*1e-6)
-		} else if absPPM < -ppmFromBase {
+			clamped = true
+		} else if rawPPM < -ppmFromBase {
 			candidate = basePeriodS * (1.0 - ppmFromBase*1e-6)
+			clamped = true
 		}
 	}
 	refined = candidate
@@ -715,6 +869,132 @@ func (ms *MultiSyncSolver) assessPeriodFailure(
 		return true
 	}
 	return false
+}
+
+// ─── reacquire candidate search ──────────────────────────────────────────────
+
+// searchBestCandidate evaluates a set of nearby period candidates and returns the
+// (period, score) pair with the best evidence from the current fit-eligible window.
+// Called during wrong-period reacquire to escape an incorrect period family instead
+// of snapping back to the (potentially wrong) bootstrap base period.
+func (ms *MultiSyncSolver) searchBestCandidate(scored []scoredObs, epochUS float64) (bestPeriod, bestScore float64) {
+	candidates := ms.buildCandidatePeriods()
+	bestPeriod = ms.PeriodS // safe fallback: current refined period
+	bestScore = -1.0
+	for _, cand := range candidates {
+		r := ms.evalCandidatePeriod(scored, cand, epochUS)
+		if r.score > bestScore {
+			bestScore = r.score
+			bestPeriod = r.periodS
+		}
+	}
+	return
+}
+
+// buildCandidatePeriods returns a deduplicated set of period values to probe
+// during reacquire.  Includes the current refined period, the bootstrap seed,
+// the trusted base (if promoted), and fractional offsets around each anchor.
+func (ms *MultiSyncSolver) buildCandidatePeriods() []float64 {
+	// Probe offsets in fractional terms (signed).
+	probeOffsets := [8]float64{-0.020, -0.010, -0.005, -0.002, 0.002, 0.005, 0.010, 0.020}
+	// Key by period rounded to the nearest microsecond to deduplicate near-identical values.
+	seen := make(map[int64]bool)
+	var candidates []float64
+
+	add := func(p float64) {
+		if p < 0.5 || p > 20.0 {
+			return
+		}
+		key := int64(p * 1e6) // μs resolution
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		candidates = append(candidates, p)
+	}
+
+	anchors := [3]float64{ms.PeriodS, ms.BootstrapPeriodS, ms.TrustedBasePeriodS}
+	for _, anchor := range anchors {
+		if anchor <= 0 {
+			continue
+		}
+		add(anchor)
+		for _, frac := range probeOffsets {
+			add(anchor * (1.0 + frac))
+		}
+	}
+	return candidates
+}
+
+// evalCandidatePeriod scores how well a candidate period explains the current
+// fit-eligible observation window using a circular-mean phase estimate.
+// A higher score means stronger evidence for that period family.
+func (ms *MultiSyncSolver) evalCandidatePeriod(scored []scoredObs, candidatePeriodS, epochUS float64) candidateEvalResult {
+	if candidatePeriodS <= 0 || len(scored) == 0 {
+		return candidateEvalResult{periodS: candidatePeriodS, score: -1}
+	}
+	periodUS := candidatePeriodS * 1e6
+
+	// Estimate the best-fit phase offset for this candidate via circular mean of implied offsets.
+	var sinSum, cosSum float64
+	n := 0
+	for _, se := range scored {
+		if !se.fitEligible {
+			continue
+		}
+		phaseInRot := math.Mod((se.effectiveUS-epochUS)/periodUS*360.0, 360.0)
+		if phaseInRot < 0 {
+			phaseInRot += 360.0
+		}
+		impliedOffset := math.Mod(se.o.BearingDeg-phaseInRot+360.0, 360.0)
+		rad := impliedOffset * math.Pi / 180.0
+		sinSum += math.Sin(rad)
+		cosSum += math.Cos(rad)
+		n++
+	}
+	if n == 0 {
+		return candidateEvalResult{periodS: candidatePeriodS, score: -1}
+	}
+	bestOffset := math.Mod(math.Atan2(sinSum, cosSum)*180.0/math.Pi+360.0, 360.0)
+
+	// Compute residuals with the best-fit offset and classify each observation.
+	icaos := make(map[uint32]bool)
+	inliers, rejected := 0, 0
+	var absResiduals []float64
+	for _, se := range scored {
+		if !se.fitEligible {
+			continue
+		}
+		predicted := msPredictBearing(epochUS, bestOffset, periodUS, se.effectiveUS)
+		absR := math.Abs(circularDiff(se.o.BearingDeg, predicted))
+		absResiduals = append(absResiduals, absR)
+		switch msClassifyResidual(absR) {
+		case "inlier":
+			inliers++
+			icaos[se.o.ICAO] = true
+		case "rejected":
+			rejected++
+		}
+	}
+	if len(absResiduals) == 0 {
+		return candidateEvalResult{periodS: candidatePeriodS, score: -1}
+	}
+	madDeg := medianFloat64(absResiduals)
+	total := len(absResiduals)
+	rejFrac := float64(rejected) / float64(total)
+	icaoCount := len(icaos)
+
+	// Score rewards inlier count and ICAO diversity; penalises high MAD and rejection fraction.
+	score := float64(inliers) * float64(icaoCount) / (1.0 + madDeg/5.0) / (1.0 + rejFrac*3.0)
+
+	return candidateEvalResult{
+		periodS:     candidatePeriodS,
+		inlierCount: inliers,
+		icaoCount:   icaoCount,
+		madDeg:      madDeg,
+		rejFrac:     rejFrac,
+		score:       score,
+	}
 }
 
 // ─── package-level pure helpers ───────────────────────────────────────────────
