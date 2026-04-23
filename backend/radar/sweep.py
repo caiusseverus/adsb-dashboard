@@ -1344,6 +1344,25 @@ class LiveSyncState:
     last_anchor_switch_ts: float | None = None
     last_anchor_switch_reason: str | None = None
     anchor_hold_updates: int = 0
+    candidate_period_s: float | None = None
+    authoritative_period_s: float | None = None
+    candidate_phase_offset_deg: float | None = None
+    authoritative_phase_offset_deg: float | None = None
+    candidate_anchor_icao: str | None = None
+    authoritative_anchor_icao: str | None = None
+    candidate_validation_score: float | None = None
+    authoritative_validation_score: float | None = None
+    authoritative_state_age_s: float | None = None
+    candidate_promotion_streak: int = 0
+    authoritative_period_update_gain: float | None = None
+    authoritative_phase_update_gain: float | None = None
+    period_frozen_due_to_phase_validation: bool = False
+    branch_ambiguity_score: float | None = None
+    circular_dispersion_deg: float | None = None
+    validator_agreement_count: int = 0
+    validator_disagreement_count: int = 0
+    candidate_mode: str | None = None
+    authoritative_mode: str | None = None
 
 
 @_dataclass
@@ -4504,6 +4523,20 @@ class RadarState:
                 anchor_icao = f"{int(anchor_icao_raw):06X}"
             except Exception:
                 anchor_icao = None
+        candidate_anchor_icao_raw = msg.get("cai")
+        candidate_anchor_icao = None
+        if candidate_anchor_icao_raw is not None:
+            try:
+                candidate_anchor_icao = f"{int(candidate_anchor_icao_raw):06X}"
+            except Exception:
+                candidate_anchor_icao = None
+        authoritative_anchor_icao_raw = msg.get("aai")
+        authoritative_anchor_icao = None
+        if authoritative_anchor_icao_raw is not None:
+            try:
+                authoritative_anchor_icao = f"{int(authoritative_anchor_icao_raw):06X}"
+            except Exception:
+                authoritative_anchor_icao = None
         anchor_candidates = self._normalise_go_anchor_candidates(msg.get("acs"))
         anchor_row = next((row for row in anchor_candidates if row.get("icao") == anchor_icao), None)
         fit_reject_reasons_raw = msg.get("frr") or {}
@@ -4582,6 +4615,25 @@ class RadarState:
                 last_anchor_switch_ts=(float(msg["ant"]) if msg.get("ant") not in (None, 0) else None),
                 last_anchor_switch_reason=msg.get("ahr"),
                 anchor_hold_updates=int(msg.get("ahu") or 0),
+                candidate_period_s=(float(msg["cps"]) if msg.get("cps") not in (None, 0) else None),
+                authoritative_period_s=(float(msg["aps"]) if msg.get("aps") not in (None, 0) else None),
+                candidate_phase_offset_deg=(float(msg["cpo"]) if msg.get("cpo") is not None else None),
+                authoritative_phase_offset_deg=(float(msg["apo"]) if msg.get("apo") is not None else None),
+                candidate_anchor_icao=candidate_anchor_icao,
+                authoritative_anchor_icao=authoritative_anchor_icao,
+                candidate_validation_score=(float(msg["cvs"]) if msg.get("cvs") is not None else None),
+                authoritative_validation_score=(float(msg["avs"]) if msg.get("avs") is not None else None),
+                authoritative_state_age_s=(float(msg["asa"]) if msg.get("asa") is not None else None),
+                candidate_promotion_streak=int(msg.get("cpr") or 0),
+                authoritative_period_update_gain=(float(msg["apg"]) if msg.get("apg") is not None else None),
+                authoritative_phase_update_gain=(float(msg["afg"]) if msg.get("afg") is not None else None),
+                period_frozen_due_to_phase_validation=bool(msg.get("pfv", False)),
+                branch_ambiguity_score=(float(msg["bas"]) if msg.get("bas") is not None else None),
+                circular_dispersion_deg=(float(msg["cdd"]) if msg.get("cdd") is not None else None),
+                validator_agreement_count=int(msg.get("vac") or 0),
+                validator_disagreement_count=int(msg.get("vdc") or 0),
+                candidate_mode=msg.get("cmd"),
+                authoritative_mode=msg.get("amd"),
                 period_authoritative_source=period_authoritative_source,
             )
 
@@ -8575,6 +8627,25 @@ class RadarState:
             "last_anchor_switch_ts": getattr(sync, "last_anchor_switch_ts", None) if sync is not None else None,
             "last_anchor_switch_reason": getattr(sync, "last_anchor_switch_reason", None) if sync is not None else None,
             "anchor_hold_updates": int(getattr(sync, "anchor_hold_updates", 0) or 0) if sync is not None else 0,
+            "candidate_period_s": getattr(sync, "candidate_period_s", None) if sync is not None else None,
+            "authoritative_period_s": getattr(sync, "authoritative_period_s", None) if sync is not None else None,
+            "candidate_phase_offset_deg": getattr(sync, "candidate_phase_offset_deg", None) if sync is not None else None,
+            "authoritative_phase_offset_deg": getattr(sync, "authoritative_phase_offset_deg", None) if sync is not None else None,
+            "candidate_anchor_icao": getattr(sync, "candidate_anchor_icao", None) if sync is not None else None,
+            "authoritative_anchor_icao": getattr(sync, "authoritative_anchor_icao", None) if sync is not None else None,
+            "candidate_validation_score": getattr(sync, "candidate_validation_score", None) if sync is not None else None,
+            "authoritative_validation_score": getattr(sync, "authoritative_validation_score", None) if sync is not None else None,
+            "authoritative_state_age_s": getattr(sync, "authoritative_state_age_s", None) if sync is not None else None,
+            "candidate_promotion_streak": int(getattr(sync, "candidate_promotion_streak", 0) or 0) if sync is not None else 0,
+            "authoritative_period_update_gain": getattr(sync, "authoritative_period_update_gain", None) if sync is not None else None,
+            "authoritative_phase_update_gain": getattr(sync, "authoritative_phase_update_gain", None) if sync is not None else None,
+            "period_frozen_due_to_phase_validation": bool(getattr(sync, "period_frozen_due_to_phase_validation", False)) if sync is not None else False,
+            "branch_ambiguity_score": getattr(sync, "branch_ambiguity_score", None) if sync is not None else None,
+            "circular_dispersion_deg": getattr(sync, "circular_dispersion_deg", None) if sync is not None else None,
+            "validator_agreement_count": int(getattr(sync, "validator_agreement_count", 0) or 0) if sync is not None else 0,
+            "validator_disagreement_count": int(getattr(sync, "validator_disagreement_count", 0) or 0) if sync is not None else 0,
+            "candidate_mode": getattr(sync, "candidate_mode", None) if sync is not None else None,
+            "authoritative_mode": getattr(sync, "authoritative_mode", None) if sync is not None else None,
             "compact": {
                 "active": not refined_active,
                 "period_s": getattr(sync, "compact_period_s", None) if sync is not None else None,
@@ -9970,6 +10041,25 @@ class RadarState:
             "last_anchor_switch_ts": getattr(sync, "last_anchor_switch_ts", None),
             "last_anchor_switch_reason": getattr(sync, "last_anchor_switch_reason", None),
             "anchor_hold_updates": getattr(sync, "anchor_hold_updates", None),
+            "candidate_period_s": getattr(sync, "candidate_period_s", None),
+            "authoritative_period_s": getattr(sync, "authoritative_period_s", None),
+            "candidate_phase_offset_deg": getattr(sync, "candidate_phase_offset_deg", None),
+            "authoritative_phase_offset_deg": getattr(sync, "authoritative_phase_offset_deg", None),
+            "candidate_anchor_icao": getattr(sync, "candidate_anchor_icao", None),
+            "authoritative_anchor_icao": getattr(sync, "authoritative_anchor_icao", None),
+            "candidate_validation_score": getattr(sync, "candidate_validation_score", None),
+            "authoritative_validation_score": getattr(sync, "authoritative_validation_score", None),
+            "authoritative_state_age_s": getattr(sync, "authoritative_state_age_s", None),
+            "candidate_promotion_streak": getattr(sync, "candidate_promotion_streak", None),
+            "authoritative_period_update_gain": getattr(sync, "authoritative_period_update_gain", None),
+            "authoritative_phase_update_gain": getattr(sync, "authoritative_phase_update_gain", None),
+            "period_frozen_due_to_phase_validation": getattr(sync, "period_frozen_due_to_phase_validation", None),
+            "branch_ambiguity_score": getattr(sync, "branch_ambiguity_score", None),
+            "circular_dispersion_deg": getattr(sync, "circular_dispersion_deg", None),
+            "validator_agreement_count": getattr(sync, "validator_agreement_count", None),
+            "validator_disagreement_count": getattr(sync, "validator_disagreement_count", None),
+            "candidate_mode": getattr(sync, "candidate_mode", None),
+            "authoritative_mode": getattr(sync, "authoritative_mode", None),
             "period_refine_mode": getattr(sync, "period_refine_mode", None),
             "period_authoritative_source": getattr(sync, "period_authoritative_source", None),
             "period_failure_score": getattr(sync, "period_failure_score", None),

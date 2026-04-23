@@ -99,6 +99,20 @@ const (
 	anchorHoldMinUpdates             = 3
 	anchorPoorSpreadDeg              = 18.0
 	anchorPoorFitFraction            = 0.55
+	candidateStablePeriodPPM         = 300.0
+	candidateStablePhaseDeg          = 10.0
+	candidatePromotionMinStreak      = 6
+	authoritativeInitPromotionStreak = 4
+	authoritativePeriodGain          = 0.02
+	authoritativePhaseGain           = 0.08
+	authoritativePeriodMaxStepPPM    = 20.0
+	authoritativeValidationStrong    = 0.7
+	authoritativeValidationWeak      = 0.45
+	branchAmbiguityRejectThreshold   = 0.9
+	validatorAgreementMinCount       = 2
+	validatorAgreementPhaseDeg       = 12.0
+	validatorDisagreementPhaseDeg    = 24.0
+	validatorMinObsPerICAO           = 2
 
 	// ICAO quality memory.
 	icaoQualityMADAlpha  = 0.15
@@ -189,6 +203,26 @@ type publishedAlignment struct {
 	anchorCandidates        []AnchorCandidateSnapshot
 }
 
+type syncStateEstimate struct {
+	present     bool
+	periodS     float64
+	epochUS     float64
+	offsetDeg   float64
+	anchorICAO  *uint32
+	anchorScore float64
+	anchorPhase float64
+}
+
+type syncValidationSummary struct {
+	score              float64
+	branchAmbiguity    float64
+	circularDispersion float64
+	validatorAgreement int
+	validatorDisagree  int
+	strong             bool
+	weak               bool
+}
+
 // MultiSyncSnapshot is a point-in-time view for protocol emission.
 type MultiSyncSnapshot struct {
 	Present               bool
@@ -208,47 +242,66 @@ type MultiSyncSnapshot struct {
 	AnchorPhaseDeg        float64
 	AnchorScore           float64
 	// Bootstrap / trust diagnostics.
-	BootstrapPeriodS          float64 // compact-sync seed captured at first run
-	TrustedBasePeriodS        float64 // promoted from refined period after trustMinStreak updates; 0=not yet trusted
-	TrustUpdateStreak         int     // consecutive updates meeting trust criteria
-	BaseClamped               bool    // true if the base-period clamp fired on the last run
-	BaseClampDiffPPM          float64 // raw PPM deviation that triggered (or would have triggered) the clamp
-	WrongPeriodSuspect        bool    // true if wrong-period suspicion was raised on the last run
-	ReacquireCandidatePeriod  float64 // period chosen by candidate search during reacquire (0 if not active)
-	ReacquireCandidateScore   float64 // score of that candidate
-	FitTotalObservations      int
-	FitEligibleObservations   int
-	FitRejectedObservations   int
-	FitContributingICAOs      int
-	FitRejectReasons          map[string]uint64
-	AnchorCandidateCount      int
-	AnchorNoCandidateReason   string
-	AnchorCandidates          []AnchorCandidateSnapshot
-	DominantPriorPeriodS      float64
-	TrustedRefinedPeriodS     float64
-	ActiveFamilyPriorPeriodS  float64
-	ActiveFamilyPriorSource   string
-	DominantPriorActive       bool
-	CompactPeriodS            float64
-	PeriodDeltaToDominantS    float64
-	PeriodDeltaToDominantPPM  float64
-	CompactDeltaToDominantS   float64
-	CompactDeltaToDominantPPM float64
-	CompactSyncUnreliable     bool
-	RecoveryModeActive        bool
-	RecoveryTriggerReasons    []string
-	CompactGatingBypassed     bool
-	RecoveryRelaxedAdmissions int
-	ActiveAuthorityMode       string
-	AuthoritySwitchCount      int
-	LastAuthoritySwitchTS     float64
-	LastAuthoritySwitchReason string
-	AuthorityEnterStreak      int
-	AuthorityExitStreak       int
-	AnchorSwitchCount         int
-	LastAnchorSwitchTS        float64
-	LastAnchorSwitchReason    string
-	AnchorHoldUpdates         int
+	BootstrapPeriodS                 float64 // compact-sync seed captured at first run
+	TrustedBasePeriodS               float64 // promoted from refined period after trustMinStreak updates; 0=not yet trusted
+	TrustUpdateStreak                int     // consecutive updates meeting trust criteria
+	BaseClamped                      bool    // true if the base-period clamp fired on the last run
+	BaseClampDiffPPM                 float64 // raw PPM deviation that triggered (or would have triggered) the clamp
+	WrongPeriodSuspect               bool    // true if wrong-period suspicion was raised on the last run
+	ReacquireCandidatePeriod         float64 // period chosen by candidate search during reacquire (0 if not active)
+	ReacquireCandidateScore          float64 // score of that candidate
+	FitTotalObservations             int
+	FitEligibleObservations          int
+	FitRejectedObservations          int
+	FitContributingICAOs             int
+	FitRejectReasons                 map[string]uint64
+	AnchorCandidateCount             int
+	AnchorNoCandidateReason          string
+	AnchorCandidates                 []AnchorCandidateSnapshot
+	DominantPriorPeriodS             float64
+	TrustedRefinedPeriodS            float64
+	ActiveFamilyPriorPeriodS         float64
+	ActiveFamilyPriorSource          string
+	DominantPriorActive              bool
+	CompactPeriodS                   float64
+	PeriodDeltaToDominantS           float64
+	PeriodDeltaToDominantPPM         float64
+	CompactDeltaToDominantS          float64
+	CompactDeltaToDominantPPM        float64
+	CompactSyncUnreliable            bool
+	RecoveryModeActive               bool
+	RecoveryTriggerReasons           []string
+	CompactGatingBypassed            bool
+	RecoveryRelaxedAdmissions        int
+	ActiveAuthorityMode              string
+	AuthoritySwitchCount             int
+	LastAuthoritySwitchTS            float64
+	LastAuthoritySwitchReason        string
+	AuthorityEnterStreak             int
+	AuthorityExitStreak              int
+	AnchorSwitchCount                int
+	LastAnchorSwitchTS               float64
+	LastAnchorSwitchReason           string
+	AnchorHoldUpdates                int
+	CandidatePeriodS                 float64
+	AuthoritativePeriodS             float64
+	CandidatePhaseOffsetDeg          float64
+	AuthoritativePhaseOffsetDeg      float64
+	CandidateAnchorICAO              *uint32
+	AuthoritativeAnchorICAO          *uint32
+	CandidateValidationScore         float64
+	AuthoritativeValidationScore     float64
+	AuthoritativeStateAgeS           float64
+	CandidatePromotionStreak         int
+	AuthoritativePeriodUpdateGain    float64
+	AuthoritativePhaseUpdateGain     float64
+	PeriodFrozenDueToPhaseValidation bool
+	BranchAmbiguityScore             float64
+	CircularDispersionDeg            float64
+	ValidatorAgreementCount          int
+	ValidatorDisagreementCount       int
+	CandidateMode                    string
+	AuthoritativeMode                string
 }
 
 // MultiSyncSolver holds per-IID multi-aircraft sync refinement state.
@@ -299,48 +352,76 @@ type MultiSyncSolver struct {
 	TrustUpdateStreak  int
 
 	// Per-run diagnostics (updated each solver run, readable via Snapshot).
-	LastBaseClamped               bool    // true if base-period clamp fired on the last run
-	LastBaseClampDiffPPM          float64 // raw PPM deviation that triggered (or would have triggered) the clamp
-	LastWrongPeriodSuspect        bool    // true if wrong-period suspicion was raised on the last run
-	LastReacquireCandidateP       float64 // period chosen by candidate search during reacquire (0 if not active)
-	LastReacquireCandidateSc      float64 // score of that candidate period
-	LastFitTotalObs               int
-	LastFitEligibleObs            int
-	LastFitRejectedObs            int
-	LastFitContributingICAOs      int
-	LastFitRejectReasons          map[string]uint64
-	LastAnchorCandidateCount      int
-	LastAnchorNoCandidate         string
-	LastAnchorCandidates          []AnchorCandidateSnapshot
-	LastDominantPriorPeriodS      float64
-	LastActiveFamilyPriorPeriodS  float64
-	LastActiveFamilyPriorSource   string
-	LastDominantPriorActive       bool
-	LastCompactPeriodS            float64
-	LastPeriodDeltaToDominantS    float64
-	LastPeriodDeltaToDominantPPM  float64
-	LastCompactDeltaToDominantS   float64
-	LastCompactDeltaToDominantPPM float64
-	LastCompactSyncUnreliable     bool
-	LastRecoveryModeActive        bool
-	LastRecoveryTriggerReasons    []string
-	LastCompactGatingBypassed     bool
-	LastRecoveryRelaxedAdmissions int
-	ActiveAuthorityMode           string
-	AuthoritySwitchCount          int
-	LastAuthoritySwitchTS         float64
-	LastAuthoritySwitchReason     string
-	AuthorityEnterStreak          int
-	AuthorityExitStreak           int
-	RefinedHealthyStreak          int
-	RefinedFailureStreak          int
-	CompactHealthyStreak          int
-	RecoveryEntryStreak           int
-	RecoveryExitStreak            int
-	AnchorSwitchCount             int
-	LastAnchorSwitchTS            float64
-	LastAnchorSwitchReason        string
-	AnchorHoldUpdates             int
+	LastBaseClamped                      bool    // true if base-period clamp fired on the last run
+	LastBaseClampDiffPPM                 float64 // raw PPM deviation that triggered (or would have triggered) the clamp
+	LastWrongPeriodSuspect               bool    // true if wrong-period suspicion was raised on the last run
+	LastReacquireCandidateP              float64 // period chosen by candidate search during reacquire (0 if not active)
+	LastReacquireCandidateSc             float64 // score of that candidate period
+	LastFitTotalObs                      int
+	LastFitEligibleObs                   int
+	LastFitRejectedObs                   int
+	LastFitContributingICAOs             int
+	LastFitRejectReasons                 map[string]uint64
+	LastAnchorCandidateCount             int
+	LastAnchorNoCandidate                string
+	LastAnchorCandidates                 []AnchorCandidateSnapshot
+	LastDominantPriorPeriodS             float64
+	LastActiveFamilyPriorPeriodS         float64
+	LastActiveFamilyPriorSource          string
+	LastDominantPriorActive              bool
+	LastCompactPeriodS                   float64
+	LastPeriodDeltaToDominantS           float64
+	LastPeriodDeltaToDominantPPM         float64
+	LastCompactDeltaToDominantS          float64
+	LastCompactDeltaToDominantPPM        float64
+	LastCompactSyncUnreliable            bool
+	LastRecoveryModeActive               bool
+	LastRecoveryTriggerReasons           []string
+	LastCompactGatingBypassed            bool
+	LastRecoveryRelaxedAdmissions        int
+	ActiveAuthorityMode                  string
+	AuthoritySwitchCount                 int
+	LastAuthoritySwitchTS                float64
+	LastAuthoritySwitchReason            string
+	AuthorityEnterStreak                 int
+	AuthorityExitStreak                  int
+	RefinedHealthyStreak                 int
+	RefinedFailureStreak                 int
+	CompactHealthyStreak                 int
+	RecoveryEntryStreak                  int
+	RecoveryExitStreak                   int
+	AnchorSwitchCount                    int
+	LastAnchorSwitchTS                   float64
+	LastAnchorSwitchReason               string
+	AnchorHoldUpdates                    int
+	CandidatePresent                     bool
+	CandidatePeriodS                     float64
+	CandidatePhaseEpochUS                float64
+	CandidatePhaseOffsetDeg              float64
+	CandidateAnchorICAO                  *uint32
+	CandidateAnchorScore                 float64
+	CandidateAnchorPhaseDeg              float64
+	CandidateValidationScore             float64
+	CandidateStateSinceTS                float64
+	CandidatePromotionStreak             int
+	AuthoritativePresent                 bool
+	AuthoritativePeriodS                 float64
+	AuthoritativePhaseEpochUS            float64
+	AuthoritativePhaseOffsetDeg          float64
+	AuthoritativeAnchorICAO              *uint32
+	AuthoritativeAnchorScore             float64
+	AuthoritativeAnchorPhaseDeg          float64
+	AuthoritativeValidationScore         float64
+	AuthoritativeStateSinceTS            float64
+	LastAuthoritativePeriodGain          float64
+	LastAuthoritativePhaseGain           float64
+	LastPeriodFrozenDueToPhaseValidation bool
+	LastBranchAmbiguityScore             float64
+	LastCircularDispersionDeg            float64
+	LastValidatorAgreementCount          int
+	LastValidatorDisagreementCount       int
+	LastCandidateMode                    string
+	LastAuthoritativeMode                string
 
 	// Throttle.
 	lastRunTS float64
@@ -465,6 +546,34 @@ func (ms *MultiSyncSolver) Reset() {
 	ms.LastAnchorSwitchTS = 0
 	ms.LastAnchorSwitchReason = ""
 	ms.AnchorHoldUpdates = 0
+	ms.CandidatePresent = false
+	ms.CandidatePeriodS = 0
+	ms.CandidatePhaseEpochUS = 0
+	ms.CandidatePhaseOffsetDeg = 0
+	ms.CandidateAnchorICAO = nil
+	ms.CandidateAnchorScore = 0
+	ms.CandidateAnchorPhaseDeg = 0
+	ms.CandidateValidationScore = 0
+	ms.CandidateStateSinceTS = 0
+	ms.CandidatePromotionStreak = 0
+	ms.AuthoritativePresent = false
+	ms.AuthoritativePeriodS = 0
+	ms.AuthoritativePhaseEpochUS = 0
+	ms.AuthoritativePhaseOffsetDeg = 0
+	ms.AuthoritativeAnchorICAO = nil
+	ms.AuthoritativeAnchorScore = 0
+	ms.AuthoritativeAnchorPhaseDeg = 0
+	ms.AuthoritativeValidationScore = 0
+	ms.AuthoritativeStateSinceTS = 0
+	ms.LastAuthoritativePeriodGain = 0
+	ms.LastAuthoritativePhaseGain = 0
+	ms.LastPeriodFrozenDueToPhaseValidation = false
+	ms.LastBranchAmbiguityScore = 0
+	ms.LastCircularDispersionDeg = 0
+	ms.LastValidatorAgreementCount = 0
+	ms.LastValidatorDisagreementCount = 0
+	ms.LastCandidateMode = ""
+	ms.LastAuthoritativeMode = ""
 }
 
 // Snapshot returns a copy of the published state for protocol emission.
@@ -486,47 +595,66 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 		PeriodReacquireActive: ms.PeriodReacquireActive,
 		PeriodReacquireReason: ms.PeriodReacquireReason,
 		// Bootstrap / trust diagnostics.
-		BootstrapPeriodS:          ms.BootstrapPeriodS,
-		TrustedBasePeriodS:        ms.TrustedBasePeriodS,
-		TrustUpdateStreak:         ms.TrustUpdateStreak,
-		BaseClamped:               ms.LastBaseClamped,
-		BaseClampDiffPPM:          ms.LastBaseClampDiffPPM,
-		WrongPeriodSuspect:        ms.LastWrongPeriodSuspect,
-		ReacquireCandidatePeriod:  ms.LastReacquireCandidateP,
-		ReacquireCandidateScore:   ms.LastReacquireCandidateSc,
-		FitTotalObservations:      ms.LastFitTotalObs,
-		FitEligibleObservations:   ms.LastFitEligibleObs,
-		FitRejectedObservations:   ms.LastFitRejectedObs,
-		FitContributingICAOs:      ms.LastFitContributingICAOs,
-		FitRejectReasons:          make(map[string]uint64, len(ms.LastFitRejectReasons)),
-		AnchorCandidateCount:      ms.LastAnchorCandidateCount,
-		AnchorNoCandidateReason:   ms.LastAnchorNoCandidate,
-		AnchorCandidates:          make([]AnchorCandidateSnapshot, len(ms.LastAnchorCandidates)),
-		DominantPriorPeriodS:      ms.LastDominantPriorPeriodS,
-		TrustedRefinedPeriodS:     ms.TrustedBasePeriodS,
-		ActiveFamilyPriorPeriodS:  ms.LastActiveFamilyPriorPeriodS,
-		ActiveFamilyPriorSource:   ms.LastActiveFamilyPriorSource,
-		DominantPriorActive:       ms.LastDominantPriorActive,
-		CompactPeriodS:            ms.LastCompactPeriodS,
-		PeriodDeltaToDominantS:    ms.LastPeriodDeltaToDominantS,
-		PeriodDeltaToDominantPPM:  ms.LastPeriodDeltaToDominantPPM,
-		CompactDeltaToDominantS:   ms.LastCompactDeltaToDominantS,
-		CompactDeltaToDominantPPM: ms.LastCompactDeltaToDominantPPM,
-		CompactSyncUnreliable:     ms.LastCompactSyncUnreliable,
-		RecoveryModeActive:        ms.LastRecoveryModeActive,
-		RecoveryTriggerReasons:    append([]string(nil), ms.LastRecoveryTriggerReasons...),
-		CompactGatingBypassed:     ms.LastCompactGatingBypassed,
-		RecoveryRelaxedAdmissions: ms.LastRecoveryRelaxedAdmissions,
-		ActiveAuthorityMode:       ms.ActiveAuthorityMode,
-		AuthoritySwitchCount:      ms.AuthoritySwitchCount,
-		LastAuthoritySwitchTS:     ms.LastAuthoritySwitchTS,
-		LastAuthoritySwitchReason: ms.LastAuthoritySwitchReason,
-		AuthorityEnterStreak:      ms.AuthorityEnterStreak,
-		AuthorityExitStreak:       ms.AuthorityExitStreak,
-		AnchorSwitchCount:         ms.AnchorSwitchCount,
-		LastAnchorSwitchTS:        ms.LastAnchorSwitchTS,
-		LastAnchorSwitchReason:    ms.LastAnchorSwitchReason,
-		AnchorHoldUpdates:         ms.AnchorHoldUpdates,
+		BootstrapPeriodS:                 ms.BootstrapPeriodS,
+		TrustedBasePeriodS:               ms.TrustedBasePeriodS,
+		TrustUpdateStreak:                ms.TrustUpdateStreak,
+		BaseClamped:                      ms.LastBaseClamped,
+		BaseClampDiffPPM:                 ms.LastBaseClampDiffPPM,
+		WrongPeriodSuspect:               ms.LastWrongPeriodSuspect,
+		ReacquireCandidatePeriod:         ms.LastReacquireCandidateP,
+		ReacquireCandidateScore:          ms.LastReacquireCandidateSc,
+		FitTotalObservations:             ms.LastFitTotalObs,
+		FitEligibleObservations:          ms.LastFitEligibleObs,
+		FitRejectedObservations:          ms.LastFitRejectedObs,
+		FitContributingICAOs:             ms.LastFitContributingICAOs,
+		FitRejectReasons:                 make(map[string]uint64, len(ms.LastFitRejectReasons)),
+		AnchorCandidateCount:             ms.LastAnchorCandidateCount,
+		AnchorNoCandidateReason:          ms.LastAnchorNoCandidate,
+		AnchorCandidates:                 make([]AnchorCandidateSnapshot, len(ms.LastAnchorCandidates)),
+		DominantPriorPeriodS:             ms.LastDominantPriorPeriodS,
+		TrustedRefinedPeriodS:            ms.TrustedBasePeriodS,
+		ActiveFamilyPriorPeriodS:         ms.LastActiveFamilyPriorPeriodS,
+		ActiveFamilyPriorSource:          ms.LastActiveFamilyPriorSource,
+		DominantPriorActive:              ms.LastDominantPriorActive,
+		CompactPeriodS:                   ms.LastCompactPeriodS,
+		PeriodDeltaToDominantS:           ms.LastPeriodDeltaToDominantS,
+		PeriodDeltaToDominantPPM:         ms.LastPeriodDeltaToDominantPPM,
+		CompactDeltaToDominantS:          ms.LastCompactDeltaToDominantS,
+		CompactDeltaToDominantPPM:        ms.LastCompactDeltaToDominantPPM,
+		CompactSyncUnreliable:            ms.LastCompactSyncUnreliable,
+		RecoveryModeActive:               ms.LastRecoveryModeActive,
+		RecoveryTriggerReasons:           append([]string(nil), ms.LastRecoveryTriggerReasons...),
+		CompactGatingBypassed:            ms.LastCompactGatingBypassed,
+		RecoveryRelaxedAdmissions:        ms.LastRecoveryRelaxedAdmissions,
+		ActiveAuthorityMode:              ms.ActiveAuthorityMode,
+		AuthoritySwitchCount:             ms.AuthoritySwitchCount,
+		LastAuthoritySwitchTS:            ms.LastAuthoritySwitchTS,
+		LastAuthoritySwitchReason:        ms.LastAuthoritySwitchReason,
+		AuthorityEnterStreak:             ms.AuthorityEnterStreak,
+		AuthorityExitStreak:              ms.AuthorityExitStreak,
+		AnchorSwitchCount:                ms.AnchorSwitchCount,
+		LastAnchorSwitchTS:               ms.LastAnchorSwitchTS,
+		LastAnchorSwitchReason:           ms.LastAnchorSwitchReason,
+		AnchorHoldUpdates:                ms.AnchorHoldUpdates,
+		CandidatePeriodS:                 ms.CandidatePeriodS,
+		AuthoritativePeriodS:             ms.AuthoritativePeriodS,
+		CandidatePhaseOffsetDeg:          ms.CandidatePhaseOffsetDeg,
+		AuthoritativePhaseOffsetDeg:      ms.AuthoritativePhaseOffsetDeg,
+		CandidateValidationScore:         ms.CandidateValidationScore,
+		AuthoritativeValidationScore:     ms.AuthoritativeValidationScore,
+		CandidatePromotionStreak:         ms.CandidatePromotionStreak,
+		AuthoritativePeriodUpdateGain:    ms.LastAuthoritativePeriodGain,
+		AuthoritativePhaseUpdateGain:     ms.LastAuthoritativePhaseGain,
+		PeriodFrozenDueToPhaseValidation: ms.LastPeriodFrozenDueToPhaseValidation,
+		BranchAmbiguityScore:             ms.LastBranchAmbiguityScore,
+		CircularDispersionDeg:            ms.LastCircularDispersionDeg,
+		ValidatorAgreementCount:          ms.LastValidatorAgreementCount,
+		ValidatorDisagreementCount:       ms.LastValidatorDisagreementCount,
+		CandidateMode:                    ms.LastCandidateMode,
+		AuthoritativeMode:                ms.LastAuthoritativeMode,
+	}
+	if ms.AuthoritativeStateSinceTS > 0 && ms.LastUpdated > 0 {
+		snap.AuthoritativeStateAgeS = math.Max(0, ms.LastUpdated-ms.AuthoritativeStateSinceTS)
 	}
 	for k, v := range ms.LastFitRejectReasons {
 		snap.FitRejectReasons[k] = v
@@ -538,6 +666,14 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 		snap.AnchorPhaseDeg = ms.AnchorPhaseDeg
 		snap.AnchorScore = ms.AnchorScore
 	}
+	if ms.CandidateAnchorICAO != nil {
+		v := *ms.CandidateAnchorICAO
+		snap.CandidateAnchorICAO = &v
+	}
+	if ms.AuthoritativeAnchorICAO != nil {
+		v := *ms.AuthoritativeAnchorICAO
+		snap.AuthoritativeAnchorICAO = &v
+	}
 	return snap
 }
 
@@ -547,7 +683,13 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	ms.ensureAuthorityMode()
 	// Determine seed phase from existing multi-sync state or frame sync.
 	var seedEpochUS, seedOffsetDeg float64
-	if ms.Present && ms.PhaseEpochUS > 0 {
+	if ms.CandidatePresent && ms.CandidatePhaseEpochUS > 0 {
+		seedEpochUS = ms.CandidatePhaseEpochUS
+		seedOffsetDeg = ms.CandidatePhaseOffsetDeg
+	} else if ms.AuthoritativePresent && ms.AuthoritativePhaseEpochUS > 0 {
+		seedEpochUS = ms.AuthoritativePhaseEpochUS
+		seedOffsetDeg = ms.AuthoritativePhaseOffsetDeg
+	} else if ms.Present && ms.PhaseEpochUS > 0 {
 		seedEpochUS = ms.PhaseEpochUS
 		seedOffsetDeg = ms.PhaseOffsetDeg
 	} else if sync != nil && sync.PeriodS > 0 {
@@ -916,6 +1058,28 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	ms.LastAnchorNoCandidate = finalAlignment.anchorNoCandidateReason
 	ms.LastAnchorCandidates = finalAlignment.anchorCandidates
 
+	candidateEstimate := syncStateEstimate{
+		present:     true,
+		periodS:     finalPeriodS,
+		epochUS:     finalAlignment.epochUS,
+		offsetDeg:   finalAlignment.offsetDeg,
+		anchorICAO:  finalAlignment.anchorICAO,
+		anchorScore: finalAlignment.anchorScore,
+		anchorPhase: finalAlignment.anchorPhaseDeg,
+	}
+	candidateMode := "tracking"
+	if recoveryActive {
+		candidateMode = "recovery"
+	} else if ms.ActiveAuthorityMode == authorityModeCompact {
+		candidateMode = "bootstrap"
+	}
+	validation := ms.evaluatePhaseValidation(scored, candidateEstimate, finalAlignment.anchorCandidates)
+	ms.LastBranchAmbiguityScore = validation.branchAmbiguity
+	ms.LastCircularDispersionDeg = validation.circularDispersion
+	ms.LastValidatorAgreementCount = validation.validatorAgreement
+	ms.LastValidatorDisagreementCount = validation.validatorDisagree
+	ms.LastCandidateMode = candidateMode
+
 	// Capture per-run clamp diagnostics (after refinePeriod returned them).
 	ms.LastBaseClamped = clampedByBase
 	ms.LastBaseClampDiffPPM = clampDiffPPM
@@ -940,35 +1104,64 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		}
 	}
 
+	ms.updateCandidateState(candidateEstimate, validation, candidateMode, nowUnix)
+	ms.updateAuthoritativeState(candidateEstimate, validation, recoveryActive, nowUnix)
+
+	publishedEstimate := candidateEstimate
+	if ms.AuthoritativePresent {
+		publishedEstimate = syncStateEstimate{
+			present:     true,
+			periodS:     ms.AuthoritativePeriodS,
+			epochUS:     ms.AuthoritativePhaseEpochUS,
+			offsetDeg:   ms.AuthoritativePhaseOffsetDeg,
+			anchorICAO:  ms.AuthoritativeAnchorICAO,
+			anchorScore: ms.AuthoritativeAnchorScore,
+			anchorPhase: ms.AuthoritativeAnchorPhaseDeg,
+		}
+	}
+
 	// Publish.
 	ms.Present = true
 	ms.Usable = len(fitPool) >= 4 && !majorityRejected
-	ms.PeriodS = finalPeriodS
+	ms.PeriodS = publishedEstimate.periodS
 	ms.PeriodBaseS = basePeriodS
-	ms.PhaseEpochUS = finalAlignment.epochUS
-	ms.PhaseOffsetDeg = finalAlignment.offsetDeg
-	ms.JitterDeg = clamp(newResidualEMA, 1.5, 20.0)
+	ms.PhaseEpochUS = publishedEstimate.epochUS
+	ms.PhaseOffsetDeg = publishedEstimate.offsetDeg
+	if ms.AuthoritativePresent && ms.JitterDeg > 0 {
+		ms.JitterDeg = clamp(0.92*ms.JitterDeg+0.08*newResidualEMA, 1.5, 20.0)
+	} else {
+		ms.JitterDeg = clamp(newResidualEMA, 1.5, 20.0)
+	}
 	ms.ResidualEMADeg = newResidualEMA
 	ms.NSyncUpdates++
 	ms.Holdover = len(fitPool) < 2
 	ms.LastUpdated = nowUnix
-	if finalAlignment.anchorICAO != nil {
-		ms.AnchorICAO = finalAlignment.anchorICAO
-		ms.AnchorPhaseDeg = finalAlignment.anchorPhaseDeg
-		ms.AnchorScore = finalAlignment.anchorScore
+	if publishedEstimate.anchorICAO != nil {
+		ms.AnchorICAO = publishedEstimate.anchorICAO
+		ms.AnchorPhaseDeg = publishedEstimate.anchorPhase
+		ms.AnchorScore = publishedEstimate.anchorScore
+	} else {
+		ms.AnchorICAO = nil
+		ms.AnchorPhaseDeg = 0
+		ms.AnchorScore = 0
 	}
-	ms.LastPeriodDeltaToDominantS, ms.LastPeriodDeltaToDominantPPM = periodDeltaToDominant(finalPeriodS, dominantPeriodS)
+	ms.LastAuthoritativeMode = "tentative_candidate"
+	if ms.AuthoritativePresent {
+		ms.LastAuthoritativeMode = "settled_authoritative"
+	}
+	ms.LastPeriodDeltaToDominantS, ms.LastPeriodDeltaToDominantPPM = periodDeltaToDominant(ms.PeriodS, dominantPeriodS)
 	ms.LastCompactDeltaToDominantS, ms.LastCompactDeltaToDominantPPM = periodDeltaToDominant(compactPeriodS, dominantPeriodS)
 
 	refinedHealthy := ms.Usable &&
-		finalAlignment.anchorICAO != nil &&
+		candidateEstimate.anchorICAO != nil &&
 		len(fitPool) >= trustMinFitPool &&
 		len(fitICAOs) >= 2 &&
-		detrended <= trustMaxResidualDeg &&
+		validation.score >= authoritativeValidationStrong &&
 		!majorityRejected &&
 		!wrongPeriodSuspect
 	refinedFailure := !ms.Usable ||
-		finalAlignment.anchorICAO == nil ||
+		candidateEstimate.anchorICAO == nil ||
+		validation.weak ||
 		wrongPeriodSuspect ||
 		majorityRejected ||
 		detrended > reacquireMADThreshold
@@ -996,12 +1189,24 @@ func (ms *MultiSyncSolver) selectActiveFamilyPrior(compactPeriodS, dominantPerio
 		return compactPeriodS, "compact_seed"
 	}
 	if authorityMode == authorityModeRefined {
+		if ms.CandidatePresent && ms.CandidatePeriodS > 0 {
+			return ms.CandidatePeriodS, "candidate_refined"
+		}
+		if ms.AuthoritativePresent && ms.AuthoritativePeriodS > 0 {
+			return ms.AuthoritativePeriodS, "authoritative_refined"
+		}
 		if ms.TrustedBasePeriodS > 0 {
 			return ms.TrustedBasePeriodS, "trusted_refined"
 		}
 		if ms.Present && ms.PeriodS > 0 {
 			return ms.PeriodS, "current_refined"
 		}
+	}
+	if ms.CandidatePresent && ms.CandidatePeriodS > 0 && authorityMode != authorityModeCompact {
+		return ms.CandidatePeriodS, "candidate_refined"
+	}
+	if ms.AuthoritativePresent && ms.AuthoritativePeriodS > 0 && authorityMode != authorityModeCompact {
+		return ms.AuthoritativePeriodS, "authoritative_refined"
 	}
 	if ms.TrustedBasePeriodS > 0 && authorityMode != authorityModeCompact {
 		return ms.TrustedBasePeriodS, "trusted_refined"
@@ -1189,6 +1394,213 @@ func (ms *MultiSyncSolver) applyTrustedBaseUpdate(finalPeriodS float64, trustedE
 	// Slow EMA keeps the trusted base tracking a genuinely stable family
 	// without snapping to transient fluctuations.
 	ms.TrustedBasePeriodS = 0.98*ms.TrustedBasePeriodS + 0.02*finalPeriodS
+}
+
+func (ms *MultiSyncSolver) updateCandidateState(
+	estimate syncStateEstimate,
+	validation syncValidationSummary,
+	candidateMode string,
+	nowUnix float64,
+) {
+	stable := false
+	if ms.CandidatePresent {
+		_, deltaPPM := periodDeltaToDominant(estimate.periodS, ms.CandidatePeriodS)
+		phaseDelta := math.Abs(circularDiff(estimate.offsetDeg, ms.CandidatePhaseOffsetDeg))
+		sameAnchor := (ms.CandidateAnchorICAO == nil && estimate.anchorICAO == nil) ||
+			(ms.CandidateAnchorICAO != nil && estimate.anchorICAO != nil && *ms.CandidateAnchorICAO == *estimate.anchorICAO)
+		stable = math.Abs(deltaPPM) <= candidateStablePeriodPPM &&
+			phaseDelta <= candidateStablePhaseDeg &&
+			sameAnchor
+	}
+	if validation.strong {
+		if stable {
+			ms.CandidatePromotionStreak++
+		} else {
+			ms.CandidatePromotionStreak = 1
+			ms.CandidateStateSinceTS = nowUnix
+		}
+	} else {
+		ms.CandidatePromotionStreak = 0
+		ms.CandidateStateSinceTS = nowUnix
+	}
+	if !ms.CandidatePresent || !stable {
+		ms.CandidateStateSinceTS = nowUnix
+	}
+	ms.CandidatePresent = estimate.present
+	ms.CandidatePeriodS = estimate.periodS
+	ms.CandidatePhaseEpochUS = estimate.epochUS
+	ms.CandidatePhaseOffsetDeg = estimate.offsetDeg
+	ms.CandidateAnchorICAO = estimate.anchorICAO
+	ms.CandidateAnchorScore = estimate.anchorScore
+	ms.CandidateAnchorPhaseDeg = estimate.anchorPhase
+	ms.CandidateValidationScore = validation.score
+	ms.LastCandidateMode = candidateMode
+}
+
+func (ms *MultiSyncSolver) updateAuthoritativeState(
+	candidate syncStateEstimate,
+	validation syncValidationSummary,
+	recoveryActive bool,
+	nowUnix float64,
+) {
+	ms.LastAuthoritativePeriodGain = 0
+	ms.LastAuthoritativePhaseGain = 0
+	ms.LastPeriodFrozenDueToPhaseValidation = false
+	if !candidate.present {
+		return
+	}
+
+	promotionReady := validation.strong && ms.CandidatePromotionStreak >= candidatePromotionMinStreak
+	if !ms.AuthoritativePresent {
+		if validation.strong && ms.CandidatePromotionStreak >= authoritativeInitPromotionStreak {
+			ms.AuthoritativePresent = true
+			ms.AuthoritativePeriodS = candidate.periodS
+			ms.AuthoritativePhaseEpochUS = candidate.epochUS
+			ms.AuthoritativePhaseOffsetDeg = candidate.offsetDeg
+			ms.AuthoritativeAnchorICAO = candidate.anchorICAO
+			ms.AuthoritativeAnchorScore = candidate.anchorScore
+			ms.AuthoritativeAnchorPhaseDeg = candidate.anchorPhase
+			ms.AuthoritativeValidationScore = validation.score
+			ms.AuthoritativeStateSinceTS = nowUnix
+			ms.LastAuthoritativeMode = "authoritative_initialized"
+		}
+		return
+	}
+
+	if !promotionReady || recoveryActive {
+		ms.LastPeriodFrozenDueToPhaseValidation = true
+		ms.AuthoritativeValidationScore = 0.9*ms.AuthoritativeValidationScore + 0.1*validation.score
+		ms.LastAuthoritativeMode = "authoritative_holding"
+		return
+	}
+
+	periodGain := authoritativePeriodGain
+	phaseGain := authoritativePhaseGain
+	if validation.branchAmbiguity >= branchAmbiguityRejectThreshold {
+		periodGain = 0
+		phaseGain = 0
+		ms.LastPeriodFrozenDueToPhaseValidation = true
+	}
+	if validation.score < authoritativeValidationStrong {
+		periodGain = 0
+		phaseGain *= 0.5
+		ms.LastPeriodFrozenDueToPhaseValidation = true
+	}
+	ms.LastAuthoritativePeriodGain = periodGain
+	ms.LastAuthoritativePhaseGain = phaseGain
+
+	if periodGain > 0 && ms.AuthoritativePeriodS > 0 {
+		maxStepS := ms.AuthoritativePeriodS * authoritativePeriodMaxStepPPM / 1e6
+		targetDelta := candidate.periodS - ms.AuthoritativePeriodS
+		clampedDelta := clamp(targetDelta, -maxStepS, maxStepS)
+		ms.AuthoritativePeriodS += clampedDelta * periodGain
+	}
+	if phaseGain > 0 {
+		phaseDelta := circularDiff(candidate.offsetDeg, ms.AuthoritativePhaseOffsetDeg)
+		ms.AuthoritativePhaseOffsetDeg = math.Mod(ms.AuthoritativePhaseOffsetDeg+phaseDelta*phaseGain+360.0, 360.0)
+		ms.AuthoritativePhaseEpochUS = candidate.epochUS
+	}
+	if candidate.anchorICAO != nil &&
+		ms.CandidatePromotionStreak >= candidatePromotionMinStreak &&
+		validation.branchAmbiguity < branchAmbiguityRejectThreshold {
+		ms.AuthoritativeAnchorICAO = candidate.anchorICAO
+		ms.AuthoritativeAnchorScore = candidate.anchorScore
+		ms.AuthoritativeAnchorPhaseDeg = candidate.anchorPhase
+	}
+	ms.AuthoritativeValidationScore = 0.85*ms.AuthoritativeValidationScore + 0.15*validation.score
+	ms.LastAuthoritativeMode = "authoritative_tracking"
+}
+
+func (ms *MultiSyncSolver) evaluatePhaseValidation(
+	scored []scoredObs,
+	estimate syncStateEstimate,
+	candidates []AnchorCandidateSnapshot,
+) syncValidationSummary {
+	summary := syncValidationSummary{
+		score:              0,
+		branchAmbiguity:    1,
+		circularDispersion: 999,
+		weak:               true,
+	}
+	if !estimate.present || estimate.periodS <= 0 || estimate.anchorICAO == nil {
+		return summary
+	}
+
+	topScore := 0.0
+	secondScore := 0.0
+	selectedSpread := 999.0
+	for _, row := range candidates {
+		if row.Status == "rejected" {
+			continue
+		}
+		if row.Score > topScore {
+			secondScore = topScore
+			topScore = row.Score
+		} else if row.Score > secondScore {
+			secondScore = row.Score
+		}
+		if row.ICAO == *estimate.anchorICAO {
+			selectedSpread = row.SpreadDeg
+		}
+	}
+	if topScore > 0 {
+		summary.branchAmbiguity = clamp(secondScore/topScore, 0, 1)
+	}
+	summary.circularDispersion = selectedSpread
+
+	type validatorAccum struct {
+		count int
+		sin   float64
+		cos   float64
+	}
+	periodUS := estimate.periodS * 1e6
+	byICAO := make(map[uint32]*validatorAccum)
+	for _, se := range scored {
+		if !se.fitEligible || se.o.ICAO == *estimate.anchorICAO {
+			continue
+		}
+		phaseRel := math.Mod((se.effectiveUS-estimate.epochUS)/periodUS*360.0, 360.0)
+		if phaseRel < 0 {
+			phaseRel += 360.0
+		}
+		implied := math.Mod(se.o.BearingDeg-phaseRel+360.0, 360.0)
+		diff := circularDiff(implied, estimate.offsetDeg)
+		acc := byICAO[se.o.ICAO]
+		if acc == nil {
+			acc = &validatorAccum{}
+			byICAO[se.o.ICAO] = acc
+		}
+		acc.count++
+		rad := diff * math.Pi / 180.0
+		acc.sin += math.Sin(rad)
+		acc.cos += math.Cos(rad)
+	}
+	for _, acc := range byICAO {
+		if acc.count < validatorMinObsPerICAO {
+			continue
+		}
+		mean := math.Atan2(acc.sin, acc.cos) * 180.0 / math.Pi
+		absMean := math.Abs(mean)
+		if absMean <= validatorAgreementPhaseDeg {
+			summary.validatorAgreement++
+		} else if absMean >= validatorDisagreementPhaseDeg {
+			summary.validatorDisagree++
+		}
+	}
+
+	agreementScore := clamp(float64(summary.validatorAgreement)/3.0, 0, 1)
+	disagreementPenalty := clamp(float64(summary.validatorDisagree)/3.0, 0, 1)
+	dispersionScore := 0.0
+	if selectedSpread < 999 {
+		dispersionScore = clamp(1.0-selectedSpread/30.0, 0, 1)
+	}
+	ambiguityScore := 1.0 - summary.branchAmbiguity
+	summary.score = clamp(0.45*agreementScore+0.30*dispersionScore+0.25*ambiguityScore-0.35*disagreementPenalty, 0, 1)
+	summary.strong = summary.validatorAgreement >= validatorAgreementMinCount &&
+		summary.branchAmbiguity < branchAmbiguityRejectThreshold &&
+		summary.score >= authoritativeValidationStrong
+	summary.weak = summary.score < authoritativeValidationWeak || summary.validatorAgreement == 0
+	return summary
 }
 
 func (ms *MultiSyncSolver) buildAlignmentForPeriod(

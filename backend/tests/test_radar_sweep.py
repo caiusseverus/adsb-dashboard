@@ -3254,6 +3254,25 @@ def test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst(monkey
         "ant": 1_999.5,
         "ahr": "anchor_hysteresis_switch",
         "ahu": 4,
+        "cps": 4.03,
+        "aps": 4.01,
+        "cpo": 24.0,
+        "apo": 22.5,
+        "cai": int("BBBBBB", 16),
+        "aai": int("AAAAAA", 16),
+        "cvs": 0.52,
+        "avs": 0.87,
+        "asa": 42.0,
+        "cpr": 7,
+        "apg": 0.0,
+        "afg": 0.08,
+        "pfv": True,
+        "bas": 0.93,
+        "cdd": 11.5,
+        "vac": 1,
+        "vdc": 2,
+        "cmd": "recovery",
+        "amd": "settled_authoritative",
         "ai": int("AAAAAA", 16),
         "as": 0.8,
         "ft": 11,
@@ -3296,6 +3315,25 @@ def test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst(monkey
     assert sync.last_anchor_switch_ts == pytest.approx(1_999.5)
     assert sync.last_anchor_switch_reason == "anchor_hysteresis_switch"
     assert sync.anchor_hold_updates == 4
+    assert sync.candidate_period_s == pytest.approx(4.03)
+    assert sync.authoritative_period_s == pytest.approx(4.01)
+    assert sync.candidate_phase_offset_deg == pytest.approx(24.0)
+    assert sync.authoritative_phase_offset_deg == pytest.approx(22.5)
+    assert sync.candidate_anchor_icao == "BBBBBB"
+    assert sync.authoritative_anchor_icao == "AAAAAA"
+    assert sync.candidate_validation_score == pytest.approx(0.52)
+    assert sync.authoritative_validation_score == pytest.approx(0.87)
+    assert sync.authoritative_state_age_s == pytest.approx(42.0)
+    assert sync.candidate_promotion_streak == 7
+    assert sync.authoritative_period_update_gain == pytest.approx(0.0)
+    assert sync.authoritative_phase_update_gain == pytest.approx(0.08)
+    assert sync.period_frozen_due_to_phase_validation is True
+    assert sync.branch_ambiguity_score == pytest.approx(0.93)
+    assert sync.circular_dispersion_deg == pytest.approx(11.5)
+    assert sync.validator_agreement_count == 1
+    assert sync.validator_disagreement_count == 2
+    assert sync.candidate_mode == "recovery"
+    assert sync.authoritative_mode == "settled_authoritative"
 
 
 def test_go_iid_state_does_not_overwrite_go_multi_sync_state():
@@ -3361,6 +3399,25 @@ def test_go_multi_sync_mode_diagnostics_report_dominant_recovery_fields():
         last_anchor_switch_ts=1_995.0,
         last_anchor_switch_reason="anchor_hysteresis_switch",
         anchor_hold_updates=5,
+        candidate_period_s=4.03,
+        authoritative_period_s=4.01,
+        candidate_phase_offset_deg=24.0,
+        authoritative_phase_offset_deg=22.5,
+        candidate_anchor_icao="BBBBBB",
+        authoritative_anchor_icao="AAAAAA",
+        candidate_validation_score=0.52,
+        authoritative_validation_score=0.87,
+        authoritative_state_age_s=42.0,
+        candidate_promotion_streak=7,
+        authoritative_period_update_gain=0.0,
+        authoritative_phase_update_gain=0.08,
+        period_frozen_due_to_phase_validation=True,
+        branch_ambiguity_score=0.93,
+        circular_dispersion_deg=11.5,
+        validator_agreement_count=1,
+        validator_disagreement_count=2,
+        candidate_mode="recovery",
+        authoritative_mode="settled_authoritative",
         fit_total_observations=12,
         fit_eligible_observations=8,
         fit_rejected_observations=4,
@@ -3382,6 +3439,12 @@ def test_go_multi_sync_mode_diagnostics_report_dominant_recovery_fields():
     assert diagnostics["anchor_switch_count"] == 3
     assert diagnostics["last_anchor_switch_reason"] == "anchor_hysteresis_switch"
     assert diagnostics["anchor_hold_updates"] == 5
+    assert diagnostics["candidate_period_s"] == pytest.approx(4.03)
+    assert diagnostics["authoritative_period_s"] == pytest.approx(4.01)
+    assert diagnostics["period_frozen_due_to_phase_validation"] is True
+    assert diagnostics["branch_ambiguity_score"] == pytest.approx(0.93)
+    assert diagnostics["validator_agreement_count"] == 1
+    assert diagnostics["authoritative_mode"] == "settled_authoritative"
     assert diagnostics["compact"]["period_s"] == pytest.approx(4.16)
     assert diagnostics["compact"]["unreliable"] is True
     assert diagnostics["refined"]["period_delta_to_dominant_ppm"] == pytest.approx(2500.0)

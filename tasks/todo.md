@@ -1,3 +1,32 @@
+## 2026-04-23 Burst Sync Long-Term Authoritative Estimator
+
+- [x] Inspect the current Go refined solver flow and confirm where short-horizon candidate period/phase/anchor estimates are still published directly as live state.
+- [x] Refactor the Go multi-sync solver to maintain explicit candidate versus authoritative sync state with strong long-term inertia for authoritative period and phase.
+- [x] Make recovery entry relatively quick but authoritative promotion/demotion slow, validator-backed, and branch-aware.
+- [x] Export additive candidate-versus-authoritative diagnostics through the Go protocol and Python payload shaping so the UI can distinguish tentative from trusted state.
+- [x] Add focused Go/backend tests for stable authoritative period damping, weak-phase period freeze, wrong-branch non-promotion, recovery-then-slow-settlement, and no rapid state flapping.
+- [x] Run verification and record exact commands/results in the review section.
+
+### Review
+- Root cause confirmed:
+  - `radar-core/iid/multisync.go` still computed a fast local period/alignment estimate and then published it directly into `PeriodS`, `PhaseOffsetDeg`, and `AnchorICAO` in the same solver pass.
+  - The existing `TrustedBasePeriodS` only damped the clamp reference. It did not create a separate slow authoritative state, so the published sync still behaved like a short-horizon tracker.
+  - Anchor selection and recovery authority had hysteresis, but absolute phase/period promotion still lacked a validator-backed long-term settlement path.
+- Implemented:
+  - The Go solver now carries explicit candidate and authoritative state for period, phase, and anchor. The fast layer updates candidate state every run; the published state prefers the slow authoritative state when it exists.
+  - Added validator-backed phase scoring using branch ambiguity, selected-anchor circular dispersion, and independent validator ICAO agreement/disagreement counts. Weak or ambiguous phase validation freezes authoritative period updates.
+  - Authoritative period and phase now update with explicit low gains and capped per-update drift, and only after sustained candidate promotion streaks. Recovery can still move candidate state quickly, but authoritative settlement remains slow.
+  - Added additive diagnostics for candidate versus authoritative state, promotion streaks, update gains, frozen-period state, branch ambiguity, circular dispersion, validator counts, and candidate/authoritative modes.
+  - Exported those fields through `radar-core/protocol/messages.go`, `radar-core/cmd/radar-core/main.go`, and `backend/radar/sweep.py`.
+- Audited files with no direct code change needed:
+  - `backend/radar/api.py` already forwards the backend snapshot/debug payloads built in `backend/radar/sweep.py`.
+  - `backend/radar_core/client.py` continues to pass through additive protocol fields without shape-specific changes.
+- Verification:
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid -run 'TestMultiSyncSolver_(AuthoritativePeriodHasStrongInertia|WeakPhaseFreezesAuthoritativePeriod|WrongPhaseBranchNotPromotedQuickly|ValidatorBackedPromotionInitializesAuthoritativeState|RecoveryThenSlowSettlement|SelectAnchorKeepsCurrentOnSmallScoreDelta|SelectAnchorSwitchesWhenChallengerMateriallyBetter|UsesDominantPriorDuringRecovery|AuthorityModeHysteresis)|TestEvalCandidatePeriod_PreservesAnchorCandidates' -count=1` → passed
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid ./cmd/radar-core ./protocol -count=1` → passed
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -q -k 'update_go_multi_sync_state_overrides_python_multi_aircraft_burst or go_multi_sync_mode_diagnostics_report_dominant_recovery_fields'` → `2 passed, 87 deselected`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_radar_core_client.py -q` → `147 passed`
+
 ## 2026-04-23 Burst Sync Panel Stable Ordering
 
 - [x] Inspect the current frontend ordering of anchor candidates and implied-offset rows and confirm why they jump around.

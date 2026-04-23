@@ -1048,6 +1048,193 @@ func TestMultiSyncSolver_SelectAnchorSwitchesWhenChallengerMateriallyBetter(t *t
 	}
 }
 
+func TestMultiSyncSolver_AuthoritativePeriodHasStrongInertia(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	ms.AuthoritativePresent = true
+	ms.AuthoritativePeriodS = 4.0
+	ms.AuthoritativePhaseOffsetDeg = 45.0
+	ms.AuthoritativePhaseEpochUS = 0.0
+	ms.CandidatePromotionStreak = candidatePromotionMinStreak
+
+	validation := syncValidationSummary{
+		score:              0.92,
+		branchAmbiguity:    0.2,
+		circularDispersion: 4.0,
+		validatorAgreement: 3,
+		strong:             true,
+	}
+	for i := 0; i < 20; i++ {
+		candidatePeriod := 4.002
+		if i%2 == 1 {
+			candidatePeriod = 3.998
+		}
+		ms.updateAuthoritativeState(syncStateEstimate{
+			present:   true,
+			periodS:   candidatePeriod,
+			epochUS:   float64(i) * 1e6,
+			offsetDeg: 45.0,
+		}, validation, false, float64(i+1))
+	}
+	if math.Abs(ms.AuthoritativePeriodS-4.0) > 0.0001 {
+		t.Fatalf("expected authoritative period to remain nearly fixed, got %.6f", ms.AuthoritativePeriodS)
+	}
+	if ms.LastAuthoritativePeriodGain <= 0 {
+		t.Fatalf("expected non-zero period gain under strong validation, got %.6f", ms.LastAuthoritativePeriodGain)
+	}
+}
+
+func TestMultiSyncSolver_WeakPhaseFreezesAuthoritativePeriod(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	ms.AuthoritativePresent = true
+	ms.AuthoritativePeriodS = 4.0
+	ms.AuthoritativePhaseOffsetDeg = 45.0
+	ms.AuthoritativePhaseEpochUS = 0.0
+	ms.AuthoritativeAnchorICAO = nil
+	ms.CandidatePromotionStreak = 0
+
+	ms.updateAuthoritativeState(syncStateEstimate{
+		present:   true,
+		periodS:   4.2,
+		epochUS:   1e6,
+		offsetDeg: 210.0,
+	}, syncValidationSummary{
+		score:              0.2,
+		branchAmbiguity:    0.95,
+		circularDispersion: 40.0,
+		validatorAgreement: 0,
+		validatorDisagree:  2,
+		weak:               true,
+	}, false, 10.0)
+
+	if ms.AuthoritativePeriodS != 4.0 {
+		t.Fatalf("expected weak phase validation to freeze authoritative period, got %.6f", ms.AuthoritativePeriodS)
+	}
+	if !ms.LastPeriodFrozenDueToPhaseValidation {
+		t.Fatal("expected weak phase validation to mark period frozen")
+	}
+	if ms.LastAuthoritativePeriodGain != 0 {
+		t.Fatalf("expected zero authoritative period gain under weak validation, got %.6f", ms.LastAuthoritativePeriodGain)
+	}
+}
+
+func TestMultiSyncSolver_WrongPhaseBranchNotPromotedQuickly(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	authAnchor := uint32(0xABC001)
+	ms.AuthoritativePresent = true
+	ms.AuthoritativePeriodS = 4.0
+	ms.AuthoritativePhaseOffsetDeg = 30.0
+	ms.AuthoritativePhaseEpochUS = 0.0
+	ms.AuthoritativeAnchorICAO = &authAnchor
+	ms.CandidatePromotionStreak = candidatePromotionMinStreak
+
+	candidateAnchor := uint32(0xABC002)
+	ms.updateAuthoritativeState(syncStateEstimate{
+		present:     true,
+		periodS:     4.0,
+		epochUS:     1e6,
+		offsetDeg:   210.0,
+		anchorICAO:  &candidateAnchor,
+		anchorScore: 0.8,
+		anchorPhase: 210.0,
+	}, syncValidationSummary{
+		score:              0.75,
+		branchAmbiguity:    0.96,
+		circularDispersion: 8.0,
+		validatorAgreement: 2,
+		weak:               false,
+	}, false, 20.0)
+
+	if math.Abs(circularDiff(ms.AuthoritativePhaseOffsetDeg, 30.0)) > 1e-6 {
+		t.Fatalf("expected authoritative phase branch to hold, got %.2f", ms.AuthoritativePhaseOffsetDeg)
+	}
+	if ms.AuthoritativeAnchorICAO == nil || *ms.AuthoritativeAnchorICAO != authAnchor {
+		t.Fatalf("expected authoritative anchor to remain %06X, got %#v", authAnchor, ms.AuthoritativeAnchorICAO)
+	}
+}
+
+func TestMultiSyncSolver_ValidatorBackedPromotionInitializesAuthoritativeState(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	ms.CandidatePromotionStreak = authoritativeInitPromotionStreak
+	anchor := uint32(0xABC010)
+
+	ms.updateAuthoritativeState(syncStateEstimate{
+		present:     true,
+		periodS:     4.0,
+		epochUS:     2e6,
+		offsetDeg:   55.0,
+		anchorICAO:  &anchor,
+		anchorScore: 0.9,
+		anchorPhase: 55.0,
+	}, syncValidationSummary{
+		score:              0.9,
+		branchAmbiguity:    0.2,
+		circularDispersion: 3.0,
+		validatorAgreement: 3,
+		strong:             true,
+	}, false, 30.0)
+
+	if !ms.AuthoritativePresent {
+		t.Fatal("expected strong validator-backed candidate to initialize authoritative state")
+	}
+	if ms.AuthoritativeAnchorICAO == nil || *ms.AuthoritativeAnchorICAO != anchor {
+		t.Fatalf("expected authoritative anchor %06X, got %#v", anchor, ms.AuthoritativeAnchorICAO)
+	}
+	if math.Abs(ms.AuthoritativePhaseOffsetDeg-55.0) > 1e-6 {
+		t.Fatalf("expected authoritative phase to initialize from candidate, got %.2f", ms.AuthoritativePhaseOffsetDeg)
+	}
+}
+
+func TestMultiSyncSolver_RecoveryThenSlowSettlement(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	authAnchor := uint32(0xABC111)
+	ms.AuthoritativePresent = true
+	ms.AuthoritativePeriodS = 4.0
+	ms.AuthoritativePhaseOffsetDeg = 40.0
+	ms.AuthoritativePhaseEpochUS = 0.0
+	ms.AuthoritativeAnchorICAO = &authAnchor
+	ms.CandidatePromotionStreak = candidatePromotionMinStreak
+
+	validation := syncValidationSummary{
+		score:              0.9,
+		branchAmbiguity:    0.2,
+		circularDispersion: 4.0,
+		validatorAgreement: 3,
+		strong:             true,
+	}
+	candidateAnchor := uint32(0xABC222)
+	candidate := syncStateEstimate{
+		present:     true,
+		periodS:     4.05,
+		epochUS:     5e6,
+		offsetDeg:   100.0,
+		anchorICAO:  &candidateAnchor,
+		anchorScore: 0.8,
+		anchorPhase: 100.0,
+	}
+
+	ms.updateAuthoritativeState(candidate, validation, true, 40.0)
+	if math.Abs(ms.AuthoritativePeriodS-4.0) > 1e-9 {
+		t.Fatalf("expected recovery to hold authoritative period, got %.6f", ms.AuthoritativePeriodS)
+	}
+	if math.Abs(circularDiff(ms.AuthoritativePhaseOffsetDeg, 40.0)) > 1e-6 {
+		t.Fatalf("expected recovery to hold authoritative phase, got %.2f", ms.AuthoritativePhaseOffsetDeg)
+	}
+
+	for i := 0; i < 6; i++ {
+		ms.CandidatePromotionStreak = candidatePromotionMinStreak
+		ms.updateAuthoritativeState(candidate, validation, false, 41.0+float64(i))
+	}
+	if math.Abs(ms.AuthoritativePeriodS-4.0) < 1e-6 {
+		t.Fatal("expected authoritative period to begin moving after sustained non-recovery validation")
+	}
+	if math.Abs(ms.AuthoritativePeriodS-4.05) < 0.001 {
+		t.Fatalf("expected authoritative period to settle slowly, got %.6f", ms.AuthoritativePeriodS)
+	}
+	if math.Abs(circularDiff(ms.AuthoritativePhaseOffsetDeg, 100.0)) < 20.0 {
+		t.Fatalf("expected authoritative phase to move cautiously, got %.2f", ms.AuthoritativePhaseOffsetDeg)
+	}
+}
+
 func TestMultiSyncSolver_ICAOQualityDownweights(t *testing.T) {
 	ms := NewMultiSyncSolver(1)
 	// Mark one ICAO as noisy.
