@@ -714,14 +714,29 @@ def test_update_go_burst_fired_tracks_compact_vs_refined_sync_semantics():
     track = state._go_track_observations[-1]
     evidence = state._go_evidence_events[-1]
 
-    assert track["sync_eligible"] is True
+    assert track["sync_eligible"] is False
     assert track["compact_sync_eligible"] is True
     assert track["refined_sync_present"] is True
     assert track["refined_sync_usable"] is False
-    assert evidence["sync_eligible"] is True
+    assert evidence["sync_eligible"] is False
     assert evidence["compact_sync_eligible"] is True
     assert evidence["refined_sync_present"] is True
     assert evidence["refined_sync_usable"] is False
+
+
+def test_go_observation_normaliser_keeps_legacy_compact_only_payloads_compatible():
+    entry = RadarState._normalise_go_track_observation({
+        "iid": 7,
+        "icao": int("AAAAAA", 16),
+        "arrival_us": 4_000_000.0,
+        "wall_ts": 1_000.0,
+        "sync_eligible": True,
+    })
+
+    assert entry["compact_sync_eligible"] is True
+    assert entry["refined_sync_present"] is False
+    assert entry["refined_sync_usable"] is False
+    assert entry["sync_eligible"] is True
 
 
 def test_live_sync_observation_buffers_prune_by_age_with_high_count_caps(monkeypatch):

@@ -93,9 +93,9 @@ type BurstFired struct {
 	RangeNM            *float32 `codec:"rn"`
 	PosAgeS            *float32 `codec:"pa"`
 	DominantFamily     bool     `codec:"df"`
-	// SyncEligible is the legacy compact/bootstrap sync-admission bit. It aliases
-	// CompactSyncEligible for backward compatibility and does not imply refined
-	// multi-aircraft sync usability.
+	// SyncEligible reports whether authoritative refined sync is usable for this
+	// burst. Compact/bootstrap admission is exported separately via
+	// CompactSyncEligible.
 	SyncEligible        bool `codec:"se"`
 	CompactSyncEligible bool `codec:"ce"`
 	RefinedSyncPresent  bool `codec:"rp"`

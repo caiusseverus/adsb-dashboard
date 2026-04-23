@@ -647,6 +647,23 @@ func TestMultiSyncSolver_PeriodBaseReflectsSameRunTrustPromotion(t *testing.T) {
 	}
 }
 
+func TestMultiSyncSolver_TrustedBaseEMAUsesPublishedFinalPeriod(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	ms.TrustedBasePeriodS = 4.0000
+	ms.TrustUpdateStreak = trustMinStreak - 1
+
+	finalPeriodS := 4.2000
+	ms.applyTrustedBaseUpdate(finalPeriodS, true, false)
+
+	expected := 0.98*4.0000 + 0.02*finalPeriodS
+	if math.Abs(ms.TrustedBasePeriodS-expected) > 1e-9 {
+		t.Fatalf("TrustedBasePeriodS %.9f should EMA toward published final period %.9f, want %.9f", ms.TrustedBasePeriodS, finalPeriodS, expected)
+	}
+	if ms.TrustUpdateStreak != trustMinStreak {
+		t.Fatalf("expected trust streak to advance to %d, got %d", trustMinStreak, ms.TrustUpdateStreak)
+	}
+}
+
 // TestMultiSyncSolver_TrustResetOnReacquire verifies that TrustUpdateStreak is reset
 // when wrong-period suspicion is raised, preventing premature trust promotion.
 //

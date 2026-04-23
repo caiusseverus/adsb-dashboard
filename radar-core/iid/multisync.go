@@ -615,8 +615,10 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 	}
 
 	// Trust promotion: once the solver has accumulated enough consistent multi-aircraft
-	// evidence, promote the current refined period to TrustedBasePeriodS.  From that
+	// evidence, promote the current published period to TrustedBasePeriodS.  From that
 	// point the clamp tightens against the trusted base rather than the bootstrap seed.
+	// This must use finalPeriodS, not the pre-publication refinedPeriodS, so the trusted
+	// base never drifts toward a family that was not actually published this run.
 	trustedEnough := !majorityRejected &&
 		len(recent) > 0 &&
 		float64(nRejected)/float64(len(recent)) < trustMaxRejFrac &&
@@ -624,24 +626,7 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 		len(fitICAOs) >= trustMinICAOs &&
 		detrended <= trustMaxResidualDeg
 
-	if ms.PeriodReacquireActive || wrongPeriodSuspect {
-		ms.TrustUpdateStreak = 0
-	} else if trustedEnough {
-		ms.TrustUpdateStreak++
-		if ms.TrustUpdateStreak >= trustMinStreak {
-			if ms.TrustedBasePeriodS <= 0 {
-				// First promotion: adopt the refined period as the trusted base.
-				ms.TrustedBasePeriodS = refinedPeriodS
-			} else {
-				// Slow EMA keeps the trusted base tracking a genuinely stable family
-				// without snapping to transient fluctuations.
-				ms.TrustedBasePeriodS = 0.98*ms.TrustedBasePeriodS + 0.02*refinedPeriodS
-			}
-		}
-	} else {
-		// The field is explicitly consecutive: any update that misses the trust gate resets it.
-		ms.TrustUpdateStreak = 0
-	}
+	ms.applyTrustedBaseUpdate(finalPeriodS, trustedEnough, wrongPeriodSuspect)
 
 	if ms.TrustedBasePeriodS > 0 {
 		basePeriodS = ms.TrustedBasePeriodS
@@ -696,6 +681,32 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 		ms.AnchorPhaseDeg = finalAlignment.anchorPhaseDeg
 		ms.AnchorScore = finalAlignment.anchorScore
 	}
+}
+
+func (ms *MultiSyncSolver) applyTrustedBaseUpdate(finalPeriodS float64, trustedEnough, wrongPeriodSuspect bool) {
+	if ms.PeriodReacquireActive || wrongPeriodSuspect {
+		ms.TrustUpdateStreak = 0
+		return
+	}
+	if !trustedEnough {
+		// The field is explicitly consecutive: any update that misses the trust gate resets it.
+		ms.TrustUpdateStreak = 0
+		return
+	}
+
+	ms.TrustUpdateStreak++
+	if ms.TrustUpdateStreak < trustMinStreak {
+		return
+	}
+	if ms.TrustedBasePeriodS <= 0 {
+		// First promotion: adopt the published period as the trusted base.
+		ms.TrustedBasePeriodS = finalPeriodS
+		return
+	}
+
+	// Slow EMA keeps the trusted base tracking a genuinely stable family
+	// without snapping to transient fluctuations.
+	ms.TrustedBasePeriodS = 0.98*ms.TrustedBasePeriodS + 0.02*finalPeriodS
 }
 
 func (ms *MultiSyncSolver) buildAlignmentForPeriod(

@@ -131,7 +131,7 @@ func TestBurstFiredRoundTrip(t *testing.T) {
 		RangeNM:             pf32(42.1),
 		PosAgeS:             pf32(1.2),
 		DominantFamily:      true,
-		SyncEligible:        true,
+		SyncEligible:        false,
 		CompactSyncEligible: true,
 		RefinedSyncPresent:  true,
 		RefinedSyncUsable:   false,
@@ -140,7 +140,7 @@ func TestBurstFiredRoundTrip(t *testing.T) {
 	if got.CentroidUS != orig.CentroidUS {
 		t.Errorf("CentroidUS: got %v want %v", got.CentroidUS, orig.CentroidUS)
 	}
-	if !got.DominantFamily || !got.SyncEligible || !got.CompactSyncEligible || !got.RefinedSyncPresent || got.RefinedSyncUsable {
+	if !got.DominantFamily || got.SyncEligible || !got.CompactSyncEligible || !got.RefinedSyncPresent || got.RefinedSyncUsable {
 		t.Errorf(
 			"bool fields lost: DominantFamily=%v SyncEligible=%v CompactSyncEligible=%v RefinedSyncPresent=%v RefinedSyncUsable=%v",
 			got.DominantFamily, got.SyncEligible, got.CompactSyncEligible, got.RefinedSyncPresent, got.RefinedSyncUsable,

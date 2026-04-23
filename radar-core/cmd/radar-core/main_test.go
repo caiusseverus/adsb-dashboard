@@ -36,8 +36,11 @@ func TestExportSyncEligibilitySeparatesCompactAndRefinedSemantics(t *testing.T) 
 	}
 
 	track := tracks[0]
-	if !track.SyncEligible || !track.CompactSyncEligible {
-		t.Fatalf("expected compact/bootstrap sync eligibility to be exported on track, got sync_eligible=%v compact=%v", track.SyncEligible, track.CompactSyncEligible)
+	if track.SyncEligible {
+		t.Fatalf("expected sync_eligible to reflect authoritative refined usability, got %v", track.SyncEligible)
+	}
+	if !track.CompactSyncEligible {
+		t.Fatalf("expected compact/bootstrap sync eligibility to remain explicit on track, got compact=%v", track.CompactSyncEligible)
 	}
 	if !track.RefinedSyncPresent {
 		t.Fatal("expected refined sync presence to be exported on track")
@@ -47,8 +50,11 @@ func TestExportSyncEligibilitySeparatesCompactAndRefinedSemantics(t *testing.T) 
 	}
 
 	ev := evidence[0]
-	if !ev.SyncEligible || !ev.CompactSyncEligible {
-		t.Fatalf("expected compact/bootstrap sync eligibility to be exported on evidence, got sync_eligible=%v compact=%v", ev.SyncEligible, ev.CompactSyncEligible)
+	if ev.SyncEligible {
+		t.Fatalf("expected sync_eligible to reflect authoritative refined usability on evidence, got %v", ev.SyncEligible)
+	}
+	if !ev.CompactSyncEligible {
+		t.Fatalf("expected compact/bootstrap sync eligibility to remain explicit on evidence, got compact=%v", ev.CompactSyncEligible)
 	}
 	if !ev.RefinedSyncPresent {
 		t.Fatal("expected refined sync presence to be exported on evidence")

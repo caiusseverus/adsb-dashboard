@@ -84,9 +84,9 @@ type EvidenceEvent struct {
 	TruthLon           *float64 `codec:"truth_lon" json:"truth_lon"`
 	PositionAgeS       *float32 `codec:"position_age_s" json:"position_age_s"`
 	DominantFamily     bool     `codec:"dominant_family" json:"dominant_family"`
-	// SyncEligible is the legacy compact/bootstrap sync-admission bit. It aliases
-	// CompactSyncEligible for backward compatibility and does not mean refined
-	// multi-aircraft sync is already usable.
+	// SyncEligible reports whether authoritative refined sync is usable for this
+	// observation. Compact/bootstrap admission is exported separately via
+	// CompactSyncEligible.
 	SyncEligible          bool    `codec:"sync_eligible" json:"sync_eligible"`
 	CompactSyncEligible   bool    `codec:"compact_sync_eligible" json:"compact_sync_eligible"`
 	RefinedSyncPresent    bool    `codec:"refined_sync_present" json:"refined_sync_present"`
@@ -106,9 +106,9 @@ type TrackObservation struct {
 	PositionAgeS          *float32 `codec:"position_age_s" json:"position_age_s"`
 	AssociationConfidence float32  `codec:"association_confidence" json:"association_confidence"`
 	DominantFamily        bool     `codec:"dominant_family" json:"dominant_family"`
-	// SyncEligible is the legacy compact/bootstrap sync-admission bit. It aliases
-	// CompactSyncEligible for backward compatibility and does not mean refined
-	// multi-aircraft sync is already usable.
+	// SyncEligible reports whether authoritative refined sync is usable for this
+	// observation. Compact/bootstrap admission is exported separately via
+	// CompactSyncEligible.
 	SyncEligible        bool `codec:"sync_eligible" json:"sync_eligible"`
 	CompactSyncEligible bool `codec:"compact_sync_eligible" json:"compact_sync_eligible"`
 	RefinedSyncPresent  bool `codec:"refined_sync_present" json:"refined_sync_present"`

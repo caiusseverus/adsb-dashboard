@@ -3872,10 +3872,52 @@ class RadarState:
         }
 
     @staticmethod
+    def _normalise_go_sync_eligibility(entry: dict) -> tuple[bool, bool, bool, bool]:
+        compact_value = entry.get("compact_sync_eligible")
+        refined_present_value = entry.get("refined_sync_present")
+        refined_usable_value = entry.get("refined_sync_usable")
+        sync_value = entry.get("sync_eligible")
+
+        legacy_compact_only = (
+            compact_value is None
+            and refined_present_value is None
+            and refined_usable_value is None
+        )
+
+        compact_sync_eligible = bool(
+            compact_value if compact_value is not None else (
+                sync_value if legacy_compact_only else False
+            )
+        )
+        refined_sync_present = bool(refined_present_value)
+        refined_sync_usable = bool(
+            refined_usable_value if refined_usable_value is not None else (
+                sync_value if not legacy_compact_only else False
+            )
+        )
+        sync_eligible = bool(
+            refined_usable_value if refined_usable_value is not None else (
+                sync_value if sync_value is not None else refined_sync_usable
+            )
+        )
+        return (
+            compact_sync_eligible,
+            refined_sync_present,
+            refined_sync_usable,
+            sync_eligible,
+        )
+
+    @staticmethod
     def _normalise_go_track_observation(entry: dict) -> dict | None:
         if not isinstance(entry, dict):
             return None
         try:
+            (
+                compact_sync_eligible,
+                refined_sync_present,
+                refined_sync_usable,
+                sync_eligible,
+            ) = RadarState._normalise_go_sync_eligibility(entry)
             return {
                 "iid": int(entry["iid"]),
                 "icao": f"{int(entry['icao']):06X}",
@@ -3899,15 +3941,10 @@ class RadarState:
                 ),
                 "association_confidence": float(entry.get("association_confidence") or 0.0),
                 "dominant_family": bool(entry.get("dominant_family")),
-                "compact_sync_eligible": bool(
-                    entry.get("compact_sync_eligible", entry.get("sync_eligible"))
-                ),
-                "refined_sync_present": bool(entry.get("refined_sync_present")),
-                "refined_sync_usable": bool(entry.get("refined_sync_usable")),
-                # Legacy alias retained for older callers that still read sync_eligible.
-                "sync_eligible": bool(
-                    entry.get("compact_sync_eligible", entry.get("sync_eligible"))
-                ),
+                "compact_sync_eligible": compact_sync_eligible,
+                "refined_sync_present": refined_sync_present,
+                "refined_sync_usable": refined_sync_usable,
+                "sync_eligible": sync_eligible,
             }
         except Exception:
             return None
@@ -4031,6 +4068,12 @@ class RadarState:
         if not isinstance(entry, dict):
             return None
         try:
+            (
+                compact_sync_eligible,
+                refined_sync_present,
+                refined_sync_usable,
+                sync_eligible,
+            ) = RadarState._normalise_go_sync_eligibility(entry)
             return {
                 "kind": str(entry.get("kind") or "burst_fired"),
                 "iid": int(entry["iid"]),
@@ -4092,20 +4135,19 @@ class RadarState:
                 ),
                 "association_confidence": float(entry.get("association_confidence") or 0.0),
                 "dominant_family": bool(entry.get("dominant_family")),
-                "compact_sync_eligible": bool(
-                    entry.get("compact_sync_eligible", entry.get("sync_eligible"))
-                ),
-                "refined_sync_present": bool(entry.get("refined_sync_present")),
-                "refined_sync_usable": bool(entry.get("refined_sync_usable")),
-                # Legacy alias retained for older callers that still read sync_eligible.
-                "sync_eligible": bool(
-                    entry.get("compact_sync_eligible", entry.get("sync_eligible"))
-                ),
+                "compact_sync_eligible": compact_sync_eligible,
+                "refined_sync_present": refined_sync_present,
+                "refined_sync_usable": refined_sync_usable,
+                "sync_eligible": sync_eligible,
             }
         except Exception:
             return None
 
     def update_go_burst_fired(self, burst_dict: dict) -> None:
+        compact_sync_eligible = burst_dict.get("ce")
+        refined_sync_present = burst_dict.get("rp")
+        refined_sync_usable = burst_dict.get("ru")
+        sync_eligible = burst_dict.get("ru", burst_dict.get("se"))
         entry = self._normalise_go_track_observation({
             "iid": burst_dict.get("i"),
             "icao": burst_dict.get("c"),
@@ -4117,10 +4159,10 @@ class RadarState:
             "position_age_s": burst_dict.get("pa"),
             "association_confidence": 1.0 if burst_dict.get("la") is not None and burst_dict.get("lo") is not None else 0.0,
             "dominant_family": burst_dict.get("df"),
-            "compact_sync_eligible": burst_dict.get("ce", burst_dict.get("se")),
-            "refined_sync_present": burst_dict.get("rp"),
-            "refined_sync_usable": burst_dict.get("ru"),
-            "sync_eligible": burst_dict.get("ce", burst_dict.get("se")),
+            "compact_sync_eligible": compact_sync_eligible,
+            "refined_sync_present": refined_sync_present,
+            "refined_sync_usable": refined_sync_usable,
+            "sync_eligible": sync_eligible,
         })
         if entry is None:
             return
@@ -4146,10 +4188,10 @@ class RadarState:
             "position_age_s": burst_dict.get("pa"),
             "association_confidence": entry["association_confidence"],
             "dominant_family": burst_dict.get("df"),
-            "compact_sync_eligible": burst_dict.get("ce", burst_dict.get("se")),
-            "refined_sync_present": burst_dict.get("rp"),
-            "refined_sync_usable": burst_dict.get("ru"),
-            "sync_eligible": burst_dict.get("ce", burst_dict.get("se")),
+            "compact_sync_eligible": compact_sync_eligible,
+            "refined_sync_present": refined_sync_present,
+            "refined_sync_usable": refined_sync_usable,
+            "sync_eligible": sync_eligible,
         })
         sync_update_iid = None
         sync_update_period_s = None
