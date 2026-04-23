@@ -137,12 +137,26 @@ type candidateEvalResult struct {
 	anchorPhaseDeg     float64
 }
 
+type AnchorCandidateSnapshot struct {
+	ICAO                uint32
+	Score               float64
+	SpreadDeg           float64
+	ObsCount            int
+	FitEligibleCount    int
+	FitEligibleFraction float64
+	Status              string
+	RejectReasons       []string
+}
+
 type publishedAlignment struct {
-	epochUS        float64
-	offsetDeg      float64
-	anchorICAO     *uint32
-	anchorScore    float64
-	anchorPhaseDeg float64
+	epochUS                 float64
+	offsetDeg               float64
+	anchorICAO              *uint32
+	anchorScore             float64
+	anchorPhaseDeg          float64
+	anchorCandidateCount    int
+	anchorNoCandidateReason string
+	anchorCandidates        []AnchorCandidateSnapshot
 }
 
 // MultiSyncSnapshot is a point-in-time view for protocol emission.
@@ -172,6 +186,14 @@ type MultiSyncSnapshot struct {
 	WrongPeriodSuspect       bool    // true if wrong-period suspicion was raised on the last run
 	ReacquireCandidatePeriod float64 // period chosen by candidate search during reacquire (0 if not active)
 	ReacquireCandidateScore  float64 // score of that candidate
+	FitTotalObservations     int
+	FitEligibleObservations  int
+	FitRejectedObservations  int
+	FitContributingICAOs     int
+	FitRejectReasons         map[string]uint64
+	AnchorCandidateCount     int
+	AnchorNoCandidateReason  string
+	AnchorCandidates         []AnchorCandidateSnapshot
 }
 
 // MultiSyncSolver holds per-IID multi-aircraft sync refinement state.
@@ -227,6 +249,14 @@ type MultiSyncSolver struct {
 	LastWrongPeriodSuspect   bool    // true if wrong-period suspicion was raised on the last run
 	LastReacquireCandidateP  float64 // period chosen by candidate search during reacquire (0 if not active)
 	LastReacquireCandidateSc float64 // score of that candidate period
+	LastFitTotalObs          int
+	LastFitEligibleObs       int
+	LastFitRejectedObs       int
+	LastFitContributingICAOs int
+	LastFitRejectReasons     map[string]uint64
+	LastAnchorCandidateCount int
+	LastAnchorNoCandidate    string
+	LastAnchorCandidates     []AnchorCandidateSnapshot
 
 	// Throttle.
 	lastRunTS float64
@@ -313,6 +343,14 @@ func (ms *MultiSyncSolver) Reset() {
 	ms.LastWrongPeriodSuspect = false
 	ms.LastReacquireCandidateP = 0
 	ms.LastReacquireCandidateSc = 0
+	ms.LastFitTotalObs = 0
+	ms.LastFitEligibleObs = 0
+	ms.LastFitRejectedObs = 0
+	ms.LastFitContributingICAOs = 0
+	ms.LastFitRejectReasons = nil
+	ms.LastAnchorCandidateCount = 0
+	ms.LastAnchorNoCandidate = ""
+	ms.LastAnchorCandidates = nil
 }
 
 // Snapshot returns a copy of the published state for protocol emission.
@@ -342,7 +380,19 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 		WrongPeriodSuspect:       ms.LastWrongPeriodSuspect,
 		ReacquireCandidatePeriod: ms.LastReacquireCandidateP,
 		ReacquireCandidateScore:  ms.LastReacquireCandidateSc,
+		FitTotalObservations:     ms.LastFitTotalObs,
+		FitEligibleObservations:  ms.LastFitEligibleObs,
+		FitRejectedObservations:  ms.LastFitRejectedObs,
+		FitContributingICAOs:     ms.LastFitContributingICAOs,
+		FitRejectReasons:         make(map[string]uint64, len(ms.LastFitRejectReasons)),
+		AnchorCandidateCount:     ms.LastAnchorCandidateCount,
+		AnchorNoCandidateReason:  ms.LastAnchorNoCandidate,
+		AnchorCandidates:         make([]AnchorCandidateSnapshot, len(ms.LastAnchorCandidates)),
 	}
+	for k, v := range ms.LastFitRejectReasons {
+		snap.FitRejectReasons[k] = v
+	}
+	copy(snap.AnchorCandidates, ms.LastAnchorCandidates)
 	if ms.AnchorICAO != nil {
 		v := *ms.AnchorICAO
 		snap.AnchorICAO = &v
@@ -412,6 +462,8 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 
 	// Score each observation.
 	scored := make([]scoredObs, 0, len(recent))
+	fitRejectReasons := make(map[string]uint64)
+	fitEligibleObs := 0
 	for _, o := range recent {
 		effectiveUS := msPropCorrectedUS(float64(o.CentroidUS), float64(o.RangeNM))
 		predicted := msPredictBearing(seedEpochUS, seedOffsetDeg, periodUS, effectiveUS)
@@ -444,6 +496,11 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 			fitEligible:     fitRejectReason == "",
 			fitRejectReason: fitRejectReason,
 		})
+		if fitRejectReason == "" {
+			fitEligibleObs++
+		} else {
+			fitRejectReasons[fitRejectReason]++
+		}
 	}
 
 	// Update ICAO quality memory from fit-eligible observations.
@@ -475,6 +532,14 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 		}
 	}
 	if len(fitPool) == 0 {
+		ms.LastFitTotalObs = len(recent)
+		ms.LastFitEligibleObs = fitEligibleObs
+		ms.LastFitRejectedObs = len(recent) - fitEligibleObs
+		ms.LastFitContributingICAOs = 0
+		ms.LastFitRejectReasons = fitRejectReasons
+		ms.LastAnchorCandidateCount = 0
+		ms.LastAnchorNoCandidate = "no_fit_pool"
+		ms.LastAnchorCandidates = nil
 		ms.Holdover = true
 		ms.Usable = false
 		return
@@ -521,6 +586,11 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 	for _, fe := range fitPool {
 		fitICAOs[fe.icao] = true
 	}
+	ms.LastFitTotalObs = len(recent)
+	ms.LastFitEligibleObs = fitEligibleObs
+	ms.LastFitRejectedObs = len(recent) - fitEligibleObs
+	ms.LastFitContributingICAOs = len(fitICAOs)
+	ms.LastFitRejectReasons = fitRejectReasons
 
 	smoothedSlope := (1.0-slopeEMAAlpha)*ms.SmoothSlopeDegPerS + slopeEMAAlpha*bFit
 	ms.SmoothSlopeDegPerS = smoothedSlope
@@ -639,6 +709,9 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 	if !finalAlignmentReady {
 		finalAlignment = ms.buildAlignmentForPeriod(scored, seedEpochUS, seedOffsetDeg, finalPeriodS)
 	}
+	ms.LastAnchorCandidateCount = finalAlignment.anchorCandidateCount
+	ms.LastAnchorNoCandidate = finalAlignment.anchorNoCandidateReason
+	ms.LastAnchorCandidates = finalAlignment.anchorCandidates
 
 	// Capture per-run clamp diagnostics (after refinePeriod returned them).
 	ms.LastBaseClamped = clampedByBase
@@ -773,7 +846,7 @@ func (ms *MultiSyncSolver) buildAlignmentForPeriod(
 		ws[i] = fe.weight
 	}
 	phaseAdjustDeg, _ := weightedLinearFit(xs, ys, ws)
-	newEpochUS, publishedOffsetDeg, anchorICAO, anchorScore, anchorPhaseDeg := ms.buildPublishedAlignment(
+	alignment := ms.buildPublishedAlignment(
 		scored,
 		seedEpochUS,
 		seedOffsetDeg,
@@ -781,44 +854,39 @@ func (ms *MultiSyncSolver) buildAlignmentForPeriod(
 		phaseAdjustDeg,
 		nInliers,
 	)
-	return publishedAlignment{
-		epochUS:        newEpochUS,
-		offsetDeg:      publishedOffsetDeg,
-		anchorICAO:     anchorICAO,
-		anchorScore:    anchorScore,
-		anchorPhaseDeg: anchorPhaseDeg,
-	}
+	return alignment
 }
 
 func (ms *MultiSyncSolver) buildPublishedAlignment(
 	scored []scoredObs,
 	seedEpochUS, seedOffsetDeg, periodS, phaseAdjustDeg float64,
 	nInliers int,
-) (newEpochUS, publishedOffsetDeg float64, anchorICAO *uint32, anchorScore, anchorPhaseDeg float64) {
+) publishedAlignment {
 	periodUS := periodS * 1e6
 	if periodUS <= 0 {
-		return seedEpochUS, seedOffsetDeg, nil, 0, 0
+		return publishedAlignment{epochUS: seedEpochUS, offsetDeg: seedOffsetDeg}
 	}
 
+	out := publishedAlignment{}
 	// Advance epoch to the newest anchor-eligible observation.
 	for _, se := range scored {
 		if se.baseW > 0 && se.fitRejectReason != "near_wrap_residual" {
-			if se.effectiveUS > newEpochUS {
-				newEpochUS = se.effectiveUS
+			if se.effectiveUS > out.epochUS {
+				out.epochUS = se.effectiveUS
 			}
 		}
 	}
-	if newEpochUS == 0 && len(scored) > 0 {
-		newEpochUS = scored[len(scored)-1].effectiveUS
+	if out.epochUS == 0 && len(scored) > 0 {
+		out.epochUS = scored[len(scored)-1].effectiveUS
 	}
-	if newEpochUS == 0 {
-		newEpochUS = seedEpochUS
+	if out.epochUS == 0 {
+		out.epochUS = seedEpochUS
 	}
 
 	// Conservative phase-correction gain for the fallback branch.
 	nEff := math.Max(float64(nInliers), 1.0)
 	gain := math.Min(multiSyncGainBase+0.01*(nEff-1), multiSyncGainMax)
-	existingAtNew := math.Mod((newEpochUS-seedEpochUS)/periodUS*360.0+seedOffsetDeg, 360.0)
+	existingAtNew := math.Mod((out.epochUS-seedEpochUS)/periodUS*360.0+seedOffsetDeg, 360.0)
 	if existingAtNew < 0 {
 		existingAtNew += 360.0
 	}
@@ -826,10 +894,10 @@ func (ms *MultiSyncSolver) buildPublishedAlignment(
 	if mixedFallback < 0 {
 		mixedFallback += 360.0
 	}
-	publishedOffsetDeg, anchorICAO, anchorScore, anchorPhaseDeg = ms.selectAnchor(
-		scored, newEpochUS, periodUS, mixedFallback,
+	out.offsetDeg, out.anchorICAO, out.anchorScore, out.anchorPhaseDeg, out.anchorCandidateCount, out.anchorNoCandidateReason, out.anchorCandidates = ms.selectAnchor(
+		scored, out.epochUS, periodUS, mixedFallback,
 	)
-	return newEpochUS, publishedOffsetDeg, anchorICAO, anchorScore, anchorPhaseDeg
+	return out
 }
 
 func (ms *MultiSyncSolver) updateICAOQuality(scored []scoredObs) {
@@ -859,16 +927,31 @@ func (ms *MultiSyncSolver) updateICAOQuality(scored []scoredObs) {
 func (ms *MultiSyncSolver) selectAnchor(
 	scored []scoredObs,
 	newEpochUS, periodUS, fallbackOffset float64,
-) (newOffset float64, anchorICAO *uint32, anchorScore, anchorPhaseDeg float64) {
+) (newOffset float64, anchorICAO *uint32, anchorScore, anchorPhaseDeg float64, candidateCount int, noCandidateReason string, candidates []AnchorCandidateSnapshot) {
 	type icaoAnchor struct {
-		icao   uint32
-		sinSum float64
-		cosSum float64
-		nObs   int
-		score  float64
+		icao             uint32
+		sinSum           float64
+		cosSum           float64
+		nObs             int
+		totalObs         int
+		fitEligibleCount int
+		maxBaseW         float64
+		score            float64
+		rejectReasons    map[string]bool
 	}
 	byICAO := make(map[uint32]*icaoAnchor)
 	for _, se := range scored {
+		a := byICAO[se.o.ICAO]
+		if a == nil {
+			a = &icaoAnchor{icao: se.o.ICAO, rejectReasons: make(map[string]bool)}
+			byICAO[se.o.ICAO] = a
+		}
+		a.totalObs++
+		if se.fitEligible {
+			a.fitEligibleCount++
+		} else if se.fitRejectReason != "" {
+			a.rejectReasons[se.fitRejectReason] = true
+		}
 		if se.status == "rejected" || se.baseW <= 0 || se.fitRejectReason == "near_wrap_residual" {
 			continue
 		}
@@ -878,33 +961,82 @@ func (ms *MultiSyncSolver) selectAnchor(
 			implied += 360.0
 		}
 		impliedRad := implied * math.Pi / 180.0
-		icao := se.o.ICAO
-		a := byICAO[icao]
-		if a == nil {
-			q := ms.ICAOQuality[icao]
-			sc := msAnchorScore(q, se.baseW)
-			byICAO[icao] = &icaoAnchor{
-				icao:   icao,
-				sinSum: math.Sin(impliedRad),
-				cosSum: math.Cos(impliedRad),
-				nObs:   1,
-				score:  sc,
-			}
-		} else {
-			a.sinSum += math.Sin(impliedRad)
-			a.cosSum += math.Cos(impliedRad)
-			a.nObs++
+		a.sinSum += math.Sin(impliedRad)
+		a.cosSum += math.Cos(impliedRad)
+		a.nObs++
+		if se.baseW > a.maxBaseW {
+			a.maxBaseW = se.baseW
 		}
 	}
 
 	var best *icaoAnchor
 	for _, a := range byICAO {
-		if best == nil || a.score > best.score {
+		a.score = msAnchorScore(ms.ICAOQuality[a.icao], a.maxBaseW)
+		rejectReasons := make([]string, 0, len(a.rejectReasons)+2)
+		for reason := range a.rejectReasons {
+			rejectReasons = append(rejectReasons, reason)
+		}
+		sort.Strings(rejectReasons)
+		fitFraction := 0.0
+		if a.totalObs > 0 {
+			fitFraction = float64(a.fitEligibleCount) / float64(a.totalObs)
+		}
+		status := "candidate"
+		if a.fitEligibleCount == 0 {
+			status = "rejected"
+			if len(rejectReasons) == 0 {
+				rejectReasons = append(rejectReasons, "no_fit_eligible_observations")
+			}
+		} else if a.nObs == 0 {
+			status = "rejected"
+			rejectReasons = append(rejectReasons, "no_anchor_pool_observations")
+		} else if a.score < 0.1 {
+			status = "rejected"
+			rejectReasons = append(rejectReasons, "anchor_score_below_threshold")
+		}
+		spreadDeg := 0.0
+		if a.nObs > 1 {
+			r := math.Hypot(a.sinSum, a.cosSum) / float64(a.nObs)
+			if r > 0 && r < 1 {
+				spreadDeg = math.Sqrt(-2.0*math.Log(r)) * 180.0 / math.Pi
+			}
+		}
+		candidates = append(candidates, AnchorCandidateSnapshot{
+			ICAO:                a.icao,
+			Score:               a.score,
+			SpreadDeg:           spreadDeg,
+			ObsCount:            a.totalObs,
+			FitEligibleCount:    a.fitEligibleCount,
+			FitEligibleFraction: fitFraction,
+			Status:              status,
+			RejectReasons:       rejectReasons,
+		})
+		if status != "rejected" {
+			candidateCount++
+		}
+		if status != "rejected" && (best == nil || a.score > best.score) {
 			best = a
 		}
 	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Status != candidates[j].Status {
+			return candidates[i].Status == "candidate"
+		}
+		if candidates[i].Score != candidates[j].Score {
+			return candidates[i].Score > candidates[j].Score
+		}
+		if candidates[i].FitEligibleCount != candidates[j].FitEligibleCount {
+			return candidates[i].FitEligibleCount > candidates[j].FitEligibleCount
+		}
+		return candidates[i].ICAO < candidates[j].ICAO
+	})
 	if best == nil || best.score < 0.1 {
-		return fallbackOffset, nil, 0, 0
+		if len(candidates) == 0 {
+			noCandidateReason = "no_scored_aircraft"
+		} else if candidateCount == 0 {
+			noCandidateReason = "no_anchor_candidates"
+		}
+		return fallbackOffset, nil, 0, 0, candidateCount, noCandidateReason, candidates
 	}
 
 	// Circular mean of implied phases.
@@ -912,7 +1044,7 @@ func (ms *MultiSyncSolver) selectAnchor(
 	meanDeg := math.Mod(meanRad*180.0/math.Pi+360.0, 360.0)
 
 	icao := best.icao
-	return meanDeg, &icao, best.score, meanDeg
+	return meanDeg, &icao, best.score, meanDeg, candidateCount, "", candidates
 }
 
 func (ms *MultiSyncSolver) refinePeriod(
@@ -1139,7 +1271,7 @@ func (ms *MultiSyncSolver) evalCandidatePeriod(scored []scoredObs, candidatePeri
 	// Score rewards inlier count and ICAO diversity; penalises high MAD and rejection fraction.
 	score := float64(inliers) * float64(icaoCount) / (1.0 + madDeg/5.0) / (1.0 + rejFrac*3.0)
 
-	newEpochUS, publishedOffsetDeg, anchorICAO, anchorScore, anchorPhaseDeg := ms.buildPublishedAlignment(
+	alignment := ms.buildPublishedAlignment(
 		scored,
 		epochUS,
 		bestOffset,
@@ -1156,11 +1288,11 @@ func (ms *MultiSyncSolver) evalCandidatePeriod(scored []scoredObs, candidatePeri
 		rejFrac:            rejFrac,
 		score:              score,
 		phaseOffsetDeg:     bestOffset,
-		publishedOffsetDeg: publishedOffsetDeg,
-		newEpochUS:         newEpochUS,
-		anchorICAO:         anchorICAO,
-		anchorScore:        anchorScore,
-		anchorPhaseDeg:     anchorPhaseDeg,
+		publishedOffsetDeg: alignment.offsetDeg,
+		newEpochUS:         alignment.epochUS,
+		anchorICAO:         alignment.anchorICAO,
+		anchorScore:        alignment.anchorScore,
+		anchorPhaseDeg:     alignment.anchorPhaseDeg,
 	}
 }
 

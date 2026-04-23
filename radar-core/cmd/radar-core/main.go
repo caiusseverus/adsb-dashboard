@@ -291,6 +291,19 @@ func (e *engine) emitMultiSyncState(s *iid.IIDState) {
 	if !snap.Present {
 		return
 	}
+	candidates := make([]protocol.MultiSyncAnchorCandidate, 0, len(snap.AnchorCandidates))
+	for _, row := range snap.AnchorCandidates {
+		candidates = append(candidates, protocol.MultiSyncAnchorCandidate{
+			ICAO:                row.ICAO,
+			Score:               row.Score,
+			SpreadDeg:           row.SpreadDeg,
+			ObsCount:            uint16(row.ObsCount),
+			FitEligibleCount:    uint16(row.FitEligibleCount),
+			FitEligibleFraction: row.FitEligibleFraction,
+			Status:              row.Status,
+			RejectReasons:       row.RejectReasons,
+		})
+	}
 	msg := &protocol.MultiSyncState{
 		MsgType:               protocol.MsgMultiSyncState,
 		IID:                   s.IID,
@@ -319,6 +332,14 @@ func (e *engine) emitMultiSyncState(s *iid.IIDState) {
 		WrongPeriodSuspect:       snap.WrongPeriodSuspect,
 		ReacquireCandidatePeriod: snap.ReacquireCandidatePeriod,
 		ReacquireCandidateScore:  snap.ReacquireCandidateScore,
+		FitTotalObservations:     uint32(snap.FitTotalObservations),
+		FitEligibleObservations:  uint32(snap.FitEligibleObservations),
+		FitRejectedObservations:  uint32(snap.FitRejectedObservations),
+		FitContributingICAOs:     uint16(snap.FitContributingICAOs),
+		FitRejectReasons:         snap.FitRejectReasons,
+		AnchorCandidateCount:     uint16(snap.AnchorCandidateCount),
+		AnchorNoCandidateReason:  snap.AnchorNoCandidateReason,
+		AnchorCandidates:         candidates,
 	}
 	e.writer.Send(msg)
 }

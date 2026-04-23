@@ -1802,8 +1802,76 @@ const legendDotStyle = {
   display: 'inline-block',
 }
 
-function PhaseAnchorPanel({ syncState, observations, candidates }) {
+function humanizeSyncReason(value) {
+  if (!value) return '—'
+  return String(value).replaceAll('_', ' ')
+}
+
+function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
+  if (!syncState || !modeDiagnostics) return null
+  const compact = modeDiagnostics.compact ?? {}
+  const refined = modeDiagnostics.refined ?? {}
+  return (
+    <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
+        <div>
+          <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Sync Source</div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>
+            {modeDiagnostics.active_mode === 'refined_multi_aircraft'
+              ? 'Residuals are currently driven by the refined multi-aircraft sync state.'
+              : 'Residuals are currently driven by compact sweep-frame sync; abrupt jumps can come from bootstrap reference churn.'}
+          </div>
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: '4px', fontSize: '0.72rem' }}>
+          <span className={styles.metricPill}>Mode <span className={styles.metricValue}>{modeDiagnostics.active_label ?? '—'}</span></span>
+          <span className={styles.metricPill}>Source <span className={styles.metricValue}>{modeDiagnostics.active_source ?? '—'}</span></span>
+          <span className={styles.metricPill}>Refined usable <span className={styles.metricValue}>{refined.usable ? 'yes' : 'no'}</span></span>
+          <span className={styles.metricPill}>Holdover <span className={styles.metricValue}>{syncState.holdover ? 'yes' : 'no'}</span></span>
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '10px' }}>
+        <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '6px 8px' }}>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Compact / bootstrap</div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px' }}>
+            <span className={styles.metricPill}>Ref ICAO <span className={styles.metricValue}>{compact.reference_icao ?? '—'}</span></span>
+            <span className={styles.metricPill}>Prev ref <span className={styles.metricValue}>{compact.last_reference_icao ?? '—'}</span></span>
+            <span className={styles.metricPill}>Ref churn <span className={styles.metricValue}>{compact.reference_changed_recently ? 'recent' : 'stable'}</span></span>
+            <span className={styles.metricPill}>Resets <span className={styles.metricValue}>{compact.sync_reset_count ?? 0}</span></span>
+          </div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', lineHeight: 1.45 }}>
+            {compact.reference_changed_recently ? `Reference changed recently from ${compact.last_reference_icao ?? '—'} to ${compact.reference_icao ?? '—'}. ` : ''}
+            {compact.phase_epoch_changed_recently ? 'Phase epoch changed recently. ' : ''}
+            {compact.last_holdover_transition ? `Last holdover transition: ${humanizeSyncReason(compact.last_holdover_transition)}. ` : ''}
+            {compact.last_sync_reset_reason ? `Last reset: ${humanizeSyncReason(compact.last_sync_reset_reason)}.` : (alignmentStatus?.detail ?? '')}
+          </div>
+        </div>
+
+        <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '6px 8px' }}>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Refined / multi-aircraft</div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px' }}>
+            <span className={styles.metricPill}>Present <span className={styles.metricValue}>{refined.present ? 'yes' : 'no'}</span></span>
+            <span className={styles.metricPill}>Anchor <span className={styles.metricValue}>{refined.anchor_icao ?? '—'}</span></span>
+            <span className={styles.metricPill}>Candidates <span className={styles.metricValue}>{refined.anchor_candidate_count ?? 0}</span></span>
+            <span className={styles.metricPill}>Fit obs <span className={styles.metricValue}>{refined.fit_eligible_observations ?? 0}/{refined.fit_total_observations ?? 0}</span></span>
+            <span className={styles.metricPill}>ICAOs <span className={styles.metricValue}>{refined.fit_contributing_icao_count ?? 0}</span></span>
+          </div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', lineHeight: 1.45 }}>
+            {refined.active
+              ? (refined.no_anchor_reason ? `No refined anchor selected: ${humanizeSyncReason(refined.no_anchor_reason)}.` : 'Refined sync is active.')
+              : `Refined sync is not active: ${humanizeSyncReason(refined.no_anchor_reason)}.`}
+            {refined.admission?.last_reason ? ` Last admission result: ${humanizeSyncReason(refined.admission.last_reason)}${refined.admission.last_icao ? ` (${refined.admission.last_icao})` : ''}.` : ''}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics }) {
   if (!syncState) return null
+  const refined = modeDiagnostics?.refined ?? {}
+  const refinedActive = Boolean(refined.active)
   const anchorIcao = syncState.phase_anchor_icao
   const candidateRows = Array.isArray(candidates) && candidates.length > 0
     ? candidates
@@ -1825,6 +1893,19 @@ function PhaseAnchorPanel({ syncState, observations, candidates }) {
   const tdRight = { textAlign: 'right', padding: '2px 5px', fontFamily: 'SFMono-Regular, Consolas, monospace', borderTop: '1px solid #21262d' }
   const tdLeft = { textAlign: 'left', padding: '2px 5px', borderTop: '1px solid #21262d' }
 
+  if (!refinedActive) {
+    return (
+      <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
+        <div style={{ color: '#c9d1d9', fontWeight: 600, marginBottom: '0.2rem' }}>Phase Anchor</div>
+        <div style={{ color: '#8b949e', fontSize: '0.72rem', lineHeight: 1.45 }}>
+          Refined anchor diagnostics are inactive while the panel is running in compact/bootstrap mode.
+          {' '}
+          {humanizeSyncReason(refined.no_anchor_reason)}
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
@@ -1842,12 +1923,20 @@ function PhaseAnchorPanel({ syncState, observations, candidates }) {
           <span className={styles.metricPill}>Validation <span className={styles.metricValue}>{syncState.phase_validation_status || '—'}</span></span>
           <span className={styles.metricPill}>Agree/reject <span className={styles.metricValue}>{syncState.phase_validation_contributors ?? 0}/{syncState.phase_validation_reject_count ?? 0}</span></span>
           <span className={styles.metricPill}>Median Δ <span className={styles.metricValue}>{fmtNumber(syncState.phase_validation_median_error_deg, 2, '°')}</span></span>
+          <span className={styles.metricPill}>Fit obs <span className={styles.metricValue}>{syncState.fit_eligible_observations ?? 0}/{syncState.fit_total_observations ?? 0}</span></span>
+          <span className={styles.metricPill}>Fit ICAOs <span className={styles.metricValue}>{syncState.fit_contributing_icao_count ?? 0}</span></span>
+          <span className={styles.metricPill}>Candidates <span className={styles.metricValue}>{syncState.phase_anchor_candidate_count ?? candidateRows.length}</span></span>
         </div>
       </div>
 
       {syncState.phase_anchor_replacement_reason && (
         <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '0.35rem' }}>
           Replacement reason <span className={styles.metricValue}>{syncState.phase_anchor_replacement_reason}</span>
+        </div>
+      )}
+      {!anchorIcao && (
+        <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '0.35rem' }}>
+          No anchor selected: <span className={styles.metricValue}>{humanizeSyncReason(syncState.phase_anchor_no_candidate_reason)}</span>
         </div>
       )}
 
@@ -1873,11 +1962,11 @@ function PhaseAnchorPanel({ syncState, observations, candidates }) {
                   <td style={tdRight}>{fmtNumber(row.spread_deg, 2, '°')}</td>
                   <td style={tdRight}>{row.obs_count ?? '—'}</td>
                   <td style={tdRight}>{fmtNumber(Number(row.fit_eligible_fraction) * 100, 0, '%')}</td>
-                  <td style={tdLeft}>{row.status === 'rejected' ? (row.reject_reasons?.join(', ') || 'rejected') : (row.warning_reasons?.length ? `candidate: ${row.warning_reasons.join(', ')}` : (row.status || 'candidate'))}</td>
+                  <td style={tdLeft}>{row.status === 'rejected' ? humanizeSyncReason(row.reject_reasons?.join(', ') || 'rejected') : (row.warning_reasons?.length ? `candidate: ${humanizeSyncReason(row.warning_reasons.join(', '))}` : humanizeSyncReason(row.status || 'candidate'))}</td>
                 </tr>
               ))}
               {candidateRows.length === 0 && (
-                <tr><td colSpan={6} style={{ ...tdLeft, color: '#8b949e' }}>No candidate ranking yet.</td></tr>
+                <tr><td colSpan={6} style={{ ...tdLeft, color: '#8b949e' }}>No candidate ranking yet. {humanizeSyncReason(syncState.phase_anchor_no_candidate_reason)}</td></tr>
               )}
             </tbody>
           </table>
@@ -2033,6 +2122,7 @@ function RotationAlignmentPanel({
   const rotation = syncSnapshot?.rotation ?? null
   const observations = Array.isArray(burstTimeline?.observations) ? burstTimeline.observations : []
   const alignmentStatus = burstTimeline?.alignment_status ?? null
+  const syncModeDiagnostics = burstTimeline?.sync_mode_diagnostics ?? null
   const legacyIcaosRaw = Array.isArray(legacyTimeline?.icaos) ? legacyTimeline.icaos : []
   const syncState = burstTimeline?.sync_state ?? null
   const loading = legacyLoading || streamStatus.mode === 'connecting' || streamStatus.mode === 'reconnecting'
@@ -2317,6 +2407,9 @@ function RotationAlignmentPanel({
             </select>
           </span>
           <span className={styles.metricPill}>
+            Sync mode <span className={styles.metricValue}>{syncModeDiagnostics?.active_label ?? '—'}</span>
+          </span>
+          <span className={styles.metricPill}>
             Status <span className={styles.metricValue}>{rotation?.status ?? '—'}</span>
           </span>
           <span className={styles.metricPill}>
@@ -2404,10 +2497,17 @@ function RotationAlignmentPanel({
         </div>
       </div>
 
+      <SyncModeStatusPanel
+        syncState={syncState}
+        modeDiagnostics={syncModeDiagnostics}
+        alignmentStatus={alignmentStatus}
+      />
+
       <PhaseAnchorPanel
         syncState={syncState}
         observations={filteredObservations}
         candidates={burstTimeline?.phase_anchor_candidates}
+        modeDiagnostics={syncModeDiagnostics}
       />
 
       {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS ? (

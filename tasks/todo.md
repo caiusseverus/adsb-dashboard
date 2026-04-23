@@ -1,3 +1,30 @@
+## 2026-04-23 Burst Sync Mode Clarity And Anchor Diagnostics
+
+- [x] Trace the current burst sync alignment payload path end to end and document what actually drives the chart, anchor list, and existing status fields
+- [x] Extend the Go export path and Python normalisation so compact/bootstrap sync and refined multi-aircraft sync are explicitly distinguishable in live payloads
+- [x] Expose compact reference churn diagnostics, including current reference ICAO, previous reference ICAO, recent change indicators, and recent sync/reset transitions where available
+- [x] Expose refined multi-sync diagnostics, including presence/usability, fit totals, fit-eligible counts, contributing ICAO counts, anchor candidate counts, admission diagnostics, and explicit no-anchor reasons
+- [x] Update the burst sync panel UI so compact/bootstrap mode is clearly labelled, compact churn/reset events are visible, and the anchor section explains why it is empty when refined sync is absent or not admitted
+- [x] Add or update focused tests for the new backend payload fields and compact/refined rendering semantics, run verification, and capture example compact/refined payloads in the review section below
+
+Plan confirmation:
+- The chart will keep using the real backend sync source; the fix is to export and present the source and diagnostics explicitly rather than guessing from chart motion.
+- Hot-path authority remains in Go for compact sync and Go multi-sync. Python will only mirror, normalise, and explain the exported state.
+- Thresholds will not be relaxed speculatively. Candidate/admission diagnostics will be exposed first so any gating issue is evidenced before tuning.
+
+### Review
+- Root cause confirmed:
+  - The burst-sync chart can already be driven from Go-retained evidence while the phase-anchor panel still reads refined-only fields. In practice that let compact/bootstrap `sweep_frame_go` behaviour look like refined-anchor instability whenever refined sync was absent or thin.
+  - Even when Go refined sync was active, Python still routed it through the compact Go diagnostics path, so the mode boundary was not explicit.
+- Implemented:
+  - Go multi-sync payloads now export fit totals, fit-eligible/rejected counts, contributing ICAO count, fit rejection reasons, anchor candidate count, no-candidate reason, and per-candidate rows.
+  - Python now mirrors those refined diagnostics into `LiveSyncState`, tracks compact reference/epoch/reset transitions for Go sweep-frame sync, and exposes a unified `sync_mode_diagnostics` object in the live sync payload.
+  - The Radar burst-sync panel now shows an explicit sync-source status section, compact reference churn/reset diagnostics, and a refined-anchor panel that explains inactivity instead of showing a blank list.
+- Verification:
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid ./cmd/radar-core ./protocol` → passed
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -q` → `86 passed`
+  - `cd frontend && npm run build` → passed
+
 ## 2026-04-23 Final-Period Trust And Eligibility Semantics Fixes
 
 - [x] Inspect the remaining `finalPeriodS` vs `refinedPeriodS` trust-promotion and EMA leak in `radar-core/iid/multisync.go`, plus the current exported eligibility field meanings end to end

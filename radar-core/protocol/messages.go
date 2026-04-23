@@ -276,12 +276,31 @@ type MultiSyncState struct {
 	AnchorScore           float64 `codec:"as"`
 	UpdatedAt             float64 `codec:"ts"`
 	// Bootstrap / trust diagnostics (added for wrong-period escape tracking).
-	BootstrapPeriodS         float64 `codec:"bp"`
-	TrustedBasePeriodS       float64 `codec:"tb"`
-	TrustUpdateStreak        uint16  `codec:"tu"`
-	BaseClamped              bool    `codec:"bc"`
-	BaseClampDiffPPM         float64 `codec:"bd"`
-	WrongPeriodSuspect       bool    `codec:"ws"`
-	ReacquireCandidatePeriod float64 `codec:"rcp"`
-	ReacquireCandidateScore  float64 `codec:"rcs"`
+	BootstrapPeriodS         float64                    `codec:"bp"`
+	TrustedBasePeriodS       float64                    `codec:"tb"`
+	TrustUpdateStreak        uint16                     `codec:"tu"`
+	BaseClamped              bool                       `codec:"bc"`
+	BaseClampDiffPPM         float64                    `codec:"bd"`
+	WrongPeriodSuspect       bool                       `codec:"ws"`
+	ReacquireCandidatePeriod float64                    `codec:"rcp"`
+	ReacquireCandidateScore  float64                    `codec:"rcs"`
+	FitTotalObservations     uint32                     `codec:"ft"`
+	FitEligibleObservations  uint32                     `codec:"fe"`
+	FitRejectedObservations  uint32                     `codec:"fr"`
+	FitContributingICAOs     uint16                     `codec:"fc"`
+	FitRejectReasons         map[string]uint64          `codec:"frr"`
+	AnchorCandidateCount     uint16                     `codec:"ac"`
+	AnchorNoCandidateReason  string                     `codec:"anr"`
+	AnchorCandidates         []MultiSyncAnchorCandidate `codec:"acs"`
+}
+
+type MultiSyncAnchorCandidate struct {
+	ICAO                uint32   `codec:"i"`
+	Score               float64  `codec:"s"`
+	SpreadDeg           float64  `codec:"sp"`
+	ObsCount            uint16   `codec:"o"`
+	FitEligibleCount    uint16   `codec:"f"`
+	FitEligibleFraction float64  `codec:"ff"`
+	Status              string   `codec:"st"`
+	RejectReasons       []string `codec:"rr"`
 }

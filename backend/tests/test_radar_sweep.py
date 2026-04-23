@@ -1540,6 +1540,17 @@ def test_go_sync_snapshot_and_debug_use_compact_diagnostics_path(monkeypatch):
             sync_update_eligible=True,
         )
     ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+    state._compact_sync_debug_by_iid[7] = {
+        "current_reference_icao": "AAAAAA",
+        "last_reference_icao": "BBBBBB",
+        "reference_changed_recently": True,
+        "reference_change_count": 2,
+        "current_phase_epoch_us": 0.0,
+        "last_phase_epoch_us": -500_000.0,
+        "phase_epoch_changed_recently": True,
+        "sync_reset_count": 1,
+        "last_sync_reset_reason": "sync_state_missing",
+    }
 
     snapshot = state.get_live_sync_snapshot(7, window_s=90.0, debug_limit=20)
     debug_payload = state.get_sync_debug_payload(7, window_s=60.0, limit=20)
@@ -1550,6 +1561,10 @@ def test_go_sync_snapshot_and_debug_use_compact_diagnostics_path(monkeypatch):
     assert snapshot["observations"][0]["phase_anchor_contributor"] is False
     assert snapshot["observations"][0]["waveform_applied"] is False
     assert snapshot["retention_diagnostics"]["timeline"]["count"] == 1
+    assert snapshot["sync_mode_diagnostics"]["active_mode"] == "compact_bootstrap"
+    assert snapshot["sync_mode_diagnostics"]["compact"]["reference_icao"] == "AAAAAA"
+    assert snapshot["sync_mode_diagnostics"]["compact"]["last_reference_icao"] == "BBBBBB"
+    assert snapshot["sync_mode_diagnostics"]["compact"]["reference_changed_recently"] is True
 
     assert debug_payload["available"] is True
     assert debug_payload["summary"]["diagnostics_mode"] == "compact_go_sync"
@@ -3219,6 +3234,19 @@ def test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst(monkey
         "pe": 888_000.0, "po": 22.5,
         "jd": 3.0, "re": 4.0, "nu": 10,
         "ho": False, "ra": False, "ts": 2_000.0,
+        "ai": int("AAAAAA", 16),
+        "as": 0.8,
+        "ft": 11,
+        "fe": 8,
+        "fr": 3,
+        "fc": 3,
+        "frr": {"no_adsb_position": 2},
+        "ac": 2,
+        "anr": "no_anchor_candidates",
+        "acs": [
+            {"i": int("AAAAAA", 16), "s": 0.8, "sp": 3.0, "o": 4, "f": 4, "ff": 1.0, "st": "candidate", "rr": []},
+            {"i": int("BBBBBB", 16), "s": 0.0, "sp": 0.0, "o": 3, "f": 0, "ff": 0.0, "st": "rejected", "rr": ["no_fit_eligible_aircraft"]},
+        ],
     })
 
     sync = state.get_live_sync_state(3)
@@ -3226,6 +3254,14 @@ def test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst(monkey
     assert sync.source == "go_multi_aircraft_burst"
     assert sync.phase_epoch_us == pytest.approx(888_000.0)
     assert sync.phase_offset_deg == pytest.approx(22.5)
+    assert sync.phase_anchor_icao == "AAAAAA"
+    assert sync.phase_anchor_candidate_count == 2
+    assert sync.fit_total_observations == 11
+    assert sync.fit_eligible_observations == 8
+    assert sync.fit_contributing_icao_count == 3
+    assert sync.phase_anchor_no_candidate_reason == "no_anchor_candidates"
+    assert sync.phase_anchor_candidates[0]["icao"] == "AAAAAA"
+    assert sync.phase_anchor_candidates[1]["reject_reasons"] == ["no_fit_eligible_aircraft"]
 
 
 def test_reset_iid_clears_go_multi_sync_state():

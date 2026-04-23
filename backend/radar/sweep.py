@@ -283,7 +283,7 @@ def _sync_source_has_rich_python_diagnostics(sync: "LiveSyncState | None") -> bo
 
 
 def _sync_source_is_go_compact(sync: "LiveSyncState | None") -> bool:
-    return bool(sync is not None and getattr(sync, "source", None) in {"sweep_frame_go", "go_multi_aircraft_burst"})
+    return bool(sync is not None and getattr(sync, "source", None) == "sweep_frame_go")
 
 
 def _serialise_waveform_bins(bins: list) -> list[dict]:
@@ -1300,6 +1300,7 @@ class LiveSyncState:
     phase_anchor_since_ts: float | None = None
     phase_anchor_replacement_reason: str | None = None
     phase_anchor_candidate_count: int = 0
+    phase_anchor_no_candidate_reason: str | None = None
     phase_validation_contributors: int = 0
     phase_validation_reject_count: int = 0
     phase_validation_median_error_deg: float | None = None
@@ -2285,6 +2286,7 @@ class RadarState:
         self._go_sync_states_by_iid: dict[int, dict] = {}
         self._go_multi_sync_states_by_iid: dict[int, dict] = {}
         self._go_multi_sync_admission_by_iid: dict[int, dict] = {}
+        self._compact_sync_debug_by_iid: dict[int, dict] = {}
         self._go_iid_state_revision: dict[int, int] = {}
         self._go_track_observations: deque = deque(maxlen=self._GO_TRACK_OBSERVATIONS_MAX)
         self._go_evidence_events: deque = deque(maxlen=self._GO_EVIDENCE_EVENTS_MAX)
@@ -3715,9 +3717,10 @@ class RadarState:
                 ref_icao = iid_payload.get("reference_icao")
                 has_ref = bool(iid_payload.get("has_reference_icao")) and ref_icao is not None
                 if has_ref:
+                    ref_text = f"{int(ref_icao):06X}" if not isinstance(ref_icao, str) else ref_icao.upper()
                     self._go_reference_aircraft_by_iid[iid] = {
                         "status": "SELECTED",
-                        "ref_icao": f"{int(ref_icao):06X}" if not isinstance(ref_icao, str) else ref_icao.upper(),
+                        "ref_icao": ref_text,
                         "ref_score": None,
                         "ref_since_sweep": None,
                         "hysteresis_margin": None,
@@ -3726,14 +3729,33 @@ class RadarState:
                     }
                 elif iid in self._go_reference_aircraft_by_iid:
                     self._go_reference_aircraft_by_iid.pop(iid, None)
+                    ref_text = None
+                else:
+                    ref_text = None
 
                 go_sync = self._normalise_go_sync_state(iid_payload)
                 if go_sync is not None:
                     self._go_sync_states_by_iid[iid] = go_sync
+                    self._record_compact_sync_transition_locked(
+                        iid,
+                        ref_icao=ref_text,
+                        sync_present=True,
+                        phase_epoch_us=go_sync.get("phase_epoch_us"),
+                        holdover=go_sync.get("holdover"),
+                        event_ts=go_sync.get("last_updated"),
+                        source="sweep_frame_go",
+                    )
                     self._adopt_go_frame_sync_locked(iid, go_sync)
                     seen_go_sync_iids.add(iid)
                 elif iid in self._go_sync_states_by_iid:
                     self._go_sync_states_by_iid.pop(iid, None)
+                    self._record_compact_sync_transition_locked(
+                        iid,
+                        ref_icao=ref_text,
+                        sync_present=False,
+                        event_ts=time.time(),
+                        source="sweep_frame_go",
+                    )
 
                 admission = self._normalise_go_multi_sync_admission(iid_payload.get("multi_sync_admission"))
                 if admission is not None:
@@ -3870,6 +3892,102 @@ class RadarState:
             "last_ts": float(entry.get("last_ts") or 0.0),
             "counts": counts,
         }
+
+    @staticmethod
+    def _normalise_go_anchor_candidates(entries: list | None) -> list[dict]:
+        if not isinstance(entries, list):
+            return []
+        results: list[dict] = []
+        for raw in entries:
+            if not isinstance(raw, dict):
+                continue
+            icao = raw.get("i")
+            try:
+                icao_text = f"{int(icao):06X}" if icao is not None else None
+            except Exception:
+                icao_text = None
+            if not icao_text:
+                continue
+            reject_reasons = raw.get("rr") or []
+            if not isinstance(reject_reasons, list):
+                reject_reasons = []
+            results.append({
+                "icao": icao_text,
+                "score": float(raw.get("s") or 0.0),
+                "spread_deg": float(raw.get("sp") or 0.0),
+                "obs_count": int(raw.get("o") or 0),
+                "fit_eligible_count": int(raw.get("f") or 0),
+                "fit_eligible_fraction": float(raw.get("ff") or 0.0),
+                "status": raw.get("st") or "unknown",
+                "reject_reasons": [str(reason) for reason in reject_reasons if reason],
+            })
+        return results
+
+    def _record_compact_sync_transition_locked(
+        self,
+        iid: int,
+        *,
+        ref_icao: str | None = None,
+        sync_present: bool | None = None,
+        phase_epoch_us: float | None = None,
+        holdover: bool | None = None,
+        event_ts: float | None = None,
+        source: str | None = None,
+    ) -> dict:
+        now_ts = float(event_ts or time.time())
+        entry = dict(self._compact_sync_debug_by_iid.get(iid) or {})
+        entry.setdefault("current_reference_icao", None)
+        entry.setdefault("last_reference_icao", None)
+        entry.setdefault("reference_change_count", 0)
+        entry.setdefault("last_reference_change_ts", None)
+        entry.setdefault("reference_changed_recently", False)
+        entry.setdefault("sync_reset_count", 0)
+        entry.setdefault("last_sync_reset_ts", None)
+        entry.setdefault("last_sync_reset_reason", None)
+        entry.setdefault("sync_present", None)
+        entry.setdefault("current_phase_epoch_us", None)
+        entry.setdefault("last_phase_epoch_us", None)
+        entry.setdefault("last_phase_epoch_change_ts", None)
+        entry.setdefault("phase_epoch_changed_recently", False)
+        entry.setdefault("holdover", None)
+        entry.setdefault("last_holdover_transition_ts", None)
+        entry.setdefault("last_holdover_transition", None)
+        entry.setdefault("source", None)
+
+        if source:
+            entry["source"] = source
+        if ref_icao is not None and ref_icao != entry.get("current_reference_icao"):
+            entry["last_reference_icao"] = entry.get("current_reference_icao")
+            entry["current_reference_icao"] = ref_icao
+            entry["reference_change_count"] = int(entry.get("reference_change_count") or 0) + 1
+            entry["last_reference_change_ts"] = now_ts
+            entry["reference_changed_recently"] = True
+        elif entry.get("last_reference_change_ts") is not None:
+            entry["reference_changed_recently"] = (now_ts - float(entry["last_reference_change_ts"])) <= 30.0
+
+        if phase_epoch_us is not None:
+            prev_epoch = entry.get("current_phase_epoch_us")
+            if prev_epoch is not None and abs(float(phase_epoch_us) - float(prev_epoch)) > 1e-6:
+                entry["last_phase_epoch_us"] = prev_epoch
+                entry["last_phase_epoch_change_ts"] = now_ts
+                entry["phase_epoch_changed_recently"] = True
+            elif entry.get("last_phase_epoch_change_ts") is not None:
+                entry["phase_epoch_changed_recently"] = (now_ts - float(entry["last_phase_epoch_change_ts"])) <= 30.0
+            entry["current_phase_epoch_us"] = float(phase_epoch_us)
+
+        if sync_present is False and entry.get("sync_present") is not False:
+            entry["sync_reset_count"] = int(entry.get("sync_reset_count") or 0) + 1
+            entry["last_sync_reset_ts"] = now_ts
+            entry["last_sync_reset_reason"] = "sync_state_missing"
+        if sync_present is not None:
+            entry["sync_present"] = bool(sync_present)
+        if holdover is not None and holdover != entry.get("holdover"):
+            entry["last_holdover_transition_ts"] = now_ts
+            entry["last_holdover_transition"] = "entered_holdover" if holdover else "exited_holdover"
+            entry["holdover"] = bool(holdover)
+
+        self._compact_sync_debug_by_iid[iid] = entry
+        return dict(entry)
 
     @staticmethod
     def _normalise_go_sync_eligibility(entry: dict) -> tuple[bool, bool, bool, bool]:
@@ -4299,9 +4417,27 @@ class RadarState:
             })
             if go_sync is not None:
                 self._go_sync_states_by_iid[iid] = go_sync
+                existing_ref = (self._go_reference_aircraft_by_iid.get(iid) or {}).get("ref_icao")
+                self._record_compact_sync_transition_locked(
+                    iid,
+                    ref_icao=existing_ref,
+                    sync_present=True,
+                    phase_epoch_us=go_sync.get("phase_epoch_us"),
+                    holdover=go_sync.get("holdover"),
+                    event_ts=go_sync.get("last_updated"),
+                    source="sweep_frame_go",
+                )
                 self._adopt_go_frame_sync_locked(iid, go_sync)
             else:
                 self._go_sync_states_by_iid.pop(iid, None)
+                existing_ref = (self._go_reference_aircraft_by_iid.get(iid) or {}).get("ref_icao")
+                self._record_compact_sync_transition_locked(
+                    iid,
+                    ref_icao=existing_ref,
+                    sync_present=False,
+                    event_ts=float(iid_state.get("lu") or time.time()),
+                    source="sweep_frame_go",
+                )
 
     def update_go_multi_sync_state(self, msg: dict) -> None:
         """Mirror a Go MULTI_SYNC_STATE into a Python LiveSyncState.
@@ -4334,6 +4470,23 @@ class RadarState:
         n_sync_updates = int(msg.get("nu") or 0)
         reacquire_active = bool(msg.get("ra", False))
         last_updated = float(msg.get("ts") or time.time())
+        anchor_icao_raw = msg.get("ai")
+        anchor_icao = None
+        if anchor_icao_raw is not None:
+            try:
+                anchor_icao = f"{int(anchor_icao_raw):06X}"
+            except Exception:
+                anchor_icao = None
+        anchor_candidates = self._normalise_go_anchor_candidates(msg.get("acs"))
+        anchor_row = next((row for row in anchor_candidates if row.get("icao") == anchor_icao), None)
+        fit_reject_reasons_raw = msg.get("frr") or {}
+        if not isinstance(fit_reject_reasons_raw, dict):
+            fit_reject_reasons_raw = {}
+        fit_reject_reasons = {
+            str(key): int(value)
+            for key, value in fit_reject_reasons_raw.items()
+            if key is not None
+        }
 
         with self._lock:
             self._go_multi_sync_states_by_iid[iid] = dict(msg)
@@ -4353,8 +4506,21 @@ class RadarState:
                 n_rejected_frames=0,
                 last_residual_deg=0.0,
                 holdover=holdover,
+                fit_total_observations=int(msg.get("ft") or 0),
+                fit_eligible_observations=int(msg.get("fe") or 0),
+                fit_rejected_observations=int(msg.get("fr") or 0),
+                fit_reject_reasons=fit_reject_reasons,
+                fit_contributing_icao_count=int(msg.get("fc") or 0),
                 period_reacquire_active=reacquire_active,
                 period_reacquire_reason=msg.get("rr"),
+                phase_anchor_icao=anchor_icao,
+                phase_anchor_score=float(msg.get("as") or 0.0),
+                phase_anchor_obs_count=int((anchor_row or {}).get("obs_count") or 0),
+                phase_anchor_spread_deg=((anchor_row or {}).get("spread_deg")),
+                phase_anchor_status=("selected" if anchor_icao else "unavailable"),
+                phase_anchor_candidate_count=int(msg.get("ac") or 0),
+                phase_anchor_no_candidate_reason=msg.get("anr"),
+                phase_anchor_candidates=anchor_candidates,
                 period_authoritative_source="refined",
             )
 
@@ -7330,6 +7496,9 @@ class RadarState:
             if iid in self._go_multi_sync_admission_by_iid:
                 del self._go_multi_sync_admission_by_iid[iid]
                 had_any = True
+            if iid in self._compact_sync_debug_by_iid:
+                del self._compact_sync_debug_by_iid[iid]
+                had_any = True
             if iid in self._go_iid_state_revision:
                 del self._go_iid_state_revision[iid]
                 had_any = True
@@ -7455,6 +7624,7 @@ class RadarState:
             self._go_sync_states_by_iid.clear()
             self._go_multi_sync_states_by_iid.clear()
             self._go_multi_sync_admission_by_iid.clear()
+            self._compact_sync_debug_by_iid.clear()
             self._go_iid_state_revision.clear()
             self._go_reference_aircraft_by_iid.clear()
             self._go_track_observations.clear()
@@ -8225,6 +8395,7 @@ class RadarState:
         fit_eligible_count = sum(1 for row in observations if row.get("fit_eligible"))
         sync_update_eligible_count = sum(1 for row in observations if row.get("sync_update_eligible"))
         alignment_status = burst_timeline.get("alignment_status")
+        refined_source = getattr(sync, "source", None) == "go_multi_aircraft_burst"
         return {
             "iid": iid,
             "available": True,
@@ -8232,9 +8403,9 @@ class RadarState:
             "summary": {
                 "iid": iid,
                 "sync_source": getattr(sync, "source", None),
-                "diagnostics_mode": "compact_go_sync",
+                "diagnostics_mode": "refined_go_sync" if refined_source else "compact_go_sync",
                 "rich_diagnostics_available": False,
-                "compact_reason": "sync_source_not_multi_aircraft",
+                "compact_reason": "rich_python_multi_aircraft_diagnostics_unavailable_for_go_sync_source",
                 "wall_clock_used_operationally": False,
                 "observation_count": len(observations),
                 "fit_eligible_count": fit_eligible_count,
@@ -8246,8 +8417,76 @@ class RadarState:
             "retention_diagnostics": retention_diagnostics,
             "alignment_status": alignment_status,
             "observation_model_diagnostics": {
-                "mode": "compact_go_sync",
+                "mode": "refined_go_sync" if refined_source else "compact_go_sync",
                 "reason": "rich_python_multi_aircraft_diagnostics_unavailable_for_sync_source",
+            },
+        }
+
+    def _build_sync_mode_diagnostics(
+        self,
+        iid: int,
+        sync: LiveSyncState | None,
+        alignment_status: dict | None,
+    ) -> dict:
+        with self._lock:
+            compact_debug = dict(self._compact_sync_debug_by_iid.get(iid) or {})
+            go_admission = dict(self._go_multi_sync_admission_by_iid.get(iid) or {})
+        sync_source = getattr(sync, "source", None) if sync is not None else None
+        refined_active = bool(sync_source in {"multi_aircraft_burst", "go_multi_aircraft_burst"})
+        refined_present = bool(refined_active or (go_admission and go_admission.get("counts")))
+        refined_usable = bool(sync is not None and refined_active and getattr(sync, "usable", False))
+        active_mode = "refined_multi_aircraft" if refined_active else "compact_bootstrap"
+        no_anchor_reason = None
+        if refined_active:
+            no_anchor_reason = getattr(sync, "phase_anchor_no_candidate_reason", None)
+            if not getattr(sync, "phase_anchor_icao", None) and not no_anchor_reason:
+                no_anchor_reason = "no_anchor_selected"
+        else:
+            no_anchor_reason = (
+                ((alignment_status or {}).get("reason"))
+                or "awaiting_refined_multi_sync"
+            )
+
+        return {
+            "active_source": sync_source,
+            "active_mode": active_mode,
+            "active_label": (
+                "Refined sync (multi-aircraft)"
+                if refined_active else "Compact sync (sweep-frame)"
+            ),
+            "compact": {
+                "active": not refined_active,
+                "reference_icao": compact_debug.get("current_reference_icao"),
+                "last_reference_icao": compact_debug.get("last_reference_icao"),
+                "reference_changed_recently": bool(compact_debug.get("reference_changed_recently")),
+                "reference_change_count": int(compact_debug.get("reference_change_count") or 0),
+                "last_reference_change_ts": compact_debug.get("last_reference_change_ts"),
+                "phase_epoch_us": compact_debug.get("current_phase_epoch_us"),
+                "last_phase_epoch_us": compact_debug.get("last_phase_epoch_us"),
+                "phase_epoch_changed_recently": bool(compact_debug.get("phase_epoch_changed_recently")),
+                "sync_reset_count": int(compact_debug.get("sync_reset_count") or 0),
+                "last_sync_reset_ts": compact_debug.get("last_sync_reset_ts"),
+                "last_sync_reset_reason": compact_debug.get("last_sync_reset_reason"),
+                "holdover": compact_debug.get("holdover"),
+                "last_holdover_transition": compact_debug.get("last_holdover_transition"),
+                "last_holdover_transition_ts": compact_debug.get("last_holdover_transition_ts"),
+            },
+            "refined": {
+                "present": refined_present,
+                "active": refined_active,
+                "usable": refined_usable,
+                "anchor_icao": getattr(sync, "phase_anchor_icao", None) if refined_active else None,
+                "anchor_candidate_count": int(getattr(sync, "phase_anchor_candidate_count", 0) or 0) if refined_active else 0,
+                "fit_total_observations": int(getattr(sync, "fit_total_observations", 0) or 0) if refined_active else 0,
+                "fit_eligible_observations": int(getattr(sync, "fit_eligible_observations", 0) or 0) if refined_active else 0,
+                "fit_rejected_observations": int(getattr(sync, "fit_rejected_observations", 0) or 0) if refined_active else 0,
+                "fit_contributing_icao_count": int(getattr(sync, "fit_contributing_icao_count", 0) or 0) if refined_active else 0,
+                "fit_reject_reasons": (
+                    dict(getattr(sync, "fit_reject_reasons", {}) or {})
+                    if refined_active else {}
+                ),
+                "no_anchor_reason": no_anchor_reason,
+                "admission": go_admission or None,
             },
         }
 
@@ -8343,6 +8582,7 @@ class RadarState:
                 "radar_position_source": radar_pos.get("source"),
                 "multi_sync_admission": go_admission or None,
             }
+        sync_mode_diagnostics = self._build_sync_mode_diagnostics(iid, sync, alignment_status)
 
         # Filter outside the lock — safe since we operate on an immutable snapshot.
         iid_events_for_df11 = [
@@ -8367,6 +8607,7 @@ class RadarState:
                 "chart_overlay_consistent": False,
                 "retention_diagnostics": retention_diagnostics,
                 "alignment_status": alignment_status,
+                "sync_mode_diagnostics": sync_mode_diagnostics,
             }
 
         if not _sync_source_has_rich_python_diagnostics(sync):
@@ -8419,7 +8660,7 @@ class RadarState:
                 "slope_history": [],
                 "period_history": [],
                 "predictor_consistency": getattr(sync, "predictor_consistency", None),
-                "phase_anchor_candidates": [],
+                "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []),
                 "motion_comp_summary": {
                     "phase_enabled": bool(getattr(sync, "motion_comp_phase_enabled", False)),
                     "fit_enabled": bool(getattr(sync, "motion_comp_fit_enabled", False)),
@@ -8437,8 +8678,9 @@ class RadarState:
                 "df11_residual_observations": df11_residual_observations,
                 "chart_overlay_consistent": True,
                 "retention_diagnostics": retention_diagnostics,
-                "diagnostics_mode": "compact_go_sync",
+                "diagnostics_mode": "refined_go_sync" if getattr(sync, "source", None) == "go_multi_aircraft_burst" else "compact_go_sync",
                 "alignment_status": alignment_status,
+                "sync_mode_diagnostics": sync_mode_diagnostics,
             }
 
         now_ts = time.time()
@@ -8669,6 +8911,7 @@ class RadarState:
             "chart_overlay_consistent": True,
             "retention_diagnostics": retention_diagnostics,
             "alignment_status": alignment_status,
+            "sync_mode_diagnostics": sync_mode_diagnostics,
         }
 
     def get_live_sync_snapshot(self, iid: int, window_s: float = 90.0, debug_limit: int = 120) -> dict:
@@ -8684,6 +8927,7 @@ class RadarState:
             model = self._models.get(iid)
             go_evidence = [entry for entry in self._go_evidence_events if int(entry.get("iid", -1)) == iid]
             go_admission = dict(self._go_multi_sync_admission_by_iid.get(iid) or {})
+            compact_debug = dict(self._compact_sync_debug_by_iid.get(iid) or {})
             go_frame_revision = self._go_sweep_frames_revision.get(iid, 0)
             obs_buf = None if go_evidence else (self._live_burst_timeline_obs.get(iid) or self._live_aligned_burst_obs.get(iid))
             obs_len = len(go_evidence) if go_evidence else (len(obs_buf) if obs_buf else 0)
@@ -8713,6 +8957,13 @@ class RadarState:
                 go_admission.get("last_reason"),
                 go_admission.get("last_ts"),
                 tuple(sorted((go_admission.get("counts") or {}).items())),
+                compact_debug.get("current_reference_icao"),
+                compact_debug.get("last_reference_icao"),
+                compact_debug.get("last_reference_change_ts"),
+                compact_debug.get("current_phase_epoch_us"),
+                compact_debug.get("last_phase_epoch_change_ts"),
+                compact_debug.get("last_sync_reset_ts"),
+                compact_debug.get("last_holdover_transition_ts"),
                 go_frame_revision,
             )
             cached = self._live_sync_snapshot_cache.get(iid)
@@ -8743,6 +8994,7 @@ class RadarState:
             "motion_comp_summary": burst_timeline.get("motion_comp_summary"),
             "retention_diagnostics": burst_timeline.get("retention_diagnostics"),
             "alignment_status": burst_timeline.get("alignment_status"),
+            "sync_mode_diagnostics": burst_timeline.get("sync_mode_diagnostics"),
             "transport": {
                 "source": "shared_snapshot",
                 "cached": False,
