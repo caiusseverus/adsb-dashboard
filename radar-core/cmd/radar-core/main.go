@@ -218,7 +218,9 @@ func (e *engine) maybeUpdateSync(s *iid.IIDState, f *burst.FiredBurst) {
 // maybeUpdateMultiSync feeds sync-eligible bursts into the per-IID multi-aircraft
 // sync solver and emits a MultiSyncState when a solver run completes.
 func (e *engine) maybeUpdateMultiSync(s *iid.IIDState, f *burst.FiredBurst) {
+	nowUnix := float64(time.Now().UnixMicro()) / 1e6
 	if s.MultiSync == nil {
+		s.RecordMultiSyncAdmission("no_solver", f.ICAO, nowUnix)
 		return
 	}
 	// Only feed dominant-family bursts with a known ADS-B position.
@@ -227,16 +229,19 @@ func (e *engine) maybeUpdateMultiSync(s *iid.IIDState, f *burst.FiredBurst) {
 		_, dominantFamily = family.FoldedICAOs[f.ICAO]
 	}
 	if !dominantFamily {
+		s.RecordMultiSyncAdmission("not_dominant_family", f.ICAO, nowUnix)
 		return
 	}
 	pos := e.positions.Get(f.ICAO)
 	if pos == nil {
+		s.RecordMultiSyncAdmission("no_adsb_position", f.ICAO, nowUnix)
 		return
 	}
 
 	// Compute bearing and range from receiver to aircraft.
 	cfg := rcconfig.Get()
 	if !cfg.HasReceiver {
+		s.RecordMultiSyncAdmission("no_receiver_config", f.ICAO, nowUnix)
 		return
 	}
 	bearing, rangeNM := iid.BearingAndRangeNM(
@@ -257,10 +262,11 @@ func (e *engine) maybeUpdateMultiSync(s *iid.IIDState, f *burst.FiredBurst) {
 		RangeNM:    float32(rangeNM),
 		PosAgeS:    posAgeS,
 		NReplies:   f.NReplies,
-		SignalDBFS:  sig,
+		SignalDBFS: sig,
 		WallTS:     float64(time.Now().UnixMicro()) / 1e6,
 	}
 	s.MultiSync.AddObs(obs)
+	s.RecordMultiSyncAdmission("admitted", f.ICAO, nowUnix)
 
 	// Run the solver if the throttle interval has elapsed.
 	syncSnap, _ := s.SyncSnapshot()
@@ -268,6 +274,8 @@ func (e *engine) maybeUpdateMultiSync(s *iid.IIDState, f *burst.FiredBurst) {
 	sync := s.SyncStateRef()
 	if updated := s.MultiSync.TryUpdate(sync); updated {
 		e.emitMultiSyncState(s)
+	} else {
+		s.RecordMultiSyncAdmission("solver_throttled_or_no_update", f.ICAO, nowUnix)
 	}
 }
 
@@ -667,6 +675,19 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 				"centroid_history_cap_per_icao":   accDiag.CentroidHistoryCapPerICAO,
 				"centroid_history_cap_hit":        accDiag.CentroidHistoryCapHit,
 				"centroid_history_cap_hits_total": accDiag.CentroidHistoryCapHitsTotal,
+			}
+		}
+		if admission := s.MultiSyncAdmissionSnapshot(); admission.Counts != nil {
+			iidPayload["multi_sync_admission"] = map[string]interface{}{
+				"last_reason": admission.LastReason,
+				"last_icao": func() interface{} {
+					if admission.LastICAO == 0 {
+						return nil
+					}
+					return admission.LastICAO
+				}(),
+				"last_ts": admission.LastTS,
+				"counts":  admission.Counts,
 			}
 		}
 		if fmState := e.fmState.Snapshot(iidNum); fmState != nil {

@@ -1509,6 +1509,64 @@ def test_go_sync_snapshot_and_debug_use_compact_diagnostics_path(monkeypatch):
     assert debug_payload["observations"][0]["icao"] == "AAAAAA"
 
 
+def test_go_sync_snapshot_falls_back_to_sweep_frames_when_burst_evidence_aged_out(monkeypatch):
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    state._models[9] = RadarIID(
+        iid=9,
+        status="SINGLE_RADAR",
+        period_s=4.0,
+        manual_lat=51.5,
+        manual_lon=-0.1,
+        resolution_mode="locked_position",
+    )
+    state._iid_latest_arrival_us[9] = 4_200_000.0
+    state._live_sync_states[9] = LiveSyncState(
+        iid=9,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="sweep_frame_go",
+        usable=True,
+        period_base_s=4.0,
+        period_authoritative_source="base",
+    )
+    state.update_go_frame_ready({
+        "i": 9,
+        "fi": 5,
+        "p": 4.0,
+        "rc": int("AAAAAA", 16),
+        "rla": 51.6,
+        "rlo": -0.05,
+        "ra": 4_000_000.0,
+        "q": "good",
+        "obs": [
+            {
+                "c": int("BBBBBB", 16),
+                "la": 51.7,
+                "lo": 0.02,
+                "a": 4_200_000.0,
+                "n": 3,
+                "pa": 0.2,
+            }
+        ],
+    })
+
+    snapshot = state.get_live_sync_snapshot(9, window_s=90.0, debug_limit=20)
+
+    assert snapshot["observations"]
+    assert snapshot["observations"][0]["burst_center_method"] == "go_sweep_frame"
+    assert snapshot["df11_residual_observations"]
+    assert snapshot["df11_residual_observations"][0]["residual_source"] == "go_sweep_frame_compact"
+    assert snapshot["alignment_status"]["reason"] == "go_sweep_frames_projected"
+
+
 def test_phase_anchor_selected_aircraft_recovers_wrong_absolute_branch(monkeypatch):
     import radar.sweep as sweep_module
 

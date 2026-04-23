@@ -50,16 +50,16 @@ const (
 	multiSyncGainMax  = 0.20
 
 	// Period refinement constants (match Python).
-	slopeEMAAlpha         = 0.08
-	slopeDeadBand         = 0.08  // deg/s — must exceed to drive period change
-	persistMinEntries     = 5
-	periodPPMPerUpdate    = 60.0
-	periodPPMFromBase     = 2000.0
-	periodPPMStrong       = 400.0
-	periodPPMBaseStrong   = 15000.0
-	periodRefineMinInlier = 6
+	slopeEMAAlpha          = 0.08
+	slopeDeadBand          = 0.08 // deg/s — must exceed to drive period change
+	persistMinEntries      = 5
+	periodPPMPerUpdate     = 60.0
+	periodPPMFromBase      = 2000.0
+	periodPPMStrong        = 400.0
+	periodPPMBaseStrong    = 15000.0
+	periodRefineMinInlier  = 6
 	periodRefineMinSpanRot = 2.0
-	periodGain            = 0.12
+	periodGain             = 0.12
 
 	// Trust promotion thresholds — the refined solver must earn a stable run streak
 	// before its period is promoted to the trusted base.  Until then the clamp is
@@ -123,12 +123,18 @@ type scoredObs struct {
 // candidateEvalResult holds the scoring result for one candidate period
 // evaluated during wrong-period reacquire search.
 type candidateEvalResult struct {
-	periodS     float64
-	inlierCount int
-	icaoCount   int
-	madDeg      float64
-	rejFrac     float64
-	score       float64
+	periodS            float64
+	inlierCount        int
+	icaoCount          int
+	madDeg             float64
+	rejFrac            float64
+	score              float64
+	phaseOffsetDeg     float64
+	publishedOffsetDeg float64
+	newEpochUS         float64
+	anchorICAO         *uint32
+	anchorScore        float64
+	anchorPhaseDeg     float64
 }
 
 // MultiSyncSnapshot is a point-in-time view for protocol emission.
@@ -150,12 +156,12 @@ type MultiSyncSnapshot struct {
 	AnchorPhaseDeg        float64
 	AnchorScore           float64
 	// Bootstrap / trust diagnostics.
-	BootstrapPeriodS        float64 // compact-sync seed captured at first run
-	TrustedBasePeriodS      float64 // promoted from refined period after trustMinStreak updates; 0=not yet trusted
-	TrustUpdateStreak       int     // consecutive updates meeting trust criteria
-	BaseClamped             bool    // true if the base-period clamp fired on the last run
-	BaseClampDiffPPM        float64 // raw PPM deviation that triggered (or would have triggered) the clamp
-	WrongPeriodSuspect      bool    // true if wrong-period suspicion was raised on the last run
+	BootstrapPeriodS         float64 // compact-sync seed captured at first run
+	TrustedBasePeriodS       float64 // promoted from refined period after trustMinStreak updates; 0=not yet trusted
+	TrustUpdateStreak        int     // consecutive updates meeting trust criteria
+	BaseClamped              bool    // true if the base-period clamp fired on the last run
+	BaseClampDiffPPM         float64 // raw PPM deviation that triggered (or would have triggered) the clamp
+	WrongPeriodSuspect       bool    // true if wrong-period suspicion was raised on the last run
 	ReacquireCandidatePeriod float64 // period chosen by candidate search during reacquire (0 if not active)
 	ReacquireCandidateScore  float64 // score of that candidate
 }
@@ -170,17 +176,17 @@ type MultiSyncSolver struct {
 	obs []MultiSyncObs
 
 	// Published sync state.
-	Present               bool
-	Usable                bool
-	PeriodS               float64
-	PeriodBaseS           float64
-	PhaseEpochUS          float64
-	PhaseOffsetDeg        float64
-	JitterDeg             float64
-	ResidualEMADeg        float64
-	NSyncUpdates          int
-	Holdover              bool
-	LastUpdated           float64
+	Present        bool
+	Usable         bool
+	PeriodS        float64
+	PeriodBaseS    float64
+	PhaseEpochUS   float64
+	PhaseOffsetDeg float64
+	JitterDeg      float64
+	ResidualEMADeg float64
+	NSyncUpdates   int
+	Holdover       bool
+	LastUpdated    float64
 
 	// Period refinement.
 	SmoothSlopeDegPerS    float64
@@ -203,9 +209,9 @@ type MultiSyncSolver struct {
 	// TrustedBasePeriodS is promoted from the refined period after trustMinStreak consistent
 	// multi-aircraft updates.  Until trust is established, the clamp is applied loosely
 	// against BootstrapPeriodS so the solver can escape an incorrect seed family.
-	BootstrapPeriodS  float64
+	BootstrapPeriodS   float64
 	TrustedBasePeriodS float64
-	TrustUpdateStreak int
+	TrustUpdateStreak  int
 
 	// Per-run diagnostics (updated each solver run, readable via Snapshot).
 	LastBaseClamped          bool    // true if base-period clamp fired on the last run
@@ -320,12 +326,12 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 		PeriodReacquireActive: ms.PeriodReacquireActive,
 		PeriodReacquireReason: ms.PeriodReacquireReason,
 		// Bootstrap / trust diagnostics.
-		BootstrapPeriodS:        ms.BootstrapPeriodS,
-		TrustedBasePeriodS:      ms.TrustedBasePeriodS,
-		TrustUpdateStreak:       ms.TrustUpdateStreak,
-		BaseClamped:             ms.LastBaseClamped,
-		BaseClampDiffPPM:        ms.LastBaseClampDiffPPM,
-		WrongPeriodSuspect:      ms.LastWrongPeriodSuspect,
+		BootstrapPeriodS:         ms.BootstrapPeriodS,
+		TrustedBasePeriodS:       ms.TrustedBasePeriodS,
+		TrustUpdateStreak:        ms.TrustUpdateStreak,
+		BaseClamped:              ms.LastBaseClamped,
+		BaseClampDiffPPM:         ms.LastBaseClampDiffPPM,
+		WrongPeriodSuspect:       ms.LastWrongPeriodSuspect,
 		ReacquireCandidatePeriod: ms.LastReacquireCandidateP,
 		ReacquireCandidateScore:  ms.LastReacquireCandidateSc,
 	}
@@ -496,36 +502,13 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 	}
 	aFit, bFit := weightedLinearFit(xs, ys, ws)
 
-	// Conservative phase-correction gain.
-	nEff := math.Max(float64(nInliers), 1.0)
-	gain := math.Min(multiSyncGainBase+0.01*(nEff-1), multiSyncGainMax)
-
-	// Advance epoch to most recent anchor-eligible observation.
-	var newEpochUS float64
-	for _, se := range scored {
-		if se.baseW > 0 && se.fitRejectReason != "near_wrap_residual" {
-			if se.effectiveUS > newEpochUS {
-				newEpochUS = se.effectiveUS
-			}
-		}
-	}
-	if newEpochUS == 0 {
-		newEpochUS = scored[len(scored)-1].effectiveUS
-	}
-
-	// Propagate existing model to new epoch (mixed fallback).
-	existingAtNew := math.Mod((newEpochUS-seedEpochUS)/periodUS*360.0+seedOffsetDeg, 360.0)
-	if existingAtNew < 0 {
-		existingAtNew += 360.0
-	}
-	mixedFallback := math.Mod(existingAtNew+aFit*gain, 360.0)
-	if mixedFallback < 0 {
-		mixedFallback += 360.0
-	}
-
-	// Anchor selection.
-	newOffset, anchorICAO, anchorScore, anchorPhaseDeg := ms.selectAnchor(
-		scored, newEpochUS, periodUS, mixedFallback,
+	finalEpochUS, finalOffsetDeg, anchorICAO, anchorScore, anchorPhaseDeg := ms.buildPublishedAlignment(
+		scored,
+		seedEpochUS,
+		seedOffsetDeg,
+		livePeriodS,
+		aFit,
+		nInliers,
 	)
 
 	// Period refinement.
@@ -584,10 +567,17 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 			ms.CleanReacquireStreak = 0
 			// Search for the best-scoring period family instead of snapping back to the
 			// bootstrap base, which may itself be the wrong family.
-			bestP, bestSc := ms.searchBestCandidate(scored, seedEpochUS)
-			ms.LastReacquireCandidateP = bestP
-			ms.LastReacquireCandidateSc = bestSc
-			refinedPeriodS = bestP
+			best := ms.searchBestCandidate(scored, seedEpochUS)
+			ms.LastReacquireCandidateP = best.periodS
+			ms.LastReacquireCandidateSc = best.score
+			if best.periodS > 0 {
+				refinedPeriodS = best.periodS
+				finalEpochUS = best.newEpochUS
+				finalOffsetDeg = best.publishedOffsetDeg
+				anchorICAO = best.anchorICAO
+				anchorScore = best.anchorScore
+				anchorPhaseDeg = best.anchorPhaseDeg
+			}
 		}
 	} else {
 		ms.CleanReacquireStreak = 0
@@ -597,10 +587,17 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 			ms.TrustUpdateStreak = 0
 			// On entering reacquire, search candidate periods immediately.  This allows the
 			// solver to jump to the correct family rather than holding the incorrect bootstrap.
-			bestP, bestSc := ms.searchBestCandidate(scored, seedEpochUS)
-			ms.LastReacquireCandidateP = bestP
-			ms.LastReacquireCandidateSc = bestSc
-			refinedPeriodS = bestP
+			best := ms.searchBestCandidate(scored, seedEpochUS)
+			ms.LastReacquireCandidateP = best.periodS
+			ms.LastReacquireCandidateSc = best.score
+			if best.periodS > 0 {
+				refinedPeriodS = best.periodS
+				finalEpochUS = best.newEpochUS
+				finalOffsetDeg = best.publishedOffsetDeg
+				anchorICAO = best.anchorICAO
+				anchorScore = best.anchorScore
+				anchorPhaseDeg = best.anchorPhaseDeg
+			}
 		} else {
 			// Not in reacquire; clear stale candidate diagnostics.
 			ms.LastReacquireCandidateP = 0
@@ -619,7 +616,6 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 		detrended <= trustMaxResidualDeg
 
 	if ms.PeriodReacquireActive || wrongPeriodSuspect {
-		// Problem detected — reset trust streak; do not promote.
 		ms.TrustUpdateStreak = 0
 	} else if trustedEnough {
 		ms.TrustUpdateStreak++
@@ -633,6 +629,9 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 				ms.TrustedBasePeriodS = 0.98*ms.TrustedBasePeriodS + 0.02*refinedPeriodS
 			}
 		}
+	} else {
+		// The field is explicitly consecutive: any update that misses the trust gate resets it.
+		ms.TrustUpdateStreak = 0
 	}
 
 	// Capture per-run clamp diagnostics (after refinePeriod returned them).
@@ -664,8 +663,8 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 	ms.Usable = len(fitPool) >= 4 && !majorityRejected
 	ms.PeriodS = refinedPeriodS
 	ms.PeriodBaseS = basePeriodS
-	ms.PhaseEpochUS = newEpochUS
-	ms.PhaseOffsetDeg = newOffset
+	ms.PhaseEpochUS = finalEpochUS
+	ms.PhaseOffsetDeg = finalOffsetDeg
 	ms.JitterDeg = clamp(newResidualEMA, 1.5, 20.0)
 	ms.ResidualEMADeg = newResidualEMA
 	ms.NSyncUpdates++
@@ -676,6 +675,48 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 		ms.AnchorPhaseDeg = anchorPhaseDeg
 		ms.AnchorScore = anchorScore
 	}
+}
+
+func (ms *MultiSyncSolver) buildPublishedAlignment(
+	scored []scoredObs,
+	seedEpochUS, seedOffsetDeg, periodS, phaseAdjustDeg float64,
+	nInliers int,
+) (newEpochUS, publishedOffsetDeg float64, anchorICAO *uint32, anchorScore, anchorPhaseDeg float64) {
+	periodUS := periodS * 1e6
+	if periodUS <= 0 {
+		return seedEpochUS, seedOffsetDeg, nil, 0, 0
+	}
+
+	// Advance epoch to the newest anchor-eligible observation.
+	for _, se := range scored {
+		if se.baseW > 0 && se.fitRejectReason != "near_wrap_residual" {
+			if se.effectiveUS > newEpochUS {
+				newEpochUS = se.effectiveUS
+			}
+		}
+	}
+	if newEpochUS == 0 && len(scored) > 0 {
+		newEpochUS = scored[len(scored)-1].effectiveUS
+	}
+	if newEpochUS == 0 {
+		newEpochUS = seedEpochUS
+	}
+
+	// Conservative phase-correction gain for the fallback branch.
+	nEff := math.Max(float64(nInliers), 1.0)
+	gain := math.Min(multiSyncGainBase+0.01*(nEff-1), multiSyncGainMax)
+	existingAtNew := math.Mod((newEpochUS-seedEpochUS)/periodUS*360.0+seedOffsetDeg, 360.0)
+	if existingAtNew < 0 {
+		existingAtNew += 360.0
+	}
+	mixedFallback := math.Mod(existingAtNew+phaseAdjustDeg*gain, 360.0)
+	if mixedFallback < 0 {
+		mixedFallback += 360.0
+	}
+	publishedOffsetDeg, anchorICAO, anchorScore, anchorPhaseDeg = ms.selectAnchor(
+		scored, newEpochUS, periodUS, mixedFallback,
+	)
+	return newEpochUS, publishedOffsetDeg, anchorICAO, anchorScore, anchorPhaseDeg
 }
 
 func (ms *MultiSyncSolver) updateICAOQuality(scored []scoredObs) {
@@ -707,11 +748,11 @@ func (ms *MultiSyncSolver) selectAnchor(
 	newEpochUS, periodUS, fallbackOffset float64,
 ) (newOffset float64, anchorICAO *uint32, anchorScore, anchorPhaseDeg float64) {
 	type icaoAnchor struct {
-		icao        uint32
-		sinSum      float64
-		cosSum      float64
-		nObs        int
-		score       float64
+		icao   uint32
+		sinSum float64
+		cosSum float64
+		nObs   int
+		score  float64
 	}
 	byICAO := make(map[uint32]*icaoAnchor)
 	for _, se := range scored {
@@ -877,18 +918,16 @@ func (ms *MultiSyncSolver) assessPeriodFailure(
 // (period, score) pair with the best evidence from the current fit-eligible window.
 // Called during wrong-period reacquire to escape an incorrect period family instead
 // of snapping back to the (potentially wrong) bootstrap base period.
-func (ms *MultiSyncSolver) searchBestCandidate(scored []scoredObs, epochUS float64) (bestPeriod, bestScore float64) {
+func (ms *MultiSyncSolver) searchBestCandidate(scored []scoredObs, epochUS float64) candidateEvalResult {
 	candidates := ms.buildCandidatePeriods()
-	bestPeriod = ms.PeriodS // safe fallback: current refined period
-	bestScore = -1.0
+	best := candidateEvalResult{periodS: ms.PeriodS, score: -1.0}
 	for _, cand := range candidates {
 		r := ms.evalCandidatePeriod(scored, cand, epochUS)
-		if r.score > bestScore {
-			bestScore = r.score
-			bestPeriod = r.periodS
+		if r.score > best.score {
+			best = r
 		}
 	}
-	return
+	return best
 }
 
 // buildCandidatePeriods returns a deduplicated set of period values to probe
@@ -987,13 +1026,28 @@ func (ms *MultiSyncSolver) evalCandidatePeriod(scored []scoredObs, candidatePeri
 	// Score rewards inlier count and ICAO diversity; penalises high MAD and rejection fraction.
 	score := float64(inliers) * float64(icaoCount) / (1.0 + madDeg/5.0) / (1.0 + rejFrac*3.0)
 
+	newEpochUS, publishedOffsetDeg, anchorICAO, anchorScore, anchorPhaseDeg := ms.buildPublishedAlignment(
+		scored,
+		epochUS,
+		bestOffset,
+		candidatePeriodS,
+		0.0,
+		inliers,
+	)
+
 	return candidateEvalResult{
-		periodS:     candidatePeriodS,
-		inlierCount: inliers,
-		icaoCount:   icaoCount,
-		madDeg:      madDeg,
-		rejFrac:     rejFrac,
-		score:       score,
+		periodS:            candidatePeriodS,
+		inlierCount:        inliers,
+		icaoCount:          icaoCount,
+		madDeg:             madDeg,
+		rejFrac:            rejFrac,
+		score:              score,
+		phaseOffsetDeg:     bestOffset,
+		publishedOffsetDeg: publishedOffsetDeg,
+		newEpochUS:         newEpochUS,
+		anchorICAO:         anchorICAO,
+		anchorScore:        anchorScore,
+		anchorPhaseDeg:     anchorPhaseDeg,
 	}
 }
 

@@ -59,6 +59,18 @@ type IIDState struct {
 	RefICAO   *uint32 // selected reference aircraft (nil until stable)
 	Sync      *SyncState
 	MultiSync *MultiSyncSolver // multi-aircraft sync refinement solver
+
+	// Multi-sync admission diagnostics.
+	multiSyncAdmission MultiSyncAdmissionDiagnostics
+}
+
+// MultiSyncAdmissionDiagnostics tracks why bursts were or were not admitted into
+// the refined multi-aircraft sync solver.
+type MultiSyncAdmissionDiagnostics struct {
+	LastReason string
+	LastICAO   uint32
+	LastTS     float64
+	Counts     map[string]uint64
 }
 
 // DebugSnapshot is a point-in-time operational view of one IID.
@@ -109,6 +121,9 @@ func NewIIDState(iid uint8) *IIDState {
 		IID:       iid,
 		Status:    "UNKNOWN",
 		MultiSync: NewMultiSyncSolver(iid),
+		multiSyncAdmission: MultiSyncAdmissionDiagnostics{
+			Counts: make(map[string]uint64),
+		},
 	}
 }
 
@@ -185,6 +200,33 @@ func (s *IIDState) TakeIfDirty() []BurstRecord {
 	return snap
 }
 
+func (s *IIDState) RecordMultiSyncAdmission(reason string, icao uint32, nowUnix float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.multiSyncAdmission.Counts == nil {
+		s.multiSyncAdmission.Counts = make(map[string]uint64)
+	}
+	s.multiSyncAdmission.LastReason = reason
+	s.multiSyncAdmission.LastICAO = icao
+	s.multiSyncAdmission.LastTS = nowUnix
+	s.multiSyncAdmission.Counts[reason]++
+}
+
+func (s *IIDState) MultiSyncAdmissionSnapshot() MultiSyncAdmissionDiagnostics {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := MultiSyncAdmissionDiagnostics{
+		LastReason: s.multiSyncAdmission.LastReason,
+		LastICAO:   s.multiSyncAdmission.LastICAO,
+		LastTS:     s.multiSyncAdmission.LastTS,
+		Counts:     make(map[string]uint64, len(s.multiSyncAdmission.Counts)),
+	}
+	for k, v := range s.multiSyncAdmission.Counts {
+		out.Counts[k] = v
+	}
+	return out
+}
+
 // ApplyRotation stores the result of a rotation analysis pass.
 func (s *IIDState) ApplyRotation(model *RotationModel) {
 	s.mu.Lock()
@@ -208,6 +250,9 @@ func (s *IIDState) Reset() {
 	s.LastRotationModel = nil
 	s.RefICAO = nil
 	s.Sync = nil
+	s.multiSyncAdmission = MultiSyncAdmissionDiagnostics{
+		Counts: make(map[string]uint64),
+	}
 	if s.MultiSync != nil {
 		s.MultiSync.Reset()
 	}

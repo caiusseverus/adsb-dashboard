@@ -17,7 +17,7 @@ func buildObs(centroidUS float64, bearingDeg float64, icao uint32, wallTS float6
 		RangeNM:    50.0,
 		PosAgeS:    posAge,
 		NReplies:   8,
-		SignalDBFS:  &sig,
+		SignalDBFS: &sig,
 		WallTS:     wallTS,
 	}
 }
@@ -324,7 +324,7 @@ func TestMultiSyncSolver_EscapeWrongSeed(t *testing.T) {
 			RangeNM:    0,
 			PosAgeS:    0.5,
 			NReplies:   8,
-			SignalDBFS:  &sig,
+			SignalDBFS: &sig,
 		}
 		se := scoredObs{
 			o:           o,
@@ -335,18 +335,18 @@ func TestMultiSyncSolver_EscapeWrongSeed(t *testing.T) {
 	}
 
 	// Directly invoke the candidate search (the part called during reacquire).
-	bestP, bestSc := ms.searchBestCandidate(scored, epochUS)
+	best := ms.searchBestCandidate(scored, epochUS)
 
 	// The winning candidate must score better than the wrong bootstrap for true-period obs.
 	wrongBootstrapScore := ms.evalCandidatePeriod(scored, wrongBootstrapS, epochUS)
-	if bestSc <= wrongBootstrapScore.score {
+	if best.score <= wrongBootstrapScore.score {
 		t.Errorf("candidate search did not find a better period than bootstrap: bestP=%.4f score=%.2f, bootstrap score=%.2f",
-			bestP, bestSc, wrongBootstrapScore.score)
+			best.periodS, best.score, wrongBootstrapScore.score)
 	}
 	// The winning period must be meaningfully closer to the true period than the bootstrap.
-	if math.Abs(bestP-truePeriodS) >= math.Abs(wrongBootstrapS-truePeriodS) {
+	if math.Abs(best.periodS-truePeriodS) >= math.Abs(wrongBootstrapS-truePeriodS) {
 		t.Errorf("reacquire candidate (%.4f) is not closer to true period (%.4f) than bootstrap (%.4f)",
-			bestP, truePeriodS, wrongBootstrapS)
+			best.periodS, truePeriodS, wrongBootstrapS)
 	}
 }
 
@@ -372,6 +372,40 @@ func TestMultiSyncSolver_NoDriftOnWeakEvidence(t *testing.T) {
 	}
 	if ms.TrustedBasePeriodS > 0 {
 		t.Errorf("TrustedBasePeriodS must not be promoted on weak evidence: got %.4f", ms.TrustedBasePeriodS)
+	}
+}
+
+func TestMultiSyncSolver_TrustStreakResetsOnNonEligibleUpdate(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	periodS := 4.0
+	sync := NewSyncState(1, periodS, 0.0, 45.0, 0.8)
+	now := float64(time.Now().UnixMicro()) / 1e6
+
+	for run := 0; run < 3; run++ {
+		for i := 0; i < 16; i++ {
+			us := float64(run*100+i) * periodS / 16.0 * 1e6
+			bearing := simulatedBearing(us, 0, 45.0, periodS)
+			ms.obs = append(ms.obs, buildObs(us, bearing, uint32(0xABC100+i%4), now+float64(run)))
+		}
+		ms.lastRunTS = 0.0
+		ms.TryUpdate(sync)
+	}
+	if ms.TrustUpdateStreak == 0 {
+		t.Fatal("expected streak to advance on clean updates")
+	}
+
+	// Weak-but-clean update: insufficient support for trust, but not a reacquire trigger.
+	ms.obs = nil
+	for i := 0; i < 4; i++ {
+		us := float64(400+i) * periodS * 1e6
+		bearing := simulatedBearing(us, 0, 45.0, periodS)
+		ms.obs = append(ms.obs, buildObs(us, bearing, uint32(0xABC200+i%2), now+10.0))
+	}
+	ms.lastRunTS = 0.0
+	ms.TryUpdate(sync)
+
+	if ms.TrustUpdateStreak != 0 {
+		t.Fatalf("expected non-trust-eligible update to reset streak, got %d", ms.TrustUpdateStreak)
 	}
 }
 
@@ -407,6 +441,81 @@ func TestMultiSyncSolver_ReacquireCandidateSearch(t *testing.T) {
 	}
 	if ms.LastReacquireCandidateSc < 0 {
 		t.Error("expected non-negative reacquire candidate score")
+	}
+}
+
+func TestMultiSyncSolver_ReacquirePublishesConsistentCandidateFamily(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	truePeriodS := 4.0
+	wrongSeedS := 4.08
+	sync := NewSyncState(1, wrongSeedS, 0.0, 45.0, 0.8)
+
+	now := float64(time.Now().UnixMicro()) / 1e6
+	var newestUS float64
+	var scored []scoredObs
+	seedPeriodUS := wrongSeedS * 1e6
+	for i := 0; i < 5; i++ {
+		us := float64(i) * truePeriodS * 0.8 * 1e6
+		bearing := simulatedBearing(us, 0.0, 45.0, truePeriodS)
+		obs := buildObs(us, bearing, uint32(0xABC001+i%3), now+float64(i)*0.4)
+		ms.obs = append(ms.obs, obs)
+		effectiveUS := msPropCorrectedUS(obs.CentroidUS, float64(obs.RangeNM))
+		predicted := msPredictBearing(0.0, 45.0, seedPeriodUS, effectiveUS)
+		residual := circularDiff(obs.BearingDeg, predicted)
+		absR := math.Abs(residual)
+		status := msClassifyResidual(absR)
+		baseW := msScoreObs(obs)
+		qMult := msICAOQualityMult(ms.ICAOQuality[obs.ICAO])
+		effectiveW := 0.0
+		switch status {
+		case "inlier":
+			effectiveW = baseW * qMult
+		case "soft":
+			effectiveW = baseW * 0.2 * qMult
+		}
+		fitRejectReason := msFitRejectReason(obs, status, absR, ms.ICAOQuality[obs.ICAO])
+		scored = append(scored, scoredObs{
+			o:               obs,
+			residual:        residual,
+			effectiveUS:     effectiveUS,
+			phaseInRot:      math.Mod((effectiveUS-0.0)/seedPeriodUS*360.0, 360.0),
+			baseW:           baseW,
+			effectiveW:      effectiveW,
+			status:          status,
+			fitEligible:     fitRejectReason == "",
+			fitRejectReason: fitRejectReason,
+		})
+		newestUS = us
+	}
+	ms.BootstrapPeriodS = wrongSeedS
+	ms.PeriodS = wrongSeedS
+	ms.Present = true
+	ms.PhaseEpochUS = 0.0
+	ms.PhaseOffsetDeg = 45.0
+	ms.PeriodFailureStreak = 3
+	ms.PeriodReacquireActive = true
+	ms.PeriodReacquireReason = "failure_streak"
+	ms.updateICAOQuality(scored)
+	expected := ms.searchBestCandidate(scored, 0.0)
+
+	ms.lastRunTS = 0.0
+	ms.TryUpdate(sync)
+
+	if math.Abs(ms.PeriodS-ms.LastReacquireCandidateP) > 1e-9 {
+		t.Fatalf("published period %.6f should match candidate %.6f", ms.PeriodS, ms.LastReacquireCandidateP)
+	}
+	if math.Abs(ms.PeriodS-wrongSeedS) < 1e-6 {
+		t.Fatalf("expected reacquire to publish a new candidate family, still at seed %.6f", wrongSeedS)
+	}
+	if math.Abs(ms.PeriodS-expected.periodS) > 1e-9 {
+		t.Fatalf("published period %.6f should match expected candidate %.6f", ms.PeriodS, expected.periodS)
+	}
+	expectedEpochUS := msPropCorrectedUS(newestUS, 50.0)
+	if math.Abs(ms.PhaseEpochUS-expected.newEpochUS) > 1e-6 || math.Abs(ms.PhaseEpochUS-expectedEpochUS) > 1e-6 {
+		t.Fatalf("published phase epoch %.1f should match candidate/newest effective epoch %.1f", ms.PhaseEpochUS, expected.newEpochUS)
+	}
+	if math.Abs(circularDiff(ms.PhaseOffsetDeg, expected.publishedOffsetDeg)) > 1e-6 {
+		t.Fatalf("published phase offset %.6f should match candidate package %.6f", ms.PhaseOffsetDeg, expected.publishedOffsetDeg)
 	}
 }
 
@@ -538,7 +647,7 @@ func TestEvalCandidatePeriod_CorrectPeriodScoresHigher(t *testing.T) {
 			RangeNM:    0, // no propagation correction in this test
 			PosAgeS:    0.5,
 			NReplies:   8,
-			SignalDBFS:  &sig,
+			SignalDBFS: &sig,
 		}
 		se := scoredObs{
 			o:           o,

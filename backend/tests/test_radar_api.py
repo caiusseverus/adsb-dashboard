@@ -97,6 +97,99 @@ def test_get_iid_timeline_includes_primary_harmonic_and_residual_classification(
     assert [series["family"] for series in rows["CCCCCC"]["family_series"]] == ["residual"]
 
 
+def test_get_iid_timeline_falls_back_to_go_evidence_when_burst_records_absent():
+    state = RadarState()
+    state._go_evidence_events = deque([
+        {
+            "kind": "burst_fired",
+            "iid": 31,
+            "icao": "AAAAAA",
+            "arrival_us": 10_000_000.0,
+            "wall_ts": 1_000.0,
+        },
+        {
+            "kind": "burst_fired",
+            "iid": 31,
+            "icao": "BBBBBB",
+            "arrival_us": 10_500_000.0,
+            "wall_ts": 1_000.1,
+        },
+        {
+            "kind": "burst_fired",
+            "iid": 31,
+            "icao": "AAAAAA",
+            "arrival_us": 14_000_000.0,
+            "wall_ts": 1_001.0,
+        },
+    ], maxlen=state._GO_EVIDENCE_EVENTS_MAX)
+
+    payload = radar_api.build_iid_timeline_payload(state, 31, window_s=30.0)
+
+    rows = {row["icao"]: row for row in payload["icaos"]}
+    assert rows["AAAAAA"]["arrivals_us"] == [10_000_000.0, 14_000_000.0]
+    assert rows["BBBBBB"]["arrivals_us"] == [10_500_000.0]
+
+
+def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_labels(monkeypatch):
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+    state = RadarState()
+    state.update_go_snapshot({
+        "iids": {
+            "23": {
+                "iid": 23,
+                "sync_state_present": True,
+                "sync_state_usable": True,
+                "sync_period_s": 4.25,
+                "sync_phase_epoch_us": 0.0,
+                "sync_phase_offset_deg": 12.0,
+                "sync_quality": 0.82,
+                "sync_jitter_deg": 1.5,
+                "sync_residual_ema_deg": 2.5,
+                "sync_n_frames": 17,
+                "sync_n_rejected_frames": 3,
+                "sync_holdover": False,
+                "sync_last_updated": 1_000.0,
+                "multi_sync_admission": {
+                    "last_reason": "no_receiver_config",
+                    "last_icao": 0xABCDEF,
+                    "last_ts": 999.5,
+                    "counts": {
+                        "no_receiver_config": 7,
+                        "admitted": 2,
+                    },
+                },
+            }
+        }
+    })
+    state._models[23] = RadarIID(iid=23, status="SINGLE_RADAR", period_s=4.25)
+    state._go_evidence_events = deque([
+        {
+            "kind": "burst_fired",
+            "iid": 23,
+            "icao": "ABCDEF",
+            "arrival_us": 4_100_000.0,
+            "wall_ts": 1_000.0,
+            "n_replies": 4,
+            "signal_dbfs": -18.0,
+            "truth_lat": 51.5,
+            "truth_lon": -0.1,
+            "position_age_s": 0.4,
+            "sync_eligible": True,
+        },
+    ], maxlen=state._GO_EVIDENCE_EVENTS_MAX)
+
+    payload = radar_api.build_iid_sync_snapshot_payload(state, 23, window_s=60.0, debug_limit=20)
+
+    assert payload["sync_state"]["source"] == "sweep_frame_go"
+    assert payload["sync_state"]["period_authoritative_source"] == "base"
+    assert payload["observations"] == []
+    assert payload["alignment_status"]["reason"] == "radar_position_unavailable"
+    assert payload["alignment_status"]["multi_sync_admission"]["last_reason"] == "no_receiver_config"
+    assert payload["alignment_status"]["multi_sync_admission"]["counts"]["no_receiver_config"] == 7
+
+
 def test_get_iid_sync_debug_endpoint_exposes_summary_and_observation(monkeypatch):
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", True)

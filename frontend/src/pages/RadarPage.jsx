@@ -2032,6 +2032,7 @@ function RotationAlignmentPanel({
   const burstTimeline = syncSnapshot
   const rotation = syncSnapshot?.rotation ?? null
   const observations = Array.isArray(burstTimeline?.observations) ? burstTimeline.observations : []
+  const alignmentStatus = burstTimeline?.alignment_status ?? null
   const legacyIcaosRaw = Array.isArray(legacyTimeline?.icaos) ? legacyTimeline.icaos : []
   const syncState = burstTimeline?.sync_state ?? null
   const loading = legacyLoading || streamStatus.mode === 'connecting' || streamStatus.mode === 'reconnecting'
@@ -2413,9 +2414,10 @@ function RotationAlignmentPanel({
         <>
           {filteredObservations.length === 0 && df11ResidualDots.length === 0 ? (
             <div className={styles.empty}>
-              {syncState
-                ? 'No burst-sync or DF11 residual data yet for this IID.'
-                : 'Waiting for a maintained sync model before backend DF11 residual dots can be computed.'}
+              {alignmentStatus?.detail
+                ?? (syncState
+                  ? 'No burst-sync or DF11 residual data yet for this IID.'
+                  : 'Waiting for a maintained sync model before backend DF11 residual dots can be computed.')}
             </div>
           ) : (
             <>
