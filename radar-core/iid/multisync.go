@@ -137,6 +137,14 @@ type candidateEvalResult struct {
 	anchorPhaseDeg     float64
 }
 
+type publishedAlignment struct {
+	epochUS        float64
+	offsetDeg      float64
+	anchorICAO     *uint32
+	anchorScore    float64
+	anchorPhaseDeg float64
+}
+
 // MultiSyncSnapshot is a point-in-time view for protocol emission.
 type MultiSyncSnapshot struct {
 	Present               bool
@@ -502,15 +510,6 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 	}
 	aFit, bFit := weightedLinearFit(xs, ys, ws)
 
-	finalEpochUS, finalOffsetDeg, anchorICAO, anchorScore, anchorPhaseDeg := ms.buildPublishedAlignment(
-		scored,
-		seedEpochUS,
-		seedOffsetDeg,
-		livePeriodS,
-		aFit,
-		nInliers,
-	)
-
 	// Period refinement.
 	spanS := 0.0
 	for _, x := range xs {
@@ -546,6 +545,10 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 	}
 	ms.LastWrongPeriodSuspect = wrongPeriodSuspect
 
+	finalPeriodS := refinedPeriodS
+	var finalAlignment publishedAlignment
+	finalAlignmentReady := false
+
 	cleanUpdate := len(recent) > 0 &&
 		float64(nRejected)/float64(len(recent)) < 0.25 &&
 		len(fitPool) >= 6 &&
@@ -571,12 +574,15 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 			ms.LastReacquireCandidateP = best.periodS
 			ms.LastReacquireCandidateSc = best.score
 			if best.periodS > 0 {
-				refinedPeriodS = best.periodS
-				finalEpochUS = best.newEpochUS
-				finalOffsetDeg = best.publishedOffsetDeg
-				anchorICAO = best.anchorICAO
-				anchorScore = best.anchorScore
-				anchorPhaseDeg = best.anchorPhaseDeg
+				finalPeriodS = best.periodS
+				finalAlignment = publishedAlignment{
+					epochUS:        best.newEpochUS,
+					offsetDeg:      best.publishedOffsetDeg,
+					anchorICAO:     best.anchorICAO,
+					anchorScore:    best.anchorScore,
+					anchorPhaseDeg: best.anchorPhaseDeg,
+				}
+				finalAlignmentReady = true
 			}
 		}
 	} else {
@@ -591,12 +597,15 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 			ms.LastReacquireCandidateP = best.periodS
 			ms.LastReacquireCandidateSc = best.score
 			if best.periodS > 0 {
-				refinedPeriodS = best.periodS
-				finalEpochUS = best.newEpochUS
-				finalOffsetDeg = best.publishedOffsetDeg
-				anchorICAO = best.anchorICAO
-				anchorScore = best.anchorScore
-				anchorPhaseDeg = best.anchorPhaseDeg
+				finalPeriodS = best.periodS
+				finalAlignment = publishedAlignment{
+					epochUS:        best.newEpochUS,
+					offsetDeg:      best.publishedOffsetDeg,
+					anchorICAO:     best.anchorICAO,
+					anchorScore:    best.anchorScore,
+					anchorPhaseDeg: best.anchorPhaseDeg,
+				}
+				finalAlignmentReady = true
 			}
 		} else {
 			// Not in reacquire; clear stale candidate diagnostics.
@@ -634,6 +643,18 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 		ms.TrustUpdateStreak = 0
 	}
 
+	if ms.TrustedBasePeriodS > 0 {
+		basePeriodS = ms.TrustedBasePeriodS
+	} else if ms.BootstrapPeriodS > 0 {
+		basePeriodS = ms.BootstrapPeriodS
+	} else {
+		basePeriodS = seedPeriodS
+	}
+
+	if !finalAlignmentReady {
+		finalAlignment = ms.buildAlignmentForPeriod(scored, seedEpochUS, seedOffsetDeg, finalPeriodS)
+	}
+
 	// Capture per-run clamp diagnostics (after refinePeriod returned them).
 	ms.LastBaseClamped = clampedByBase
 	ms.LastBaseClampDiffPPM = clampDiffPPM
@@ -661,19 +682,100 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, nowUnix float64) {
 	// Publish.
 	ms.Present = true
 	ms.Usable = len(fitPool) >= 4 && !majorityRejected
-	ms.PeriodS = refinedPeriodS
+	ms.PeriodS = finalPeriodS
 	ms.PeriodBaseS = basePeriodS
-	ms.PhaseEpochUS = finalEpochUS
-	ms.PhaseOffsetDeg = finalOffsetDeg
+	ms.PhaseEpochUS = finalAlignment.epochUS
+	ms.PhaseOffsetDeg = finalAlignment.offsetDeg
 	ms.JitterDeg = clamp(newResidualEMA, 1.5, 20.0)
 	ms.ResidualEMADeg = newResidualEMA
 	ms.NSyncUpdates++
 	ms.Holdover = len(fitPool) < 2
 	ms.LastUpdated = nowUnix
-	if anchorICAO != nil {
-		ms.AnchorICAO = anchorICAO
-		ms.AnchorPhaseDeg = anchorPhaseDeg
-		ms.AnchorScore = anchorScore
+	if finalAlignment.anchorICAO != nil {
+		ms.AnchorICAO = finalAlignment.anchorICAO
+		ms.AnchorPhaseDeg = finalAlignment.anchorPhaseDeg
+		ms.AnchorScore = finalAlignment.anchorScore
+	}
+}
+
+func (ms *MultiSyncSolver) buildAlignmentForPeriod(
+	scored []scoredObs,
+	seedEpochUS, seedOffsetDeg, periodS float64,
+) publishedAlignment {
+	periodUS := periodS * 1e6
+	if periodUS <= 0 {
+		return publishedAlignment{epochUS: seedEpochUS, offsetDeg: seedOffsetDeg}
+	}
+
+	type fitEntry struct {
+		effectiveUS float64
+		residual    float64
+		weight      float64
+	}
+	var fitPool []fitEntry
+	nInliers := 0
+	for _, se := range scored {
+		predicted := msPredictBearing(seedEpochUS, seedOffsetDeg, periodUS, se.effectiveUS)
+		residual := circularDiff(se.o.BearingDeg, predicted)
+		absResidual := math.Abs(residual)
+		if se.fitEligible && se.effectiveW > 0 {
+			fitPool = append(fitPool, fitEntry{
+				effectiveUS: se.effectiveUS,
+				residual:    residual,
+				weight:      se.effectiveW,
+			})
+		}
+		if msClassifyResidual(absResidual) == "inlier" {
+			nInliers++
+		}
+	}
+	if len(fitPool) == 0 {
+		for _, se := range scored {
+			if se.baseW <= 0 || se.fitRejectReason == "near_wrap_residual" {
+				continue
+			}
+			predicted := msPredictBearing(seedEpochUS, seedOffsetDeg, periodUS, se.effectiveUS)
+			fitPool = append(fitPool, fitEntry{
+				effectiveUS: se.effectiveUS,
+				residual:    circularDiff(se.o.BearingDeg, predicted),
+				weight:      se.baseW * msICAOQualityMult(ms.ICAOQuality[se.o.ICAO]),
+			})
+		}
+	}
+	if len(fitPool) == 0 {
+		return publishedAlignment{epochUS: seedEpochUS, offsetDeg: seedOffsetDeg}
+	}
+
+	tRef := fitPool[0].effectiveUS
+	for _, fe := range fitPool[1:] {
+		if fe.effectiveUS < tRef {
+			tRef = fe.effectiveUS
+		}
+	}
+	tRef /= 1e6
+	xs := make([]float64, len(fitPool))
+	ys := make([]float64, len(fitPool))
+	ws := make([]float64, len(fitPool))
+	for i, fe := range fitPool {
+		xs[i] = fe.effectiveUS/1e6 - tRef
+		ys[i] = fe.residual
+		ws[i] = fe.weight
+	}
+	phaseAdjustDeg, _ := weightedLinearFit(xs, ys, ws)
+	newEpochUS, publishedOffsetDeg, anchorICAO, anchorScore, anchorPhaseDeg := ms.buildPublishedAlignment(
+		scored,
+		seedEpochUS,
+		seedOffsetDeg,
+		periodS,
+		phaseAdjustDeg,
+		nInliers,
+	)
+	return publishedAlignment{
+		epochUS:        newEpochUS,
+		offsetDeg:      publishedOffsetDeg,
+		anchorICAO:     anchorICAO,
+		anchorScore:    anchorScore,
+		anchorPhaseDeg: anchorPhaseDeg,
 	}
 }
 

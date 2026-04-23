@@ -166,12 +166,15 @@ class TestBurstFiredDecode:
             "s": -33.0,
             "la": 51.5, "lo": -0.1,
             "br": 275.3, "rn": 42.1, "pa": 1.2,
-            "df": True, "se": True,
+            "df": True, "se": True, "ce": True, "rp": True, "ru": False,
         })
         assert d["t"] == P.MSG_BURST_FIRED
         assert d["cu"] == pytest.approx(9876543210.75)
         assert d["df"] is True
         assert d["se"] is True
+        assert d["ce"] is True
+        assert d["rp"] is True
+        assert d["ru"] is False
 
     def test_no_position(self):
         d = _make_outbound({

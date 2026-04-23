@@ -119,26 +119,32 @@ func TestResetIIDRoundTrip(t *testing.T) {
 
 func TestBurstFiredRoundTrip(t *testing.T) {
 	orig := &protocol.BurstFired{
-		MsgType:        protocol.MsgBurstFired,
-		IID:            2,
-		ICAO:           0x3C4B4A,
-		CentroidUS:     9876543210.75,
-		NReplies:       5,
-		SignalDBFS:     pf32(-33.0),
-		Lat:            pf64(51.5),
-		Lon:            pf64(-0.1),
-		BearingDeg:     pf32(275.3),
-		RangeNM:        pf32(42.1),
-		PosAgeS:        pf32(1.2),
-		DominantFamily: true,
-		SyncEligible:   true,
+		MsgType:             protocol.MsgBurstFired,
+		IID:                 2,
+		ICAO:                0x3C4B4A,
+		CentroidUS:          9876543210.75,
+		NReplies:            5,
+		SignalDBFS:          pf32(-33.0),
+		Lat:                 pf64(51.5),
+		Lon:                 pf64(-0.1),
+		BearingDeg:          pf32(275.3),
+		RangeNM:             pf32(42.1),
+		PosAgeS:             pf32(1.2),
+		DominantFamily:      true,
+		SyncEligible:        true,
+		CompactSyncEligible: true,
+		RefinedSyncPresent:  true,
+		RefinedSyncUsable:   false,
 	}
 	got := roundTrip(t, orig).(*protocol.BurstFired)
 	if got.CentroidUS != orig.CentroidUS {
 		t.Errorf("CentroidUS: got %v want %v", got.CentroidUS, orig.CentroidUS)
 	}
-	if !got.DominantFamily || !got.SyncEligible {
-		t.Errorf("bool fields lost: DominantFamily=%v SyncEligible=%v", got.DominantFamily, got.SyncEligible)
+	if !got.DominantFamily || !got.SyncEligible || !got.CompactSyncEligible || !got.RefinedSyncPresent || got.RefinedSyncUsable {
+		t.Errorf(
+			"bool fields lost: DominantFamily=%v SyncEligible=%v CompactSyncEligible=%v RefinedSyncPresent=%v RefinedSyncUsable=%v",
+			got.DominantFamily, got.SyncEligible, got.CompactSyncEligible, got.RefinedSyncPresent, got.RefinedSyncUsable,
+		)
 	}
 	if got.Lat == nil || math.Abs(*got.Lat-*orig.Lat) > 1e-9 {
 		t.Errorf("Lat: got %v want %v", got.Lat, orig.Lat)

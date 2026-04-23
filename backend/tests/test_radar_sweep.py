@@ -683,10 +683,45 @@ def test_update_go_burst_fired_triggers_multi_sync_update_from_go_evidence(monke
         "pa": 0.2,
         "df": True,
         "se": True,
+        "ce": True,
+        "rp": True,
+        "ru": False,
     })
 
     assert calls == [(7, 4.0)]
     assert list(state._live_aligned_burst_obs.get(7, [])) == []
+
+
+def test_update_go_burst_fired_tracks_compact_vs_refined_sync_semantics():
+    state = RadarState()
+
+    state.update_go_burst_fired({
+        "i": 7,
+        "c": int("AAAAAA", 16),
+        "cu": 4_000_000.0,
+        "n": 4,
+        "s": -15.0,
+        "la": 51.1,
+        "lo": 0.1,
+        "pa": 0.2,
+        "df": True,
+        "se": True,
+        "ce": True,
+        "rp": True,
+        "ru": False,
+    })
+
+    track = state._go_track_observations[-1]
+    evidence = state._go_evidence_events[-1]
+
+    assert track["sync_eligible"] is True
+    assert track["compact_sync_eligible"] is True
+    assert track["refined_sync_present"] is True
+    assert track["refined_sync_usable"] is False
+    assert evidence["sync_eligible"] is True
+    assert evidence["compact_sync_eligible"] is True
+    assert evidence["refined_sync_present"] is True
+    assert evidence["refined_sync_usable"] is False
 
 
 def test_live_sync_observation_buffers_prune_by_age_with_high_count_caps(monkeypatch):

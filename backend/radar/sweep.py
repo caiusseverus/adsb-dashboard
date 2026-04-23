@@ -3899,7 +3899,15 @@ class RadarState:
                 ),
                 "association_confidence": float(entry.get("association_confidence") or 0.0),
                 "dominant_family": bool(entry.get("dominant_family")),
-                "sync_eligible": bool(entry.get("sync_eligible")),
+                "compact_sync_eligible": bool(
+                    entry.get("compact_sync_eligible", entry.get("sync_eligible"))
+                ),
+                "refined_sync_present": bool(entry.get("refined_sync_present")),
+                "refined_sync_usable": bool(entry.get("refined_sync_usable")),
+                # Legacy alias retained for older callers that still read sync_eligible.
+                "sync_eligible": bool(
+                    entry.get("compact_sync_eligible", entry.get("sync_eligible"))
+                ),
             }
         except Exception:
             return None
@@ -4084,7 +4092,15 @@ class RadarState:
                 ),
                 "association_confidence": float(entry.get("association_confidence") or 0.0),
                 "dominant_family": bool(entry.get("dominant_family")),
-                "sync_eligible": bool(entry.get("sync_eligible")),
+                "compact_sync_eligible": bool(
+                    entry.get("compact_sync_eligible", entry.get("sync_eligible"))
+                ),
+                "refined_sync_present": bool(entry.get("refined_sync_present")),
+                "refined_sync_usable": bool(entry.get("refined_sync_usable")),
+                # Legacy alias retained for older callers that still read sync_eligible.
+                "sync_eligible": bool(
+                    entry.get("compact_sync_eligible", entry.get("sync_eligible"))
+                ),
             }
         except Exception:
             return None
@@ -4101,7 +4117,10 @@ class RadarState:
             "position_age_s": burst_dict.get("pa"),
             "association_confidence": 1.0 if burst_dict.get("la") is not None and burst_dict.get("lo") is not None else 0.0,
             "dominant_family": burst_dict.get("df"),
-            "sync_eligible": burst_dict.get("se"),
+            "compact_sync_eligible": burst_dict.get("ce", burst_dict.get("se")),
+            "refined_sync_present": burst_dict.get("rp"),
+            "refined_sync_usable": burst_dict.get("ru"),
+            "sync_eligible": burst_dict.get("ce", burst_dict.get("se")),
         })
         if entry is None:
             return
@@ -4127,7 +4146,10 @@ class RadarState:
             "position_age_s": burst_dict.get("pa"),
             "association_confidence": entry["association_confidence"],
             "dominant_family": burst_dict.get("df"),
-            "sync_eligible": burst_dict.get("se"),
+            "compact_sync_eligible": burst_dict.get("ce", burst_dict.get("se")),
+            "refined_sync_present": burst_dict.get("rp"),
+            "refined_sync_usable": burst_dict.get("ru"),
+            "sync_eligible": burst_dict.get("ce", burst_dict.get("se")),
         })
         sync_update_iid = None
         sync_update_period_s = None
@@ -4135,7 +4157,7 @@ class RadarState:
             self._go_track_observations.append(entry)
             if evidence is not None:
                 self._go_evidence_events.append(evidence)
-                if evidence.get("sync_eligible"):
+                if evidence.get("compact_sync_eligible"):
                     iid = int(evidence["iid"])
                     sync = self._live_sync_states.get(iid)
                     model = self._models.get(iid)
@@ -7865,7 +7887,9 @@ class RadarState:
                 pos_age_s=pos_age_s,
                 range_nm=range_nm,
                 ts=wall_ts,
-                sync_update_eligible=bool(entry.get("sync_eligible", False)),
+                sync_update_eligible=bool(
+                    entry.get("compact_sync_eligible", entry.get("sync_eligible", False))
+                ),
                 raw_arrival_us=float(entry["arrival_us"]),
                 prop_delay_aircraft_to_receiver_us=prop_delay_us,
                 prop_delay_radar_to_aircraft_us=None,

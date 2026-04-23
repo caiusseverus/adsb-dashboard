@@ -101,6 +101,12 @@ type engine struct {
 	framesEmitted atomic.Uint64
 }
 
+type exportSyncEligibility struct {
+	compactEligible bool
+	refinedPresent  bool
+	refinedUsable   bool
+}
+
 func newEngine() *engine {
 	return &engine{
 		writer:       output.NewWriter(),
@@ -345,7 +351,7 @@ func (e *engine) emitBurstFired(s *iid.IIDState, f *burst.FiredBurst) {
 	if family := s.FamilySnapshot(); family != nil && family.FoldedICAOs != nil {
 		_, dominantFamily = family.FoldedICAOs[f.ICAO]
 	}
-	syncQuality, _ := s.SyncSnapshot()
+	eligibility := e.exportSyncEligibility(s, dominantFamily, assoc)
 	simpleCentroid := f.SimpleCentroidUS
 	centroidDelta := f.CentroidDeltaUS
 	firstReply := f.FirstReplyUS
@@ -358,26 +364,29 @@ func (e *engine) emitBurstFired(s *iid.IIDState, f *burst.FiredBurst) {
 	}
 
 	e.writer.Send(&protocol.BurstFired{
-		MsgType:            protocol.MsgBurstFired,
-		IID:                f.IID,
-		ICAO:               f.ICAO,
-		CentroidUS:         f.CentroidUS,
-		SimpleCentroidUS:   &simpleCentroid,
-		WeightedCentroidUS: f.WeightedCentroidUS,
-		CentroidDeltaUS:    &centroidDelta,
-		FirstReplyUS:       &firstReply,
-		StrongestReplyUS:   f.StrongestReplyUS,
-		MidStrongWindowUS:  f.MidStrongWindowUS,
-		LastReplyUS:        &lastReply,
-		SpanUS:             &spanUS,
-		PeakAmplitude:      peakAmplitude,
-		NReplies:           uint8(nReplies),
-		SignalDBFS:         sig,
-		Lat:                latPtr,
-		Lon:                lonPtr,
-		PosAgeS:            posAgePtr,
-		DominantFamily:     dominantFamily,
-		SyncEligible:       dominantFamily && assoc > 0.0 && syncQuality >= 0.3,
+		MsgType:             protocol.MsgBurstFired,
+		IID:                 f.IID,
+		ICAO:                f.ICAO,
+		CentroidUS:          f.CentroidUS,
+		SimpleCentroidUS:    &simpleCentroid,
+		WeightedCentroidUS:  f.WeightedCentroidUS,
+		CentroidDeltaUS:     &centroidDelta,
+		FirstReplyUS:        &firstReply,
+		StrongestReplyUS:    f.StrongestReplyUS,
+		MidStrongWindowUS:   f.MidStrongWindowUS,
+		LastReplyUS:         &lastReply,
+		SpanUS:              &spanUS,
+		PeakAmplitude:       peakAmplitude,
+		NReplies:            uint8(nReplies),
+		SignalDBFS:          sig,
+		Lat:                 latPtr,
+		Lon:                 lonPtr,
+		PosAgeS:             posAgePtr,
+		DominantFamily:      dominantFamily,
+		SyncEligible:        eligibility.compactEligible,
+		CompactSyncEligible: eligibility.compactEligible,
+		RefinedSyncPresent:  eligibility.refinedPresent,
+		RefinedSyncUsable:   eligibility.refinedUsable,
 	})
 }
 
@@ -401,7 +410,7 @@ func (e *engine) recordObservationExports(s *iid.IIDState, f *burst.FiredBurst) 
 	if family := s.FamilySnapshot(); family != nil && family.FoldedICAOs != nil {
 		_, dominantFamily = family.FoldedICAOs[f.ICAO]
 	}
-	syncQuality, _ := s.SyncSnapshot()
+	eligibility := e.exportSyncEligibility(s, dominantFamily, assoc)
 	wallTS := float64(time.Now().UnixNano()) / float64(time.Second)
 	track := rcexport.TrackObservation{
 		IID:                   f.IID,
@@ -414,7 +423,10 @@ func (e *engine) recordObservationExports(s *iid.IIDState, f *burst.FiredBurst) 
 		PositionAgeS:          posAgePtr,
 		AssociationConfidence: assoc,
 		DominantFamily:        dominantFamily,
-		SyncEligible:          dominantFamily && assoc > 0.0 && syncQuality >= 0.3,
+		SyncEligible:          eligibility.compactEligible,
+		CompactSyncEligible:   eligibility.compactEligible,
+		RefinedSyncPresent:    eligibility.refinedPresent,
+		RefinedSyncUsable:     eligibility.refinedUsable,
 	}
 	tExport := time.Now()
 	e.exports.RecordTrackObservation(track)
@@ -446,9 +458,26 @@ func (e *engine) recordObservationExports(s *iid.IIDState, f *burst.FiredBurst) 
 		PositionAgeS:          posAgePtr,
 		DominantFamily:        dominantFamily,
 		SyncEligible:          track.SyncEligible,
+		CompactSyncEligible:   track.CompactSyncEligible,
+		RefinedSyncPresent:    track.RefinedSyncPresent,
+		RefinedSyncUsable:     track.RefinedSyncUsable,
 		AssociationConfidence: assoc,
 	})
 	e.profiler.Observe("evidence_export", time.Since(tExport))
+}
+
+func (e *engine) exportSyncEligibility(s *iid.IIDState, dominantFamily bool, assoc float32) exportSyncEligibility {
+	syncQuality, _ := s.SyncSnapshot()
+	result := exportSyncEligibility{
+		compactEligible: dominantFamily && assoc > 0.0 && syncQuality >= 0.3,
+	}
+	if s.MultiSync == nil {
+		return result
+	}
+	snap := s.MultiSync.Snapshot()
+	result.refinedPresent = snap.Present
+	result.refinedUsable = snap.Present && snap.Usable
+	return result
 }
 
 func (e *engine) recordSweepFrame(frameMsg *protocol.FrameReady) {

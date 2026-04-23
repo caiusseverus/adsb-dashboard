@@ -64,28 +64,34 @@ type SweepFrameObservation struct {
 
 // EvidenceEvent is the stable exported compact evidence DTO.
 type EvidenceEvent struct {
-	Kind                  string   `codec:"kind" json:"kind"`
-	IID                   uint8    `codec:"iid" json:"iid"`
-	ICAO                  uint32   `codec:"icao" json:"icao"`
-	ArrivalUS             float64  `codec:"arrival_us" json:"arrival_us"`
-	SimpleCentroidUS      *float64 `codec:"simple_centroid_us" json:"simple_centroid_us"`
-	WeightedCentroidUS    *float64 `codec:"weighted_centroid_us" json:"weighted_centroid_us"`
-	CentroidDeltaUS       *float64 `codec:"centroid_delta_us" json:"centroid_delta_us"`
-	FirstReplyUS          *float64 `codec:"first_reply_us" json:"first_reply_us"`
-	StrongestReplyUS      *float64 `codec:"strongest_reply_us" json:"strongest_reply_us"`
-	MidStrongWindowUS     *float64 `codec:"mid_strong_window_us" json:"mid_strong_window_us"`
-	LastReplyUS           *float64 `codec:"last_reply_us" json:"last_reply_us"`
-	SpanUS                *float64 `codec:"span_us" json:"span_us"`
-	PeakAmplitude         *float32 `codec:"peak_amplitude" json:"peak_amplitude"`
-	WallTS                float64  `codec:"wall_ts" json:"wall_ts"`
-	NReplies              uint8    `codec:"n_replies" json:"n_replies"`
-	SignalDBFS            *float32 `codec:"signal_dbfs" json:"signal_dbfs"`
-	TruthLat              *float64 `codec:"truth_lat" json:"truth_lat"`
-	TruthLon              *float64 `codec:"truth_lon" json:"truth_lon"`
-	PositionAgeS          *float32 `codec:"position_age_s" json:"position_age_s"`
-	DominantFamily        bool     `codec:"dominant_family" json:"dominant_family"`
-	SyncEligible          bool     `codec:"sync_eligible" json:"sync_eligible"`
-	AssociationConfidence float32  `codec:"association_confidence" json:"association_confidence"`
+	Kind               string   `codec:"kind" json:"kind"`
+	IID                uint8    `codec:"iid" json:"iid"`
+	ICAO               uint32   `codec:"icao" json:"icao"`
+	ArrivalUS          float64  `codec:"arrival_us" json:"arrival_us"`
+	SimpleCentroidUS   *float64 `codec:"simple_centroid_us" json:"simple_centroid_us"`
+	WeightedCentroidUS *float64 `codec:"weighted_centroid_us" json:"weighted_centroid_us"`
+	CentroidDeltaUS    *float64 `codec:"centroid_delta_us" json:"centroid_delta_us"`
+	FirstReplyUS       *float64 `codec:"first_reply_us" json:"first_reply_us"`
+	StrongestReplyUS   *float64 `codec:"strongest_reply_us" json:"strongest_reply_us"`
+	MidStrongWindowUS  *float64 `codec:"mid_strong_window_us" json:"mid_strong_window_us"`
+	LastReplyUS        *float64 `codec:"last_reply_us" json:"last_reply_us"`
+	SpanUS             *float64 `codec:"span_us" json:"span_us"`
+	PeakAmplitude      *float32 `codec:"peak_amplitude" json:"peak_amplitude"`
+	WallTS             float64  `codec:"wall_ts" json:"wall_ts"`
+	NReplies           uint8    `codec:"n_replies" json:"n_replies"`
+	SignalDBFS         *float32 `codec:"signal_dbfs" json:"signal_dbfs"`
+	TruthLat           *float64 `codec:"truth_lat" json:"truth_lat"`
+	TruthLon           *float64 `codec:"truth_lon" json:"truth_lon"`
+	PositionAgeS       *float32 `codec:"position_age_s" json:"position_age_s"`
+	DominantFamily     bool     `codec:"dominant_family" json:"dominant_family"`
+	// SyncEligible is the legacy compact/bootstrap sync-admission bit. It aliases
+	// CompactSyncEligible for backward compatibility and does not mean refined
+	// multi-aircraft sync is already usable.
+	SyncEligible          bool    `codec:"sync_eligible" json:"sync_eligible"`
+	CompactSyncEligible   bool    `codec:"compact_sync_eligible" json:"compact_sync_eligible"`
+	RefinedSyncPresent    bool    `codec:"refined_sync_present" json:"refined_sync_present"`
+	RefinedSyncUsable     bool    `codec:"refined_sync_usable" json:"refined_sync_usable"`
+	AssociationConfidence float32 `codec:"association_confidence" json:"association_confidence"`
 }
 
 // TrackObservation is the stable exported Stage 3 observation DTO.
@@ -100,7 +106,13 @@ type TrackObservation struct {
 	PositionAgeS          *float32 `codec:"position_age_s" json:"position_age_s"`
 	AssociationConfidence float32  `codec:"association_confidence" json:"association_confidence"`
 	DominantFamily        bool     `codec:"dominant_family" json:"dominant_family"`
-	SyncEligible          bool     `codec:"sync_eligible" json:"sync_eligible"`
+	// SyncEligible is the legacy compact/bootstrap sync-admission bit. It aliases
+	// CompactSyncEligible for backward compatibility and does not mean refined
+	// multi-aircraft sync is already usable.
+	SyncEligible        bool `codec:"sync_eligible" json:"sync_eligible"`
+	CompactSyncEligible bool `codec:"compact_sync_eligible" json:"compact_sync_eligible"`
+	RefinedSyncPresent  bool `codec:"refined_sync_present" json:"refined_sync_present"`
+	RefinedSyncUsable   bool `codec:"refined_sync_usable" json:"refined_sync_usable"`
 }
 
 // StageProfile is one exported timing aggregate.

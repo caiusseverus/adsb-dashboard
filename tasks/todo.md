@@ -25,3 +25,29 @@ Plan confirmation:
 - Intentional non-goals left unchanged:
   - Waveform correction and motion-compensation parity remain richer on the Python authoritative multi-aircraft path.
   - Stage 3 ownership boundaries remain unchanged; Python still reshapes/explains Go-owned sync state rather than retaking authoritative hot-path fitting.
+
+## 2026-04-23 Multi-Sync Consistency And Export Semantics Fixes
+
+- [x] Inspect the remaining refined multi-sync ordering, trust-promotion, and export-semantic bugs in the current Go/Python paths and confirm the concrete failure modes in code
+- [x] Refactor `radar-core/iid/multisync.go` so each solver run selects the final published period before any published alignment/anchor values are built, covering both normal refinement and reacquire candidate flows
+- [x] Ensure `PeriodBaseS` published by the multi-sync snapshot reflects the effective base after same-run trust promotion rather than the pre-promotion base
+- [x] Make exported sync eligibility semantics explicit and internally consistent across `radar-core/cmd/radar-core/main.go`, protocol/export payloads, and Python consumers
+- [x] Add or update focused tests for normal refinement alignment consistency, reacquire alignment consistency, trust-promotion base diagnostics, and exported sync eligibility semantics
+- [x] Run focused verification, capture results here, and note any compatibility tradeoffs
+
+Plan confirmation:
+- The solver will publish one coherent family per run: `PeriodS`, `PhaseEpochUS`, `PhaseOffsetDeg`, anchor ICAO, and anchor phase will all be derived from the same final published period.
+- Exported objects will stop overloading one ambiguous sync-eligibility bit. Compact/bootstrap gating and authoritative refined-sync usability will be exposed with explicit names and preserved consistently through Go and Python.
+
+### Review
+- Root causes fixed:
+  - `runFit()` no longer computes published alignment from `livePeriodS` before final period selection. It now chooses the final published period first, then builds one final alignment package from that period, or uses the selected reacquire candidate package directly.
+  - `PeriodBaseS` now reflects the post-promotion effective base for the same solver run, so the snapshot stops lagging one cycle behind `TrustedBasePeriodS`.
+  - Exported burst/evidence/track objects now expose explicit compact/bootstrap vs refined sync semantics: legacy `sync_eligible` is preserved as a compact-sync alias, and new `compact_sync_eligible`, `refined_sync_present`, and `refined_sync_usable` fields make the meaning explicit.
+- Verification:
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./...` (from `radar-core/`) → passed
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_core_protocol.py -q` → `111 passed`
+  - `uv run --directory backend pytest tests/test_radar_api.py -q` → `47 passed`
+- Compatibility notes:
+  - `sync_eligible` remains on the wire and in exported snapshots as a backward-compatible alias for compact/bootstrap sync admission.
+  - New explicit refined-sync fields are additive and are preferred by updated Python consumers.

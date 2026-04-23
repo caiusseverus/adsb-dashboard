@@ -33,6 +33,55 @@ func simulatedBearing(centroidUS, epochUS, offsetDeg, periodS float64) float64 {
 	return math.Mod(phase+offsetDeg, 360.0)
 }
 
+func scoreObsForSeed(ms *MultiSyncSolver, obs []MultiSyncObs, seedEpochUS, seedOffsetDeg, seedPeriodS float64) []scoredObs {
+	seedPeriodUS := seedPeriodS * 1e6
+	scored := make([]scoredObs, 0, len(obs))
+	for _, o := range obs {
+		effectiveUS := msPropCorrectedUS(o.CentroidUS, float64(o.RangeNM))
+		predicted := msPredictBearing(seedEpochUS, seedOffsetDeg, seedPeriodUS, effectiveUS)
+		residual := circularDiff(o.BearingDeg, predicted)
+		absR := math.Abs(residual)
+		status := msClassifyResidual(absR)
+		baseW := msScoreObs(o)
+		qEntry := ms.ICAOQuality[o.ICAO]
+		qMult := msICAOQualityMult(qEntry)
+		effectiveW := 0.0
+		switch status {
+		case "inlier":
+			effectiveW = baseW * qMult
+		case "soft":
+			effectiveW = baseW * 0.2 * qMult
+		}
+		fitRejectReason := msFitRejectReason(o, status, absR, qEntry)
+		scored = append(scored, scoredObs{
+			o:               o,
+			residual:        residual,
+			effectiveUS:     effectiveUS,
+			phaseInRot:      math.Mod((effectiveUS-seedEpochUS)/seedPeriodUS*360.0, 360.0),
+			baseW:           baseW,
+			effectiveW:      effectiveW,
+			status:          status,
+			fitEligible:     fitRejectReason == "",
+			fitRejectReason: fitRejectReason,
+		})
+	}
+	return scored
+}
+
+func meanAbsAlignmentResidual(obs []MultiSyncObs, epochUS, offsetDeg, periodS float64) float64 {
+	if len(obs) == 0 {
+		return 0
+	}
+	periodUS := periodS * 1e6
+	sum := 0.0
+	for _, o := range obs {
+		effectiveUS := msPropCorrectedUS(o.CentroidUS, float64(o.RangeNM))
+		predicted := msPredictBearing(epochUS, offsetDeg, periodUS, effectiveUS)
+		sum += math.Abs(circularDiff(o.BearingDeg, predicted))
+	}
+	return sum / float64(len(obs))
+}
+
 func TestMultiSyncSolver_BasicFit(t *testing.T) {
 	ms := NewMultiSyncSolver(1)
 
@@ -516,6 +565,85 @@ func TestMultiSyncSolver_ReacquirePublishesConsistentCandidateFamily(t *testing.
 	}
 	if math.Abs(circularDiff(ms.PhaseOffsetDeg, expected.publishedOffsetDeg)) > 1e-6 {
 		t.Fatalf("published phase offset %.6f should match candidate package %.6f", ms.PhaseOffsetDeg, expected.publishedOffsetDeg)
+	}
+}
+
+func TestMultiSyncSolver_NormalRefinementPublishesAlignmentFromRefinedPeriod(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	livePeriodS := 4.05
+	truePeriodS := 4.0
+	seedEpochUS := 0.0
+	seedOffsetDeg := 45.0
+	sync := NewSyncState(1, livePeriodS, seedEpochUS, seedOffsetDeg, 0.8)
+	ms.SlopeHistory = []float64{0.6, 0.6, 0.6, 0.6, 0.6}
+	ms.SmoothSlopeDegPerS = 0.6
+
+	now := float64(time.Now().UnixMicro()) / 1e6
+	for i := 0; i < 48; i++ {
+		us := float64(i) * truePeriodS / 8.0 * 1e6
+		bearing := simulatedBearing(us, seedEpochUS, seedOffsetDeg, truePeriodS)
+		ms.obs = append(ms.obs, buildObs(us, bearing, uint32(0xABC001+i%4), now+float64(i)*0.3))
+	}
+
+	ms.lastRunTS = 0.0
+	ms.TryUpdate(sync)
+
+	if ms.PeriodReacquireActive {
+		t.Fatal("expected normal refinement path, not reacquire")
+	}
+	if math.Abs(ms.PeriodS-livePeriodS) < 1e-4 {
+		t.Fatalf("expected refined period to move away from live seed %.6f, got %.6f", livePeriodS, ms.PeriodS)
+	}
+
+	scored := scoreObsForSeed(ms, ms.obs, seedEpochUS, seedOffsetDeg, livePeriodS)
+	expected := ms.buildAlignmentForPeriod(scored, seedEpochUS, seedOffsetDeg, ms.PeriodS)
+	stale := ms.buildAlignmentForPeriod(scored, seedEpochUS, seedOffsetDeg, livePeriodS)
+
+	if math.Abs(ms.PhaseEpochUS-expected.epochUS) > 1e-6 {
+		t.Fatalf("published epoch %.6f should match refined-period alignment %.6f", ms.PhaseEpochUS, expected.epochUS)
+	}
+	if math.Abs(circularDiff(ms.PhaseOffsetDeg, expected.offsetDeg)) > 1e-6 {
+		t.Fatalf("published offset %.6f should match refined-period alignment %.6f", ms.PhaseOffsetDeg, expected.offsetDeg)
+	}
+
+	publishedResidual := meanAbsAlignmentResidual(ms.obs, ms.PhaseEpochUS, ms.PhaseOffsetDeg, ms.PeriodS)
+	staleResidual := meanAbsAlignmentResidual(ms.obs, stale.epochUS, stale.offsetDeg, ms.PeriodS)
+	if publishedResidual > staleResidual {
+		t.Fatalf("published refined-period alignment residual %.4f should not be worse than stale-seed alignment %.4f", publishedResidual, staleResidual)
+	}
+}
+
+func TestMultiSyncSolver_PeriodBaseReflectsSameRunTrustPromotion(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	bootstrapPeriodS := 4.05
+	truePeriodS := 4.0
+	seedEpochUS := 0.0
+	seedOffsetDeg := 45.0
+	sync := NewSyncState(1, bootstrapPeriodS, seedEpochUS, seedOffsetDeg, 0.8)
+
+	ms.BootstrapPeriodS = bootstrapPeriodS
+	ms.TrustUpdateStreak = trustMinStreak - 1
+	ms.SlopeHistory = []float64{0.6, 0.6, 0.6, 0.6, 0.6}
+	ms.SmoothSlopeDegPerS = 0.6
+
+	now := float64(time.Now().UnixMicro()) / 1e6
+	for i := 0; i < 48; i++ {
+		us := float64(i) * truePeriodS / 8.0 * 1e6
+		bearing := simulatedBearing(us, seedEpochUS, seedOffsetDeg, truePeriodS)
+		ms.obs = append(ms.obs, buildObs(us, bearing, uint32(0xABC100+i%4), now+float64(i)*0.3))
+	}
+
+	ms.lastRunTS = 0.0
+	ms.TryUpdate(sync)
+
+	if ms.TrustedBasePeriodS <= 0 {
+		t.Fatal("expected trusted base promotion on this run")
+	}
+	if math.Abs(ms.PeriodBaseS-ms.TrustedBasePeriodS) > 1e-9 {
+		t.Fatalf("PeriodBaseS %.9f should reflect promoted trusted base %.9f immediately", ms.PeriodBaseS, ms.TrustedBasePeriodS)
+	}
+	if math.Abs(ms.PeriodBaseS-bootstrapPeriodS) < 1e-6 {
+		t.Fatalf("PeriodBaseS should not lag on bootstrap base %.6f after promotion", bootstrapPeriodS)
 	}
 }
 
