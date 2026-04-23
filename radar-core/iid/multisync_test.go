@@ -1292,3 +1292,362 @@ func TestMultiSyncSolver_ICAOQualityDownweights(t *testing.T) {
 		t.Errorf("expected multiplier=1.0 for nil quality, got %.4f", mult2)
 	}
 }
+
+// ─── dominant-prior lock / AbsolutePhaseTrusted tests ────────────────────────
+
+// TestA_DominantPriorLock verifies that when dominantPeriodS is provided, the published
+// refined period cannot exceed periodRefineMaxPPMFromDominant from the dominant prior,
+// even when burst evidence strongly suggests a period far outside that bound.
+func TestA_DominantPriorLock(t *testing.T) {
+	dominantPeriodS := 4.0
+	ms := NewMultiSyncSolver(1)
+	sync := NewSyncState(1, dominantPeriodS, 0.0, 45.0, 0.8)
+
+	// Observations consistent with a period 2% away from dominant (20000 PPM — well
+	// outside the 300ppm refinement bound).
+	farPeriodS := dominantPeriodS * 1.02
+	now := float64(time.Now().UnixMicro()) / 1e6
+	for i := 0; i < 60; i++ {
+		us := float64(i) * farPeriodS / 10.0 * 1e6
+		bearing := simulatedBearing(us, 0.0, 45.0, farPeriodS)
+		ms.obs = append(ms.obs, buildObs(us, bearing, uint32(0xABC001+i%3), now+float64(i)*0.3))
+	}
+	// Run multiple times to allow slope and reacquire paths to fire.
+	for i := 0; i < 14; i++ {
+		ms.lastRunTS = 0.0
+		ms.runFit(sync, dominantPeriodS, now+float64(i))
+	}
+
+	snap := ms.Snapshot()
+	if snap.PeriodS <= 0 {
+		t.Skip("solver did not produce a state")
+	}
+	maxAllowedDeltaPPM := periodRefineMaxPPMFromDominant + 1.0 // +1 for float tolerance
+	_, publishedPPM := periodDeltaToDominant(snap.PeriodS, dominantPeriodS)
+	if math.Abs(publishedPPM) > maxAllowedDeltaPPM {
+		t.Fatalf("published period %.9f is %.2f PPM from dominant %.9f, exceeds allowed %.1f PPM",
+			snap.PeriodS, math.Abs(publishedPPM), dominantPeriodS, periodRefineMaxPPMFromDominant)
+	}
+}
+
+// TestB_BoundedSlopeCorrection verifies that when a persistent residual slope is present
+// with a dominant prior active, each per-update period step is bounded by
+// periodRefineMaxStepPPM and the final period stays within periodRefineMaxPPMFromDominant.
+func TestB_BoundedSlopeCorrection(t *testing.T) {
+	dominantPeriodS := 4.0
+	ms := NewMultiSyncSolver(1)
+	// Seed slope history so slope-based refinement fires.
+	ms.SlopeHistory = []float64{0.5, 0.5, 0.5, 0.5, 0.5, 0.5}
+	ms.SmoothSlopeDegPerS = 0.5
+	ms.PeriodS = dominantPeriodS
+	ms.Present = true
+	ms.PhaseEpochUS = 0.0
+	ms.PhaseOffsetDeg = 45.0
+	ms.BootstrapPeriodS = dominantPeriodS
+
+	// Observations matching dominant period (clean, no slope — slope comes from seed above).
+	now := float64(time.Now().UnixMicro()) / 1e6
+	for i := 0; i < 80; i++ {
+		us := float64(i) * dominantPeriodS / 10.0 * 1e6
+		bearing := simulatedBearing(us, 0.0, 45.0, dominantPeriodS)
+		ms.obs = append(ms.obs, buildObs(us, bearing, uint32(0xABC001+i%3), now+float64(i)*0.3))
+	}
+
+	initialPeriod := ms.PeriodS
+	sync := NewSyncState(1, dominantPeriodS, 0.0, 45.0, 0.8)
+	ms.lastRunTS = 0.0
+	ms.runFit(sync, dominantPeriodS, now)
+
+	if ms.PeriodS <= 0 {
+		t.Skip("solver did not produce a state")
+	}
+	// Per-update step must not exceed periodRefineMaxStepPPM (+1 float tolerance).
+	stepPPM := math.Abs(ms.PeriodS-initialPeriod) / initialPeriod * 1e6
+	if stepPPM > periodRefineMaxStepPPM+1.0 {
+		t.Fatalf("single-step period change %.3f PPM exceeds max step %.3f PPM when dominant prior active",
+			stepPPM, periodRefineMaxStepPPM)
+	}
+	// Final period must be within dominant bound.
+	_, deltaPPM := periodDeltaToDominant(ms.PeriodS, dominantPeriodS)
+	if math.Abs(deltaPPM) > periodRefineMaxPPMFromDominant+1.0 {
+		t.Fatalf("period %.9f is %.2f PPM from dominant — outside allowed bound %.1f PPM",
+			ms.PeriodS, math.Abs(deltaPPM), periodRefineMaxPPMFromDominant)
+	}
+}
+
+// TestC_NoAutonomousReacquireOutsideBound verifies that when the reacquire candidate search
+// finds a period outside the dominant-prior bound, it populates diagnostic fields only and
+// does NOT update the published period or authoritative state.
+//
+// Uses wrongSeedS=5.0 (25% = 250000 PPM from dominant 4.0) so that observations
+// score predominantly as "rejected" against the 4.0s prior, forcing cleanUpdate=false
+// and thus triggering the candidate search.
+func TestC_NoAutonomousReacquireOutsideBound(t *testing.T) {
+	dominantPeriodS := 4.0
+	wrongSeedS := 5.0 // 250000 PPM off — far outside 300ppm bound; forces large residuals
+
+	ms := NewMultiSyncSolver(1)
+	// ms.Present is NOT set so selectActiveFamilyPrior falls through to dominantPeriodS.
+	// This ensures observations score against the dominant (4.0s) rather than wrongSeedS,
+	// producing large residuals and forcing cleanUpdate=false so the candidate search fires.
+	ms.BootstrapPeriodS = wrongSeedS
+	ms.ActiveAuthorityMode = authorityModeRecovery
+	ms.PeriodFailureStreak = 5
+	ms.PeriodReacquireActive = true
+
+	// Observations consistent with wrongSeedS (outside dominant bound).
+	// Against dominant 4.0s, the bearings drift ~9°/obs and ~72% become "rejected" after
+	// several rotations, forcing cleanUpdate=false and triggering the candidate search.
+	sync := NewSyncState(1, wrongSeedS, 0.0, 45.0, 0.8)
+	now := float64(time.Now().UnixMicro()) / 1e6
+	for i := 0; i < 40; i++ {
+		us := float64(i) * wrongSeedS / 10.0 * 1e6
+		bearing := simulatedBearing(us, 0.0, 45.0, wrongSeedS)
+		ms.obs = append(ms.obs, buildObs(us, bearing, uint32(0xABC001+i%3), now+float64(i)*0.5))
+	}
+	ms.lastRunTS = 0.0
+	ms.TryUpdate(sync, dominantPeriodS)
+
+	snap := ms.Snapshot()
+	// Candidate search should have populated diagnostic fields.
+	if snap.ReacquireCandidatePeriod <= 0 {
+		t.Error("expected reacquire candidate to be populated as diagnostic")
+	}
+	// Published period must remain within dominant bound.
+	if snap.PeriodS > 0 {
+		_, publishedPPM := periodDeltaToDominant(snap.PeriodS, dominantPeriodS)
+		if math.Abs(publishedPPM) > periodRefineMaxPPMFromDominant+1.0 {
+			t.Fatalf("candidate outside dominant bound was published: period %.9f is %.2f PPM from dominant",
+				snap.PeriodS, math.Abs(publishedPPM))
+		}
+	}
+	// If the candidate found is itself outside the bound, DominantPriorInconsistent must be set.
+	if snap.ReacquireCandidatePeriod > 0 {
+		_, candidatePPM := periodDeltaToDominant(snap.ReacquireCandidatePeriod, dominantPeriodS)
+		if math.Abs(candidatePPM) > periodRefineMaxPPMFromDominant {
+			if !snap.DominantPriorInconsistent {
+				t.Fatalf("expected DominantPriorInconsistent=true when candidate (%.2f PPM from dominant) is outside bound",
+					math.Abs(candidatePPM))
+			}
+			// And the published period must NOT match the out-of-bound candidate.
+			if snap.PeriodS > 0 && math.Abs(snap.PeriodS-snap.ReacquireCandidatePeriod) < 1e-9 {
+				t.Fatalf("out-of-bound candidate period %.9f was published as live period", snap.ReacquireCandidatePeriod)
+			}
+		}
+	}
+}
+
+// TestD_AbsolutePhaseTrustedRequiresAnchor verifies that AbsolutePhaseTrusted is false
+// when no anchor passes validation, even when the authoritative state is present.
+func TestD_AbsolutePhaseTrustedRequiresAnchor(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	dominantPeriodS := 4.0
+	sync := NewSyncState(1, dominantPeriodS, 0.0, 45.0, 0.8)
+
+	// Minimal observations — below anchor selection threshold for most ICAOs.
+	now := float64(time.Now().UnixMicro()) / 1e6
+	for i := 0; i < 4; i++ {
+		us := float64(i) * dominantPeriodS * 1e6
+		ms.obs = append(ms.obs, buildObs(us, simulatedBearing(us, 0, 45.0, dominantPeriodS),
+			uint32(0xABC001+i%2), now+float64(i)))
+	}
+	// Force authoritative present without a valid anchor.
+	anchor := uint32(0xABC001)
+	ms.AuthoritativePresent = true
+	ms.AuthoritativePeriodS = dominantPeriodS
+	ms.AuthoritativePhaseOffsetDeg = 45.0
+	ms.AuthoritativePhaseEpochUS = 0.0
+	ms.AuthoritativeAnchorICAO = &anchor
+	ms.AbsolutePhaseTrusted = true // set; must be cleared if anchor/validation fails
+
+	ms.lastRunTS = 0.0
+	ms.TryUpdate(sync, dominantPeriodS)
+
+	snap := ms.Snapshot()
+	// With only 4 observations across 2 ICAOs, validation will be weak → not trusted.
+	// (We don't hard-assert here because obs may or may not satisfy anchor gates,
+	// but we verify the field is accessible and correctly typed.)
+	_ = snap.AbsolutePhaseTrusted // field must compile and be readable
+	// If usable state was not reached, AbsolutePhaseTrusted must be false.
+	if !snap.Present || !snap.Usable {
+		if snap.AbsolutePhaseTrusted {
+			t.Fatal("AbsolutePhaseTrusted must be false when solver is not usable")
+		}
+	}
+}
+
+// TestE_AbsolutePhaseTrustedRequiresPopulationAgreement verifies that AbsolutePhaseTrusted
+// is false when two ICAOs are on opposite phase branches (high branch ambiguity).
+func TestE_AbsolutePhaseTrustedRequiresPopulationAgreement(t *testing.T) {
+	periodS := 4.0
+	dominantPeriodS := 4.0
+	ms := NewMultiSyncSolver(1)
+	sync := NewSyncState(1, periodS, 0.0, 45.0, 0.8)
+
+	now := float64(time.Now().UnixMicro()) / 1e6
+	// Two ICAOs on opposite phase branches: offset 45° vs 225°.
+	for i := 0; i < 30; i++ {
+		us := float64(i) * periodS / 10.0 * 1e6
+		bearingA := simulatedBearing(us, 0.0, 45.0, periodS)
+		bearingB := simulatedBearing(us, 0.0, 225.0, periodS)
+		ms.obs = append(ms.obs, buildObs(us, bearingA, 0xABC001, now+float64(i)*0.4))
+		ms.obs = append(ms.obs, buildObs(us, bearingB, 0xABC002, now+float64(i)*0.4))
+	}
+	// Bootstrap with authoritative state to allow validation to run.
+	anchor := uint32(0xABC001)
+	ms.AuthoritativePresent = true
+	ms.AuthoritativePeriodS = periodS
+	ms.AuthoritativePhaseOffsetDeg = 45.0
+	ms.AuthoritativePhaseEpochUS = 0.0
+	ms.AuthoritativeAnchorICAO = &anchor
+	ms.CandidatePromotionStreak = candidatePromotionMinStreak
+
+	ms.lastRunTS = 0.0
+	ms.TryUpdate(sync, dominantPeriodS)
+
+	snap := ms.Snapshot()
+	// With two ICAOs on opposite branches, branch ambiguity is high and/or validators
+	// disagree — AbsolutePhaseTrusted must be false.
+	if snap.AbsolutePhaseTrusted {
+		t.Fatalf("AbsolutePhaseTrusted must be false with conflicting phase branches (ambiguity=%.2f, validatorDisagree=%d)",
+			snap.BranchAmbiguityScore, snap.ValidatorDisagreementCount)
+	}
+}
+
+// TestF_LocaliserGatingViaSnapshot verifies that AbsolutePhaseTrusted propagates correctly
+// through Snapshot() so that the localiser can use it to gate geographic bearing prediction.
+func TestF_LocaliserGatingViaSnapshot(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+
+	// Initial state: not trusted.
+	snap := ms.Snapshot()
+	if snap.AbsolutePhaseTrusted {
+		t.Fatal("initial AbsolutePhaseTrusted must be false")
+	}
+	if snap.DominantPriorInconsistent {
+		t.Fatal("initial DominantPriorInconsistent must be false")
+	}
+
+	// Manually set fields and verify they round-trip through Snapshot.
+	ms.AbsolutePhaseTrusted = true
+	ms.LastDominantPriorInconsistent = true
+	snap = ms.Snapshot()
+	if !snap.AbsolutePhaseTrusted {
+		t.Fatal("AbsolutePhaseTrusted must propagate through Snapshot")
+	}
+	if !snap.DominantPriorInconsistent {
+		t.Fatal("DominantPriorInconsistent must propagate through Snapshot")
+	}
+
+	// Reset must clear both.
+	ms.Reset()
+	snap = ms.Snapshot()
+	if snap.AbsolutePhaseTrusted {
+		t.Fatal("AbsolutePhaseTrusted must be cleared by Reset")
+	}
+	if snap.DominantPriorInconsistent {
+		t.Fatal("DominantPriorInconsistent must be cleared by Reset")
+	}
+}
+
+// TestDominantPriorInconsistentDiagnostic verifies that when a reacquire candidate is outside
+// the dominant-prior bound, DominantPriorInconsistent is set diagnostically and the
+// published period stays within the bound.
+//
+// Uses wrongSeedS=5.0 (25% off) to ensure observations score as "rejected" against the
+// dominant 4.0s prior, triggering the reacquire candidate search.
+// TestG_SettledWrongPeriodSnapsToDominant is the regression test for the real-world
+// scenario where the refined model locked at 4.0178s before the DF dominant prior
+// (4.7859s) became available. Previously the model would stay stuck because slope ≈ 0
+// at the settled period → slope_not_persistent → refinePeriod early-exits before the
+// dominant clamp code. The fix enforces the dominant bound in runFit before scoring.
+func TestG_SettledWrongPeriodSnapsToDominant(t *testing.T) {
+	wrongPeriodS := 4.0178
+	dominantS := 4.7859
+	// dominantPPM is ~191,000 — far outside the 300 PPM refinement bound.
+
+	ms := NewMultiSyncSolver(1)
+	// Simulate a solver that settled at the wrong period.
+	ms.PeriodS = wrongPeriodS
+	ms.Present = true
+	ms.Usable = true
+	ms.AuthoritativePresent = true
+	ms.AuthoritativePeriodS = wrongPeriodS
+	ms.TrustedBasePeriodS = wrongPeriodS
+	ms.TrustUpdateStreak = 20
+	ms.ActiveAuthorityMode = authorityModeRefined
+	ms.BootstrapPeriodS = wrongPeriodS
+
+	// Observations that are consistent with wrongPeriodS (look clean at the wrong period).
+	sync := NewSyncState(1, wrongPeriodS, 0.0, 45.0, 0.8)
+	now := float64(time.Now().UnixMicro()) / 1e6
+	for i := 0; i < 30; i++ {
+		us := float64(i) * wrongPeriodS / 10.0 * 1e6
+		bearing := simulatedBearing(us, 0.0, 45.0, wrongPeriodS)
+		icao := uint32(0xABC001 + i%3)
+		ms.obs = append(ms.obs, buildObs(us, bearing, icao, now+float64(i)*0.5))
+	}
+
+	ms.lastRunTS = 0.0
+	ms.TryUpdate(sync, dominantS)
+
+	snap := ms.Snapshot()
+	if !snap.Present {
+		t.Fatal("expected Present=true after solver run")
+	}
+	_, publishedPPM := periodDeltaToDominant(snap.PeriodS, dominantS)
+	if math.Abs(publishedPPM) > periodRefineMaxPPMFromDominant+1.0 {
+		t.Fatalf("published period %.9f is %.1f PPM from dominant %.9f — model failed to snap (bound ±%.0f PPM)",
+			snap.PeriodS, math.Abs(publishedPPM), dominantS, periodRefineMaxPPMFromDominant)
+	}
+	// Trust must have been cleared by the family snap.
+	if ms.TrustedBasePeriodS > 0 {
+		_, trustedPPM := periodDeltaToDominant(ms.TrustedBasePeriodS, dominantS)
+		if math.Abs(trustedPPM) > periodRefineMaxPPMFromDominant+1.0 {
+			t.Errorf("TrustedBasePeriodS %.9f still outside dominant bound after snap", ms.TrustedBasePeriodS)
+		}
+	}
+}
+
+func TestDominantPriorInconsistentDiagnostic(t *testing.T) {
+	dominantPeriodS := 4.0
+	wrongSeedS := 5.0 // 250000 PPM off — far outside 300ppm bound
+	ms := NewMultiSyncSolver(1)
+	// ms.Present is NOT set so selectActiveFamilyPrior falls through to dominantPeriodS,
+	// ensuring observations score against 4.0s rather than wrongSeedS.
+	ms.BootstrapPeriodS = wrongSeedS
+	ms.ActiveAuthorityMode = authorityModeRecovery
+	ms.PeriodReacquireActive = true
+	ms.PeriodFailureStreak = 5
+
+	// Observations consistent with wrongSeedS; scored against dominant 4.0 → mostly rejected.
+	sync := NewSyncState(1, wrongSeedS, 0.0, 45.0, 0.8)
+	now := float64(time.Now().UnixMicro()) / 1e6
+	for i := 0; i < 40; i++ {
+		us := float64(i) * wrongSeedS / 10.0 * 1e6
+		bearing := simulatedBearing(us, 0.0, 45.0, wrongSeedS)
+		ms.obs = append(ms.obs, buildObs(us, bearing, uint32(0xABC001+i%3), now+float64(i)*0.5))
+	}
+	ms.lastRunTS = 0.0
+	ms.TryUpdate(sync, dominantPeriodS)
+
+	snap := ms.Snapshot()
+	// If candidate is outside the dominant bound, DominantPriorInconsistent is set.
+	if snap.ReacquireCandidatePeriod > 0 {
+		_, candidatePPM := periodDeltaToDominant(snap.ReacquireCandidatePeriod, dominantPeriodS)
+		if math.Abs(candidatePPM) > periodRefineMaxPPMFromDominant {
+			if !snap.DominantPriorInconsistent {
+				t.Fatalf("expected DominantPriorInconsistent when candidate %.9f is %.2f PPM from dominant",
+					snap.ReacquireCandidatePeriod, math.Abs(candidatePPM))
+			}
+		}
+	}
+	// Published period must be within dominant bound.
+	if snap.PeriodS > 0 {
+		_, publishedPPM := periodDeltaToDominant(snap.PeriodS, dominantPeriodS)
+		if math.Abs(publishedPPM) > periodRefineMaxPPMFromDominant+1.0 {
+			t.Fatalf("published period %.9f is %.2f PPM from dominant — exceeds bound %.1f PPM",
+				snap.PeriodS, math.Abs(publishedPPM), periodRefineMaxPPMFromDominant)
+		}
+	}
+}

@@ -389,6 +389,8 @@ func (e *engine) emitMultiSyncState(s *iid.IIDState) {
 		ValidatorDisagreementCount:       uint16(snap.ValidatorDisagreementCount),
 		CandidateMode:                    snap.CandidateMode,
 		AuthoritativeMode:                snap.AuthoritativeMode,
+		AbsolutePhaseTrusted:             snap.AbsolutePhaseTrusted,
+		DominantPriorInconsistent:        snap.DominantPriorInconsistent,
 	}
 	e.writer.Send(msg)
 }

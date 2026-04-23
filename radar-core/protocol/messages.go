@@ -340,6 +340,14 @@ type MultiSyncState struct {
 	ValidatorDisagreementCount       uint16                     `codec:"vdc"`
 	CandidateMode                    string                     `codec:"cmd"`
 	AuthoritativeMode                string                     `codec:"amd"`
+	// AbsolutePhaseTrusted is true only when the period is bounded to the DF dominant prior,
+	// an anchor is selected, and phase validation is strong. Localiser must gate geographic
+	// bearing prediction on this field rather than the broader Usable flag.
+	AbsolutePhaseTrusted bool `codec:"apt"`
+	// DominantPriorInconsistent is set when the reacquire candidate lies outside the allowed
+	// refinement bound around the DF dominant period. Diagnostic only — the DF alignment model
+	// should react; the refined solver does not change its published period in this case.
+	DominantPriorInconsistent bool `codec:"dpi"`
 }
 
 type MultiSyncAnchorCandidate struct {

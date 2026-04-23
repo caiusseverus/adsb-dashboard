@@ -71,10 +71,18 @@ const (
 	trustMaxResidualDeg = 8.0  // detrended MAD ceiling for a trust-eligible update (deg)
 	trustMaxRejFrac     = 0.15 // rejection fraction ceiling for a trust-eligible update
 
-	// Period clamp limits during the untrusted bootstrap phase.
-	// Wider than the trusted-base limits so the solver can escape an incorrect seed family.
-	periodPPMFromBootstrap       = 10000.0 // ±1% from bootstrap — bootstrap phase wide gate
-	periodPPMFromBootstrapStrong = 30000.0 // ±3% under strong fit in bootstrap phase
+	// Period clamp limits when the DF dominant prior is NOT available.
+	// These legacy bootstrap limits allow the solver to migrate families when no
+	// authoritative external period family is provided by the DF alignment model.
+	// When dominantPeriodS > 0 these values are overridden by the dominant-prior bounds below.
+	periodPPMFromBootstrap       = 10000.0 // ±1% from bootstrap — legacy bootstrap phase gate
+	periodPPMFromBootstrapStrong = 30000.0 // ±3% under strong fit — legacy bootstrap phase gate
+
+	// Period refinement limits relative to the DF dominant prior (used when dominantPeriodS > 0).
+	// These replace the bootstrap escape window and bound the refined period tightly around
+	// the family already established by the DF alignment model.
+	periodRefineMaxPPMFromDominant = 300.0 // max PPM deviation from DF dominant prior
+	periodRefineMaxStepPPM         = 20.0  // max per-update period correction step when dominant is active
 
 	// Reacquire / failure detection.
 	reacquireMADThreshold = 8.0 // deg — detrended MAD for recovery
@@ -323,6 +331,14 @@ type MultiSyncSnapshot struct {
 	ValidatorDisagreementCount       int
 	CandidateMode                    string
 	AuthoritativeMode                string
+	// AbsolutePhaseTrusted is true only when the period is bounded to the DF dominant prior,
+	// an anchor is selected, and phase validation is strong. The localiser must gate
+	// geographic bearing prediction on this flag rather than the broader Usable field.
+	AbsolutePhaseTrusted bool
+	// DominantPriorInconsistent is set when the reacquire candidate search finds evidence
+	// for a period outside the allowed refinement bound around dominantPeriodS. This is
+	// purely diagnostic — the DF alignment model should react to it, not the refined solver.
+	DominantPriorInconsistent bool
 }
 
 // MultiSyncSolver holds per-IID multi-aircraft sync refinement state.
@@ -447,6 +463,14 @@ type MultiSyncSolver struct {
 	LastValidatorDisagreementCount       int
 	LastCandidateMode                    string
 	LastAuthoritativeMode                string
+
+	// Absolute phase trust: true only when period is within periodRefineMaxPPMFromDominant
+	// of the DF dominant prior, anchor is valid, and phase validation is strong.
+	AbsolutePhaseTrusted bool
+	// LastDominantPriorInconsistent is set when the reacquire candidate lies outside the
+	// allowed refinement bound around dominantPeriodS. Diagnostic only — the candidate
+	// period is not published in this case.
+	LastDominantPriorInconsistent bool
 
 	// Throttle.
 	lastRunTS float64
@@ -603,6 +627,8 @@ func (ms *MultiSyncSolver) Reset() {
 	ms.LastValidatorDisagreementCount = 0
 	ms.LastCandidateMode = ""
 	ms.LastAuthoritativeMode = ""
+	ms.AbsolutePhaseTrusted = false
+	ms.LastDominantPriorInconsistent = false
 }
 
 // Snapshot returns a copy of the published state for protocol emission.
@@ -685,6 +711,8 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 		ValidatorDisagreementCount:       ms.LastValidatorDisagreementCount,
 		CandidateMode:                    ms.LastCandidateMode,
 		AuthoritativeMode:                ms.LastAuthoritativeMode,
+		AbsolutePhaseTrusted:             ms.AbsolutePhaseTrusted,
+		DominantPriorInconsistent:        ms.LastDominantPriorInconsistent,
 	}
 	if ms.AuthoritativeStateSinceTS > 0 && ms.LastUpdated > 0 {
 		snap.AuthoritativeStateAgeS = math.Max(0, ms.LastUpdated-ms.AuthoritativeStateSinceTS)
@@ -714,6 +742,7 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 
 func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix float64) {
 	ms.ensureAuthorityMode()
+	ms.LastDominantPriorInconsistent = false
 	// Determine seed phase from existing multi-sync state or frame sync.
 	var seedEpochUS, seedOffsetDeg float64
 	if ms.CandidatePresent && ms.CandidatePhaseEpochUS > 0 {
@@ -796,6 +825,31 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		basePeriodS = compactPeriodS
 	} else if ms.BootstrapPeriodS > 0 {
 		basePeriodS = ms.BootstrapPeriodS
+	}
+
+	// Dominant-prior family enforcement.
+	// When the DF alignment period is known and the current live period has drifted
+	// outside the ±300 PPM refinement band, snap back immediately. Slope-based
+	// refinement cannot self-correct a large period error: if the model is settled at
+	// the wrong period, observations score cleanly at that period, slope ≈ 0, and
+	// refinePeriod's slope_not_persistent gate fires before the dominant clamp is
+	// ever reached. We must force the correction here, before observations are scored.
+	if dominantPeriodS > 0 && livePeriodS > 0 {
+		livePPM := (livePeriodS - dominantPeriodS) / dominantPeriodS * 1e6
+		if math.Abs(livePPM) > periodRefineMaxPPMFromDominant {
+			if livePPM > 0 {
+				livePeriodS = dominantPeriodS * (1.0 + periodRefineMaxPPMFromDominant*1e-6)
+			} else {
+				livePeriodS = dominantPeriodS * (1.0 - periodRefineMaxPPMFromDominant*1e-6)
+			}
+			basePeriodS = dominantPeriodS
+			trusted = false
+			ms.TrustedBasePeriodS = 0
+			ms.TrustUpdateStreak = 0
+			if ms.AuthoritativePeriodS > 0 {
+				ms.AuthoritativePeriodS = livePeriodS
+			}
+		}
 	}
 
 	// Rolling observation window.
@@ -987,7 +1041,7 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	}
 
 	refinedPeriodS, _, _, clampedByBase, clampDiffPPM := ms.refinePeriod(
-		livePeriodS, basePeriodS, periodSlope,
+		livePeriodS, basePeriodS, dominantPeriodS, periodSlope,
 		periodFitCount, periodFitICAOs, periodFitSpanS, majorityRejected,
 		trusted,
 	)
@@ -1012,6 +1066,48 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		len(fitICAOs) >= 2 &&
 		detrended <= reacquireMADThreshold
 
+	// applyReacquireCandidate tests whether the reacquire search result should be
+	// published as the new live period, or whether it is diagnostic only.
+	//
+	// When dominantPeriodS > 0, the refined model must not escape the DF-aligned family.
+	// If the best candidate is outside periodRefineMaxPPMFromDominant, it is reported as
+	// "dominant prior inconsistent" — a signal for the DF alignment model to reacquire —
+	// but it must not update the published period.
+	//
+	// When dominantPeriodS <= 0 (no DF alignment available), the old behaviour is
+	// preserved so the solver can still migrate to a better family on its own.
+	applyReacquireCandidate := func(best candidateEvalResult) {
+		ms.LastReacquireCandidateP = best.periodS
+		ms.LastReacquireCandidateSc = best.score
+		if best.periodS <= 0 {
+			return
+		}
+		withinDominantBound := dominantPeriodS <= 0
+		if dominantPeriodS > 0 {
+			_, candidatePPM := periodDeltaToDominant(best.periodS, dominantPeriodS)
+			withinDominantBound = math.Abs(candidatePPM) <= periodRefineMaxPPMFromDominant
+		}
+		if withinDominantBound {
+			finalPeriodS = best.periodS
+			finalAlignment = publishedAlignment{
+				epochUS:                 best.newEpochUS,
+				offsetDeg:               best.publishedOffsetDeg,
+				anchorICAO:              best.anchorICAO,
+				anchorScore:             best.anchorScore,
+				anchorPhaseDeg:          best.anchorPhaseDeg,
+				anchorCandidateCount:    best.anchorCandidateCount,
+				anchorNoCandidateReason: best.anchorNoCandidateReason,
+				anchorCandidates:        best.anchorCandidates,
+			}
+			finalAlignmentReady = true
+		} else {
+			// Candidate is outside dominant-prior bound: diagnostic only.
+			// The DF alignment model should be notified to reacquire.
+			ms.LastWrongPeriodSuspect = true
+			ms.LastDominantPriorInconsistent = true
+		}
+	}
+
 	if recoveryActive {
 		ms.PeriodReacquireActive = true
 		ms.PeriodReacquireReason = joinReasons(recoveryReasons)
@@ -1024,30 +1120,14 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 				ms.LastRecoveryModeActive = false
 				ms.LastRecoveryTriggerReasons = nil
 			}
-			// On a clean update, let the solver's refined period pass through rather than
-			// holding the bootstrap base — the candidate search already guided us to a
-			// plausible family and this update is confirming it.
+			// On a clean update, the refined period passes through rather than
+			// jumping to a candidate — the existing period is already converging.
 		} else {
 			ms.CleanReacquireStreak = 0
-			// Search for the best-scoring period family instead of snapping back to the
-			// bootstrap base, which may itself be the wrong family.
+			// Search for the best-scoring period. If it is within the dominant-prior
+			// bound it replaces the live period; otherwise it is diagnostic only.
 			best := ms.searchBestCandidate(scored, seedEpochUS)
-			ms.LastReacquireCandidateP = best.periodS
-			ms.LastReacquireCandidateSc = best.score
-			if best.periodS > 0 {
-				finalPeriodS = best.periodS
-				finalAlignment = publishedAlignment{
-					epochUS:                 best.newEpochUS,
-					offsetDeg:               best.publishedOffsetDeg,
-					anchorICAO:              best.anchorICAO,
-					anchorScore:             best.anchorScore,
-					anchorPhaseDeg:          best.anchorPhaseDeg,
-					anchorCandidateCount:    best.anchorCandidateCount,
-					anchorNoCandidateReason: best.anchorNoCandidateReason,
-					anchorCandidates:        best.anchorCandidates,
-				}
-				finalAlignmentReady = true
-			}
+			applyReacquireCandidate(best)
 		}
 	} else {
 		ms.CleanReacquireStreak = 0
@@ -1057,25 +1137,10 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 			ms.TrustUpdateStreak = 0
 			ms.LastRecoveryModeActive = true
 			ms.LastRecoveryTriggerReasons = appendUniqueStrings(ms.LastRecoveryTriggerReasons, "failure_streak")
-			// On entering reacquire, search candidate periods immediately.  This allows the
-			// solver to jump to the correct family rather than holding the incorrect bootstrap.
+			// Search candidate periods. If the best is within the dominant-prior
+			// bound it replaces the live period; otherwise it is diagnostic only.
 			best := ms.searchBestCandidate(scored, seedEpochUS)
-			ms.LastReacquireCandidateP = best.periodS
-			ms.LastReacquireCandidateSc = best.score
-			if best.periodS > 0 {
-				finalPeriodS = best.periodS
-				finalAlignment = publishedAlignment{
-					epochUS:                 best.newEpochUS,
-					offsetDeg:               best.publishedOffsetDeg,
-					anchorICAO:              best.anchorICAO,
-					anchorScore:             best.anchorScore,
-					anchorPhaseDeg:          best.anchorPhaseDeg,
-					anchorCandidateCount:    best.anchorCandidateCount,
-					anchorNoCandidateReason: best.anchorNoCandidateReason,
-					anchorCandidates:        best.anchorCandidates,
-				}
-				finalAlignmentReady = true
-			}
+			applyReacquireCandidate(best)
 		} else {
 			// Not in reacquire; clear stale candidate diagnostics.
 			ms.LastReacquireCandidateP = 0
@@ -1209,6 +1274,18 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	}
 	ms.LastPeriodDeltaToDominantS, ms.LastPeriodDeltaToDominantPPM = periodDeltaToDominant(ms.PeriodS, dominantPeriodS)
 	ms.LastCompactDeltaToDominantS, ms.LastCompactDeltaToDominantPPM = periodDeltaToDominant(compactPeriodS, dominantPeriodS)
+
+	// AbsolutePhaseTrusted: true only when the period is bounded to the DF dominant
+	// prior, anchor phase validation is strong, and branch ambiguity is low.
+	// The localiser must not use refined sync for geographic bearing prediction unless
+	// this flag is set — Usable alone is insufficient since it covers relative sync only.
+	ms.AbsolutePhaseTrusted = dominantPeriodS > 0 &&
+		ms.AuthoritativePresent &&
+		math.Abs(ms.LastPeriodDeltaToDominantPPM) <= periodRefineMaxPPMFromDominant &&
+		ms.AnchorICAO != nil &&
+		validation.score >= authoritativeValidationStrong &&
+		validation.branchAmbiguity < branchAmbiguityRejectThreshold &&
+		(len(fitICAOs) < validatorAgreementMinCount || validation.validatorAgreement >= validatorAgreementMinCount)
 
 	refinedHealthy := ms.Usable &&
 		candidateEstimate.anchorICAO != nil &&
@@ -2181,9 +2258,12 @@ func (ms *MultiSyncSolver) recordAnchorSelection(anchorICAO *uint32, nowUnix flo
 }
 
 func (ms *MultiSyncSolver) refinePeriod(
-	livePeriodS, basePeriodS, smoothedSlope float64,
+	livePeriodS, basePeriodS, dominantPeriodS, smoothedSlope float64,
 	nFit, nFitICAOs int, spanS float64, majorityRejected bool,
 	trusted bool, // true = tight clamp from promoted trusted base; false = wide clamp from bootstrap seed
+	// When dominantPeriodS > 0, the dominant prior overrides the bootstrap/trusted-base
+	// clamp with a tight bound (periodRefineMaxPPMFromDominant). This prevents the refined
+	// period from escaping the DF-aligned family regardless of trusted state.
 ) (refined float64, blockReason, reacquireReason string, clamped bool, clampDiffPPM float64) {
 	refined = livePeriodS
 	absSmoothed := math.Abs(smoothedSlope)
@@ -2253,6 +2333,21 @@ func (ms *MultiSyncSolver) refinePeriod(
 			ppmFromBase = periodPPMFromBootstrapStrong
 		}
 	}
+	// When the DF dominant prior is available, override the step and base clamps with
+	// tight bounds anchored to the dominant family. This prevents the refined period from
+	// escaping the family established by the DF alignment model regardless of trusted state.
+	//
+	// Motion compensation is not implemented. The multi-ICAO requirement in
+	// retainedResidualSlope (len(byICAO) < 2 → no slope) is the implicit protection
+	// against a single moving aircraft driving period changes. Two aircraft both moving in
+	// the same direction can still cause a bias; full motion compensation requires velocity
+	// vectors and is deferred to a later slice.
+	if dominantPeriodS > 0 {
+		ppmPerUpdate = periodRefineMaxStepPPM
+		basePeriodS = dominantPeriodS
+		ppmFromBase = periodRefineMaxPPMFromDominant
+	}
+
 	deltaPPM := (candidate - livePeriodS) / livePeriodS * 1e6
 	if deltaPPM > ppmPerUpdate {
 		candidate = livePeriodS * (1.0 + ppmPerUpdate*1e-6)
