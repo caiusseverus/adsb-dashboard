@@ -3250,6 +3250,10 @@ def test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst(monkey
         "rtr": ["compact_dominant_delta", "fit_pool_starved"],
         "cgb": True,
         "rla": 5,
+        "anc": 2,
+        "ant": 1_999.5,
+        "ahr": "anchor_hysteresis_switch",
+        "ahu": 4,
         "ai": int("AAAAAA", 16),
         "as": 0.8,
         "ft": 11,
@@ -3288,6 +3292,43 @@ def test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst(monkey
     assert sync.recovery_trigger_reasons == ["compact_dominant_delta", "fit_pool_starved"]
     assert sync.compact_gating_bypassed is True
     assert sync.recovery_relaxed_admitted_observations == 5
+    assert sync.anchor_switch_count == 2
+    assert sync.last_anchor_switch_ts == pytest.approx(1_999.5)
+    assert sync.last_anchor_switch_reason == "anchor_hysteresis_switch"
+    assert sync.anchor_hold_updates == 4
+
+
+def test_go_iid_state_does_not_overwrite_go_multi_sync_state():
+    state = RadarState()
+    state._live_sync_states[14] = LiveSyncState(
+        iid=14,
+        period_s=4.01,
+        phase_epoch_us=900_000.0,
+        phase_offset_deg=22.0,
+        sync_quality=0.8,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=2_000.0,
+        source="go_multi_aircraft_burst",
+        usable=True,
+        phase_anchor_icao="AAAAAA",
+        active_authority_mode="refined_authoritative",
+    )
+
+    state._adopt_go_frame_sync_locked(14, {
+        "period_s": 4.25,
+        "phase_epoch_us": 100.0,
+        "phase_offset_deg": 10.0,
+        "sync_quality": 0.4,
+        "sync_jitter_deg": 8.0,
+        "usable": False,
+        "last_updated": 2_100.0,
+    })
+
+    sync = state.get_live_sync_state(14)
+    assert sync is not None
+    assert sync.source == "go_multi_aircraft_burst"
+    assert sync.period_s == pytest.approx(4.01)
+    assert sync.phase_anchor_icao == "AAAAAA"
 
 
 def test_go_multi_sync_mode_diagnostics_report_dominant_recovery_fields():
@@ -3316,6 +3357,10 @@ def test_go_multi_sync_mode_diagnostics_report_dominant_recovery_fields():
         recovery_trigger_reasons=["compact_dominant_delta", "fit_pool_starved"],
         compact_gating_bypassed=True,
         recovery_relaxed_admitted_observations=4,
+        anchor_switch_count=3,
+        last_anchor_switch_ts=1_995.0,
+        last_anchor_switch_reason="anchor_hysteresis_switch",
+        anchor_hold_updates=5,
         fit_total_observations=12,
         fit_eligible_observations=8,
         fit_rejected_observations=4,
@@ -3334,9 +3379,64 @@ def test_go_multi_sync_mode_diagnostics_report_dominant_recovery_fields():
     assert diagnostics["recovery_trigger_reasons"] == ["compact_dominant_delta", "fit_pool_starved"]
     assert diagnostics["compact_gating_bypassed"] is True
     assert diagnostics["recovery_relaxed_admitted_observations"] == 4
+    assert diagnostics["anchor_switch_count"] == 3
+    assert diagnostics["last_anchor_switch_reason"] == "anchor_hysteresis_switch"
+    assert diagnostics["anchor_hold_updates"] == 5
     assert diagnostics["compact"]["period_s"] == pytest.approx(4.16)
     assert diagnostics["compact"]["unreliable"] is True
     assert diagnostics["refined"]["period_delta_to_dominant_ppm"] == pytest.approx(2500.0)
+
+
+def test_go_refined_timeline_includes_implied_phase_offsets_without_zero_fallback(monkeypatch):
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+    state = RadarState()
+    state._live_sync_states[12] = LiveSyncState(
+        iid=12,
+        period_s=10.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.8,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=1_000.0,
+        source="go_multi_aircraft_burst",
+        usable=True,
+        phase_anchor_icao="AAAAAA",
+        phase_anchor_offset_smoothed_deg=120.0,
+        phase_anchor_candidates=[{
+            "icao": "AAAAAA",
+            "score": 80.0,
+            "spread_deg": 2.0,
+            "obs_count": 4,
+            "fit_eligible_count": 4,
+            "fit_eligible_fraction": 1.0,
+            "status": "selected",
+            "reject_reasons": [],
+        }],
+    )
+    state._live_burst_timeline_obs[12] = deque([
+        AlignedBurstSyncObs(
+            burst_centroid_us=0.0,
+            icao="AAAAAA",
+            bearing_deg=120.0,
+            n_replies=5,
+            signal_dbfs=-12.0,
+            pos_age_s=0.2,
+            range_nm=0.0,
+            ts=999.5,
+            sync_update_eligible=True,
+            raw_arrival_us=0.0,
+        )
+    ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+
+    timeline = state.get_burst_sync_timeline(12, window_s=60.0)
+    row = timeline["observations"][0]
+
+    assert row["implied_phase_offset_deg"] == pytest.approx(120.0)
+    assert row["anchor_relative_phase_error_deg"] == pytest.approx(0.0)
+    assert row["phase_anchor_contributor"] is True
+    assert timeline["phase_anchor_candidates"][0]["icao"] == "AAAAAA"
 
 
 def test_reset_iid_clears_go_multi_sync_state():

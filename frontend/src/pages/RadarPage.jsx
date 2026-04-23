@@ -1807,10 +1807,15 @@ function humanizeSyncReason(value) {
   return String(value).replaceAll('_', ' ')
 }
 
+function isFiniteValue(value) {
+  return value !== null && value !== undefined && Number.isFinite(Number(value))
+}
+
 function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
   if (!syncState || !modeDiagnostics) return null
   const compact = modeDiagnostics.compact ?? {}
   const refined = modeDiagnostics.refined ?? {}
+  const authorityMode = modeDiagnostics.active_authority_mode ?? refined.active_authority_mode ?? '—'
   return (
     <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
@@ -1819,12 +1824,16 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
           <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>
             {modeDiagnostics.active_mode === 'refined_multi_aircraft'
               ? 'Residuals are currently driven by the refined multi-aircraft sync state.'
-              : 'Residuals are currently driven by compact sweep-frame sync; abrupt jumps can come from bootstrap reference churn.'}
+              : modeDiagnostics.active_mode === 'dominant_recovery'
+                ? 'Residuals are currently in dominant-period recovery; refined sync is rebuilding anchors around the live DF family prior.'
+                : 'Residuals are currently driven by compact sweep-frame sync; abrupt jumps can come from bootstrap reference churn.'}
           </div>
         </div>
         <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: '4px', fontSize: '0.72rem' }}>
           <span className={styles.metricPill}>Mode <span className={styles.metricValue}>{modeDiagnostics.active_label ?? '—'}</span></span>
           <span className={styles.metricPill}>Source <span className={styles.metricValue}>{modeDiagnostics.active_source ?? '—'}</span></span>
+          <span className={styles.metricPill}>Authority <span className={styles.metricValue}>{authorityMode}</span></span>
+          <span className={styles.metricPill}>Switches <span className={styles.metricValue}>{modeDiagnostics.authority_switch_count ?? 0}</span></span>
           <span className={styles.metricPill}>Refined usable <span className={styles.metricValue}>{refined.usable ? 'yes' : 'no'}</span></span>
           <span className={styles.metricPill}>Holdover <span className={styles.metricValue}>{syncState.holdover ? 'yes' : 'no'}</span></span>
         </div>
@@ -1860,6 +1869,7 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
             {refined.active
               ? (refined.no_anchor_reason ? `No refined anchor selected: ${humanizeSyncReason(refined.no_anchor_reason)}.` : 'Refined sync is active.')
               : `Refined sync is not active: ${humanizeSyncReason(refined.no_anchor_reason)}.`}
+            {modeDiagnostics.last_authority_switch_reason ? ` Last authority switch: ${humanizeSyncReason(modeDiagnostics.last_authority_switch_reason)}.` : ''}
             {refined.admission?.last_reason ? ` Last admission result: ${humanizeSyncReason(refined.admission.last_reason)}${refined.admission.last_icao ? ` (${refined.admission.last_icao})` : ''}.` : ''}
           </div>
         </div>
@@ -1873,13 +1883,52 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
   const refined = modeDiagnostics?.refined ?? {}
   const refinedActive = Boolean(refined.active)
   const anchorIcao = syncState.phase_anchor_icao
-  const candidateRows = Array.isArray(candidates) && candidates.length > 0
+  const candidateRowsRaw = Array.isArray(candidates) && candidates.length > 0
     ? candidates
     : (Array.isArray(syncState.phase_anchor_candidates) ? syncState.phase_anchor_candidates : [])
   const anchorObs = (observations || []).filter(obs => obs?.phase_anchor_contributor)
   const impliedRows = (observations || [])
-    .filter(obs => Number.isFinite(Number(obs?.implied_phase_offset_deg)))
+    .filter(obs => isFiniteValue(obs?.implied_phase_offset_deg))
     .slice(-160)
+  const candidateStatusPriority = useCallback((status) => {
+    if (status === 'selected') return 0
+    if (status === 'candidate') return 1
+    if (status === 'rejected') return 2
+    return 3
+  }, [])
+  const candidateRows = useMemo(() => {
+    return [...candidateRowsRaw].sort((a, b) => {
+      const aAnchor = a?.icao === anchorIcao ? 0 : 1
+      const bAnchor = b?.icao === anchorIcao ? 0 : 1
+      if (aAnchor !== bAnchor) return aAnchor - bAnchor
+      const statusDiff = candidateStatusPriority(a?.status) - candidateStatusPriority(b?.status)
+      if (statusDiff !== 0) return statusDiff
+      return String(a?.icao ?? '').localeCompare(String(b?.icao ?? ''))
+    })
+  }, [anchorIcao, candidateRowsRaw, candidateStatusPriority])
+  const latestImpliedRows = useMemo(() => {
+    const latestByIcao = new Map()
+    for (const obs of impliedRows) {
+      const key = String(obs?.icao ?? '')
+      const ts = Number(obs?.beam_center_us ?? obs?.raw_arrival_us ?? 0)
+      const current = latestByIcao.get(key)
+      const currentTs = Number(current?.beam_center_us ?? current?.raw_arrival_us ?? 0)
+      if (!current || ts >= currentTs) {
+        latestByIcao.set(key, obs)
+      }
+    }
+    const candidateByIcao = new Map(candidateRows.map(row => [String(row?.icao ?? ''), row]))
+    return [...latestByIcao.values()].sort((a, b) => {
+      const aIcao = String(a?.icao ?? '')
+      const bIcao = String(b?.icao ?? '')
+      const aAnchor = aIcao === anchorIcao ? 0 : 1
+      const bAnchor = bIcao === anchorIcao ? 0 : 1
+      if (aAnchor !== bAnchor) return aAnchor - bAnchor
+      const statusDiff = candidateStatusPriority(candidateByIcao.get(aIcao)?.status) - candidateStatusPriority(candidateByIcao.get(bIcao)?.status)
+      if (statusDiff !== 0) return statusDiff
+      return aIcao.localeCompare(bIcao)
+    })
+  }, [anchorIcao, candidateRows, candidateStatusPriority, impliedRows])
   const scatterW = 520
   const scatterH = 132
   const times = impliedRows.map(obs => Number(obs.beam_center_us ?? obs.raw_arrival_us)).filter(Number.isFinite)
@@ -1926,6 +1975,7 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
           <span className={styles.metricPill}>Fit obs <span className={styles.metricValue}>{syncState.fit_eligible_observations ?? 0}/{syncState.fit_total_observations ?? 0}</span></span>
           <span className={styles.metricPill}>Fit ICAOs <span className={styles.metricValue}>{syncState.fit_contributing_icao_count ?? 0}</span></span>
           <span className={styles.metricPill}>Candidates <span className={styles.metricValue}>{syncState.phase_anchor_candidate_count ?? candidateRows.length}</span></span>
+          <span className={styles.metricPill}>Authority <span className={styles.metricValue}>{modeDiagnostics?.active_authority_mode ?? syncState.active_authority_mode ?? '—'}</span></span>
         </div>
       </div>
 
@@ -2016,15 +2066,15 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
               </tr>
             </thead>
             <tbody>
-              {impliedRows.slice(-20).reverse().map((obs, idx) => (
+              {latestImpliedRows.slice(0, 20).map((obs, idx) => (
                 <tr key={`${obs.icao}-${obs.beam_center_us}-${idx}`}>
                   <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</td>
-                  <td style={tdRight}>{fmtNumber(obs.implied_phase_offset_deg, 2, '°')}</td>
-                  <td style={tdRight}>{fmtNumber(obs.anchor_relative_phase_error_deg, 2, '°')}</td>
+                  <td style={tdRight}>{isFiniteValue(obs.implied_phase_offset_deg) ? fmtNumber(obs.implied_phase_offset_deg, 2, '°') : '—'}</td>
+                  <td style={tdRight}>{isFiniteValue(obs.anchor_relative_phase_error_deg) ? fmtNumber(obs.anchor_relative_phase_error_deg, 2, '°') : '—'}</td>
                   <td style={tdLeft}>{obs.phase_anchor_contributor ? 'anchor' : (obs.phase_anchor_reject_reason || 'validator')}</td>
                 </tr>
               ))}
-              {impliedRows.length === 0 && (
+              {latestImpliedRows.length === 0 && (
                 <tr><td colSpan={4} style={{ ...tdLeft, color: '#8b949e' }}>No implied-offset observations yet.</td></tr>
               )}
             </tbody>

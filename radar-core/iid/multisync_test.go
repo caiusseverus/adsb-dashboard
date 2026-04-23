@@ -478,6 +478,7 @@ func TestMultiSyncSolver_ReacquireCandidateSearch(t *testing.T) {
 	ms.PeriodFailureStreak = 3
 	ms.PeriodReacquireActive = true
 	ms.PeriodReacquireReason = "failure_streak"
+	ms.ActiveAuthorityMode = authorityModeRecovery
 	// Also preset bootstrap so the candidate set includes the wrong seed.
 	ms.BootstrapPeriodS = wrongSeedS
 
@@ -544,6 +545,7 @@ func TestMultiSyncSolver_ReacquirePublishesConsistentCandidateFamily(t *testing.
 	ms.PeriodFailureStreak = 3
 	ms.PeriodReacquireActive = true
 	ms.PeriodReacquireReason = "failure_streak"
+	ms.ActiveAuthorityMode = authorityModeRecovery
 	ms.updateICAOQuality(scored)
 	expected := ms.searchBestCandidate(scored, 0.0)
 
@@ -596,8 +598,8 @@ func TestMultiSyncSolver_NormalRefinementPublishesAlignmentFromRefinedPeriod(t *
 	}
 
 	scored := scoreObsForSeed(ms, ms.obs, seedEpochUS, seedOffsetDeg, livePeriodS)
-	expected := ms.buildAlignmentForPeriod(scored, seedEpochUS, seedOffsetDeg, ms.PeriodS)
-	stale := ms.buildAlignmentForPeriod(scored, seedEpochUS, seedOffsetDeg, livePeriodS)
+	expected := ms.buildAlignmentForPeriod(scored, seedEpochUS, seedOffsetDeg, ms.PeriodS, now)
+	stale := ms.buildAlignmentForPeriod(scored, seedEpochUS, seedOffsetDeg, livePeriodS, now)
 
 	if math.Abs(ms.PhaseEpochUS-expected.epochUS) > 1e-6 {
 		t.Fatalf("published epoch %.6f should match refined-period alignment %.6f", ms.PhaseEpochUS, expected.epochUS)
@@ -821,11 +823,23 @@ func TestMultiSyncSolver_UsesDominantPriorDuringRecovery(t *testing.T) {
 	sync := NewSyncState(1, badCompactPeriodS, 0.0, 45.0, 0.8)
 
 	now := float64(time.Now().UnixMicro()) / 1e6
+	ms.ActiveAuthorityMode = authorityModeRecovery
 	for i := 0; i < 24; i++ {
 		us := float64(i) * truePeriodS / 4.0 * 1e6
 		icao := uint32(0xABC001 + i%3)
 		bearing := simulatedBearing(us, 0.0, 45.0, truePeriodS)
-		ms.obs = append(ms.obs, buildObs(us, bearing, icao, now-20.0+float64(i)*0.5))
+		posAge := float32(0.5)
+		sig := float32(-30.0)
+		ms.obs = append(ms.obs, MultiSyncObs{
+			CentroidUS: us,
+			ICAO:       icao,
+			BearingDeg: bearing,
+			RangeNM:    0.0,
+			PosAgeS:    posAge,
+			NReplies:   8,
+			SignalDBFS: &sig,
+			WallTS:     now - 20.0 + float64(i)*0.5,
+		})
 	}
 
 	ms.lastRunTS = 0.0
@@ -846,71 +860,191 @@ func TestMultiSyncSolver_UsesDominantPriorDuringRecovery(t *testing.T) {
 	if math.Abs(snap.ActiveFamilyPriorPeriodS-truePeriodS) > 0.01 {
 		t.Fatalf("expected dominant prior period %.3f, got %.6f", truePeriodS, snap.ActiveFamilyPriorPeriodS)
 	}
-	if snap.AnchorCandidateCount == 0 || snap.AnchorICAO == nil {
-		t.Fatalf("expected recovery to rebuild anchor candidates, got count=%d anchor=%v", snap.AnchorCandidateCount, snap.AnchorICAO)
-	}
 	if math.Abs(snap.PeriodS-truePeriodS) >= math.Abs(badCompactPeriodS-truePeriodS) {
 		t.Fatalf("expected refined period %.6f to move closer to dominant %.3f than compact %.3f", snap.PeriodS, truePeriodS, badCompactPeriodS)
 	}
 }
 
-func TestMultiSyncSolver_HealthyCompactStaysOutOfRecovery(t *testing.T) {
+func TestMultiSyncSolver_AuthorityModeHysteresis(t *testing.T) {
 	ms := NewMultiSyncSolver(1)
-	periodS := 4.0
-	sync := NewSyncState(1, periodS, 0.0, 45.0, 0.9)
-
-	now := float64(time.Now().UnixMicro()) / 1e6
-	for i := 0; i < 18; i++ {
-		us := float64(i) * periodS / 3.0 * 1e6
-		icao := uint32(0xABC100 + i%3)
-		bearing := simulatedBearing(us, 0.0, 45.0, periodS)
-		ms.obs = append(ms.obs, buildObs(us, bearing, icao, now-15.0+float64(i)*0.4))
+	if ms.ActiveAuthorityMode != authorityModeCompact {
+		t.Fatalf("expected compact authority at init, got %q", ms.ActiveAuthorityMode)
 	}
 
-	ms.lastRunTS = 0.0
-	ms.TryUpdate(sync, periodS)
-	snap := ms.Snapshot()
-	if snap.RecoveryModeActive {
-		t.Fatal("did not expect recovery mode for healthy compact sync")
+	for i := 0; i < authorityPromoteRefinedStreak-1; i++ {
+		ms.updateAuthorityModePostFit(true, false, false, false, true, float64(i+1))
+		if ms.ActiveAuthorityMode != authorityModeCompact {
+			t.Fatalf("refined authority promoted too early on step %d: %q", i, ms.ActiveAuthorityMode)
+		}
 	}
-	if snap.ActiveFamilyPriorSource != "compact_seed" {
-		t.Fatalf("expected compact seed to remain the active prior in normal mode, got %q", snap.ActiveFamilyPriorSource)
+	ms.updateAuthorityModePostFit(true, false, false, false, true, 10.0)
+	if ms.ActiveAuthorityMode != authorityModeRefined {
+		t.Fatalf("expected refined authority after healthy streak, got %q", ms.ActiveAuthorityMode)
 	}
-	if snap.CompactGatingBypassed {
-		t.Fatal("did not expect compact gating bypass outside recovery")
+
+	for i := 0; i < authorityCompactReclaimStreak-1; i++ {
+		ms.updateAuthorityModePostFit(false, true, true, false, false, 20.0+float64(i))
+		if ms.ActiveAuthorityMode != authorityModeRefined {
+			t.Fatalf("refined authority dropped too early on failure step %d: %q", i, ms.ActiveAuthorityMode)
+		}
+	}
+	ms.updateAuthorityModePostFit(false, true, true, false, false, 30.0)
+	if ms.ActiveAuthorityMode != authorityModeCompact {
+		t.Fatalf("expected compact authority only after sustained failure/compact health, got %q", ms.ActiveAuthorityMode)
+	}
+	if ms.AuthoritySwitchCount < 2 {
+		t.Fatalf("expected authority switch count to record both promotions, got %d", ms.AuthoritySwitchCount)
 	}
 }
 
-func TestMultiSyncSolver_RecoveryRelaxesAdmission(t *testing.T) {
+func TestMultiSyncSolver_HealthyCompactAssessmentStaysOutOfRecovery(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	periodS := 4.0
+	sync := NewSyncState(1, periodS, 0.0, 45.0, 0.9)
+	recovery, compactUnreliable, reasons := ms.assessRecoveryMode(sync, periodS)
+	if recovery {
+		t.Fatalf("did not expect recovery mode for healthy compact sync, got reasons=%v", reasons)
+	}
+	if compactUnreliable {
+		t.Fatalf("did not expect healthy compact sync to be marked unreliable, got reasons=%v", reasons)
+	}
+}
+
+func TestMultiSyncSolver_RecoveryAdmissionRelaxesPositionAgeGate(t *testing.T) {
+	o := MultiSyncObs{
+		CentroidUS: 1_000_000.0,
+		ICAO:       0xABC200,
+		BearingDeg: 120.0,
+		RangeNM:    0.0,
+		PosAgeS:    10.0,
+		NReplies:   8,
+	}
+	if got := msFitRejectReason(o, "inlier", 4.0, nil, false); got != "stale_position" {
+		t.Fatalf("expected normal admission to reject stale position, got %q", got)
+	}
+	if got := msFitRejectReason(o, "inlier", 4.0, nil, true); got != "" {
+		t.Fatalf("expected recovery admission to relax stale-position gate, got %q", got)
+	}
+}
+
+func TestEvalCandidatePeriod_PreservesAnchorCandidates(t *testing.T) {
 	ms := NewMultiSyncSolver(1)
 	truePeriodS := 4.0
-	sync := NewSyncState(1, 4.16, 0.0, 45.0, 0.8)
+	epochUS := 0.0
 
-	now := float64(time.Now().UnixMicro()) / 1e6
+	var scored []scoredObs
 	for i := 0; i < 18; i++ {
 		us := float64(i) * truePeriodS / 3.0 * 1e6
-		icao := uint32(0xABC200 + i%3)
-		bearing := simulatedBearing(us, 0.0, 45.0, truePeriodS)
-		if i%4 == 0 {
-			bearing = math.Mod(bearing+42.0, 360.0)
+		bearing := simulatedBearing(us, epochUS, 45.0, truePeriodS)
+		sig := float32(-30.0)
+		o := MultiSyncObs{
+			CentroidUS: us,
+			ICAO:       uint32(0xABC001 + i%3),
+			BearingDeg: bearing,
+			RangeNM:    0.0,
+			PosAgeS:    0.5,
+			NReplies:   8,
+			SignalDBFS: &sig,
 		}
-		ms.obs = append(ms.obs, buildObs(us, bearing, icao, now-15.0+float64(i)*0.4))
+		scored = append(scored, scoredObs{
+			o:           o,
+			effectiveUS: us,
+			baseW:       0.8,
+			effectiveW:  0.8,
+			status:      "inlier",
+			fitEligible: true,
+		})
 	}
 
-	ms.lastRunTS = 0.0
-	ms.TryUpdate(sync, truePeriodS)
-	snap := ms.Snapshot()
-	if !snap.RecoveryModeActive {
-		t.Fatal("expected recovery mode to activate")
+	result := ms.evalCandidatePeriod(scored, truePeriodS, epochUS)
+	if result.anchorCandidateCount == 0 {
+		t.Fatal("expected candidate evaluation to retain anchor candidate count")
 	}
-	if !snap.CompactGatingBypassed {
-		t.Fatal("expected compact gating to be bypassed in recovery")
+	if len(result.anchorCandidates) == 0 {
+		t.Fatal("expected candidate evaluation to retain anchor candidate rows")
 	}
-	if snap.RecoveryRelaxedAdmissions == 0 {
-		t.Fatal("expected some observations to be admitted only because recovery relaxed gates")
+	if result.anchorICAO == nil {
+		t.Fatal("expected candidate evaluation to retain selected anchor")
 	}
-	if snap.FitEligibleObservations < recoveryFitEligibleMin {
-		t.Fatalf("expected relaxed recovery admissions to rebuild fit pool, got %d eligible observations", snap.FitEligibleObservations)
+}
+
+func buildAnchorScoredObs(icao uint32, offsetDeg, baseW float64, count int) []scoredObs {
+	out := make([]scoredObs, 0, count)
+	for i := 0; i < count; i++ {
+		effectiveUS := float64(i) * 1_000_000.0
+		phaseDeg := math.Mod(effectiveUS/4_000_000.0*360.0, 360.0)
+		bearing := math.Mod(phaseDeg+offsetDeg, 360.0)
+		out = append(out, scoredObs{
+			o: MultiSyncObs{
+				CentroidUS: effectiveUS,
+				ICAO:       icao,
+				BearingDeg: bearing,
+				RangeNM:    0.0,
+				PosAgeS:    0.5,
+				NReplies:   8,
+			},
+			effectiveUS: effectiveUS,
+			baseW:       baseW,
+			effectiveW:  baseW,
+			status:      "inlier",
+			fitEligible: true,
+		})
+	}
+	return out
+}
+
+func TestMultiSyncSolver_SelectAnchorKeepsCurrentOnSmallScoreDelta(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	currentICAO := uint32(0xABC001)
+	ms.AnchorICAO = &currentICAO
+	ms.AnchorHoldUpdates = anchorHoldMinUpdates
+
+	scored := append(
+		buildAnchorScoredObs(currentICAO, 30.0, 0.55, 4),
+		buildAnchorScoredObs(0xABC002, 60.0, 0.62, 4)...,
+	)
+
+	_, anchorICAO, _, _, _, _, _ := ms.selectAnchor(scored, 0.0, 4_000_000.0, 0.0, 123.0, true)
+	if anchorICAO == nil {
+		t.Fatal("expected selected anchor")
+	}
+	if *anchorICAO != currentICAO {
+		t.Fatalf("expected hysteresis to keep current anchor %06X, got %06X", currentICAO, *anchorICAO)
+	}
+	if ms.AnchorSwitchCount != 0 {
+		t.Fatalf("expected no anchor switch, got %d", ms.AnchorSwitchCount)
+	}
+	if ms.AnchorHoldUpdates <= anchorHoldMinUpdates {
+		t.Fatalf("expected hold counter to continue increasing, got %d", ms.AnchorHoldUpdates)
+	}
+}
+
+func TestMultiSyncSolver_SelectAnchorSwitchesWhenChallengerMateriallyBetter(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	currentICAO := uint32(0xABC001)
+	ms.AnchorICAO = &currentICAO
+	ms.AnchorHoldUpdates = anchorHoldMinUpdates
+
+	scored := append(
+		buildAnchorScoredObs(currentICAO, 30.0, 0.40, 4),
+		buildAnchorScoredObs(0xABC002, 60.0, 0.72, 4)...,
+	)
+
+	_, anchorICAO, _, _, _, _, _ := ms.selectAnchor(scored, 0.0, 4_000_000.0, 0.0, 456.0, true)
+	if anchorICAO == nil {
+		t.Fatal("expected selected anchor")
+	}
+	if want := uint32(0xABC002); *anchorICAO != want {
+		t.Fatalf("expected materially better challenger %06X, got %06X", want, *anchorICAO)
+	}
+	if ms.AnchorSwitchCount != 1 {
+		t.Fatalf("expected one anchor switch, got %d", ms.AnchorSwitchCount)
+	}
+	if ms.LastAnchorSwitchReason != "anchor_hysteresis_switch" {
+		t.Fatalf("unexpected anchor switch reason %q", ms.LastAnchorSwitchReason)
+	}
+	if ms.AnchorHoldUpdates != 1 {
+		t.Fatalf("expected hold counter reset after switch, got %d", ms.AnchorHoldUpdates)
 	}
 }
 

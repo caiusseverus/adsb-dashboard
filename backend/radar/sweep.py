@@ -1334,6 +1334,16 @@ class LiveSyncState:
     recovery_trigger_reasons: list[str] = _field(default_factory=list)
     compact_gating_bypassed: bool = False
     recovery_relaxed_admitted_observations: int = 0
+    active_authority_mode: str | None = None
+    authority_switch_count: int = 0
+    last_authority_switch_ts: float | None = None
+    last_authority_switch_reason: str | None = None
+    authority_enter_streak: int = 0
+    authority_exit_streak: int = 0
+    anchor_switch_count: int = 0
+    last_anchor_switch_ts: float | None = None
+    last_anchor_switch_reason: str | None = None
+    anchor_hold_updates: int = 0
 
 
 @_dataclass
@@ -4377,7 +4387,7 @@ class RadarState:
 
     def _adopt_go_frame_sync_locked(self, iid: int, go_sync: dict) -> None:
         existing = self._live_sync_states.get(iid)
-        if existing is not None and existing.source == "multi_aircraft_burst":
+        if existing is not None and existing.source in {"multi_aircraft_burst", "go_multi_aircraft_burst"}:
             return
         if go_sync.get("period_s") is None:
             return
@@ -4507,6 +4517,10 @@ class RadarState:
         recovery_trigger_reasons = [
             str(reason) for reason in (msg.get("rtr") or []) if reason is not None
         ]
+        active_authority_mode = msg.get("aam")
+        period_authoritative_source = (
+            "refined" if active_authority_mode == "refined_authoritative" else "base"
+        )
 
         with self._lock:
             self._go_multi_sync_states_by_iid[iid] = dict(msg)
@@ -4558,7 +4572,17 @@ class RadarState:
                 compact_sync_unreliable=bool(msg.get("cu", False)),
                 compact_gating_bypassed=bool(msg.get("cgb", False)),
                 recovery_relaxed_admitted_observations=int(msg.get("rla") or 0),
-                period_authoritative_source="refined",
+                active_authority_mode=active_authority_mode,
+                authority_switch_count=int(msg.get("asc") or 0),
+                last_authority_switch_ts=(float(msg["ast"]) if msg.get("ast") not in (None, 0) else None),
+                last_authority_switch_reason=msg.get("asr"),
+                authority_enter_streak=int(msg.get("aes") or 0),
+                authority_exit_streak=int(msg.get("axs") or 0),
+                anchor_switch_count=int(msg.get("anc") or 0),
+                last_anchor_switch_ts=(float(msg["ant"]) if msg.get("ant") not in (None, 0) else None),
+                last_anchor_switch_reason=msg.get("ahr"),
+                anchor_hold_updates=int(msg.get("ahu") or 0),
+                period_authoritative_source=period_authoritative_source,
             )
 
     def _stage3_detection_from_go_observation(self, entry: dict) -> Stage3LiveDetection:
@@ -8313,6 +8337,14 @@ class RadarState:
         now_ts = time.time()
         cutoff_ts = now_ts - window_s
         entries: list[dict] = []
+        refined_go_source = getattr(sync, "source", None) == "go_multi_aircraft_burst"
+        candidate_by_icao = {}
+        if refined_go_source:
+            candidate_by_icao = {
+                row.get("icao"): row
+                for row in (getattr(sync, "phase_anchor_candidates", []) or [])
+                if row.get("icao")
+            }
         for obs in obs_snapshot:
             if obs.ts < cutoff_ts:
                 continue
@@ -8331,6 +8363,24 @@ class RadarState:
             classification = self._classify_sync_residual(abs(residual_deg))
             weight = self._score_sync_burst_observation(obs)
             fit_eligible = bool(getattr(obs, "sync_update_eligible", True)) and classification != "rejected" and weight > 0
+            implied_phase_offset = None
+            anchor_relative_error = None
+            phase_anchor_contributor = False
+            phase_anchor_reject_reason = None
+            if refined_go_source:
+                implied_phase_offset = (
+                    obs.bearing_deg
+                    + float(getattr(prediction, "waveform_correction_deg", 0.0) or 0.0)
+                    - float(getattr(prediction, "phase_in_rot_deg", 0.0) or 0.0)
+                ) % 360.0
+                anchor_relative_error = _circular_delta_deg(
+                    implied_phase_offset,
+                    getattr(sync, "phase_anchor_offset_smoothed_deg", None),
+                )
+                phase_anchor_contributor = obs.icao == getattr(sync, "phase_anchor_icao", None)
+                candidate = candidate_by_icao.get(obs.icao) or {}
+                reject_reasons = candidate.get("reject_reasons") or []
+                phase_anchor_reject_reason = ",".join(reject_reasons) if reject_reasons else None
             entries.append({
                 "beam_center_us": obs.burst_centroid_us,
                 "wall_ts": obs.ts,
@@ -8351,10 +8401,10 @@ class RadarState:
                 "residual_corrected_deg": residual_deg,
                 "motion_comp_improvement_deg": 0.0,
                 "residual_for_period_fit_deg": residual_deg if fit_eligible else None,
-                "implied_phase_offset_deg": None,
-                "anchor_relative_phase_error_deg": None,
-                "phase_anchor_contributor": False,
-                "phase_anchor_reject_reason": None,
+                "implied_phase_offset_deg": implied_phase_offset,
+                "anchor_relative_phase_error_deg": anchor_relative_error,
+                "phase_anchor_contributor": phase_anchor_contributor,
+                "phase_anchor_reject_reason": phase_anchor_reject_reason,
                 "phase_in_rot_deg": prediction.phase_in_rot_deg,
                 "raw_arrival_us": getattr(obs, "raw_arrival_us", obs.burst_centroid_us),
                 "prop_corrected_beast_us": prediction.prop_corrected_beast_us,
@@ -8372,7 +8422,7 @@ class RadarState:
                 "weight": weight,
                 "classification": classification,
                 "fit_eligible": fit_eligible,
-                "fit_reject_reason": None if fit_eligible else "compact_go_sync",
+                "fit_reject_reason": None if fit_eligible else ("go_refined_sync" if refined_go_source else "compact_go_sync"),
                 "n_replies": obs.n_replies,
                 "signal_dbfs": obs.signal_dbfs,
                 "pos_age_s": obs.pos_age_s,
@@ -8472,7 +8522,19 @@ class RadarState:
         refined_active = bool(sync_source in {"multi_aircraft_burst", "go_multi_aircraft_burst"})
         refined_present = bool(refined_active or (go_admission and go_admission.get("counts")))
         refined_usable = bool(sync is not None and refined_active and getattr(sync, "usable", False))
-        active_mode = "refined_multi_aircraft" if refined_active else "compact_bootstrap"
+        authority_mode = getattr(sync, "active_authority_mode", None) if sync is not None else None
+        if authority_mode == "dominant_recovery":
+            active_mode = "dominant_recovery"
+            active_label = "Dominant-period recovery"
+        elif authority_mode == "compact_authoritative":
+            active_mode = "compact_bootstrap"
+            active_label = "Compact sync (authoritative)"
+        elif refined_active:
+            active_mode = "refined_multi_aircraft"
+            active_label = "Refined sync (multi-aircraft)"
+        else:
+            active_mode = "compact_bootstrap"
+            active_label = "Compact sync (sweep-frame)"
         no_anchor_reason = None
         if refined_active:
             no_anchor_reason = getattr(sync, "phase_anchor_no_candidate_reason", None)
@@ -8487,10 +8549,7 @@ class RadarState:
         return {
             "active_source": sync_source,
             "active_mode": active_mode,
-            "active_label": (
-                "Refined sync (multi-aircraft)"
-                if refined_active else "Compact sync (sweep-frame)"
-            ),
+            "active_label": active_label,
             "dominant_period_s": getattr(sync, "dominant_period_s", None) if sync is not None else None,
             "active_family_prior_s": getattr(sync, "active_family_prior_s", None) if sync is not None else None,
             "active_family_prior_source": getattr(sync, "active_family_prior_source", None) if sync is not None else None,
@@ -8506,6 +8565,16 @@ class RadarState:
             "recovery_relaxed_admitted_observations": int(
                 getattr(sync, "recovery_relaxed_admitted_observations", 0) or 0
             ) if sync is not None else 0,
+            "active_authority_mode": getattr(sync, "active_authority_mode", None) if sync is not None else None,
+            "authority_switch_count": int(getattr(sync, "authority_switch_count", 0) or 0) if sync is not None else 0,
+            "last_authority_switch_ts": getattr(sync, "last_authority_switch_ts", None) if sync is not None else None,
+            "last_authority_switch_reason": getattr(sync, "last_authority_switch_reason", None) if sync is not None else None,
+            "authority_enter_streak": int(getattr(sync, "authority_enter_streak", 0) or 0) if sync is not None else 0,
+            "authority_exit_streak": int(getattr(sync, "authority_exit_streak", 0) or 0) if sync is not None else 0,
+            "anchor_switch_count": int(getattr(sync, "anchor_switch_count", 0) or 0) if sync is not None else 0,
+            "last_anchor_switch_ts": getattr(sync, "last_anchor_switch_ts", None) if sync is not None else None,
+            "last_anchor_switch_reason": getattr(sync, "last_anchor_switch_reason", None) if sync is not None else None,
+            "anchor_hold_updates": int(getattr(sync, "anchor_hold_updates", 0) or 0) if sync is not None else 0,
             "compact": {
                 "active": not refined_active,
                 "period_s": getattr(sync, "compact_period_s", None) if sync is not None else None,
@@ -8544,6 +8613,7 @@ class RadarState:
                 "period_delta_to_dominant_ppm": (
                     getattr(sync, "dominant_period_delta_ppm", None) if refined_active else None
                 ),
+                "active_authority_mode": getattr(sync, "active_authority_mode", None) if refined_active else None,
                 "anchor_icao": getattr(sync, "phase_anchor_icao", None) if refined_active else None,
                 "anchor_candidate_count": int(getattr(sync, "phase_anchor_candidate_count", 0) or 0) if refined_active else 0,
                 "fit_total_observations": int(getattr(sync, "fit_total_observations", 0) or 0) if refined_active else 0,
@@ -9890,6 +9960,16 @@ class RadarState:
             "recovery_trigger_reasons": getattr(sync, "recovery_trigger_reasons", None),
             "compact_gating_bypassed": getattr(sync, "compact_gating_bypassed", None),
             "recovery_relaxed_admitted_observations": getattr(sync, "recovery_relaxed_admitted_observations", None),
+            "active_authority_mode": getattr(sync, "active_authority_mode", None),
+            "authority_switch_count": getattr(sync, "authority_switch_count", None),
+            "last_authority_switch_ts": getattr(sync, "last_authority_switch_ts", None),
+            "last_authority_switch_reason": getattr(sync, "last_authority_switch_reason", None),
+            "authority_enter_streak": getattr(sync, "authority_enter_streak", None),
+            "authority_exit_streak": getattr(sync, "authority_exit_streak", None),
+            "anchor_switch_count": getattr(sync, "anchor_switch_count", None),
+            "last_anchor_switch_ts": getattr(sync, "last_anchor_switch_ts", None),
+            "last_anchor_switch_reason": getattr(sync, "last_anchor_switch_reason", None),
+            "anchor_hold_updates": getattr(sync, "anchor_hold_updates", None),
             "period_refine_mode": getattr(sync, "period_refine_mode", None),
             "period_authoritative_source": getattr(sync, "period_authoritative_source", None),
             "period_failure_score": getattr(sync, "period_failure_score", None),

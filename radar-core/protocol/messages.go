@@ -307,6 +307,16 @@ type MultiSyncState struct {
 	RecoveryTriggerReasons    []string                   `codec:"rtr"`
 	CompactGatingBypassed     bool                       `codec:"cgb"`
 	RecoveryRelaxedAdmissions uint32                     `codec:"rla"`
+	ActiveAuthorityMode       string                     `codec:"aam"`
+	AuthoritySwitchCount      uint32                     `codec:"asc"`
+	LastAuthoritySwitchTS     float64                    `codec:"ast"`
+	LastAuthoritySwitchReason string                     `codec:"asr"`
+	AuthorityEnterStreak      uint16                     `codec:"aes"`
+	AuthorityExitStreak       uint16                     `codec:"axs"`
+	AnchorSwitchCount         uint32                     `codec:"anc"`
+	LastAnchorSwitchTS        float64                    `codec:"ant"`
+	LastAnchorSwitchReason    string                     `codec:"ahr"`
+	AnchorHoldUpdates         uint16                     `codec:"ahu"`
 }
 
 type MultiSyncAnchorCandidate struct {

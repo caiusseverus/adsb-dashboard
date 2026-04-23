@@ -1,3 +1,82 @@
+## 2026-04-23 Burst Sync Panel Stable Ordering
+
+- [x] Inspect the current frontend ordering of anchor candidates and implied-offset rows and confirm why they jump around.
+- [x] Replace volatile score/time ordering with a more stable deterministic ordering that still keeps the selected anchor prominent.
+- [x] Ensure the implied-offset panel is actually grouped per aircraft instead of resorting raw observations every refresh.
+- [x] Run frontend verification and record the exact result.
+
+### Review
+- Root cause confirmed:
+  - The anchor candidate table was effectively rendered in live backend score order, so small score changes could reshuffle the whole list on every poll.
+  - The “per-aircraft implied offsets” table was not actually per aircraft. It rendered the last 20 observations in reverse time order, so rows constantly moved as new observations arrived.
+- Implemented:
+  - `frontend/src/pages/RadarPage.jsx` now sorts anchor candidates deterministically: selected anchor first, then by candidate status, then by ICAO.
+  - The implied-offset table now collapses to the latest observation per ICAO and sorts rows stably with the selected anchor first, then candidate status, then ICAO.
+- Verification:
+  - `cd frontend && npm run build` → passed
+
+## 2026-04-23 Burst Sync Anchor Stability
+
+- [x] Inspect the Go refined anchor-selection path and confirm why selected anchors are churning.
+- [x] Add explicit anchor hysteresis / lockout so close-score challengers do not replace a usable anchor every update.
+- [x] Expose anchor-switch diagnostics if needed to explain why the solver kept or changed the anchor.
+- [x] Add regression tests covering stable-anchor retention and anchor replacement only on materially better or clearly degraded evidence.
+- [x] Run focused Go tests and any broader verification needed for the burst sync path.
+
+### Review
+- Root cause confirmed:
+  - The prior source-authority hysteresis fixed compact vs refined mode switching, but Go anchor selection itself still had no hysteresis. `selectAnchor()` simply picked the highest-scoring aircraft on each run, so small score oscillations between otherwise-healthy candidates could churn the selected anchor even while the period family stayed stable.
+  - The anchor selector is also used by candidate-period evaluation during wrong-period recovery. Any stickiness applied there would have been incorrect because those candidate evaluations are exploratory, not published state.
+- Implemented:
+  - `radar-core/iid/multisync.go` now applies anchor hysteresis only on the published alignment path. The solver keeps the current anchor through small score deltas and during an initial dwell window, and only switches when the current anchor is degraded or a challenger is materially better.
+  - The solver now exports anchor-switch diagnostics (`anchor_switch_count`, `last_anchor_switch_ts`, `last_anchor_switch_reason`, `anchor_hold_updates`) through the Go snapshot/protocol path and the Python `LiveSyncState`/debug payloads.
+  - Candidate-period evaluation still preserves candidate rows, but it no longer mutates anchor-switch state while exploring non-published candidate families.
+- Verification:
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid -run 'TestMultiSyncSolver_(SelectAnchorKeepsCurrentOnSmallScoreDelta|SelectAnchorSwitchesWhenChallengerMateriallyBetter|UsesDominantPriorDuringRecovery|AuthorityModeHysteresis)|TestEvalCandidatePeriod_PreservesAnchorCandidates' -count=1` → passed
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid ./cmd/radar-core ./protocol -count=1` → passed
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -q -k 'update_go_multi_sync_state_overrides_python_multi_aircraft_burst or go_multi_sync_mode_diagnostics_report_dominant_recovery_fields'` → `2 passed, 87 deselected`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_radar_core_client.py -q` → `147 passed`
+
+## 2026-04-23 Burst Sync Authority Hysteresis And Refined Row Diagnostics
+
+- [x] Trace the current compact/refined authority handoff end to end, including Go solver mode selection and Python adoption of compact `IID_STATE` vs Go multi-sync state
+- [x] Refactor `radar-core/iid/multisync.go` to carry explicit authority mode with hysteresis/lockout so compact, dominant-recovery, and refined-authoritative decisions do not flap run-to-run
+- [x] Export authority-mode diagnostics through Go protocol and Python normalisation, including switch count/reason/timestamp and any enter/exit streaks used for hysteresis
+- [x] Fix the Go recovery candidate path so selected-anchor candidate metadata survives end to end instead of dropping the candidate list when a reacquire candidate wins
+- [x] Audit and fix the refined row payload path so Go refined sync emits meaningful implied-offset / anchor-relative row fields, with explicit nulls where data is unavailable rather than misleading zeros
+- [x] Update frontend burst-sync rendering to show authority mode clearly, preserve refined candidate rows, and never coerce missing implied offsets to 0
+- [x] Add focused Go, backend, and frontend-compatible tests for authority hysteresis, Go refined candidate export, refined implied-offset row payloads, and bridge overwrite prevention
+- [x] Run verification and capture the exact commands/results in the review below
+
+Plan confirmation:
+- Hot-path sync fitting and authority logic stay in Go. Python remains the bridge and diagnostics layer, but it must stop overwriting a Go refined state with compact sync traffic.
+- The UI fix will prefer explicit degraded/null states over fabricated zero values so the panel stops implying a valid refined anchor row when the data is absent.
+
+### Review
+- Root causes confirmed:
+  - Authority flapping was not just threshold noise in `multisync.go`. The Go solver had no explicit sticky authority mode, and Python’s `_adopt_go_frame_sync_locked()` still allowed compact `IID_STATE` updates to overwrite `go_multi_aircraft_burst`, so compact and refined ownership could bounce at the bridge even when Go multi-sync was present.
+  - The selected-anchor / empty-candidates bug came from the Go recovery path: `runFit()` could publish the winning candidate’s anchor ICAO/score/phase but dropped the candidate list/count metadata when the reacquire search selected that candidate family.
+  - The `0` implied offsets were a payload/rendering bug: the Go-refined timeline still used the compact row builder, which left `implied_phase_offset_deg` unset, and the frontend’s `Number(...)` coercion turned `null` into `0`.
+- Implemented:
+  - `radar-core/iid/multisync.go` now carries an explicit authority mode (`compact_authoritative`, `dominant_recovery`, `refined_authoritative`) with hysteresis streaks and switch diagnostics, and publishes those fields through `MultiSyncSnapshot`.
+  - The Go recovery candidate path now preserves `anchorCandidateCount`, `anchorNoCandidateReason`, and `anchorCandidates` when a searched candidate family is published.
+  - `radar-core/protocol/messages.go` and `radar-core/cmd/radar-core/main.go` now export authority-mode diagnostics and the preserved candidate metadata.
+  - `backend/radar/sweep.py` now:
+    - mirrors authority diagnostics into `LiveSyncState`
+    - stops compact Go sync adoption from overwriting `go_multi_aircraft_burst`
+    - marks Go multi-sync period authority as `base` unless authority mode is truly refined-authoritative
+    - computes implied phase offsets / anchor-relative errors / candidate-linked row reasons for Go-refined timeline rows instead of leaving placeholder nulls
+  - `frontend/src/pages/RadarPage.jsx` now shows authority mode/switch info and no longer coerces missing implied offsets to `0`.
+- Audited files with no code change needed:
+  - `backend/radar/api.py` already forwards the snapshot/state payloads built in `backend/radar/sweep.py`, so no direct code change was required there.
+  - `backend/radar_core/client.py` forwards protocol payloads generically and did not need a shape-specific patch for these additive fields.
+- Verification:
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid -run 'Test(MultiSyncSolver_(UsesDominantPriorDuringRecovery|AuthorityModeHysteresis)|EvalCandidatePeriod_PreservesAnchorCandidates|MultiSyncSolver_HealthyCompactAssessmentStaysOutOfRecovery|MultiSyncSolver_RecoveryAdmissionRelaxesPositionAgeGate)' -count=1` → passed
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid ./cmd/radar-core ./protocol -count=1` → passed
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -q -k 'go_iid_state_does_not_overwrite_go_multi_sync_state or go_refined_timeline_includes_implied_phase_offsets_without_zero_fallback or update_go_multi_sync_state_overrides_python_multi_aircraft_burst or go_multi_sync_mode_diagnostics_report_dominant_recovery_fields'` → `4 passed, 85 deselected`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_radar_core_client.py -q` → `147 passed`
+  - `cd frontend && npm run build` → passed
+
 ## 2026-04-23 Dominant-Period-Led Refined Sync Recovery
 
 - [x] Trace the current compact/bootstrap, dominant rotation, and refined multi-sync dependency chain in Go/Python and confirm where compact sync still seeds, clamps, and hard-gates recovery

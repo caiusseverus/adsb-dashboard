@@ -88,6 +88,17 @@ const (
 	recoveryEntryFailureStreak       = 2
 	recoveryAnchorStarvedCandidates  = 0
 	recoveryAnchorStarvedFitEligible = 2
+	authorityPromoteRefinedStreak    = 3
+	authorityRefinedFailureStreak    = 3
+	authorityCompactReclaimStreak    = 5
+	authorityRecoveryEntryStreak     = 2
+	authorityRecoveryExitStreak      = 4
+	authorityCompactHealthyDeltaPPM  = 1000.0
+	anchorSwitchMinScoreDelta        = 0.12
+	anchorSwitchMinScoreRatio        = 1.25
+	anchorHoldMinUpdates             = 3
+	anchorPoorSpreadDeg              = 18.0
+	anchorPoorFitFraction            = 0.55
 
 	// ICAO quality memory.
 	icaoQualityMADAlpha  = 0.15
@@ -96,6 +107,12 @@ const (
 
 	// Throttle: minimum interval between solver runs (matches Python 250 ms).
 	multiSyncMinIntervalS = 0.25
+)
+
+const (
+	authorityModeCompact  = "compact_authoritative"
+	authorityModeRecovery = "dominant_recovery"
+	authorityModeRefined  = "refined_authoritative"
 )
 
 // MultiSyncObs is one sync-eligible burst observation buffered by the solver.
@@ -133,18 +150,21 @@ type scoredObs struct {
 // candidateEvalResult holds the scoring result for one candidate period
 // evaluated during wrong-period reacquire search.
 type candidateEvalResult struct {
-	periodS            float64
-	inlierCount        int
-	icaoCount          int
-	madDeg             float64
-	rejFrac            float64
-	score              float64
-	phaseOffsetDeg     float64
-	publishedOffsetDeg float64
-	newEpochUS         float64
-	anchorICAO         *uint32
-	anchorScore        float64
-	anchorPhaseDeg     float64
+	periodS                 float64
+	inlierCount             int
+	icaoCount               int
+	madDeg                  float64
+	rejFrac                 float64
+	score                   float64
+	phaseOffsetDeg          float64
+	publishedOffsetDeg      float64
+	newEpochUS              float64
+	anchorICAO              *uint32
+	anchorScore             float64
+	anchorPhaseDeg          float64
+	anchorCandidateCount    int
+	anchorNoCandidateReason string
+	anchorCandidates        []AnchorCandidateSnapshot
 }
 
 type AnchorCandidateSnapshot struct {
@@ -219,6 +239,16 @@ type MultiSyncSnapshot struct {
 	RecoveryTriggerReasons    []string
 	CompactGatingBypassed     bool
 	RecoveryRelaxedAdmissions int
+	ActiveAuthorityMode       string
+	AuthoritySwitchCount      int
+	LastAuthoritySwitchTS     float64
+	LastAuthoritySwitchReason string
+	AuthorityEnterStreak      int
+	AuthorityExitStreak       int
+	AnchorSwitchCount         int
+	LastAnchorSwitchTS        float64
+	LastAnchorSwitchReason    string
+	AnchorHoldUpdates         int
 }
 
 // MultiSyncSolver holds per-IID multi-aircraft sync refinement state.
@@ -296,6 +326,21 @@ type MultiSyncSolver struct {
 	LastRecoveryTriggerReasons    []string
 	LastCompactGatingBypassed     bool
 	LastRecoveryRelaxedAdmissions int
+	ActiveAuthorityMode           string
+	AuthoritySwitchCount          int
+	LastAuthoritySwitchTS         float64
+	LastAuthoritySwitchReason     string
+	AuthorityEnterStreak          int
+	AuthorityExitStreak           int
+	RefinedHealthyStreak          int
+	RefinedFailureStreak          int
+	CompactHealthyStreak          int
+	RecoveryEntryStreak           int
+	RecoveryExitStreak            int
+	AnchorSwitchCount             int
+	LastAnchorSwitchTS            float64
+	LastAnchorSwitchReason        string
+	AnchorHoldUpdates             int
 
 	// Throttle.
 	lastRunTS float64
@@ -304,8 +349,9 @@ type MultiSyncSolver struct {
 // NewMultiSyncSolver creates an empty solver for the given IID.
 func NewMultiSyncSolver(iid uint8) *MultiSyncSolver {
 	return &MultiSyncSolver{
-		iid:         iid,
-		ICAOQuality: make(map[uint32]*ICAOSyncQuality),
+		iid:                 iid,
+		ICAOQuality:         make(map[uint32]*ICAOSyncQuality),
+		ActiveAuthorityMode: authorityModeCompact,
 	}
 }
 
@@ -404,6 +450,21 @@ func (ms *MultiSyncSolver) Reset() {
 	ms.LastRecoveryTriggerReasons = nil
 	ms.LastCompactGatingBypassed = false
 	ms.LastRecoveryRelaxedAdmissions = 0
+	ms.ActiveAuthorityMode = authorityModeCompact
+	ms.AuthoritySwitchCount = 0
+	ms.LastAuthoritySwitchTS = 0
+	ms.LastAuthoritySwitchReason = ""
+	ms.AuthorityEnterStreak = 0
+	ms.AuthorityExitStreak = 0
+	ms.RefinedHealthyStreak = 0
+	ms.RefinedFailureStreak = 0
+	ms.CompactHealthyStreak = 0
+	ms.RecoveryEntryStreak = 0
+	ms.RecoveryExitStreak = 0
+	ms.AnchorSwitchCount = 0
+	ms.LastAnchorSwitchTS = 0
+	ms.LastAnchorSwitchReason = ""
+	ms.AnchorHoldUpdates = 0
 }
 
 // Snapshot returns a copy of the published state for protocol emission.
@@ -456,6 +517,16 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 		RecoveryTriggerReasons:    append([]string(nil), ms.LastRecoveryTriggerReasons...),
 		CompactGatingBypassed:     ms.LastCompactGatingBypassed,
 		RecoveryRelaxedAdmissions: ms.LastRecoveryRelaxedAdmissions,
+		ActiveAuthorityMode:       ms.ActiveAuthorityMode,
+		AuthoritySwitchCount:      ms.AuthoritySwitchCount,
+		LastAuthoritySwitchTS:     ms.LastAuthoritySwitchTS,
+		LastAuthoritySwitchReason: ms.LastAuthoritySwitchReason,
+		AuthorityEnterStreak:      ms.AuthorityEnterStreak,
+		AuthorityExitStreak:       ms.AuthorityExitStreak,
+		AnchorSwitchCount:         ms.AnchorSwitchCount,
+		LastAnchorSwitchTS:        ms.LastAnchorSwitchTS,
+		LastAnchorSwitchReason:    ms.LastAnchorSwitchReason,
+		AnchorHoldUpdates:         ms.AnchorHoldUpdates,
 	}
 	for k, v := range ms.LastFitRejectReasons {
 		snap.FitRejectReasons[k] = v
@@ -473,6 +544,7 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 // ─── internal solver ──────────────────────────────────────────────────────────
 
 func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix float64) {
+	ms.ensureAuthorityMode()
 	// Determine seed phase from existing multi-sync state or frame sync.
 	var seedEpochUS, seedOffsetDeg float64
 	if ms.Present && ms.PhaseEpochUS > 0 {
@@ -507,8 +579,18 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		}
 	}
 
-	recoveryActive, compactUnreliable, recoveryReasons := ms.assessRecoveryMode(sync, dominantPeriodS)
-	activeFamilyPriorS, activeFamilyPriorSource := ms.selectActiveFamilyPrior(compactPeriodS, dominantPeriodS, recoveryActive)
+	recoveryRequested, compactUnreliable, recoveryReasons := ms.assessRecoveryMode(sync, dominantPeriodS)
+	if recoveryRequested {
+		ms.RecoveryEntryStreak++
+	} else {
+		ms.RecoveryEntryStreak = 0
+	}
+	if ms.ActiveAuthorityMode != authorityModeRecovery && ms.RecoveryEntryStreak >= authorityRecoveryEntryStreak {
+		ms.setAuthorityMode(authorityModeRecovery, "recovery_requested_streak", nowUnix)
+		ms.RecoveryExitStreak = 0
+	}
+	recoveryActive := ms.ActiveAuthorityMode == authorityModeRecovery
+	activeFamilyPriorS, activeFamilyPriorSource := ms.selectActiveFamilyPrior(compactPeriodS, dominantPeriodS, ms.ActiveAuthorityMode)
 	if activeFamilyPriorS <= 0 {
 		return
 	}
@@ -755,11 +837,14 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 			if best.periodS > 0 {
 				finalPeriodS = best.periodS
 				finalAlignment = publishedAlignment{
-					epochUS:        best.newEpochUS,
-					offsetDeg:      best.publishedOffsetDeg,
-					anchorICAO:     best.anchorICAO,
-					anchorScore:    best.anchorScore,
-					anchorPhaseDeg: best.anchorPhaseDeg,
+					epochUS:                 best.newEpochUS,
+					offsetDeg:               best.publishedOffsetDeg,
+					anchorICAO:              best.anchorICAO,
+					anchorScore:             best.anchorScore,
+					anchorPhaseDeg:          best.anchorPhaseDeg,
+					anchorCandidateCount:    best.anchorCandidateCount,
+					anchorNoCandidateReason: best.anchorNoCandidateReason,
+					anchorCandidates:        best.anchorCandidates,
 				}
 				finalAlignmentReady = true
 			}
@@ -780,11 +865,14 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 			if best.periodS > 0 {
 				finalPeriodS = best.periodS
 				finalAlignment = publishedAlignment{
-					epochUS:        best.newEpochUS,
-					offsetDeg:      best.publishedOffsetDeg,
-					anchorICAO:     best.anchorICAO,
-					anchorScore:    best.anchorScore,
-					anchorPhaseDeg: best.anchorPhaseDeg,
+					epochUS:                 best.newEpochUS,
+					offsetDeg:               best.publishedOffsetDeg,
+					anchorICAO:              best.anchorICAO,
+					anchorScore:             best.anchorScore,
+					anchorPhaseDeg:          best.anchorPhaseDeg,
+					anchorCandidateCount:    best.anchorCandidateCount,
+					anchorNoCandidateReason: best.anchorNoCandidateReason,
+					anchorCandidates:        best.anchorCandidates,
 				}
 				finalAlignmentReady = true
 			}
@@ -822,7 +910,7 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	}
 
 	if !finalAlignmentReady {
-		finalAlignment = ms.buildAlignmentForPeriod(scored, seedEpochUS, seedOffsetDeg, finalPeriodS)
+		finalAlignment = ms.buildAlignmentForPeriod(scored, seedEpochUS, seedOffsetDeg, finalPeriodS, nowUnix)
 	}
 	ms.LastAnchorCandidateCount = finalAlignment.anchorCandidateCount
 	ms.LastAnchorNoCandidate = finalAlignment.anchorNoCandidateReason
@@ -871,13 +959,51 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	}
 	ms.LastPeriodDeltaToDominantS, ms.LastPeriodDeltaToDominantPPM = periodDeltaToDominant(finalPeriodS, dominantPeriodS)
 	ms.LastCompactDeltaToDominantS, ms.LastCompactDeltaToDominantPPM = periodDeltaToDominant(compactPeriodS, dominantPeriodS)
+
+	refinedHealthy := ms.Usable &&
+		finalAlignment.anchorICAO != nil &&
+		len(fitPool) >= trustMinFitPool &&
+		len(fitICAOs) >= 2 &&
+		detrended <= trustMaxResidualDeg &&
+		!majorityRejected &&
+		!wrongPeriodSuspect
+	refinedFailure := !ms.Usable ||
+		finalAlignment.anchorICAO == nil ||
+		wrongPeriodSuspect ||
+		majorityRejected ||
+		detrended > reacquireMADThreshold
+	compactHealthy := false
+	if sync != nil && compactPeriodS > 0 {
+		_, compactDeltaPPM := periodDeltaToDominant(compactPeriodS, dominantPeriodS)
+		compactHealthy = !sync.Holdover &&
+			sync.ResidualEMA < reacquireMADThreshold &&
+			sync.NRejectedFrames < recoveryRejectedFrameThreshold &&
+			(dominantPeriodS <= 0 || math.Abs(compactDeltaPPM) <= authorityCompactHealthyDeltaPPM)
+	}
+	ms.updateAuthorityModePostFit(refinedHealthy, refinedFailure, compactHealthy, recoveryRequested, cleanUpdate, nowUnix)
+	ms.LastRecoveryModeActive = ms.ActiveAuthorityMode == authorityModeRecovery
+	ms.LastCompactGatingBypassed = ms.ActiveAuthorityMode == authorityModeRecovery
+	if ms.ActiveAuthorityMode != authorityModeRecovery && !recoveryRequested {
+		ms.LastRecoveryTriggerReasons = nil
+	}
 }
 
-func (ms *MultiSyncSolver) selectActiveFamilyPrior(compactPeriodS, dominantPeriodS float64, recoveryActive bool) (float64, string) {
-	if recoveryActive && dominantPeriodS > 0 {
+func (ms *MultiSyncSolver) selectActiveFamilyPrior(compactPeriodS, dominantPeriodS float64, authorityMode string) (float64, string) {
+	if authorityMode == authorityModeRecovery && dominantPeriodS > 0 {
 		return dominantPeriodS, "dominant_live_df"
 	}
-	if ms.TrustedBasePeriodS > 0 {
+	if authorityMode == authorityModeCompact && compactPeriodS > 0 {
+		return compactPeriodS, "compact_seed"
+	}
+	if authorityMode == authorityModeRefined {
+		if ms.TrustedBasePeriodS > 0 {
+			return ms.TrustedBasePeriodS, "trusted_refined"
+		}
+		if ms.Present && ms.PeriodS > 0 {
+			return ms.PeriodS, "current_refined"
+		}
+	}
+	if ms.TrustedBasePeriodS > 0 && authorityMode != authorityModeCompact {
 		return ms.TrustedBasePeriodS, "trusted_refined"
 	}
 	if ms.Present && ms.PeriodS > 0 && !ms.Holdover {
@@ -967,6 +1093,78 @@ func (ms *MultiSyncSolver) assessRecoveryMode(sync *SyncState, dominantPeriodS f
 	return hasFailure && largeDelta, compactUnreliable, uniqueStrings(reasons)
 }
 
+func (ms *MultiSyncSolver) ensureAuthorityMode() {
+	if ms.ActiveAuthorityMode == "" {
+		ms.ActiveAuthorityMode = authorityModeCompact
+	}
+}
+
+func (ms *MultiSyncSolver) setAuthorityMode(mode, reason string, nowUnix float64) {
+	ms.ensureAuthorityMode()
+	if ms.ActiveAuthorityMode == mode {
+		return
+	}
+	ms.ActiveAuthorityMode = mode
+	ms.AuthoritySwitchCount++
+	ms.LastAuthoritySwitchTS = nowUnix
+	ms.LastAuthoritySwitchReason = reason
+	ms.AuthorityEnterStreak = 0
+	ms.AuthorityExitStreak = 0
+}
+
+func (ms *MultiSyncSolver) updateAuthorityModePostFit(
+	refinedHealthy, refinedFailure, compactHealthy, recoveryRequested, cleanUpdate bool,
+	nowUnix float64,
+) {
+	if refinedHealthy {
+		ms.RefinedHealthyStreak++
+	} else {
+		ms.RefinedHealthyStreak = 0
+	}
+	if refinedFailure {
+		ms.RefinedFailureStreak++
+	} else {
+		ms.RefinedFailureStreak = 0
+	}
+	if compactHealthy {
+		ms.CompactHealthyStreak++
+	} else {
+		ms.CompactHealthyStreak = 0
+	}
+
+	switch ms.ActiveAuthorityMode {
+	case authorityModeRecovery:
+		if cleanUpdate && !recoveryRequested {
+			ms.RecoveryExitStreak++
+		} else {
+			ms.RecoveryExitStreak = 0
+		}
+		ms.AuthorityExitStreak = ms.RecoveryExitStreak
+		if ms.RecoveryExitStreak >= authorityRecoveryExitStreak {
+			if ms.RefinedHealthyStreak >= authorityPromoteRefinedStreak {
+				ms.setAuthorityMode(authorityModeRefined, "recovery_converged_to_refined", nowUnix)
+			} else if ms.CompactHealthyStreak >= authorityCompactReclaimStreak {
+				ms.setAuthorityMode(authorityModeCompact, "recovery_released_to_compact", nowUnix)
+			}
+		}
+	case authorityModeCompact:
+		ms.AuthorityEnterStreak = ms.RefinedHealthyStreak
+		if ms.RefinedHealthyStreak >= authorityPromoteRefinedStreak {
+			ms.setAuthorityMode(authorityModeRefined, "refined_usable_streak", nowUnix)
+		}
+	case authorityModeRefined:
+		ms.AuthorityExitStreak = ms.RefinedFailureStreak
+		if ms.RefinedFailureStreak >= authorityRefinedFailureStreak {
+			if recoveryRequested {
+				ms.setAuthorityMode(authorityModeRecovery, "refined_failure_streak", nowUnix)
+				ms.RecoveryExitStreak = 0
+			} else if ms.CompactHealthyStreak >= authorityCompactReclaimStreak {
+				ms.setAuthorityMode(authorityModeCompact, "compact_healthy_reclaim", nowUnix)
+			}
+		}
+	}
+}
+
 func (ms *MultiSyncSolver) applyTrustedBaseUpdate(finalPeriodS float64, trustedEnough, wrongPeriodSuspect bool) {
 	if ms.PeriodReacquireActive || wrongPeriodSuspect {
 		ms.TrustUpdateStreak = 0
@@ -995,7 +1193,7 @@ func (ms *MultiSyncSolver) applyTrustedBaseUpdate(finalPeriodS float64, trustedE
 
 func (ms *MultiSyncSolver) buildAlignmentForPeriod(
 	scored []scoredObs,
-	seedEpochUS, seedOffsetDeg, periodS float64,
+	seedEpochUS, seedOffsetDeg, periodS, nowUnix float64,
 ) publishedAlignment {
 	periodUS := periodS * 1e6
 	if periodUS <= 0 {
@@ -1064,6 +1262,8 @@ func (ms *MultiSyncSolver) buildAlignmentForPeriod(
 		periodS,
 		phaseAdjustDeg,
 		nInliers,
+		nowUnix,
+		true,
 	)
 	return alignment
 }
@@ -1072,6 +1272,8 @@ func (ms *MultiSyncSolver) buildPublishedAlignment(
 	scored []scoredObs,
 	seedEpochUS, seedOffsetDeg, periodS, phaseAdjustDeg float64,
 	nInliers int,
+	nowUnix float64,
+	recordSelection bool,
 ) publishedAlignment {
 	periodUS := periodS * 1e6
 	if periodUS <= 0 {
@@ -1106,7 +1308,7 @@ func (ms *MultiSyncSolver) buildPublishedAlignment(
 		mixedFallback += 360.0
 	}
 	out.offsetDeg, out.anchorICAO, out.anchorScore, out.anchorPhaseDeg, out.anchorCandidateCount, out.anchorNoCandidateReason, out.anchorCandidates = ms.selectAnchor(
-		scored, out.epochUS, periodUS, mixedFallback,
+		scored, out.epochUS, periodUS, mixedFallback, nowUnix, recordSelection,
 	)
 	return out
 }
@@ -1137,7 +1339,7 @@ func (ms *MultiSyncSolver) updateICAOQuality(scored []scoredObs) {
 // selectAnchor returns (newOffsetDeg, anchorICAO, anchorScore, anchorPhaseDeg).
 func (ms *MultiSyncSolver) selectAnchor(
 	scored []scoredObs,
-	newEpochUS, periodUS, fallbackOffset float64,
+	newEpochUS, periodUS, fallbackOffset, nowUnix float64, recordSelection bool,
 ) (newOffset float64, anchorICAO *uint32, anchorScore, anchorPhaseDeg float64, candidateCount int, noCandidateReason string, candidates []AnchorCandidateSnapshot) {
 	type icaoAnchor struct {
 		icao             uint32
@@ -1148,6 +1350,8 @@ func (ms *MultiSyncSolver) selectAnchor(
 		fitEligibleCount int
 		maxBaseW         float64
 		score            float64
+		spreadDeg        float64
+		fitFraction      float64
 		rejectReasons    map[string]bool
 	}
 	byICAO := make(map[uint32]*icaoAnchor)
@@ -1192,6 +1396,7 @@ func (ms *MultiSyncSolver) selectAnchor(
 		if a.totalObs > 0 {
 			fitFraction = float64(a.fitEligibleCount) / float64(a.totalObs)
 		}
+		a.fitFraction = fitFraction
 		status := "candidate"
 		if a.fitEligibleCount == 0 {
 			status = "rejected"
@@ -1212,6 +1417,7 @@ func (ms *MultiSyncSolver) selectAnchor(
 				spreadDeg = math.Sqrt(-2.0*math.Log(r)) * 180.0 / math.Pi
 			}
 		}
+		a.spreadDeg = spreadDeg
 		candidates = append(candidates, AnchorCandidateSnapshot{
 			ICAO:                a.icao,
 			Score:               a.score,
@@ -1247,7 +1453,30 @@ func (ms *MultiSyncSolver) selectAnchor(
 		} else if candidateCount == 0 {
 			noCandidateReason = "no_anchor_candidates"
 		}
+		if recordSelection {
+			ms.AnchorHoldUpdates = 0
+		}
 		return fallbackOffset, nil, 0, 0, candidateCount, noCandidateReason, candidates
+	}
+
+	if recordSelection && ms.AnchorICAO != nil && best.icao != *ms.AnchorICAO {
+		var current *icaoAnchor
+		for _, a := range byICAO {
+			if a.icao == *ms.AnchorICAO {
+				current = a
+				break
+			}
+		}
+		if current != nil && current.fitEligibleCount > 0 && current.nObs > 0 && current.score >= 0.1 {
+			materiallyBetter := best.score >= current.score+anchorSwitchMinScoreDelta &&
+				best.score >= current.score*anchorSwitchMinScoreRatio
+			currentPoor := current.spreadDeg >= anchorPoorSpreadDeg ||
+				current.fitFraction < anchorPoorFitFraction
+			holdActive := ms.AnchorHoldUpdates < anchorHoldMinUpdates
+			if !currentPoor && (holdActive || !materiallyBetter) {
+				best = current
+			}
+		}
 	}
 
 	// Circular mean of implied phases.
@@ -1255,7 +1484,28 @@ func (ms *MultiSyncSolver) selectAnchor(
 	meanDeg := math.Mod(meanRad*180.0/math.Pi+360.0, 360.0)
 
 	icao := best.icao
+	if recordSelection {
+		ms.recordAnchorSelection(&icao, nowUnix)
+	}
 	return meanDeg, &icao, best.score, meanDeg, candidateCount, "", candidates
+}
+
+func (ms *MultiSyncSolver) recordAnchorSelection(anchorICAO *uint32, nowUnix float64) {
+	switch {
+	case anchorICAO == nil:
+		ms.AnchorHoldUpdates = 0
+	case ms.AnchorICAO == nil:
+		ms.AnchorHoldUpdates = 1
+		ms.LastAnchorSwitchTS = nowUnix
+		ms.LastAnchorSwitchReason = "initial_anchor"
+	case *ms.AnchorICAO != *anchorICAO:
+		ms.AnchorSwitchCount++
+		ms.AnchorHoldUpdates = 1
+		ms.LastAnchorSwitchTS = nowUnix
+		ms.LastAnchorSwitchReason = "anchor_hysteresis_switch"
+	default:
+		ms.AnchorHoldUpdates++
+	}
 }
 
 func (ms *MultiSyncSolver) refinePeriod(
@@ -1489,21 +1739,26 @@ func (ms *MultiSyncSolver) evalCandidatePeriod(scored []scoredObs, candidatePeri
 		candidatePeriodS,
 		0.0,
 		inliers,
+		0,
+		false,
 	)
 
 	return candidateEvalResult{
-		periodS:            candidatePeriodS,
-		inlierCount:        inliers,
-		icaoCount:          icaoCount,
-		madDeg:             madDeg,
-		rejFrac:            rejFrac,
-		score:              score,
-		phaseOffsetDeg:     bestOffset,
-		publishedOffsetDeg: alignment.offsetDeg,
-		newEpochUS:         alignment.epochUS,
-		anchorICAO:         alignment.anchorICAO,
-		anchorScore:        alignment.anchorScore,
-		anchorPhaseDeg:     alignment.anchorPhaseDeg,
+		periodS:                 candidatePeriodS,
+		inlierCount:             inliers,
+		icaoCount:               icaoCount,
+		madDeg:                  madDeg,
+		rejFrac:                 rejFrac,
+		score:                   score,
+		phaseOffsetDeg:          bestOffset,
+		publishedOffsetDeg:      alignment.offsetDeg,
+		newEpochUS:              alignment.epochUS,
+		anchorICAO:              alignment.anchorICAO,
+		anchorScore:             alignment.anchorScore,
+		anchorPhaseDeg:          alignment.anchorPhaseDeg,
+		anchorCandidateCount:    alignment.anchorCandidateCount,
+		anchorNoCandidateReason: alignment.anchorNoCandidateReason,
+		anchorCandidates:        alignment.anchorCandidates,
 	}
 }
 

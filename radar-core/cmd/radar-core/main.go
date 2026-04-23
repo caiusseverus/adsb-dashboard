@@ -356,6 +356,16 @@ func (e *engine) emitMultiSyncState(s *iid.IIDState) {
 		RecoveryTriggerReasons:    snap.RecoveryTriggerReasons,
 		CompactGatingBypassed:     snap.CompactGatingBypassed,
 		RecoveryRelaxedAdmissions: uint32(snap.RecoveryRelaxedAdmissions),
+		ActiveAuthorityMode:       snap.ActiveAuthorityMode,
+		AuthoritySwitchCount:      uint32(snap.AuthoritySwitchCount),
+		LastAuthoritySwitchTS:     snap.LastAuthoritySwitchTS,
+		LastAuthoritySwitchReason: snap.LastAuthoritySwitchReason,
+		AuthorityEnterStreak:      uint16(snap.AuthorityEnterStreak),
+		AuthorityExitStreak:       uint16(snap.AuthorityExitStreak),
+		AnchorSwitchCount:         uint32(snap.AnchorSwitchCount),
+		LastAnchorSwitchTS:        snap.LastAnchorSwitchTS,
+		LastAnchorSwitchReason:    snap.LastAnchorSwitchReason,
+		AnchorHoldUpdates:         uint16(snap.AnchorHoldUpdates),
 	}
 	e.writer.Send(msg)
 }
