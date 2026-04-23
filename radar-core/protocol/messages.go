@@ -288,6 +288,10 @@ type MultiSyncState struct {
 	FitEligibleObservations          uint32                     `codec:"fe"`
 	FitRejectedObservations          uint32                     `codec:"fr"`
 	FitContributingICAOs             uint16                     `codec:"fc"`
+	FitWindowS                       float64                    `codec:"fw"`
+	DisplayWindowS                   float64                    `codec:"dw"`
+	FitSpanS                         float64                    `codec:"fs"`
+	ResidualSlopeDegPerS             float64                    `codec:"rs"`
 	FitRejectReasons                 map[string]uint64          `codec:"frr"`
 	AnchorCandidateCount             uint16                     `codec:"ac"`
 	AnchorNoCandidateReason          string                     `codec:"anr"`

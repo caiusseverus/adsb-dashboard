@@ -116,7 +116,8 @@ BURST_GAP_US = 200_000
 MIN_BURSTS = 4
 
 # IID event max age for in-memory accumulation (seconds)
-IID_EVENT_MAX_AGE_S = 60  # 60s — sufficient for DF11 residual diagnostics; rotation uses _burst_records
+IID_EVENT_MAX_AGE_S = 60  # 60s raw bootstrap window; rotation analysis uses _burst_records
+DF11_RESIDUAL_EVENT_MAX_AGE_S = 360  # retained source for 300s residual diagnostics
 ROTATION_ANALYSIS_MAX_AGE_S = 120.0   # 2 min ≈ 24–40 rotations — sufficient for period detection
 # BurstRecord retention: matches the rotation analysis window so _burst_records
 # always covers the full window used by _analyse_burst_records.
@@ -142,6 +143,10 @@ _ROTATION_ANALYSIS_MAX_EVENTS_PER_IID = 12_000
 # pruning cycles.
 _IID_EVENTS_MAX = 50_000
 STABLE_REANALYZE_INTERVAL_S = 300.0
+_MULTI_SYNC_FIT_WINDOW_ROTATIONS = 6.0
+_MULTI_SYNC_FIT_WINDOW_MIN_S = 30.0
+_SYNC_DISPLAY_HISTORY_WINDOW_S = 300.0
+_SYNC_DIAGNOSTIC_HISTORY_MAX = 1500
 
 # Co-sweep window: two bursts within 70ms are considered one radar sweep
 CO_SWEEP_WINDOW_US = 70_000
@@ -2332,6 +2337,7 @@ class RadarState:
         self._go_sync_states_by_iid: dict[int, dict] = {}
         self._go_multi_sync_states_by_iid: dict[int, dict] = {}
         self._go_multi_sync_admission_by_iid: dict[int, dict] = {}
+        self._go_sync_diagnostic_history_revision: dict[int, int] = {}
         self._compact_sync_debug_by_iid: dict[int, dict] = {}
         self._go_iid_state_revision: dict[int, int] = {}
         self._go_track_observations: deque = deque(maxlen=self._GO_TRACK_OBSERVATIONS_MAX)
@@ -2348,6 +2354,7 @@ class RadarState:
         # Pruned by age in update_rotation_models(); maxlen caps worst-case growth
         # between pruning cycles at high DF11 rates (oldest events evicted first).
         self._iid_events: deque[tuple[float, int, str, float | None]] = deque(maxlen=_IID_EVENTS_MAX)
+        self._df11_residual_events: deque[tuple[float, int, str, float | None]] = deque(maxlen=_IID_EVENTS_MAX)
         self._iid_latest_arrival_us: dict[int, float] = {}
 
         # Per-IID compact burst records: {iid: deque[BurstRecord]}
@@ -2578,6 +2585,7 @@ class RadarState:
 
             with self._lock:
                 self._iid_events.append((arrival_us, iid, icao_hex, signal_dbfs))
+                self._df11_residual_events.append((arrival_us, iid, icao_hex, signal_dbfs))
                 self._iid_latest_arrival_us[iid] = arrival_us
                 self._dirty_iids.add(iid)
 
@@ -2799,6 +2807,100 @@ class RadarState:
                 self._BURST_SYNC_TIMELINE_OBS_MAX,
             ),
         }
+
+    @staticmethod
+    def _fit_window_s_for_period(period_s: float | None) -> float:
+        """Return the short solver window used for local multi-sync fitting."""
+        try:
+            period = float(period_s or 0.0)
+        except (TypeError, ValueError):
+            period = 0.0
+        return max(period * _MULTI_SYNC_FIT_WINDOW_ROTATIONS, _MULTI_SYNC_FIT_WINDOW_MIN_S)
+
+    def _sync_horizons_payload(self, sync: "LiveSyncState | None", *, display_window_s: float | None = None) -> dict:
+        """Expose the distinct solver, display, and authoritative horizons."""
+        fit_window_s = self._fit_window_s_for_period(getattr(sync, "period_s", None))
+        authoritative_age_s = getattr(sync, "authoritative_state_age_s", None) if sync is not None else None
+        return {
+            "fit_window_s": fit_window_s,
+            "display_window_s": float(display_window_s or _SYNC_DISPLAY_HISTORY_WINDOW_S),
+            "retained_history_window_s": self._LIVE_SYNC_OBS_RETENTION_S,
+            "authoritative_state_age_s": authoritative_age_s,
+            "authoritative_state_window_s": authoritative_age_s,
+            "fit_source": "solver_fit_window",
+            "display_source": "retained_diagnostic_history",
+            "authoritative_source": "slow_damped_state",
+        }
+
+    def _append_go_sync_diagnostic_history_locked(self, iid: int, msg: dict, sync: "LiveSyncState") -> None:
+        """Record retained trend diagnostics from Go-owned multi-sync updates."""
+        ts = float(msg.get("ts") or sync.last_sync_update_ts or time.time())
+        period_s = float(sync.period_s or 0.0)
+        fit_window_s = self._fit_window_s_for_period(period_s)
+        fit_span_s = float(msg.get("fs") or min(fit_window_s, max(0.0, fit_window_s)))
+        fit_total = int(msg.get("ft") or 0)
+        fit_eligible = int(msg.get("fe") or 0)
+        source = sync.source
+
+        self._live_period_update_history.setdefault(
+            iid, deque(maxlen=_SYNC_DIAGNOSTIC_HISTORY_MAX)
+        ).append({
+            "ts": ts,
+            "source": source,
+            "fit_window_s": fit_window_s,
+            "display_window_s": _SYNC_DISPLAY_HISTORY_WINDOW_S,
+            "period_s": period_s,
+            "period_base_s": sync.period_base_s,
+            "period_correction_ppm": sync.period_correction_ppm,
+            "period_correction_status": sync.period_correction_status,
+            "period_update_block_reason": sync.period_update_block_reason,
+            "period_update_allowed": sync.period_update_allowed,
+            "period_update_gain": sync.period_update_gain,
+            "period_update_applied_s": sync.period_update_applied_s,
+            "period_update_applied_us": sync.period_update_applied_us,
+            "n_fit_observations": fit_eligible,
+            "n_total_observations": fit_total,
+            "n_fit_icaos": int(msg.get("fc") or 0),
+            "fit_span_s": fit_span_s,
+            "fit_reject_reasons": dict(sync.fit_reject_reasons),
+            "active_authority_mode": sync.active_authority_mode,
+            "candidate_period_s": sync.candidate_period_s,
+            "authoritative_period_s": sync.authoritative_period_s,
+            "candidate_validation_score": sync.candidate_validation_score,
+            "authoritative_validation_score": sync.authoritative_validation_score,
+            "authoritative_state_age_s": sync.authoritative_state_age_s,
+        })
+        self._live_slope_history.setdefault(
+            iid, deque(maxlen=_SYNC_DIAGNOSTIC_HISTORY_MAX)
+        ).append({
+            "ts": ts,
+            "source": source,
+            "fit_window_s": fit_window_s,
+            "display_window_s": _SYNC_DISPLAY_HISTORY_WINDOW_S,
+            "residual_slope_deg_per_s": sync.residual_slope_deg_per_s,
+            "raw_slope_deg_per_s": msg.get("rs"),
+            "fit_span_s": fit_span_s,
+            "n_fit_observations": fit_eligible,
+            "active_authority_mode": sync.active_authority_mode,
+        })
+        self._live_period_history.setdefault(
+            iid, deque(maxlen=_SYNC_DIAGNOSTIC_HISTORY_MAX)
+        ).append({
+            "ts": ts,
+            "source": source,
+            "fit_window_s": fit_window_s,
+            "display_window_s": _SYNC_DISPLAY_HISTORY_WINDOW_S,
+            "period_s": period_s,
+            "period_base_s": sync.period_base_s,
+            "period_correction_ppm": sync.period_correction_ppm,
+            "period_correction_status": sync.period_correction_status,
+            "candidate_period_s": sync.candidate_period_s,
+            "authoritative_period_s": sync.authoritative_period_s,
+            "active_authority_mode": sync.active_authority_mode,
+        })
+        self._go_sync_diagnostic_history_revision[iid] = (
+            self._go_sync_diagnostic_history_revision.get(iid, 0) + 1
+        )
 
     def get_memory_stats(self) -> dict:
         """Return current sizes of key in-memory structures for observability."""
@@ -3333,6 +3435,7 @@ class RadarState:
             with self._lock:
                 for iid, icao_hex, signal_dbfs, arrival_us in prepared:
                     self._iid_events.append((arrival_us, iid, icao_hex, signal_dbfs))
+                    self._df11_residual_events.append((arrival_us, iid, icao_hex, signal_dbfs))
                     self._iid_latest_arrival_us[iid] = arrival_us
                     self._dirty_iids.add(iid)
             append_s = time.perf_counter() - t_append
@@ -4511,6 +4614,10 @@ class RadarState:
         period_base_s = float(msg.get("pb") or period_s)
         jitter_deg = float(msg.get("jd") or 5.0)
         residual_ema_deg = float(msg.get("re") or 5.0)
+        fit_window_s = float(msg.get("fw") or self._fit_window_s_for_period(period_s))
+        display_window_s = float(msg.get("dw") or _SYNC_DISPLAY_HISTORY_WINDOW_S)
+        fit_span_s = float(msg.get("fs") or 0.0)
+        residual_slope_deg_per_s = float(msg.get("rs") or 0.0)
         usable = bool(msg.get("us", False))
         holdover = bool(msg.get("ho", False))
         n_sync_updates = int(msg.get("nu") or 0)
@@ -4576,7 +4683,7 @@ class RadarState:
                 phase_validation_status = "partial"
             else:
                 phase_validation_status = "unavailable"
-            self._live_sync_states[iid] = LiveSyncState(
+            new_sync = LiveSyncState(
                 iid=iid,
                 period_s=float(period_s),
                 period_base_s=period_base_s,
@@ -4597,6 +4704,8 @@ class RadarState:
                 fit_rejected_observations=int(msg.get("fr") or 0),
                 fit_reject_reasons=fit_reject_reasons,
                 fit_contributing_icao_count=int(msg.get("fc") or 0),
+                fit_span_s=fit_span_s,
+                residual_slope_deg_per_s=residual_slope_deg_per_s,
                 period_reacquire_active=reacquire_active,
                 period_reacquire_reason=msg.get("rr"),
                 recovery_mode_active=bool(msg.get("rma", reacquire_active)),
@@ -4659,6 +4768,14 @@ class RadarState:
                 authoritative_mode=msg.get("amd"),
                 period_authoritative_source=period_authoritative_source,
             )
+            self._live_sync_states[iid] = new_sync
+            self._append_go_sync_diagnostic_history_locked(iid, {
+                **dict(msg),
+                "fw": fit_window_s,
+                "dw": display_window_s,
+                "fs": fit_span_s,
+                "rs": residual_slope_deg_per_s,
+            }, new_sync)
 
     def _stage3_detection_from_go_observation(self, entry: dict) -> Stage3LiveDetection:
         return Stage3LiveDetection(
@@ -7200,6 +7317,9 @@ class RadarState:
                 # Prune old events from the left
                 while self._iid_events and self._iid_events[0][0] < cutoff_us:
                     self._iid_events.popleft()
+                df11_residual_cutoff_us = now_us - int(DF11_RESIDUAL_EVENT_MAX_AGE_S * 1_000_000)
+                while self._df11_residual_events and self._df11_residual_events[0][0] < df11_residual_cutoff_us:
+                    self._df11_residual_events.popleft()
 
                 # Prune burst records beyond BURST_RECORD_MAX_AGE_S
                 burst_cutoff_us = now_us - int(BURST_RECORD_MAX_AGE_S * 1_000_000)
@@ -7582,6 +7702,8 @@ class RadarState:
                                self._live_period_update_history,
                                self._live_slope_history,
                                self._live_period_history,
+                               self._go_sync_diagnostic_history_revision,
+                               self._df11_residual_events,
                                self._live_sync_snapshot_cache,
                                self._live_sync_snapshot_seq,
                                self._live_sweep_frame_summary_cache,
@@ -7632,6 +7754,9 @@ class RadarState:
             if iid in self._go_multi_sync_admission_by_iid:
                 del self._go_multi_sync_admission_by_iid[iid]
                 had_any = True
+            if iid in self._go_sync_diagnostic_history_revision:
+                del self._go_sync_diagnostic_history_revision[iid]
+                had_any = True
             if iid in self._compact_sync_debug_by_iid:
                 del self._compact_sync_debug_by_iid[iid]
                 had_any = True
@@ -7658,6 +7783,13 @@ class RadarState:
                 )
                 had_any = had_any or len(filtered_events) != len(self._iid_events)
                 self._iid_events = filtered_events
+            if self._df11_residual_events:
+                filtered_residual_events = deque(
+                    (ev for ev in self._df11_residual_events if ev[1] != iid),
+                    maxlen=_IID_EVENTS_MAX,
+                )
+                had_any = had_any or len(filtered_residual_events) != len(self._df11_residual_events)
+                self._df11_residual_events = filtered_residual_events
             if self._live_detection_buffer:
                 filtered_detections = deque(
                     (det for det in self._live_detection_buffer if det.iid != iid),
@@ -7711,6 +7843,7 @@ class RadarState:
             self._models.clear()
             self._sweep_history.clear()
             self._iid_events.clear()
+            self._df11_residual_events.clear()
             self._burst_records.clear()
             self._dirty_iids.clear()
             self._iid_latest_arrival_us.clear()
@@ -7760,6 +7893,7 @@ class RadarState:
             self._go_sync_states_by_iid.clear()
             self._go_multi_sync_states_by_iid.clear()
             self._go_multi_sync_admission_by_iid.clear()
+            self._go_sync_diagnostic_history_revision.clear()
             self._compact_sync_debug_by_iid.clear()
             self._go_iid_state_revision.clear()
             self._go_reference_aircraft_by_iid.clear()
@@ -8760,7 +8894,7 @@ class RadarState:
             _df11_cutoff_us = (latest_arrival_us_for_iid or 0.0) - window_s * 1_000_000.0
             # Take a fast deque snapshot under lock; filtering happens outside so the
             # decoder thread is not blocked while we scan 30k+ elements at Python speed.
-            _iid_events_copy = list(self._iid_events)
+            _iid_events_copy = list(self._df11_residual_events)
 
         if has_go_evidence:
             timeline_obs_snapshot = self._go_burst_sync_timeline_snapshot(iid, window_s=window_s)
@@ -8833,6 +8967,7 @@ class RadarState:
                 "period_update_history": update_history,
                 "slope_history": slope_history,
                 "period_history": period_history,
+                "sync_horizons": self._sync_horizons_payload(sync, display_window_s=window_s),
                 "predictor_consistency": getattr(sync, "predictor_consistency", None) if sync else None,
                 "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []) if sync else [],
                 # No sync state → no authoritative residuals possible.
@@ -8889,9 +9024,10 @@ class RadarState:
                 "window_s": window_s,
                 "waveform_bins": _serialise_waveform_bins(waveform_bins),
                 "per_icao_quality": [],
-                "period_update_history": [],
-                "slope_history": [],
-                "period_history": [],
+                "period_update_history": update_history,
+                "slope_history": slope_history,
+                "period_history": period_history,
+                "sync_horizons": self._sync_horizons_payload(sync, display_window_s=window_s),
                 "predictor_consistency": getattr(sync, "predictor_consistency", None),
                 "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []),
                 "motion_comp_summary": {
@@ -9121,6 +9257,7 @@ class RadarState:
             "period_update_history": update_history,
             "slope_history": slope_history,
             "period_history": period_history,
+            "sync_horizons": self._sync_horizons_payload(sync, display_window_s=window_s),
             "predictor_consistency": getattr(sync, "predictor_consistency", None),
             "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []),
             "motion_comp_summary": {
@@ -9162,6 +9299,7 @@ class RadarState:
             go_admission = dict(self._go_multi_sync_admission_by_iid.get(iid) or {})
             compact_debug = dict(self._compact_sync_debug_by_iid.get(iid) or {})
             go_frame_revision = self._go_sweep_frames_revision.get(iid, 0)
+            sync_history_revision = int(self._go_sync_diagnostic_history_revision.get(iid, 0))
             obs_buf = None if go_evidence else (self._live_burst_timeline_obs.get(iid) or self._live_aligned_burst_obs.get(iid))
             obs_len = len(go_evidence) if go_evidence else (len(obs_buf) if obs_buf else 0)
             last_obs_us = None
@@ -9198,6 +9336,7 @@ class RadarState:
                 compact_debug.get("last_sync_reset_ts"),
                 compact_debug.get("last_holdover_transition_ts"),
                 go_frame_revision,
+                sync_history_revision,
             )
             cached = self._live_sync_snapshot_cache.get(iid)
             if cached is not None and cached[0] == signature:
@@ -9224,10 +9363,14 @@ class RadarState:
             "chart_overlay_consistent": burst_timeline.get("chart_overlay_consistent", False),
             "waveform_bins": burst_timeline.get("waveform_bins", []),
             "phase_anchor_candidates": burst_timeline.get("phase_anchor_candidates", []),
+            "period_update_history": burst_timeline.get("period_update_history", []),
+            "slope_history": burst_timeline.get("slope_history", []),
+            "period_history": burst_timeline.get("period_history", []),
             "motion_comp_summary": burst_timeline.get("motion_comp_summary"),
             "retention_diagnostics": burst_timeline.get("retention_diagnostics"),
             "alignment_status": burst_timeline.get("alignment_status"),
             "sync_mode_diagnostics": burst_timeline.get("sync_mode_diagnostics"),
+            "sync_horizons": burst_timeline.get("sync_horizons"),
             "transport": {
                 "source": "shared_snapshot",
                 "cached": False,

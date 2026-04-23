@@ -23,7 +23,7 @@ const RADAR_SYNC_WS_BASE = import.meta.env.PROD
   ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`
   : 'ws://localhost:8000'
 const BURST_SYNC_POLL_MS = 1500
-const BURST_SYNC_ALIGNMENT_WINDOW_S = 90
+const BURST_SYNC_ALIGNMENT_WINDOW_S = 300
 const BURST_SYNC_DF11_ON_TIME_THRESHOLD_DEG = 6
 const POSITION_VERIFICATION_ON_TIME_THRESHOLD_DEG = 6
 const RADAR_FIELD_PERSISTENCE_US = 3_000_000
@@ -2173,6 +2173,7 @@ function RotationAlignmentPanel({
   const observations = Array.isArray(burstTimeline?.observations) ? burstTimeline.observations : []
   const alignmentStatus = burstTimeline?.alignment_status ?? null
   const syncModeDiagnostics = burstTimeline?.sync_mode_diagnostics ?? null
+  const syncHorizons = burstTimeline?.sync_horizons ?? null
   const legacyIcaosRaw = Array.isArray(legacyTimeline?.icaos) ? legacyTimeline.icaos : []
   const syncState = burstTimeline?.sync_state ?? null
   const loading = legacyLoading || streamStatus.mode === 'connecting' || streamStatus.mode === 'reconnecting'
@@ -2183,12 +2184,19 @@ function RotationAlignmentPanel({
     const value = Number(obs?.beam_center_us ?? 0)
     return Number.isFinite(value) ? Math.max(max, value) : max
   }, 0)
+  const latestDf11ResidualUs = Array.isArray(burstTimeline?.df11_residual_observations)
+    ? burstTimeline.df11_residual_observations.reduce((max, dot) => {
+        const value = Number(dot?.arrival_beast_us ?? 0)
+        return Number.isFinite(value) ? Math.max(max, value) : max
+      }, 0)
+    : 0
   const timingNowUs = Number(timingView?.nowUs ?? 0)
   const windowSpanUs = Math.max(
     10 * 1_000_000,
     Number(burstTimeline?.window_s ?? BURST_SYNC_ALIGNMENT_WINDOW_S) * 1_000_000,
   )
-  const windowEndUs = Math.max(timingNowUs, latestBurstUs)
+  const latestResidualUs = Math.max(latestBurstUs, latestDf11ResidualUs)
+  const windowEndUs = latestResidualUs > 0 ? latestResidualUs : timingNowUs
   const windowStartUs = Math.max(0, windowEndUs - windowSpanUs)
   // DF11 residual dots for the burst-sync chart are now backend-derived.
   // The backend computes them via _build_df11_residual_observations() using the
@@ -2200,9 +2208,13 @@ function RotationAlignmentPanel({
     const backendDots = Array.isArray(burstTimeline?.df11_residual_observations)
       ? burstTimeline.df11_residual_observations
       : []
-    if (!selectedIcao) return backendDots
-    return backendDots.filter(dot => dot.icao === selectedIcao)
-  }, [burstTimeline?.df11_residual_observations, selectedIcao])
+    return backendDots.filter(dot => {
+      const sampleUs = Number(dot?.arrival_beast_us ?? 0)
+      if (!Number.isFinite(sampleUs) || sampleUs < windowStartUs || sampleUs > windowEndUs) return false
+      if (selectedIcao && dot.icao !== selectedIcao) return false
+      return true
+    })
+  }, [burstTimeline?.df11_residual_observations, selectedIcao, windowEndUs, windowStartUs])
   const filteredObservations = observations.filter(obs => {
     const sampleUs = Number(obs?.beam_center_us ?? 0)
     if (!Number.isFinite(sampleUs) || sampleUs < windowStartUs || sampleUs > windowEndUs) return false
@@ -2467,6 +2479,15 @@ function RotationAlignmentPanel({
           </span>
           <span className={styles.metricPill}>
             Period <span className={styles.metricValue}>{shownPeriodS != null ? `${shownPeriodS.toFixed(4)}s` : '—'}</span>
+          </span>
+          <span className={styles.metricPill} title="Short local solver window used for fitting only.">
+            Fit window <span className={styles.metricValue}>{syncHorizons?.fit_window_s != null ? `${Number(syncHorizons.fit_window_s).toFixed(0)}s` : '—'}</span>
+          </span>
+          <span className={styles.metricPill} title="Retained diagnostic history window shown in this panel.">
+            Display window <span className={styles.metricValue}>{syncHorizons?.display_window_s != null ? `${Number(syncHorizons.display_window_s).toFixed(0)}s` : `${BURST_SYNC_ALIGNMENT_WINDOW_S}s`}</span>
+          </span>
+          <span className={styles.metricPill} title="Age of the slow authoritative sync state, when available.">
+            Authority age <span className={styles.metricValue}>{syncHorizons?.authoritative_state_age_s != null ? `${Number(syncHorizons.authoritative_state_age_s).toFixed(0)}s` : '—'}</span>
           </span>
           <span className={styles.metricPill}>
             Jitter <span className={styles.metricValue}>

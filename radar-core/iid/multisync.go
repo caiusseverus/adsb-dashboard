@@ -49,9 +49,10 @@ const (
 	multiSyncGainBase = 0.12
 	multiSyncGainMax  = 0.20
 
-	// Period refinement constants (match Python).
+	// Period refinement constants.
 	slopeEMAAlpha          = 0.08
-	slopeDeadBand          = 0.08 // deg/s — must exceed to drive period change
+	retainedSlopeEMAAlpha  = 0.05
+	slopeDeadBand          = 0.01 // deg/s — retained-window slope must exceed this to drive period change
 	persistMinEntries      = 5
 	periodPPMPerUpdate     = 60.0
 	periodPPMFromBase      = 2000.0
@@ -89,30 +90,30 @@ const (
 	recoveryAnchorStarvedCandidates  = 0
 	recoveryAnchorStarvedFitEligible = 2
 	// Authority hysteresis: longer streaks + minimum hold time prevent flapping.
-	authorityPromoteRefinedStreak    = 6     // was 3 — need sustained health before promoting
-	authorityRefinedFailureStreak    = 5     // was 3 — need sustained failure before dropping
-	authorityCompactReclaimStreak    = 8     // was 5 — compact needs long healthy window to reclaim
-	authorityRecoveryEntryStreak     = 2
-	authorityRecoveryExitStreak      = 6     // was 4 — longer clean window to exit recovery
-	authorityCompactHealthyDeltaPPM  = 1000.0
-	authorityMinModeHoldS            = 15.0  // min seconds in any mode before switching (recovery exempt)
+	authorityPromoteRefinedStreak   = 6 // was 3 — need sustained health before promoting
+	authorityRefinedFailureStreak   = 5 // was 3 — need sustained failure before dropping
+	authorityCompactReclaimStreak   = 8 // was 5 — compact needs long healthy window to reclaim
+	authorityRecoveryEntryStreak    = 2
+	authorityRecoveryExitStreak     = 6 // was 4 — longer clean window to exit recovery
+	authorityCompactHealthyDeltaPPM = 1000.0
+	authorityMinModeHoldS           = 15.0 // min seconds in any mode before switching (recovery exempt)
 
-	anchorSwitchMinScoreDelta        = 0.12
-	anchorSwitchMinScoreRatio        = 1.25
-	anchorHoldMinUpdates             = 3
-	anchorPoorSpreadDeg              = 18.0
-	anchorPoorFitFraction            = 0.55
+	anchorSwitchMinScoreDelta = 0.12
+	anchorSwitchMinScoreRatio = 1.25
+	anchorHoldMinUpdates      = 3
+	anchorPoorSpreadDeg       = 18.0
+	anchorPoorFitFraction     = 0.55
 
 	// Anchor candidate hard-gates — tighter than the legacy score-only check.
-	anchorMinScore       = 0.15  // was 0.1 — reject weak anchors earlier
-	anchorMinFitEligible = 2     // at least 2 fit-eligible observations required
-	anchorMinFitFraction = 0.18  // at least 18% of observations must be fit-eligible
-	anchorMaxSpreadDeg   = 32.0  // circular spread ceiling for anchor candidates
+	anchorMinScore       = 0.15 // was 0.1 — reject weak anchors earlier
+	anchorMinFitEligible = 2    // at least 2 fit-eligible observations required
+	anchorMinFitFraction = 0.18 // at least 18% of observations must be fit-eligible
+	anchorMaxSpreadDeg   = 32.0 // circular spread ceiling for anchor candidates
 
 	// Global branch clustering: reject anchors that diverge from the population consensus.
 	// This breaks wrong-branch self-reinforcement where all ICAOs locally agree on a bad phase.
-	globalBranchMatchDeg    = 35.0 // ICAO mean more than this from global center → rejected
-	globalBranchMinObs      = 3    // minimum observations to trust global branch estimate
+	globalBranchMatchDeg     = 35.0 // ICAO mean more than this from global center → rejected
+	globalBranchMinObs       = 3    // minimum observations to trust global branch estimate
 	globalBranchMaxSpreadDeg = 42.0 // global spread above this → multi-cluster / branch-ambiguous
 
 	candidateStablePeriodPPM         = 300.0
@@ -270,6 +271,10 @@ type MultiSyncSnapshot struct {
 	FitEligibleObservations          int
 	FitRejectedObservations          int
 	FitContributingICAOs             int
+	FitWindowS                       float64
+	DisplayWindowS                   float64
+	FitSpanS                         float64
+	ResidualSlopeDegPerS             float64
 	FitRejectReasons                 map[string]uint64
 	AnchorCandidateCount             int
 	AnchorNoCandidateReason          string
@@ -377,6 +382,10 @@ type MultiSyncSolver struct {
 	LastFitEligibleObs                   int
 	LastFitRejectedObs                   int
 	LastFitContributingICAOs             int
+	LastFitWindowS                       float64
+	LastDisplayWindowS                   float64
+	LastFitSpanS                         float64
+	LastResidualSlopeDegPerS             float64
 	LastFitRejectReasons                 map[string]uint64
 	LastAnchorCandidateCount             int
 	LastAnchorNoCandidate                string
@@ -529,6 +538,10 @@ func (ms *MultiSyncSolver) Reset() {
 	ms.LastFitEligibleObs = 0
 	ms.LastFitRejectedObs = 0
 	ms.LastFitContributingICAOs = 0
+	ms.LastFitWindowS = 0
+	ms.LastDisplayWindowS = multiSyncRetentionS
+	ms.LastFitSpanS = 0
+	ms.LastResidualSlopeDegPerS = 0
 	ms.LastFitRejectReasons = nil
 	ms.LastAnchorCandidateCount = 0
 	ms.LastAnchorNoCandidate = ""
@@ -623,6 +636,10 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 		FitEligibleObservations:          ms.LastFitEligibleObs,
 		FitRejectedObservations:          ms.LastFitRejectedObs,
 		FitContributingICAOs:             ms.LastFitContributingICAOs,
+		FitWindowS:                       ms.LastFitWindowS,
+		DisplayWindowS:                   ms.LastDisplayWindowS,
+		FitSpanS:                         ms.LastFitSpanS,
+		ResidualSlopeDegPerS:             ms.LastResidualSlopeDegPerS,
 		FitRejectReasons:                 make(map[string]uint64, len(ms.LastFitRejectReasons)),
 		AnchorCandidateCount:             ms.LastAnchorCandidateCount,
 		AnchorNoCandidateReason:          ms.LastAnchorNoCandidate,
@@ -773,7 +790,7 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	basePeriodS := activeFamilyPriorS
 	if trusted && ms.TrustedBasePeriodS > 0 {
 		basePeriodS = ms.TrustedBasePeriodS
-	} else if recoveryActive && dominantPeriodS > 0 {
+	} else if dominantPeriodS > 0 {
 		basePeriodS = dominantPeriodS
 	} else if compactPeriodS > 0 {
 		basePeriodS = compactPeriodS
@@ -791,6 +808,8 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		}
 	}
 	if len(recent) < multiSyncMinObs {
+		ms.LastFitWindowS = windowS
+		ms.LastDisplayWindowS = multiSyncRetentionS
 		ms.Holdover = true
 		return
 	}
@@ -881,6 +900,9 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		ms.LastFitEligibleObs = fitEligibleObs
 		ms.LastFitRejectedObs = len(recent) - fitEligibleObs
 		ms.LastFitContributingICAOs = 0
+		ms.LastFitWindowS = windowS
+		ms.LastDisplayWindowS = multiSyncRetentionS
+		ms.LastFitSpanS = 0
 		ms.LastFitRejectReasons = fitRejectReasons
 		ms.LastAnchorCandidateCount = 0
 		ms.LastAnchorNoCandidate = "no_fit_pool"
@@ -935,18 +957,38 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	ms.LastFitEligibleObs = fitEligibleObs
 	ms.LastFitRejectedObs = len(recent) - fitEligibleObs
 	ms.LastFitContributingICAOs = len(fitICAOs)
+	ms.LastFitWindowS = windowS
+	ms.LastDisplayWindowS = multiSyncRetentionS
+	ms.LastFitSpanS = spanS
 	ms.LastFitRejectReasons = fitRejectReasons
 
-	smoothedSlope := (1.0-slopeEMAAlpha)*ms.SmoothSlopeDegPerS + slopeEMAAlpha*bFit
-	ms.SmoothSlopeDegPerS = smoothedSlope
-	ms.SlopeHistory = append(ms.SlopeHistory, smoothedSlope)
+	prevSlope := ms.SmoothSlopeDegPerS
+	smoothedSlope := (1.0-slopeEMAAlpha)*prevSlope + slopeEMAAlpha*bFit
+
+	periodSlope, periodFitCount, periodFitICAOs, periodFitSpanS, periodSlopeOK := ms.retainedResidualSlope(
+		seedEpochUS, seedOffsetDeg, livePeriodS, nowUnix, recoveryActive,
+	)
+	if periodSlopeOK {
+		rawRetainedSlope := periodSlope
+		ms.SmoothSlopeDegPerS = (1.0-retainedSlopeEMAAlpha)*prevSlope + retainedSlopeEMAAlpha*rawRetainedSlope
+		ms.LastResidualSlopeDegPerS = ms.SmoothSlopeDegPerS
+		periodSlope = rawRetainedSlope
+	} else {
+		periodSlope = smoothedSlope
+		ms.SmoothSlopeDegPerS = periodSlope
+		ms.LastResidualSlopeDegPerS = periodSlope
+		periodFitCount = len(fitPool)
+		periodFitICAOs = len(fitICAOs)
+		periodFitSpanS = spanS
+	}
+	ms.SlopeHistory = append(ms.SlopeHistory, periodSlope)
 	if len(ms.SlopeHistory) > 12 {
 		ms.SlopeHistory = ms.SlopeHistory[len(ms.SlopeHistory)-12:]
 	}
 
 	refinedPeriodS, _, _, clampedByBase, clampDiffPPM := ms.refinePeriod(
-		livePeriodS, basePeriodS, smoothedSlope,
-		len(fitPool), len(fitICAOs), spanS, majorityRejected,
+		livePeriodS, basePeriodS, periodSlope,
+		periodFitCount, periodFitICAOs, periodFitSpanS, majorityRejected,
 		trusted,
 	)
 
@@ -1057,7 +1099,7 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 
 	if ms.TrustedBasePeriodS > 0 {
 		basePeriodS = ms.TrustedBasePeriodS
-	} else if recoveryActive && dominantPeriodS > 0 {
+	} else if dominantPeriodS > 0 {
 		basePeriodS = dominantPeriodS
 	} else if compactPeriodS > 0 {
 		basePeriodS = compactPeriodS
@@ -1198,24 +1240,26 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 }
 
 func (ms *MultiSyncSolver) selectActiveFamilyPrior(compactPeriodS, dominantPeriodS float64, authorityMode string) (float64, string) {
-	if authorityMode == authorityModeRecovery && dominantPeriodS > 0 {
-		return dominantPeriodS, "dominant_live_df"
-	}
-	if authorityMode == authorityModeCompact && compactPeriodS > 0 {
-		return compactPeriodS, "compact_seed"
-	}
 	if authorityMode == authorityModeRefined {
-		if ms.CandidatePresent && ms.CandidatePeriodS > 0 {
-			return ms.CandidatePeriodS, "candidate_refined"
-		}
 		if ms.AuthoritativePresent && ms.AuthoritativePeriodS > 0 {
 			return ms.AuthoritativePeriodS, "authoritative_refined"
+		}
+		if ms.CandidatePresent && ms.CandidatePeriodS > 0 {
+			return ms.CandidatePeriodS, "candidate_refined"
 		}
 		if ms.TrustedBasePeriodS > 0 {
 			return ms.TrustedBasePeriodS, "trusted_refined"
 		}
 		if ms.Present && ms.PeriodS > 0 {
 			return ms.PeriodS, "current_refined"
+		}
+	}
+	if authorityMode == authorityModeCompact {
+		if dominantPeriodS > 0 {
+			return dominantPeriodS, "dominant_live_df_seed"
+		}
+		if compactPeriodS > 0 {
+			return compactPeriodS, "compact_seed"
 		}
 	}
 	if ms.CandidatePresent && ms.CandidatePeriodS > 0 && authorityMode != authorityModeCompact {
@@ -1230,16 +1274,115 @@ func (ms *MultiSyncSolver) selectActiveFamilyPrior(compactPeriodS, dominantPerio
 	if ms.Present && ms.PeriodS > 0 && !ms.Holdover {
 		return ms.PeriodS, "current_refined"
 	}
-	if compactPeriodS > 0 {
-		return compactPeriodS, "compact_seed"
-	}
 	if dominantPeriodS > 0 {
 		return dominantPeriodS, "dominant_live_df"
+	}
+	if compactPeriodS > 0 {
+		return compactPeriodS, "compact_seed"
 	}
 	if ms.BootstrapPeriodS > 0 {
 		return ms.BootstrapPeriodS, "bootstrap_seed"
 	}
 	return 0, ""
+}
+
+func (ms *MultiSyncSolver) retainedResidualSlope(
+	seedEpochUS, seedOffsetDeg, periodS, nowUnix float64,
+	recoveryActive bool,
+) (float64, int, int, float64, bool) {
+	// Estimate the common period-error slope across retained observations while
+	// allowing each ICAO its own phase intercept. This keeps spurious per-aircraft
+	// offsets from steering the hardware-period correction.
+	if periodS <= 0 {
+		return 0, 0, 0, 0, false
+	}
+	type entry struct {
+		icao uint32
+		x    float64
+		y    float64
+		w    float64
+	}
+	type accum struct {
+		n    int
+		sumW float64
+		sumX float64
+		sumY float64
+	}
+
+	cutoffTS := nowUnix - multiSyncRetentionS
+	periodUS := periodS * 1e6
+	entries := make([]entry, 0, len(ms.obs))
+	byICAO := make(map[uint32]*accum)
+	minX := math.Inf(1)
+	maxX := math.Inf(-1)
+	for _, o := range ms.obs {
+		if o.WallTS < cutoffTS {
+			continue
+		}
+		effectiveUS := msPropCorrectedUS(float64(o.CentroidUS), float64(o.RangeNM))
+		predicted := msPredictBearing(seedEpochUS, seedOffsetDeg, periodUS, effectiveUS)
+		residual := circularDiff(o.BearingDeg, predicted)
+		absR := math.Abs(residual)
+		status := msClassifyResidual(absR)
+		qEntry := ms.ICAOQuality[o.ICAO]
+		rejectReason := msFitRejectReason(o, status, absR, qEntry, recoveryActive)
+		if rejectReason != "" {
+			continue
+		}
+		weight := msScoreObs(o) * msICAOQualityMult(qEntry)
+		if weight <= 0 {
+			continue
+		}
+		x := effectiveUS / 1e6
+		entries = append(entries, entry{icao: o.ICAO, x: x, y: residual, w: weight})
+		a := byICAO[o.ICAO]
+		if a == nil {
+			a = &accum{}
+			byICAO[o.ICAO] = a
+		}
+		a.n++
+		a.sumW += weight
+		a.sumX += weight * x
+		a.sumY += weight * residual
+		if x < minX {
+			minX = x
+		}
+		if x > maxX {
+			maxX = x
+		}
+	}
+	if len(entries) < periodRefineMinInlier || len(byICAO) < 2 {
+		return 0, len(entries), len(byICAO), 0, false
+	}
+
+	num := 0.0
+	den := 0.0
+	used := 0
+	usedICAOs := make(map[uint32]bool, len(byICAO))
+	for _, e := range entries {
+		a := byICAO[e.icao]
+		if a == nil || a.n < 2 || a.sumW <= 0 {
+			continue
+		}
+		xMean := a.sumX / a.sumW
+		yMean := a.sumY / a.sumW
+		dx := e.x - xMean
+		dy := e.y - yMean
+		num += e.w * dx * dy
+		den += e.w * dx * dx
+		used++
+		usedICAOs[e.icao] = true
+	}
+	if used < periodRefineMinInlier || len(usedICAOs) < 2 || den <= 0 ||
+		math.IsNaN(num) || math.IsInf(num, 0) || math.IsNaN(den) || math.IsInf(den, 0) {
+		span := 0.0
+		if math.IsInf(minX, 0) || math.IsInf(maxX, 0) {
+			return 0, used, len(usedICAOs), span, false
+		}
+		span = maxX - minX
+		return 0, used, len(usedICAOs), span, false
+	}
+	return num / den, used, len(usedICAOs), maxX - minX, true
 }
 
 func (ms *MultiSyncSolver) assessRecoveryMode(sync *SyncState, dominantPeriodS float64) (bool, bool, []string) {

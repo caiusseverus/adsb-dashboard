@@ -1,5 +1,11 @@
 # Lessons
 
+## 2026-04-23
+
+- When fixing a displayed history regression, verify both backend payload span and frontend render-domain clipping. A plot can receive retained data but still hide it if its x-window is anchored to an unrelated live clock.
+- For passive radar sync, treat the DF alignment period as the bootstrap prior, not the final answer. The refined model must slowly decontaminate that prior using motion-corrected residual evidence rather than locking to it or re-estimating from only a short noisy window.
+- When extending an operator chart to a 300s display window, check every upstream source cap. A retained axis is not enough if the raw dot source is still age-pruned at 60s or exported by a shorter Go snapshot store.
+
 ## 2026-04-20
 
 - When introducing backend-managed subprocess startup, do not hardcode a single install-path default for the worker binary. Use a robust default-resolution order (installed path first, repo-local build fallback) so local/dev and production/service environments both start cleanly without extra manual env edits.

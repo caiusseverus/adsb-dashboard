@@ -3336,6 +3336,160 @@ def test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst(monkey
     assert sync.authoritative_mode == "settled_authoritative"
 
 
+def test_go_sync_diagnostic_history_is_retained_beyond_fit_window(monkeypatch):
+    """Go trend history must be retained independently from the short fit window."""
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 2_000.0)
+
+    state = RadarState()
+    for idx, ts in enumerate([1_900.0, 1_960.0, 2_000.0]):
+        state.update_go_multi_sync_state({
+            "i": 5, "pr": True, "us": True,
+            "p": 4.0 + idx * 0.001, "pb": 4.0,
+            "pe": float(idx + 1) * 1_000_000.0, "po": 20.0 + idx,
+            "jd": 2.0, "re": 3.0, "nu": idx + 1,
+            "ho": False, "ra": False, "ts": ts,
+            "ft": 9, "fe": 7, "fr": 2, "fc": 3,
+            "fw": 30.0, "dw": 300.0, "fs": 28.0, "rs": 0.05 + idx * 0.01,
+            "aam": "refined_authoritative",
+            "aps": 4.0 + idx * 0.001,
+            "asa": 120.0 + idx,
+            "avs": 0.9, "vac": 3, "bas": 0.1,
+        })
+
+    snapshot = state.get_live_sync_snapshot(5, window_s=120.0, debug_limit=20)
+
+    assert snapshot["sync_horizons"]["fit_window_s"] == pytest.approx(30.0)
+    assert snapshot["sync_horizons"]["display_window_s"] == pytest.approx(120.0)
+    assert len(snapshot["slope_history"]) == 3
+    assert snapshot["slope_history"][0]["ts"] == pytest.approx(1_900.0)
+    assert snapshot["slope_history"][0]["fit_window_s"] == pytest.approx(30.0)
+    assert snapshot["slope_history"][-1]["residual_slope_deg_per_s"] == pytest.approx(0.07)
+    assert len(snapshot["period_history"]) == 3
+    assert snapshot["period_history"][-1]["authoritative_period_s"] == pytest.approx(4.002)
+
+
+def test_go_alignment_rows_use_retained_display_history_not_fit_window(monkeypatch):
+    """Go alignment projection must follow requested display history, not 30s fit window."""
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    state._models[6] = RadarIID(
+        iid=6,
+        status="SINGLE_RADAR",
+        period_s=4.0,
+        manual_lat=51.0,
+        manual_lon=0.0,
+        resolution_mode="locked_position",
+    )
+    state.update_go_multi_sync_state({
+        "i": 6, "pr": True, "us": True,
+        "p": 4.0, "pb": 4.0,
+        "pe": 1_000_000.0, "po": 0.0,
+        "jd": 2.0, "re": 3.0, "nu": 1,
+        "ho": False, "ra": False, "ts": 1_000.0,
+        "ft": 8, "fe": 6, "fr": 2, "fc": 3,
+        "fw": 30.0, "dw": 300.0, "fs": 29.0, "rs": 0.02,
+        "aam": "refined_authoritative",
+        "aps": 4.0, "asa": 90.0,
+        "avs": 0.9, "vac": 3, "bas": 0.1,
+    })
+    state._go_evidence_events = deque([
+        {
+            "kind": "burst_fired", "iid": 6, "icao": "AAAAAA",
+            "arrival_us": 1_000_000.0, "wall_ts": 940.0,
+            "n_replies": 4, "signal_dbfs": -15.0,
+            "truth_lat": 51.1, "truth_lon": 0.1, "position_age_s": 0.2,
+            "compact_sync_eligible": True, "sync_eligible": True,
+        },
+        {
+            "kind": "burst_fired", "iid": 6, "icao": "BBBBBB",
+            "arrival_us": 31_000_000.0, "wall_ts": 970.0,
+            "n_replies": 4, "signal_dbfs": -15.0,
+            "truth_lat": 51.2, "truth_lon": 0.1, "position_age_s": 0.2,
+            "compact_sync_eligible": True, "sync_eligible": True,
+        },
+        {
+            "kind": "burst_fired", "iid": 6, "icao": "CCCCCC",
+            "arrival_us": 61_000_000.0, "wall_ts": 1_000.0,
+            "n_replies": 4, "signal_dbfs": -15.0,
+            "truth_lat": 51.3, "truth_lon": 0.1, "position_age_s": 0.2,
+            "compact_sync_eligible": True, "sync_eligible": True,
+        },
+    ], maxlen=state._GO_EVIDENCE_EVENTS_MAX)
+
+    snapshot = state.get_live_sync_snapshot(6, window_s=90.0, debug_limit=20)
+    wall_span_s = snapshot["observations"][-1]["wall_ts"] - snapshot["observations"][0]["wall_ts"]
+
+    assert snapshot["sync_horizons"]["fit_window_s"] == pytest.approx(30.0)
+    assert snapshot["sync_horizons"]["display_window_s"] == pytest.approx(90.0)
+    assert len(snapshot["observations"]) == 3
+    assert wall_span_s == pytest.approx(60.0)
+    assert snapshot["alignment_status"]["projected_observation_count"] == 3
+
+
+def test_df11_residual_dots_use_retained_residual_event_history(monkeypatch):
+    """The 300s residual plot must not be limited by the 60s raw bootstrap event buffer."""
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    state._receiver_lat = 51.0
+    state._receiver_lon = 0.0
+    state._models[8] = RadarIID(iid=8, status="SINGLE_RADAR", period_s=4.0)
+    state._live_sync_states[8] = LiveSyncState(
+        iid=8,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1_000.0,
+        source="multi_aircraft_burst",
+        usable=True,
+    )
+    state._live_burst_timeline_obs[8] = deque([
+        AlignedBurstSyncObs(
+            burst_centroid_us=1_000_000.0,
+            icao="AAAAAA",
+            bearing_deg=90.0,
+            n_replies=4,
+            signal_dbfs=-20.0,
+            pos_age_s=0.2,
+            range_nm=10.0,
+            ts=940.0,
+        )
+    ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+    state._iid_events = deque([
+        (295_000_000.0, 8, "RECENT", -20.0),
+    ], maxlen=sweep_module._IID_EVENTS_MAX)
+    state._df11_residual_events = deque([
+        (10_000_000.0, 8, "OLD300", -22.0),
+        (295_000_000.0, 8, "RECENT", -20.0),
+    ], maxlen=sweep_module._IID_EVENTS_MAX)
+    state._iid_latest_arrival_us[8] = 300_000_000.0
+
+    seen_events: list[tuple[float, int, str, float | None]] = []
+
+    def fake_build_df11_residuals(**kwargs):
+        seen_events.extend(kwargs["iid_events"])
+        return [
+            {"icao": icao, "arrival_beast_us": arrival_us, "residual_deg": 0.0}
+            for arrival_us, _iid, icao, _signal in kwargs["iid_events"]
+        ]
+
+    monkeypatch.setattr(state, "_build_df11_residual_observations", fake_build_df11_residuals)
+
+    payload = state.get_burst_sync_timeline(8, window_s=300.0)
+
+    assert [event[2] for event in seen_events] == ["OLD300", "RECENT"]
+    assert [dot["icao"] for dot in payload["df11_residual_observations"]] == ["OLD300", "RECENT"]
+
+
 def test_go_iid_state_does_not_overwrite_go_multi_sync_state():
     state = RadarState()
     state._live_sync_states[14] = LiveSyncState(

@@ -132,6 +132,46 @@ func TestMultiSyncSolver_BasicFit(t *testing.T) {
 	}
 }
 
+func TestMultiSyncSolver_DominantPeriodSeedsButDoesNotLockRefinement(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+
+	truePeriodS := 4.0
+	dominantPeriodS := 4.001
+	epochUS := 0.0
+	offsetDeg := 45.0
+	sync := NewSyncState(1, dominantPeriodS, epochUS, offsetDeg, 0.8)
+	now := float64(time.Now().UnixMicro()) / 1e6
+	for i := 0; i < 180; i++ {
+		us := 1_000_000.0 + float64(i)*truePeriodS/2.0*1e6
+		bearing := simulatedBearing(us, epochUS, offsetDeg, truePeriodS)
+		icao := uint32(0xDAD000 + i%4)
+		ms.obs = append(ms.obs, buildObs(us, bearing, icao, now-300.0+float64(i)*2.0))
+	}
+
+	for i := 0; i < persistMinEntries+4; i++ {
+		ms.runFit(sync, dominantPeriodS, now+float64(i))
+	}
+
+	if !ms.Present {
+		t.Fatal("expected solver to publish a state")
+	}
+	if ms.LastActiveFamilyPriorSource != "dominant_live_df_seed" && ms.LastActiveFamilyPriorSource != "candidate_refined" {
+		t.Fatalf("expected dominant seed or candidate refined prior, got %q", ms.LastActiveFamilyPriorSource)
+	}
+	initialErr := math.Abs(dominantPeriodS - truePeriodS)
+	refinedErr := math.Abs(ms.CandidatePeriodS - truePeriodS)
+	if refinedErr >= initialErr {
+		t.Fatalf("expected candidate period to move closer to true period; initial err %.9f refined err %.9f period %.9f slope %.6f history=%v fit=%d span=%.3f source=%s",
+			initialErr, refinedErr, ms.CandidatePeriodS, ms.LastResidualSlopeDegPerS, ms.SlopeHistory, ms.LastFitEligibleObs, ms.LastFitSpanS, ms.LastActiveFamilyPriorSource)
+	}
+	if math.Abs(ms.CandidatePeriodS-dominantPeriodS) < 1e-9 {
+		t.Fatalf("expected refined candidate not to be locked to dominant %.9f", dominantPeriodS)
+	}
+	if math.Abs(ms.LastCompactPeriodS-dominantPeriodS) > 1e-6 {
+		t.Fatalf("expected compact/DF seed diagnostic %.6f, got %.6f", dominantPeriodS, ms.LastCompactPeriodS)
+	}
+}
+
 func TestMultiSyncSolver_Throttle(t *testing.T) {
 	ms := NewMultiSyncSolver(1)
 	sync := NewSyncState(1, 4.0, 0.0, 0.0, 0.8)

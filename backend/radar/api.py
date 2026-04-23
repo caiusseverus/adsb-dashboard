@@ -1186,6 +1186,7 @@ def build_iid_sync_snapshot_payload(
             "phase_anchor_candidates": [],
             "motion_comp_summary": None,
             "retention_diagnostics": None,
+            "sync_horizons": None,
         }
     snapshot = state.get_live_sync_snapshot(iid, window_s=window_s, debug_limit=debug_limit)
     payload = dict(snapshot)
@@ -2459,6 +2460,12 @@ def build_selected_iid_page_state_payload(
     sync_payload = build_iid_sync_snapshot_payload(state, iid, window_s=window_s, debug_limit=debug_limit)
     sync_signature = (
         sync_payload.get("sequence"),
+        sync_payload.get("window_s"),
+        tuple((sync_payload.get("sync_horizons") or {}).items()),
+        len(sync_payload.get("observations") or []),
+        len(sync_payload.get("period_update_history") or []),
+        len(sync_payload.get("slope_history") or []),
+        len(sync_payload.get("period_history") or []),
         sync_payload.get("rotation", {}).get("period_s"),
         sync_payload.get("rotation", {}).get("status"),
     )
