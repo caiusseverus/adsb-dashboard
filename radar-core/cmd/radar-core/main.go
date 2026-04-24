@@ -392,6 +392,14 @@ func (e *engine) emitMultiSyncState(s *iid.IIDState) {
 		AuthoritativeMode:                snap.AuthoritativeMode,
 		AbsolutePhaseTrusted:             snap.AbsolutePhaseTrusted,
 		DominantPriorInconsistent:        snap.DominantPriorInconsistent,
+		PeriodFitAcceptedObservations:    uint32(snap.PeriodFitAcceptedObservations),
+		PeriodFitRejectedObservations:    uint32(snap.PeriodFitRejectedObservations),
+		PeriodFitRejectedAfterUnwrap:     uint32(snap.PeriodFitRejectedAfterUnwrap),
+		SlopeWindowDeg:                   snap.SlopeWindowDeg,
+		SlopePromotionGatePassed:         snap.SlopePromotionGatePassed,
+		AuthorityPromotionBlockReason:    snap.AuthorityPromotionBlockReason,
+		ResidualCorrectionBasis:          snap.ResidualCorrectionBasis,
+		MotionGuardDegraded:              snap.MotionGuardDegraded,
 	}
 	e.writer.Send(msg)
 }

@@ -354,6 +354,25 @@ type MultiSyncState struct {
 	// refinement bound around the DF dominant period. Diagnostic only — the DF alignment model
 	// should react; the refined solver does not change its published period in this case.
 	DominantPriorInconsistent bool `codec:"dpi"`
+	// Unwrapped-slope period-fit diagnostics (added for near-wrap residual recovery).
+	// PeriodFitAcceptedObservations is the count that passed the unwrapped gate.
+	// PeriodFitRejectedObservations is the count rejected before unwrapping.
+	// PeriodFitRejectedAfterUnwrap is the count that wrapped but failed the detrended gate.
+	PeriodFitAcceptedObservations uint32  `codec:"pfa"`
+	PeriodFitRejectedObservations uint32  `codec:"pfr"`
+	PeriodFitRejectedAfterUnwrap  uint32  `codec:"prw"`
+	// SlopeWindowDeg is the slope × fit-span product used for authority promotion gating.
+	// SlopePromotionGatePassed is false when the slope window blocks authority promotion.
+	SlopeWindowDeg               float64 `codec:"swd"`
+	SlopePromotionGatePassed     bool    `codec:"spg"`
+	// AuthorityPromotionBlockReason is non-empty when authority promotion was blocked by slope.
+	AuthorityPromotionBlockReason string  `codec:"apb"`
+	// ResidualCorrectionBasis describes which slope path produced the period slope:
+	// "wrapped_fit", "unwrapped_fit", or "ema_fallback".
+	ResidualCorrectionBasis string `codec:"rcb"`
+	// MotionGuardDegraded is true when period correction ran at reduced gain/step due to
+	// insufficient ICAOs or bearing spread (degraded motion compensation guard).
+	MotionGuardDegraded bool `codec:"mgd"`
 }
 
 type MultiSyncAnchorCandidate struct {

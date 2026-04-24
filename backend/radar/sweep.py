@@ -4724,6 +4724,7 @@ class RadarState:
                 phase_anchor_score=float(msg.get("as") or 0.0),
                 phase_anchor_obs_count=int((anchor_row or {}).get("obs_count") or 0),
                 phase_anchor_spread_deg=((anchor_row or {}).get("spread_deg")),
+                phase_anchor_offset_smoothed_deg=(float(msg["ap"]) if anchor_icao is not None and msg.get("ap") not in (None, 0) else None),
                 phase_anchor_status=("selected" if anchor_icao else "unavailable"),
                 phase_anchor_since_ts=anchor_since_ts,
                 phase_anchor_candidate_count=int(msg.get("ac") or 0),

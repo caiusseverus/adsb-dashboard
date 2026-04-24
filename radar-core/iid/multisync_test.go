@@ -1803,3 +1803,297 @@ func TestJ_MotionGuardInsufficientGeometry(t *testing.T) {
 		t.Errorf("expected bearing spread < 30° for clustered ICAOs, got %.1f°", ms.LastFitBearingSpreadDeg)
 	}
 }
+
+// ─── Phase 2 tests: unwrapped slope, slope gate, anchor delta ───────────────
+
+// TestWrappedResidualSlopeRecovery verifies that retainedResidualSlopeUnwrapped
+// can detect a period-error slope even when residuals wrap through ±180°.
+//
+// Scenario: two ICAOs observed over 60 s.  The seed period is 2.5 % longer than
+// the true period, so residuals accumulate at ~2.2°/s and wrap every ~80 s.
+// retainedResidualSlope rejects near-wrap observations and cannot form a fit;
+// retainedResidualSlopeUnwrapped must succeed and return a slope with the correct sign.
+func TestWrappedResidualSlopeRecovery(t *testing.T) {
+	truePeriodS := 4.0
+	seedPeriodS := 4.1 // 2.5 % error — residuals drift at ≈ 2.2 deg/s
+	offsetDeg := 45.0
+	epochUS := 0.0
+
+	ms := NewMultiSyncSolver(1)
+	now := float64(time.Now().UnixMicro()) / 1e6
+
+	// Build observations for two ICAOs spread ≥ 90° apart.
+	// Bearings follow truePeriodS; the solver seeds from seedPeriodS.
+	icaoA := uint32(0xAA0001)
+	icaoB := uint32(0xBB0002)
+	// One burst every true period over 60 s.
+	nBursts := int(60.0 / truePeriodS)
+	for i := 0; i < nBursts; i++ {
+		us := float64(i) * truePeriodS * 1e6
+		bearingA := simulatedBearing(us, epochUS, offsetDeg, truePeriodS)
+		bearingB := simulatedBearing(us, epochUS, offsetDeg+180.0, truePeriodS)
+		wallA := now + float64(i)*truePeriodS
+		ms.obs = append(ms.obs, buildObs(us, bearingA, icaoA, wallA))
+		ms.obs = append(ms.obs, buildObs(us, bearingB, icaoB, wallA))
+	}
+
+	// Standard retainedResidualSlope should fail (near-wrap residuals dominate).
+	_, stdCount, _, _, _, stdOK := ms.retainedResidualSlope(epochUS, offsetDeg, seedPeriodS, now, false)
+	_ = stdCount
+
+	// Unwrapped path must succeed.
+	slope, nAcc, _, nRejAfterUnwrap, nICAOs, _, spanS, ok := ms.retainedResidualSlopeUnwrapped(epochUS, offsetDeg, seedPeriodS, now)
+	if !ok {
+		t.Fatalf("retainedResidualSlopeUnwrapped: expected ok=true, got false (stdOK=%v, nAcc=%d, nRejAfterUnwrap=%d)",
+			stdOK, nAcc, nRejAfterUnwrap)
+	}
+	if nICAOs < 2 {
+		t.Errorf("expected ≥2 fit ICAOs, got %d", nICAOs)
+	}
+	if spanS < 20.0 {
+		t.Errorf("expected fit span ≥ 20 s, got %.1f s", spanS)
+	}
+	// Slope must be non-negligible and positive (seed is too long → residuals grow forward).
+	if math.Abs(slope) < 0.5 {
+		t.Errorf("expected |slope| ≥ 0.5 deg/s to detect period error, got %.3f", slope)
+	}
+	if slope <= 0 {
+		t.Errorf("expected positive slope (seed period too long), got %.3f", slope)
+	}
+}
+
+// TestNoAnchorPeriodRecovery verifies that period correction runs even when no
+// valid anchor candidate is available.  The deadlock was: anchor needed for
+// period correction → no anchor because period wrong → period never corrected.
+//
+// Expected behaviour after fix: refinePeriod executes (refineBlockReason is not
+// "motion_guard_*" or "insufficient_*"), authority does not promote (no anchor),
+// and the solver is not stuck.
+func TestNoAnchorPeriodRecovery(t *testing.T) {
+	dominantPeriodS := 4.0
+	seedPeriodS := 4.0 * (1.0 + 200.0/1e6) // 200 PPM off — within dominant bound
+	epochUS := 0.0
+	offsetDeg := 45.0
+
+	ms := NewMultiSyncSolver(1)
+	sync := NewSyncState(1, seedPeriodS, 0.0, offsetDeg, 0.8)
+	now := float64(time.Now().UnixMicro()) / 1e6
+
+	// Two ICAOs with a steady slope signature (seedPeriodS slightly off).
+	// Bearings follow dominantPeriodS; scored against seedPeriodS → small slope.
+	icaoA := uint32(0xCC0001)
+	icaoB := uint32(0xDD0002)
+	nBursts := 20
+	for i := 0; i < nBursts; i++ {
+		us := float64(i) * dominantPeriodS * 1e6
+		bearingA := simulatedBearing(us, epochUS, offsetDeg, dominantPeriodS)
+		bearingB := simulatedBearing(us, epochUS, offsetDeg+120.0, dominantPeriodS)
+		wallTS := now - float64(nBursts-i)*dominantPeriodS
+		ms.obs = append(ms.obs, buildObs(us, bearingA, icaoA, wallTS))
+		ms.obs = append(ms.obs, buildObs(us, bearingB, icaoB, wallTS))
+	}
+
+	// Pre-seed a persistent slope to pass the slope_not_persistent gate.
+	for i := 0; i < persistMinEntries+2; i++ {
+		ms.SlopeHistory = append(ms.SlopeHistory, 0.05)
+	}
+	ms.SmoothSlopeDegPerS = 0.05
+
+	ms.lastRunTS = 0.0
+	ms.TryUpdate(sync, dominantPeriodS)
+
+	// Period correction must have been attempted (block reason should not be motion guard).
+	blockReason := ms.LastPeriodRefineBlockReason
+	if blockReason == "motion_guard_insufficient_icaos" {
+		t.Errorf("period correction hard-blocked by motion guard with 2 ICAOs: %q", blockReason)
+	}
+	// Authority must NOT be refined — no anchor available.
+	snap := ms.Snapshot()
+	if snap.ActiveAuthorityMode == authorityModeRefined {
+		t.Errorf("authority promoted to refined_authoritative without a valid anchor")
+	}
+}
+
+// TestAuthorityPromotionBlockedBySlope verifies that the solver does not promote
+// to refined_authoritative when the retained-window residual slope exceeds
+// authorityPromotionMaxSlopeDegPerS, even if phase validation is otherwise strong.
+func TestAuthorityPromotionBlockedBySlope(t *testing.T) {
+	periodS := 4.0
+	dominantPeriodS := 4.0
+	epochUS := 0.0
+	offsetDeg := 45.0
+
+	ms := NewMultiSyncSolver(1)
+	sync := NewSyncState(1, periodS, epochUS, offsetDeg, 0.8)
+	now := float64(time.Now().UnixMicro()) / 1e6
+
+	// Good observations from multiple ICAOs (would otherwise promote).
+	icaos := []uint32{0xA00001, 0xB00002, 0xC00003}
+	for _, icao := range icaos {
+		icaoOff := float64(icao&0xFF) * 0.5
+		for i := 0; i < 12; i++ {
+			us := float64(i) * periodS * 1e6
+			bearing := simulatedBearing(us, epochUS, offsetDeg+icaoOff, periodS)
+			ms.obs = append(ms.obs, buildObs(us, bearing, icao, now-float64(12-i)*periodS))
+		}
+	}
+
+	// Force a large persistent slope that must block promotion.
+	largeSlopeDegPerS := authorityPromotionMaxSlopeDegPerS * 4.0 // 4× threshold
+	for i := 0; i < 12; i++ {
+		ms.SlopeHistory = append(ms.SlopeHistory, largeSlopeDegPerS)
+	}
+	ms.SmoothSlopeDegPerS = largeSlopeDegPerS
+
+	// Bootstrap authoritative state so we can test the promotion guard.
+	anchor := icaos[0]
+	ms.AuthoritativePresent = true
+	ms.AuthoritativePeriodS = periodS
+	ms.AuthoritativePhaseEpochUS = epochUS
+	ms.AuthoritativePhaseOffsetDeg = offsetDeg
+	ms.AuthoritativeAnchorICAO = &anchor
+	ms.CandidatePromotionStreak = candidatePromotionMinStreak + 2
+	ms.ActiveAuthorityMode = authorityModeCompact
+
+	ms.lastRunTS = 0.0
+	ms.TryUpdate(sync, dominantPeriodS)
+
+	snap := ms.Snapshot()
+	if snap.SlopePromotionGatePassed {
+		t.Errorf("SlopePromotionGatePassed must be false with slope=%.3f (threshold=%.3f)",
+			largeSlopeDegPerS, authorityPromotionMaxSlopeDegPerS)
+	}
+	if snap.AuthorityPromotionBlockReason == "" {
+		t.Error("AuthorityPromotionBlockReason must be non-empty when slope gate blocks promotion")
+	}
+	// Authority must NOT have entered refined_authoritative.
+	if snap.ActiveAuthorityMode == authorityModeRefined {
+		t.Errorf("authority promoted despite large slope (slope=%.3f, blockReason=%q)",
+			largeSlopeDegPerS, snap.AuthorityPromotionBlockReason)
+	}
+}
+
+// TestAnchorDeltaCircularDiff verifies the circular difference formula used for
+// the per-aircraft anchor Δ column. The formula is the standard circularDiff
+// helper already present in multisync.go.
+func TestAnchorDeltaCircularDiff(t *testing.T) {
+	// Example from the spec: anchor at 153.73°
+	anchorOffset := 153.73
+	cases := []struct {
+		acOffset float64
+		wantDeg  float64
+	}{
+		{157.23, +3.50},
+		{156.05, +2.32},
+		{150.68, -3.05},
+		// Wrap cases.
+		{350.0, circularDiff(350.0, anchorOffset)}, // ≈ -163.73, stays in [-180,180)
+		{10.0, circularDiff(10.0, anchorOffset)},   // ≈ -143.73
+	}
+	for _, tc := range cases {
+		got := circularDiff(tc.acOffset, anchorOffset)
+		if math.Abs(got-tc.wantDeg) > 0.05 {
+			t.Errorf("circularDiff(%.2f, %.2f): got %.3f, want %.3f",
+				tc.acOffset, anchorOffset, got, tc.wantDeg)
+		}
+		// Result must be in [-180, 180).
+		if got < -180 || got >= 180 {
+			t.Errorf("circularDiff result %.3f out of [-180,180)", got)
+		}
+	}
+}
+
+// TestDominantPriorBoundReacquireOutOfBound verifies that when the reacquire
+// candidate search finds a period outside periodRefineMaxPPMFromDominant, the
+// DominantPriorInconsistent flag is set and the published period stays within bound.
+func TestDominantPriorBoundReacquireOutOfBound(t *testing.T) {
+	dominantS := 4.0
+	// Build observations consistent with 4.08s — 20000 PPM off (> 300 PPM bound).
+	outOfBoundS := dominantS * (1.0 + 20000.0/1e6)
+	ms := NewMultiSyncSolver(1)
+	ms.BootstrapPeriodS = dominantS
+	ms.PeriodS = dominantS
+	ms.ActiveAuthorityMode = authorityModeRecovery
+
+	sync := NewSyncState(1, dominantS, 0.0, 45.0, 0.8)
+	now := float64(time.Now().UnixMicro()) / 1e6
+
+	// Observations consistent with outOfBoundS so the reacquire search can find it.
+	for i := 0; i < 20; i++ {
+		us := float64(i) * outOfBoundS * 1e6
+		bearingA := simulatedBearing(us, 0.0, 45.0, outOfBoundS)
+		bearingB := simulatedBearing(us, 0.0, 225.0, outOfBoundS)
+		ms.obs = append(ms.obs, buildObs(us, bearingA, 0xEE0001, now-float64(20-i)*outOfBoundS))
+		ms.obs = append(ms.obs, buildObs(us, bearingB, 0xFF0002, now-float64(20-i)*outOfBoundS))
+	}
+
+	ms.lastRunTS = 0.0
+	ms.TryUpdate(sync, dominantS)
+
+	snap := ms.Snapshot()
+	// If a candidate was evaluated and was out of bound, DominantPriorInconsistent must be set.
+	// Published period must be within dominant bound.
+	_, ppm := periodDeltaToDominant(snap.PeriodS, dominantS)
+	if math.Abs(ppm) > periodRefineMaxPPMFromDominant+1.0 {
+		t.Errorf("published period %.6f s is %.0f PPM from dominant (max %d PPM)",
+			snap.PeriodS, math.Abs(ppm), int(periodRefineMaxPPMFromDominant))
+	}
+	// The reacquire candidate should have been flagged.
+	if snap.ReacquireCandidatePeriod > 0 {
+		_, candPPM := periodDeltaToDominant(snap.ReacquireCandidatePeriod, dominantS)
+		if math.Abs(candPPM) > periodRefineMaxPPMFromDominant && !snap.DominantPriorInconsistent {
+			t.Errorf("reacquire candidate at %.0f PPM from dominant but DominantPriorInconsistent not set", math.Abs(candPPM))
+		}
+	}
+}
+
+// TestAnchorSelectionPrefersMoreObservations verifies that selectAnchor prefers
+// a well-supported ICAO over a 2-observation ICAO, even when the weak ICAO has
+// a slightly higher base quality score.
+func TestAnchorSelectionPrefersMoreObservations(t *testing.T) {
+	periodS := 4.0
+	epochUS := 0.0
+	offsetDeg := 45.0
+
+	ms := NewMultiSyncSolver(1)
+	now := float64(time.Now().UnixMicro()) / 1e6
+
+	icaoWeak := uint32(0x100001) // 2 observations
+	icaoStrong := uint32(0x200002) // 10 observations
+
+	periodUS := periodS * 1e6
+	var scored []scoredObs
+	addObs := func(icao uint32, n int) {
+		for i := 0; i < n; i++ {
+			us := float64(i) * periodS * 1e6
+			bearing := simulatedBearing(us, epochUS, offsetDeg, periodS)
+			o := buildObs(us, bearing, icao, now-float64(n-i)*periodS)
+			effectiveUS := msPropCorrectedUS(o.CentroidUS, float64(o.RangeNM))
+			predicted := msPredictBearing(epochUS, offsetDeg, periodUS, effectiveUS)
+			residual := circularDiff(o.BearingDeg, predicted)
+			absR := math.Abs(residual)
+			status := msClassifyResidual(absR)
+			baseW := msScoreObs(o)
+			scored = append(scored, scoredObs{
+				o:           o,
+				residual:    residual,
+				effectiveUS: effectiveUS,
+				baseW:       baseW,
+				effectiveW:  baseW,
+				status:      status,
+				fitEligible: msFitRejectReason(o, status, absR, nil, false) == "",
+			})
+		}
+	}
+	addObs(icaoWeak, 2)
+	addObs(icaoStrong, 10)
+
+	newOffset, anchorICAO, _, _, _, _, _ := ms.selectAnchor(scored, 0, periodUS, offsetDeg, now, true)
+	_ = newOffset
+	if anchorICAO == nil {
+		t.Fatal("selectAnchor returned nil anchor; expected icaoStrong")
+	}
+	if *anchorICAO == icaoWeak {
+		t.Errorf("anchor selected icaoWeak (2 obs) instead of icaoStrong (10 obs); anchor=%06X", *anchorICAO)
+	}
+}

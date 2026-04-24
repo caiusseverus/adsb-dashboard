@@ -101,3 +101,23 @@ Verification:
 - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid ./cmd/radar-core ./protocol ./export -count=1` -> passed
 - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_radar_core_client.py tests/test_radar_core_protocol.py -q` -> `176 passed`
 - `cd frontend && npm run build` -> passed; Vite reported the existing chunk-size warning.
+
+## 2026-04-24 Robust Go Refined Multi-Aircraft Sync
+
+- [x] Review lessons and current multisync / protocol / frontend paths before editing.
+- [ ] Preserve the role split: DF alignment owns dominant period/family; Go multisync uses `DominantPeriodS` as the family authority and applies only bounded correction.
+- [ ] Replace residual-gated period fitting with per-ICAO unwrapped retained residual-slope fitting, with diagnostics for slope-fit accepted/rejected vs phase-anchor rejected observations.
+- [ ] Split period recovery from phase anchoring: run bounded period correction before anchor selection, and block anchor selection until the unwrapped slope gate is stable.
+- [ ] Add authority promotion/demotion gates based on sustained retained residual slope health and expose slope window/gate/block diagnostics.
+- [ ] Enforce dominant-prior bounds in normal refinement, recovery candidate publication, and authoritative state updates.
+- [ ] Improve anchor scoring so support/persistence/validator agreement dominate over two-observation tight spreads.
+- [ ] Populate per-aircraft anchor delta for Go-derived implied-offset rows and keep frontend rendering explicit when no anchor exists.
+- [ ] Mark residual correction provenance, including current raw/propagation/motion/waveform status, and support degraded motion-guard correction.
+- [ ] Add focused Go/backend/frontend tests for wrapped slope recovery, no-anchor period recovery, slope-blocked promotion, anchor delta output, dominant bounds, and anchor selection support.
+- [ ] Run Go/backend/frontend verification, document results here, and commit the completed change.
+
+Plan confirmation:
+- Keep `rotation.go` focused on dominant-period/family detection; no family switching in multisync.
+- Make period slope fitting use retained, propagation-corrected residual evidence that is unwrapped within each ICAO before fitting.
+- Treat waveform/motion limitations as explicit diagnostics and conservative gains, not blockers for obvious bounded period recovery.
+- Keep phase/anchor validation stricter than period recovery so near-wrap evidence can correct period without being promoted as absolute phase.
