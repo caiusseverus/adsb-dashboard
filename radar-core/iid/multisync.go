@@ -1329,7 +1329,14 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	ms.updateAuthoritativeState(candidateEstimate, validation, recoveryActive, nowUnix)
 
 	publishedEstimate := candidateEstimate
-	if ms.AuthoritativePresent {
+	if ms.ActiveAuthorityMode == authorityModeCompact && sync != nil && sync.PeriodS > 0 {
+		publishedEstimate = syncStateEstimate{
+			present:   true,
+			periodS:   sync.PeriodS,
+			epochUS:   sync.PhaseEpochUS,
+			offsetDeg: sync.PhaseOffsetDeg,
+		}
+	} else if ms.AuthoritativePresent {
 		publishedEstimate = syncStateEstimate{
 			present:     true,
 			periodS:     ms.AuthoritativePeriodS,
@@ -1357,10 +1364,10 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	ms.NSyncUpdates++
 	ms.Holdover = len(fitPool) < 2
 	ms.LastUpdated = nowUnix
-	if publishedEstimate.anchorICAO != nil {
-		ms.AnchorICAO = publishedEstimate.anchorICAO
-		ms.AnchorPhaseDeg = publishedEstimate.anchorPhase
-		ms.AnchorScore = publishedEstimate.anchorScore
+	if candidateEstimate.anchorICAO != nil {
+		ms.AnchorICAO = candidateEstimate.anchorICAO
+		ms.AnchorPhaseDeg = candidateEstimate.anchorPhase
+		ms.AnchorScore = candidateEstimate.anchorScore
 	} else {
 		ms.AnchorICAO = nil
 		ms.AnchorPhaseDeg = 0
@@ -1378,6 +1385,7 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	// The localiser must not use refined sync for geographic bearing prediction unless
 	// this flag is set — Usable alone is insufficient since it covers relative sync only.
 	ms.AbsolutePhaseTrusted = dominantPeriodS > 0 &&
+		ms.ActiveAuthorityMode == authorityModeRefined &&
 		ms.AuthoritativePresent &&
 		math.Abs(ms.LastPeriodDeltaToDominantPPM) <= periodRefineMaxPPMFromDominant &&
 		ms.AnchorICAO != nil &&

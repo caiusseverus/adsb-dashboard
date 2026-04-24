@@ -1,3 +1,39 @@
+## 2026-04-24 Phase Anchor Residual Basis Follow-Up
+
+- [x] Review current lessons and the prior phase-anchor task before changing code.
+- [x] Trace Go `PhaseOffsetDeg` / `AuthoritativePhaseOffsetDeg` / `CandidatePhaseOffsetDeg` / `AnchorPhaseDeg` through the Python bridge and Radar UI.
+- [x] Add explicit residual-basis labelling to burst residual plots.
+- [x] Add an operator-controlled anchor-relative residual plot mode where the selected candidate anchor plots around zero.
+- [x] Change Phase Anchor wording so candidate anchor diagnostics are not described as operational authority unless promoted.
+- [x] Show single-ICAO validation blocking explicitly: candidate anchor selected, not applied, active residuals still compact-authority residuals.
+- [x] Add focused backend/frontend verification and document results.
+
+Plan confirmation:
+- Keep this as a display/diagnostic separation fix; do not change the Go solver's authority promotion or validation rules.
+- The active residual plot remains operational by default and is labelled by active authority mode (`compact_authoritative`, `dominant_recovery`, `refined_authoritative`, etc.).
+- Add an explicit anchor-relative residual basis (`refined_candidate_anchor`) as a separate selectable mode.
+- Treat selected phase anchors as candidate/diagnostic unless `active_authority_mode === "refined_authoritative"` and the authoritative anchor matches.
+- Audit outcome will be documented in the review section after verification.
+
+### Review
+- Audit outcome:
+  - Go `CandidatePhaseOffsetDeg` and `AuthoritativePhaseOffsetDeg` were already separate, and Stage 3 localisation is gated by `absolute_phase_trusted`.
+  - The remaining bug was that `PhaseOffsetDeg` could publish the candidate phase while `ActiveAuthorityMode` still reported `compact_authoritative`, which made active residual plots ambiguous.
+  - `AnchorPhaseDeg` / `AnchorICAO` remain diagnostic candidate-anchor exports; the UI now distinguishes candidate anchor from applied authoritative anchor.
+- Implemented:
+  - Go compact authority now publishes compact sync `PeriodS` / `PhaseEpochUS` / `PhaseOffsetDeg` while preserving candidate phase/anchor diagnostics in candidate fields and anchor diagnostics.
+  - `absolute_phase_trusted` now requires `active_authority_mode == refined_authoritative`, so compact publication cannot be treated as trusted absolute phase even if a stale authoritative state exists.
+  - Radar residual plots now show a `Residual basis` selector. Default is the active operational basis (`compact_authoritative`, `dominant_recovery`, or `refined_authoritative`); `refined_candidate_anchor` is available only when the selected ICAO is the candidate anchor and anchor-relative residuals exist.
+  - DF11 dots are hidden in `refined_candidate_anchor` mode because they are active-authority residuals, not candidate-anchor residuals.
+  - Phase Anchor panels now say `candidate anchor selected` / `not applied: insufficient validator ICAOs` when validation has not promoted the phase branch, and show active residuals as still compact-authority residuals.
+- Verification:
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid -run 'TestMultiSyncSolver_(CompactAuthorityPublishesCompactPhaseNotCandidate|NormalRefinementPublishesAlignmentFromRefinedPeriod|ValidatorBackedPromotionInitializesAuthoritativeState|AuthorityPromotionBlockedBySlope)' -count=1` -> passed
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid ./cmd/radar-core ./protocol ./export -count=1` -> passed
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go build -o radar-core ./cmd/radar-core` -> passed
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -q -k 'go_sync_decodes_absolute_phase_trusted_and_dominant_prior_inconsistent or go_refined_timeline_includes_implied_phase_offsets_without_zero_fallback or update_go_multi_sync_state_overrides_python_multi_aircraft_burst or go_multi_sync_mode_diagnostics_report_dominant_recovery_fields'` -> `4 passed`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_radar_core_client.py tests/test_radar_core_protocol.py -q` -> `177 passed`
+  - `cd frontend && npm run build` -> passed; Vite reported the existing chunk-size warning.
+
 ## 2026-04-24 Phase Anchor Reference Frame Fix
 
 - [x] Review current lessons and existing radar-sync task history before changing code.

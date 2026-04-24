@@ -610,8 +610,45 @@ func TestMultiSyncSolver_ReacquirePublishesConsistentCandidateFamily(t *testing.
 	}
 }
 
+func TestMultiSyncSolver_CompactAuthorityPublishesCompactPhaseNotCandidate(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	periodS := 4.0
+	seedEpochUS := 0.0
+	compactOffsetDeg := 10.0
+	candidateOffsetDeg := 20.0
+	sync := NewSyncState(1, periodS, seedEpochUS, compactOffsetDeg, 0.8)
+
+	now := float64(time.Now().UnixMicro()) / 1e6
+	for i := 0; i < 36; i++ {
+		us := float64(i) * periodS / 3.0 * 1e6
+		icao := uint32(0xAB1000 + i%3)
+		bearing := simulatedBearing(us, seedEpochUS, candidateOffsetDeg, periodS)
+		ms.obs = append(ms.obs, buildObs(us, bearing, icao, now+float64(i)*0.2))
+	}
+
+	ms.lastRunTS = 0.0
+	ms.TryUpdate(sync, periodS)
+
+	if ms.ActiveAuthorityMode != authorityModeCompact {
+		t.Fatalf("expected compact authority before promotion, got %s", ms.ActiveAuthorityMode)
+	}
+	if math.Abs(circularDiff(ms.PhaseOffsetDeg, compactOffsetDeg)) > 1e-6 {
+		t.Fatalf("compact authority published phase %.6f, want compact %.6f", ms.PhaseOffsetDeg, compactOffsetDeg)
+	}
+	if math.Abs(circularDiff(ms.CandidatePhaseOffsetDeg, compactOffsetDeg)) < 5.0 {
+		t.Fatalf("candidate diagnostic phase %.6f should remain separate from compact %.6f", ms.CandidatePhaseOffsetDeg, compactOffsetDeg)
+	}
+	if ms.AnchorICAO == nil {
+		t.Fatal("candidate anchor diagnostics should remain exported while compact authority is published")
+	}
+	if ms.AbsolutePhaseTrusted {
+		t.Fatal("compact authority must not export trusted absolute phase")
+	}
+}
+
 func TestMultiSyncSolver_NormalRefinementPublishesAlignmentFromRefinedPeriod(t *testing.T) {
 	ms := NewMultiSyncSolver(1)
+	ms.ActiveAuthorityMode = authorityModeRefined
 	livePeriodS := 4.05
 	truePeriodS := 4.0
 	seedEpochUS := 0.0

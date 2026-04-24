@@ -33,6 +33,8 @@ const RADAR_FIELD_AXIS_SHRINK_HOLD_MS = 45_000
 const RADAR_FIELD_AXIS_SHRINK_TIME_CONSTANT_MS = 12_000
 const BURST_SYNC_VIEW_MODE_RESIDUALS = 'burst_sync_residuals'
 const BURST_SYNC_VIEW_MODE_LEGACY = 'legacy_live_df_alignment'
+const RESIDUAL_BASIS_ACTIVE = 'active_authority'
+const RESIDUAL_BASIS_ANCHOR = 'anchor_relative'
 function getRadarPageMetricsStore() {
   if (typeof window === 'undefined') return null
   if (!window.__RADAR_PAGE_REQUEST_METRICS__) {
@@ -1823,6 +1825,15 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
   const compact = modeDiagnostics.compact ?? {}
   const refined = modeDiagnostics.refined ?? {}
   const authorityMode = modeDiagnostics.active_authority_mode ?? refined.active_authority_mode ?? '—'
+  const anchorIcao = syncState.candidate_anchor_icao ?? syncState.phase_anchor_icao
+  const candidateAnchorSelected = Boolean(anchorIcao)
+  const refinedAuthorityApplied = authorityMode === 'refined_authoritative'
+    && syncState.authoritative_anchor_icao
+    && syncState.authoritative_anchor_icao === anchorIcao
+  const insufficientValidatorICAOs = candidateAnchorSelected
+    && !refinedAuthorityApplied
+    && Number(syncState.validator_agreement_count ?? syncState.phase_validation_contributors ?? 0) < 2
+    && Number(refined.fit_contributing_icao_count ?? syncState.fit_contributing_icao_count ?? 0) <= 1
   return (
     <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
@@ -1845,6 +1856,16 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
           <span className={styles.metricPill}>Holdover <span className={styles.metricValue}>{syncState.holdover ? 'yes' : 'no'}</span></span>
         </div>
       </div>
+
+      {candidateAnchorSelected && !refinedAuthorityApplied && (
+        <div style={{ marginBottom: '0.5rem', border: '1px solid #8b6f1f', background: '#16130b', color: '#d29922', fontSize: '0.72rem', lineHeight: 1.45, padding: '6px 8px' }}>
+          Candidate anchor selected: <span className={styles.metricValue}>{anchorIcao}</span>.
+          {' '}
+          Not applied: {insufficientValidatorICAOs ? 'insufficient validator ICAOs' : humanizeSyncReason(syncState.phase_validation_status || 'phase validation incomplete')}.
+          {' '}
+          Active residuals are still <span className={styles.metricValue}>{authorityMode}</span> residuals.
+        </div>
+      )}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '10px' }}>
         <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '6px 8px' }}>
@@ -1889,7 +1910,18 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
   if (!syncState) return null
   const refined = modeDiagnostics?.refined ?? {}
   const refinedActive = Boolean(refined.active)
-  const anchorIcao = syncState.phase_anchor_icao
+  const appliedAnchorIcao = syncState.phase_anchor_icao
+  const candidateAnchorIcao = syncState.candidate_anchor_icao ?? appliedAnchorIcao
+  const anchorIcao = candidateAnchorIcao
+  const authorityMode = modeDiagnostics?.active_authority_mode ?? syncState.active_authority_mode
+  const refinedAuthorityApplied = Boolean(
+    authorityMode === 'refined_authoritative'
+    && syncState.authoritative_anchor_icao
+    && syncState.authoritative_anchor_icao === candidateAnchorIcao,
+  )
+  const validatorAgreement = Number(syncState.validator_agreement_count ?? syncState.phase_validation_contributors ?? 0)
+  const fitIcaoCount = Number(syncState.fit_contributing_icao_count ?? refined.fit_contributing_icao_count ?? 0)
+  const insufficientValidatorICAOs = Boolean(anchorIcao && !refinedAuthorityApplied && validatorAgreement < 2 && fitIcaoCount <= 1)
   const candidateRowsRaw = Array.isArray(candidates) && candidates.length > 0
     ? candidates
     : (Array.isArray(syncState.phase_anchor_candidates) ? syncState.phase_anchor_candidates : [])
@@ -2000,11 +2032,16 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
         <div>
           <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Phase Anchor</div>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>Absolute phase is anchored from one aircraft; the rest validate and nudge.</div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>
+            {refinedAuthorityApplied
+              ? 'Refined authoritative phase is active; anchor diagnostics show the applied phase branch.'
+              : 'Candidate anchor diagnostics are not operational authority until validator ICAOs promote the phase branch.'}
+          </div>
         </div>
         <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: '4px', fontSize: '0.72rem' }}>
-          <span className={styles.metricPill}>Anchor <span className={styles.metricValue}>{anchorIcao || '—'}</span></span>
-          <span className={styles.metricPill}>Status <span className={styles.metricValue}>{syncState.phase_anchor_status || '—'}</span></span>
+          <span className={styles.metricPill}>Candidate anchor <span className={styles.metricValue}>{candidateAnchorIcao || '—'}</span></span>
+          <span className={styles.metricPill}>Applied anchor <span className={styles.metricValue}>{refinedAuthorityApplied ? (syncState.authoritative_anchor_icao || appliedAnchorIcao || '—') : '—'}</span></span>
+          <span className={styles.metricPill}>Status <span className={styles.metricValue}>{refinedAuthorityApplied ? 'applied authority' : (candidateAnchorIcao ? 'candidate anchor selected' : (syncState.phase_anchor_status || '—'))}</span></span>
           <span className={styles.metricPill}>Score <span className={styles.metricValue}>{fmtNumber(syncState.phase_anchor_score, 1)}</span></span>
           <span className={styles.metricPill}>Spread <span className={styles.metricValue}>{fmtNumber(syncState.phase_anchor_spread_deg, 2, '°')}</span></span>
           <span className={styles.metricPill}>Obs <span className={styles.metricValue}>{syncState.phase_anchor_obs_count ?? anchorObs.length ?? '—'}</span></span>
@@ -2015,9 +2052,15 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
           <span className={styles.metricPill}>Fit obs <span className={styles.metricValue}>{syncState.fit_eligible_observations ?? 0}/{syncState.fit_total_observations ?? 0}</span></span>
           <span className={styles.metricPill}>Fit ICAOs <span className={styles.metricValue}>{syncState.fit_contributing_icao_count ?? 0}</span></span>
           <span className={styles.metricPill}>Candidates <span className={styles.metricValue}>{syncState.phase_anchor_candidate_count ?? candidateRows.length}</span></span>
-          <span className={styles.metricPill}>Authority <span className={styles.metricValue}>{modeDiagnostics?.active_authority_mode ?? syncState.active_authority_mode ?? '—'}</span></span>
+          <span className={styles.metricPill}>Authority <span className={styles.metricValue}>{authorityMode ?? '—'}</span></span>
         </div>
       </div>
+
+      {candidateAnchorIcao && !refinedAuthorityApplied && (
+        <div style={{ color: '#d29922', background: '#16130b', border: '1px solid #8b6f1f', fontSize: '0.72rem', lineHeight: 1.45, padding: '5px 6px', marginBottom: '0.35rem' }}>
+          Candidate anchor selected. Not applied: {insufficientValidatorICAOs ? 'insufficient validator ICAOs' : humanizeSyncReason(syncState.phase_validation_status || 'phase validation incomplete')}. Active residuals are still <span className={styles.metricValue}>{authorityMode ?? 'compact_authoritative'}</span> residuals.
+        </div>
+      )}
 
       {syncState.phase_anchor_replacement_reason && (
         <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '0.35rem' }}>
@@ -2112,7 +2155,7 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
                   <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</td>
                   <td style={tdRight}>{isFiniteValue(obs.implied_phase_offset_deg) ? fmtNumber(obs.implied_phase_offset_deg, 2, '°') : '—'}</td>
                   <td style={tdRight}>{isFiniteValue(anchorRelativeDelta(obs)) ? fmtNumber(anchorRelativeDelta(obs), 2, '°') : '—'}</td>
-                  <td style={tdLeft}>{obs.phase_anchor_contributor ? 'anchor' : (obs.phase_anchor_reject_reason || 'validator')}</td>
+                  <td style={tdLeft}>{obs.phase_anchor_contributor ? (refinedAuthorityApplied ? 'applied anchor' : 'candidate anchor') : (obs.phase_anchor_reject_reason || 'validator')}</td>
                 </tr>
               ))}
               {latestImpliedRows.length === 0 && (
@@ -2148,6 +2191,7 @@ function RotationAlignmentPanel({
   const [legacyLoading, setLegacyLoading] = useState(false)
   const [refOverride, setRefOverride] = useState(null)
   const [refOverrideSent, setRefOverrideSent] = useState(false)
+  const [residualBasisMode, setResidualBasisMode] = useState(RESIDUAL_BASIS_ACTIVE)
   const timelineCacheRef = useRef(new Map())
   const streamStatus = syncFeedStatus ?? {
     connected: false,
@@ -2262,12 +2306,13 @@ function RotationAlignmentPanel({
     if (selectedIcao && obs?.icao !== selectedIcao) return false
     return true
   })
-  const anchorRelativeResidualFrame = Boolean(
-    selectedIcao &&
-    syncState?.phase_anchor_icao &&
-    selectedIcao === syncState.phase_anchor_icao &&
-    filteredObservations.some(obs => Number.isFinite(Number(obs?.anchor_relative_phase_error_deg))),
-  )
+  const activeAuthorityMode = syncModeDiagnostics?.active_authority_mode ?? syncState?.active_authority_mode ?? 'compact_authoritative'
+  const candidateAnchorIcao = syncState?.candidate_anchor_icao ?? syncState?.phase_anchor_icao
+  const selectedIcaoIsAnchor = Boolean(selectedIcao && candidateAnchorIcao && selectedIcao === candidateAnchorIcao)
+  const hasAnchorRelativeResiduals = filteredObservations.some(obs => Number.isFinite(Number(obs?.anchor_relative_phase_error_deg)))
+  const anchorRelativeBasisAvailable = Boolean(selectedIcaoIsAnchor && hasAnchorRelativeResiduals)
+  const anchorRelativeResidualFrame = residualBasisMode === RESIDUAL_BASIS_ANCHOR && anchorRelativeBasisAvailable
+  const displayedResidualBasis = anchorRelativeResidualFrame ? 'refined_candidate_anchor' : activeAuthorityMode
   const burstResidualValue = (obs) => {
     if (anchorRelativeResidualFrame && Number.isFinite(Number(obs?.anchor_relative_phase_error_deg))) {
       return Number(obs.anchor_relative_phase_error_deg)
@@ -2275,8 +2320,8 @@ function RotationAlignmentPanel({
     return Number(obs?.residual_deg)
   }
   const burstResidualLabel = anchorRelativeResidualFrame
-    ? 'selected-anchor-relative phase error'
-    : 'active-authority residual'
+    ? 'refined candidate-anchor residual'
+    : `${activeAuthorityMode} residual`
   const visibleDf11ResidualDots = anchorRelativeResidualFrame ? [] : df11ResidualDots
   const inlierCount = filteredObservations.filter(obs => obs.classification === 'inlier').length
   const softCount = filteredObservations.filter(obs => obs.classification === 'soft').length
@@ -2308,6 +2353,12 @@ function RotationAlignmentPanel({
       .map(([icao, count]) => ({ icao, count }))
       .sort((a, b) => (b.count - a.count) || a.icao.localeCompare(b.icao))
   }, [observations, sortedLegacyIcaos])
+
+  useEffect(() => {
+    if (residualBasisMode === RESIDUAL_BASIS_ANCHOR && !anchorRelativeBasisAvailable) {
+      setResidualBasisMode(RESIDUAL_BASIS_ACTIVE)
+    }
+  }, [anchorRelativeBasisAvailable, residualBasisMode])
 
   async function handleReset() {
     if (iid == null || resetting) return
@@ -2479,7 +2530,7 @@ function RotationAlignmentPanel({
           <div className={styles.cardTitle}>Burst Sync Alignment</div>
           <div className={styles.sectionLead}>
             {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS
-              ? 'Both layers are backend-derived and directly comparable: burst-centre residuals (circles) and DF11 arrival residuals (dots) use the same authoritative sync model and predictor.'
+              ? `Burst-centre residuals are shown in the selected basis: ${displayedResidualBasis}. DF11 dots are shown only in active-authority mode.`
               : 'Legacy view: per-aircraft live DF alignment across the rolling window for broad multi-aircraft timing context.'}
           </div>
         </div>
@@ -2530,6 +2581,27 @@ function RotationAlignmentPanel({
           <span className={styles.metricPill}>
             Sync mode <span className={styles.metricValue}>{syncModeDiagnostics?.active_label ?? '—'}</span>
           </span>
+          {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS && (
+            <span className={styles.metricPill} title="Choose whether residual plots show the operational authority frame or the diagnostic selected-anchor-relative frame.">
+              Residual basis
+              <select
+                value={residualBasisMode}
+                onChange={e => setResidualBasisMode(e.target.value)}
+                style={{
+                  background: 'transparent',
+                  border: '1px solid #30363d',
+                  borderRadius: '3px',
+                  color: '#c9d1d9',
+                  fontSize: '0.72rem',
+                  marginLeft: '4px',
+                  padding: '1px 3px',
+                }}
+              >
+                <option value={RESIDUAL_BASIS_ACTIVE}>{activeAuthorityMode}</option>
+                <option value={RESIDUAL_BASIS_ANCHOR} disabled={!anchorRelativeBasisAvailable}>refined_candidate_anchor</option>
+              </select>
+            </span>
+          )}
           <span className={styles.metricPill}>
             Status <span className={styles.metricValue}>{rotation?.status ?? '—'}</span>
           </span>
@@ -2561,11 +2633,9 @@ function RotationAlignmentPanel({
               <span className={styles.metricPill}>
                 DF11 residual dots <span className={styles.metricValue}>{visibleDf11ResidualDots.length}</span>
               </span>
-              {anchorRelativeResidualFrame && (
-                <span className={styles.metricPill}>
-                  Residual frame <span className={styles.metricValue}>selected anchor</span>
-                </span>
-              )}
+              <span className={styles.metricPill}>
+                Residual basis <span className={styles.metricValue}>{displayedResidualBasis}</span>
+              </span>
             </>
           ) : (
             <span className={styles.metricPill}>
@@ -2742,8 +2812,8 @@ function RotationAlignmentPanel({
                   })}
                   <text x={padL + plotW / 2} y={18} textAnchor="middle" className={styles.axisLabel}>
                     {anchorRelativeResidualFrame
-                      ? 'Burst-centre selected-anchor-relative phase error'
-                      : 'Burst-centre residuals and DF11 arrival residuals — both backend-derived, directly comparable'}
+                      ? 'Burst-centre residuals — basis refined_candidate_anchor'
+                      : `Burst-centre and DF11 residuals — basis ${activeAuthorityMode}`}
                   </text>
                   <text x={padL + plotW / 2} y={chartH - 4} textAnchor="middle" className={styles.axisLabel}>
                     Elapsed seconds across rolling window
@@ -2764,7 +2834,7 @@ function RotationAlignmentPanel({
                           opacity={0.62}
                         >
                           <title>
-                            {`${dot.icao ?? 'DF11'} ${(dot.timing_class ?? '').replace('_', ' ')} residual ${Number(dot.residual_deg ?? 0).toFixed(2)}° (backend)`}
+                            {`${dot.icao ?? 'DF11'} ${(dot.timing_class ?? '').replace('_', ' ')} ${activeAuthorityMode} residual ${Number(dot.residual_deg ?? 0).toFixed(2)}° (backend)`}
                           </title>
                         </circle>
                       ))
@@ -2849,10 +2919,10 @@ function RotationAlignmentPanel({
                       )
                     })}
                     <text x={phasePadL + phasePlotW / 2} y={18} textAnchor="middle" className={styles.axisLabel}>
-                      {anchorRelativeResidualFrame ? 'Folded anchor-relative residual vs bearing' : 'Folded residual vs bearing'}
+                      {anchorRelativeResidualFrame ? 'Folded residual vs bearing — basis refined_candidate_anchor' : `Folded residual vs bearing — basis ${activeAuthorityMode}`}
                     </text>
                     <text x={phasePadL + phasePlotW / 2} y={phaseChartH - 4} textAnchor="middle" className={styles.axisLabel}>
-                      {anchorRelativeResidualFrame ? 'Selected-anchor-relative frame' : 'Static 0-360° rotation domain'}
+                      {anchorRelativeResidualFrame ? 'Selected candidate-anchor frame' : 'Static 0-360° rotation domain'}
                     </text>
                     {phaseResidualRows.map(row => (
                       <circle
@@ -2863,7 +2933,7 @@ function RotationAlignmentPanel({
                         fill={burstSyncClassColor(row.classification)}
                         opacity={0.78}
                       >
-                        <title>{`${row.icao ?? '—'} bearing ${row.phaseDeg.toFixed(1)}° residual ${row.residualDeg.toFixed(2)}°`}</title>
+                        <title>{`${row.icao ?? '—'} bearing ${row.phaseDeg.toFixed(1)}° ${displayedResidualBasis} residual ${row.residualDeg.toFixed(2)}°`}</title>
                       </circle>
                     ))}
                     {foldedPhaseCurve.length > 1 && (
@@ -2924,10 +2994,10 @@ function RotationAlignmentPanel({
                       )
                     })}
                     <text x={phasePadL + phasePlotW / 2} y={18} textAnchor="middle" className={styles.axisLabel}>
-                      {anchorRelativeResidualFrame ? 'Anchor-relative residual vs range' : 'Residual vs range'}
+                      {anchorRelativeResidualFrame ? 'Residual vs range — basis refined_candidate_anchor' : `Residual vs range — basis ${activeAuthorityMode}`}
                     </text>
                     <text x={phasePadL + phasePlotW / 2} y={auxChartH - 4} textAnchor="middle" className={styles.axisLabel}>
-                      {anchorRelativeResidualFrame ? 'Selected-anchor-relative residual by aircraft range' : 'Corrected residual by aircraft range'}
+                      {anchorRelativeResidualFrame ? 'Selected candidate-anchor residual by aircraft range' : 'Corrected residual by aircraft range'}
                     </text>
                     {rangeResidualRows.map(row => (
                       <circle
@@ -2938,7 +3008,7 @@ function RotationAlignmentPanel({
                         fill={burstSyncClassColor(row.classification)}
                         opacity={0.78}
                       >
-                        <title>{`${row.icao ?? '—'} range ${row.rangeNm.toFixed(1)} NM residual ${row.residualCorrectedDeg.toFixed(2)}°`}</title>
+                        <title>{`${row.icao ?? '—'} range ${row.rangeNm.toFixed(1)} NM ${displayedResidualBasis} residual ${row.residualCorrectedDeg.toFixed(2)}°`}</title>
                       </circle>
                     ))}
                   </svg>
