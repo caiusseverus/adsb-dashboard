@@ -2003,6 +2003,59 @@ func TestAnchorDeltaCircularDiff(t *testing.T) {
 	}
 }
 
+func TestSelectAnchorExportsLatestAnchorImpliedOffsetSeparatelyFromMean(t *testing.T) {
+	periodS := 4.0
+	periodUS := periodS * 1e6
+	epochUS := 0.0
+	now := float64(time.Now().UnixMicro()) / 1e6
+	anchorICAO := uint32(0x440C1B)
+
+	ms := NewMultiSyncSolver(1)
+	scored := []scoredObs{}
+	addScored := func(icao uint32, effectiveUS, impliedOffset float64) {
+		phaseRel := math.Mod((effectiveUS-epochUS)/periodUS*360.0, 360.0)
+		bearing := math.Mod(phaseRel+impliedOffset+360.0, 360.0)
+		scored = append(scored, scoredObs{
+			o: MultiSyncObs{
+				CentroidUS: effectiveUS,
+				ICAO:       icao,
+				BearingDeg: bearing,
+				RangeNM:    0,
+				PosAgeS:    0.1,
+				NReplies:   4,
+				WallTS:     now + effectiveUS/1e6,
+			},
+			residual:    0,
+			effectiveUS: effectiveUS,
+			baseW:       1,
+			effectiveW:  1,
+			status:      "inlier",
+			fitEligible: true,
+		})
+	}
+
+	// The anchor's latest implied offset is intentionally different from its
+	// circular mean. UI anchor Δ must reference the latest selected-anchor row.
+	addScored(anchorICAO, 0, 220.0)
+	addScored(anchorICAO, periodUS, 240.91)
+
+	newOffset, selectedICAO, _, anchorPhaseDeg, _, _, _ := ms.selectAnchor(
+		scored, epochUS, periodUS, 0, now, true,
+	)
+	if selectedICAO == nil || *selectedICAO != anchorICAO {
+		t.Fatalf("expected selected anchor %06X, got %#v", anchorICAO, selectedICAO)
+	}
+	if math.Abs(anchorPhaseDeg-240.91) > 0.001 {
+		t.Fatalf("exported anchor phase %.3f should be latest selected-anchor implied offset 240.91", anchorPhaseDeg)
+	}
+	if math.Abs(circularDiff(newOffset, anchorPhaseDeg)) < 1.0 {
+		t.Fatalf("test setup expected solver mean %.3f to differ from exported latest anchor offset %.3f", newOffset, anchorPhaseDeg)
+	}
+	if got := circularDiff(anchorPhaseDeg, anchorPhaseDeg); math.Abs(got) > 1e-9 {
+		t.Fatalf("selected anchor Δ must be zero against latest selected-anchor offset, got %.6f", got)
+	}
+}
+
 // TestDominantPriorBoundReacquireOutOfBound verifies that when the reacquire
 // candidate search finds a period outside periodRefineMaxPPMFromDominant, the
 // DominantPriorInconsistent flag is set and the published period stays within bound.
@@ -2058,7 +2111,7 @@ func TestAnchorSelectionPrefersMoreObservations(t *testing.T) {
 	ms := NewMultiSyncSolver(1)
 	now := float64(time.Now().UnixMicro()) / 1e6
 
-	icaoWeak := uint32(0x100001) // 2 observations
+	icaoWeak := uint32(0x100001)   // 2 observations
 	icaoStrong := uint32(0x200002) // 10 observations
 
 	periodUS := periodS * 1e6

@@ -1629,6 +1629,13 @@ function wrapSignedResidualDeg(observedDeg, predictedDeg) {
   return ((observedDeg - predictedDeg + 540) % 360) - 180
 }
 
+function circularDeltaDeg(valueDeg, referenceDeg) {
+  const value = Number(valueDeg)
+  const reference = Number(referenceDeg)
+  if (!Number.isFinite(value) || !Number.isFinite(reference)) return null
+  return wrapSignedResidualDeg(value, reference)
+}
+
 function classifyTimingResidual(residualDeg, thresholdDeg) {
   if (!Number.isFinite(residualDeg)) return 'unknown'
   if (residualDeg > thresholdDeg) return 'early'
@@ -1890,6 +1897,39 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
   const impliedRows = (observations || [])
     .filter(obs => isFiniteValue(obs?.implied_phase_offset_deg))
     .slice(-160)
+  const anchorReferenceOffsetDeg = useMemo(() => {
+    if (!anchorIcao) return null
+    let latest = null
+    let latestTs = -Infinity
+    for (const obs of impliedRows) {
+      if (obs?.icao !== anchorIcao || !isFiniteValue(obs?.implied_phase_offset_deg)) continue
+      const ts = Number(obs?.beam_center_us ?? obs?.raw_arrival_us ?? obs?.effective_beast_us ?? obs?.wall_ts ?? 0)
+      if (!latest || ts >= latestTs) {
+        latest = obs
+        latestTs = Number.isFinite(ts) ? ts : 0
+      }
+    }
+    return latest ? Number(latest.implied_phase_offset_deg) : null
+  }, [anchorIcao, impliedRows])
+  const anchorRelativeDelta = useCallback((obs) => {
+    if (!obs || !isFiniteValue(obs.implied_phase_offset_deg) || !Number.isFinite(Number(anchorReferenceOffsetDeg))) {
+      return null
+    }
+    if (obs.icao === anchorIcao) {
+      const ts = Number(obs?.beam_center_us ?? obs?.raw_arrival_us ?? obs?.effective_beast_us ?? obs?.wall_ts ?? 0)
+      const latestAnchor = impliedRows
+        .filter(row => row?.icao === anchorIcao && isFiniteValue(row?.implied_phase_offset_deg))
+        .reduce((best, row) => {
+          const rowTs = Number(row?.beam_center_us ?? row?.raw_arrival_us ?? row?.effective_beast_us ?? row?.wall_ts ?? 0)
+          if (!best || (Number.isFinite(rowTs) ? rowTs : 0) >= best.ts) {
+            return { row, ts: Number.isFinite(rowTs) ? rowTs : 0 }
+          }
+          return best
+        }, null)
+      if (latestAnchor?.row === obs || (Number.isFinite(ts) && latestAnchor && ts === latestAnchor.ts)) return 0
+    }
+    return circularDeltaDeg(obs.implied_phase_offset_deg, anchorReferenceOffsetDeg)
+  }, [anchorIcao, anchorReferenceOffsetDeg, impliedRows])
   const candidateStatusPriority = useCallback((status) => {
     if (status === 'selected') return 0
     if (status === 'candidate') return 1
@@ -2032,6 +2072,7 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
             {impliedRows.map((obs, idx) => {
               const t = Number(obs.beam_center_us ?? obs.raw_arrival_us)
               const off = Number(obs.implied_phase_offset_deg)
+              const anchorDelta = anchorRelativeDelta(obs)
               const x = Number.isFinite(t) ? ((t - tMin) / tSpan) * scatterW : 0
               const y = scatterH - (((off % 360) + 360) % 360 / 360) * scatterH
               const isAnchor = obs.icao === anchorIcao
@@ -2045,7 +2086,7 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
                   fill={isAnchor ? '#ffd166' : rejected ? '#ff7b72' : '#58a6ff'}
                   fillOpacity={isAnchor ? 0.95 : 0.65}
                 >
-                  <title>{`${obs.icao || '—'} implied ${off.toFixed(2)}°${obs.anchor_relative_phase_error_deg != null ? ` | anchor Δ ${Number(obs.anchor_relative_phase_error_deg).toFixed(2)}°` : ''}`}</title>
+                  <title>{`${obs.icao || '—'} implied ${off.toFixed(2)}°${Number.isFinite(Number(anchorDelta)) ? ` | anchor Δ ${Number(anchorDelta).toFixed(2)}°` : ''}`}</title>
                 </circle>
               )
             })}
@@ -2070,7 +2111,7 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
                 <tr key={`${obs.icao}-${obs.beam_center_us}-${idx}`}>
                   <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</td>
                   <td style={tdRight}>{isFiniteValue(obs.implied_phase_offset_deg) ? fmtNumber(obs.implied_phase_offset_deg, 2, '°') : '—'}</td>
-                  <td style={tdRight}>{isFiniteValue(obs.anchor_relative_phase_error_deg) ? fmtNumber(obs.anchor_relative_phase_error_deg, 2, '°') : '—'}</td>
+                  <td style={tdRight}>{isFiniteValue(anchorRelativeDelta(obs)) ? fmtNumber(anchorRelativeDelta(obs), 2, '°') : '—'}</td>
                   <td style={tdLeft}>{obs.phase_anchor_contributor ? 'anchor' : (obs.phase_anchor_reject_reason || 'validator')}</td>
                 </tr>
               ))}
@@ -2221,14 +2262,30 @@ function RotationAlignmentPanel({
     if (selectedIcao && obs?.icao !== selectedIcao) return false
     return true
   })
+  const anchorRelativeResidualFrame = Boolean(
+    selectedIcao &&
+    syncState?.phase_anchor_icao &&
+    selectedIcao === syncState.phase_anchor_icao &&
+    filteredObservations.some(obs => Number.isFinite(Number(obs?.anchor_relative_phase_error_deg))),
+  )
+  const burstResidualValue = (obs) => {
+    if (anchorRelativeResidualFrame && Number.isFinite(Number(obs?.anchor_relative_phase_error_deg))) {
+      return Number(obs.anchor_relative_phase_error_deg)
+    }
+    return Number(obs?.residual_deg)
+  }
+  const burstResidualLabel = anchorRelativeResidualFrame
+    ? 'selected-anchor-relative phase error'
+    : 'active-authority residual'
+  const visibleDf11ResidualDots = anchorRelativeResidualFrame ? [] : df11ResidualDots
   const inlierCount = filteredObservations.filter(obs => obs.classification === 'inlier').length
   const softCount = filteredObservations.filter(obs => obs.classification === 'soft').length
   const rejectedCount = filteredObservations.filter(obs => obs.classification === 'rejected').length
   const syncDrivingCount = filteredObservations.filter(obs => obs?.sync_update_eligible !== false).length
   const nonSyncDrivingCount = filteredObservations.length - syncDrivingCount
-  const dfEarlyCount = df11ResidualDots.filter(dot => dot.timing_class === 'early').length
-  const dfOnTimeCount = df11ResidualDots.filter(dot => dot.timing_class === 'on_time').length
-  const dfLateCount = df11ResidualDots.filter(dot => dot.timing_class === 'late').length
+  const dfEarlyCount = visibleDf11ResidualDots.filter(dot => dot.timing_class === 'early').length
+  const dfOnTimeCount = visibleDf11ResidualDots.filter(dot => dot.timing_class === 'on_time').length
+  const dfLateCount = visibleDf11ResidualDots.filter(dot => dot.timing_class === 'late').length
   const sortedLegacyIcaos = useMemo(() => [...legacyIcaosRaw].sort((a, b) => {
     if ((b.arrivals_us?.length ?? 0) !== (a.arrivals_us?.length ?? 0)) {
       return (b.arrivals_us?.length ?? 0) - (a.arrivals_us?.length ?? 0)
@@ -2308,10 +2365,10 @@ function RotationAlignmentPanel({
   const plotH = chartH - padT - padB
   const spanUs = Math.max(1, windowEndUs - windowStartUs)
   const maxAbsResidualBursts = filteredObservations.reduce((max, obs) => {
-    const value = Math.abs(Number(obs?.residual_deg ?? 0))
+    const value = Math.abs(burstResidualValue(obs))
     return Number.isFinite(value) ? Math.max(max, value) : max
   }, 0)
-  const maxAbsResidualDf11 = df11ResidualDots.reduce((max, dot) => {
+  const maxAbsResidualDf11 = visibleDf11ResidualDots.reduce((max, dot) => {
     const value = Math.abs(Number(dot?.residual_deg ?? 0))
     return Number.isFinite(value) ? Math.max(max, value) : max
   }, 0)
@@ -2324,8 +2381,10 @@ function RotationAlignmentPanel({
     .map(obs => ({
       key: `${obs?.icao ?? 'unknown'}-${Number(obs?.beam_center_us ?? obs?.raw_arrival_us ?? 0)}-${Number(obs?.residual_deg ?? 0).toFixed(3)}`,
       phaseDeg: Number(obs?.bearing_deg),
-      residualDeg: Number(obs?.residual_deg),
-      residualCorrectedDeg: Number(obs?.residual_corrected_deg ?? obs?.residual_deg),
+      residualDeg: burstResidualValue(obs),
+      residualCorrectedDeg: anchorRelativeResidualFrame
+        ? burstResidualValue(obs)
+        : Number(obs?.residual_corrected_deg ?? obs?.residual_deg),
       classification: obs?.classification,
       icao: obs?.icao,
       bearingDeg: Number(obs?.bearing_deg),
@@ -2500,8 +2559,13 @@ function RotationAlignmentPanel({
                 Burst obs <span className={styles.metricValue}>{filteredObservations.length}</span>
               </span>
               <span className={styles.metricPill}>
-                DF11 residual dots <span className={styles.metricValue}>{df11ResidualDots.length}</span>
+                DF11 residual dots <span className={styles.metricValue}>{visibleDf11ResidualDots.length}</span>
               </span>
+              {anchorRelativeResidualFrame && (
+                <span className={styles.metricPill}>
+                  Residual frame <span className={styles.metricValue}>selected anchor</span>
+                </span>
+              )}
             </>
           ) : (
             <span className={styles.metricPill}>
@@ -2583,7 +2647,7 @@ function RotationAlignmentPanel({
 
       {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS ? (
         <>
-          {filteredObservations.length === 0 && df11ResidualDots.length === 0 ? (
+          {filteredObservations.length === 0 && visibleDf11ResidualDots.length === 0 ? (
             <div className={styles.empty}>
               {alignmentStatus?.detail
                 ?? (syncState
@@ -2677,7 +2741,9 @@ function RotationAlignmentPanel({
                     )
                   })}
                   <text x={padL + plotW / 2} y={18} textAnchor="middle" className={styles.axisLabel}>
-                    Burst-centre residuals and DF11 arrival residuals — both backend-derived, directly comparable
+                    {anchorRelativeResidualFrame
+                      ? 'Burst-centre selected-anchor-relative phase error'
+                      : 'Burst-centre residuals and DF11 arrival residuals — both backend-derived, directly comparable'}
                   </text>
                   <text x={padL + plotW / 2} y={chartH - 4} textAnchor="middle" className={styles.axisLabel}>
                     Elapsed seconds across rolling window
@@ -2685,8 +2751,8 @@ function RotationAlignmentPanel({
                   {(() => {
                     // Backend-derived DF11 residual dots — timing_class and residual_deg
                     // come from predict_sync_observation() on the backend, same path as burst obs.
-                    const stride = Math.max(1, Math.ceil(df11ResidualDots.length / 2400))
-                    return df11ResidualDots
+                    const stride = Math.max(1, Math.ceil(visibleDf11ResidualDots.length / 2400))
+                    return visibleDf11ResidualDots
                       .filter((_, idx) => idx % stride === 0)
                       .map((dot, idx) => (
                         <circle
@@ -2705,7 +2771,8 @@ function RotationAlignmentPanel({
                   })()}
                   {filteredObservations.map(obs => {
                     const x = obsToX(obs)
-                    const y = residualToY(Number(obs.residual_deg ?? 0))
+                    const displayedResidual = burstResidualValue(obs)
+                    const y = residualToY(displayedResidual)
                     const weight = Number(obs.weight ?? 0)
                     const syncEligible = obs?.sync_update_eligible !== false
                     const radiusBase = syncEligible ? 2.7 : 2.1
@@ -2722,7 +2789,7 @@ function RotationAlignmentPanel({
                         strokeWidth={selectedIcao === obs.icao ? 1.2 : syncEligible ? 0 : 0.8}
                       >
                         <title>
-                          {`${obs.icao} residual ${Number(obs.residual_deg ?? 0).toFixed(2)}° | predicted ${Number(obs.predicted_deg ?? 0).toFixed(1)}° | replies ${obs.n_replies ?? 0}${syncEligible ? '' : ' | non-sync-driving'}`}
+                          {`${obs.icao} ${burstResidualLabel} ${Number(displayedResidual ?? 0).toFixed(2)}° | predicted ${Number(obs.predicted_deg ?? 0).toFixed(1)}° | replies ${obs.n_replies ?? 0}${syncEligible ? '' : ' | non-sync-driving'}`}
                         </title>
                       </circle>
                     )
@@ -2733,7 +2800,7 @@ function RotationAlignmentPanel({
                 Burst inlier {inlierCount} · Soft {softCount} · Rejected {rejectedCount}
                 {' · '}Sync-driving bursts {syncDrivingCount}
                 {nonSyncDrivingCount > 0 ? ` · Non-sync-driving bursts ${nonSyncDrivingCount}` : ''}
-                {' · '}DF11 early {dfEarlyCount} · on time {dfOnTimeCount} · late {dfLateCount}
+                {anchorRelativeResidualFrame ? ' · DF11 hidden in anchor-relative frame' : ` · DF11 early ${dfEarlyCount} · on time ${dfOnTimeCount} · late ${dfLateCount}`}
                 {syncState?.sync_jitter_deg != null ? ` · Sync jitter ±${syncState.sync_jitter_deg.toFixed(1)}°` : ''}
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))', gap: '12px', marginTop: '0.8rem' }}>
@@ -2782,10 +2849,10 @@ function RotationAlignmentPanel({
                       )
                     })}
                     <text x={phasePadL + phasePlotW / 2} y={18} textAnchor="middle" className={styles.axisLabel}>
-                      Folded residual vs bearing
+                      {anchorRelativeResidualFrame ? 'Folded anchor-relative residual vs bearing' : 'Folded residual vs bearing'}
                     </text>
                     <text x={phasePadL + phasePlotW / 2} y={phaseChartH - 4} textAnchor="middle" className={styles.axisLabel}>
-                      Static 0-360° rotation domain
+                      {anchorRelativeResidualFrame ? 'Selected-anchor-relative frame' : 'Static 0-360° rotation domain'}
                     </text>
                     {phaseResidualRows.map(row => (
                       <circle
@@ -2857,10 +2924,10 @@ function RotationAlignmentPanel({
                       )
                     })}
                     <text x={phasePadL + phasePlotW / 2} y={18} textAnchor="middle" className={styles.axisLabel}>
-                      Residual vs range
+                      {anchorRelativeResidualFrame ? 'Anchor-relative residual vs range' : 'Residual vs range'}
                     </text>
                     <text x={phasePadL + phasePlotW / 2} y={auxChartH - 4} textAnchor="middle" className={styles.axisLabel}>
-                      Corrected residual by aircraft range
+                      {anchorRelativeResidualFrame ? 'Selected-anchor-relative residual by aircraft range' : 'Corrected residual by aircraft range'}
                     </text>
                     {rangeResidualRows.map(row => (
                       <circle

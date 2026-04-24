@@ -8313,6 +8313,61 @@ class RadarState:
             })
         return results
 
+    @staticmethod
+    def _apply_selected_anchor_relative_offsets(
+        rows: list[dict],
+        anchor_icao: str | None,
+    ) -> float | None:
+        """Recompute displayed anchor deltas from the selected anchor's latest implied offset."""
+        if not anchor_icao:
+            return None
+        latest_anchor: dict | None = None
+        latest_ts = float("-inf")
+        for row in rows:
+            if row.get("icao") != anchor_icao:
+                continue
+            implied = row.get("implied_phase_offset_deg")
+            try:
+                implied_value = float(implied)
+            except (TypeError, ValueError):
+                continue
+            if not _math.isfinite(implied_value):
+                continue
+            ts_candidates = (
+                row.get("beam_center_us"),
+                row.get("raw_arrival_us"),
+                row.get("effective_beast_us"),
+                row.get("wall_ts"),
+            )
+            ts = next(
+                (
+                    float(value)
+                    for value in ts_candidates
+                    if value is not None and _math.isfinite(float(value))
+                ),
+                0.0,
+            )
+            if latest_anchor is None or ts >= latest_ts:
+                latest_anchor = row
+                latest_ts = ts
+        if latest_anchor is None:
+            return None
+
+        anchor_offset = float(latest_anchor["implied_phase_offset_deg"])
+        for row in rows:
+            implied = row.get("implied_phase_offset_deg")
+            try:
+                implied_value = float(implied)
+            except (TypeError, ValueError):
+                row["anchor_relative_phase_error_deg"] = None
+                continue
+            if not _math.isfinite(implied_value):
+                row["anchor_relative_phase_error_deg"] = None
+                continue
+            row["anchor_relative_phase_error_deg"] = _circular_delta_deg(implied_value, anchor_offset)
+        latest_anchor["anchor_relative_phase_error_deg"] = 0.0
+        return anchor_offset
+
     def _go_burst_sync_timeline_snapshot(
         self,
         iid: int,
@@ -8656,6 +8711,15 @@ class RadarState:
                 "burst_center_delta_us": getattr(obs, "burst_center_delta_us", None),
             })
         entries.sort(key=lambda e: e["beam_center_us"])
+        if refined_go_source:
+            anchor_offset = self._apply_selected_anchor_relative_offsets(
+                entries,
+                getattr(sync, "phase_anchor_icao", None),
+            )
+            if anchor_offset is not None:
+                for entry in entries:
+                    entry["anchor_relative_reference_offset_deg"] = anchor_offset
+                    entry["anchor_relative_reference_icao"] = getattr(sync, "phase_anchor_icao", None)
         return entries
 
     @staticmethod
@@ -9209,6 +9273,14 @@ class RadarState:
 
         # Sort chronologically by burst centre timestamp
         entries.sort(key=lambda e: e["beam_center_us"])
+        anchor_offset = self._apply_selected_anchor_relative_offsets(
+            entries,
+            getattr(sync, "phase_anchor_icao", None),
+        )
+        if anchor_offset is not None:
+            for entry in entries:
+                entry["anchor_relative_reference_offset_deg"] = anchor_offset
+                entry["anchor_relative_reference_icao"] = getattr(sync, "phase_anchor_icao", None)
         motion_applied_entries = [e for e in entries if e.get("motion_comp_applied")]
         motion_improvements = [
             e.get("motion_comp_improvement_deg")
@@ -9819,6 +9891,15 @@ class RadarState:
             if br is not None and abs(br) >= 0.2:
                 high_rate_residuals_without_motion.append(resid_without_motion_deg)
                 high_rate_residuals_with_motion.append(resid_authoritative_deg)
+
+        anchor_offset = self._apply_selected_anchor_relative_offsets(
+            observations,
+            getattr(sync, "phase_anchor_icao", None),
+        )
+        if anchor_offset is not None:
+            for row in observations:
+                row["anchor_relative_reference_offset_deg"] = anchor_offset
+                row["anchor_relative_reference_icao"] = getattr(sync, "phase_anchor_icao", None)
 
         # Diagnostic-only detrending: remove the current period-refinement
         # residual slope from the plotted residuals without changing solver

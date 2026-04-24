@@ -1,3 +1,44 @@
+## 2026-04-24 Phase Anchor Reference Frame Fix
+
+- [x] Review current lessons and existing radar-sync task history before changing code.
+- [x] Trace selected-anchor offset, active authority phase offset, and candidate/refined phase offset uses across Go export, backend payloads, and React rendering.
+- [x] Fix Go `AnchorPhaseDeg` export so selected-anchor offset is the selected anchor's latest implied offset, while solver phase offset remains separate.
+- [x] Fix `anchor Δ` so it is strictly the signed circular difference from the selected anchor's latest implied offset.
+- [x] Ensure the selected anchor's latest row reports `anchor Δ = 0.00°`.
+- [x] Make burst residual diagnostics anchor-relative when viewing the selected phase anchor, or explicitly label active-authority residual views.
+- [x] Add focused Go regression coverage for selected-anchor relative offsets.
+- [x] Run backend/frontend verification and document results here.
+
+Plan confirmation:
+- Do not change sync solving, authority promotion, or period refinement behavior for this display bug.
+- Live behavior is Go-owned; fix `radar-core/iid/multisync.go` first, then keep Python/React as consumers/diagnostics.
+- Treat `phase_anchor_offset_raw_deg` / `phase_anchor_offset_smoothed_deg` as solver state, not as the UI table's selected-anchor reference.
+- Derive UI `anchor Δ` from observed `implied_phase_offset_deg` rows, choosing the latest selected-anchor observation as the reference.
+- Keep active-authority residual fields available, but expose/label an anchor-relative residual frame when the selected aircraft is the phase anchor.
+
+### Review
+- Correction accepted: the first pass was incomplete because the live source is Go-owned. The fixed source of truth is now `radar-core/iid/multisync.go`.
+- Root cause confirmed:
+  - Go `selectAnchor()` returned the circular mean as both the solver phase offset and exported `AnchorPhaseDeg` (`ap`).
+  - Python imported `ap` as the phase-anchor offset, so downstream `anchor_relative_phase_error_deg` compared rows against a mean/authority-adjacent phase rather than the selected anchor's latest implied offset.
+  - The React table displayed that mixed frame, which made the selected anchor row show non-zero `anchor Δ`.
+- Implemented:
+  - Go now keeps solver `newOffset` as the circular mean, but exports `anchorPhaseDeg` as the latest implied offset for the selected anchor ICAO.
+  - Added Go regression coverage proving exported anchor phase can differ from solver mean and that the selected anchor delta is zero by definition.
+  - Python recomputes diagnostic `anchor_relative_phase_error_deg` from the latest selected-anchor implied row when rebuilding retained timeline payloads.
+  - React Phase Anchor table/tooltips recompute `anchor Δ` from the latest selected-anchor row, and burst residual plots switch to selected-anchor-relative residuals when the selected ICAO is the active phase anchor. DF11 dots are hidden in that frame because they are active-authority residuals.
+  - `radar-core/radar-core` was rebuilt locally from the patched Go source for backend-managed deployments.
+- Frame audit:
+  - Go `PhaseOffsetDeg`, `CandidatePhaseOffsetDeg`, and `AuthoritativePhaseOffsetDeg` remain active/candidate/authoritative solver offsets.
+  - Go `AnchorPhaseDeg` is now selected-anchor latest implied offset for diagnostics/export.
+  - Python/React no longer use active authority phase offset as the Phase Anchor table's anchor-relative reference.
+- Verification:
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid -run 'Test(SelectAnchorExportsLatestAnchorImpliedOffsetSeparatelyFromMean|AnchorDeltaCircularDiff|EvalCandidatePeriod_PreservesAnchorCandidates|MultiSyncSolver_ValidatorBackedPromotionInitializesAuthoritativeState)' -count=1` -> passed
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid ./cmd/radar-core ./protocol ./export -count=1` -> passed
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -q -k 'go_refined_timeline_includes_implied_phase_offsets_without_zero_fallback or df11_residual_dots_use_retained_residual_event_history'` -> `2 passed`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_radar_core_client.py tests/test_radar_core_protocol.py -q` -> `177 passed`
+  - `cd frontend && npm run build` -> passed; Vite reported the existing chunk-size warning.
+
 ## 2026-04-23 Burst Sync Display History Regression
 
 - [x] Review current lessons and prior radar-sync task history before changing code.

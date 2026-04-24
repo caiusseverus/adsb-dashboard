@@ -3,6 +3,7 @@
 ## 2026-04-23
 
 - When fixing a displayed history regression, verify both backend payload span and frontend render-domain clipping. A plot can receive retained data but still hide it if its x-window is anchored to an unrelated live clock.
+- When a live radar display is Go-owned, fix the Go source/export first instead of correcting only Python/React consumers. Python display post-processing can hide the bug while the runtime binary still exports the wrong diagnostic frame.
 - For passive radar sync, treat the DF alignment period as the bootstrap prior, not the final answer. The refined model must slowly decontaminate that prior using motion-corrected residual evidence rather than locking to it or re-estimating from only a short noisy window.
 - When extending an operator chart to a 300s display window, check every upstream source cap. A retained axis is not enough if the raw dot source is still age-pruned at 60s or exported by a shorter Go snapshot store.
 
