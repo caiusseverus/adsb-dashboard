@@ -33,9 +33,9 @@ func simulatedBearing(centroidUS, epochUS, offsetDeg, periodS float64) float64 {
 	return math.Mod(phase+offsetDeg, 360.0)
 }
 
-func scoreObsForSeed(ms *MultiSyncSolver, obs []MultiSyncObs, seedEpochUS, seedOffsetDeg, seedPeriodS float64) []scoredObs {
+func scoreObsForSeed(ms *MultiSyncSolver, obs []MultiSyncObs, seedEpochUS, seedOffsetDeg, seedPeriodS float64) []PreparedObservation {
 	seedPeriodUS := seedPeriodS * 1e6
-	scored := make([]scoredObs, 0, len(obs))
+	scored := make([]PreparedObservation, 0, len(obs))
 	for _, o := range obs {
 		effectiveUS := msPropCorrectedUS(o.CentroidUS, float64(o.RangeNM))
 		predicted := msPredictBearing(seedEpochUS, seedOffsetDeg, seedPeriodUS, effectiveUS)
@@ -53,23 +53,23 @@ func scoreObsForSeed(ms *MultiSyncSolver, obs []MultiSyncObs, seedEpochUS, seedO
 			effectiveW = baseW * 0.2 * qMult
 		}
 		fitRejectReason := msFitRejectReason(o, status, absR, qEntry, false)
-		scored = append(scored, scoredObs{
-			o:               o,
-			residual:        residual,
-			effectiveUS:     effectiveUS,
+		scored = append(scored, PreparedObservation{
+			Obs: o,
+			ResidualDeg: residual,
+			EffectiveUS: effectiveUS,
 			phaseInRot:      math.Mod((effectiveUS-seedEpochUS)/seedPeriodUS*360.0, 360.0),
-			baseW:           baseW,
-			effectiveW:      effectiveW,
-			status:          status,
-			fitEligible:     fitRejectReason == "",
-			fitRejectReason: fitRejectReason,
+			BaseWeight: baseW,
+			EffectiveWeight: effectiveW,
+			Status:          status,
+			FitEligible: fitRejectReason == "",
+			FitRejectReason: fitRejectReason,
 		})
 	}
 	return scored
 }
 
-func validationScoredObs(periodS, epochUS, offsetDeg float64, anchorICAO uint32, validatorOffsets map[uint32]float64) []scoredObs {
-	var scored []scoredObs
+func validationScoredObs(periodS, epochUS, offsetDeg float64, anchorICAO uint32, validatorOffsets map[uint32]float64) []PreparedObservation {
+	var scored []PreparedObservation
 	add := func(icao uint32, validatorOffset float64) {
 		for i := 0; i < 2; i++ {
 			us := float64(i) * periodS * 1e6
@@ -79,14 +79,14 @@ func validationScoredObs(periodS, epochUS, offsetDeg float64, anchorICAO uint32,
 			if phaseRel < 0 {
 				phaseRel += 360.0
 			}
-			scored = append(scored, scoredObs{
-				o:           obs,
-				effectiveUS: us,
+			scored = append(scored, PreparedObservation{
+				Obs: obs,
+				EffectiveUS: us,
 				phaseInRot:  phaseRel,
-				baseW:       1.0,
-				effectiveW:  1.0,
-				status:      "inlier",
-				fitEligible: true,
+				BaseWeight: 1.0,
+				EffectiveWeight: 1.0,
+				Status:      "inlier",
+				FitEligible: true,
 			})
 		}
 	}
@@ -430,7 +430,7 @@ func TestMultiSyncSolver_EscapeWrongSeed(t *testing.T) {
 	ms.PeriodFailureStreak = 3
 
 	// Build scored observations consistent with truePeriodS from multiple ICAOs.
-	var scored []scoredObs
+	var scored []PreparedObservation
 	for i := 0; i < 30; i++ {
 		us := float64(i) * truePeriodS / 10.0 * 1e6
 		bearing := simulatedBearing(us, epochUS, 45.0, truePeriodS)
@@ -444,10 +444,10 @@ func TestMultiSyncSolver_EscapeWrongSeed(t *testing.T) {
 			NReplies:   8,
 			SignalDBFS: &sig,
 		}
-		se := scoredObs{
-			o:           o,
-			effectiveUS: us,
-			fitEligible: true,
+		se := PreparedObservation{
+			Obs: o,
+			EffectiveUS: us,
+			FitEligible: true,
 		}
 		scored = append(scored, se)
 	}
@@ -571,7 +571,7 @@ func TestMultiSyncSolver_ReacquirePublishesConsistentCandidateFamily(t *testing.
 
 	now := float64(time.Now().UnixMicro()) / 1e6
 	var newestUS float64
-	var scored []scoredObs
+	var scored []PreparedObservation
 	seedPeriodUS := wrongSeedS * 1e6
 	for i := 0; i < 5; i++ {
 		us := float64(i) * truePeriodS * 0.8 * 1e6
@@ -593,16 +593,16 @@ func TestMultiSyncSolver_ReacquirePublishesConsistentCandidateFamily(t *testing.
 			effectiveW = baseW * 0.2 * qMult
 		}
 		fitRejectReason := msFitRejectReason(obs, status, absR, ms.ICAOQuality[obs.ICAO], false)
-		scored = append(scored, scoredObs{
-			o:               obs,
-			residual:        residual,
-			effectiveUS:     effectiveUS,
+		scored = append(scored, PreparedObservation{
+			Obs: obs,
+			ResidualDeg: residual,
+			EffectiveUS: effectiveUS,
 			phaseInRot:      math.Mod((effectiveUS-0.0)/seedPeriodUS*360.0, 360.0),
-			baseW:           baseW,
-			effectiveW:      effectiveW,
-			status:          status,
-			fitEligible:     fitRejectReason == "",
-			fitRejectReason: fitRejectReason,
+			BaseWeight: baseW,
+			EffectiveWeight: effectiveW,
+			Status:          status,
+			FitEligible: fitRejectReason == "",
+			FitRejectReason: fitRejectReason,
 		})
 		newestUS = us
 	}
@@ -1020,7 +1020,7 @@ func TestEvalCandidatePeriod_CorrectPeriodScoresHigher(t *testing.T) {
 	epochUS := 0.0
 
 	// Build scored observations consistent with the true period.
-	var scored []scoredObs
+	var scored []PreparedObservation
 	for i := 0; i < 30; i++ {
 		us := float64(i) * truePeriodS / 10.0 * 1e6
 		bearing := simulatedBearing(us, epochUS, 45.0, truePeriodS)
@@ -1034,10 +1034,10 @@ func TestEvalCandidatePeriod_CorrectPeriodScoresHigher(t *testing.T) {
 			NReplies:   8,
 			SignalDBFS: &sig,
 		}
-		se := scoredObs{
-			o:           o,
-			effectiveUS: us,
-			fitEligible: true,
+		se := PreparedObservation{
+			Obs: o,
+			EffectiveUS: us,
+			FitEligible: true,
 		}
 		scored = append(scored, se)
 	}
@@ -1170,7 +1170,7 @@ func TestEvalCandidatePeriod_PreservesAnchorCandidates(t *testing.T) {
 	truePeriodS := 4.0
 	epochUS := 0.0
 
-	var scored []scoredObs
+	var scored []PreparedObservation
 	for i := 0; i < 18; i++ {
 		us := float64(i) * truePeriodS / 3.0 * 1e6
 		bearing := simulatedBearing(us, epochUS, 45.0, truePeriodS)
@@ -1184,13 +1184,13 @@ func TestEvalCandidatePeriod_PreservesAnchorCandidates(t *testing.T) {
 			NReplies:   8,
 			SignalDBFS: &sig,
 		}
-		scored = append(scored, scoredObs{
-			o:           o,
-			effectiveUS: us,
-			baseW:       0.8,
-			effectiveW:  0.8,
-			status:      "inlier",
-			fitEligible: true,
+		scored = append(scored, PreparedObservation{
+			Obs: o,
+			EffectiveUS: us,
+			BaseWeight: 0.8,
+			EffectiveWeight: 0.8,
+			Status:      "inlier",
+			FitEligible: true,
 		})
 	}
 
@@ -1206,14 +1206,14 @@ func TestEvalCandidatePeriod_PreservesAnchorCandidates(t *testing.T) {
 	}
 }
 
-func buildAnchorScoredObs(icao uint32, offsetDeg, baseW float64, count int) []scoredObs {
-	out := make([]scoredObs, 0, count)
+func buildAnchorScoredObs(icao uint32, offsetDeg, baseW float64, count int) []PreparedObservation {
+	out := make([]PreparedObservation, 0, count)
 	for i := 0; i < count; i++ {
 		effectiveUS := float64(i) * 1_000_000.0
 		phaseDeg := math.Mod(effectiveUS/4_000_000.0*360.0, 360.0)
 		bearing := math.Mod(phaseDeg+offsetDeg, 360.0)
-		out = append(out, scoredObs{
-			o: MultiSyncObs{
+		out = append(out, PreparedObservation{
+			Obs: MultiSyncObs{
 				CentroidUS: effectiveUS,
 				ICAO:       icao,
 				BearingDeg: bearing,
@@ -1221,11 +1221,11 @@ func buildAnchorScoredObs(icao uint32, offsetDeg, baseW float64, count int) []sc
 				PosAgeS:    0.5,
 				NReplies:   8,
 			},
-			effectiveUS: effectiveUS,
-			baseW:       baseW,
-			effectiveW:  baseW,
-			status:      "inlier",
-			fitEligible: true,
+			EffectiveUS: effectiveUS,
+			BaseWeight: baseW,
+			EffectiveWeight: baseW,
+			Status:      "inlier",
+			FitEligible: true,
 		})
 	}
 	return out
@@ -2209,12 +2209,12 @@ func TestSelectAnchorExportsLatestAnchorImpliedOffsetSeparatelyFromMean(t *testi
 	anchorICAO := uint32(0x440C1B)
 
 	ms := NewMultiSyncSolver(1)
-	scored := []scoredObs{}
+	scored := []PreparedObservation{}
 	addScored := func(icao uint32, effectiveUS, impliedOffset float64) {
 		phaseRel := math.Mod((effectiveUS-epochUS)/periodUS*360.0, 360.0)
 		bearing := math.Mod(phaseRel+impliedOffset+360.0, 360.0)
-		scored = append(scored, scoredObs{
-			o: MultiSyncObs{
+		scored = append(scored, PreparedObservation{
+			Obs: MultiSyncObs{
 				CentroidUS: effectiveUS,
 				ICAO:       icao,
 				BearingDeg: bearing,
@@ -2223,12 +2223,12 @@ func TestSelectAnchorExportsLatestAnchorImpliedOffsetSeparatelyFromMean(t *testi
 				NReplies:   4,
 				WallTS:     now + effectiveUS/1e6,
 			},
-			residual:    0,
-			effectiveUS: effectiveUS,
-			baseW:       1,
-			effectiveW:  1,
-			status:      "inlier",
-			fitEligible: true,
+			ResidualDeg: 0,
+			EffectiveUS: effectiveUS,
+			BaseWeight: 1,
+			EffectiveWeight: 1,
+			Status:      "inlier",
+			FitEligible: true,
 		})
 	}
 
@@ -2313,7 +2313,7 @@ func TestAnchorSelectionPrefersMoreObservations(t *testing.T) {
 	icaoStrong := uint32(0x200002) // 10 observations
 
 	periodUS := periodS * 1e6
-	var scored []scoredObs
+	var scored []PreparedObservation
 	addObs := func(icao uint32, n int) {
 		for i := 0; i < n; i++ {
 			us := float64(i) * periodS * 1e6
@@ -2325,14 +2325,14 @@ func TestAnchorSelectionPrefersMoreObservations(t *testing.T) {
 			absR := math.Abs(residual)
 			status := msClassifyResidual(absR)
 			baseW := msScoreObs(o)
-			scored = append(scored, scoredObs{
-				o:           o,
-				residual:    residual,
-				effectiveUS: effectiveUS,
-				baseW:       baseW,
-				effectiveW:  baseW,
-				status:      status,
-				fitEligible: msFitRejectReason(o, status, absR, nil, false) == "",
+			scored = append(scored, PreparedObservation{
+				Obs: o,
+				ResidualDeg: residual,
+				EffectiveUS: effectiveUS,
+				BaseWeight: baseW,
+				EffectiveWeight: baseW,
+				Status:      status,
+				FitEligible: msFitRejectReason(o, status, absR, nil, false) == "",
 			})
 		}
 	}
