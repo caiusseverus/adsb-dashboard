@@ -1366,6 +1366,8 @@ class LiveSyncState:
     circular_dispersion_deg: float | None = None
     validator_agreement_count: int = 0
     validator_disagreement_count: int = 0
+    candidate_validation_status: str | None = None
+    candidate_application_block_reason: str | None = None
     candidate_mode: str | None = None
     authoritative_mode: str | None = None
     # Fields propagated from Go MULTI_SYNC_STATE to allow Python consumers (in particular
@@ -4687,12 +4689,23 @@ class RadarState:
             validator_agreement = int(msg.get("vac") or 0)
             validator_disagree = int(msg.get("vdc") or 0)
             branch_ambiguity = float(msg.get("bas") or 1.0)
-            if validation_score >= 0.7 and validator_agreement >= 2 and branch_ambiguity < 0.9:
+            candidate_validation_status = msg.get("cvsn")
+            if candidate_validation_status:
+                phase_validation_status = str(candidate_validation_status)
+            elif validator_agreement == 0 and validator_disagree == 0:
+                phase_validation_status = "validation_unavailable"
+            elif branch_ambiguity >= 0.9:
+                phase_validation_status = "branch_ambiguous"
+            elif validator_agreement < 2:
+                phase_validation_status = "insufficient_validator_agreement"
+            elif validator_disagree >= validator_agreement:
+                phase_validation_status = "validator_disagreement"
+            elif validation_score >= 0.7:
                 phase_validation_status = "validated"
             elif validation_score >= 0.45:
-                phase_validation_status = "partial"
+                phase_validation_status = "weak_validation"
             else:
-                phase_validation_status = "unavailable"
+                phase_validation_status = "weak_validation"
             new_sync = LiveSyncState(
                 iid=iid,
                 period_s=float(period_s),
@@ -4775,6 +4788,8 @@ class RadarState:
                 circular_dispersion_deg=(float(msg["cdd"]) if msg.get("cdd") is not None else None),
                 validator_agreement_count=int(msg.get("vac") or 0),
                 validator_disagreement_count=int(msg.get("vdc") or 0),
+                candidate_validation_status=candidate_validation_status,
+                candidate_application_block_reason=msg.get("cabr"),
                 candidate_mode=msg.get("cmd"),
                 authoritative_mode=msg.get("amd"),
                 period_authoritative_source=period_authoritative_source,
@@ -8878,6 +8893,8 @@ class RadarState:
             "circular_dispersion_deg": getattr(sync, "circular_dispersion_deg", None) if sync is not None else None,
             "validator_agreement_count": int(getattr(sync, "validator_agreement_count", 0) or 0) if sync is not None else 0,
             "validator_disagreement_count": int(getattr(sync, "validator_disagreement_count", 0) or 0) if sync is not None else 0,
+            "candidate_validation_status": getattr(sync, "candidate_validation_status", None) if sync is not None else None,
+            "candidate_application_block_reason": getattr(sync, "candidate_application_block_reason", None) if sync is not None else None,
             "candidate_mode": getattr(sync, "candidate_mode", None) if sync is not None else None,
             "authoritative_mode": getattr(sync, "authoritative_mode", None) if sync is not None else None,
             "compact": {
@@ -8930,6 +8947,11 @@ class RadarState:
                     if refined_active else {}
                 ),
                 "no_anchor_reason": no_anchor_reason,
+                "candidate_validation_status": getattr(sync, "candidate_validation_status", None) if refined_active else None,
+                "candidate_application_block_reason": (
+                    getattr(sync, "candidate_application_block_reason", None)
+                    if refined_active else None
+                ),
                 "admission": go_admission or None,
             },
         }

@@ -3,6 +3,7 @@
 ## 2026-04-23
 
 - For Go multi-sync phase work, do not treat an exported candidate anchor as operational authority. Keep `PhaseOffsetDeg` aligned with the active authority mode, expose candidate-anchor diagnostics separately, and label residual plots by their actual basis.
+- When adding an output trust flag such as `AbsolutePhaseTrusted`, verify it is not accidentally coupled into the authority-entry path. Promotion gates should report their own blocker reason; the trust flag should be a consequence of promotion and validation, not a prerequisite.
 - When fixing a displayed history regression, verify both backend payload span and frontend render-domain clipping. A plot can receive retained data but still hide it if its x-window is anchored to an unrelated live clock.
 - When a live radar display is Go-owned, fix the Go source/export first instead of correcting only Python/React consumers. Python display post-processing can hide the bug while the runtime binary still exports the wrong diagnostic frame.
 - For passive radar sync, treat the DF alignment period as the bootstrap prior, not the final answer. The refined model must slowly decontaminate that prior using motion-corrected residual evidence rather than locking to it or re-estimating from only a short noisy window.

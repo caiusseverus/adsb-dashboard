@@ -3271,6 +3271,8 @@ def test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst(monkey
         "cdd": 11.5,
         "vac": 1,
         "vdc": 2,
+        "cvsn": "validator_disagreement",
+        "cabr": "validator_disagreement_too_high",
         "cmd": "recovery",
         "amd": "settled_authoritative",
         "ai": int("AAAAAA", 16),
@@ -3332,6 +3334,9 @@ def test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst(monkey
     assert sync.circular_dispersion_deg == pytest.approx(11.5)
     assert sync.validator_agreement_count == 1
     assert sync.validator_disagreement_count == 2
+    assert sync.candidate_validation_status == "validator_disagreement"
+    assert sync.candidate_application_block_reason == "validator_disagreement_too_high"
+    assert sync.phase_validation_status == "validator_disagreement"
     assert sync.candidate_mode == "recovery"
     assert sync.authoritative_mode == "settled_authoritative"
 
@@ -3620,6 +3625,8 @@ def test_go_multi_sync_mode_diagnostics_report_dominant_recovery_fields():
         circular_dispersion_deg=11.5,
         validator_agreement_count=1,
         validator_disagreement_count=2,
+        candidate_validation_status="validator_disagreement",
+        candidate_application_block_reason="validator_disagreement_too_high",
         candidate_mode="recovery",
         authoritative_mode="settled_authoritative",
         fit_total_observations=12,
@@ -3648,6 +3655,8 @@ def test_go_multi_sync_mode_diagnostics_report_dominant_recovery_fields():
     assert diagnostics["period_frozen_due_to_phase_validation"] is True
     assert diagnostics["branch_ambiguity_score"] == pytest.approx(0.93)
     assert diagnostics["validator_agreement_count"] == 1
+    assert diagnostics["candidate_validation_status"] == "validator_disagreement"
+    assert diagnostics["candidate_application_block_reason"] == "validator_disagreement_too_high"
     assert diagnostics["authoritative_mode"] == "settled_authoritative"
     assert diagnostics["compact"]["period_s"] == pytest.approx(4.16)
     assert diagnostics["compact"]["unreliable"] is True

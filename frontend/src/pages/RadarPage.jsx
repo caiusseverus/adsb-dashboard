@@ -35,6 +35,7 @@ const BURST_SYNC_VIEW_MODE_RESIDUALS = 'burst_sync_residuals'
 const BURST_SYNC_VIEW_MODE_LEGACY = 'legacy_live_df_alignment'
 const RESIDUAL_BASIS_ACTIVE = 'active_authority'
 const RESIDUAL_BASIS_ANCHOR = 'anchor_relative'
+const CANDIDATE_PROMOTION_MIN_STREAK = 6
 function getRadarPageMetricsStore() {
   if (typeof window === 'undefined') return null
   if (!window.__RADAR_PAGE_REQUEST_METRICS__) {
@@ -1834,6 +1835,9 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
     && !refinedAuthorityApplied
     && Number(syncState.validator_agreement_count ?? syncState.phase_validation_contributors ?? 0) < 2
     && Number(refined.fit_contributing_icao_count ?? syncState.fit_contributing_icao_count ?? 0) <= 1
+  const candidateBlockReason = syncState.candidate_application_block_reason
+    ?? refined.candidate_application_block_reason
+    ?? (insufficientValidatorICAOs ? 'insufficient_fit_icaos' : (syncState.candidate_validation_status ?? syncState.phase_validation_status ?? 'validation_unavailable'))
   return (
     <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
@@ -1861,7 +1865,7 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
         <div style={{ marginBottom: '0.5rem', border: '1px solid #8b6f1f', background: '#16130b', color: '#d29922', fontSize: '0.72rem', lineHeight: 1.45, padding: '6px 8px' }}>
           Candidate anchor selected: <span className={styles.metricValue}>{anchorIcao}</span>.
           {' '}
-          Not applied: {insufficientValidatorICAOs ? 'insufficient validator ICAOs' : humanizeSyncReason(syncState.phase_validation_status || 'phase validation incomplete')}.
+          Not applied: {humanizeSyncReason(candidateBlockReason)}.
           {' '}
           Active residuals are still <span className={styles.metricValue}>{authorityMode}</span> residuals.
         </div>
@@ -1920,8 +1924,12 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
     && syncState.authoritative_anchor_icao === candidateAnchorIcao,
   )
   const validatorAgreement = Number(syncState.validator_agreement_count ?? syncState.phase_validation_contributors ?? 0)
+  const validatorDisagreement = Number(syncState.validator_disagreement_count ?? syncState.phase_validation_reject_count ?? 0)
   const fitIcaoCount = Number(syncState.fit_contributing_icao_count ?? refined.fit_contributing_icao_count ?? 0)
   const insufficientValidatorICAOs = Boolean(anchorIcao && !refinedAuthorityApplied && validatorAgreement < 2 && fitIcaoCount <= 1)
+  const candidateBlockReason = syncState.candidate_application_block_reason
+    ?? refined.candidate_application_block_reason
+    ?? (insufficientValidatorICAOs ? 'insufficient_fit_icaos' : (syncState.candidate_validation_status ?? syncState.phase_validation_status ?? 'validation_unavailable'))
   const candidateRowsRaw = Array.isArray(candidates) && candidates.length > 0
     ? candidates
     : (Array.isArray(syncState.phase_anchor_candidates) ? syncState.phase_anchor_candidates : [])
@@ -2048,6 +2056,7 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
           <span className={styles.metricPill}>Since <span className={styles.metricValue}>{Number.isFinite(sinceAgeS) ? `${Math.max(0, sinceAgeS).toFixed(0)}s` : '—'}</span></span>
           <span className={styles.metricPill}>Validation <span className={styles.metricValue}>{syncState.phase_validation_status || '—'}</span></span>
           <span className={styles.metricPill}>Agree/reject <span className={styles.metricValue}>{syncState.phase_validation_contributors ?? 0}/{syncState.phase_validation_reject_count ?? 0}</span></span>
+          <span className={styles.metricPill}>Promotion <span className={styles.metricValue}>{syncState.candidate_promotion_streak ?? 0}/{CANDIDATE_PROMOTION_MIN_STREAK}</span></span>
           <span className={styles.metricPill}>Median Δ <span className={styles.metricValue}>{fmtNumber(syncState.phase_validation_median_error_deg, 2, '°')}</span></span>
           <span className={styles.metricPill}>Fit obs <span className={styles.metricValue}>{syncState.fit_eligible_observations ?? 0}/{syncState.fit_total_observations ?? 0}</span></span>
           <span className={styles.metricPill}>Fit ICAOs <span className={styles.metricValue}>{syncState.fit_contributing_icao_count ?? 0}</span></span>
@@ -2058,7 +2067,13 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
 
       {candidateAnchorIcao && !refinedAuthorityApplied && (
         <div style={{ color: '#d29922', background: '#16130b', border: '1px solid #8b6f1f', fontSize: '0.72rem', lineHeight: 1.45, padding: '5px 6px', marginBottom: '0.35rem' }}>
-          Candidate anchor selected. Not applied: {insufficientValidatorICAOs ? 'insufficient validator ICAOs' : humanizeSyncReason(syncState.phase_validation_status || 'phase validation incomplete')}. Active residuals are still <span className={styles.metricValue}>{authorityMode ?? 'compact_authoritative'}</span> residuals.
+          Candidate anchor selected. Not applied: {humanizeSyncReason(candidateBlockReason)}.
+          {' '}
+          Agreement/rejection: <span className={styles.metricValue}>{validatorAgreement}/{validatorDisagreement}</span>.
+          {' '}
+          Candidate promotion streak: <span className={styles.metricValue}>{syncState.candidate_promotion_streak ?? 0}/{CANDIDATE_PROMOTION_MIN_STREAK}</span>.
+          {' '}
+          Active residuals are still <span className={styles.metricValue}>{authorityMode ?? 'compact_authoritative'}</span> residuals.
         </div>
       )}
 

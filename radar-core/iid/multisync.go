@@ -12,15 +12,20 @@ package iid
 //   - Propagation delay correction included (same formula as Python).
 //   - Waveform correction NOT included; Python waveform bins remain authoritative
 //     for Stage 3 and are applied after reading the Go sync state.
-//   - Motion compensation: Option B geometric guard — period correction requires
-//     ≥3 contributing ICAOs and ≥30° bearing spread among them when the DF dominant
-//     prior is active. Full velocity-vector compensation is deferred to a later slice.
-//   - Anchor selection: highest-quality ICAO with good recent observations.
+//   - Motion compensation: Option B geometric guard — period correction prefers
+//     ≥3 contributing ICAOs and ≥30° bearing spread when the DF dominant prior is
+//     active; limited evidence can still run in degraded mode with reduced gain/step.
+//   - Anchor selection: highest-quality ICAO with good recent observations. Candidate
+//     anchors remain diagnostic until validator-backed authority promotion applies them.
 //   - Period refinement: slope EMA + persistence gate (matches Python).
 //   - Wrong-period reacquire: state machine matching Python's reacquire logic.
 //   - The refined model is a bounded correction around the DF dominant period family,
 //     not an independent period estimator. Reacquire candidates outside the dominant
 //     bound are diagnostic only; they do not update the published period.
+//   - AbsolutePhaseTrusted is an output of refined_authoritative authority and strong
+//     validation, not an input prerequisite for entering refined_authoritative.
+//   - Compact/dominant-recovery residuals are operational frames; refined candidate-anchor
+//     residuals are a separate diagnostic basis until promotion.
 
 import (
 	"math"
@@ -263,6 +268,8 @@ type syncValidationSummary struct {
 	circularDispersion float64
 	validatorAgreement int
 	validatorDisagree  int
+	validatorEvaluated int
+	status             string
 	strong             bool
 	weak               bool
 }
@@ -348,6 +355,8 @@ type MultiSyncSnapshot struct {
 	CircularDispersionDeg            float64
 	ValidatorAgreementCount          int
 	ValidatorDisagreementCount       int
+	CandidateValidationStatus        string
+	CandidateApplicationBlockReason  string
 	CandidateMode                    string
 	AuthoritativeMode                string
 	// AbsolutePhaseTrusted is true only when the period is bounded to the DF dominant prior,
@@ -498,6 +507,8 @@ type MultiSyncSolver struct {
 	LastCircularDispersionDeg            float64
 	LastValidatorAgreementCount          int
 	LastValidatorDisagreementCount       int
+	LastCandidateValidationStatus        string
+	LastCandidateApplicationBlockReason  string
 	LastCandidateMode                    string
 	LastAuthoritativeMode                string
 
@@ -676,6 +687,8 @@ func (ms *MultiSyncSolver) Reset() {
 	ms.LastCircularDispersionDeg = 0
 	ms.LastValidatorAgreementCount = 0
 	ms.LastValidatorDisagreementCount = 0
+	ms.LastCandidateValidationStatus = ""
+	ms.LastCandidateApplicationBlockReason = ""
 	ms.LastCandidateMode = ""
 	ms.LastAuthoritativeMode = ""
 	ms.AbsolutePhaseTrusted = false
@@ -770,6 +783,8 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 		CircularDispersionDeg:            ms.LastCircularDispersionDeg,
 		ValidatorAgreementCount:          ms.LastValidatorAgreementCount,
 		ValidatorDisagreementCount:       ms.LastValidatorDisagreementCount,
+		CandidateValidationStatus:        ms.LastCandidateValidationStatus,
+		CandidateApplicationBlockReason:  ms.LastCandidateApplicationBlockReason,
 		CandidateMode:                    ms.LastCandidateMode,
 		AuthoritativeMode:                ms.LastAuthoritativeMode,
 		AbsolutePhaseTrusted:             ms.AbsolutePhaseTrusted,
@@ -1299,6 +1314,7 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	ms.LastCircularDispersionDeg = validation.circularDispersion
 	ms.LastValidatorAgreementCount = validation.validatorAgreement
 	ms.LastValidatorDisagreementCount = validation.validatorDisagree
+	ms.LastCandidateValidationStatus = validation.status
 	ms.LastCandidateMode = candidateMode
 
 	// Capture per-run clamp diagnostics (after refinePeriod returned them).
@@ -1411,12 +1427,26 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		}
 	}
 	ms.LastAuthorityPromotionBlockReason = authorityPromotionBlockReason
+	_, candidateDeltaToDominantPPM := periodDeltaToDominant(candidateEstimate.periodS, dominantPeriodS)
+	dominantBoundOK := dominantPeriodS <= 0 || math.Abs(candidateDeltaToDominantPPM) <= periodRefineMaxPPMFromDominant
+	ms.LastCandidateApplicationBlockReason = ms.candidateApplicationBlockReason(
+		candidateEstimate,
+		validation,
+		slopeGatePassed,
+		dominantBoundOK,
+		len(fitPool),
+		len(fitICAOs),
+		recoveryRequested,
+		cleanUpdate,
+		nowUnix,
+	)
 
 	refinedHealthy := ms.Usable &&
 		candidateEstimate.anchorICAO != nil &&
 		len(fitPool) >= trustMinFitPool &&
-		len(fitICAOs) >= 2 &&
-		validation.score >= authoritativeValidationStrong &&
+		len(fitICAOs) >= validatorAgreementMinCount &&
+		validation.strong &&
+		dominantBoundOK &&
 		!majorityRejected &&
 		!wrongPeriodSuspect &&
 		slopeGatePassed // block promotion when residual slope is too large
@@ -1437,6 +1467,21 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	ms.updateAuthorityModePostFit(refinedHealthy, refinedFailure, compactHealthy, recoveryRequested, cleanUpdate, nowUnix)
 	ms.LastRecoveryModeActive = ms.ActiveAuthorityMode == authorityModeRecovery
 	ms.LastCompactGatingBypassed = ms.ActiveAuthorityMode == authorityModeRecovery
+	if ms.ActiveAuthorityMode == authorityModeRefined && ms.AuthoritativePresent && ms.AuthoritativeAnchorICAO != nil {
+		ms.LastCandidateApplicationBlockReason = ""
+	} else {
+		ms.LastCandidateApplicationBlockReason = ms.candidateApplicationBlockReason(
+			candidateEstimate,
+			validation,
+			slopeGatePassed,
+			dominantBoundOK,
+			len(fitPool),
+			len(fitICAOs),
+			recoveryRequested,
+			cleanUpdate,
+			nowUnix,
+		)
+	}
 	if ms.ActiveAuthorityMode != authorityModeRecovery && !recoveryRequested {
 		ms.LastRecoveryTriggerReasons = nil
 	}
@@ -1994,10 +2039,10 @@ func (ms *MultiSyncSolver) updateAuthorityModePostFit(
 			ms.RecoveryExitStreak = 0
 		}
 		ms.AuthorityExitStreak = ms.RecoveryExitStreak
-		if ms.RecoveryExitStreak >= authorityRecoveryExitStreak {
-			if ms.RefinedHealthyStreak >= authorityPromoteRefinedStreak {
-				ms.setAuthorityMode(authorityModeRefined, "recovery_converged_to_refined", nowUnix)
-			} else if ms.CompactHealthyStreak >= authorityCompactReclaimStreak {
+		if ms.RefinedHealthyStreak >= authorityPromoteRefinedStreak {
+			ms.setAuthorityMode(authorityModeRefined, "recovery_converged_to_refined", nowUnix)
+		} else if ms.RecoveryExitStreak >= authorityRecoveryExitStreak {
+			if ms.CompactHealthyStreak >= authorityCompactReclaimStreak {
 				ms.setAuthorityMode(authorityModeCompact, "recovery_released_to_compact", nowUnix)
 			}
 		}
@@ -2043,6 +2088,73 @@ func (ms *MultiSyncSolver) applyTrustedBaseUpdate(finalPeriodS float64, trustedE
 	// Slow EMA keeps the trusted base tracking a genuinely stable family
 	// without snapping to transient fluctuations.
 	ms.TrustedBasePeriodS = 0.98*ms.TrustedBasePeriodS + 0.02*finalPeriodS
+}
+
+func (ms *MultiSyncSolver) candidateApplicationBlockReason(
+	estimate syncStateEstimate,
+	validation syncValidationSummary,
+	slopeGatePassed, dominantBoundOK bool,
+	fitPoolCount, fitICAOCount int,
+	recoveryRequested, cleanUpdate bool,
+	nowUnix float64,
+) string {
+	if !estimate.present {
+		return "period_not_stable"
+	}
+	if fitPoolCount < trustMinFitPool {
+		return "insufficient_fit_observations"
+	}
+	if fitICAOCount < validatorAgreementMinCount {
+		return "insufficient_fit_icaos"
+	}
+	if estimate.anchorICAO == nil {
+		if ms.LastAnchorNoCandidate != "" {
+			return "no_anchor_candidate"
+		}
+		return "anchor_candidate_invalid"
+	}
+	if validation.status != "validated" {
+		switch validation.status {
+		case "":
+			return "validation_unavailable"
+		case "validation_unavailable":
+			return "validation_unavailable"
+		case "insufficient_validator_agreement":
+			return "validator_agreement_insufficient"
+		case "validator_disagreement":
+			return "validator_disagreement_too_high"
+		case "branch_ambiguous":
+			return "branch_ambiguous"
+		case "weak_validation":
+			return "weak_validation"
+		default:
+			return validation.status
+		}
+	}
+	if !slopeGatePassed {
+		return "slope_gate_failed"
+	}
+	if !dominantBoundOK {
+		return "dominant_prior_bound_failed"
+	}
+	if ms.CandidatePromotionStreak < candidatePromotionMinStreak {
+		return "candidate_streak_not_met"
+	}
+	if ms.ActiveAuthorityMode == authorityModeCompact {
+		if ms.LastAuthoritySwitchTS > 0 && nowUnix-ms.LastAuthoritySwitchTS < authorityMinModeHoldS {
+			return "authority_hold_time"
+		}
+		return "already_compact_authority"
+	}
+	if ms.ActiveAuthorityMode == authorityModeRecovery {
+		if recoveryRequested || !cleanUpdate || ms.RecoveryExitStreak < authorityRecoveryExitStreak {
+			return "recovery_streak_not_met"
+		}
+	}
+	if ms.ActiveAuthorityMode == authorityModeRefined {
+		return ""
+	}
+	return "period_not_stable"
 }
 
 func (ms *MultiSyncSolver) updateCandidateState(
@@ -2169,6 +2281,7 @@ func (ms *MultiSyncSolver) evaluatePhaseValidation(
 		score:              0,
 		branchAmbiguity:    1,
 		circularDispersion: 999,
+		status:             "validation_unavailable",
 		weak:               true,
 	}
 	if !estimate.present || estimate.periodS <= 0 || estimate.anchorICAO == nil {
@@ -2274,6 +2387,7 @@ func (ms *MultiSyncSolver) evaluatePhaseValidation(
 		if acc.count < validatorMinObsPerICAO {
 			continue
 		}
+		summary.validatorEvaluated++
 		mean := math.Atan2(acc.sin, acc.cos) * 180.0 / math.Pi
 		absMean := math.Abs(mean)
 		if absMean <= validatorAgreementPhaseDeg {
@@ -2292,9 +2406,24 @@ func (ms *MultiSyncSolver) evaluatePhaseValidation(
 	ambiguityScore := 1.0 - summary.branchAmbiguity
 	summary.score = clamp(0.40*agreementScore+0.25*dispersionScore+0.20*ambiguityScore+globalCohesionBonus-0.35*disagreementPenalty, 0, 1)
 	summary.strong = summary.validatorAgreement >= validatorAgreementMinCount &&
+		summary.validatorAgreement > summary.validatorDisagree &&
 		summary.branchAmbiguity < branchAmbiguityRejectThreshold &&
 		summary.score >= authoritativeValidationStrong
 	summary.weak = summary.score < authoritativeValidationWeak || summary.validatorAgreement == 0
+	switch {
+	case summary.validatorEvaluated == 0:
+		summary.status = "validation_unavailable"
+	case summary.validatorDisagree >= summary.validatorAgreement && summary.validatorDisagree > 0:
+		summary.status = "validator_disagreement"
+	case summary.validatorAgreement < validatorAgreementMinCount:
+		summary.status = "insufficient_validator_agreement"
+	case summary.branchAmbiguity >= branchAmbiguityRejectThreshold:
+		summary.status = "branch_ambiguous"
+	case summary.score < authoritativeValidationStrong:
+		summary.status = "weak_validation"
+	default:
+		summary.status = "validated"
+	}
 	return summary
 }
 

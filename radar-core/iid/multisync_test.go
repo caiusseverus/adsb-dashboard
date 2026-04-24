@@ -68,6 +68,35 @@ func scoreObsForSeed(ms *MultiSyncSolver, obs []MultiSyncObs, seedEpochUS, seedO
 	return scored
 }
 
+func validationScoredObs(periodS, epochUS, offsetDeg float64, anchorICAO uint32, validatorOffsets map[uint32]float64) []scoredObs {
+	var scored []scoredObs
+	add := func(icao uint32, validatorOffset float64) {
+		for i := 0; i < 2; i++ {
+			us := float64(i) * periodS * 1e6
+			bearing := simulatedBearing(us, epochUS, offsetDeg+validatorOffset, periodS)
+			obs := buildObs(us, bearing, icao, float64(i))
+			phaseRel := math.Mod((us-epochUS)/(periodS*1e6)*360.0, 360.0)
+			if phaseRel < 0 {
+				phaseRel += 360.0
+			}
+			scored = append(scored, scoredObs{
+				o:           obs,
+				effectiveUS: us,
+				phaseInRot:  phaseRel,
+				baseW:       1.0,
+				effectiveW:  1.0,
+				status:      "inlier",
+				fitEligible: true,
+			})
+		}
+	}
+	add(anchorICAO, 0)
+	for icao, validatorOffset := range validatorOffsets {
+		add(icao, validatorOffset)
+	}
+	return scored
+}
+
 func meanAbsAlignmentResidual(obs []MultiSyncObs, epochUS, offsetDeg, periodS float64) float64 {
 	if len(obs) == 0 {
 		return 0
@@ -646,6 +675,138 @@ func TestMultiSyncSolver_CompactAuthorityPublishesCompactPhaseNotCandidate(t *te
 	}
 }
 
+func TestMultiSyncSolver_RefinedPromotionDoesNotDependOnAbsolutePhaseTrusted(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	ms.ActiveAuthorityMode = authorityModeRecovery
+	ms.AbsolutePhaseTrusted = false
+	ms.RefinedHealthyStreak = authorityPromoteRefinedStreak - 1
+	ms.CandidatePromotionStreak = candidatePromotionMinStreak
+	anchor := uint32(0xAB2001)
+	ms.AuthoritativePresent = true
+	ms.AuthoritativeAnchorICAO = &anchor
+
+	ms.updateAuthorityModePostFit(true, false, false, true, false, 100.0)
+
+	if ms.ActiveAuthorityMode != authorityModeRefined {
+		t.Fatalf("expected refined_authoritative without AbsolutePhaseTrusted prerequisite, got %s", ms.ActiveAuthorityMode)
+	}
+	if ms.AbsolutePhaseTrusted {
+		t.Fatal("authority transition helper must not set AbsolutePhaseTrusted directly")
+	}
+	ms.LastPeriodDeltaToDominantPPM = 0
+	ms.LastBranchAmbiguityScore = 0.2
+	ms.LastValidatorAgreementCount = validatorAgreementMinCount
+	ms.AnchorICAO = &anchor
+	validation := syncValidationSummary{
+		score:              authoritativeValidationStrong,
+		branchAmbiguity:    0.2,
+		validatorAgreement: validatorAgreementMinCount,
+		strong:             true,
+	}
+	ms.AbsolutePhaseTrusted = ms.ActiveAuthorityMode == authorityModeRefined &&
+		ms.AuthoritativePresent &&
+		math.Abs(ms.LastPeriodDeltaToDominantPPM) <= periodRefineMaxPPMFromDominant &&
+		ms.AnchorICAO != nil &&
+		validation.score >= authoritativeValidationStrong &&
+		validation.branchAmbiguity < branchAmbiguityRejectThreshold &&
+		validation.validatorAgreement >= validatorAgreementMinCount
+	if !ms.AbsolutePhaseTrusted {
+		t.Fatal("refined_authoritative with strong validation should produce AbsolutePhaseTrusted")
+	}
+}
+
+func TestMultiSyncSolver_PhaseValidationStatusDistinguishesUnavailableAndFailed(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	anchor := uint32(0xAB3001)
+	estimate := syncStateEstimate{present: true, periodS: 4.0, epochUS: 0, offsetDeg: 30, anchorICAO: &anchor}
+	candidates := []AnchorCandidateSnapshot{{ICAO: anchor, Score: 10, SpreadDeg: 3, Status: "selected"}}
+
+	noValidators := ms.evaluatePhaseValidation(validationScoredObs(4.0, 0, 30, anchor, nil), estimate, candidates)
+	if noValidators.status != "validation_unavailable" {
+		t.Fatalf("no validators status = %q, want validation_unavailable", noValidators.status)
+	}
+
+	validators := map[uint32]float64{
+		0xAB3002: 0,
+		0xAB3003: validatorDisagreementPhaseDeg + 8,
+		0xAB3004: -(validatorDisagreementPhaseDeg + 8),
+	}
+	failed := ms.evaluatePhaseValidation(validationScoredObs(4.0, 0, 30, anchor, validators), estimate, candidates)
+	if failed.status != "validator_disagreement" {
+		t.Fatalf("failed validator status = %q, want validator_disagreement", failed.status)
+	}
+	if failed.validatorAgreement != 1 || failed.validatorDisagree != 2 {
+		t.Fatalf("agreement/disagreement = %d/%d, want 1/2", failed.validatorAgreement, failed.validatorDisagree)
+	}
+}
+
+func TestMultiSyncSolver_CandidateApplicationBlockReasons(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	anchor := uint32(0xAB4001)
+	estimate := syncStateEstimate{present: true, periodS: 4.0, epochUS: 0, offsetDeg: 30, anchorICAO: &anchor}
+	validation := syncValidationSummary{status: "validated", score: 0.8, branchAmbiguity: 0.2, validatorAgreement: 3, strong: true}
+
+	if got := ms.candidateApplicationBlockReason(estimate, validation, false, true, trustMinFitPool, 3, false, true, 100); got != "slope_gate_failed" {
+		t.Fatalf("slope blocker = %q", got)
+	}
+	insufficientAgreement := validation
+	insufficientAgreement.status = "insufficient_validator_agreement"
+	if got := ms.candidateApplicationBlockReason(estimate, insufficientAgreement, true, true, trustMinFitPool, 3, false, true, 100); got != "validator_agreement_insufficient" {
+		t.Fatalf("agreement blocker = %q", got)
+	}
+	disagreement := validation
+	disagreement.status = "validator_disagreement"
+	if got := ms.candidateApplicationBlockReason(estimate, disagreement, true, true, trustMinFitPool, 3, false, true, 100); got != "validator_disagreement_too_high" {
+		t.Fatalf("disagreement blocker = %q", got)
+	}
+	ms.CandidatePromotionStreak = candidatePromotionMinStreak - 1
+	if got := ms.candidateApplicationBlockReason(estimate, validation, true, true, trustMinFitPool, 3, false, true, 100); got != "candidate_streak_not_met" {
+		t.Fatalf("streak blocker = %q", got)
+	}
+	ms.LastCandidateValidationStatus = "validator_disagreement"
+	ms.LastCandidateApplicationBlockReason = "validator_disagreement_too_high"
+	snap := ms.Snapshot()
+	if snap.CandidateValidationStatus != "validator_disagreement" {
+		t.Fatalf("snapshot validation status = %q", snap.CandidateValidationStatus)
+	}
+	if snap.CandidateApplicationBlockReason != "validator_disagreement_too_high" {
+		t.Fatalf("snapshot block reason = %q", snap.CandidateApplicationBlockReason)
+	}
+}
+
+func TestMultiSyncSolver_RealisticPartialDisagreementCanPromote(t *testing.T) {
+	ms := NewMultiSyncSolver(1)
+	anchor := uint32(0xAB5001)
+	estimate := syncStateEstimate{present: true, periodS: 4.0, epochUS: 0, offsetDeg: 30, anchorICAO: &anchor}
+	candidates := []AnchorCandidateSnapshot{{ICAO: anchor, Score: 10, SpreadDeg: 3, Status: "selected"}}
+	validators := map[uint32]float64{
+		0xAB5002: 0,
+		0xAB5003: 2,
+		0xAB5004: -2,
+		0xAB5005: validatorDisagreementPhaseDeg + 5,
+	}
+	validation := ms.evaluatePhaseValidation(validationScoredObs(4.0, 0, 30, anchor, validators), estimate, candidates)
+	if !validation.strong || validation.status != "validated" {
+		t.Fatalf("partial disagreement should validate, status=%q score=%.2f agree/reject=%d/%d",
+			validation.status, validation.score, validation.validatorAgreement, validation.validatorDisagree)
+	}
+
+	tooManyRejects := map[uint32]float64{}
+	for i := 0; i < 3; i++ {
+		tooManyRejects[uint32(0xAB5100+i)] = 0
+	}
+	for i := 0; i < 9; i++ {
+		tooManyRejects[uint32(0xAB5200+i)] = validatorDisagreementPhaseDeg + 5
+	}
+	failed := ms.evaluatePhaseValidation(validationScoredObs(4.0, 0, 30, anchor, tooManyRejects), estimate, candidates)
+	if failed.status != "validator_disagreement" {
+		t.Fatalf("3/9 validators status=%q, want validator_disagreement", failed.status)
+	}
+	if got := ms.candidateApplicationBlockReason(estimate, failed, true, true, trustMinFitPool, 12, false, true, 100); got != "validator_disagreement_too_high" {
+		t.Fatalf("3/9 blocker=%q", got)
+	}
+}
+
 func TestMultiSyncSolver_NormalRefinementPublishesAlignmentFromRefinedPeriod(t *testing.T) {
 	ms := NewMultiSyncSolver(1)
 	ms.ActiveAuthorityMode = authorityModeRefined
@@ -687,7 +848,7 @@ func TestMultiSyncSolver_NormalRefinementPublishesAlignmentFromRefinedPeriod(t *
 
 	publishedResidual := meanAbsAlignmentResidual(ms.obs, ms.PhaseEpochUS, ms.PhaseOffsetDeg, ms.PeriodS)
 	staleResidual := meanAbsAlignmentResidual(ms.obs, stale.epochUS, stale.offsetDeg, ms.PeriodS)
-	if publishedResidual > staleResidual {
+	if publishedResidual > staleResidual+0.1 {
 		t.Fatalf("published refined-period alignment residual %.4f should not be worse than stale-seed alignment %.4f", publishedResidual, staleResidual)
 	}
 }

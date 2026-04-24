@@ -1,3 +1,34 @@
+## 2026-04-24 Refined Sync Authority Promotion
+
+- [x] Review lessons, current task history, and working-tree scope before editing.
+- [x] Audit Go promotion logic for circular dependencies involving `AbsolutePhaseTrusted`.
+- [x] Add explicit Go promotion blocker / validation status diagnostics and protocol fields.
+- [x] Propagate blocker diagnostics through Python bridge and Radar UI.
+- [x] Keep candidate, relative usable, refined authoritative, and absolute trusted concepts separate.
+- [x] Add Go/backend/frontend regression coverage for promotion, blockers, partial disagreement, and UI propagation.
+- [x] Run verification, rebuild `radar-core`, document results, and commit.
+
+Plan confirmation:
+- `AbsolutePhaseTrusted` must remain an output of refined authority, never an input to promotion.
+- Promotion should be based on candidate validation, validator agreement/disagreement, branch ambiguity, slope gate, dominant-prior bounds, and candidate streak.
+- Candidate-anchor diagnostics remain separate from applied authority and active residual basis.
+
+### Review
+- Audit outcome:
+  - `AbsolutePhaseTrusted` was not directly used as a promotion prerequisite, but the recovery-mode exit gate was too opaque and could keep a validated refined candidate in `dominant_recovery` behind recovery-clean streak semantics.
+  - Validation status was collapsed to `unavailable` on the Python/UI side whenever the score was weak, even when validator agree/reject counts had been evaluated.
+- Implemented:
+  - Recovery mode can now enter `refined_authoritative` from sustained refined-health streak directly; `AbsolutePhaseTrusted` remains only an output once refined authority is active and validation is strong.
+  - Go now exports `candidate_validation_status` and `candidate_application_block_reason` with specific reasons such as `validator_disagreement_too_high`, `validator_agreement_insufficient`, `slope_gate_failed`, and `candidate_streak_not_met`.
+  - Validation status now distinguishes genuine `validation_unavailable` from evaluated failures such as `validator_disagreement`, `insufficient_validator_agreement`, `branch_ambiguous`, and `weak_validation`.
+  - The Radar UI shows the specific not-applied reason, agreement/rejection counts, and candidate promotion streak `N/6`.
+- Verification:
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid -run 'TestMultiSyncSolver_(RefinedPromotionDoesNotDependOnAbsolutePhaseTrusted|PhaseValidationStatusDistinguishesUnavailableAndFailed|CandidateApplicationBlockReasons|RealisticPartialDisagreementCanPromote|CompactAuthorityPublishesCompactPhaseNotCandidate|AuthorityPromotionBlockedBySlope)' -count=1` -> passed
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go test ./iid ./cmd/radar-core ./protocol ./export -count=1` -> passed
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_radar_core_client.py tests/test_radar_core_protocol.py -q` -> `177 passed`
+  - `env GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-cache go build -o radar-core ./cmd/radar-core` -> passed
+  - `cd frontend && npm run build` -> passed; Vite reported the existing chunk-size warning.
+
 ## 2026-04-24 Phase Anchor Residual Basis Follow-Up
 
 - [x] Review current lessons and the prior phase-anchor task before changing code.
