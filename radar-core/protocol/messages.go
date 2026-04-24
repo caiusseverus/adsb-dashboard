@@ -93,13 +93,19 @@ type BurstFired struct {
 	RangeNM            *float32 `codec:"rn"`
 	PosAgeS            *float32 `codec:"pa"`
 	DominantFamily     bool     `codec:"df"`
-	// SyncEligible reports whether authoritative refined sync is usable for this
-	// burst. Compact/bootstrap admission is exported separately via
-	// CompactSyncEligible.
+	// SyncEligible reports whether the refined sync state carries AbsolutePhaseTrusted,
+	// meaning it is safe to use for geographic bearing / localisation. It does NOT fire
+	// for relative-only sync (Present+Usable without anchor or phase validation).
+	// Compact/bootstrap admission is exported separately via CompactSyncEligible.
 	SyncEligible        bool `codec:"se"`
 	CompactSyncEligible bool `codec:"ce"`
 	RefinedSyncPresent  bool `codec:"rp"`
-	RefinedSyncUsable   bool `codec:"ru"`
+	// RefinedSyncUsable is the relative-sync flag (Present && Usable). Safe for
+	// timing/phase work but NOT sufficient for geographic bearing prediction.
+	RefinedSyncUsable bool `codec:"ru"`
+	// RefinedSyncAbsolutePhaseTrusted mirrors snap.AbsolutePhaseTrusted. Geographic
+	// bearing consumers must check this rather than RefinedSyncUsable.
+	RefinedSyncAbsolutePhaseTrusted bool `codec:"rat"`
 }
 
 // FrameObservation is one non-reference aircraft within a SweepFrame.

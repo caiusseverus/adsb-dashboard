@@ -102,9 +102,10 @@ type engine struct {
 }
 
 type exportSyncEligibility struct {
-	compactEligible bool
-	refinedPresent  bool
-	refinedUsable   bool
+	compactEligible             bool
+	refinedPresent              bool
+	refinedUsable               bool // relative sync: Present && Usable (timing/phase work)
+	refinedAbsolutePhaseTrusted bool // geographic bearing: Present && AbsolutePhaseTrusted
 }
 
 func newEngine() *engine {
@@ -454,11 +455,12 @@ func (e *engine) emitBurstFired(s *iid.IIDState, f *burst.FiredBurst) {
 		Lat:                 latPtr,
 		Lon:                 lonPtr,
 		PosAgeS:             posAgePtr,
-		DominantFamily:      dominantFamily,
-		SyncEligible:        eligibility.refinedUsable,
-		CompactSyncEligible: eligibility.compactEligible,
-		RefinedSyncPresent:  eligibility.refinedPresent,
-		RefinedSyncUsable:   eligibility.refinedUsable,
+		DominantFamily:                  dominantFamily,
+		SyncEligible:                    eligibility.refinedAbsolutePhaseTrusted,
+		CompactSyncEligible:             eligibility.compactEligible,
+		RefinedSyncPresent:              eligibility.refinedPresent,
+		RefinedSyncUsable:               eligibility.refinedUsable,
+		RefinedSyncAbsolutePhaseTrusted: eligibility.refinedAbsolutePhaseTrusted,
 	})
 }
 
@@ -495,7 +497,7 @@ func (e *engine) recordObservationExports(s *iid.IIDState, f *burst.FiredBurst) 
 		PositionAgeS:          posAgePtr,
 		AssociationConfidence: assoc,
 		DominantFamily:        dominantFamily,
-		SyncEligible:          eligibility.refinedUsable,
+		SyncEligible:          eligibility.refinedAbsolutePhaseTrusted,
 		CompactSyncEligible:   eligibility.compactEligible,
 		RefinedSyncPresent:    eligibility.refinedPresent,
 		RefinedSyncUsable:     eligibility.refinedUsable,
@@ -529,10 +531,10 @@ func (e *engine) recordObservationExports(s *iid.IIDState, f *burst.FiredBurst) 
 		TruthLon:              lonPtr,
 		PositionAgeS:          posAgePtr,
 		DominantFamily:        dominantFamily,
-		SyncEligible:          track.SyncEligible,
-		CompactSyncEligible:   track.CompactSyncEligible,
-		RefinedSyncPresent:    track.RefinedSyncPresent,
-		RefinedSyncUsable:     track.RefinedSyncUsable,
+		SyncEligible:          eligibility.refinedAbsolutePhaseTrusted,
+		CompactSyncEligible:   eligibility.compactEligible,
+		RefinedSyncPresent:    eligibility.refinedPresent,
+		RefinedSyncUsable:     eligibility.refinedUsable,
 		AssociationConfidence: assoc,
 	})
 	e.profiler.Observe("evidence_export", time.Since(tExport))
@@ -549,6 +551,7 @@ func (e *engine) exportSyncEligibility(s *iid.IIDState, dominantFamily bool, ass
 	snap := s.MultiSync.Snapshot()
 	result.refinedPresent = snap.Present
 	result.refinedUsable = snap.Present && snap.Usable
+	result.refinedAbsolutePhaseTrusted = snap.Present && snap.AbsolutePhaseTrusted
 	return result
 }
 

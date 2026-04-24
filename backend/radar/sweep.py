@@ -1368,6 +1368,16 @@ class LiveSyncState:
     validator_disagreement_count: int = 0
     candidate_mode: str | None = None
     authoritative_mode: str | None = None
+    # Fields propagated from Go MULTI_SYNC_STATE to allow Python consumers (in particular
+    # the aircraft localiser) to gate on authoritative Go decisions rather than re-deriving
+    # them from partial diagnostic state.
+    # absolute_phase_trusted: mirrors Go AbsolutePhaseTrusted — True only when period is
+    # bounded to the DF dominant prior, anchor is selected, and phase validation is strong.
+    # Localiser must check this rather than the broader usable flag for geographic bearing.
+    absolute_phase_trusted: bool = False
+    # dominant_prior_inconsistent: mirrors Go DominantPriorInconsistent — True when the
+    # reacquire candidate lies outside the dominant-prior bound. Diagnostic only.
+    dominant_prior_inconsistent: bool = False
 
 
 @_dataclass
@@ -4767,6 +4777,8 @@ class RadarState:
                 candidate_mode=msg.get("cmd"),
                 authoritative_mode=msg.get("amd"),
                 period_authoritative_source=period_authoritative_source,
+                absolute_phase_trusted=bool(msg.get("apt", False)),
+                dominant_prior_inconsistent=bool(msg.get("dpi", False)),
             )
             self._live_sync_states[iid] = new_sync
             self._append_go_sync_diagnostic_history_locked(iid, {

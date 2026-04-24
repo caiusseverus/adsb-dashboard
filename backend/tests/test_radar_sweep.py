@@ -3336,6 +3336,56 @@ def test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst(monkey
     assert sync.authoritative_mode == "settled_authoritative"
 
 
+def test_go_sync_decodes_absolute_phase_trusted_and_dominant_prior_inconsistent():
+    """Go MULTI_SYNC_STATE absolute_phase_trusted (apt) and dominant_prior_inconsistent
+    (dpi) fields must be decoded into the Python LiveSyncState and default to False
+    when absent from the message."""
+    state = RadarState()
+
+    # Message with both new fields present.
+    state.update_go_multi_sync_state({
+        "i": 3, "pr": True, "us": True,
+        "p": 4.0, "pb": 4.0,
+        "pe": 1_000_000.0, "po": 45.0,
+        "jd": 3.0, "re": 4.0, "nu": 5,
+        "ho": False, "ra": False, "ts": 1_000.0,
+        "apt": True,
+        "dpi": True,
+    })
+    sync = state.get_live_sync_state(3)
+    assert sync is not None
+    assert sync.absolute_phase_trusted is True
+    assert sync.dominant_prior_inconsistent is True
+
+    # Message with apt=False.
+    state.update_go_multi_sync_state({
+        "i": 4, "pr": True, "us": True,
+        "p": 4.0, "pb": 4.0,
+        "pe": 1_000_000.0, "po": 45.0,
+        "jd": 3.0, "re": 4.0, "nu": 5,
+        "ho": False, "ra": False, "ts": 1_000.0,
+        "apt": False,
+        "dpi": False,
+    })
+    sync2 = state.get_live_sync_state(4)
+    assert sync2 is not None
+    assert sync2.absolute_phase_trusted is False
+    assert sync2.dominant_prior_inconsistent is False
+
+    # Message with fields absent — must default to False.
+    state.update_go_multi_sync_state({
+        "i": 5, "pr": True, "us": True,
+        "p": 4.0, "pb": 4.0,
+        "pe": 1_000_000.0, "po": 45.0,
+        "jd": 3.0, "re": 4.0, "nu": 5,
+        "ho": False, "ra": False, "ts": 1_000.0,
+    })
+    sync3 = state.get_live_sync_state(5)
+    assert sync3 is not None
+    assert sync3.absolute_phase_trusted is False
+    assert sync3.dominant_prior_inconsistent is False
+
+
 def test_go_sync_diagnostic_history_is_retained_beyond_fit_window(monkeypatch):
     """Go trend history must be retained independently from the short fit window."""
     import radar.sweep as sweep_module

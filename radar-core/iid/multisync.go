@@ -12,10 +12,15 @@ package iid
 //   - Propagation delay correction included (same formula as Python).
 //   - Waveform correction NOT included; Python waveform bins remain authoritative
 //     for Stage 3 and are applied after reading the Go sync state.
-//   - Motion compensation NOT included; deferred for a later slice.
+//   - Motion compensation: Option B geometric guard — period correction requires
+//     ≥3 contributing ICAOs and ≥30° bearing spread among them when the DF dominant
+//     prior is active. Full velocity-vector compensation is deferred to a later slice.
 //   - Anchor selection: highest-quality ICAO with good recent observations.
 //   - Period refinement: slope EMA + persistence gate (matches Python).
 //   - Wrong-period reacquire: state machine matching Python's reacquire logic.
+//   - The refined model is a bounded correction around the DF dominant period family,
+//     not an independent period estimator. Reacquire candidates outside the dominant
+//     bound are diagnostic only; they do not update the published period.
 
 import (
 	"math"
@@ -63,8 +68,9 @@ const (
 	periodGain             = 0.12
 
 	// Trust promotion thresholds — the refined solver must earn a stable run streak
-	// before its period is promoted to the trusted base.  Until then the clamp is
-	// applied loosely against the bootstrap (compact-sync) seed.
+	// before its period is promoted to the trusted base. When dominantPeriodS > 0
+	// the trusted base is secondary: the DF dominant prior is the family authority
+	// and the base-period clamp is overridden to dominantPeriodS regardless of trust.
 	trustMinStreak      = 8    // consecutive updates required to promote the period
 	trustMinFitPool     = 8    // min fit-pool entries per update to count toward streak
 	trustMinICAOs       = 3    // min distinct ICAOs per update to count toward streak
@@ -80,9 +86,17 @@ const (
 
 	// Period refinement limits relative to the DF dominant prior (used when dominantPeriodS > 0).
 	// These replace the bootstrap escape window and bound the refined period tightly around
-	// the family already established by the DF alignment model.
+	// the family already established by the DF alignment model. The refined solver is not an
+	// independent period estimator; it is a bounded correction within the DF-assigned family.
 	periodRefineMaxPPMFromDominant = 300.0 // max PPM deviation from DF dominant prior
 	periodRefineMaxStepPPM         = 20.0  // max per-update period correction step when dominant is active
+
+	// Motion compensation guard (Option B) — geometric safeguards for period correction
+	// when the DF dominant prior is active. Requires ≥3 contributing ICAOs and sufficient
+	// azimuth spread to reduce the risk of common-motion bias driving spurious corrections.
+	// When dominant prior is not active, the legacy 2-ICAO minimum applies unchanged.
+	periodRefineMotionGuardMinICAOs  = 3    // min distinct ICAOs for period update when dominant is active
+	periodRefineMinBearingSpreadDeg  = 30.0 // min circular arc coverage of contributing ICAO bearings
 
 	// Reacquire / failure detection.
 	reacquireMADThreshold = 8.0 // deg — detrended MAD for recovery
@@ -339,6 +353,14 @@ type MultiSyncSnapshot struct {
 	// for a period outside the allowed refinement bound around dominantPeriodS. This is
 	// purely diagnostic — the DF alignment model should react to it, not the refined solver.
 	DominantPriorInconsistent bool
+	// PeriodRefineBlockReason records why period refinement was blocked on the last run.
+	// Empty string means the slope candidate was evaluated (though it may have been clamped).
+	// Populated with reasons such as "motion_guard_insufficient_icaos" or
+	// "motion_guard_insufficient_geometry" for the motion-compensation guard.
+	PeriodRefineBlockReason string
+	// FitBearingSpreadDeg is the circular arc coverage of contributing ICAO mean bearings
+	// from the last retained-slope fit. Used to diagnose the motion-guard geometry check.
+	FitBearingSpreadDeg float64
 }
 
 // MultiSyncSolver holds per-IID multi-aircraft sync refinement state.
@@ -381,9 +403,11 @@ type MultiSyncSolver struct {
 
 	// Bootstrap vs trusted base separation.
 	// BootstrapPeriodS is the compact-sync period captured on first run and never overwritten.
+	// It is a fallback clamp base used only when no DF dominant prior is available.
+	// When dominantPeriodS > 0, the dominant prior is the family authority; bootstrap
+	// escape behaviour is suppressed and the clamp is anchored to dominantPeriodS.
 	// TrustedBasePeriodS is promoted from the refined period after trustMinStreak consistent
-	// multi-aircraft updates.  Until trust is established, the clamp is applied loosely
-	// against BootstrapPeriodS so the solver can escape an incorrect seed family.
+	// multi-aircraft updates, but is also overridden by dominantPeriodS when present.
 	BootstrapPeriodS   float64
 	TrustedBasePeriodS float64
 	TrustUpdateStreak  int
@@ -471,6 +495,12 @@ type MultiSyncSolver struct {
 	// allowed refinement bound around dominantPeriodS. Diagnostic only — the candidate
 	// period is not published in this case.
 	LastDominantPriorInconsistent bool
+	// LastPeriodRefineBlockReason records the block reason from the most recent
+	// refinePeriod call. Empty when refinement ran (slope candidate was evaluated).
+	LastPeriodRefineBlockReason string
+	// LastFitBearingSpreadDeg is the circular arc coverage of mean bearings among
+	// contributing ICAOs from the most recent retained-slope fit.
+	LastFitBearingSpreadDeg float64
 
 	// Throttle.
 	lastRunTS float64
@@ -629,6 +659,8 @@ func (ms *MultiSyncSolver) Reset() {
 	ms.LastAuthoritativeMode = ""
 	ms.AbsolutePhaseTrusted = false
 	ms.LastDominantPriorInconsistent = false
+	ms.LastPeriodRefineBlockReason = ""
+	ms.LastFitBearingSpreadDeg = 0
 }
 
 // Snapshot returns a copy of the published state for protocol emission.
@@ -713,6 +745,8 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 		AuthoritativeMode:                ms.LastAuthoritativeMode,
 		AbsolutePhaseTrusted:             ms.AbsolutePhaseTrusted,
 		DominantPriorInconsistent:        ms.LastDominantPriorInconsistent,
+		PeriodRefineBlockReason:          ms.LastPeriodRefineBlockReason,
+		FitBearingSpreadDeg:              ms.LastFitBearingSpreadDeg,
 	}
 	if ms.AuthoritativeStateSinceTS > 0 && ms.LastUpdated > 0 {
 		snap.AuthoritativeStateAgeS = math.Max(0, ms.LastUpdated-ms.AuthoritativeStateSinceTS)
@@ -1019,7 +1053,7 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	prevSlope := ms.SmoothSlopeDegPerS
 	smoothedSlope := (1.0-slopeEMAAlpha)*prevSlope + slopeEMAAlpha*bFit
 
-	periodSlope, periodFitCount, periodFitICAOs, periodFitSpanS, periodSlopeOK := ms.retainedResidualSlope(
+	periodSlope, periodFitCount, periodFitICAOs, periodFitSpanS, periodFitBearingSpreadDeg, periodSlopeOK := ms.retainedResidualSlope(
 		seedEpochUS, seedOffsetDeg, livePeriodS, nowUnix, recoveryActive,
 	)
 	if periodSlopeOK {
@@ -1034,17 +1068,20 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		periodFitCount = len(fitPool)
 		periodFitICAOs = len(fitICAOs)
 		periodFitSpanS = spanS
+		periodFitBearingSpreadDeg = msBearingSpreadDeg(ms.obs, fitICAOs, nowUnix-multiSyncRetentionS)
 	}
+	ms.LastFitBearingSpreadDeg = periodFitBearingSpreadDeg
 	ms.SlopeHistory = append(ms.SlopeHistory, periodSlope)
 	if len(ms.SlopeHistory) > 12 {
 		ms.SlopeHistory = ms.SlopeHistory[len(ms.SlopeHistory)-12:]
 	}
 
-	refinedPeriodS, _, _, clampedByBase, clampDiffPPM := ms.refinePeriod(
+	refinedPeriodS, refineBlockReason, _, clampedByBase, clampDiffPPM := ms.refinePeriod(
 		livePeriodS, basePeriodS, dominantPeriodS, periodSlope,
-		periodFitCount, periodFitICAOs, periodFitSpanS, majorityRejected,
-		trusted,
+		periodFitCount, periodFitICAOs, periodFitSpanS, periodFitBearingSpreadDeg,
+		majorityRejected, trusted,
 	)
+	ms.LastPeriodRefineBlockReason = refineBlockReason
 
 	// Wrong-period detection.
 	detrended := msDetrendedMAD(scored, aFit, bFit, tRef)
@@ -1366,12 +1403,14 @@ func (ms *MultiSyncSolver) selectActiveFamilyPrior(compactPeriodS, dominantPerio
 func (ms *MultiSyncSolver) retainedResidualSlope(
 	seedEpochUS, seedOffsetDeg, periodS, nowUnix float64,
 	recoveryActive bool,
-) (float64, int, int, float64, bool) {
+) (slope float64, nFit, nICAOs int, spanS, bearingSpreadDeg float64, ok bool) {
 	// Estimate the common period-error slope across retained observations while
 	// allowing each ICAO its own phase intercept. This keeps spurious per-aircraft
 	// offsets from steering the hardware-period correction.
+	// Also returns the circular arc coverage of contributing ICAO mean bearings for
+	// the motion-compensation geometry guard.
 	if periodS <= 0 {
-		return 0, 0, 0, 0, false
+		return 0, 0, 0, 0, 0, false
 	}
 	type entry struct {
 		icao uint32
@@ -1380,10 +1419,12 @@ func (ms *MultiSyncSolver) retainedResidualSlope(
 		w    float64
 	}
 	type accum struct {
-		n    int
-		sumW float64
-		sumX float64
-		sumY float64
+		n      int
+		sumW   float64
+		sumX   float64
+		sumY   float64
+		sumSin float64 // weighted circular-mean bearing (sin component)
+		sumCos float64 // weighted circular-mean bearing (cos component)
 	}
 
 	cutoffTS := nowUnix - multiSyncRetentionS
@@ -1421,6 +1462,9 @@ func (ms *MultiSyncSolver) retainedResidualSlope(
 		a.sumW += weight
 		a.sumX += weight * x
 		a.sumY += weight * residual
+		rad := o.BearingDeg * math.Pi / 180.0
+		a.sumSin += weight * math.Sin(rad)
+		a.sumCos += weight * math.Cos(rad)
 		if x < minX {
 			minX = x
 		}
@@ -1429,7 +1473,7 @@ func (ms *MultiSyncSolver) retainedResidualSlope(
 		}
 	}
 	if len(entries) < periodRefineMinInlier || len(byICAO) < 2 {
-		return 0, len(entries), len(byICAO), 0, false
+		return 0, len(entries), len(byICAO), 0, 0, false
 	}
 
 	num := 0.0
@@ -1453,13 +1497,73 @@ func (ms *MultiSyncSolver) retainedResidualSlope(
 	if used < periodRefineMinInlier || len(usedICAOs) < 2 || den <= 0 ||
 		math.IsNaN(num) || math.IsInf(num, 0) || math.IsNaN(den) || math.IsInf(den, 0) {
 		span := 0.0
-		if math.IsInf(minX, 0) || math.IsInf(maxX, 0) {
-			return 0, used, len(usedICAOs), span, false
+		if !math.IsInf(minX, 0) && !math.IsInf(maxX, 0) {
+			span = maxX - minX
 		}
-		span = maxX - minX
-		return 0, used, len(usedICAOs), span, false
+		return 0, used, len(usedICAOs), span, 0, false
 	}
-	return num / den, used, len(usedICAOs), maxX - minX, true
+
+	// Bearing diversity of contributing ICAOs (for motion-guard geometry check).
+	bearingMeans := make([]float64, 0, len(usedICAOs))
+	for icao := range usedICAOs {
+		a := byICAO[icao]
+		if a != nil && a.sumW > 0 {
+			meanDeg := math.Atan2(a.sumSin/a.sumW, a.sumCos/a.sumW) * 180.0 / math.Pi
+			bearingMeans = append(bearingMeans, meanDeg)
+		}
+	}
+	return num / den, used, len(usedICAOs), maxX - minX, bearingCircularSpreadDeg(bearingMeans), true
+}
+
+// bearingCircularSpreadDeg returns the arc coverage (degrees) spanned by a set of
+// bearings on a circle: 360° minus the largest gap between consecutive bearings.
+// Returns 0 for fewer than 2 bearings.
+func bearingCircularSpreadDeg(bearings []float64) float64 {
+	if len(bearings) < 2 {
+		return 0.0
+	}
+	sorted := make([]float64, len(bearings))
+	for i, b := range bearings {
+		r := math.Mod(b, 360.0)
+		if r < 0 {
+			r += 360.0
+		}
+		sorted[i] = r
+	}
+	sort.Float64s(sorted)
+	maxGap := sorted[0] + 360.0 - sorted[len(sorted)-1]
+	for i := 1; i < len(sorted); i++ {
+		if gap := sorted[i] - sorted[i-1]; gap > maxGap {
+			maxGap = gap
+		}
+	}
+	return 360.0 - maxGap
+}
+
+// msBearingSpreadDeg computes the circular arc coverage of the mean bearings of a
+// set of ICAOs across retained observations. Used by the motion-guard check in the
+// EMA-slope fallback path where retainedResidualSlope did not return a fresh slope.
+func msBearingSpreadDeg(obs []MultiSyncObs, icaos map[uint32]bool, cutoffTS float64) float64 {
+	type bAccum struct{ sumSin, sumCos float64 }
+	byICAO := make(map[uint32]*bAccum, len(icaos))
+	for _, o := range obs {
+		if o.WallTS < cutoffTS || !icaos[o.ICAO] {
+			continue
+		}
+		a := byICAO[o.ICAO]
+		if a == nil {
+			a = &bAccum{}
+			byICAO[o.ICAO] = a
+		}
+		rad := o.BearingDeg * math.Pi / 180.0
+		a.sumSin += math.Sin(rad)
+		a.sumCos += math.Cos(rad)
+	}
+	means := make([]float64, 0, len(byICAO))
+	for _, a := range byICAO {
+		means = append(means, math.Atan2(a.sumSin, a.sumCos)*180.0/math.Pi)
+	}
+	return bearingCircularSpreadDeg(means)
 }
 
 func (ms *MultiSyncSolver) assessRecoveryMode(sync *SyncState, dominantPeriodS float64) (bool, bool, []string) {
@@ -2259,7 +2363,7 @@ func (ms *MultiSyncSolver) recordAnchorSelection(anchorICAO *uint32, nowUnix flo
 
 func (ms *MultiSyncSolver) refinePeriod(
 	livePeriodS, basePeriodS, dominantPeriodS, smoothedSlope float64,
-	nFit, nFitICAOs int, spanS float64, majorityRejected bool,
+	nFit, nFitICAOs int, spanS, bearingSpreadDeg float64, majorityRejected bool,
 	trusted bool, // true = tight clamp from promoted trusted base; false = wide clamp from bootstrap seed
 	// When dominantPeriodS > 0, the dominant prior overrides the bootstrap/trusted-base
 	// clamp with a tight bound (periodRefineMaxPPMFromDominant). This prevents the refined
@@ -2297,6 +2401,13 @@ func (ms *MultiSyncSolver) refinePeriod(
 		blockReason = "insufficient_fit_observations"
 	case nFitICAOs < 2:
 		blockReason = "insufficient_fit_icaos"
+	// Motion-compensation guard (Option B): when the DF dominant prior is active,
+	// require more contributing ICAOs and sufficient azimuth spread to reduce the
+	// risk of a small cluster of co-moving aircraft biasing the period estimate.
+	case dominantPeriodS > 0 && nFitICAOs < periodRefineMotionGuardMinICAOs:
+		blockReason = "motion_guard_insufficient_icaos"
+	case dominantPeriodS > 0 && bearingSpreadDeg < periodRefineMinBearingSpreadDeg:
+		blockReason = "motion_guard_insufficient_geometry"
 	case spanS < periodRefineMinSpanRot*livePeriodS:
 		blockReason = "insufficient_fit_span"
 	case !persistent:
@@ -2337,11 +2448,11 @@ func (ms *MultiSyncSolver) refinePeriod(
 	// tight bounds anchored to the dominant family. This prevents the refined period from
 	// escaping the family established by the DF alignment model regardless of trusted state.
 	//
-	// Motion compensation is not implemented. The multi-ICAO requirement in
-	// retainedResidualSlope (len(byICAO) < 2 → no slope) is the implicit protection
-	// against a single moving aircraft driving period changes. Two aircraft both moving in
-	// the same direction can still cause a bias; full motion compensation requires velocity
-	// vectors and is deferred to a later slice.
+	// Motion compensation guard (Option B) is applied via the switch above: when
+	// dominantPeriodS > 0, execution is blocked before reaching here if fewer than
+	// periodRefineMotionGuardMinICAOs (3) ICAOs contribute or if their bearing spread
+	// is below periodRefineMinBearingSpreadDeg (30°). Full velocity-vector compensation
+	// is deferred to a later slice.
 	if dominantPeriodS > 0 {
 		ppmPerUpdate = periodRefineMaxStepPPM
 		basePeriodS = dominantPeriodS
