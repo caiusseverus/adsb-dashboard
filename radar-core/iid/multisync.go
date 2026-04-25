@@ -476,6 +476,10 @@ type MultiSyncSolver struct {
 	BranchCompetitorCount      int
 	BranchPromotionBlockReason string
 
+	// Internal: wall-clock TS of the last long-term-estimator seed (used to
+	// derive LongTermPeriodEstimatorAgeS). Not exposed in Snapshot.
+	lastLongTermPeriodSeedTS float64
+
 	// Throttle.
 	lastRunTS float64
 }
@@ -665,6 +669,7 @@ func (ms *MultiSyncSolver) Reset() {
 	ms.BranchContradictionWindows = 0
 	ms.BranchCompetitorCount = 0
 	ms.BranchPromotionBlockReason = ""
+	ms.lastLongTermPeriodSeedTS = 0
 }
 
 // ─── internal solver — pipeline orchestration ─────────────────────────────────
@@ -879,6 +884,17 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		ms.LastLocalFitQualityScore = 0
 	}
 
+	// Layer 2: feed the local measurement into the persistent long-term
+	// estimator. This nudges (or seeds) `LongTermPeriodEstimateS`. The
+	// applied period further down (`finalPeriodS`) is then sourced from the
+	// long-term estimator rather than the raw short-window measurement.
+	ms.updateLongTermPeriodEstimator(
+		ms.LastLocalPeriodMeasurementS,
+		dominantPeriodS,
+		nowUnix,
+		ms.LastLocalFitQualityScore,
+	)
+
 	// Slope gate for authority promotion.
 	slopeWindowDeg := math.Abs(period.ResidualSlopeDegPerS) * period.FitSpanS
 	ms.LastSlopeWindowDeg = slopeWindowDeg
@@ -904,7 +920,14 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	// ── Reacquire logic ───────────────────────────────────────────────────────
 	// Determines whether searchBestCandidate should run and whether its result
 	// should replace the refined period (or be reported as diagnostic only).
+	//
+	// Layer 2: the applied period is sourced from the long-term estimator once
+	// it is seeded. Until seeding, fall back to the raw short-window measurement
+	// so behaviour at first refined entry is unchanged.
 	finalPeriodS := period.AppliedPeriodS
+	if ms.LongTermPeriodEstimateS > 0 {
+		finalPeriodS = ms.LongTermPeriodEstimateS
+	}
 	var finalAlignment publishedAlignment
 	finalAlignmentReady := false
 
@@ -932,6 +955,10 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		}
 		if withinDominantBound {
 			finalPeriodS = best.periodS
+			// Layer 2: a reacquire candidate is a deliberate jump — reseed the
+			// long-term estimator so it tracks the new family rather than
+			// drifting toward it from the prior estimate.
+			ms.reseedLongTermPeriodEstimator(best.periodS, nowUnix)
 			finalAlignment = publishedAlignment{
 				epochUS:                 best.newEpochUS,
 				offsetDeg:               best.publishedOffsetDeg,
