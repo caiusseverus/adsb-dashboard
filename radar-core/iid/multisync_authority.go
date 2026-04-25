@@ -265,12 +265,26 @@ func (ms *MultiSyncSolver) candidateApplicationBlockReason(
 	if ms.CandidatePromotionStreak < candidatePromotionMinStreak {
 		return "candidate_streak_not_met"
 	}
-	// Layer 4: long-term estimator gates. Promotion to authoritative authority
-	// requires accumulated evidence from the persistent estimators, not just a
-	// single strong window.
-	if ms.LongTermPeriodEstimateS > 0 && ms.LongTermPeriodEstimatorConfidence < periodEstimatorMinConfidence {
+	// Layer 4 / fix: long-term estimator gates. Promotion to authoritative
+	// authority requires accumulated evidence from the persistent estimators.
+	// Missing estimator state is NOT a free pass — the previous "seeded > 0
+	// AND conf < threshold" form silently bypassed the gate when the estimator
+	// wasn't seeded yet. Now we report period_estimator_unseeded and
+	// branch_estimator_unseeded explicitly so the operator sees the real
+	// reason instead of a downstream consequence.
+	if ms.LongTermPeriodEstimateS <= 0 {
+		return "period_estimator_unseeded"
+	}
+	if ms.LongTermPeriodEstimatorConfidence < periodEstimatorMinConfidence {
 		return fmt.Sprintf("period_estimator_confidence_insufficient: conf=%.3f required>=%.2f",
 			ms.LongTermPeriodEstimatorConfidence, periodEstimatorMinConfidence)
+	}
+	// Branch gate: if there is a candidate anchor this window, the branch
+	// estimator MUST exist before promotion can succeed. (Anchorless promotion
+	// has been rejected upstream, so this only fires when a candidate anchor
+	// is present but no track has been spawned yet.)
+	if estimate.anchorICAO != nil && len(ms.BranchTracks) == 0 {
+		return "branch_estimator_unseeded"
 	}
 	if len(ms.BranchTracks) > 0 && ms.BranchEstimatorConfidence < branchPromotionMinConfidence {
 		return fmt.Sprintf("branch_confidence_insufficient: conf=%.3f required>=%.2f",

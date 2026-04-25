@@ -46,21 +46,35 @@ type BranchEstimate struct {
 	ContradictedWindows         int
 }
 
-// updateBranchTracks ingests this window's local candidate (anchor + phase offset)
-// and updates the persistent branch-track set. It reports the matched track index
-// (-1 if a new track was spawned), the post-update dominant track index, and
-// total competitor count.
+// LocalCandidateValidation is the validation classification of the current
+// window's local candidate, as decided by the phase-validation stage. The
+// branch tracker uses this to gate reinforcement so weak or disagreeing
+// candidates cannot promote a track past the authority gates.
+type LocalCandidateValidation int
+
+const (
+	LocalCandidateValidated  LocalCandidateValidation = iota // strong validation
+	LocalCandidateWeak                                       // not strong, not disagreeing
+	LocalCandidateDisagreed                                  // validator disagreement / branch ambiguous
+)
+
+// updateBranchTracks ingests this window's local candidate (anchor + phase
+// offset) and updates the persistent branch-track set. It is validation-aware:
 //
-// Inputs:
-//   - localAnchor: anchor ICAO chosen this window (may be nil → no candidate)
-//   - localOffsetDeg: candidate phase offset for the window
-//   - localQuality: 0..1 fit quality (scales confidence updates)
-//   - nowUnix: current wall-clock time
-//
-// On `localAnchor == nil` no track is updated; existing tracks decay slightly
-// to age them. This preserves long-term state through gaps in the local fit.
+//   - Validated candidates reinforce normally — full confidence step and
+//     full EMA gain on the matched track.
+//   - Weak candidates reinforce with reduced gain so they keep the track
+//     alive but cannot drive promotion on their own.
+//   - Disagreed candidates do NOT reinforce the dominant or any matched
+//     track. They still spawn a competing track when the offset is far from
+//     all existing tracks (so a sustained disagreement can take over via
+//     repeated spawn-and-compete) but cannot raise an existing track's
+//     confidence.
+//   - localAnchor == nil ages existing tracks slightly without modifying
+//     the dominant selection.
 func (ms *MultiSyncSolver) updateBranchTracks(
 	localAnchor *uint32, localOffsetDeg, localQuality, nowUnix float64,
+	validation LocalCandidateValidation,
 ) {
 	// No local candidate — age existing tracks but do not modify the dominant
 	// selection in a destructive way.
@@ -85,14 +99,27 @@ func (ms *MultiSyncSolver) updateBranchTracks(
 		}
 	}
 
-	if matchIdx >= 0 {
+	// Reinforcement scale based on validation status.
+	var reinforcementScale float64
+	switch validation {
+	case LocalCandidateValidated:
+		reinforcementScale = 1.0
+	case LocalCandidateWeak:
+		reinforcementScale = 0.25
+	case LocalCandidateDisagreed:
+		reinforcementScale = 0.0
+	default:
+		reinforcementScale = 0.25
+	}
+
+	if matchIdx >= 0 && reinforcementScale > 0 {
 		tr := ms.BranchTracks[matchIdx]
-		// EMA the offset toward the local measurement; gain scales with local
-		// quality so noisy windows do not dominate the consensus.
-		gain := 0.15 * clamp(localQuality, 0, 1)
+		// EMA the offset toward the local measurement; gain scales with both
+		// local quality and validation strength.
+		gain := 0.15 * clamp(localQuality, 0, 1) * reinforcementScale
 		tr.OffsetDeg = circularEMAUpdate(tr.OffsetDeg, localOffsetDeg, gain)
 		tr.Confidence = math.Min(branchTrackMaxConfidence,
-			tr.Confidence+branchTrackConfidenceStep*clamp(localQuality, 0, 1))
+			tr.Confidence+branchTrackConfidenceStep*clamp(localQuality, 0, 1)*reinforcementScale)
 		tr.ConsecutiveSupportedWindows++
 		tr.LastSeenTS = nowUnix
 		v := *localAnchor
@@ -111,15 +138,41 @@ func (ms *MultiSyncSolver) updateBranchTracks(
 				other.Confidence-branchTrackAgingPenalty)
 			other.ContradictedWindows++
 		}
+	} else if matchIdx >= 0 && reinforcementScale == 0 {
+		// Disagreed candidate that matches an existing track: do not reinforce
+		// the matched track, but record the contradiction on it. The matched
+		// track itself ages slightly.
+		tr := ms.BranchTracks[matchIdx]
+		tr.Confidence = math.Max(branchTrackMinConfidence,
+			tr.Confidence-branchTrackAgingPenalty)
+		tr.ContradictedWindows++
+		tr.ConsecutiveSupportedWindows = 0
+		// Other tracks age normally.
+		for i, other := range ms.BranchTracks {
+			if i == matchIdx {
+				continue
+			}
+			other.Confidence = math.Max(branchTrackMinConfidence,
+				other.Confidence-branchTrackAgingPenalty)
+		}
 	} else {
-		// Contradiction: every existing track loses a slice of confidence;
-		// spawn a competing track for the new offset.
+		// No match: contradiction. Every existing track loses a slice of
+		// confidence; a new competing track is spawned at reduced confidence
+		// when the local candidate is weak or disagreeing.
 		for _, tr := range ms.BranchTracks {
 			tr.Confidence *= branchTrackContradictDecay
 			tr.ContradictedWindows++
 			tr.ConsecutiveSupportedWindows = 0
 		}
-		ms.spawnBranchTrack(localAnchor, localOffsetDeg, localQuality, nowUnix)
+		spawnQuality := localQuality
+		if reinforcementScale > 0 && reinforcementScale < 1.0 {
+			spawnQuality *= reinforcementScale
+		} else if reinforcementScale == 0 {
+			// A disagreed first-sighting still spawns (so sustained disagreement
+			// can take over via competition) but at minimal confidence.
+			spawnQuality *= 0.10
+		}
+		ms.spawnBranchTrack(localAnchor, localOffsetDeg, spawnQuality, nowUnix)
 	}
 
 	ms.evictWeakestBranchTracks()

@@ -2094,8 +2094,9 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
       {(syncState.long_term_period_estimate_s || syncState.branch_estimator_confidence) && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', fontSize: '0.71rem', marginBottom: '0.35rem', padding: '4px 6px', background: '#0c1117', border: '1px dashed #21262d', borderRadius: '3px' }}>
           <span style={{ color: '#8b949e' }}>Long-term:</span>
-          <span className={styles.metricPill}>Local period <span className={styles.metricValue}>{fmtNumber(syncState.local_period_measurement_s, 4, 's')}</span></span>
-          <span className={styles.metricPill}>LT period <span className={styles.metricValue}>{fmtNumber(syncState.long_term_period_estimate_s, 4, 's')}</span></span>
+          <span className={styles.metricPill} title="Short-window (≈30s) local period measurement; may wobble — that's expected.">Local period <span className={styles.metricValue}>{fmtNumber(syncState.local_period_measurement_s, 4, 's')}</span></span>
+          <span className={styles.metricPill} title="Persistent long-term EMA estimate, bounded to ±300 PPM of the dominant prior.">LT period <span className={styles.metricValue}>{fmtNumber(syncState.long_term_period_estimate_s, 4, 's')}</span></span>
+          <span className={styles.metricPill} title="Published refined period — what the predictor uses. Should follow LT period after seed.">Published period <span className={styles.metricValue}>{fmtNumber(syncState.period_s, 4, 's')}</span></span>
           <span className={styles.metricPill}>LT period conf <span className={styles.metricValue}>{fmtNumber(syncState.long_term_period_estimator_confidence, 2)}</span></span>
           <span className={styles.metricPill}>Δ this window <span className={styles.metricValue}>{fmtNumber((syncState.period_update_delta_s ?? 0) * 1e6, 2, ' µs')}</span></span>
           <span className={styles.metricPill}>Consistent windows <span className={styles.metricValue}>{syncState.consecutive_period_consistent_windows ?? 0}</span></span>
@@ -2357,6 +2358,7 @@ function RotationAlignmentPanel({
   const alignmentStatus = burstTimeline?.alignment_status ?? null
   const syncModeDiagnostics = burstTimeline?.sync_mode_diagnostics ?? null
   const burstSyncDiagnostic = burstTimeline?.burst_sync_diagnostic ?? null
+  const displayRetentionDiagnostic = burstTimeline?.display_retention_diagnostic ?? null
   const syncHorizons = burstTimeline?.sync_horizons ?? null
   const legacyIcaosRaw = Array.isArray(legacyTimeline?.icaos) ? legacyTimeline.icaos : []
   const syncState = burstTimeline?.sync_state ?? null
@@ -2716,6 +2718,26 @@ function RotationAlignmentPanel({
           <span className={styles.metricPill} title="Retained diagnostic history window shown in this panel.">
             Display window <span className={styles.metricValue}>{syncHorizons?.display_window_s != null ? `${Number(syncHorizons.display_window_s).toFixed(0)}s` : `${BURST_SYNC_ALIGNMENT_WINDOW_S}s`}</span>
           </span>
+          {displayRetentionDiagnostic && (
+            <span
+              className={styles.metricPill}
+              title="Realised plotted-point retention. If oldest age is much smaller than the display window, the chart is silently truncated."
+              style={{
+                color: (() => {
+                  const oldest = Number(displayRetentionDiagnostic.oldest_point_age_s ?? 0)
+                  const axis = Number(displayRetentionDiagnostic.axis_window_s ?? 300)
+                  if (!Number.isFinite(oldest) || axis <= 0) return undefined
+                  return oldest >= axis * 0.5 ? '#3fb950' : '#d29922'
+                })(),
+              }}
+            >
+              Plotted span <span className={styles.metricValue}>
+                {displayRetentionDiagnostic.oldest_point_age_s != null
+                  ? `${Number(displayRetentionDiagnostic.oldest_point_age_s).toFixed(0)}s (${displayRetentionDiagnostic.plotted_point_count ?? 0} pts)`
+                  : 'no points yet'}
+              </span>
+            </span>
+          )}
           <span className={styles.metricPill} title="Age of the slow authoritative sync state, when available.">
             Authority age <span className={styles.metricValue}>{syncHorizons?.authoritative_state_age_s != null ? `${Number(syncHorizons.authoritative_state_age_s).toFixed(0)}s` : '—'}</span>
           </span>

@@ -2377,7 +2377,12 @@ class RadarState:
         self._go_frame_positions: dict[int, deque] = {}
         self._go_frame_positions_revision: dict[int, int] = {}
         self._GO_TRACK_OBSERVATIONS_MAX = 8_000
-        self._GO_EVIDENCE_EVENTS_MAX = 12_000
+        # Evidence-event retention: count-cap is a safety bound; time-based
+        # pruning at DF11_RESIDUAL_EVENT_MAX_AGE_S (360s) is the actual governor
+        # so the burst-residual chart honours the 300s display window even at
+        # high burst rates. Previous 12_000 cap held only ~30s at typical rates,
+        # which is why points rolled off after about 30s on the chart.
+        self._GO_EVIDENCE_EVENTS_MAX = 60_000
         self._GO_SWEEP_FRAMES_MAX = 256
         self._go_sync_states_by_iid: dict[int, dict] = {}
         self._go_multi_sync_states_by_iid: dict[int, dict] = {}
@@ -7448,6 +7453,10 @@ class RadarState:
                 df11_residual_cutoff_us = now_us - int(DF11_RESIDUAL_EVENT_MAX_AGE_S * 1_000_000)
                 while self._df11_residual_events and self._df11_residual_events[0][0] < df11_residual_cutoff_us:
                     self._df11_residual_events.popleft()
+                # Burst-evidence buffer: time-prune to the same display retention so
+                # the chart can render the configured display window even if the
+                # underlying count cap would otherwise hold only ~30s of bursts.
+                self._prune_go_evidence_events_locked(now_us / 1_000_000.0)
 
                 # Prune burst records beyond BURST_RECORD_MAX_AGE_S
                 burst_cutoff_us = now_us - int(BURST_RECORD_MAX_AGE_S * 1_000_000)
@@ -8714,6 +8723,70 @@ class RadarState:
             aligned = aligned[-self._MULTI_SYNC_OBS_MAX:]
         return aligned
 
+    def _prune_go_evidence_events_locked(self, now_ts: float) -> int:
+        """Drop burst-evidence entries older than DF11_RESIDUAL_EVENT_MAX_AGE_S.
+
+        Caller must hold ``self._lock``. Returns the number of entries pruned.
+        Time-based; the deque also has a count cap as a safety bound but the
+        time bound is what governs chart retention at high burst rates.
+        """
+        cutoff_ts = now_ts - DF11_RESIDUAL_EVENT_MAX_AGE_S
+        pruned = 0
+        while self._go_evidence_events and float(
+            self._go_evidence_events[0].get("wall_ts") or 0.0
+        ) < cutoff_ts:
+            self._go_evidence_events.popleft()
+            pruned += 1
+        return pruned
+
+    def _build_display_retention_diagnostic(
+        self,
+        sync: "LiveSyncState | None",
+        observations: list[dict],
+        df11_residual_observations: list[dict],
+        window_s: float,
+    ) -> dict:
+        """Diagnostic block exposing actual chart retention vs the display window.
+
+        Surfaces both the requested axis window and the realised oldest/newest
+        ages of plotted points so the UI can detect cases where the chart axis
+        is 300s but only ~30s of points actually arrived (e.g. evidence buffer
+        pruned by count rather than time, or an upstream filter using the fit
+        window). Also exposes the solver's fit window so the separation between
+        fit_window_s (solver) and display_window_s (chart) is observable.
+        """
+        now_ts = time.time()
+        all_ts = []
+        for entry in observations or []:
+            ts = entry.get("wall_ts")
+            if ts is not None:
+                all_ts.append(float(ts))
+        # df11_residual_observations carry arrival_beast_us and an estimated wall ts.
+        for entry in df11_residual_observations or []:
+            ts = entry.get("wall_ts") or entry.get("estimated_wall_ts")
+            if ts is not None:
+                all_ts.append(float(ts))
+        plotted_count = len(all_ts)
+        oldest_age = (now_ts - min(all_ts)) if all_ts else None
+        newest_age = (now_ts - max(all_ts)) if all_ts else None
+        fit_window_s = self._fit_window_s_for_period(
+            getattr(sync, "period_s", None) if sync is not None else None
+        )
+        return {
+            "axis_window_s": float(window_s),
+            "fit_window_s": float(fit_window_s),
+            "display_window_s": float(window_s),
+            "plotted_point_count": plotted_count,
+            "oldest_point_age_s": oldest_age,
+            "newest_point_age_s": newest_age,
+            "backend_payload_point_count": plotted_count,
+            "backend_payload_oldest_age_s": oldest_age,
+            "frontend_buffer_window_s": float(window_s),
+            "points_source": "backend_history" if plotted_count > 0 else "empty",
+            "evidence_buffer_size": len(getattr(self, "_go_evidence_events", []) or []),
+            "evidence_buffer_max": int(getattr(self, "_GO_EVIDENCE_EVENTS_MAX", 0) or 0),
+        }
+
     def _build_compact_burst_sync_timeline_entries(
         self,
         sync: LiveSyncState,
@@ -9200,6 +9273,9 @@ class RadarState:
                 "df11_residual_observations": [],
                 "chart_overlay_consistent": False,
                 "retention_diagnostics": retention_diagnostics,
+                "display_retention_diagnostic": self._build_display_retention_diagnostic(
+                    sync, [], [], window_s
+                ),
                 "alignment_status": alignment_status,
                 "sync_mode_diagnostics": sync_mode_diagnostics,
                 "burst_sync_diagnostic": burst_sync_diagnostic,
@@ -9288,6 +9364,9 @@ class RadarState:
                 "df11_residual_observations": df11_residual_observations,
                 "chart_overlay_consistent": True,
                 "retention_diagnostics": retention_diagnostics,
+                "display_retention_diagnostic": self._build_display_retention_diagnostic(
+                    sync, entries, df11_residual_observations, window_s
+                ),
                 "diagnostics_mode": "refined_go_sync" if getattr(sync, "source", None) == "go_multi_aircraft_burst" else "compact_go_sync",
                 "alignment_status": alignment_status,
                 "sync_mode_diagnostics": sync_mode_diagnostics,
@@ -9529,6 +9608,9 @@ class RadarState:
             "df11_residual_observations": df11_residual_observations,
             "chart_overlay_consistent": True,
             "retention_diagnostics": retention_diagnostics,
+            "display_retention_diagnostic": self._build_display_retention_diagnostic(
+                sync, entries, df11_residual_observations, window_s
+            ),
             "alignment_status": alignment_status,
             "sync_mode_diagnostics": sync_mode_diagnostics,
         }
@@ -9619,6 +9701,7 @@ class RadarState:
             "period_history": burst_timeline.get("period_history", []),
             "motion_comp_summary": burst_timeline.get("motion_comp_summary"),
             "retention_diagnostics": burst_timeline.get("retention_diagnostics"),
+            "display_retention_diagnostic": burst_timeline.get("display_retention_diagnostic"),
             "alignment_status": burst_timeline.get("alignment_status"),
             "sync_mode_diagnostics": burst_timeline.get("sync_mode_diagnostics"),
             "sync_horizons": burst_timeline.get("sync_horizons"),

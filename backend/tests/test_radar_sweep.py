@@ -3523,6 +3523,65 @@ def test_go_sync_display_retention_independent_of_fit_window(monkeypatch):
     assert got_fits == pytest.approx(fit_windows)
 
 
+def test_burst_evidence_buffer_time_pruned_for_display_window(monkeypatch):
+    """Problem A: the burst-evidence deque must be time-pruned (not just
+    count-capped) so the chart can render the full 300s display window even
+    when burst rates would otherwise fill the count cap inside ~30s."""
+    import radar.sweep as sweep_module
+
+    # Simulate "now" 1000s in. The pruner uses now_us derived from
+    # _latest_burst_us / _latest_event_us, so set those alongside time.time.
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+    state = RadarState()
+    # Synthetic latest beast/event clocks that match wall time scale.
+    state._latest_burst_us = 1_000.0 * 1_000_000.0
+    state._latest_event_us = 1_000.0 * 1_000_000.0
+
+    # Cap is 60_000; push 100_000 entries spanning 1200s of wall time.
+    # After time-pruning to DF11_RESIDUAL_EVENT_MAX_AGE_S (360s), entries older
+    # than now-360s = wall_ts < 640s must be dropped.
+    from collections import deque
+    state._go_evidence_events = deque(maxlen=state._GO_EVIDENCE_EVENTS_MAX)
+    for i in range(100_000):
+        # wall_ts spread evenly from 0..1000s.
+        wall_ts = 1000.0 - (100_000 - i) * (1000.0 / 100_000)
+        state._go_evidence_events.append({
+            "kind": "burst_fired", "iid": 1, "icao": "AAAAAA",
+            "arrival_us": 0.0, "wall_ts": wall_ts,
+        })
+
+    # Force a prune cycle directly via the helper.
+    state._prune_go_evidence_events_locked(1000.0)
+    survivors = list(state._go_evidence_events)
+    assert len(survivors) > 0
+    oldest_wall = min(float(e["wall_ts"]) for e in survivors)
+    assert oldest_wall >= 1000.0 - sweep_module.DF11_RESIDUAL_EVENT_MAX_AGE_S - 1.0, (
+        f"oldest survivor wall_ts={oldest_wall} not within retention window"
+    )
+
+
+def test_burst_timeline_includes_display_retention_diagnostic(monkeypatch):
+    """The burst timeline payload exposes axis vs fit window vs realised
+    point ages so the UI can detect silent truncation."""
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+    state = RadarState()
+    state._models[3] = RadarIID(iid=3, status="SINGLE_RADAR", period_s=4.0)
+    snapshot = state.get_live_sync_snapshot(3, window_s=300.0, debug_limit=20)
+    diag = snapshot.get("display_retention_diagnostic")
+    assert diag is not None, "display_retention_diagnostic missing from snapshot"
+    assert diag["axis_window_s"] == pytest.approx(300.0)
+    assert diag["display_window_s"] == pytest.approx(300.0)
+    assert "fit_window_s" in diag
+    assert "plotted_point_count" in diag
+    assert "oldest_point_age_s" in diag
+    assert "newest_point_age_s" in diag
+    assert "evidence_buffer_size" in diag
+    assert "evidence_buffer_max" in diag
+    assert diag["evidence_buffer_max"] == state._GO_EVIDENCE_EVENTS_MAX
+
+
 def test_go_long_term_estimator_fields_round_trip_through_bridge(monkeypatch):
     """Layer 6: the new Local* / LongTerm* / Branch* protocol keys land on
     LiveSyncState with the right types. UI consumers depend on these names."""

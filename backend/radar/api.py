@@ -1186,6 +1186,7 @@ def build_iid_sync_snapshot_payload(
             "phase_anchor_candidates": [],
             "motion_comp_summary": None,
             "retention_diagnostics": None,
+            "display_retention_diagnostic": None,
             "sync_horizons": None,
         }
     snapshot = state.get_live_sync_snapshot(iid, window_s=window_s, debug_limit=debug_limit)

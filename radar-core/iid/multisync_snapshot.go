@@ -124,10 +124,12 @@ type MultiSyncSnapshot struct {
 	ResidualCorrectionBasis       string
 	MotionGuardDegraded           bool
 
-	// ─── Long-term estimator separation (Layer 1: diagnostics) ────────────────
+	// ─── Long-term estimator separation ───────────────────────────────────────
 	// Local* fields are the short-window (current fit window) measurement.
-	// LongTerm* / Branch* fields are the persistent estimator state. In Layer 1
-	// LongTerm* are zero-valued placeholders; Layer 2/3 wire them to behaviour.
+	// LongTerm* / Branch* fields are the persistent estimator state and drive
+	// the applied refined period and authority promotion gates. The published
+	// PeriodS follows LongTermPeriodEstimateS once seeded; promotion blocks
+	// until BranchEstimatorConfidence has accumulated.
 	LocalPeriodMeasurementS  float64
 	LocalCandidateAnchorICAO *uint32
 	LocalBranchOffsetDeg     float64

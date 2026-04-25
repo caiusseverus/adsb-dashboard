@@ -28,12 +28,14 @@ package iid
 //     residuals are a separate diagnostic basis until promotion.
 //
 // File layout (each stage can be tested independently):
-//   multisync.go           — solver struct, public API, runFit orchestration
-//   multisync_observation.go — Stage 1: propagation correction, residual scoring, fit eligibility
-//   multisync_period.go    — Stage 2: slope fitting, period refinement, trust promotion
-//   multisync_phase.go     — Stage 3: anchor selection, phase branch solving, validation
-//   multisync_authority.go — Stage 4: authority state machine, candidate/authoritative update
-//   multisync_snapshot.go  — Snapshot construction and protocol emission
+//   multisync.go              — solver struct, public API, runFit orchestration
+//   multisync_observation.go  — Stage 1: propagation correction, residual scoring, fit eligibility
+//   multisync_period.go       — Stage 2: slope fitting, period refinement, trust promotion
+//   multisync_phase.go        — Stage 3: anchor selection, phase branch solving, validation
+//   multisync_authority.go    — Stage 4: authority state machine, candidate/authoritative update
+//   multisync_long_term.go    — persistent long-term period estimator (bounded EMA around dominant)
+//   multisync_branch.go       — persistent bounded branch-track set with validation-aware updates
+//   multisync_snapshot.go     — Snapshot construction and protocol emission
 
 import (
 	"math"
@@ -438,18 +440,15 @@ type MultiSyncSolver struct {
 	LastResidualCorrectionBasis       string
 	LastMotionGuardDegraded           bool
 
-	// ─── Long-term estimator separation (Layer 1: diagnostic outputs) ─────────
+	// ─── Long-term estimator separation ───────────────────────────────────────
 	// These fields separate the short-term measurement (the 30s fit window) from
-	// the long-term applied state. In Layer 1 they are populated as DIAGNOSTICS
-	// only — `PeriodS`, `PhaseOffsetDeg`, etc. are still driven directly by the
-	// short-window fit. Layer 2/3 reroute the apply path through the long-term
-	// estimator, at which point `LastLocalPeriodMeasurementS` becomes the input
-	// to the EMA and `LongTermPeriodEstimateS` becomes the published period.
-	//
-	// Existing `LastResidualSlopeDegPerS`, `LastFitSpanS`, etc. continue to mean
-	// the short-window measurement (their original semantics — preserved for
-	// compatibility). The `LastLocal*` mirrors below name them explicitly so
-	// callers can disambiguate measurement vs applied without grepping history.
+	// the long-term applied state. `LastLocal*` mirror the per-window fit
+	// outputs; `LongTerm*` and `Branch*` hold the persistent estimator state.
+	// `LongTermPeriodEstimateS` drives the published `PeriodS` via the apply
+	// path in runFit (sourced from the long-term estimator once seeded).
+	// Branch promotion to authoritative authority requires accumulated branch
+	// confidence. Existing `LastResidualSlopeDegPerS`, `LastFitSpanS`, etc.
+	// continue to mean the short-window measurement.
 	LastLocalPeriodMeasurementS float64 // slope-corrected refined period from current fit window
 	LastLocalCandidateAnchorICAO *uint32
 	LastLocalBranchOffsetDeg     float64 // candidate phase offset chosen by current fit window
@@ -1084,21 +1083,30 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	ms.LastLocalBranchOffsetDeg = finalAlignment.offsetDeg
 	ms.LastLocalValidatorAgreement = validation.validatorAgreement
 
-	// Layer 3: ingest the local candidate into the persistent branch tracker.
-	// The dominant track populates LongTermBranch* fields. Authority promotion
-	// (Layer 4) consumes accumulated branch confidence rather than the
-	// per-window candidate.
+	// Layer 3 / fix: ingest the local candidate into the persistent branch
+	// tracker, validation-aware. The dominant track populates LongTermBranch*
+	// fields. Authority promotion (Layer 4) consumes accumulated branch
+	// confidence rather than the per-window candidate.
 	branchQuality := ms.LastLocalFitQualityScore
-	if validation.strong {
+	var branchValidation LocalCandidateValidation
+	switch {
+	case validation.strong:
+		branchValidation = LocalCandidateValidated
 		branchQuality = math.Min(1.0, branchQuality+0.1)
-	} else if validation.weak {
+	case validation.status == "validator_disagreement" || validation.status == "branch_ambiguous":
+		branchValidation = LocalCandidateDisagreed
+	case validation.weak:
+		branchValidation = LocalCandidateWeak
 		branchQuality *= 0.5
+	default:
+		branchValidation = LocalCandidateWeak
 	}
 	ms.updateBranchTracks(
 		ms.LastLocalCandidateAnchorICAO,
 		ms.LastLocalBranchOffsetDeg,
 		branchQuality,
 		nowUnix,
+		branchValidation,
 	)
 
 	// ── Stage 4: Candidate and authoritative state update ─────────────────────

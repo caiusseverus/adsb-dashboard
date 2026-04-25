@@ -722,13 +722,24 @@ func TestAuthority_BlockReason_AllGatesPassed(t *testing.T) {
 	ms := newSolver()
 	ms.ActiveAuthorityMode = authorityModeRefined
 	ms.CandidatePromotionStreak = candidatePromotionMinStreak + 1
+	// Layer 4 / fix: long-term estimator state must exist for the all-gates-
+	// passed assertion to hold; explicit unseeded gates now fire otherwise.
+	ms.LongTermPeriodEstimateS = 4.0
+	ms.LongTermPeriodEstimatorConfidence = 0.9
+	anchor := uint32(0xA01)
+	ms.BranchTracks = []*BranchEstimate{{
+		OffsetDeg: 45.0, AnchorICAO: &anchor,
+		Confidence:                  0.9,
+		ConsecutiveSupportedWindows: 5,
+	}}
+	ms.BranchEstimatorConfidence = 0.9
 
 	estimate := syncStateEstimate{
 		present:    true,
 		periodS:    4.0,
 		epochUS:    0,
 		offsetDeg:  45.0,
-		anchorICAO: ptr(uint32(0xA01)),
+		anchorICAO: &anchor,
 	}
 	v := strongValidation()
 	reason := ms.candidateApplicationBlockReason(estimate, v, true, true, trustMinFitPool+1, validatorAgreementMinCount+1, false, true, 1000.0)

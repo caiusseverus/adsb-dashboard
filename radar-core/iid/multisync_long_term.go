@@ -69,12 +69,25 @@ func (ms *MultiSyncSolver) updateLongTermPeriodEstimator(
 	}
 
 	// Bootstrap exception: first viable window seeds the estimator directly.
-	// Subsequent windows can only nudge.
+	// Subsequent windows can only nudge. The seed itself MUST respect the
+	// dominant-prior bound; otherwise a wildly off-family local measurement
+	// would be stored verbatim and the dominant clamp would only engage on the
+	// next nudge — by which point the published period has already followed
+	// the bad seed for one window.
 	if ms.LongTermPeriodEstimateS <= 0 {
 		if localQuality < longTermPeriodSeedQualityMin {
 			return
 		}
-		ms.LongTermPeriodEstimateS = localPeriodS
+		seedPeriodS := localPeriodS
+		if dominantPeriodS > 0 {
+			maxDiff := dominantPeriodS * periodRefineMaxPPMFromDominant * 1e-6
+			if seedPeriodS > dominantPeriodS+maxDiff {
+				seedPeriodS = dominantPeriodS + maxDiff
+			} else if seedPeriodS < dominantPeriodS-maxDiff {
+				seedPeriodS = dominantPeriodS - maxDiff
+			}
+		}
+		ms.LongTermPeriodEstimateS = seedPeriodS
 		ms.LongTermPeriodEstimatorConfidence = clamp(localQuality, 0, 1)
 		ms.ConsecutivePeriodConsistentWindows = 1
 		ms.LastPeriodUpdateDeltaS = 0

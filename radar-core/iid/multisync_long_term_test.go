@@ -269,7 +269,7 @@ func TestLayer3_StableBranchAccumulatesConfidence(t *testing.T) {
 	rng := newDeterministicRNG(0x42)
 	for i := 0; i < 30; i++ {
 		jitter := (rng.float64()*2 - 1) * 2.0 // ±2°
-		ms.updateBranchTracks(&anchor, branchOffset+jitter, 1.0, 1000.0+float64(i))
+		ms.updateBranchTracks(&anchor, branchOffset+jitter, 1.0, 1000.0+float64(i), LocalCandidateValidated)
 	}
 
 	if len(ms.BranchTracks) != 1 {
@@ -302,7 +302,7 @@ func TestLayer3_SustainedContradictionTakesOver(t *testing.T) {
 
 	// Establish anchorA / offsetA dominant.
 	for i := 0; i < 15; i++ {
-		ms.updateBranchTracks(&anchorA, offsetA, 1.0, 1000.0+float64(i))
+		ms.updateBranchTracks(&anchorA, offsetA, 1.0, 1000.0+float64(i), LocalCandidateValidated)
 	}
 	if ms.LongTermBranchAnchorICAO == nil || *ms.LongTermBranchAnchorICAO != anchorA {
 		t.Fatalf("seed phase: dominant should be A, got %v", ms.LongTermBranchAnchorICAO)
@@ -311,7 +311,7 @@ func TestLayer3_SustainedContradictionTakesOver(t *testing.T) {
 
 	// Sustained competing branch B for 20 windows.
 	for i := 0; i < 20; i++ {
-		ms.updateBranchTracks(&anchorB, offsetB, 1.0, 2000.0+float64(i))
+		ms.updateBranchTracks(&anchorB, offsetB, 1.0, 2000.0+float64(i), LocalCandidateValidated)
 	}
 
 	if ms.LongTermBranchAnchorICAO == nil || *ms.LongTermBranchAnchorICAO != anchorB {
@@ -338,7 +338,7 @@ func TestLayer3_BranchTracksCappedAtMax(t *testing.T) {
 	for i := 0; i < 30; i++ {
 		anchor := uint32(0xA00 + i)
 		offset := math.Mod(float64(i)*40.0, 360.0)
-		ms.updateBranchTracks(&anchor, offset, 1.0, 1000.0+float64(i))
+		ms.updateBranchTracks(&anchor, offset, 1.0, 1000.0+float64(i), LocalCandidateValidated)
 		if len(ms.BranchTracks) > branchMaxTracks {
 			t.Fatalf("BranchTracks exceeded cap %d at iteration %d: got %d",
 				branchMaxTracks, i, len(ms.BranchTracks))
@@ -374,14 +374,20 @@ func TestLayer4_PeriodEstimatorConfidenceGate(t *testing.T) {
 		t.Errorf("block reason missing diagnostic numbers: %q", reason)
 	}
 
-	// Once confidence rises above threshold, the gate clears (other gates
-	// must not fire — branch tracks are empty so branch gates pass).
+	// Once confidence rises above threshold AND a branch track exists with
+	// enough confidence, the gate clears.
 	ms.LongTermPeriodEstimatorConfidence = periodEstimatorMinConfidence + 0.05
+	anchor := uint32(0xA01)
+	ms.BranchTracks = []*BranchEstimate{{
+		OffsetDeg: 45.0, AnchorICAO: &anchor,
+		Confidence: 0.9, ConsecutiveSupportedWindows: 5,
+	}}
+	ms.BranchEstimatorConfidence = 0.9
 	reason = ms.candidateApplicationBlockReason(
 		estimate, v, true, true, trustMinFitPool+1, validatorAgreementMinCount+2, false, true, 1000.0,
 	)
 	if reason != "" {
-		t.Errorf("expected no block once period confidence sufficient, got %q", reason)
+		t.Errorf("expected no block once period confidence sufficient and branch seeded, got %q", reason)
 	}
 }
 
@@ -446,6 +452,157 @@ func TestLayer4_BranchCompetitorDominantGate(t *testing.T) {
 	)
 	if reason == "branch_competitor_dominant" {
 		t.Errorf("expected gate to clear once competitor decays, got %q", reason)
+	}
+}
+
+// D: Published period uses long-term estimate, not per-window measurement.
+// After seeding, an injected window-to-window noisy local measurement must
+// not be reflected verbatim in PeriodS — the apply path runs through the
+// long-term EMA so PeriodS smooths.
+func TestLayer2_PublishedPeriodFollowsLongTermNotLocal(t *testing.T) {
+	ms := newSolver()
+	truth := 4.8
+	dominantS := truth
+	// Seed at truth.
+	ms.updateLongTermPeriodEstimator(truth, dominantS, 1000.0, 1.0)
+	// Stabilise.
+	for i := 0; i < 10; i++ {
+		ms.updateLongTermPeriodEstimator(truth, dominantS, 1000.0+float64(i+1), 1.0)
+	}
+
+	// Inject a noisy local measurement that is +50 PPM off truth.
+	noisyLocal := truth * (1.0 + 50e-6)
+	preLT := ms.LongTermPeriodEstimateS
+	ms.updateLongTermPeriodEstimator(noisyLocal, dominantS, 1100.0, 1.0)
+	postLT := ms.LongTermPeriodEstimateS
+
+	// Long-term must move by less than the noise — that's the EMA contract.
+	movedLT := math.Abs(postLT-preLT) / truth * 1e6
+	if movedLT >= 50.0 {
+		t.Errorf("long-term EMA failed to attenuate: moved %.2f PPM (input was 50 PPM)", movedLT)
+	}
+
+	// And the long-term result is between preLT and noisyLocal (correct EMA direction).
+	if !(postLT >= preLT && postLT <= noisyLocal+1e-12) {
+		t.Errorf("long-term direction wrong: preLT=%v postLT=%v noisy=%v", preLT, postLT, noisyLocal)
+	}
+}
+
+// F: Bootstrap clamp — first seed outside ±300 PPM of dominant prior is
+// clamped to the bound before storage.
+func TestLayer2_BootstrapSeedClampedToDominantBound(t *testing.T) {
+	ms := newSolver()
+	dominantS := 4.8
+	// First local measurement is +5000 PPM above dominant.
+	farLocal := dominantS * (1.0 + 5000e-6)
+	ms.updateLongTermPeriodEstimator(farLocal, dominantS, 1000.0, 1.0)
+	upperBound := dominantS * (1.0 + periodRefineMaxPPMFromDominant*1e-6)
+	if ms.LongTermPeriodEstimateS > upperBound+1e-9 {
+		t.Errorf("bootstrap seed not clamped: stored %v, max allowed %v (dominant=%v)",
+			ms.LongTermPeriodEstimateS, upperBound, dominantS)
+	}
+	// And the symmetric negative direction.
+	ms2 := newSolver()
+	belowLocal := dominantS * (1.0 - 5000e-6)
+	ms2.updateLongTermPeriodEstimator(belowLocal, dominantS, 1000.0, 1.0)
+	lowerBound := dominantS * (1.0 - periodRefineMaxPPMFromDominant*1e-6)
+	if ms2.LongTermPeriodEstimateS < lowerBound-1e-9 {
+		t.Errorf("bootstrap seed not clamped (low): stored %v, min allowed %v",
+			ms2.LongTermPeriodEstimateS, lowerBound)
+	}
+}
+
+// G1: promotion is blocked with period_estimator_unseeded when period
+// estimator is absent, regardless of how strong the rest of the gates are.
+func TestLayer4_PeriodEstimatorUnseededBlocksPromotion(t *testing.T) {
+	ms := newSolver()
+	ms.ActiveAuthorityMode = authorityModeRefined
+	ms.CandidatePromotionStreak = candidatePromotionMinStreak + 1
+	// Long-term period estimator NOT seeded.
+	ms.LongTermPeriodEstimateS = 0
+	estimate := syncStateEstimate{
+		present: true, periodS: 4.8, epochUS: 0, offsetDeg: 45.0,
+		anchorICAO: ptr(uint32(0xA01)),
+	}
+	reason := ms.candidateApplicationBlockReason(
+		estimate, strongValidation(), true, true, trustMinFitPool+1, validatorAgreementMinCount+2, false, true, 1000.0,
+	)
+	if reason != "period_estimator_unseeded" {
+		t.Errorf("expected period_estimator_unseeded, got %q", reason)
+	}
+}
+
+// G2: promotion is blocked with branch_estimator_unseeded when a candidate
+// anchor is selected but no branch track has been spawned yet.
+func TestLayer4_BranchEstimatorUnseededBlocksPromotion(t *testing.T) {
+	ms := newSolver()
+	ms.ActiveAuthorityMode = authorityModeRefined
+	ms.CandidatePromotionStreak = candidatePromotionMinStreak + 1
+	ms.LongTermPeriodEstimateS = 4.8
+	ms.LongTermPeriodEstimatorConfidence = 0.9
+	// BranchTracks empty.
+	ms.BranchTracks = nil
+	estimate := syncStateEstimate{
+		present: true, periodS: 4.8, epochUS: 0, offsetDeg: 45.0,
+		anchorICAO: ptr(uint32(0xA01)),
+	}
+	reason := ms.candidateApplicationBlockReason(
+		estimate, strongValidation(), true, true, trustMinFitPool+1, validatorAgreementMinCount+2, false, true, 1000.0,
+	)
+	if reason != "branch_estimator_unseeded" {
+		t.Errorf("expected branch_estimator_unseeded, got %q", reason)
+	}
+}
+
+// H: validation-aware branch reinforcement.
+//
+//   - validated candidate increases dominant track confidence
+//   - weak candidate uses reduced reinforcement
+//   - validator_disagreement candidate does NOT reinforce the matched track
+func TestLayer3_BranchReinforcementRespectsValidation(t *testing.T) {
+	// Set up: seed a track with anchorA at offsetA via a few validated windows.
+	seed := func() *MultiSyncSolver {
+		ms := newSolver()
+		anchor := uint32(0xA01)
+		for i := 0; i < 3; i++ {
+			ms.updateBranchTracks(&anchor, 90.0, 1.0, 1000.0+float64(i), LocalCandidateValidated)
+		}
+		return ms
+	}
+	anchor := uint32(0xA01)
+
+	// Validated reinforcement raises confidence.
+	msV := seed()
+	confBeforeV := msV.BranchEstimatorConfidence
+	msV.updateBranchTracks(&anchor, 90.0, 1.0, 2000.0, LocalCandidateValidated)
+	if msV.BranchEstimatorConfidence <= confBeforeV {
+		t.Errorf("validated candidate should raise confidence: before=%v after=%v",
+			confBeforeV, msV.BranchEstimatorConfidence)
+	}
+
+	// Weak reinforcement uses reduced step (smaller delta than validated).
+	msW := seed()
+	confBeforeW := msW.BranchEstimatorConfidence
+	msW.updateBranchTracks(&anchor, 90.0, 1.0, 2000.0, LocalCandidateWeak)
+	deltaWeak := msW.BranchEstimatorConfidence - confBeforeW
+	deltaValidated := msV.BranchEstimatorConfidence - confBeforeV
+	if deltaWeak >= deltaValidated {
+		t.Errorf("weak reinforcement should be smaller than validated: weak=%v validated=%v",
+			deltaWeak, deltaValidated)
+	}
+	if deltaWeak <= 0 {
+		// Weak should still reinforce slightly, just not at full rate.
+		t.Errorf("weak reinforcement should still be positive, got %v", deltaWeak)
+	}
+
+	// Disagreed candidate (matching offset) must NOT raise the matched track's
+	// confidence.
+	msD := seed()
+	confBeforeD := msD.BranchEstimatorConfidence
+	msD.updateBranchTracks(&anchor, 90.0, 1.0, 2000.0, LocalCandidateDisagreed)
+	if msD.BranchEstimatorConfidence > confBeforeD {
+		t.Errorf("disagreed candidate must not raise dominant confidence: before=%v after=%v",
+			confBeforeD, msD.BranchEstimatorConfidence)
 	}
 }
 
