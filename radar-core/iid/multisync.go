@@ -280,13 +280,22 @@ type syncStateEstimate struct {
 type syncValidationSummary struct {
 	score              float64
 	branchAmbiguity    float64
-	circularDispersion float64
-	validatorAgreement int
-	validatorDisagree  int
-	validatorEvaluated int
-	status             string
-	strong             bool
-	weak               bool
+	// anchorCompetitionAmbiguity is the raw secondScore/topScore from anchor-candidate
+	// competition, before the global observation-coherence modifiers are applied.
+	// branchAmbiguity is the combined score used for operational decisions.
+	anchorCompetitionAmbiguity float64
+	circularDispersion         float64
+	validatorAgreement         int
+	validatorDisagree          int
+	validatorEvaluated         int
+	// validatorExcluded counts fit-eligible non-anchor ICAOs that had fewer than
+	// validatorMinObsPerICAO observations and were excluded from the agree/disagree tally.
+	validatorExcluded int
+	status            string
+	strong            bool
+	weak              bool
+	// PerICAOOffsets is the per-ICAO validator table built alongside validation.
+	PerICAOOffsets []PerICAOPhaseOffset
 }
 
 // MultiSyncSolver holds per-IID multi-aircraft sync refinement state.
@@ -402,9 +411,12 @@ type MultiSyncSolver struct {
 	LastAuthoritativePhaseGain           float64
 	LastPeriodFrozenDueToPhaseValidation bool
 	LastBranchAmbiguityScore             float64
+	LastAnchorCompetitionAmbiguity       float64
 	LastCircularDispersionDeg            float64
 	LastValidatorAgreementCount          int
 	LastValidatorDisagreementCount       int
+	LastValidatorExcludedCount           int
+	LastPerICAOPhaseOffsets              []PerICAOPhaseOffset
 	LastCandidateValidationStatus        string
 	LastCandidateApplicationBlockReason  string
 	LastCandidateMode                    string
@@ -576,9 +588,12 @@ func (ms *MultiSyncSolver) Reset() {
 	ms.LastAuthoritativePhaseGain = 0
 	ms.LastPeriodFrozenDueToPhaseValidation = false
 	ms.LastBranchAmbiguityScore = 0
+	ms.LastAnchorCompetitionAmbiguity = 0
 	ms.LastCircularDispersionDeg = 0
 	ms.LastValidatorAgreementCount = 0
 	ms.LastValidatorDisagreementCount = 0
+	ms.LastValidatorExcludedCount = 0
+	ms.LastPerICAOPhaseOffsets = nil
 	ms.LastCandidateValidationStatus = ""
 	ms.LastCandidateApplicationBlockReason = ""
 	ms.LastCandidateMode = ""
@@ -745,51 +760,30 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	ms.updateICAOQuality(prepared)
 	ms.LastRecoveryRelaxedAdmissions = recoveryRelaxedAdmissions
 
-	// Count inliers/rejects for diagnostics.
-	nInliers, nRejected := 0, 0
+	// Count rejects for cleanUpdate and trustedEnough gates.
+	nRejected := 0
 	for _, p := range prepared {
-		switch p.Status {
-		case "inlier":
-			nInliers++
-		case "rejected":
+		if p.Status == "rejected" {
 			nRejected++
 		}
 	}
 	majorityRejected := nRejected >= len(recent)/2+1
 
-	// ── Build fit pool (used in multiple places below) ────────────────────────
-	type fitEntry struct {
-		effectiveUS float64
-		residual    float64
-		weight      float64
-		icao        uint32
-	}
-	var fitPool []fitEntry
-	for _, p := range prepared {
-		if p.FitEligible && p.EffectiveWeight > 0 {
-			fitPool = append(fitPool, fitEntry{p.EffectiveUS, p.ResidualDeg, p.EffectiveWeight, p.Obs.ICAO})
-		}
-	}
-	if len(fitPool) == 0 {
-		for _, p := range prepared {
-			if p.BaseWeight > 0 && p.FitRejectReason != "near_wrap_residual" {
-				fitPool = append(fitPool, fitEntry{
-					p.EffectiveUS, p.ResidualDeg,
-					p.BaseWeight * msICAOQualityMult(ms.ICAOQuality[p.Obs.ICAO]),
-					p.Obs.ICAO,
-				})
-			}
-		}
-	}
-	if len(fitPool) == 0 {
-		ms.LastFitTotalObs = len(recent)
-		ms.LastFitEligibleObs = fitEligibleObs
-		ms.LastFitRejectedObs = len(recent) - fitEligibleObs
+	ms.LastFitTotalObs = len(recent)
+	ms.LastFitEligibleObs = fitEligibleObs
+	ms.LastFitRejectedObs = len(recent) - fitEligibleObs
+	ms.LastFitWindowS = windowS
+	ms.LastDisplayWindowS = multiSyncRetentionS
+	ms.LastFitRejectReasons = fitRejectReasons
+
+	// ── Stage 2: Period fitting ───────────────────────────────────────────────
+	// fitPeriod builds the fit pool internally and returns pool counts + residuals,
+	// eliminating the need for a duplicate pool construction here.
+	period := ms.fitPeriod(prepared, seedEpochUS, seedOffsetDeg, livePeriodS, basePeriodS, dominantPeriodS, recoveryActive, nowUnix)
+
+	if period.FitPoolCount == 0 {
 		ms.LastFitContributingICAOs = 0
-		ms.LastFitWindowS = windowS
-		ms.LastDisplayWindowS = multiSyncRetentionS
 		ms.LastFitSpanS = 0
-		ms.LastFitRejectReasons = fitRejectReasons
 		ms.LastAnchorCandidateCount = 0
 		ms.LastAnchorNoCandidate = "no_fit_pool"
 		ms.LastAnchorCandidates = nil
@@ -798,21 +792,7 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		return
 	}
 
-	fitICAOs := make(map[uint32]bool)
-	for _, fe := range fitPool {
-		fitICAOs[fe.icao] = true
-	}
-
-	ms.LastFitTotalObs = len(recent)
-	ms.LastFitEligibleObs = fitEligibleObs
-	ms.LastFitRejectedObs = len(recent) - fitEligibleObs
-	ms.LastFitContributingICAOs = len(fitICAOs)
-	ms.LastFitWindowS = windowS
-	ms.LastDisplayWindowS = multiSyncRetentionS
-	ms.LastFitRejectReasons = fitRejectReasons
-
-	// ── Stage 2: Period fitting ───────────────────────────────────────────────
-	period := ms.fitPeriod(prepared, seedEpochUS, seedOffsetDeg, livePeriodS, basePeriodS, dominantPeriodS, recoveryActive, nowUnix)
+	ms.LastFitContributingICAOs = period.FitICAOCount
 
 	ms.LastFitSpanS = period.FitSpanS
 	ms.LastResidualSlopeDegPerS = period.ResidualSlopeDegPerS
@@ -855,33 +835,13 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	var finalAlignment publishedAlignment
 	finalAlignmentReady := false
 
-	// weighted linear fit for clean-update check
-	tRef := 0.0
-	if len(fitPool) > 0 {
-		tRef = fitPool[0].effectiveUS
-		for _, fe := range fitPool {
-			if fe.effectiveUS < tRef {
-				tRef = fe.effectiveUS
-			}
-		}
-		tRef /= 1e6
-	}
-	xs := make([]float64, len(fitPool))
-	ys := make([]float64, len(fitPool))
-	ws := make([]float64, len(fitPool))
-	for i, fe := range fitPool {
-		xs[i] = fe.effectiveUS/1e6 - tRef
-		ys[i] = fe.residual
-		ws[i] = fe.weight
-	}
-	aFit, bFit := weightedLinearFit(xs, ys, ws)
-	detrended := msDetrendedMAD(prepared, aFit, bFit, tRef)
-
+	// period.DetrendedMADDeg is computed by fitPeriod over the same fit pool,
+	// avoiding a duplicate weighted linear fit here.
 	cleanUpdate := len(recent) > 0 &&
 		float64(nRejected)/float64(len(recent)) < 0.25 &&
-		len(fitPool) >= 6 &&
-		len(fitICAOs) >= 2 &&
-		detrended <= reacquireMADThreshold
+		period.FitPoolCount >= 6 &&
+		period.FitICAOCount >= 2 &&
+		period.DetrendedMADDeg <= reacquireMADThreshold
 
 	// applyReacquireCandidate applies a reacquire search result if valid.
 	// When dominantPeriodS > 0, candidates outside the refinement bound are
@@ -954,9 +914,9 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	trustedEnough := !majorityRejected &&
 		len(recent) > 0 &&
 		float64(nRejected)/float64(len(recent)) < trustMaxRejFrac &&
-		len(fitPool) >= trustMinFitPool &&
-		len(fitICAOs) >= trustMinICAOs &&
-		detrended <= trustMaxResidualDeg
+		period.FitPoolCount >= trustMinFitPool &&
+		period.FitICAOCount >= trustMinICAOs &&
+		period.DetrendedMADDeg <= trustMaxResidualDeg
 	ms.applyTrustedBaseUpdate(finalPeriodS, trustedEnough, period.WrongPeriodSuspect)
 
 	// Update basePeriodS after trust update.
@@ -998,9 +958,12 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 
 	validation := ms.evaluatePhaseValidation(prepared, candidateEstimate, finalAlignment.anchorCandidates)
 	ms.LastBranchAmbiguityScore = validation.branchAmbiguity
+	ms.LastAnchorCompetitionAmbiguity = validation.anchorCompetitionAmbiguity
 	ms.LastCircularDispersionDeg = validation.circularDispersion
 	ms.LastValidatorAgreementCount = validation.validatorAgreement
 	ms.LastValidatorDisagreementCount = validation.validatorDisagree
+	ms.LastValidatorExcludedCount = validation.validatorExcluded
+	ms.LastPerICAOPhaseOffsets = validation.PerICAOOffsets
 	ms.LastCandidateValidationStatus = validation.status
 	ms.LastCandidateMode = candidateMode
 
@@ -1030,26 +993,25 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		}
 	}
 
-	// Residual EMA update from fit pool.
+	// Residual EMA update using the fit residuals returned by fitPeriod.
 	var newResidualEMA float64
 	if ms.ResidualEMADeg > 0 {
 		newResidualEMA = ms.ResidualEMADeg
-		for _, fe := range fitPool {
-			absR := math.Abs(fe.residual)
-			newResidualEMA = 0.85*newResidualEMA + 0.15*absR
+		for _, r := range period.FitResiduals {
+			newResidualEMA = 0.85*newResidualEMA + 0.15*math.Abs(r)
 		}
-	} else if len(fitPool) > 0 {
+	} else if len(period.FitResiduals) > 0 {
 		sum := 0.0
-		for _, fe := range fitPool {
-			sum += math.Abs(fe.residual)
+		for _, r := range period.FitResiduals {
+			sum += math.Abs(r)
 		}
-		newResidualEMA = sum / float64(len(fitPool))
+		newResidualEMA = sum / float64(len(period.FitResiduals))
 	} else {
 		newResidualEMA = 5.0
 	}
 
 	ms.Present = true
-	ms.Usable = len(fitPool) >= 4 && !majorityRejected
+	ms.Usable = period.FitPoolCount >= 4 && !majorityRejected
 	ms.PeriodS = publishedEstimate.periodS
 	ms.PeriodBaseS = basePeriodS
 	ms.PhaseEpochUS = publishedEstimate.epochUS
@@ -1061,7 +1023,7 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	}
 	ms.ResidualEMADeg = newResidualEMA
 	ms.NSyncUpdates++
-	ms.Holdover = len(fitPool) < 2
+	ms.Holdover = period.FitPoolCount < 2
 	ms.LastUpdated = nowUnix
 
 	if candidateEstimate.anchorICAO != nil {
@@ -1091,7 +1053,7 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		ms.AnchorICAO != nil &&
 		validation.score >= authoritativeValidationStrong &&
 		validation.branchAmbiguity < branchAmbiguityRejectThreshold &&
-		(len(fitICAOs) < validatorAgreementMinCount || validation.validatorAgreement >= validatorAgreementMinCount)
+		(period.FitICAOCount < validatorAgreementMinCount || validation.validatorAgreement >= validatorAgreementMinCount)
 
 	// ── Authority mode post-fit update ────────────────────────────────────────
 	_, candidateDeltaToDominantPPM := periodDeltaToDominant(candidateEstimate.periodS, dominantPeriodS)
@@ -1099,8 +1061,8 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 
 	refinedHealthy := ms.Usable &&
 		candidateEstimate.anchorICAO != nil &&
-		len(fitPool) >= trustMinFitPool &&
-		len(fitICAOs) >= validatorAgreementMinCount &&
+		period.FitPoolCount >= trustMinFitPool &&
+		period.FitICAOCount >= validatorAgreementMinCount &&
 		validation.strong &&
 		dominantBoundOK &&
 		!majorityRejected &&
@@ -1112,7 +1074,7 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		validation.weak ||
 		period.WrongPeriodSuspect ||
 		majorityRejected ||
-		detrended > reacquireMADThreshold
+		period.DetrendedMADDeg > reacquireMADThreshold
 
 	compactHealthy := false
 	if sync != nil && compactPeriodS > 0 {
@@ -1134,7 +1096,7 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		ms.LastCandidateApplicationBlockReason = ms.candidateApplicationBlockReason(
 			candidateEstimate, validation,
 			period.SlopeGatePassed, dominantBoundOK,
-			len(fitPool), len(fitICAOs),
+			period.FitPoolCount, period.FitICAOCount,
 			recoveryRequested, cleanUpdate,
 			nowUnix,
 		)

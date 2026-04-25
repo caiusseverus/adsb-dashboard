@@ -2,6 +2,7 @@ package iid
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -751,12 +752,12 @@ func TestMultiSyncSolver_CandidateApplicationBlockReasons(t *testing.T) {
 	}
 	insufficientAgreement := validation
 	insufficientAgreement.status = "insufficient_validator_agreement"
-	if got := ms.candidateApplicationBlockReason(estimate, insufficientAgreement, true, true, trustMinFitPool, 3, false, true, 100); got != "validator_agreement_insufficient" {
+	if got := ms.candidateApplicationBlockReason(estimate, insufficientAgreement, true, true, trustMinFitPool, 3, false, true, 100); !strings.HasPrefix(got, "validator_agreement_insufficient") {
 		t.Fatalf("agreement blocker = %q", got)
 	}
 	disagreement := validation
 	disagreement.status = "validator_disagreement"
-	if got := ms.candidateApplicationBlockReason(estimate, disagreement, true, true, trustMinFitPool, 3, false, true, 100); got != "validator_disagreement_too_high" {
+	if got := ms.candidateApplicationBlockReason(estimate, disagreement, true, true, trustMinFitPool, 3, false, true, 100); !strings.HasPrefix(got, "validator_disagreement_too_high") {
 		t.Fatalf("disagreement blocker = %q", got)
 	}
 	ms.CandidatePromotionStreak = candidatePromotionMinStreak - 1
@@ -802,7 +803,7 @@ func TestMultiSyncSolver_RealisticPartialDisagreementCanPromote(t *testing.T) {
 	if failed.status != "validator_disagreement" {
 		t.Fatalf("3/9 validators status=%q, want validator_disagreement", failed.status)
 	}
-	if got := ms.candidateApplicationBlockReason(estimate, failed, true, true, trustMinFitPool, 12, false, true, 100); got != "validator_disagreement_too_high" {
+	if got := ms.candidateApplicationBlockReason(estimate, failed, true, true, trustMinFitPool, 12, false, true, 100); !strings.HasPrefix(got, "validator_disagreement_too_high") {
 		t.Fatalf("3/9 blocker=%q", got)
 	}
 }

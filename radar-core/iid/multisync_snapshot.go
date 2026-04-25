@@ -87,9 +87,16 @@ type MultiSyncSnapshot struct {
 	AuthoritativePhaseUpdateGain     float64
 	PeriodFrozenDueToPhaseValidation bool
 	BranchAmbiguityScore             float64
+	// AnchorCompetitionAmbiguity is the raw secondScore/topScore from anchor-candidate
+	// competition before global observation-coherence modifiers are applied.
+	AnchorCompetitionAmbiguity       float64
 	CircularDispersionDeg            float64
 	ValidatorAgreementCount          int
 	ValidatorDisagreementCount       int
+	ValidatorExcludedCount           int
+	// PerICAOPhaseOffsets is the per-ICAO validator table from the last run.
+	// Each entry shows whether the ICAO was counted as agree/disagree/excluded and why.
+	PerICAOPhaseOffsets              []PerICAOPhaseOffset
 	CandidateValidationStatus        string
 	CandidateApplicationBlockReason  string
 	CandidateMode                    string
@@ -194,9 +201,11 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 		AuthoritativePhaseUpdateGain:     ms.LastAuthoritativePhaseGain,
 		PeriodFrozenDueToPhaseValidation: ms.LastPeriodFrozenDueToPhaseValidation,
 		BranchAmbiguityScore:             ms.LastBranchAmbiguityScore,
+		AnchorCompetitionAmbiguity:       ms.LastAnchorCompetitionAmbiguity,
 		CircularDispersionDeg:            ms.LastCircularDispersionDeg,
 		ValidatorAgreementCount:          ms.LastValidatorAgreementCount,
 		ValidatorDisagreementCount:       ms.LastValidatorDisagreementCount,
+		ValidatorExcludedCount:           ms.LastValidatorExcludedCount,
 		CandidateValidationStatus:        ms.LastCandidateValidationStatus,
 		CandidateApplicationBlockReason:  ms.LastCandidateApplicationBlockReason,
 		CandidateMode:                    ms.LastCandidateMode,
@@ -221,6 +230,10 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 		snap.FitRejectReasons[k] = v
 	}
 	copy(snap.AnchorCandidates, ms.LastAnchorCandidates)
+	if len(ms.LastPerICAOPhaseOffsets) > 0 {
+		snap.PerICAOPhaseOffsets = make([]PerICAOPhaseOffset, len(ms.LastPerICAOPhaseOffsets))
+		copy(snap.PerICAOPhaseOffsets, ms.LastPerICAOPhaseOffsets)
+	}
 	if ms.AnchorICAO != nil {
 		v := *ms.AnchorICAO
 		snap.AnchorICAO = &v

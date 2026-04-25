@@ -1,6 +1,9 @@
 package iid
 
-import "math"
+import (
+	"fmt"
+	"math"
+)
 
 // multisync_authority.go — authority state machine.
 //
@@ -240,9 +243,11 @@ func (ms *MultiSyncSolver) candidateApplicationBlockReason(
 		case "validation_unavailable":
 			return "validation_unavailable"
 		case "insufficient_validator_agreement":
-			return "validator_agreement_insufficient"
+			return fmt.Sprintf("validator_agreement_insufficient: agree=%d eval=%d required>=%d",
+				validation.validatorAgreement, validation.validatorEvaluated, validatorAgreementMinCount)
 		case "validator_disagreement":
-			return "validator_disagreement_too_high"
+			return fmt.Sprintf("validator_disagreement_too_high: agree=%d reject=%d required agree>reject and agree>=%d",
+				validation.validatorAgreement, validation.validatorDisagree, validatorAgreementMinCount)
 		case "branch_ambiguous":
 			return "branch_ambiguous"
 		case "weak_validation":

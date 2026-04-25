@@ -62,6 +62,10 @@ type PeriodFitResult struct {
 	FitPoolCount int
 	FitICAOCount int
 
+	// FitResiduals holds the signed residuals of each fit-pool entry.
+	// Used by runFit for the residual EMA update without rebuilding the pool.
+	FitResiduals []float64
+
 	// Bearing spread of contributing ICAOs (for motion-guard geometry check).
 	BearingSpreadDeg float64
 
@@ -122,6 +126,7 @@ func (ms *MultiSyncSolver) fitPeriod(
 	fitICAOs := make(map[uint32]bool)
 	for _, fe := range fitPool {
 		fitICAOs[fe.icao] = true
+		r.FitResiduals = append(r.FitResiduals, fe.residual)
 	}
 	r.FitPoolCount = len(fitPool)
 	r.FitICAOCount = len(fitICAOs)
@@ -462,7 +467,6 @@ func (ms *MultiSyncSolver) retainedResidualSlopeUnwrapped(
 
 	for icao, obs := range byICAO {
 		if len(obs) < 2 {
-			nRejected += len(obs)
 			continue
 		}
 		sort.Slice(obs, func(i, j int) bool { return obs[i].x < obs[j].x })

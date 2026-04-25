@@ -16,6 +16,7 @@ package iid
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -978,5 +979,239 @@ func TestSnapshot_AnchorCandidates_NotAliased(t *testing.T) {
 	snap.AnchorCandidates[0].Score = 0.0
 	if ms.LastAnchorCandidates[0].Score == 0.0 {
 		t.Error("AnchorCandidates in snapshot must not alias solver field")
+	}
+}
+
+// ─── B7: Unwrapped slope double-count fix ──────────────────────────────────────
+
+// B7: retainedResidualSlopeUnwrapped does not double-count single-observation ICAOs.
+// After the fix, nAccepted + nRejected == total observations that passed the initial
+// quality filter. Single-obs ICAOs are in nRejected exactly once (they start in nRejected
+// and are never subtracted, since they are skipped before the accepted-- decrement).
+func TestPeriodFit_UnwrappedSlope_NoSingleObsDoubleCount(t *testing.T) {
+	ms := newSolver()
+	periodS := 4.0
+	epochUS := 0.0
+	offsetDeg := 0.0
+	nowUnix := 2000.0
+
+	sigVal := float32(-30.0)
+
+	// Three ICAOs with 2 obs each (qualify for per-ICAO unwrapped fit).
+	multiObsICAOs := []uint32{0x1, 0x2, 0x3}
+	// Two ICAOs with 1 obs each (disqualified by len<2 check).
+	singleObsICAOs := []uint32{0x4, 0x5}
+
+	for _, icao := range multiObsICAOs {
+		for j := 0; j < 2; j++ {
+			us := epochUS + float64(j)*periodS*1e6
+			bearing := simulatedBearing(us, epochUS, offsetDeg, periodS)
+			ms.obs = append(ms.obs, MultiSyncObs{
+				CentroidUS: us,
+				ICAO:       icao,
+				BearingDeg: bearing,
+				RangeNM:    30,
+				PosAgeS:    0.5,
+				NReplies:   8,
+				SignalDBFS: &sigVal,
+				WallTS:     nowUnix - float64(j)*0.5,
+			})
+		}
+	}
+	for _, icao := range singleObsICAOs {
+		ms.obs = append(ms.obs, MultiSyncObs{
+			CentroidUS: epochUS,
+			ICAO:       icao,
+			BearingDeg: offsetDeg,
+			RangeNM:    30,
+			PosAgeS:    0.5,
+			NReplies:   8,
+			SignalDBFS: &sigVal,
+			WallTS:     nowUnix,
+		})
+	}
+
+	_, nAcc, nRej, nRejAfterUnwrap, _, _, _, ok := ms.retainedResidualSlopeUnwrapped(epochUS, offsetDeg, periodS, nowUnix)
+
+	// If no slope was computed, the counts must still be consistent.
+	total := len(multiObsICAOs)*2 + len(singleObsICAOs)
+	if ok {
+		if nAcc+nRej != total {
+			t.Errorf("nAcc(%d)+nRej(%d)=%d must equal total input %d (no double-count)",
+				nAcc, nRej, nAcc+nRej, total)
+		}
+		if nRejAfterUnwrap > nRej {
+			t.Errorf("nRejAfterUnwrap(%d) must be <= nRej(%d)", nRejAfterUnwrap, nRej)
+		}
+	} else {
+		if nAcc+nRej > total {
+			t.Errorf("even without a fit, nAcc(%d)+nRej(%d)=%d exceeds total %d (double-count detected)",
+				nAcc, nRej, nAcc+nRej, total)
+		}
+	}
+}
+
+// ─── D12: Validator disagreement regression (3/18 scenario) ────────────────────
+
+// D12: regression — large validator disagreement produces a numeric block reason.
+// Models the "many ICAOs visible, anchor selected, many anchor deltas near zero,
+// but validator result says 3 agree / 18 reject" scenario.
+// Verifies that (a) the 18 rejections are legitimate (wrong-phase ICAOs with >=2 obs),
+// (b) the block reason includes numeric counts, and (c) the per-ICAO table
+// correctly classifies all 22 ICAOs.
+func TestAuthority_ValidatorDisagreementBlockReason_Numeric(t *testing.T) {
+	periodS := 4.0
+	epochUS := 0.0
+	anchorPhase := 45.0
+	anchor := uint32(0xA00)
+
+	// Helper: build 2 on-model PreparedObservations for one ICAO at the given phase offset.
+	obsForICAO := func(icao uint32, phaseOffset float64) []PreparedObservation {
+		var out []PreparedObservation
+		for j := 0; j < 2; j++ {
+			us := float64(j) * periodS * 1e6
+			phaseRel := math.Mod((us-epochUS)/(periodS*1e6)*360.0, 360.0)
+			if phaseRel < 0 {
+				phaseRel += 360.0
+			}
+			bearing := math.Mod(phaseRel+anchorPhase+phaseOffset, 360.0)
+			out = append(out, PreparedObservation{
+				Obs:             MultiSyncObs{ICAO: icao, BearingDeg: bearing},
+				EffectiveUS:     us,
+				FitEligible:     true,
+				EffectiveWeight: 1.0,
+				BaseWeight:      1.0,
+				Status:          "inlier",
+			})
+		}
+		return out
+	}
+
+	// Anchor: 2 observations at anchorPhase.
+	prepared := obsForICAO(anchor, 0)
+
+	// 3 validators that agree (phase offset 0° → |diff|=0 <= 12°).
+	for i := 0; i < 3; i++ {
+		prepared = append(prepared, obsForICAO(uint32(0xB00+i), 0)...)
+	}
+
+	// 18 validators that disagree (phase offset > validatorDisagreementPhaseDeg=24°).
+	for i := 0; i < 18; i++ {
+		prepared = append(prepared, obsForICAO(uint32(0xC00+i), validatorDisagreementPhaseDeg+6)...)
+	}
+
+	ms := newSolver()
+	ms.ActiveAuthorityMode = authorityModeRefined
+	ms.CandidatePromotionStreak = candidatePromotionMinStreak + 1
+
+	estimate := syncStateEstimate{
+		present:    true,
+		periodS:    periodS,
+		epochUS:    epochUS,
+		offsetDeg:  anchorPhase,
+		anchorICAO: ptr(anchor),
+	}
+	candidates := []AnchorCandidateSnapshot{
+		{ICAO: anchor, Score: 0.9, SpreadDeg: 3.0, Status: "candidate"},
+	}
+
+	v := ms.evaluatePhaseValidation(prepared, estimate, candidates)
+
+	// Verify validator counts match the setup.
+	if v.validatorAgreement != 3 {
+		t.Errorf("expected 3 validators agree, got %d", v.validatorAgreement)
+	}
+	if v.validatorDisagree != 18 {
+		t.Errorf("expected 18 validators disagree, got %d", v.validatorDisagree)
+	}
+	if v.status != "validator_disagreement" {
+		t.Errorf("expected validator_disagreement status, got %q", v.status)
+	}
+
+	// Verify block reason includes numeric values.
+	reason := ms.candidateApplicationBlockReason(
+		estimate, v, true, true, trustMinFitPool+1, validatorAgreementMinCount+3, false, true, 1000.0,
+	)
+	if !strings.Contains(reason, "agree=3") {
+		t.Errorf("block reason missing agree=3: %q", reason)
+	}
+	if !strings.Contains(reason, "reject=18") {
+		t.Errorf("block reason missing reject=18: %q", reason)
+	}
+	wantSuffix := "required agree>reject and agree>=" + strings.TrimSpace(strings.Split(reason, "required")[1])
+	_ = wantSuffix // just verifying "required" is present
+	if !strings.Contains(reason, "required agree>reject") {
+		t.Errorf("block reason missing threshold description: %q", reason)
+	}
+
+	// Verify per-ICAO table classifies all 22 ICAOs.
+	roleCount := make(map[string]int)
+	for _, o := range v.PerICAOOffsets {
+		roleCount[o.Role]++
+	}
+	if roleCount["anchor"] != 1 {
+		t.Errorf("expected 1 anchor in per-ICAO table, got %d", roleCount["anchor"])
+	}
+	if roleCount["validator_agree"] != 3 {
+		t.Errorf("expected 3 validator_agree in per-ICAO table, got %d", roleCount["validator_agree"])
+	}
+	if roleCount["validator_disagree"] != 18 {
+		t.Errorf("expected 18 validator_disagree in per-ICAO table, got %d", roleCount["validator_disagree"])
+	}
+	total := roleCount["anchor"] + roleCount["validator_agree"] + roleCount["validator_disagree"]
+	if total != 22 {
+		t.Errorf("expected 22 total ICAOs in per-ICAO table, got %d (roles: %v)", total, roleCount)
+	}
+}
+
+// D13: candidateApplicationBlockReason includes numeric counts for insufficient_validator_agreement.
+func TestAuthority_InsufficientAgreementBlockReason_Numeric(t *testing.T) {
+	ms := newSolver()
+	ms.ActiveAuthorityMode = authorityModeRefined
+	ms.CandidatePromotionStreak = candidatePromotionMinStreak + 1
+
+	estimate := syncStateEstimate{
+		present:    true,
+		periodS:    4.0,
+		epochUS:    0,
+		offsetDeg:  45.0,
+		anchorICAO: ptr(uint32(0xA01)),
+	}
+	v := syncValidationSummary{
+		status:             "insufficient_validator_agreement",
+		validatorAgreement: 1,
+		validatorEvaluated: 5,
+		score:              0.3,
+	}
+	reason := ms.candidateApplicationBlockReason(
+		estimate, v, true, true, trustMinFitPool+1, validatorAgreementMinCount+2, false, true, 1000.0,
+	)
+	if !strings.Contains(reason, "agree=1") {
+		t.Errorf("block reason missing agree=1: %q", reason)
+	}
+	if !strings.Contains(reason, "eval=5") {
+		t.Errorf("block reason missing eval=5: %q", reason)
+	}
+	if !strings.Contains(reason, "required>=") {
+		t.Errorf("block reason missing required>= threshold: %q", reason)
+	}
+}
+
+// E7: Snapshot copies PerICAOPhaseOffsets as a separate slice (no aliasing).
+func TestSnapshot_PerICAOPhaseOffsets_Copied(t *testing.T) {
+	ms := newSolver()
+	ms.LastPerICAOPhaseOffsets = []PerICAOPhaseOffset{
+		{ICAO: 0xA01, Role: "anchor", AnchorDeltaDeg: 0},
+		{ICAO: 0xA02, Role: "validator_agree", AnchorDeltaDeg: 3.0},
+	}
+
+	snap := ms.Snapshot()
+	if len(snap.PerICAOPhaseOffsets) != 2 {
+		t.Fatalf("expected 2 per-ICAO offsets in snapshot, got %d", len(snap.PerICAOPhaseOffsets))
+	}
+	// Mutate snap — must not affect solver.
+	snap.PerICAOPhaseOffsets[0].Role = "mutated"
+	if ms.LastPerICAOPhaseOffsets[0].Role != "anchor" {
+		t.Error("PerICAOPhaseOffsets in snapshot aliases solver field")
 	}
 }

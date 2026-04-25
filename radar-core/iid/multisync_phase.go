@@ -8,11 +8,15 @@ package iid
 //
 // Invariants:
 //   - A selected anchor always has anchor_delta_deg == 0.0 in anchor-relative diagnostics.
-//   - Branch ambiguity and validator agreement use the same fit-eligible validator population.
+//   - branchAmbiguity combines two distinct signals: anchor-candidate competition
+//     (secondScore/topScore, exposed separately as anchorCompetitionAmbiguity) and
+//     global fit-eligible observation coherence checks. Validator agreement is computed
+//     over the fit-eligible non-anchor observation pool.
 //   - Candidate anchor diagnostics are not operational authority until refined_authoritative.
 //   - Active residual basis and candidate-anchor diagnostic basis are separate.
 
 import (
+	"fmt"
 	"math"
 	"sort"
 )
@@ -42,11 +46,18 @@ type PhaseBranchResult struct {
 // PerICAOPhaseOffset holds the implied phase offset and validator role for one ICAO.
 // Exported for diagnostic use by protocol layers.
 type PerICAOPhaseOffset struct {
-	ICAO           uint32
+	ICAO            uint32
 	LatestOffsetDeg float64
-	AnchorDeltaDeg *float64 // nil for non-anchor validators; 0.0 for the selected anchor
-	Role           string   // "anchor" | "validator_agree" | "validator_disagree" | "validator_neutral" | "rejected"
-	RejectReasons  []string
+	AnchorDeltaDeg  float64 // circularDiff(latestImplied, anchorOffset); 0.0 for the anchor itself
+	Role            string
+	// Role values:
+	//   "anchor"            — the selected anchor ICAO (defines offsetDeg)
+	//   "validator_agree"   — counted toward agreement (|mean diff| <= validatorAgreementPhaseDeg)
+	//   "validator_disagree"— counted toward disagreement (|mean diff| >= validatorDisagreementPhaseDeg)
+	//   "validator_neutral" — fit-eligible, >=validatorMinObsPerICAO, between thresholds
+	//   "excluded"          — fit-eligible, non-anchor, but < validatorMinObsPerICAO obs
+	//   "not_fit_eligible"  — no fit-eligible observations for this ICAO
+	RejectReasons []string
 }
 
 // solvePhaseBranch runs the phase branch solving stage. It selects the best anchor
@@ -129,7 +140,8 @@ func (ms *MultiSyncSolver) evaluatePhaseValidation(
 		}
 	}
 	if topScore > 0 {
-		summary.branchAmbiguity = clamp(secondScore/topScore, 0, 1)
+		summary.anchorCompetitionAmbiguity = clamp(secondScore/topScore, 0, 1)
+		summary.branchAmbiguity = summary.anchorCompetitionAmbiguity
 	}
 	summary.circularDispersion = selectedSpread
 
@@ -178,11 +190,14 @@ func (ms *MultiSyncSolver) evaluatePhaseValidation(
 	}
 
 	// Validator agreement: count non-anchor ICAOs that agree/disagree with the
-	// proposed phase offset. Uses the same fit-eligible population as the global check.
+	// proposed phase offset. Uses the fit-eligible non-anchor observation pool.
 	type validatorAccum struct {
-		count int
-		sin   float64
-		cos   float64
+		count         int
+		sin           float64
+		cos           float64
+		latestUS      float64
+		latestImplied float64
+		hasLatest     bool
 	}
 	byICAO := make(map[uint32]*validatorAccum)
 	for _, p := range prepared {
@@ -204,9 +219,15 @@ func (ms *MultiSyncSolver) evaluatePhaseValidation(
 		rad := diff * math.Pi / 180.0
 		acc.sin += math.Sin(rad)
 		acc.cos += math.Cos(rad)
+		if p.EffectiveUS > acc.latestUS || !acc.hasLatest {
+			acc.latestUS = p.EffectiveUS
+			acc.latestImplied = implied
+			acc.hasLatest = true
+		}
 	}
 	for _, acc := range byICAO {
 		if acc.count < validatorMinObsPerICAO {
+			summary.validatorExcluded++
 			continue
 		}
 		summary.validatorEvaluated++
@@ -217,6 +238,82 @@ func (ms *MultiSyncSolver) evaluatePhaseValidation(
 		} else if absMean >= validatorDisagreementPhaseDeg {
 			summary.validatorDisagree++
 		}
+	}
+
+	// Build per-ICAO phase offset table.
+	// Pre-pass: collect latest implied offset and reject reasons for ALL ICAOs,
+	// including non-fit-eligible ones and the anchor.
+	type tableAccum struct {
+		fitEligCount     int
+		latestUS         float64
+		latestImplied    float64
+		hasLatest        bool
+		fitRejectReasons []string
+	}
+	allICAOs := make(map[uint32]*tableAccum)
+	for _, p := range prepared {
+		ta := allICAOs[p.Obs.ICAO]
+		if ta == nil {
+			ta = &tableAccum{}
+			allICAOs[p.Obs.ICAO] = ta
+		}
+		phaseRel := math.Mod((p.EffectiveUS-estimate.epochUS)/periodUS*360.0, 360.0)
+		if phaseRel < 0 {
+			phaseRel += 360.0
+		}
+		implied := math.Mod(p.Obs.BearingDeg-phaseRel+360.0, 360.0)
+		if p.EffectiveUS > ta.latestUS || !ta.hasLatest {
+			ta.latestUS = p.EffectiveUS
+			ta.latestImplied = implied
+			ta.hasLatest = true
+		}
+		if p.FitEligible {
+			ta.fitEligCount++
+		} else if p.FitRejectReason != "" {
+			ta.fitRejectReasons = appendUniqueStrings(ta.fitRejectReasons, p.FitRejectReason)
+		}
+	}
+	for icao, ta := range allICAOs {
+		if !ta.hasLatest {
+			continue
+		}
+		anchorDelta := circularDiff(ta.latestImplied, estimate.offsetDeg)
+		var role string
+		var reasons []string
+
+		if icao == *estimate.anchorICAO {
+			role = "anchor"
+			anchorDelta = 0.0
+		} else if ta.fitEligCount == 0 {
+			role = "not_fit_eligible"
+			reasons = ta.fitRejectReasons
+		} else if ta.fitEligCount < validatorMinObsPerICAO {
+			role = "excluded"
+			reasons = []string{fmt.Sprintf("insufficient_obs: need>=%d have=%d", validatorMinObsPerICAO, ta.fitEligCount)}
+		} else {
+			// Use the validator accum for the same circular-mean diff computation.
+			acc := byICAO[icao]
+			if acc != nil && acc.count >= validatorMinObsPerICAO {
+				mean := math.Atan2(acc.sin, acc.cos) * 180.0 / math.Pi
+				absMean := math.Abs(mean)
+				if absMean <= validatorAgreementPhaseDeg {
+					role = "validator_agree"
+				} else if absMean >= validatorDisagreementPhaseDeg {
+					role = "validator_disagree"
+				} else {
+					role = "validator_neutral"
+				}
+			} else {
+				role = "excluded"
+			}
+		}
+		summary.PerICAOOffsets = append(summary.PerICAOOffsets, PerICAOPhaseOffset{
+			ICAO:            icao,
+			LatestOffsetDeg: ta.latestImplied,
+			AnchorDeltaDeg:  anchorDelta,
+			Role:            role,
+			RejectReasons:   reasons,
+		})
 	}
 
 	agreementScore := clamp(float64(summary.validatorAgreement)/3.0, 0, 1)
