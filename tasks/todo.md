@@ -229,3 +229,80 @@ Plan confirmation:
 - Make period slope fitting use retained, propagation-corrected residual evidence that is unwrapped within each ICAO before fitting.
 - Treat waveform/motion limitations as explicit diagnostics and conservative gains, not blockers for obvious bounded period recovery.
 - Keep phase/anchor validation stricter than period recovery so near-wrap evidence can correct period without being promoted as absolute phase.
+
+## 2026-04-25 Persistent Long-Term Sync Estimator (Refined Model Redesign)
+
+Problem statement: the refined sync model behaves as a rolling 30s fitter — each
+short fit window is effectively the entire memory of the model, so its
+period/phase wobbles and recovery restarts every window even when evidence is
+broadly consistent. Required change: separate short-term measurement from
+long-term estimation, and have authority consume the long-term estimates rather
+than the latest 30s candidate. **Non-goal**: do NOT add validator gates, branch
+special cases, or threshold tuning to mask the wobble. The fix is structural.
+
+References:
+- solver entry: `radar-core/iid/multisync.go:627` `runFit`
+- period stage: `radar-core/iid/multisync_period.go` (`fitPeriod`, applied period at `multisync.go:782`+)
+- phase stage: `radar-core/iid/multisync_phase.go` (anchor + branch solving)
+- authority: `radar-core/iid/multisync_authority.go`
+- snapshot: `radar-core/iid/multisync_snapshot.go` + protobuf `protocol/`
+- horizons: `backend/radar/sweep.py:2833` `_fit_window_s_for_period`, `:2841` `_sync_horizons_payload`, `_SYNC_DISPLAY_HISTORY_WINDOW_S`
+- UI: `frontend/src/pages/RadarPage.jsx:2695` (Fit/Display window labels), `PhaseAnchorPanel`, sync history chart
+
+### Plan
+
+- [ ] Read recent lessons and confirm scope — do NOT touch validator gates, anchor scoring, or recovery thresholds in this task.
+
+**Layer 1 — Short-term measurement (existing fit window, made noise-tolerant):**
+- [ ] Inside `fitPeriod` and `solvePhaseBranch`, treat the current 30s fit as a *measurement only*: outputs are `local_period_measurement_s`, `local_residual_slope_deg_s`, `local_candidate_anchor`, `local_branch_offset_deg`, `local_validator_agreement`, `local_fit_quality`. No applied state mutation here beyond observation buffers and ICAO quality.
+- [ ] Stop overwriting `AppliedPeriodS` directly with the latest fit slope-correction; the applied period now comes from layer 2.
+
+**Layer 2 — Persistent long-term period estimator:**
+- [ ] Add `MultiSyncSolver` fields: `LongTermPeriodEstimateS`, `LongTermPeriodEstimatorConfidence`, `LongTermPeriodEstimatorAgeS`, `ConsecutivePeriodConsistentWindows`, `LastPeriodUpdateDeltaS`, `LastLocalPeriodMeasurementS`. Seed `LongTermPeriodEstimateS` from `dominantPeriodS` (fallback: bootstrap/compact) on first valid window.
+- [ ] Each window: nudge the estimator by a small fraction of the local measurement error (`delta = gain * (local - long_term)`), bounded around `dominantPeriodS` by `periodRefineMaxPPMFromDominant`. Gain shrinks with low local fit quality, grows with consistent windows. Never replace wholesale.
+- [ ] Update `consecutive_period_consistent_windows`, decay confidence on contradictory wide-delta windows, never reset confidence from a single bad window.
+- [ ] Trust promotion / `TrustedBasePeriodS` now derives from `LongTermPeriodEstimatorConfidence`, not raw streaks of fit-pool counts.
+
+**Layer 3 — Persistent long-term phase / branch estimator:**
+- [ ] New struct `BranchEstimate { OffsetDeg; SupportingICAOs map[uint32]struct{}; Confidence; LastSeenTS; ConsecutiveSupportedWindows; ContradictedWindows }`. Solver keeps `BranchTracks []BranchEstimate` (small bounded set, e.g. ≤4), plus `LongTermBranchAnchorICAO`, `LongTermBranchOffsetDeg`, `BranchEstimatorConfidence`.
+- [ ] Each window's local candidate anchor/branch is matched to existing tracks by `globalBranchMatchDeg` proximity. Match → increment `ConsecutiveSupportedWindows`, refresh `LastSeenTS`, raise confidence with diminishing returns. No match → spawn a competing track (capped); contradiction (wide phase delta with high local quality) decays the matched track's confidence rather than killing it.
+- [ ] Branch promotion to `refined_authoritative` requires accumulated `BranchEstimatorConfidence ≥ promotion_threshold` AND consistent windows count, not just current window validation strength.
+
+**Layer 4 — Authority decision rewrite:**
+- [ ] `updateAuthorityModePostFit` and `updateAuthoritativeState` consume `LongTermPeriodEstimateS` + `LongTermBranchOffsetDeg` (with current-window sanity checks: validator-not-strongly-disagreeing, slope-gate, dominant bound). Short-window candidate is no longer the applied authority unless we are explicitly bootstrapping (compact mode → first refined entry).
+- [ ] Add `LastAuthorityPromotionBlockReason` values: `branch_confidence_insufficient`, `period_estimator_confidence_insufficient`, `branch_competitor_dominant`.
+
+**Layer 5 — Display vs fit window separation (the chart bug):**
+- [ ] Introduce explicit `display_window_s` (default 300s, settable) distinct from `fit_window_s`. In `runFit`, retain `MultiSyncSolver.obs` and slope/residual history sized by `display_window_s`; the solver fits against a subset trimmed to `fit_window_s`.
+- [ ] `_sync_horizons_payload` already exposes both — fix any callsite that writes the fit window into the display field. Ensure `_SYNC_DISPLAY_HISTORY_WINDOW_S` is the retention horizon for slope/residual history rows shipped to the UI.
+- [ ] Snapshot/protobuf: add `local_period_measurement_s`, `long_term_period_estimate_s`, `period_update_delta_s`, `period_estimator_confidence`, `period_estimator_age_s`, `consecutive_period_consistent_windows`, `local_candidate_anchor`, `long_term_branch_anchor`, `branch_confidence`, `branch_consistent_windows`, `branch_contradiction_windows`, `branch_competitor_count`, `branch_promotion_block_reason`. Plumb through `protocol/` Go ↔ Python.
+
+**Layer 6 — UI:**
+- [ ] Sync history chart honors `display_window_s` (300s) regardless of `fit_window_s`.
+- [ ] Plot/label both: short-window fit residuals vs long-term applied residuals; local measured period vs long-term estimated period.
+- [ ] PhaseAnchorPanel/multisync diagnostic panel surfaces local vs long-term anchor, branch confidence, and the new block reasons.
+
+**Layer 7 — Tests (each must be failing-then-passing on the redesigned model):**
+- [ ] A. `multisync_long_term_period_test.go`: feed noisy zero-mean local period measurements; assert `LongTermPeriodEstimateS` variance < input variance / 4 and converges toward truth.
+- [ ] B. Same file: stable branch repeated across N windows → `BranchEstimatorConfidence` rises monotonically and eventually promotes to `refined_authoritative`.
+- [ ] C. Single bad 30s window injected mid-stream → `LongTermBranchOffsetDeg` and `BranchTracks[0].Confidence` survive (no reset).
+- [ ] D. Sustained contradictory branch (e.g. 6 windows agreeing on a different offset) → original track demotes, new track takes over.
+- [ ] E. Backend `test_radar_sweep.py`: setting `fit_window_s` env/config knob does not change `display_window_s` retention.
+- [ ] F. Backend test: with `display_window_s=300`, `fit_window_s=30`, snapshot history rows span ≥300s while solver `LastFitSpanS ≤ 30s`.
+
+### Verification
+- [ ] `go test ./iid -run 'TestMultiSync_LongTerm' -count=1`
+- [ ] `go test ./iid ./cmd/radar-core ./protocol ./export -count=1`
+- [ ] `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_core_protocol.py -q`
+- [ ] `go build -o radar-core ./cmd/radar-core`
+- [ ] `cd frontend && npm run build`
+- [ ] Manually verify chart shows 300s history with fit_window_s=30s.
+
+Plan confirmation points (please confirm before I start):
+1. Layer separation as specified — local measurement state is read-only for layer 2/3; only layer 2/3 mutate applied/authoritative period and branch.
+2. Long-term period estimator is a bounded EMA-style nudge, NOT a separate Kalman or independent free-running estimator (still anchored to dominant prior).
+3. `BranchTracks` is a small bounded set (≤4), not unbounded history. OK?
+4. Bootstrap exception: on first entry from compact → refined, the short-window candidate IS allowed to seed long-term state directly. After that, long-term wins.
+5. Display window default 300s, exposed but not user-configurable in this task (UI control deferred).
+6. Out of scope here: validator threshold tuning, anchor scoring changes, recovery threshold edits, waveform correction.
+

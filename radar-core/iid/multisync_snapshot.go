@@ -123,6 +123,30 @@ type MultiSyncSnapshot struct {
 	AuthorityPromotionBlockReason string
 	ResidualCorrectionBasis       string
 	MotionGuardDegraded           bool
+
+	// ─── Long-term estimator separation (Layer 1: diagnostics) ────────────────
+	// Local* fields are the short-window (current fit window) measurement.
+	// LongTerm* / Branch* fields are the persistent estimator state. In Layer 1
+	// LongTerm* are zero-valued placeholders; Layer 2/3 wire them to behaviour.
+	LocalPeriodMeasurementS  float64
+	LocalCandidateAnchorICAO *uint32
+	LocalBranchOffsetDeg     float64
+	LocalValidatorAgreement  int
+	LocalFitQualityScore     float64
+
+	LongTermPeriodEstimateS            float64
+	LongTermPeriodEstimatorConfidence  float64
+	LongTermPeriodEstimatorAgeS        float64
+	ConsecutivePeriodConsistentWindows int
+	PeriodUpdateDeltaS                 float64
+
+	LongTermBranchAnchorICAO   *uint32
+	LongTermBranchOffsetDeg    float64
+	BranchEstimatorConfidence  float64
+	BranchConsistentWindows    int
+	BranchContradictionWindows int
+	BranchCompetitorCount      int
+	BranchPromotionBlockReason string
 }
 
 // Snapshot returns a copy of the published state for protocol emission.
@@ -222,6 +246,32 @@ func (ms *MultiSyncSolver) Snapshot() MultiSyncSnapshot {
 		AuthorityPromotionBlockReason:    ms.LastAuthorityPromotionBlockReason,
 		ResidualCorrectionBasis:          ms.LastResidualCorrectionBasis,
 		MotionGuardDegraded:              ms.LastMotionGuardDegraded,
+
+		LocalPeriodMeasurementS: ms.LastLocalPeriodMeasurementS,
+		LocalBranchOffsetDeg:    ms.LastLocalBranchOffsetDeg,
+		LocalValidatorAgreement: ms.LastLocalValidatorAgreement,
+		LocalFitQualityScore:    ms.LastLocalFitQualityScore,
+
+		LongTermPeriodEstimateS:            ms.LongTermPeriodEstimateS,
+		LongTermPeriodEstimatorConfidence:  ms.LongTermPeriodEstimatorConfidence,
+		LongTermPeriodEstimatorAgeS:        ms.LongTermPeriodEstimatorAgeS,
+		ConsecutivePeriodConsistentWindows: ms.ConsecutivePeriodConsistentWindows,
+		PeriodUpdateDeltaS:                 ms.LastPeriodUpdateDeltaS,
+
+		LongTermBranchOffsetDeg:    ms.LongTermBranchOffsetDeg,
+		BranchEstimatorConfidence:  ms.BranchEstimatorConfidence,
+		BranchConsistentWindows:    ms.BranchConsistentWindows,
+		BranchContradictionWindows: ms.BranchContradictionWindows,
+		BranchCompetitorCount:      ms.BranchCompetitorCount,
+		BranchPromotionBlockReason: ms.BranchPromotionBlockReason,
+	}
+	if ms.LastLocalCandidateAnchorICAO != nil {
+		v := *ms.LastLocalCandidateAnchorICAO
+		snap.LocalCandidateAnchorICAO = &v
+	}
+	if ms.LongTermBranchAnchorICAO != nil {
+		v := *ms.LongTermBranchAnchorICAO
+		snap.LongTermBranchAnchorICAO = &v
 	}
 	if ms.AuthoritativeStateSinceTS > 0 && ms.LastUpdated > 0 {
 		snap.AuthoritativeStateAgeS = math.Max(0, ms.LastUpdated-ms.AuthoritativeStateSinceTS)

@@ -438,6 +438,44 @@ type MultiSyncSolver struct {
 	LastResidualCorrectionBasis       string
 	LastMotionGuardDegraded           bool
 
+	// ─── Long-term estimator separation (Layer 1: diagnostic outputs) ─────────
+	// These fields separate the short-term measurement (the 30s fit window) from
+	// the long-term applied state. In Layer 1 they are populated as DIAGNOSTICS
+	// only — `PeriodS`, `PhaseOffsetDeg`, etc. are still driven directly by the
+	// short-window fit. Layer 2/3 reroute the apply path through the long-term
+	// estimator, at which point `LastLocalPeriodMeasurementS` becomes the input
+	// to the EMA and `LongTermPeriodEstimateS` becomes the published period.
+	//
+	// Existing `LastResidualSlopeDegPerS`, `LastFitSpanS`, etc. continue to mean
+	// the short-window measurement (their original semantics — preserved for
+	// compatibility). The `LastLocal*` mirrors below name them explicitly so
+	// callers can disambiguate measurement vs applied without grepping history.
+	LastLocalPeriodMeasurementS float64 // slope-corrected refined period from current fit window
+	LastLocalCandidateAnchorICAO *uint32
+	LastLocalBranchOffsetDeg     float64 // candidate phase offset chosen by current fit window
+	LastLocalValidatorAgreement  int
+	LastLocalFitQualityScore     float64 // 0..1; derived from detrended MAD + fit pool counts
+
+	// Long-term period estimator (Layer 2 will populate). Bounded EMA-style
+	// estimate that survives across fit windows; the DF dominant period remains
+	// the family authority — these fields nudge only within ±300 PPM of it.
+	LongTermPeriodEstimateS           float64
+	LongTermPeriodEstimatorConfidence float64
+	LongTermPeriodEstimatorAgeS       float64
+	ConsecutivePeriodConsistentWindows int
+	LastPeriodUpdateDeltaS            float64
+
+	// Long-term branch / phase estimator (Layer 3 will populate). A small
+	// bounded set of competing branch tracks; promotion to refined_authoritative
+	// requires accumulated branch confidence, not just the current window.
+	LongTermBranchAnchorICAO   *uint32
+	LongTermBranchOffsetDeg    float64
+	BranchEstimatorConfidence  float64
+	BranchConsistentWindows    int
+	BranchContradictionWindows int
+	BranchCompetitorCount      int
+	BranchPromotionBlockReason string
+
 	// Throttle.
 	lastRunTS float64
 }
@@ -610,6 +648,23 @@ func (ms *MultiSyncSolver) Reset() {
 	ms.LastAuthorityPromotionBlockReason = ""
 	ms.LastResidualCorrectionBasis = ""
 	ms.LastMotionGuardDegraded = false
+	ms.LastLocalPeriodMeasurementS = 0
+	ms.LastLocalCandidateAnchorICAO = nil
+	ms.LastLocalBranchOffsetDeg = 0
+	ms.LastLocalValidatorAgreement = 0
+	ms.LastLocalFitQualityScore = 0
+	ms.LongTermPeriodEstimateS = 0
+	ms.LongTermPeriodEstimatorConfidence = 0
+	ms.LongTermPeriodEstimatorAgeS = 0
+	ms.ConsecutivePeriodConsistentWindows = 0
+	ms.LastPeriodUpdateDeltaS = 0
+	ms.LongTermBranchAnchorICAO = nil
+	ms.LongTermBranchOffsetDeg = 0
+	ms.BranchEstimatorConfidence = 0
+	ms.BranchConsistentWindows = 0
+	ms.BranchContradictionWindows = 0
+	ms.BranchCompetitorCount = 0
+	ms.BranchPromotionBlockReason = ""
 }
 
 // ─── internal solver — pipeline orchestration ─────────────────────────────────
@@ -806,6 +861,24 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	ms.LastResidualCorrectionBasis = period.CorrectionBasis
 	ms.LastMotionGuardDegraded = period.MotionGuardDegraded
 
+	// Layer 1: snapshot the short-window period measurement separately from
+	// the applied period. In Layer 2 this feeds the long-term EMA; for now
+	// the applied period (PeriodS) is still derived from the same value.
+	ms.LastLocalPeriodMeasurementS = period.AppliedPeriodS
+	if period.FitPoolCount > 0 {
+		// Quality score in [0,1]: 1 when MAD ≤ trustMaxResidualDeg AND we have
+		// enough fit-pool entries / ICAOs; degrades smoothly as MAD grows.
+		madTerm := 1.0
+		if period.DetrendedMADDeg > 0 {
+			madTerm = trustMaxResidualDeg / math.Max(period.DetrendedMADDeg, trustMaxResidualDeg)
+		}
+		poolTerm := math.Min(1.0, float64(period.FitPoolCount)/float64(trustMinFitPool))
+		icaoTerm := math.Min(1.0, float64(period.FitICAOCount)/float64(trustMinICAOs))
+		ms.LastLocalFitQualityScore = clamp(madTerm*poolTerm*icaoTerm, 0, 1)
+	} else {
+		ms.LastLocalFitQualityScore = 0
+	}
+
 	// Slope gate for authority promotion.
 	slopeWindowDeg := math.Abs(period.ResidualSlopeDegPerS) * period.FitSpanS
 	ms.LastSlopeWindowDeg = slopeWindowDeg
@@ -966,6 +1039,17 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	ms.LastPerICAOPhaseOffsets = validation.PerICAOOffsets
 	ms.LastCandidateValidationStatus = validation.status
 	ms.LastCandidateMode = candidateMode
+
+	// Layer 1: snapshot the short-window candidate anchor / branch offset and
+	// validator agreement count separately from the applied authoritative state.
+	if finalAlignment.anchorICAO != nil {
+		v := *finalAlignment.anchorICAO
+		ms.LastLocalCandidateAnchorICAO = &v
+	} else {
+		ms.LastLocalCandidateAnchorICAO = nil
+	}
+	ms.LastLocalBranchOffsetDeg = finalAlignment.offsetDeg
+	ms.LastLocalValidatorAgreement = validation.validatorAgreement
 
 	// ── Stage 4: Candidate and authoritative state update ─────────────────────
 	ms.updateCandidateState(candidateEstimate, validation, candidateMode, nowUnix)
