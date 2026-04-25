@@ -114,9 +114,10 @@ func TestLayer1_LocalMeasurementMirrorsAppliedAfterFit(t *testing.T) {
 		t.Errorf("Layer 2 bootstrap: LongTermPeriodEstimateS (%v) should equal LocalPeriodMeasurementS (%v) at seed",
 			snap.LongTermPeriodEstimateS, snap.LocalPeriodMeasurementS)
 	}
-	// Branch estimator is still a Layer 3 placeholder.
-	if snap.BranchEstimatorConfidence != 0 {
-		t.Errorf("Layer 3 placeholder: BranchEstimatorConfidence should still be 0, got %v",
+	// Layer 3: branch tracker should have at least one track populated when an
+	// anchor was selected. Confidence may be small but must be > 0.
+	if snap.LocalCandidateAnchorICAO != nil && snap.BranchEstimatorConfidence <= 0 {
+		t.Errorf("Layer 3: BranchEstimatorConfidence should be > 0 when local anchor selected, got %v",
 			snap.BranchEstimatorConfidence)
 	}
 }
@@ -254,6 +255,97 @@ func (r *deterministicRNG) next() uint32 {
 
 func (r *deterministicRNG) float64() float64 {
 	return float64(r.next()) / float64(^uint32(0))
+}
+
+// L3.B: A stable branch repeatedly seen across many fit windows accumulates
+// branch-track confidence and becomes the dominant track.
+func TestLayer3_StableBranchAccumulatesConfidence(t *testing.T) {
+	ms := newSolver()
+	anchor := uint32(0xA01)
+	branchOffset := 137.0
+
+	// Feed 30 windows of the same anchor + offset (with tiny noise).
+	rng := newDeterministicRNG(0x42)
+	for i := 0; i < 30; i++ {
+		jitter := (rng.float64()*2 - 1) * 2.0 // ±2°
+		ms.updateBranchTracks(&anchor, branchOffset+jitter, 1.0, 1000.0+float64(i))
+	}
+
+	if len(ms.BranchTracks) != 1 {
+		t.Errorf("expected 1 track after 30 consistent windows, got %d", len(ms.BranchTracks))
+	}
+	if ms.BranchEstimatorConfidence < 0.6 {
+		t.Errorf("BranchEstimatorConfidence too low: %v (want >=0.6)", ms.BranchEstimatorConfidence)
+	}
+	if ms.BranchConsistentWindows < 25 {
+		t.Errorf("BranchConsistentWindows = %d (want >=25)", ms.BranchConsistentWindows)
+	}
+	if ms.LongTermBranchAnchorICAO == nil || *ms.LongTermBranchAnchorICAO != anchor {
+		t.Errorf("dominant anchor not exposed: %v", ms.LongTermBranchAnchorICAO)
+	}
+	driftDeg := math.Abs(circularDiff(ms.LongTermBranchOffsetDeg, branchOffset))
+	if driftDeg > 3.0 {
+		t.Errorf("dominant offset drifted: %v vs target %v (delta %.2f°)",
+			ms.LongTermBranchOffsetDeg, branchOffset, driftDeg)
+	}
+}
+
+// L3.D: A sustained contradictory branch (different offset for many windows)
+// eventually takes over from the original dominant track.
+func TestLayer3_SustainedContradictionTakesOver(t *testing.T) {
+	ms := newSolver()
+	anchorA := uint32(0xA01)
+	anchorB := uint32(0xB02)
+	offsetA := 50.0
+	offsetB := 200.0 // 150° away — outside match radius
+
+	// Establish anchorA / offsetA dominant.
+	for i := 0; i < 15; i++ {
+		ms.updateBranchTracks(&anchorA, offsetA, 1.0, 1000.0+float64(i))
+	}
+	if ms.LongTermBranchAnchorICAO == nil || *ms.LongTermBranchAnchorICAO != anchorA {
+		t.Fatalf("seed phase: dominant should be A, got %v", ms.LongTermBranchAnchorICAO)
+	}
+	preConf := ms.BranchEstimatorConfidence
+
+	// Sustained competing branch B for 20 windows.
+	for i := 0; i < 20; i++ {
+		ms.updateBranchTracks(&anchorB, offsetB, 1.0, 2000.0+float64(i))
+	}
+
+	if ms.LongTermBranchAnchorICAO == nil || *ms.LongTermBranchAnchorICAO != anchorB {
+		t.Errorf("after sustained contradiction, dominant should be B, got %v", ms.LongTermBranchAnchorICAO)
+	}
+	driftDeg := math.Abs(circularDiff(ms.LongTermBranchOffsetDeg, offsetB))
+	if driftDeg > 5.0 {
+		t.Errorf("dominant offset not aligned with B: %v vs %v (delta %.2f°)",
+			ms.LongTermBranchOffsetDeg, offsetB, driftDeg)
+	}
+	if ms.BranchEstimatorConfidence < preConf*0.5 {
+		t.Errorf("dominant confidence dropped sharply on takeover: %v (was %v)",
+			ms.BranchEstimatorConfidence, preConf)
+	}
+}
+
+// L3.cap: BranchTracks length never exceeds branchMaxTracks even when many
+// distinct branches are seen across many windows. (Eviction order is
+// confidence-driven; specific survivor identity is covered by the takeover
+// test, not here.)
+func TestLayer3_BranchTracksCappedAtMax(t *testing.T) {
+	ms := newSolver()
+	// Spawn 30 distinct branches at evenly-spaced offsets.
+	for i := 0; i < 30; i++ {
+		anchor := uint32(0xA00 + i)
+		offset := math.Mod(float64(i)*40.0, 360.0)
+		ms.updateBranchTracks(&anchor, offset, 1.0, 1000.0+float64(i))
+		if len(ms.BranchTracks) > branchMaxTracks {
+			t.Fatalf("BranchTracks exceeded cap %d at iteration %d: got %d",
+				branchMaxTracks, i, len(ms.BranchTracks))
+		}
+	}
+	if len(ms.BranchTracks) != branchMaxTracks {
+		t.Errorf("final track count = %d, want %d", len(ms.BranchTracks), branchMaxTracks)
+	}
 }
 
 // L1.3: Reset clears all long-term and local diagnostic fields.

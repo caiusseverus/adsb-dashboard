@@ -476,6 +476,11 @@ type MultiSyncSolver struct {
 	BranchCompetitorCount      int
 	BranchPromotionBlockReason string
 
+	// BranchTracks is the bounded set of competing phase-branch estimates.
+	// Layer 3 populates and ages these; Layer 4 promotes a track to authority.
+	// Capped at branchMaxTracks (4) — the weakest is evicted on overflow.
+	BranchTracks []*BranchEstimate
+
 	// Internal: wall-clock TS of the last long-term-estimator seed (used to
 	// derive LongTermPeriodEstimatorAgeS). Not exposed in Snapshot.
 	lastLongTermPeriodSeedTS float64
@@ -669,6 +674,7 @@ func (ms *MultiSyncSolver) Reset() {
 	ms.BranchContradictionWindows = 0
 	ms.BranchCompetitorCount = 0
 	ms.BranchPromotionBlockReason = ""
+	ms.BranchTracks = nil
 	ms.lastLongTermPeriodSeedTS = 0
 }
 
@@ -1077,6 +1083,23 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	}
 	ms.LastLocalBranchOffsetDeg = finalAlignment.offsetDeg
 	ms.LastLocalValidatorAgreement = validation.validatorAgreement
+
+	// Layer 3: ingest the local candidate into the persistent branch tracker.
+	// The dominant track populates LongTermBranch* fields. Authority promotion
+	// (Layer 4) consumes accumulated branch confidence rather than the
+	// per-window candidate.
+	branchQuality := ms.LastLocalFitQualityScore
+	if validation.strong {
+		branchQuality = math.Min(1.0, branchQuality+0.1)
+	} else if validation.weak {
+		branchQuality *= 0.5
+	}
+	ms.updateBranchTracks(
+		ms.LastLocalCandidateAnchorICAO,
+		ms.LastLocalBranchOffsetDeg,
+		branchQuality,
+		nowUnix,
+	)
 
 	// ── Stage 4: Candidate and authoritative state update ─────────────────────
 	ms.updateCandidateState(candidateEstimate, validation, candidateMode, nowUnix)
