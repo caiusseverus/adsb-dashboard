@@ -2091,6 +2091,25 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
         </div>
       </div>
 
+      {(syncState.long_term_period_estimate_s || syncState.branch_estimator_confidence) && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', fontSize: '0.71rem', marginBottom: '0.35rem', padding: '4px 6px', background: '#0c1117', border: '1px dashed #21262d', borderRadius: '3px' }}>
+          <span style={{ color: '#8b949e' }}>Long-term:</span>
+          <span className={styles.metricPill}>Local period <span className={styles.metricValue}>{fmtNumber(syncState.local_period_measurement_s, 4, 's')}</span></span>
+          <span className={styles.metricPill}>LT period <span className={styles.metricValue}>{fmtNumber(syncState.long_term_period_estimate_s, 4, 's')}</span></span>
+          <span className={styles.metricPill}>LT period conf <span className={styles.metricValue}>{fmtNumber(syncState.long_term_period_estimator_confidence, 2)}</span></span>
+          <span className={styles.metricPill}>Δ this window <span className={styles.metricValue}>{fmtNumber((syncState.period_update_delta_s ?? 0) * 1e6, 2, ' µs')}</span></span>
+          <span className={styles.metricPill}>Consistent windows <span className={styles.metricValue}>{syncState.consecutive_period_consistent_windows ?? 0}</span></span>
+          <span className={styles.metricPill}>LT branch anchor <span className={styles.metricValue}>{syncState.long_term_branch_anchor_icao || '—'}</span></span>
+          <span className={styles.metricPill}>LT branch offset <span className={styles.metricValue}>{fmtNumber(syncState.long_term_branch_offset_deg, 2, '°')}</span></span>
+          <span className={styles.metricPill}>Branch conf <span className={styles.metricValue}>{fmtNumber(syncState.branch_estimator_confidence, 2)}</span></span>
+          <span className={styles.metricPill}>Branch supports <span className={styles.metricValue}>{syncState.branch_consistent_windows ?? 0}</span></span>
+          <span className={styles.metricPill}>Competitors <span className={styles.metricValue}>{syncState.branch_competitor_count ?? 0}</span></span>
+          {syncState.branch_promotion_block_reason && (
+            <span className={styles.metricPill} style={{ color: '#d29922' }}>Block <span className={styles.metricValue}>{humanizeSyncReason(syncState.branch_promotion_block_reason)}</span></span>
+          )}
+        </div>
+      )}
+
       {candidateAnchorIcao && !refinedAuthorityApplied && (
         <div style={{ color: '#d29922', background: '#16130b', border: '1px solid #8b6f1f', fontSize: '0.72rem', lineHeight: 1.45, padding: '5px 6px', marginBottom: '0.35rem' }}>
           Candidate anchor selected. Not applied: {humanizeSyncReason(candidateBlockReason)}.
