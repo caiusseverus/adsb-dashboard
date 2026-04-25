@@ -3486,6 +3486,43 @@ def test_go_alignment_rows_use_retained_display_history_not_fit_window(monkeypat
     assert snapshot["alignment_status"]["projected_observation_count"] == 3
 
 
+def test_go_sync_display_retention_independent_of_fit_window(monkeypatch):
+    """Layer 5: varying fit_window_s across diagnostic history rows does not
+    change how many rows are retained. The display window is what governs
+    retention; the fit window is solver-internal."""
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 2_000.0)
+
+    state = RadarState()
+    # Send 5 history entries with VARYING fit_window_s but the same display_window_s.
+    fit_windows = [24.0, 30.0, 36.0, 30.0, 28.0]
+    timestamps = [1_800.0, 1_850.0, 1_900.0, 1_950.0, 2_000.0]
+    for ts, fw in zip(timestamps, fit_windows):
+        state.update_go_multi_sync_state({
+            "i": 7, "pr": True, "us": True,
+            "p": 4.0, "pb": 4.0,
+            "pe": 1_000_000.0, "po": 20.0,
+            "jd": 2.0, "re": 3.0, "nu": 1,
+            "ho": False, "ra": False, "ts": ts,
+            "ft": 9, "fe": 7, "fr": 2, "fc": 3,
+            "fw": fw, "dw": 300.0, "fs": fw - 2.0, "rs": 0.05,
+            "aam": "refined_authoritative",
+            "aps": 4.0, "asa": 120.0,
+            "avs": 0.9, "vac": 3, "bas": 0.1,
+        })
+
+    snapshot = state.get_live_sync_snapshot(7, window_s=300.0, debug_limit=20)
+    assert snapshot["sync_horizons"]["display_window_s"] == pytest.approx(300.0)
+    # All 5 rows must be retained — display window 300s holds them all
+    # regardless of per-row fit_window_s variation.
+    assert len(snapshot["slope_history"]) == 5
+    assert len(snapshot["period_history"]) == 5
+    # Per-row fit_window_s must round-trip exactly as the solver reported it.
+    got_fits = [row["fit_window_s"] for row in snapshot["slope_history"]]
+    assert got_fits == pytest.approx(fit_windows)
+
+
 def test_df11_residual_dots_use_retained_residual_event_history(monkeypatch):
     """The 300s residual plot must not be limited by the 60s raw bootstrap event buffer."""
     import radar.sweep as sweep_module

@@ -2857,7 +2857,17 @@ class RadarState:
         """Record retained trend diagnostics from Go-owned multi-sync updates."""
         ts = float(msg.get("ts") or sync.last_sync_update_ts or time.time())
         period_s = float(sync.period_s or 0.0)
-        fit_window_s = self._fit_window_s_for_period(period_s)
+        # Layer 5: prefer the solver-reported per-row fit window. Falling back
+        # to the derived value would clobber actual per-row variance and break
+        # the display vs fit-window separation contract — the chart needs the
+        # solver's reported value at each row, not a snapshot-time derivation.
+        msg_fw = msg.get("fw")
+        if msg_fw is not None:
+            fit_window_s = float(msg_fw)
+        else:
+            fit_window_s = self._fit_window_s_for_period(period_s)
+        msg_dw = msg.get("dw")
+        display_window_s = float(msg_dw) if msg_dw is not None else _SYNC_DISPLAY_HISTORY_WINDOW_S
         fit_span_s = float(msg.get("fs") or min(fit_window_s, max(0.0, fit_window_s)))
         fit_total = int(msg.get("ft") or 0)
         fit_eligible = int(msg.get("fe") or 0)
@@ -2869,7 +2879,7 @@ class RadarState:
             "ts": ts,
             "source": source,
             "fit_window_s": fit_window_s,
-            "display_window_s": _SYNC_DISPLAY_HISTORY_WINDOW_S,
+            "display_window_s": display_window_s,
             "period_s": period_s,
             "period_base_s": sync.period_base_s,
             "period_correction_ppm": sync.period_correction_ppm,
@@ -2897,7 +2907,7 @@ class RadarState:
             "ts": ts,
             "source": source,
             "fit_window_s": fit_window_s,
-            "display_window_s": _SYNC_DISPLAY_HISTORY_WINDOW_S,
+            "display_window_s": display_window_s,
             "residual_slope_deg_per_s": sync.residual_slope_deg_per_s,
             "raw_slope_deg_per_s": msg.get("rs"),
             "fit_span_s": fit_span_s,
@@ -2910,7 +2920,7 @@ class RadarState:
             "ts": ts,
             "source": source,
             "fit_window_s": fit_window_s,
-            "display_window_s": _SYNC_DISPLAY_HISTORY_WINDOW_S,
+            "display_window_s": display_window_s,
             "period_s": period_s,
             "period_base_s": sync.period_base_s,
             "period_correction_ppm": sync.period_correction_ppm,
