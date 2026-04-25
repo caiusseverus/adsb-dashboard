@@ -1910,7 +1910,7 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
   )
 }
 
-function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics }) {
+function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics, perIcaoOffsets }) {
   if (!syncState) return null
   const refined = modeDiagnostics?.refined ?? {}
   const refinedActive = Boolean(refined.active)
@@ -2009,6 +2009,20 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
       return aIcao.localeCompare(bIcao)
     })
   }, [anchorIcao, candidateRows, candidateStatusPriority, impliedRows])
+
+  // Per-ICAO validator role table: prefer Go-populated diagnostic rows; fall back to
+  // observation-derived rows for backwards compat when per_icao_phase_offsets is absent.
+  const goPerIcaoRows = useMemo(() => {
+    const rows = Array.isArray(perIcaoOffsets) ? perIcaoOffsets : []
+    return [...rows].sort((a, b) => {
+      const roleOrder = r => r === 'anchor' ? 0 : r === 'validator_agree' ? 1 : r === 'validator_disagree' ? 2 : r === 'validator_neutral' ? 3 : r === 'excluded' ? 4 : 5
+      const rd = roleOrder(a?.role) - roleOrder(b?.role)
+      if (rd !== 0) return rd
+      return String(a?.icao ?? '').localeCompare(String(b?.icao ?? ''))
+    })
+  }, [perIcaoOffsets])
+  const useGoPerIcaoTable = goPerIcaoRows.length > 0
+
   const scatterW = 520
   const scatterH = 132
   const times = impliedRows.map(obs => Number(obs.beam_center_us ?? obs.raw_arrival_us)).filter(Number.isFinite)
@@ -2154,30 +2168,68 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
         </div>
 
         <div style={{ overflow: 'auto', border: '1px solid #30363d', background: '#0f141b', minWidth: 0 }}>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>Per-aircraft implied offsets</div>
-          <table style={tableStyle}>
-            <thead>
-              <tr>
-                <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
-                <th style={thStyle}>latest offset</th>
-                <th style={thStyle}>anchor Δ</th>
-                <th style={{ ...thStyle, textAlign: 'left' }}>role</th>
-              </tr>
-            </thead>
-            <tbody>
-              {latestImpliedRows.slice(0, 20).map((obs, idx) => (
-                <tr key={`${obs.icao}-${obs.beam_center_us}-${idx}`}>
-                  <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</td>
-                  <td style={tdRight}>{isFiniteValue(obs.implied_phase_offset_deg) ? fmtNumber(obs.implied_phase_offset_deg, 2, '°') : '—'}</td>
-                  <td style={tdRight}>{isFiniteValue(anchorRelativeDelta(obs)) ? fmtNumber(anchorRelativeDelta(obs), 2, '°') : '—'}</td>
-                  <td style={tdLeft}>{obs.phase_anchor_contributor ? (refinedAuthorityApplied ? 'applied anchor' : 'candidate anchor') : (obs.phase_anchor_reject_reason || 'validator')}</td>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>
+            Per-aircraft implied offsets{useGoPerIcaoTable ? ' (Go diagnostic)' : ''}
+          </div>
+          {useGoPerIcaoTable ? (
+            <table style={tableStyle}>
+              <thead>
+                <tr>
+                  <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
+                  <th style={thStyle}>latest offset</th>
+                  <th style={thStyle}>anchor Δ</th>
+                  <th style={{ ...thStyle, textAlign: 'left' }}>role</th>
                 </tr>
-              ))}
-              {latestImpliedRows.length === 0 && (
-                <tr><td colSpan={4} style={{ ...tdLeft, color: '#8b949e' }}>No implied-offset observations yet.</td></tr>
-              )}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {goPerIcaoRows.slice(0, 30).map((row) => {
+                  const roleColor = row.role === 'anchor' ? '#ffd166'
+                    : row.role === 'validator_agree' ? '#3fb950'
+                    : row.role === 'validator_disagree' ? '#ff7b72'
+                    : row.role === 'excluded' ? '#8b949e'
+                    : row.role === 'not_fit_eligible' ? '#6e7681'
+                    : '#c9d1d9'
+                  return (
+                    <tr key={row.icao}>
+                      <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{row.icao}</td>
+                      <td style={tdRight}>{fmtNumber(row.latest_offset_deg, 2, '°')}</td>
+                      <td style={tdRight}>{row.role === 'anchor' ? '0.00°' : fmtNumber(row.anchor_delta_deg, 2, '°')}</td>
+                      <td style={{ ...tdLeft, color: roleColor }}>
+                        {row.role}{row.reject_reasons?.length ? ` (${row.reject_reasons.join(', ')})` : ''}
+                      </td>
+                    </tr>
+                  )
+                })}
+                {goPerIcaoRows.length === 0 && (
+                  <tr><td colSpan={4} style={{ ...tdLeft, color: '#8b949e' }}>No burst sync diagnostic rows received.</td></tr>
+                )}
+              </tbody>
+            </table>
+          ) : (
+            <table style={tableStyle}>
+              <thead>
+                <tr>
+                  <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
+                  <th style={thStyle}>latest offset</th>
+                  <th style={thStyle}>anchor Δ</th>
+                  <th style={{ ...thStyle, textAlign: 'left' }}>role</th>
+                </tr>
+              </thead>
+              <tbody>
+                {latestImpliedRows.slice(0, 20).map((obs, idx) => (
+                  <tr key={`${obs.icao}-${obs.beam_center_us}-${idx}`}>
+                    <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</td>
+                    <td style={tdRight}>{isFiniteValue(obs.implied_phase_offset_deg) ? fmtNumber(obs.implied_phase_offset_deg, 2, '°') : '—'}</td>
+                    <td style={tdRight}>{isFiniteValue(anchorRelativeDelta(obs)) ? fmtNumber(anchorRelativeDelta(obs), 2, '°') : '—'}</td>
+                    <td style={tdLeft}>{obs.phase_anchor_contributor ? (refinedAuthorityApplied ? 'applied anchor' : 'candidate anchor') : (obs.phase_anchor_reject_reason || 'validator')}</td>
+                  </tr>
+                ))}
+                {latestImpliedRows.length === 0 && (
+                  <tr><td colSpan={4} style={{ ...tdLeft, color: '#8b949e' }}>No implied-offset observations yet.</td></tr>
+                )}
+              </tbody>
+            </table>
+          )}
         </div>
       </div>
     </div>
@@ -2728,6 +2780,7 @@ function RotationAlignmentPanel({
         observations={filteredObservations}
         candidates={burstTimeline?.phase_anchor_candidates}
         modeDiagnostics={syncModeDiagnostics}
+        perIcaoOffsets={Array.isArray(burstTimeline?.per_icao_phase_offsets) ? burstTimeline.per_icao_phase_offsets : []}
       />
 
       {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS ? (

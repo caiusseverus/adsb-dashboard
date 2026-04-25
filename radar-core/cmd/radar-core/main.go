@@ -306,6 +306,16 @@ func (e *engine) emitMultiSyncState(s *iid.IIDState) {
 			RejectReasons:       row.RejectReasons,
 		})
 	}
+	perICAO := make([]protocol.PerICAOPhaseOffset, 0, len(snap.PerICAOPhaseOffsets))
+	for _, row := range snap.PerICAOPhaseOffsets {
+		perICAO = append(perICAO, protocol.PerICAOPhaseOffset{
+			ICAO:            row.ICAO,
+			LatestOffsetDeg: row.LatestOffsetDeg,
+			AnchorDeltaDeg:  row.AnchorDeltaDeg,
+			Role:            row.Role,
+			RejectReasons:   row.RejectReasons,
+		})
+	}
 	msg := &protocol.MultiSyncState{
 		MsgType:               protocol.MsgMultiSyncState,
 		IID:                   s.IID,
@@ -402,6 +412,9 @@ func (e *engine) emitMultiSyncState(s *iid.IIDState) {
 		AuthorityPromotionBlockReason:    snap.AuthorityPromotionBlockReason,
 		ResidualCorrectionBasis:          snap.ResidualCorrectionBasis,
 		MotionGuardDegraded:              snap.MotionGuardDegraded,
+		AnchorCompetitionAmbiguity:       snap.AnchorCompetitionAmbiguity,
+		ValidatorExcludedCount:           uint16(snap.ValidatorExcludedCount),
+		PerICAOPhaseOffsets:              perICAO,
 	}
 	e.writer.Send(msg)
 }

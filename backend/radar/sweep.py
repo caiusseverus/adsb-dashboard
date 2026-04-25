@@ -1380,6 +1380,15 @@ class LiveSyncState:
     # dominant_prior_inconsistent: mirrors Go DominantPriorInconsistent — True when the
     # reacquire candidate lies outside the dominant-prior bound. Diagnostic only.
     dominant_prior_inconsistent: bool = False
+    # anchor_competition_ambiguity: secondScore/topScore from anchor candidate competition.
+    # Distinct from branch_ambiguity_score which also incorporates global coherence checks.
+    anchor_competition_ambiguity: float | None = None
+    # validator_excluded_count: ICAOs with fit-eligible obs below validatorMinObsPerICAO.
+    validator_excluded_count: int = 0
+    # per_icao_phase_offsets: per-ICAO implied-offset and validator-role table from Go.
+    # Each entry: {"icao": str, "latest_offset_deg": float, "anchor_delta_deg": float,
+    #              "role": str, "reject_reasons": list[str]}
+    per_icao_phase_offsets: list[dict] = _field(default_factory=list)
 
 
 @_dataclass
@@ -4084,6 +4093,33 @@ class RadarState:
             })
         return results
 
+    @staticmethod
+    def _normalise_go_per_icao_phase_offsets(entries: list | None) -> list[dict]:
+        if not isinstance(entries, list):
+            return []
+        results: list[dict] = []
+        for raw in entries:
+            if not isinstance(raw, dict):
+                continue
+            icao = raw.get("i")
+            try:
+                icao_text = f"{int(icao):06X}" if icao is not None else None
+            except Exception:
+                icao_text = None
+            if not icao_text:
+                continue
+            reject_reasons = raw.get("rr") or []
+            if not isinstance(reject_reasons, list):
+                reject_reasons = []
+            results.append({
+                "icao": icao_text,
+                "latest_offset_deg": float(raw.get("lo") or 0.0),
+                "anchor_delta_deg": float(raw.get("ad") or 0.0),
+                "role": str(raw.get("r") or "unknown"),
+                "reject_reasons": [str(r) for r in reject_reasons if r],
+            })
+        return results
+
     def _record_compact_sync_transition_locked(
         self,
         iid: int,
@@ -4795,6 +4831,9 @@ class RadarState:
                 period_authoritative_source=period_authoritative_source,
                 absolute_phase_trusted=bool(msg.get("apt", False)),
                 dominant_prior_inconsistent=bool(msg.get("dpi", False)),
+                anchor_competition_ambiguity=(float(msg["aca"]) if msg.get("aca") is not None else None),
+                validator_excluded_count=int(msg.get("vec") or 0),
+                per_icao_phase_offsets=self._normalise_go_per_icao_phase_offsets(msg.get("pio")),
             )
             self._live_sync_states[iid] = new_sync
             self._append_go_sync_diagnostic_history_locked(iid, {
@@ -9069,6 +9108,7 @@ class RadarState:
                 "sync_horizons": self._sync_horizons_payload(sync, display_window_s=window_s),
                 "predictor_consistency": getattr(sync, "predictor_consistency", None) if sync else None,
                 "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []) if sync else [],
+                "per_icao_phase_offsets": list(getattr(sync, "per_icao_phase_offsets", []) or []) if sync else [],
                 # No sync state → no authoritative residuals possible.
                 "df11_residual_observations": [],
                 "chart_overlay_consistent": False,
@@ -9129,6 +9169,7 @@ class RadarState:
                 "sync_horizons": self._sync_horizons_payload(sync, display_window_s=window_s),
                 "predictor_consistency": getattr(sync, "predictor_consistency", None),
                 "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []),
+                "per_icao_phase_offsets": list(getattr(sync, "per_icao_phase_offsets", []) or []),
                 "motion_comp_summary": {
                     "phase_enabled": bool(getattr(sync, "motion_comp_phase_enabled", False)),
                     "fit_enabled": bool(getattr(sync, "motion_comp_fit_enabled", False)),
@@ -9470,6 +9511,7 @@ class RadarState:
             "chart_overlay_consistent": burst_timeline.get("chart_overlay_consistent", False),
             "waveform_bins": burst_timeline.get("waveform_bins", []),
             "phase_anchor_candidates": burst_timeline.get("phase_anchor_candidates", []),
+            "per_icao_phase_offsets": burst_timeline.get("per_icao_phase_offsets", []),
             "period_update_history": burst_timeline.get("period_update_history", []),
             "slope_history": burst_timeline.get("slope_history", []),
             "period_history": burst_timeline.get("period_history", []),

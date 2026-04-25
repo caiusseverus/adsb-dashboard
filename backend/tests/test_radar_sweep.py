@@ -3801,3 +3801,111 @@ def test_on_df11_batch_runs_burst_builder_without_radar_core(monkeypatch):
 
     assert len(builder_calls) == 1
     assert builder_calls[0] == (7, "AAAAAA")
+
+
+def test_go_sync_decodes_per_icao_phase_offsets_and_new_diagnostic_fields():
+    """aca/vec/pio fields from Go MULTI_SYNC_STATE must decode into LiveSyncState."""
+    state = RadarState()
+    state.update_go_multi_sync_state({
+        "i": 9, "pr": True, "us": True,
+        "p": 4.0, "pb": 4.0,
+        "pe": 1_000_000.0, "po": 45.0,
+        "jd": 2.0, "re": 3.0, "nu": 5,
+        "ho": False, "ra": False, "ts": 1_000.0,
+        "aca": 0.35,
+        "vec": 3,
+        "pio": [
+            {"i": int("AAAAAA", 16), "lo": 45.0, "ad": 0.0, "r": "anchor", "rr": []},
+            {"i": int("BBBBBB", 16), "lo": 47.2, "ad": 2.2, "r": "validator_agree", "rr": []},
+            {"i": int("CCCCCC", 16), "lo": 60.0, "ad": 15.0, "r": "validator_disagree", "rr": ["phase_outlier"]},
+            {"i": int("DDDDDD", 16), "lo": 44.5, "ad": -0.5, "r": "excluded", "rr": []},
+            {"i": int("EEEEEE", 16), "lo": 0.0, "ad": 0.0, "r": "not_fit_eligible", "rr": ["no_position"]},
+        ],
+    })
+    sync = state.get_live_sync_state(9)
+    assert sync is not None
+    assert sync.anchor_competition_ambiguity == pytest.approx(0.35)
+    assert sync.validator_excluded_count == 3
+    assert len(sync.per_icao_phase_offsets) == 5
+    rows_by_icao = {r["icao"]: r for r in sync.per_icao_phase_offsets}
+    assert rows_by_icao["AAAAAA"]["role"] == "anchor"
+    assert rows_by_icao["AAAAAA"]["anchor_delta_deg"] == pytest.approx(0.0)
+    assert rows_by_icao["BBBBBB"]["role"] == "validator_agree"
+    assert rows_by_icao["BBBBBB"]["latest_offset_deg"] == pytest.approx(47.2)
+    assert rows_by_icao["CCCCCC"]["role"] == "validator_disagree"
+    assert rows_by_icao["CCCCCC"]["reject_reasons"] == ["phase_outlier"]
+    assert rows_by_icao["DDDDDD"]["role"] == "excluded"
+    assert rows_by_icao["EEEEEE"]["role"] == "not_fit_eligible"
+
+
+def test_go_sync_decodes_per_icao_phase_offsets_defaults_when_absent():
+    """anchor_competition_ambiguity, validator_excluded_count, and per_icao_phase_offsets
+    must default to None/0/[] when absent from the Go message."""
+    state = RadarState()
+    state.update_go_multi_sync_state({
+        "i": 10, "pr": True, "us": True,
+        "p": 4.0, "pb": 4.0,
+        "pe": 1_000_000.0, "po": 30.0,
+        "jd": 2.0, "re": 3.0, "nu": 3,
+        "ho": False, "ra": False, "ts": 1_000.0,
+    })
+    sync = state.get_live_sync_state(10)
+    assert sync is not None
+    assert sync.anchor_competition_ambiguity is None
+    assert sync.validator_excluded_count == 0
+    assert sync.per_icao_phase_offsets == []
+
+
+def test_burst_sync_timeline_payload_contains_per_icao_offsets(monkeypatch):
+    """get_live_sync_snapshot (used by websocket) must include per_icao_phase_offsets
+    alongside the existing observations array — not replace it."""
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    state._models[12] = RadarIID(
+        iid=12, status="SINGLE_RADAR", period_s=4.0,
+        manual_lat=51.0, manual_lon=0.0, resolution_mode="locked_position",
+    )
+    state.update_go_multi_sync_state({
+        "i": 12, "pr": True, "us": True,
+        "p": 4.0, "pb": 4.0,
+        "pe": 1_000_000.0, "po": 0.0,
+        "jd": 2.0, "re": 3.0, "nu": 2,
+        "ho": False, "ra": False, "ts": 1_000.0,
+        "aam": "refined_authoritative",
+        "aps": 4.0, "asa": 60.0, "avs": 0.9, "vac": 3, "bas": 0.1,
+        "aca": 0.2, "vec": 1,
+        "pio": [
+            {"i": int("AAAAAA", 16), "lo": 20.0, "ad": 0.0, "r": "anchor", "rr": []},
+            {"i": int("BBBBBB", 16), "lo": 21.5, "ad": 1.5, "r": "validator_agree", "rr": []},
+        ],
+    })
+    from collections import deque
+    state._go_evidence_events = deque([
+        {
+            "kind": "burst_fired", "iid": 12, "icao": "AAAAAA",
+            "arrival_us": 1_000_000.0, "wall_ts": 980.0,
+            "n_replies": 4, "signal_dbfs": -15.0,
+            "truth_lat": 51.1, "truth_lon": 0.1, "position_age_seconds": 0.2,
+            "compact_sync_eligible": True, "sync_eligible": True,
+        },
+        {
+            "kind": "burst_fired", "iid": 12, "icao": "BBBBBB",
+            "arrival_us": 5_000_000.0, "wall_ts": 990.0,
+            "n_replies": 4, "signal_dbfs": -15.0,
+            "truth_lat": 51.2, "truth_lon": 0.1, "position_age_seconds": 0.2,
+            "compact_sync_eligible": True, "sync_eligible": True,
+        },
+    ], maxlen=state._GO_EVIDENCE_EVENTS_MAX)
+
+    snapshot = state.get_live_sync_snapshot(12, window_s=90.0)
+    # Existing observations array must be preserved.
+    assert len(snapshot["observations"]) == 2, "burst observations must not be replaced by per_icao table"
+    # New per_icao_phase_offsets must appear at the top level.
+    offsets = snapshot["per_icao_phase_offsets"]
+    assert len(offsets) == 2
+    roles_by_icao = {r["icao"]: r["role"] for r in offsets}
+    assert roles_by_icao["AAAAAA"] == "anchor"
+    assert roles_by_icao["BBBBBB"] == "validator_agree"

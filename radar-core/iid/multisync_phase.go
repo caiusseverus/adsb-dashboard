@@ -104,8 +104,10 @@ func (ms *MultiSyncSolver) solvePhaseBranch(
 // non-anchor ICAOs agree with the proposed phase offset. It also computes global branch
 // coherence to detect wrong-branch self-reinforcement.
 //
-// The same fit-eligible observation population is used for both branch ambiguity and
-// validator agreement — they are not computed on different subsets.
+// branchAmbiguity and validator agreement use different populations:
+// branchAmbiguity starts from anchor-candidate competition (anchorCompetitionAmbiguity =
+// secondScore/topScore) and may be raised by global coherence checks. Validator agreement
+// counts only non-anchor ICAOs with >= validatorMinObsPerICAO fit-eligible observations.
 func (ms *MultiSyncSolver) evaluatePhaseValidation(
 	prepared []PreparedObservation,
 	estimate syncStateEstimate,

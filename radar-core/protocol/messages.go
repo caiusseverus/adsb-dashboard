@@ -375,6 +375,22 @@ type MultiSyncState struct {
 	// MotionGuardDegraded is true when period correction ran at reduced gain/step due to
 	// insufficient ICAOs or bearing spread (degraded motion compensation guard).
 	MotionGuardDegraded bool `codec:"mgd"`
+	// AnchorCompetitionAmbiguity is secondScore/topScore from anchor candidates (0=clear, 1=tied).
+	// Distinct from BranchAmbiguityScore which also incorporates global coherence checks.
+	AnchorCompetitionAmbiguity float64 `codec:"aca"`
+	// ValidatorExcludedCount is ICAOs with fit-eligible obs that were below validatorMinObsPerICAO.
+	ValidatorExcludedCount uint16 `codec:"vec"`
+	// PerICAOPhaseOffsets is the per-ICAO implied-offset and validator-role table.
+	PerICAOPhaseOffsets []PerICAOPhaseOffset `codec:"pio"`
+}
+
+// PerICAOPhaseOffset holds the implied phase offset and validator role for one ICAO.
+type PerICAOPhaseOffset struct {
+	ICAO            uint32   `codec:"i"`
+	LatestOffsetDeg float64  `codec:"lo"`
+	AnchorDeltaDeg  float64  `codec:"ad"`
+	Role            string   `codec:"r"`
+	RejectReasons   []string `codec:"rr"`
 }
 
 type MultiSyncAnchorCandidate struct {
