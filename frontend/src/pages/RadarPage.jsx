@@ -1911,7 +1911,19 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
 }
 
 function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics, perIcaoOffsets }) {
-  if (!syncState) return null
+  if (!syncState) {
+    return (
+      <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
+        <div style={{ color: '#c9d1d9', fontWeight: 600, marginBottom: '0.25rem' }}>Phase Anchor</div>
+        <div style={{ color: '#8b949e', fontSize: '0.74rem' }}>
+          No multisync state received yet. Waiting for Go radar-core to emit a MsgMultiSyncState for this IID.
+          {Array.isArray(perIcaoOffsets) && perIcaoOffsets.length > 0 && (
+            <span> ({perIcaoOffsets.length} per-ICAO offsets available from protocol.)</span>
+          )}
+        </div>
+      </div>
+    )
+  }
   const refined = modeDiagnostics?.refined ?? {}
   const refinedActive = Boolean(refined.active)
   const appliedAnchorIcao = syncState.phase_anchor_icao
@@ -2325,6 +2337,7 @@ function RotationAlignmentPanel({
   const observations = Array.isArray(burstTimeline?.observations) ? burstTimeline.observations : []
   const alignmentStatus = burstTimeline?.alignment_status ?? null
   const syncModeDiagnostics = burstTimeline?.sync_mode_diagnostics ?? null
+  const burstSyncDiagnostic = burstTimeline?.burst_sync_diagnostic ?? null
   const syncHorizons = burstTimeline?.sync_horizons ?? null
   const legacyIcaosRaw = Array.isArray(legacyTimeline?.icaos) ? legacyTimeline.icaos : []
   const syncState = burstTimeline?.sync_state ?? null
@@ -2787,10 +2800,36 @@ function RotationAlignmentPanel({
         <>
           {filteredObservations.length === 0 && visibleDf11ResidualDots.length === 0 ? (
             <div className={styles.empty}>
-              {alignmentStatus?.detail
-                ?? (syncState
-                  ? 'No burst-sync or DF11 residual data yet for this IID.'
-                  : 'Waiting for a maintained sync model before backend DF11 residual dots can be computed.')}
+              <div>
+                {alignmentStatus?.detail
+                  ?? (syncState
+                    ? 'No burst-sync or DF11 residual data yet for this IID.'
+                    : 'Waiting for a maintained sync model before backend DF11 residual dots can be computed.')}
+              </div>
+              {burstSyncDiagnostic && (
+                <div style={{ marginTop: '0.5rem', fontSize: '0.74rem', color: '#8b949e', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>
+                  <span style={{ marginRight: '1rem' }}>
+                    reason: <span style={{ color: '#d29922' }}>{burstSyncDiagnostic.no_obs_reason ?? '—'}</span>
+                  </span>
+                  <span style={{ marginRight: '1rem' }}>
+                    evidence: {burstSyncDiagnostic.evidence_total ?? 0} total / {burstSyncDiagnostic.evidence_with_position ?? 0} with pos
+                  </span>
+                  <span style={{ marginRight: '1rem' }}>
+                    radar pos: <span style={{ color: burstSyncDiagnostic.radar_position_available ? '#3fb950' : '#ff7b72' }}>
+                      {burstSyncDiagnostic.radar_position_available ? 'ok' : 'unavailable'}
+                    </span>
+                    {burstSyncDiagnostic.radar_position_source ? ` (${burstSyncDiagnostic.radar_position_source})` : ''}
+                  </span>
+                  <span style={{ marginRight: '1rem' }}>
+                    multisync age: {burstSyncDiagnostic.last_multisync_ts != null
+                      ? `${Math.max(0, (Date.now() / 1000) - burstSyncDiagnostic.last_multisync_ts).toFixed(0)}s`
+                      : 'never'}
+                  </span>
+                  <span>
+                    anchor candidates: {burstSyncDiagnostic.anchor_candidate_count ?? 0} · per-ICAO offsets: {burstSyncDiagnostic.per_icao_offsets_count ?? 0}
+                  </span>
+                </div>
+              )}
             </div>
           ) : (
             <>
@@ -2824,6 +2863,44 @@ function RotationAlignmentPanel({
                 </button>
               ))}
               </div>
+              {filteredObservations.length === 0 && burstSyncDiagnostic && (
+                <div style={{
+                  background: '#161b22',
+                  border: '1px solid #30363d',
+                  borderRadius: '6px',
+                  padding: '0.6rem 0.9rem',
+                  marginBottom: '0.6rem',
+                  fontSize: '0.74rem',
+                  color: '#8b949e',
+                  fontFamily: 'SFMono-Regular, Consolas, monospace',
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: '0.8rem',
+                  alignItems: 'center',
+                }}>
+                  <span style={{ color: '#c9d1d9', fontWeight: 600 }}>No burst sync alignment rows received</span>
+                  <span>
+                    reason: <span style={{ color: '#d29922' }}>{burstSyncDiagnostic.no_obs_reason ?? '—'}</span>
+                  </span>
+                  <span>
+                    evidence: {burstSyncDiagnostic.evidence_total ?? 0} total / {burstSyncDiagnostic.evidence_with_position ?? 0} with pos
+                  </span>
+                  <span>
+                    radar pos: <span style={{ color: burstSyncDiagnostic.radar_position_available ? '#3fb950' : '#ff7b72' }}>
+                      {burstSyncDiagnostic.radar_position_available ? 'ok' : 'unavailable'}
+                    </span>
+                    {burstSyncDiagnostic.radar_position_source ? ` (${burstSyncDiagnostic.radar_position_source})` : ''}
+                  </span>
+                  <span>
+                    multisync age: {burstSyncDiagnostic.last_multisync_ts != null
+                      ? `${Math.max(0, (Date.now() / 1000) - burstSyncDiagnostic.last_multisync_ts).toFixed(0)}s`
+                      : 'never'}
+                  </span>
+                  <span>
+                    anchor candidates: {burstSyncDiagnostic.anchor_candidate_count ?? 0} · per-ICAO offsets: {burstSyncDiagnostic.per_icao_offsets_count ?? 0}
+                  </span>
+                </div>
+              )}
               <div className={styles.alignmentWrap}>
                 <svg
                   width={chartW}

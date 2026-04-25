@@ -9095,7 +9095,33 @@ class RadarState:
             if _ev[0] >= _df11_cutoff_us and _ev[1] == iid
         ]
 
+        evidence_with_position = sum(
+            1 for ev in go_evidence
+            if ev.get("truth_lat") is not None and ev.get("truth_lon") is not None
+        )
+        radar_pos_available = (
+            radar_pos.get("lat") is not None and radar_pos.get("lon") is not None
+        )
+
         if not obs_snapshot or sync is None:
+            burst_sync_diagnostic = {
+                "last_multisync_ts": float(sync.last_sync_update_ts) if sync else None,
+                "last_multisync_iid": iid if sync else None,
+                "anchor_candidate_count": len(getattr(sync, "phase_anchor_candidates", []) or []) if sync else 0,
+                "per_icao_offsets_count": len(getattr(sync, "per_icao_phase_offsets", []) or []) if sync else 0,
+                "evidence_total": len(go_evidence),
+                "evidence_with_position": evidence_with_position,
+                "observations_emitted": 0,
+                "radar_position_available": radar_pos_available,
+                "radar_position_source": radar_pos.get("source", "none"),
+                "no_obs_reason": (
+                    "sync_state_unavailable" if sync is None
+                    else "no_go_evidence" if not go_evidence
+                    else "no_evidence_with_position" if evidence_with_position == 0
+                    else "radar_position_unavailable" if not radar_pos_available
+                    else "unknown"
+                ),
+            }
             return {
                 "observations": [],
                 "sync_state": _live_sync_state_to_dict(sync) if sync else None,
@@ -9115,6 +9141,7 @@ class RadarState:
                 "retention_diagnostics": retention_diagnostics,
                 "alignment_status": alignment_status,
                 "sync_mode_diagnostics": sync_mode_diagnostics,
+                "burst_sync_diagnostic": burst_sync_diagnostic,
             }
 
         if not _sync_source_has_rich_python_diagnostics(sync):
@@ -9157,6 +9184,18 @@ class RadarState:
                     source=residual_source,
                 )
 
+            burst_sync_diagnostic = {
+                "last_multisync_ts": float(sync.last_sync_update_ts),
+                "last_multisync_iid": iid,
+                "anchor_candidate_count": len(getattr(sync, "phase_anchor_candidates", []) or []),
+                "per_icao_offsets_count": len(getattr(sync, "per_icao_phase_offsets", []) or []),
+                "evidence_total": len(go_evidence),
+                "evidence_with_position": evidence_with_position,
+                "observations_emitted": len(entries),
+                "radar_position_available": radar_pos_available,
+                "radar_position_source": radar_pos.get("source", "none"),
+                "no_obs_reason": None,
+            }
             return {
                 "observations": entries,
                 "sync_state": _live_sync_state_to_dict(sync),
@@ -9170,6 +9209,7 @@ class RadarState:
                 "predictor_consistency": getattr(sync, "predictor_consistency", None),
                 "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []),
                 "per_icao_phase_offsets": list(getattr(sync, "per_icao_phase_offsets", []) or []),
+                "burst_sync_diagnostic": burst_sync_diagnostic,
                 "motion_comp_summary": {
                     "phase_enabled": bool(getattr(sync, "motion_comp_phase_enabled", False)),
                     "fit_enabled": bool(getattr(sync, "motion_comp_fit_enabled", False)),
@@ -9512,6 +9552,7 @@ class RadarState:
             "waveform_bins": burst_timeline.get("waveform_bins", []),
             "phase_anchor_candidates": burst_timeline.get("phase_anchor_candidates", []),
             "per_icao_phase_offsets": burst_timeline.get("per_icao_phase_offsets", []),
+            "burst_sync_diagnostic": burst_timeline.get("burst_sync_diagnostic"),
             "period_update_history": burst_timeline.get("period_update_history", []),
             "slope_history": burst_timeline.get("slope_history", []),
             "period_history": burst_timeline.get("period_history", []),
