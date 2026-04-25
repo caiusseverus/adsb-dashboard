@@ -265,6 +265,22 @@ func (ms *MultiSyncSolver) candidateApplicationBlockReason(
 	if ms.CandidatePromotionStreak < candidatePromotionMinStreak {
 		return "candidate_streak_not_met"
 	}
+	// Layer 4: long-term estimator gates. Promotion to authoritative authority
+	// requires accumulated evidence from the persistent estimators, not just a
+	// single strong window.
+	if ms.LongTermPeriodEstimateS > 0 && ms.LongTermPeriodEstimatorConfidence < periodEstimatorMinConfidence {
+		return fmt.Sprintf("period_estimator_confidence_insufficient: conf=%.3f required>=%.2f",
+			ms.LongTermPeriodEstimatorConfidence, periodEstimatorMinConfidence)
+	}
+	if len(ms.BranchTracks) > 0 && ms.BranchEstimatorConfidence < branchPromotionMinConfidence {
+		return fmt.Sprintf("branch_confidence_insufficient: conf=%.3f required>=%.2f",
+			ms.BranchEstimatorConfidence, branchPromotionMinConfidence)
+	}
+	// Competing branch dominance: if a runner-up has comparable confidence,
+	// block promotion until the dominant track's lead widens.
+	if competitorTooClose(ms.BranchTracks, ms.BranchEstimatorConfidence) {
+		return "branch_competitor_dominant"
+	}
 	if ms.ActiveAuthorityMode == authorityModeCompact {
 		if ms.LastAuthoritySwitchTS > 0 && nowUnix-ms.LastAuthoritySwitchTS < authorityMinModeHoldS {
 			return "authority_hold_time"

@@ -8,6 +8,7 @@ package iid
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -345,6 +346,106 @@ func TestLayer3_BranchTracksCappedAtMax(t *testing.T) {
 	}
 	if len(ms.BranchTracks) != branchMaxTracks {
 		t.Errorf("final track count = %d, want %d", len(ms.BranchTracks), branchMaxTracks)
+	}
+}
+
+// L4.A: Authority promotion is blocked when long-term period confidence is
+// below threshold, with a specific block reason exposing the values.
+func TestLayer4_PeriodEstimatorConfidenceGate(t *testing.T) {
+	ms := newSolver()
+	ms.ActiveAuthorityMode = authorityModeRefined
+	ms.CandidatePromotionStreak = candidatePromotionMinStreak + 1
+	// Long-term seeded but with low confidence (just below threshold).
+	ms.LongTermPeriodEstimateS = 4.8
+	ms.LongTermPeriodEstimatorConfidence = periodEstimatorMinConfidence - 0.05
+
+	estimate := syncStateEstimate{
+		present: true, periodS: 4.8, epochUS: 0, offsetDeg: 45.0,
+		anchorICAO: ptr(uint32(0xA01)),
+	}
+	v := strongValidation()
+	reason := ms.candidateApplicationBlockReason(
+		estimate, v, true, true, trustMinFitPool+1, validatorAgreementMinCount+2, false, true, 1000.0,
+	)
+	if !strings.Contains(reason, "period_estimator_confidence_insufficient") {
+		t.Errorf("expected period_estimator_confidence_insufficient block, got %q", reason)
+	}
+	if !strings.Contains(reason, "conf=") || !strings.Contains(reason, "required>=") {
+		t.Errorf("block reason missing diagnostic numbers: %q", reason)
+	}
+
+	// Once confidence rises above threshold, the gate clears (other gates
+	// must not fire — branch tracks are empty so branch gates pass).
+	ms.LongTermPeriodEstimatorConfidence = periodEstimatorMinConfidence + 0.05
+	reason = ms.candidateApplicationBlockReason(
+		estimate, v, true, true, trustMinFitPool+1, validatorAgreementMinCount+2, false, true, 1000.0,
+	)
+	if reason != "" {
+		t.Errorf("expected no block once period confidence sufficient, got %q", reason)
+	}
+}
+
+// L4.B: Authority promotion is blocked when branch confidence is below threshold.
+func TestLayer4_BranchConfidenceGate(t *testing.T) {
+	ms := newSolver()
+	ms.ActiveAuthorityMode = authorityModeRefined
+	ms.CandidatePromotionStreak = candidatePromotionMinStreak + 1
+	ms.LongTermPeriodEstimateS = 4.8
+	ms.LongTermPeriodEstimatorConfidence = 0.9
+	// Add a branch track but with low confidence.
+	anchor := uint32(0xA01)
+	ms.BranchTracks = []*BranchEstimate{{
+		OffsetDeg: 45.0, AnchorICAO: &anchor,
+		Confidence:                  branchPromotionMinConfidence - 0.05,
+		ConsecutiveSupportedWindows: 1,
+	}}
+	ms.BranchEstimatorConfidence = branchPromotionMinConfidence - 0.05
+	estimate := syncStateEstimate{
+		present: true, periodS: 4.8, epochUS: 0, offsetDeg: 45.0,
+		anchorICAO: &anchor,
+	}
+	reason := ms.candidateApplicationBlockReason(
+		estimate, strongValidation(), true, true, trustMinFitPool+1, validatorAgreementMinCount+2, false, true, 1000.0,
+	)
+	if !strings.Contains(reason, "branch_confidence_insufficient") {
+		t.Errorf("expected branch_confidence_insufficient block, got %q", reason)
+	}
+}
+
+// L4.C: Authority promotion is blocked when a competing branch has comparable
+// confidence to the dominant.
+func TestLayer4_BranchCompetitorDominantGate(t *testing.T) {
+	ms := newSolver()
+	ms.ActiveAuthorityMode = authorityModeRefined
+	ms.CandidatePromotionStreak = candidatePromotionMinStreak + 1
+	ms.LongTermPeriodEstimateS = 4.8
+	ms.LongTermPeriodEstimatorConfidence = 0.9
+	// Two tracks; runner-up at 0.6 of dominant (above branchCompetitorMaxRelativeFrac=0.5).
+	anchorA := uint32(0xA01)
+	anchorB := uint32(0xB02)
+	ms.BranchTracks = []*BranchEstimate{
+		{OffsetDeg: 45.0, AnchorICAO: &anchorA, Confidence: 0.5},
+		{OffsetDeg: 200.0, AnchorICAO: &anchorB, Confidence: 0.35},
+	}
+	ms.BranchEstimatorConfidence = 0.5
+	estimate := syncStateEstimate{
+		present: true, periodS: 4.8, epochUS: 0, offsetDeg: 45.0,
+		anchorICAO: &anchorA,
+	}
+	reason := ms.candidateApplicationBlockReason(
+		estimate, strongValidation(), true, true, trustMinFitPool+1, validatorAgreementMinCount+2, false, true, 1000.0,
+	)
+	if reason != "branch_competitor_dominant" {
+		t.Errorf("expected branch_competitor_dominant block, got %q", reason)
+	}
+
+	// Decay competitor below threshold (e.g. 0.20/0.50 = 0.4 < 0.5).
+	ms.BranchTracks[1].Confidence = 0.20
+	reason = ms.candidateApplicationBlockReason(
+		estimate, strongValidation(), true, true, trustMinFitPool+1, validatorAgreementMinCount+2, false, true, 1000.0,
+	)
+	if reason == "branch_competitor_dominant" {
+		t.Errorf("expected gate to clear once competitor decays, got %q", reason)
 	}
 }
 

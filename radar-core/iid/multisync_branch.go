@@ -194,6 +194,23 @@ func (ms *MultiSyncSolver) recomputeDominantBranch() {
 	ms.BranchCompetitorCount = len(ms.BranchTracks) - 1
 }
 
+// competitorTooClose reports whether the second-strongest track's confidence
+// is too close to the dominant for safe promotion. Returns true when the
+// runner-up's confidence is more than branchCompetitorMaxRelativeFrac of the
+// dominant's. Single-track sets always return false.
+func competitorTooClose(tracks []*BranchEstimate, dominantConf float64) bool {
+	if len(tracks) < 2 || dominantConf <= 0 {
+		return false
+	}
+	var runnerUp float64
+	for _, tr := range tracks {
+		if tr.Confidence < dominantConf && tr.Confidence > runnerUp {
+			runnerUp = tr.Confidence
+		}
+	}
+	return runnerUp/dominantConf > branchCompetitorMaxRelativeFrac
+}
+
 // circularEMAUpdate blends `current` toward `target` along the shorter arc on
 // a 0–360° circle, with the given gain. The result is normalised to [0, 360).
 func circularEMAUpdate(current, target, gain float64) float64 {

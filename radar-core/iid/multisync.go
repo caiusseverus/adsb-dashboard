@@ -1193,6 +1193,16 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 	_, candidateDeltaToDominantPPM := periodDeltaToDominant(candidateEstimate.periodS, dominantPeriodS)
 	dominantBoundOK := dominantPeriodS <= 0 || math.Abs(candidateDeltaToDominantPPM) <= periodRefineMaxPPMFromDominant
 
+	// Layer 4: refined-healthy now also requires the long-term estimators to
+	// have accumulated enough evidence. The estimators are seeded on the first
+	// viable window, so these gates do not block bootstrap; they only delay
+	// promotion until consecutive consistent windows have been observed.
+	longTermPeriodHealthy := ms.LongTermPeriodEstimateS <= 0 ||
+		ms.LongTermPeriodEstimatorConfidence >= periodEstimatorMinConfidence
+	branchHealthy := len(ms.BranchTracks) == 0 ||
+		(ms.BranchEstimatorConfidence >= branchPromotionMinConfidence &&
+			!competitorTooClose(ms.BranchTracks, ms.BranchEstimatorConfidence))
+
 	refinedHealthy := ms.Usable &&
 		candidateEstimate.anchorICAO != nil &&
 		period.FitPoolCount >= trustMinFitPool &&
@@ -1201,7 +1211,9 @@ func (ms *MultiSyncSolver) runFit(sync *SyncState, dominantPeriodS, nowUnix floa
 		dominantBoundOK &&
 		!majorityRejected &&
 		!period.WrongPeriodSuspect &&
-		period.SlopeGatePassed
+		period.SlopeGatePassed &&
+		longTermPeriodHealthy &&
+		branchHealthy
 
 	refinedFailure := !ms.Usable ||
 		candidateEstimate.anchorICAO == nil ||

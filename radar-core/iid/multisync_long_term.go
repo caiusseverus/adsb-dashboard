@@ -44,6 +44,15 @@ const (
 	longTermPeriodConfidenceStep            = 0.08
 	longTermPeriodConfidenceContradictDecay = 0.50
 	longTermPeriodConfidenceMax             = 1.0
+
+	// ─── Layer 4: authority promotion thresholds against long-term state ──────
+	// These run as ADDITIONAL gates on top of the existing single-window
+	// validation/streak checks. They prevent the candidate from being applied
+	// to authoritative state until the long-term estimators have accumulated
+	// enough evidence to back the decision.
+	periodEstimatorMinConfidence  = 0.15 // ~2 strong consistent windows
+	branchPromotionMinConfidence  = 0.20 // ~3 strong consistent windows
+	branchCompetitorMaxRelativeFrac = 0.50 // dominant must be ≥2× competitor confidence
 )
 
 // updateLongTermPeriodEstimator seeds (when not yet present) or nudges the
