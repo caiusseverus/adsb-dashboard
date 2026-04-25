@@ -1390,6 +1390,30 @@ class LiveSyncState:
     #              "role": str, "reject_reasons": list[str]}
     per_icao_phase_offsets: list[dict] = _field(default_factory=list)
 
+    # ─── Long-term estimator separation (Layer 6 plumbing) ────────────────────
+    # Local* fields are the short-window (current fit) measurement.
+    # LongTerm*/Branch* fields are the persistent estimator state. UI must
+    # plot/label these separately from the corresponding applied state.
+    local_period_measurement_s: float = 0.0
+    local_candidate_anchor_icao: str | None = None
+    local_branch_offset_deg: float = 0.0
+    local_validator_agreement: int = 0
+    local_fit_quality_score: float = 0.0
+
+    long_term_period_estimate_s: float = 0.0
+    long_term_period_estimator_confidence: float = 0.0
+    long_term_period_estimator_age_s: float = 0.0
+    consecutive_period_consistent_windows: int = 0
+    period_update_delta_s: float = 0.0
+
+    long_term_branch_anchor_icao: str | None = None
+    long_term_branch_offset_deg: float = 0.0
+    branch_estimator_confidence: float = 0.0
+    branch_consistent_windows: int = 0
+    branch_contradiction_windows: int = 0
+    branch_competitor_count: int = 0
+    branch_promotion_block_reason: str | None = None
+
 
 @_dataclass
 class AlignedBurstSyncObs:
@@ -4702,6 +4726,16 @@ class RadarState:
                 authoritative_anchor_icao = f"{int(authoritative_anchor_icao_raw):06X}"
             except Exception:
                 authoritative_anchor_icao = None
+        # Layer 6: long-term / local anchors share the same hex normalisation.
+        def _norm_icao(raw):
+            if raw is None:
+                return None
+            try:
+                return f"{int(raw):06X}"
+            except Exception:
+                return None
+        local_candidate_anchor_icao = _norm_icao(msg.get("lca"))
+        long_term_branch_anchor_icao = _norm_icao(msg.get("lba"))
         anchor_candidates = self._normalise_go_anchor_candidates(msg.get("acs"))
         anchor_row = next((row for row in anchor_candidates if row.get("icao") == anchor_icao), None)
         fit_reject_reasons_raw = msg.get("frr") or {}
@@ -4844,6 +4878,23 @@ class RadarState:
                 anchor_competition_ambiguity=(float(msg["aca"]) if msg.get("aca") is not None else None),
                 validator_excluded_count=int(msg.get("vec") or 0),
                 per_icao_phase_offsets=self._normalise_go_per_icao_phase_offsets(msg.get("pio")),
+                local_period_measurement_s=float(msg.get("lpm") or 0.0),
+                local_candidate_anchor_icao=local_candidate_anchor_icao,
+                local_branch_offset_deg=float(msg.get("lbo") or 0.0),
+                local_validator_agreement=int(msg.get("lva") or 0),
+                local_fit_quality_score=float(msg.get("lfq") or 0.0),
+                long_term_period_estimate_s=float(msg.get("lte") or 0.0),
+                long_term_period_estimator_confidence=float(msg.get("ltc") or 0.0),
+                long_term_period_estimator_age_s=float(msg.get("lta") or 0.0),
+                consecutive_period_consistent_windows=int(msg.get("cpc") or 0),
+                period_update_delta_s=float(msg.get("pud") or 0.0),
+                long_term_branch_anchor_icao=long_term_branch_anchor_icao,
+                long_term_branch_offset_deg=float(msg.get("lbf") or 0.0),
+                branch_estimator_confidence=float(msg.get("bec") or 0.0),
+                branch_consistent_windows=int(msg.get("bcw") or 0),
+                branch_contradiction_windows=int(msg.get("bcn") or 0),
+                branch_competitor_count=int(msg.get("bcc") or 0),
+                branch_promotion_block_reason=msg.get("bpb") or None,
             )
             self._live_sync_states[iid] = new_sync
             self._append_go_sync_diagnostic_history_locked(iid, {

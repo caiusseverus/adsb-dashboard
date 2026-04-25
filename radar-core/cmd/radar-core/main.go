@@ -415,6 +415,26 @@ func (e *engine) emitMultiSyncState(s *iid.IIDState) {
 		AnchorCompetitionAmbiguity:       snap.AnchorCompetitionAmbiguity,
 		ValidatorExcludedCount:           uint16(snap.ValidatorExcludedCount),
 		PerICAOPhaseOffsets:              perICAO,
+
+		LocalPeriodMeasurementS:  snap.LocalPeriodMeasurementS,
+		LocalCandidateAnchorICAO: snap.LocalCandidateAnchorICAO,
+		LocalBranchOffsetDeg:     snap.LocalBranchOffsetDeg,
+		LocalValidatorAgreement:  uint16(snap.LocalValidatorAgreement),
+		LocalFitQualityScore:     snap.LocalFitQualityScore,
+
+		LongTermPeriodEstimateS:            snap.LongTermPeriodEstimateS,
+		LongTermPeriodEstimatorConfidence:  snap.LongTermPeriodEstimatorConfidence,
+		LongTermPeriodEstimatorAgeS:        snap.LongTermPeriodEstimatorAgeS,
+		ConsecutivePeriodConsistentWindows: uint32(snap.ConsecutivePeriodConsistentWindows),
+		PeriodUpdateDeltaS:                 snap.PeriodUpdateDeltaS,
+
+		LongTermBranchAnchorICAO:   snap.LongTermBranchAnchorICAO,
+		LongTermBranchOffsetDeg:    snap.LongTermBranchOffsetDeg,
+		BranchEstimatorConfidence:  snap.BranchEstimatorConfidence,
+		BranchConsistentWindows:    uint32(snap.BranchConsistentWindows),
+		BranchContradictionWindows: uint32(snap.BranchContradictionWindows),
+		BranchCompetitorCount:      uint16(snap.BranchCompetitorCount),
+		BranchPromotionBlockReason: snap.BranchPromotionBlockReason,
 	}
 	e.writer.Send(msg)
 }

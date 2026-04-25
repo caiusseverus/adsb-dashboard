@@ -3523,6 +3523,50 @@ def test_go_sync_display_retention_independent_of_fit_window(monkeypatch):
     assert got_fits == pytest.approx(fit_windows)
 
 
+def test_go_long_term_estimator_fields_round_trip_through_bridge(monkeypatch):
+    """Layer 6: the new Local* / LongTerm* / Branch* protocol keys land on
+    LiveSyncState with the right types. UI consumers depend on these names."""
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
+    state = RadarState()
+    state.update_go_multi_sync_state({
+        "i": 9, "pr": True, "us": True,
+        "p": 4.0, "pb": 4.0,
+        "pe": 1_000_000.0, "po": 20.0,
+        "jd": 2.0, "re": 3.0, "nu": 1,
+        "ho": False, "ra": False, "ts": 1_000.0,
+        "ft": 9, "fe": 7, "fr": 2, "fc": 3,
+        "fw": 30.0, "dw": 300.0, "fs": 28.0, "rs": 0.05,
+        "aam": "refined_authoritative",
+        "aps": 4.0, "asa": 120.0, "avs": 0.9, "vac": 3, "bas": 0.1,
+        # Layer 6 fields:
+        "lpm": 4.0001, "lca": 0xA01F00, "lbo": 137.5, "lva": 4, "lfq": 0.85,
+        "lte": 4.0002, "ltc": 0.72, "lta": 60.0, "cpc": 12, "pud": 0.0001,
+        "lba": 0xB02F00, "lbf": 137.2, "bec": 0.65, "bcw": 10, "bcn": 1,
+        "bcc": 1, "bpb": "branch_competitor_dominant",
+    })
+
+    sync = state._live_sync_states[9]
+    assert sync.local_period_measurement_s == pytest.approx(4.0001)
+    assert sync.local_candidate_anchor_icao == "A01F00"
+    assert sync.local_branch_offset_deg == pytest.approx(137.5)
+    assert sync.local_validator_agreement == 4
+    assert sync.local_fit_quality_score == pytest.approx(0.85)
+    assert sync.long_term_period_estimate_s == pytest.approx(4.0002)
+    assert sync.long_term_period_estimator_confidence == pytest.approx(0.72)
+    assert sync.long_term_period_estimator_age_s == pytest.approx(60.0)
+    assert sync.consecutive_period_consistent_windows == 12
+    assert sync.period_update_delta_s == pytest.approx(0.0001)
+    assert sync.long_term_branch_anchor_icao == "B02F00"
+    assert sync.long_term_branch_offset_deg == pytest.approx(137.2)
+    assert sync.branch_estimator_confidence == pytest.approx(0.65)
+    assert sync.branch_consistent_windows == 10
+    assert sync.branch_contradiction_windows == 1
+    assert sync.branch_competitor_count == 1
+    assert sync.branch_promotion_block_reason == "branch_competitor_dominant"
+
+
 def test_df11_residual_dots_use_retained_residual_event_history(monkeypatch):
     """The 300s residual plot must not be limited by the 60s raw bootstrap event buffer."""
     import radar.sweep as sweep_module

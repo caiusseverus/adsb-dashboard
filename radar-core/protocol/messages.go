@@ -382,6 +382,29 @@ type MultiSyncState struct {
 	ValidatorExcludedCount uint16 `codec:"vec"`
 	// PerICAOPhaseOffsets is the per-ICAO implied-offset and validator-role table.
 	PerICAOPhaseOffsets []PerICAOPhaseOffset `codec:"pio"`
+
+	// ─── Long-term estimator separation (Layer 6 plumbing) ────────────────────
+	// `Local*` fields are the short-window (current fit) measurement.
+	// `LongTerm*` / `Branch*` fields are the persistent estimator state.
+	LocalPeriodMeasurementS  float64 `codec:"lpm"`
+	LocalCandidateAnchorICAO *uint32 `codec:"lca"`
+	LocalBranchOffsetDeg     float64 `codec:"lbo"`
+	LocalValidatorAgreement  uint16  `codec:"lva"`
+	LocalFitQualityScore     float64 `codec:"lfq"`
+
+	LongTermPeriodEstimateS            float64 `codec:"lte"`
+	LongTermPeriodEstimatorConfidence  float64 `codec:"ltc"`
+	LongTermPeriodEstimatorAgeS        float64 `codec:"lta"`
+	ConsecutivePeriodConsistentWindows uint32  `codec:"cpc"`
+	PeriodUpdateDeltaS                 float64 `codec:"pud"`
+
+	LongTermBranchAnchorICAO   *uint32 `codec:"lba"`
+	LongTermBranchOffsetDeg    float64 `codec:"lbf"`
+	BranchEstimatorConfidence  float64 `codec:"bec"`
+	BranchConsistentWindows    uint32  `codec:"bcw"`
+	BranchContradictionWindows uint32  `codec:"bcn"`
+	BranchCompetitorCount      uint16  `codec:"bcc"`
+	BranchPromotionBlockReason string  `codec:"bpb"`
 }
 
 // PerICAOPhaseOffset holds the implied phase offset and validator role for one ICAO.
