@@ -669,7 +669,7 @@ def test_update_go_burst_fired_triggers_multi_sync_update_from_go_evidence(monke
     def fake_update(iid: int, period_s: float, sync_quality=None):
         calls.append((iid, period_s))
 
-    # Default RADAR_SYNC_MODEL="simple" routes to _update_simple_live_sync_state.
+    # Python path always routes to _update_simple_live_sync_state.
     monkeypatch.setattr(state, "_update_simple_live_sync_state", fake_update)
     monkeypatch.setattr("radar.sweep.time.monotonic", lambda: 10.0)
 
@@ -3214,7 +3214,7 @@ def test_update_go_burst_fired_skips_python_solver_when_go_multi_sync_present(mo
     def fake_update(iid: int, period_s: float, **_kw):
         calls.append((iid, period_s))
 
-    # Default RADAR_SYNC_MODEL="simple" routes to _update_simple_live_sync_state.
+    # Python path always routes to _update_simple_live_sync_state.
     monkeypatch.setattr(state, "_update_simple_live_sync_state", fake_update)
     monkeypatch.setattr("radar.sweep.time.monotonic", lambda: 10.0)
 
@@ -4064,75 +4064,12 @@ def test_burst_sync_timeline_payload_contains_per_icao_offsets(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Config / dispatch integration tests
+# Dispatch integration tests
 # ---------------------------------------------------------------------------
 
-def test_config_defines_radar_sync_model_default_simple(monkeypatch):
-    """RADAR_SYNC_MODEL must default to 'simple' when env var is unset."""
-    import importlib
-    monkeypatch.delenv("RADAR_SYNC_MODEL", raising=False)
-    import config as cfg_module
-    importlib.reload(cfg_module)
-    assert cfg_module.RADAR_SYNC_MODEL == "simple"
-
-
-def test_invalid_radar_sync_model_falls_back_to_simple(monkeypatch):
-    """An unrecognised RADAR_SYNC_MODEL value must be replaced with 'simple'."""
-    import importlib
-    monkeypatch.setenv("RADAR_SYNC_MODEL", "nonsense_value")
-    import config as cfg_module
-    importlib.reload(cfg_module)
-    assert cfg_module.RADAR_SYNC_MODEL == "simple"
-
-
-def test_sweep_config_import_does_not_reset_other_flags_when_model_missing(monkeypatch):
-    """A config stub that omits RADAR_SYNC_MODEL must not reset established flags."""
-    import importlib
-    import types
-
-    # Build a fake config that has all the established flags but NO RADAR_SYNC_MODEL.
-    fake_cfg = types.ModuleType("config")
-    fake_cfg.RADAR_SYNC_PERIOD_REFINE_ENABLED = False   # non-default sentinel values
-    fake_cfg.RADAR_SYNC_WAVEFORM_ENABLED = False
-    fake_cfg.RADAR_SYNC_PROP_DELAY_ENABLED = False
-    fake_cfg.RADAR_SYNC_MOTION_COMP_PHASE_ENABLED = False
-    fake_cfg.RADAR_SYNC_MOTION_COMP_FIT_ENABLED = False
-    fake_cfg.RADAR_SYNC_WAVEFORM_BIN_COUNT = 99
-    fake_cfg.RADAR_DIAGNOSTICS = True
-    # Deliberately no RADAR_SYNC_MODEL attribute.
-
-    original_config = sys.modules.get("config")
-    sys.modules["config"] = fake_cfg
-    try:
-        import radar.sweep as sweep_module
-        importlib.reload(sweep_module)
-
-        # Established flags must carry the sentinel values, not fall back to defaults.
-        assert sweep_module.RADAR_SYNC_PERIOD_REFINE_ENABLED is False
-        assert sweep_module.RADAR_SYNC_WAVEFORM_ENABLED is False
-        assert sweep_module.RADAR_SYNC_PROP_DELAY_ENABLED is False
-        assert sweep_module.RADAR_SYNC_MOTION_COMP_PHASE_ENABLED is False
-        assert sweep_module.RADAR_SYNC_MOTION_COMP_FIT_ENABLED is False
-        assert sweep_module.RADAR_SYNC_WAVEFORM_BIN_COUNT == 99
-        assert sweep_module.RADAR_DIAGNOSTICS is True
-
-        # Missing RADAR_SYNC_MODEL must fall back to "simple", not crash.
-        assert sweep_module.RADAR_SYNC_MODEL == "simple"
-    finally:
-        if original_config is not None:
-            sys.modules["config"] = original_config
-        else:
-            sys.modules.pop("config", None)
-        # Reload sweep with the real config to restore module state.
-        import radar.sweep as sweep_module
-        importlib.reload(sweep_module)
-
-
-def test_simple_model_is_default_dispatch_path(monkeypatch):
-    """With default config the live sync dispatcher must call _update_simple_live_sync_state."""
+def test_python_dispatcher_always_calls_simple_live_sync(monkeypatch):
+    """Python sync dispatcher must unconditionally call _update_simple_live_sync_state."""
     import radar.sweep as sweep_module
-
-    monkeypatch.setattr(sweep_module, "RADAR_SYNC_MODEL", "simple")
 
     state = RadarState()
     iid = 7
@@ -4142,79 +4079,25 @@ def test_simple_model_is_default_dispatch_path(monkeypatch):
     )
 
     simple_calls: list = []
-    legacy_calls: list = []
-
     monkeypatch.setattr(state, "_update_simple_live_sync_state",
                         lambda iid, period_s: simple_calls.append((iid, period_s)))
-    monkeypatch.setattr(state, "_update_multi_aircraft_sync_state",
-                        lambda iid, period_s: legacy_calls.append((iid, period_s)))
-
-    # Drive the dispatch path directly.
-    state._last_multi_sync_update_ts[iid] = 0.0  # ensure throttle passes
-    import time as _time
     monkeypatch.setattr(sweep_module.time, "monotonic", lambda: 9999.0)
 
-    state._go_multi_sync_states_by_iid[iid] = None  # not active → Python path
-    # Trigger via the internal dispatch helper used by the burst loop.
+    state._go_multi_sync_states_by_iid[iid] = None  # Go not active → Python path
     state._last_multi_sync_update_ts[iid] = 0.0
     with state._lock:
         now_mono = sweep_module.time.monotonic()
         last = state._last_multi_sync_update_ts.get(iid, 0.0)
         if (now_mono - last) >= state._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
             state._last_multi_sync_update_ts[iid] = now_mono
-            if sweep_module.RADAR_SYNC_MODEL == "legacy":
-                state._update_multi_aircraft_sync_state(iid=iid, period_s=4.0)
-            else:
-                state._update_simple_live_sync_state(iid=iid, period_s=4.0)
+            state._update_simple_live_sync_state(iid=iid, period_s=4.0)
 
-    assert len(simple_calls) == 1, "simple model must be called"
-    assert len(legacy_calls) == 0, "legacy model must not be called by default"
-
-
-def test_legacy_model_dispatch_only_when_configured(monkeypatch):
-    """With RADAR_SYNC_MODEL='legacy' the dispatcher must call _update_multi_aircraft_sync_state."""
-    import radar.sweep as sweep_module
-
-    monkeypatch.setattr(sweep_module, "RADAR_SYNC_MODEL", "legacy")
-
-    state = RadarState()
-    iid = 8
-    state._models[iid] = RadarIID(
-        iid=iid, status="SINGLE_RADAR", period_s=4.0,
-        manual_lat=51.0, manual_lon=0.0, resolution_mode="locked_position",
-    )
-
-    simple_calls: list = []
-    legacy_calls: list = []
-
-    monkeypatch.setattr(state, "_update_simple_live_sync_state",
-                        lambda iid, period_s: simple_calls.append((iid, period_s)))
-    monkeypatch.setattr(state, "_update_multi_aircraft_sync_state",
-                        lambda iid, period_s: legacy_calls.append((iid, period_s)))
-
-    state._go_multi_sync_states_by_iid[iid] = None
-    state._last_multi_sync_update_ts[iid] = 0.0
-    monkeypatch.setattr(sweep_module.time, "monotonic", lambda: 9999.0)
-
-    with state._lock:
-        now_mono = sweep_module.time.monotonic()
-        last = state._last_multi_sync_update_ts.get(iid, 0.0)
-        if (now_mono - last) >= state._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
-            state._last_multi_sync_update_ts[iid] = now_mono
-            if sweep_module.RADAR_SYNC_MODEL == "legacy":
-                state._update_multi_aircraft_sync_state(iid=iid, period_s=4.0)
-            else:
-                state._update_simple_live_sync_state(iid=iid, period_s=4.0)
-
-    assert len(legacy_calls) == 1, "legacy model must be called when configured"
-    assert len(simple_calls) == 0, "simple model must not be called in legacy mode"
+    assert simple_calls == [(7, 4.0)], "simple model must always be called on Python path"
 
 
 def test_go_authoritative_state_skips_python_sync_dispatch(monkeypatch):
-    """When Go has authoritative multi-sync state for an IID neither Python method is called."""
+    """When Go has authoritative multi-sync state for an IID the Python method is not called."""
     import radar.sweep as sweep_module
-
-    monkeypatch.setattr(sweep_module, "RADAR_SYNC_MODEL", "simple")
 
     state = RadarState()
     iid = 9
@@ -4224,12 +4107,8 @@ def test_go_authoritative_state_skips_python_sync_dispatch(monkeypatch):
     )
 
     simple_calls: list = []
-    legacy_calls: list = []
-
     monkeypatch.setattr(state, "_update_simple_live_sync_state",
                         lambda iid, period_s: simple_calls.append((iid, period_s)))
-    monkeypatch.setattr(state, "_update_multi_aircraft_sync_state",
-                        lambda iid, period_s: legacy_calls.append((iid, period_s)))
 
     # Seed a truthy Go authoritative state — Python dispatch must be skipped.
     state._go_multi_sync_states_by_iid[iid] = {"authoritative": True}
@@ -4242,13 +4121,9 @@ def test_go_authoritative_state_skips_python_sync_dispatch(monkeypatch):
             last = state._last_multi_sync_update_ts.get(iid, 0.0)
             if (now_mono - last) >= state._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
                 state._last_multi_sync_update_ts[iid] = now_mono
-                if sweep_module.RADAR_SYNC_MODEL == "legacy":
-                    state._update_multi_aircraft_sync_state(iid=iid, period_s=4.0)
-                else:
-                    state._update_simple_live_sync_state(iid=iid, period_s=4.0)
+                state._update_simple_live_sync_state(iid=iid, period_s=4.0)
 
     assert len(simple_calls) == 0, "simple model must not be called when Go is authoritative"
-    assert len(legacy_calls) == 0, "legacy model must not be called when Go is authoritative"
 
 
 # ---------------------------------------------------------------------------

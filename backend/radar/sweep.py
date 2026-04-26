@@ -45,20 +45,10 @@ except Exception:  # pragma: no cover — config not importable in some test har
     RADAR_SYNC_WAVEFORM_BIN_COUNT = 24
     RADAR_DIAGNOSTICS = False
 
-try:
-    from config import RADAR_SYNC_MODEL
-except Exception:  # pragma: no cover
-    RADAR_SYNC_MODEL = "simple"
-
 if TYPE_CHECKING:
     from aircraft_state import AircraftState
 
 log = logging.getLogger(__name__)
-
-RADAR_SYNC_MODEL = str(RADAR_SYNC_MODEL or "simple").strip().lower()
-if RADAR_SYNC_MODEL not in {"simple", "legacy"}:
-    log.warning("Invalid RADAR_SYNC_MODEL=%r; defaulting to 'simple'", RADAR_SYNC_MODEL)
-    RADAR_SYNC_MODEL = "simple"
 
 _perf_lock = threading.Lock()
 df11_event_timings: deque[float] = deque(maxlen=4000)
@@ -1593,12 +1583,12 @@ class LiveSyncState:
     branch_contradiction_windows: int = 0
     branch_competitor_count: int = 0
     branch_promotion_block_reason: str | None = None
-    # Model identification — populated by both simple and legacy update paths.
+    # Model identification — populated by the sync update path.
     # sync_model: "simple" | "legacy"
     # period_source: how the operational period was derived
     # period_refinement_source: what drove the period correction this cycle
     # phase_source: what produced the phase offset this cycle
-    # legacy_model_active: True only when RADAR_SYNC_MODEL="legacy" path ran
+    # legacy_model_active: True only when _update_multi_aircraft_sync_state ran
     sync_model: str = "simple"
     period_source: str = "df_base"
     period_refinement_source: str = "none"
@@ -4765,16 +4755,10 @@ class RadarState:
                 last = self._last_multi_sync_update_ts.get(sync_update_iid, 0.0)
                 if (now_mono - last) >= self._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
                     self._last_multi_sync_update_ts[sync_update_iid] = now_mono
-                    if RADAR_SYNC_MODEL == "legacy":
-                        self._update_multi_aircraft_sync_state(
-                            iid=sync_update_iid,
-                            period_s=sync_update_period_s,
-                        )
-                    else:
-                        self._update_simple_live_sync_state(
-                            iid=sync_update_iid,
-                            period_s=sync_update_period_s,
-                        )
+                    self._update_simple_live_sync_state(
+                        iid=sync_update_iid,
+                        period_s=sync_update_period_s,
+                    )
 
     def _go_track_observation_snapshot(self) -> list[dict]:
         with self._lock:
@@ -6146,7 +6130,7 @@ class RadarState:
         period_s: float,
         sync_quality: float | None = None,
     ) -> None:
-        """Simple live sync state update — RADAR_SYNC_MODEL='simple'.
+        """Simple live sync state update — the unconditional Python sync path.
 
         Architecture (four explicit components):
           A. period_base_s from DF alignment (caller-supplied period_s / existing.period_base_s).
@@ -6160,10 +6144,9 @@ class RadarState:
           D. Phase-shape (waveform) correction: DISABLED in this model.
              Waveform learning is not called.  apply_waveform=False throughout.
 
-        The legacy model (_update_multi_aircraft_sync_state) is NOT called when
-        RADAR_SYNC_MODEL='simple'.  b_fit, period failure assessment, reacquire
-        logic, mixed failure-mode classification, and waveform participation in
-        trust/period are absent from this model.
+        b_fit, period failure assessment, reacquire logic, mixed failure-mode
+        classification, and waveform participation in trust/period are absent from
+        this model (see _update_multi_aircraft_sync_state for the legacy path).
         """
         existing = self._live_sync_states.get(iid)
         if existing is None:
@@ -6620,9 +6603,8 @@ class RadarState:
             "period_correction_status": period_correction_status,
         })
 
-    # ── LEGACY — kept for temporary comparison only; NOT called by default ──────
-    # Set RADAR_SYNC_MODEL=legacy in the environment to route here instead of
-    # _update_simple_live_sync_state().  Do not add features to this function.
+    # ── LEGACY — unreachable from the normal dispatcher; retained for reference ──
+    # Do not add features to this function.
     def _update_multi_aircraft_sync_state(
         self,
         iid: int,
