@@ -388,6 +388,10 @@ def _fit_weighted_slope(xs: list[float], ys: list[float], ws: list[float]) -> tu
     return a, b
 
 
+def _is_finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and _math.isfinite(float(value))
+
+
 def _fit_per_aircraft_slope(scored: list[dict], period_base_s: float) -> dict:
     """Fit residual slope per ICAO using unwrapped timelines; return consensus only when ≥2 ICAOs agree.
 
@@ -410,23 +414,23 @@ def _fit_per_aircraft_slope(scored: list[dict], period_base_s: float) -> dict:
     _SLOPE_ABS_FLOOR_DEG_S = 0.01
 
     # 1. Input validation.
-    # had_nonfinite is set only when a non-empty ICAO entry has non-finite timing/residual/weight.
-    # Missing/empty ICAO and zero/negative weight do NOT set had_nonfinite.
+    # had_nonfinite is set only when a non-empty ICAO entry has non-finite/non-numeric
+    # timing/residual/weight.  Missing/empty ICAO and zero/negative weight do NOT set it.
     had_nonfinite = False
     valid: list[dict] = []
     for e in scored:
         icao = e.get("icao", "")
         if not icao:
             continue  # silently skip; contributes to insufficient_icaos if needed
-        eff = e.get("effective_us", float("nan"))
-        res = e.get("residual", float("nan"))
-        w = e.get("weight", float("nan"))
-        if not (_math.isfinite(eff) and _math.isfinite(res) and _math.isfinite(w)):
+        eff = e.get("effective_us", None)
+        res = e.get("residual", None)
+        w = e.get("weight", None)
+        if not (_is_finite_number(eff) and _is_finite_number(res) and _is_finite_number(w)):
             had_nonfinite = True  # non-empty ICAO with bad numerics
             continue
         if w <= 0:
             continue  # zero/negative weight does NOT set had_nonfinite
-        valid.append(e)
+        valid.append({**e, "effective_us": float(eff), "residual": float(res), "weight": float(w)})
 
     # 2. Group by ICAO.
     by_icao: dict[str, list[dict]] = {}
@@ -438,8 +442,7 @@ def _fit_per_aircraft_slope(scored: list[dict], period_base_s: float) -> dict:
         sign_agreement=False, fit_span_s=0.0, per_icao_reject_reasons={},
     )
     if len(by_icao) < 2:
-        # nonfinite_input only when non-finite entries prevented any ICAO groups forming
-        reason = "nonfinite_input" if (had_nonfinite and len(by_icao) == 0) else "insufficient_icaos"
+        reason = "nonfinite_input" if had_nonfinite else "insufficient_icaos"
         return {**_null, "reject_reason": reason}
 
     # 3. Per-ICAO: filter, unwrap, fit slope.
@@ -491,7 +494,7 @@ def _fit_per_aircraft_slope(scored: list[dict], period_base_s: float) -> dict:
         t_all_max = max(t_all_max, ts_s[-1])
 
     if len(icao_slopes) < 2:
-        reason = "nonfinite_input" if (had_nonfinite and len(icao_slopes) == 0) else "insufficient_icaos"
+        reason = "nonfinite_input" if had_nonfinite else "insufficient_icaos"
         return {**_null, "icao_slopes": icao_slopes, "icao_count": len(icao_slopes),
                 "per_icao_reject_reasons": per_icao_reject, "reject_reason": reason}
 

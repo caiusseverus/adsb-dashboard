@@ -4208,3 +4208,143 @@ def test_legacy_model_dispatch_only_when_configured(monkeypatch):
 
     assert len(legacy_calls) == 1, "legacy model must be called when configured"
     assert len(simple_calls) == 0, "simple model must not be called in legacy mode"
+
+
+def test_go_authoritative_state_skips_python_sync_dispatch(monkeypatch):
+    """When Go has authoritative multi-sync state for an IID neither Python method is called."""
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module, "RADAR_SYNC_MODEL", "simple")
+
+    state = RadarState()
+    iid = 9
+    state._models[iid] = RadarIID(
+        iid=iid, status="SINGLE_RADAR", period_s=4.0,
+        manual_lat=51.0, manual_lon=0.0, resolution_mode="locked_position",
+    )
+
+    simple_calls: list = []
+    legacy_calls: list = []
+
+    monkeypatch.setattr(state, "_update_simple_live_sync_state",
+                        lambda iid, period_s: simple_calls.append((iid, period_s)))
+    monkeypatch.setattr(state, "_update_multi_aircraft_sync_state",
+                        lambda iid, period_s: legacy_calls.append((iid, period_s)))
+
+    # Seed a truthy Go authoritative state — Python dispatch must be skipped.
+    state._go_multi_sync_states_by_iid[iid] = {"authoritative": True}
+    state._last_multi_sync_update_ts[iid] = 0.0
+    monkeypatch.setattr(sweep_module.time, "monotonic", lambda: 9999.0)
+
+    with state._lock:
+        if not state._go_multi_sync_states_by_iid.get(iid):
+            now_mono = sweep_module.time.monotonic()
+            last = state._last_multi_sync_update_ts.get(iid, 0.0)
+            if (now_mono - last) >= state._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
+                state._last_multi_sync_update_ts[iid] = now_mono
+                if sweep_module.RADAR_SYNC_MODEL == "legacy":
+                    state._update_multi_aircraft_sync_state(iid=iid, period_s=4.0)
+                else:
+                    state._update_simple_live_sync_state(iid=iid, period_s=4.0)
+
+    assert len(simple_calls) == 0, "simple model must not be called when Go is authoritative"
+    assert len(legacy_calls) == 0, "legacy model must not be called when Go is authoritative"
+
+
+# ---------------------------------------------------------------------------
+# _fit_per_aircraft_slope malformed input tests
+# ---------------------------------------------------------------------------
+
+def _make_scored_entry(icao: str, effective_us: object, residual: object, weight: object) -> dict:
+    return {"icao": icao, "effective_us": effective_us, "residual": residual, "weight": weight}
+
+
+def _valid_entries(icao: str, n: int = 5, period_s: float = 4.0) -> list[dict]:
+    """Return n well-formed entries with a gently rising residual (non-zero slope)."""
+    return [
+        _make_scored_entry(icao, float(i * period_s * 1_000_000), float(i * 2.0), 1.0)
+        for i in range(n)
+    ]
+
+
+def test_fit_per_aircraft_slope_none_numeric_fields_do_not_crash():
+    """None in effective_us/residual/weight must not raise; must return nonfinite_input."""
+    from radar.sweep import _fit_per_aircraft_slope
+
+    scored = [
+        _make_scored_entry("AAAAAA", None, None, None),
+        _make_scored_entry("BBBBBB", None, 1.0, 1.0),
+    ]
+    result = _fit_per_aircraft_slope(scored, period_base_s=4.0)
+    assert result["reject_reason"] == "nonfinite_input"
+    assert result["slope_deg_per_s"] is None
+
+
+def test_fit_per_aircraft_slope_string_numeric_fields_do_not_crash():
+    """String values in numeric fields must not raise; must return nonfinite_input."""
+    from radar.sweep import _fit_per_aircraft_slope
+
+    scored = [
+        _make_scored_entry("AAAAAA", "bad", "data", "here"),
+        _make_scored_entry("BBBBBB", 1_000_000.0, 5.0, 1.0),
+    ]
+    result = _fit_per_aircraft_slope(scored, period_base_s=4.0)
+    assert result["reject_reason"] == "nonfinite_input"
+
+
+def test_fit_per_aircraft_slope_partial_valid_plus_malformed_returns_nonfinite_input():
+    """One valid ICAO + one non-empty ICAO with NaN fields → nonfinite_input, not insufficient_icaos."""
+    import math
+    from radar.sweep import _fit_per_aircraft_slope
+
+    scored = (
+        _valid_entries("AAAAAA")
+        + [_make_scored_entry("BBBBBB", float("nan"), 1.0, 1.0)]
+    )
+    result = _fit_per_aircraft_slope(scored, period_base_s=4.0)
+    assert result["reject_reason"] == "nonfinite_input", (
+        f"expected nonfinite_input, got {result['reject_reason']!r}"
+    )
+
+
+def test_fit_per_aircraft_slope_two_valid_plus_one_malformed_still_succeeds():
+    """Two ICAOs with valid agreeing slopes + one malformed ICAO → consensus succeeds."""
+    from radar.sweep import _fit_per_aircraft_slope
+
+    # Build two ICAOs with matching positive slopes.
+    period_s = 4.0
+    scored = (
+        _valid_entries("AAAAAA", n=6, period_s=period_s)
+        + _valid_entries("BBBBBB", n=6, period_s=period_s)
+        + [_make_scored_entry("CCCCCC", None, None, None)]  # malformed third ICAO
+    )
+    result = _fit_per_aircraft_slope(scored, period_base_s=period_s)
+    assert result["reject_reason"] is None, (
+        f"expected success, got {result['reject_reason']!r}"
+    )
+    assert result["slope_deg_per_s"] is not None
+
+
+def test_fit_per_aircraft_slope_missing_icao_does_not_set_nonfinite():
+    """Entries with missing/empty ICAO must not trigger nonfinite_input."""
+    from radar.sweep import _fit_per_aircraft_slope
+
+    # Only entries with empty ICAO — all skipped silently.
+    scored = [
+        _make_scored_entry("", 1_000_000.0, 5.0, 1.0),
+        _make_scored_entry(None, 2_000_000.0, 5.0, 1.0),
+    ]
+    result = _fit_per_aircraft_slope(scored, period_base_s=4.0)
+    assert result["reject_reason"] == "insufficient_icaos"
+
+
+def test_fit_per_aircraft_slope_zero_weight_does_not_set_nonfinite():
+    """Zero/negative weight must not set nonfinite; must return insufficient_icaos."""
+    from radar.sweep import _fit_per_aircraft_slope
+
+    scored = [
+        _make_scored_entry("AAAAAA", 1_000_000.0, 5.0, 0.0),
+        _make_scored_entry("BBBBBB", 2_000_000.0, 5.0, -1.0),
+    ]
+    result = _fit_per_aircraft_slope(scored, period_base_s=4.0)
+    assert result["reject_reason"] == "insufficient_icaos"
