@@ -2081,6 +2081,7 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
           <span className={styles.metricPill}>Obs <span className={styles.metricValue}>{syncState.phase_anchor_obs_count ?? anchorObs.length ?? '—'}</span></span>
           <span className={styles.metricPill}>Since <span className={styles.metricValue}>{Number.isFinite(sinceAgeS) ? `${Math.max(0, sinceAgeS).toFixed(0)}s` : '—'}</span></span>
           <span className={styles.metricPill}>Validation <span className={styles.metricValue}>{syncState.phase_validation_status || '—'}</span></span>
+          <span className={styles.metricPill} title="Phase trust status: trusted = Stage 3 eligible; provisional = display only; untrusted = blocked">Phase trust <span className={styles.metricValue} style={{ color: syncState.phase_status === 'trusted' ? '#3fb950' : syncState.phase_status === 'provisional' ? '#e3b341' : '#8b949e' }}>{syncState.phase_status ?? '—'}</span></span>
           <span className={styles.metricPill}>Agree/reject <span className={styles.metricValue}>{syncState.phase_validation_contributors ?? 0}/{syncState.phase_validation_reject_count ?? 0}</span></span>
           <span className={styles.metricPill}>Promotion <span className={styles.metricValue}>{syncState.candidate_promotion_streak ?? 0}/{CANDIDATE_PROMOTION_MIN_STREAK}</span></span>
           <span className={styles.metricPill}>Median Δ <span className={styles.metricValue}>{fmtNumber(syncState.phase_validation_median_error_deg, 2, '°')}</span></span>

@@ -378,6 +378,158 @@ def _fit_weighted_slope(xs: list[float], ys: list[float], ws: list[float]) -> tu
     return a, b
 
 
+def _fit_per_aircraft_slope(scored: list[dict], period_base_s: float) -> dict:
+    """Fit residual slope per ICAO using unwrapped timelines; return consensus only when ≥2 ICAOs agree.
+
+    Operates on fit-eligible observations (entries with positive weight and finite fields).
+    Returns compact summaries only — no raw residual timelines or observation lists.
+
+    Structured reject reasons:
+        "insufficient_icaos"             fewer than 2 ICAOs after all filtering
+        "insufficient_icao_observations" an ICAO had < 3 eligible observations
+        "insufficient_icao_span"         an ICAO's timespan < 2 * period_base_s
+        "ambiguous_unwrap"               an ICAO had a consecutive delta near ±180°
+        "sign_disagreement"              ICAOs disagree on slope sign
+        "slope_magnitude_disagreement"   one ICAO's slope magnitude inconsistent with others
+        "nonfinite_input"                non-empty-ICAO entries had non-finite timing/residual/weight
+    """
+    _PER_ICAO_MIN_OBS = 3
+    _PER_ICAO_MIN_SPAN_ROT = 2.0
+    _AMBIGUOUS_UNWRAP_THRESHOLD_DEG = 160.0
+    _SLOPE_MAGNITUDE_RATIO_MAX = 4.0
+    _SLOPE_ABS_FLOOR_DEG_S = 0.01
+
+    # 1. Input validation.
+    # had_nonfinite is set only when a non-empty ICAO entry has non-finite timing/residual/weight.
+    # Missing/empty ICAO and zero/negative weight do NOT set had_nonfinite.
+    had_nonfinite = False
+    valid: list[dict] = []
+    for e in scored:
+        icao = e.get("icao", "")
+        if not icao:
+            continue  # silently skip; contributes to insufficient_icaos if needed
+        eff = e.get("effective_us", float("nan"))
+        res = e.get("residual", float("nan"))
+        w = e.get("weight", float("nan"))
+        if not (_math.isfinite(eff) and _math.isfinite(res) and _math.isfinite(w)):
+            had_nonfinite = True  # non-empty ICAO with bad numerics
+            continue
+        if w <= 0:
+            continue  # zero/negative weight does NOT set had_nonfinite
+        valid.append(e)
+
+    # 2. Group by ICAO.
+    by_icao: dict[str, list[dict]] = {}
+    for e in valid:
+        by_icao.setdefault(e["icao"], []).append(e)
+
+    _null = dict(
+        slope_deg_per_s=None, icao_slopes={}, icao_count=0,
+        sign_agreement=False, fit_span_s=0.0, per_icao_reject_reasons={},
+    )
+    if len(by_icao) < 2:
+        # nonfinite_input only when non-finite entries prevented any ICAO groups forming
+        reason = "nonfinite_input" if (had_nonfinite and len(by_icao) == 0) else "insufficient_icaos"
+        return {**_null, "reject_reason": reason}
+
+    # 3. Per-ICAO: filter, unwrap, fit slope.
+    icao_slopes: dict[str, float] = {}
+    per_icao_reject: dict[str, str] = {}
+    t_all_min = float("inf")
+    t_all_max = float("-inf")
+
+    for icao, entries in by_icao.items():
+        if len(entries) < _PER_ICAO_MIN_OBS:
+            per_icao_reject[icao] = "insufficient_icao_observations"
+            continue
+
+        entries_sorted = sorted(entries, key=lambda e: e["effective_us"])
+        ts_s = [e["effective_us"] / 1_000_000.0 for e in entries_sorted]
+        span = ts_s[-1] - ts_s[0]
+
+        if span < _PER_ICAO_MIN_SPAN_ROT * period_base_s:
+            per_icao_reject[icao] = "insufficient_icao_span"
+            continue
+
+        # Build unwrapped timeline using running cumulative circular deltas.
+        # The list has the same length as entries_sorted iff ambiguous is False.
+        residuals_raw = [e["residual"] for e in entries_sorted]
+        unwrapped = [residuals_raw[0]]  # seed with first value
+        prev = residuals_raw[0]
+        ambiguous = False
+        for raw in residuals_raw[1:]:
+            delta = (raw - prev + 540.0) % 360.0 - 180.0
+            if abs(delta) > _AMBIGUOUS_UNWRAP_THRESHOLD_DEG:
+                ambiguous = True
+                break
+            unwrapped.append(unwrapped[-1] + delta)
+            prev = raw
+
+        if ambiguous:
+            per_icao_reject[icao] = "ambiguous_unwrap"
+            continue
+
+        # unwrapped and ts_s have equal length (no ambiguous break occurred)
+        assert len(unwrapped) == len(ts_s)
+        t_ref = ts_s[0]
+        xs = [t - t_ref for t in ts_s]
+        ws = [e["weight"] for e in entries_sorted]
+        _, slope = _fit_weighted_slope(xs, unwrapped, ws)
+
+        icao_slopes[icao] = slope
+        t_all_min = min(t_all_min, ts_s[0])
+        t_all_max = max(t_all_max, ts_s[-1])
+
+    if len(icao_slopes) < 2:
+        reason = "nonfinite_input" if (had_nonfinite and len(icao_slopes) == 0) else "insufficient_icaos"
+        return {**_null, "icao_slopes": icao_slopes, "icao_count": len(icao_slopes),
+                "per_icao_reject_reasons": per_icao_reject, "reject_reason": reason}
+
+    fit_span_s = t_all_max - t_all_min if t_all_max > t_all_min else 0.0
+
+    # 4. Sign agreement.
+    signs = [1 if s > 0 else -1 if s < 0 else 0 for s in icao_slopes.values()]
+    nonzero = [s for s in signs if s != 0]
+    if len(nonzero) < 2 or len(set(nonzero)) != 1:
+        return {**_null, "icao_slopes": icao_slopes, "icao_count": len(icao_slopes),
+                "fit_span_s": fit_span_s, "per_icao_reject_reasons": per_icao_reject,
+                "reject_reason": "sign_disagreement"}
+
+    # 5. Two-sided magnitude consistency with absolute floor.
+    # Near-zero slopes must not be counted as agreement with substantial slopes.
+    magnitudes = [abs(s) for s in icao_slopes.values()]
+    sorted_mags = sorted(magnitudes)
+    med_mag = sorted_mags[len(sorted_mags) // 2]
+    if med_mag < _SLOPE_ABS_FLOOR_DEG_S:
+        magnitude_disagrees = any(m > _SLOPE_ABS_FLOOR_DEG_S for m in magnitudes)
+    else:
+        magnitude_disagrees = any(
+            m > _SLOPE_MAGNITUDE_RATIO_MAX * med_mag
+            or m < med_mag / _SLOPE_MAGNITUDE_RATIO_MAX
+            for m in magnitudes
+        )
+    if magnitude_disagrees:
+        return {**_null, "icao_slopes": icao_slopes, "icao_count": len(icao_slopes),
+                "fit_span_s": fit_span_s, "per_icao_reject_reasons": per_icao_reject,
+                "reject_reason": "slope_magnitude_disagreement"}
+
+    # 6. Median aggregate slope.
+    sorted_slopes = sorted(icao_slopes.values())
+    n = len(sorted_slopes)
+    consensus = (sorted_slopes[n // 2] if n % 2
+                 else (sorted_slopes[n // 2 - 1] + sorted_slopes[n // 2]) / 2.0)
+
+    return {
+        "slope_deg_per_s": consensus,
+        "icao_slopes": icao_slopes,
+        "icao_count": len(icao_slopes),
+        "sign_agreement": True,
+        "fit_span_s": fit_span_s,
+        "reject_reason": None,
+        "per_icao_reject_reasons": per_icao_reject,
+    }
+
+
 def _median_float(values: list[float]) -> float | None:
     if not values:
         return None
@@ -851,6 +1003,7 @@ class SyncPrediction:
     waveform_correction_deg: float
     waveform_applied: bool
     predictor_version: str = "authoritative_sync_v3_motion"
+    phase_status: str | None = None  # passthrough from LiveSyncState.phase_status; None = not yet evaluated
 
 
 def predict_sync_observation(
@@ -948,6 +1101,7 @@ def predict_sync_observation(
         predicted_bearing_deg=predicted,
         waveform_correction_deg=waveform_correction,
         waveform_applied=waveform_applied,
+        phase_status=getattr(sync, "phase_status", "untrusted"),
     )
 
 
@@ -1264,6 +1418,19 @@ class LiveSyncState:
     period_correction_status: str = "unknown"
     period_update_safety_ppm_per_update: float = 0.0
     period_update_safety_ppm_from_base: float = 0.0
+    # Separate diagnostics for base-anchored and per-step clamps (new fields; do not
+    # change the meaning of period_update_ppm_applied which remains relative to live).
+    period_update_ppm_from_base: float = 0.0
+    period_update_ppm_step: float = 0.0
+    period_update_ppm_limit_from_base: float = 0.0
+    period_update_ppm_limit_step: float = 0.0
+    # Absolute phase trust status — set by _update_multi_aircraft_sync_state.
+    # "trusted": phase anchor confirmed by ≥2 independent ICAOs, spread < 8°.
+    # "provisional": single-anchor or wide spread; Stage 3 does not accept this.
+    # "untrusted": insufficient evidence / population_disagrees.
+    # None: not yet evaluated (new state); Stage 3 falls back to legacy heuristics.
+    phase_status: str | None = None
+    phase_status_reason: str | None = None
     fit_time_basis: str = "effective_beast_time_s"
     fit_residual_basis: str = "observed_minus_authoritative_prediction_after_waveform_deg"
     fit_total_observations: int = 0
@@ -5830,10 +5997,15 @@ class RadarState:
         else:
             status = "anchor_only"
 
+        _MAX_VALIDATION_CONTRIBUTOR_ICAOS = 20
+        contributor_icaos = sorted(
+            {row["icao"] for row in contributors}
+        )[:_MAX_VALIDATION_CONTRIBUTOR_ICAOS]
         return {
             "contributors": contributors,
             "rejected": rejected,
             "contributor_count": len(contributors),
+            "contributor_icaos": contributor_icaos,
             "reject_count": len(rejected),
             "median_error_deg": median_error,
             "nudge_deg": nudge,
@@ -6213,65 +6385,116 @@ class RadarState:
         phase_anchor_replacement_reason = anchor_resolution["phase_anchor_replacement_reason"]
         phase_correction = _circular_delta_deg(new_offset, existing_at_new) or 0.0
 
-        # Live period refinement from slope.
-        # residual = observed - predicted.  If residual rises with effective
-        # time, the predicted beam is falling behind: increase angular rate,
-        # which decreases period_s.  Negative slope does the opposite.
+        # ── Absolute phase status (Step 6) ───────────────────────────────────────
+        # Computed independently from period refinement.
+        # "trusted":     anchor selected, spread < 8°, ≥2 independent ICAO validators.
+        # "provisional": single anchor or wider spread; Stage 3 does not accept this.
+        # "untrusted":   default / insufficient evidence / population veto.
+        phase_anchor_spread_val = (
+            phase_anchor_spread if phase_anchor_spread is not None else 999.0
+        )
+        v_status = validation["status"]
+        v_median_err = validation.get("median_error_deg")
+        if v_median_err is None:
+            v_median_err = 999.0
+        contributor_icaos = validation.get("contributor_icaos")
+        v_icao_count = len(contributor_icaos) if contributor_icaos else 0
+        if (
+            phase_anchor_status == "selected"
+            and phase_anchor_spread_val < 8.0
+            and v_icao_count >= 2
+            and v_status not in {"population_disagrees", "population_veto"}
+            and abs(v_median_err) < 10.0
+        ):
+            phase_status = "trusted"
+            phase_status_reason = None
+        elif (
+            phase_anchor_status in {"selected", "anchor_only"}
+            and phase_anchor_spread_val < 25.0
+            and phase_anchor_obs_count >= 2
+        ):
+            phase_status = "provisional"
+            phase_status_reason = (
+                f"spread_{phase_anchor_spread_val:.1f}_deg"
+                if phase_anchor_spread_val >= 8.0
+                else f"icaos_{v_icao_count}"
+                if v_icao_count < 2
+                else v_status
+            )
+        else:
+            phase_status = "untrusted"
+            phase_status_reason = (
+                phase_anchor_status
+                if phase_anchor_status not in {"selected", "anchor_only"}
+                else f"spread_{phase_anchor_spread_val:.1f}_deg"
+            )
+
+        # ── Live period refinement from per-ICAO slope consensus ─────────────────
         #
-        # The rotation period is set by hardware and rarely changes.  Once
-        # established the model should be stable.  Three design choices enforce
-        # this:
-        #
-        #   1. Slope EMA — the fitted slope b_fit is noisy on a single window.
-        #      We maintain a slow EMA of slope (τ ≈ 12 updates) and drive
-        #      period corrections from the smoothed value, not the raw fit.
-        #      This prevents one noisy window from immediately moving the period.
-        #
-        #   2. Persistent-slope gate — any period update requires the smoothed
-        #      slope to have pointed in the same direction for at least 5 of the
-        #      last 8 stored entries AND exceed a dead-band threshold.  Transient
-        #      sign flips that cause overshoot-then-correct oscillation are
-        #      suppressed because the gate will not re-open immediately after the
-        #      period moves.
-        #
-        #   3. Reduced gain — _PERIOD_GAIN is lowered from 0.25 to 0.12 so each
-        #      accepted correction is smaller and the convergence is monotone
-        #      rather than oscillatory.
+        # Design principles:
+        #   1. Anchored to period_base_s — all corrections are expressed as PPM
+        #      offsets from the DF-alignment base period, never from the current
+        #      live (potentially-drifted) period.  This prevents family hopping.
+        #   2. Per-ICAO unwrapped slope — raw b_fit (wrapped global residuals) is
+        #      used only for waveform detrending.  The operational EMA is driven
+        #      exclusively by _fit_per_aircraft_slope() consensus.
+        #   3. Strict EMA freeze — if per-ICAO consensus is unavailable (sign
+        #      disagreement, insufficient ICAOs, ambiguous unwrap, etc.), the
+        #      operational smoothed_slope is preserved unchanged.  It is never
+        #      overwritten with b_fit or 0.0.
+        #   4. Hard ±500 PPM cap — no "strong-fit" exception.  The cap is a safety
+        #      policy against period-family hopping, not a physical limit.
+        #   5. Source-tagged slope history — persistence gate counts only entries
+        #      tagged slope_source="per_aircraft_consensus"; old/untagged entries
+        #      do not contribute and cannot open the gate.
         refined_period_s = live_period_s
         span_s = max(xs, default=0.0) if xs else 0.0
         _PERIOD_REFINE_MIN_INLIERS = 6
         _PERIOD_REFINE_MIN_SPAN_ROT = 2.0
         _PERIOD_GAIN = 0.12
-        _PERIOD_PPM_PER_UPDATE_MAX = 60.0
-        _PERIOD_PPM_PER_UPDATE_STRONG_MAX = 400.0
-        _PERIOD_PPM_FROM_BASE_MAX = 2000.0
-        _PERIOD_PPM_FROM_BASE_STRONG_MAX = 15000.0
-        # Slow EMA of the fitted slope.  α ≈ 0.08 → time constant ~12 updates.
-        # Stored in residual_slope_deg_per_s; the raw b_fit is in slope_history.
+        _PERIOD_PPM_PER_UPDATE_MAX = 60.0    # max step per update (relative to live)
+        _PERIOD_PPM_FROM_BASE_MAX = 500.0    # safety cap from period_base_s; no exceptions
         _SLOPE_EMA_ALPHA = 0.08
-        _SLOPE_DEAD_BAND = 0.08  # deg/s — smoothed slope must exceed this to drive period change
-        smoothed_slope = (
-            (1.0 - _SLOPE_EMA_ALPHA) * existing.residual_slope_deg_per_s
-            + _SLOPE_EMA_ALPHA * b_fit
-        )
+        _SLOPE_DEAD_BAND = 0.08              # deg/s dead-band for persistence gate
+
+        # Per-ICAO slope consensus.  b_fit (wrapped global) is not used here.
+        per_aircraft_result = _fit_per_aircraft_slope(fit_scored, base_period_s)
+        per_aircraft_slope = per_aircraft_result["slope_deg_per_s"]
+
+        # Operational EMA: only updated when per-ICAO consensus is available.
+        # When rejected, preserve the previous value unchanged.
+        if per_aircraft_slope is not None:
+            smoothed_slope = (
+                (1.0 - _SLOPE_EMA_ALPHA) * existing.residual_slope_deg_per_s
+                + _SLOPE_EMA_ALPHA * per_aircraft_slope
+            )
+        else:
+            smoothed_slope = existing.residual_slope_deg_per_s  # preserve; do not update
+
         period_update_term = 0.0
         period_update_applied = 0.0
         period_update_direction = "none"
         period_update_ppm_unclamped = 0.0
         period_update_ppm_applied = 0.0
+        period_update_ppm_from_base = 0.0
+        period_update_ppm_step = 0.0
+        period_update_ppm_limit_from_base = _PERIOD_PPM_FROM_BASE_MAX
+        period_update_ppm_limit_step = _PERIOD_PPM_PER_UPDATE_MAX
         period_update_block_reason = None
         period_update_clamp_reason = None
         period_update_allowed = False
-        # Persistence check over a wider window (last 8 entries, require 5 to agree).
-        # Uses the stored smoothed-slope values (residual_slope_deg_per_s field),
-        # not raw b_fit, so the gate reflects the same damped signal used for correction.
+
+        # Persistence gate: only entries tagged slope_source="per_aircraft_consensus"
+        # are counted.  Old/untagged entries (pre-upgrade) are excluded so they
+        # cannot open the gate with wrapped-residual b_fit values.
         previous_slope_rows = list(self._live_slope_history.get(iid) or [])[-8:]
         _PERSIST_MIN_ENTRIES = 5
         _PERSIST_DEAD_BAND = _SLOPE_DEAD_BAND
         slope_signs = [
             1 if float(row.get("residual_slope_deg_per_s") or 0.0) > 0 else -1
             for row in previous_slope_rows
-            if abs(float(row.get("residual_slope_deg_per_s") or 0.0)) >= _PERSIST_DEAD_BAND
+            if (row.get("slope_source") == "per_aircraft_consensus"
+                and abs(float(row.get("residual_slope_deg_per_s") or 0.0)) >= _PERSIST_DEAD_BAND)
         ]
         current_slope_sign = 1 if smoothed_slope > 0 else -1 if smoothed_slope < 0 else 0
         persistent_slope = (
@@ -6280,32 +6503,15 @@ class RadarState:
             and sum(1 for s in slope_signs if s == current_slope_sign) >= _PERSIST_MIN_ENTRIES
             and abs(smoothed_slope) >= _SLOPE_DEAD_BAND
         )
-        strong_fit_for_period = (
-            len(fit_scored) >= 12
-            and len(fit_contributing_icaos) >= 3
-            and span_s >= 4.0 * live_period_s
-            and n_rejected <= max(1, len(recent_obs) // 3)
-        )
-        adaptive_period_clamp = strong_fit_for_period and persistent_slope
-        ppm_per_update_limit = (
-            _PERIOD_PPM_PER_UPDATE_STRONG_MAX
-            if adaptive_period_clamp else _PERIOD_PPM_PER_UPDATE_MAX
-        )
-        ppm_from_base_limit = (
-            _PERIOD_PPM_FROM_BASE_STRONG_MAX
-            if adaptive_period_clamp else _PERIOD_PPM_FROM_BASE_MAX
-        )
         freeze_period_refine = bool(existing.period_reacquire_active)
-        # persistent_slope is now a hard gate on any period update, not just
-        # the strong-clamp path.  Without a persistent smoothed slope the period
-        # holds its current value even if the raw fit shows a non-zero slope.
         refine_ok = (
             bool(RADAR_SYNC_PERIOD_REFINE_ENABLED)
             and not freeze_period_refine
             and not majority_rejected
+            and per_aircraft_slope is not None          # must have per-ICAO consensus
             and len(fit_scored) >= _PERIOD_REFINE_MIN_INLIERS
             and len(fit_contributing_icaos) >= 2
-            and span_s >= _PERIOD_REFINE_MIN_SPAN_ROT * live_period_s
+            and span_s >= _PERIOD_REFINE_MIN_SPAN_ROT * base_period_s  # anchor to base
             and persistent_slope
         )
         if freeze_period_refine:
@@ -6314,53 +6520,71 @@ class RadarState:
             period_update_block_reason = "disabled"
         elif majority_rejected:
             period_update_block_reason = "majority_rejected"
+        elif per_aircraft_slope is None:
+            period_update_block_reason = per_aircraft_result.get("reject_reason") or "per_aircraft_consensus_unavailable"
         elif len(fit_scored) < _PERIOD_REFINE_MIN_INLIERS:
             period_update_block_reason = "insufficient_fit_observations"
         elif len(fit_contributing_icaos) < 2:
             period_update_block_reason = "insufficient_fit_icaos"
-        elif span_s < _PERIOD_REFINE_MIN_SPAN_ROT * live_period_s:
+        elif span_s < _PERIOD_REFINE_MIN_SPAN_ROT * base_period_s:
             period_update_block_reason = "insufficient_fit_span"
         elif not persistent_slope:
             period_update_block_reason = "slope_not_persistent"
-        if refine_ok and live_period_s > 0:
+
+        if refine_ok and base_period_s > 0:
             period_update_allowed = True
-            rate_nominal = 360.0 / live_period_s
-            # Use the smoothed slope — not the raw b_fit — for the period correction
-            # so transient noise in the fit does not immediately move the period.
+            # Anchor rate_nominal to base_period_s — never to live_period_s.
+            # This prevents corrections from self-referentially compounding drift.
+            rate_nominal = 360.0 / base_period_s
             rate_target = rate_nominal + smoothed_slope * _PERIOD_GAIN
-            if rate_target > 0:
-                candidate = 360.0 / rate_target
-                period_update_term = candidate - live_period_s
-                period_update_ppm_unclamped = period_update_term / live_period_s * 1e6
-                # Per-update ppm clamp.
-                delta_ppm = (candidate - live_period_s) / live_period_s * 1e6
-                if delta_ppm > ppm_per_update_limit:
-                    candidate = live_period_s * (1.0 + ppm_per_update_limit * 1e-6)
+            if rate_target <= 0:
+                period_update_allowed = False
+                period_update_block_reason = "non_positive_rate_target"
+            else:
+                target_from_base_s = 360.0 / rate_target
+                delta_ppm_unclamped = (target_from_base_s - base_period_s) / base_period_s * 1e6
+                period_update_ppm_unclamped = delta_ppm_unclamped
+                period_update_term = target_from_base_s - live_period_s
+
+                # Per-update step clamp: limits single-cycle jump size (uses live as reference).
+                step_limit_s = abs(live_period_s) * _PERIOD_PPM_PER_UPDATE_MAX * 1e-6
+                stepped_period_s = live_period_s + max(
+                    -step_limit_s,
+                    min(step_limit_s, target_from_base_s - live_period_s),
+                )
+                if abs(stepped_period_s - target_from_base_s) > 1e-12:
                     period_update_clamp_reason = "per_update_clamped"
-                elif delta_ppm < -ppm_per_update_limit:
-                    candidate = live_period_s * (1.0 - ppm_per_update_limit * 1e-6)
-                    period_update_clamp_reason = "per_update_clamped"
-                # Absolute ppm from base clamp.
-                if base_period_s > 0:
-                    abs_ppm = (candidate - base_period_s) / base_period_s * 1e6
-                    if abs_ppm > ppm_from_base_limit:
-                        candidate = base_period_s * (1.0 + ppm_from_base_limit * 1e-6)
-                        period_update_clamp_reason = "base_ppm_clamped"
-                    elif abs_ppm < -ppm_from_base_limit:
-                        candidate = base_period_s * (1.0 - ppm_from_base_limit * 1e-6)
-                        period_update_clamp_reason = "base_ppm_clamped"
-                refined_period_s = candidate
+
+                # Absolute base cap: hard ±500 PPM from period_base_s; no exceptions.
+                base_limit_s = abs(base_period_s) * _PERIOD_PPM_FROM_BASE_MAX * 1e-6
+                refined_period_s = max(
+                    base_period_s - base_limit_s,
+                    min(base_period_s + base_limit_s, stepped_period_s),
+                )
+                if abs(refined_period_s - stepped_period_s) > 1e-12:
+                    period_update_clamp_reason = "base_ppm_clamped"
+
                 period_update_applied = refined_period_s - live_period_s
-                period_update_ppm_applied = period_update_applied / live_period_s * 1e6
+                # period_update_ppm_applied keeps existing meaning: relative to live_period_s
+                period_update_ppm_applied = (
+                    period_update_applied / live_period_s * 1e6 if live_period_s > 0 else 0.0
+                )
+                # New separate diagnostics
+                period_update_ppm_from_base = (
+                    (refined_period_s - base_period_s) / base_period_s * 1e6
+                    if base_period_s > 0 else 0.0
+                )
+                period_update_ppm_step = (
+                    (stepped_period_s - live_period_s) / live_period_s * 1e6
+                    if live_period_s > 0 else 0.0
+                )
                 if period_update_applied > 0:
                     period_update_direction = "increase"
                 elif period_update_applied < 0:
                     period_update_direction = "decrease"
                 else:
                     period_update_direction = "none"
-            else:
-                period_update_allowed = False
-                period_update_block_reason = "non_positive_rate_target"
+
         period_refine_block_reason = period_update_block_reason
         period_correction_status = _classify_period_correction_status(
             period_update_allowed,
@@ -6503,6 +6727,11 @@ class RadarState:
         # Waveform bin learning: slow EMA of detrended residuals keyed by
         # phase-in-rotation.  Period refinement sees long-term drift first;
         # waveform learning then tracks repeatable intra-rotation structure.
+        #
+        # NOTE: b_fit (wrapped global slope) is used here ONLY to detrend residuals
+        # for waveform bin learning.  It does not affect period_refined_s, the
+        # operational slope EMA (smoothed_slope), period-update persistence gates,
+        # phase_status, or Stage 3 trust decisions.  This is intentional isolation.
         waveform_learning_enabled = False
         waveform_update_block_reason = None
         if RADAR_SYNC_WAVEFORM_ENABLED:
@@ -6675,8 +6904,14 @@ class RadarState:
             period_update_fit_support=len(fit_scored),
             period_update_fit_span_s=span_s,
             period_correction_status=period_correction_status,
-            period_update_safety_ppm_per_update=ppm_per_update_limit,
-            period_update_safety_ppm_from_base=ppm_from_base_limit,
+            period_update_safety_ppm_per_update=_PERIOD_PPM_PER_UPDATE_MAX,
+            period_update_safety_ppm_from_base=_PERIOD_PPM_FROM_BASE_MAX,
+            period_update_ppm_from_base=period_update_ppm_from_base,
+            period_update_ppm_step=period_update_ppm_step,
+            period_update_ppm_limit_from_base=period_update_ppm_limit_from_base,
+            period_update_ppm_limit_step=period_update_ppm_limit_step,
+            phase_status=phase_status,
+            phase_status_reason=phase_status_reason,
             fit_time_basis="effective_beast_time_s",
             fit_residual_basis="observed_minus_authoritative_prediction_after_prop_motion_waveform_deg",
             fit_total_observations=len(recent_obs),
@@ -6753,8 +6988,13 @@ class RadarState:
             "period_correction_status": period_correction_status,
             "period_s_before": live_period_s,
             "period_s_after": refined_period_s,
-            "period_update_safety_ppm_per_update": ppm_per_update_limit,
-            "period_update_safety_ppm_from_base": ppm_from_base_limit,
+            "period_update_safety_ppm_per_update": _PERIOD_PPM_PER_UPDATE_MAX,
+            "period_update_safety_ppm_from_base": _PERIOD_PPM_FROM_BASE_MAX,
+            "period_update_ppm_from_base": period_update_ppm_from_base,
+            "period_update_ppm_step": period_update_ppm_step,
+            "per_aircraft_slope_deg_per_s": per_aircraft_slope,
+            "per_aircraft_reject_reason": per_aircraft_result.get("reject_reason"),
+            "phase_status": phase_status,
             "period_refine_block_reason": period_refine_block_reason,
             "n_fit_observations": len(fit_scored),
             "n_total_observations": len(recent_obs),
@@ -6796,9 +7036,14 @@ class RadarState:
             "ts": now_ts,
             # residual_slope_deg_per_s is the EMA-smoothed value — this is what the
             # persistence gate and period correction use.  raw_slope_deg_per_s is the
-            # instantaneous fit result, kept for diagnostics only.
+            # instantaneous b_fit result, kept for diagnostics and waveform detrending only.
+            # slope_source tags the origin; persistence gate counts only "per_aircraft_consensus".
+            # Old/untagged entries (pre-upgrade) are excluded from the persistence gate.
             "residual_slope_deg_per_s": smoothed_slope,
             "raw_slope_deg_per_s": b_fit,
+            "slope_source": "per_aircraft_consensus" if per_aircraft_slope is not None else "b_fit_diagnostic",
+            "per_aircraft_slope_deg_per_s": per_aircraft_slope,
+            "per_aircraft_reject_reason": per_aircraft_result.get("reject_reason"),
             "fit_span_s": span_s,
             "n_fit_observations": len(fit_scored),
         })

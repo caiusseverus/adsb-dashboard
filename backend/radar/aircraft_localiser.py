@@ -1132,7 +1132,17 @@ class AircraftLocaliser:
         elif source != "multi_aircraft_burst":
             return False
 
-        # Heuristic checks for Python-sourced sync.
+        # Python-sourced sync: check new phase_status field first.
+        # "trusted"     → accept immediately.
+        # "provisional" → Stage 3 does not accept provisional phase.
+        # "untrusted"   → reject.
+        # None (absent) → old state without field; fall through to legacy heuristics.
+        phase_status = getattr(sync_state, "phase_status", None)
+        if phase_status == "trusted":
+            return True
+        elif phase_status in {"provisional", "untrusted"}:
+            return False
+        # Legacy heuristic fallback for states that predate the phase_status field.
         if sync_state.phase_anchor_status not in {"selected", "anchor_only"}:
             return False
         if sync_state.phase_anchor_icao is None:

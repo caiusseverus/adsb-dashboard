@@ -1086,6 +1086,7 @@ def test_period_refinement_uses_effective_time_slope_and_correct_sign(monkeypatc
     )
     # Pre-populate slope history with 6 consistent positive entries so the
     # persistence gate (≥5/8 agree, smoothed ≥ dead-band) will open.
+    # slope_source tag required: gate only counts "per_aircraft_consensus" entries.
     from collections import deque as _deque
     state._live_slope_history[7] = _deque(maxlen=80)
     for _ in range(6):
@@ -1095,6 +1096,7 @@ def test_period_refinement_uses_effective_time_slope_and_correct_sign(monkeypatc
             "raw_slope_deg_per_s": 0.5,
             "fit_span_s": 28.0,
             "n_fit_observations": 8,
+            "slope_source": "per_aircraft_consensus",
         })
 
     obs = deque(maxlen=state._MULTI_SYNC_OBS_MAX)
@@ -1212,6 +1214,7 @@ def test_anchor_disagreement_alone_does_not_trigger_period_reacquire(monkeypatch
             "raw_slope_deg_per_s": 0.5,
             "fit_span_s": 28.0,
             "n_fit_observations": 8,
+            "slope_source": "per_aircraft_consensus",
         })
     state._validate_phase_anchor_against_population = lambda *args, **kwargs: {
         "contributors": [],
@@ -1448,7 +1451,14 @@ def test_mild_noise_does_not_flap_into_reacquire(monkeypatch):
     state._update_multi_aircraft_sync_state(7, period_s=10.0)
 
     sync = state.get_live_sync_state(7)
-    assert sync.period_update_block_reason == "slope_not_persistent"
+    # Noisy data blocks the update; exact reason depends on which gate fires first.
+    # Old code: "slope_not_persistent" (wrapped-global b_fit path).
+    # New code: per-ICAO consensus may report "sign_disagreement" when ICAO slopes
+    # disagree in sign due to noise, which is also a valid block for this scenario.
+    assert sync.period_update_block_reason in {
+        "slope_not_persistent", "sign_disagreement",
+        "insufficient_icaos", "insufficient_icao_span",
+    }
     assert sync.period_refine_mode == "normal"
     assert sync.period_reacquire_active is False
     assert sync.period_failure_streak == 0
