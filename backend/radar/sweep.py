@@ -35,6 +35,7 @@ try:
         RADAR_SYNC_MOTION_COMP_FIT_ENABLED,
         RADAR_SYNC_WAVEFORM_BIN_COUNT,
         RADAR_DIAGNOSTICS,
+        RADAR_SYNC_MODEL,
     )
 except Exception:  # pragma: no cover — config not importable in some test harnesses
     RADAR_SYNC_PERIOD_REFINE_ENABLED = True
@@ -44,6 +45,7 @@ except Exception:  # pragma: no cover — config not importable in some test har
     RADAR_SYNC_MOTION_COMP_FIT_ENABLED = True
     RADAR_SYNC_WAVEFORM_BIN_COUNT = 24
     RADAR_DIAGNOSTICS = False
+    RADAR_SYNC_MODEL = "simple"
 
 if TYPE_CHECKING:
     from aircraft_state import AircraftState
@@ -1580,6 +1582,17 @@ class LiveSyncState:
     branch_contradiction_windows: int = 0
     branch_competitor_count: int = 0
     branch_promotion_block_reason: str | None = None
+    # Model identification — populated by both simple and legacy update paths.
+    # sync_model: "simple" | "legacy"
+    # period_source: how the operational period was derived
+    # period_refinement_source: what drove the period correction this cycle
+    # phase_source: what produced the phase offset this cycle
+    # legacy_model_active: True only when RADAR_SYNC_MODEL="legacy" path ran
+    sync_model: str = "simple"
+    period_source: str = "df_base"
+    period_refinement_source: str = "none"
+    phase_source: str = "unavailable"
+    legacy_model_active: bool = False
 
 
 @_dataclass
@@ -4741,10 +4754,16 @@ class RadarState:
                 last = self._last_multi_sync_update_ts.get(sync_update_iid, 0.0)
                 if (now_mono - last) >= self._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
                     self._last_multi_sync_update_ts[sync_update_iid] = now_mono
-                    self._update_multi_aircraft_sync_state(
-                        iid=sync_update_iid,
-                        period_s=sync_update_period_s,
-                    )
+                    if RADAR_SYNC_MODEL == "legacy":
+                        self._update_multi_aircraft_sync_state(
+                            iid=sync_update_iid,
+                            period_s=sync_update_period_s,
+                        )
+                    else:
+                        self._update_simple_live_sync_state(
+                            iid=sync_update_iid,
+                            period_s=sync_update_period_s,
+                        )
 
     def _go_track_observation_snapshot(self) -> list[dict]:
         with self._lock:
@@ -6110,6 +6129,489 @@ class RadarState:
             "phase_anchor_replacement_reason": phase_anchor_replacement_reason,
         }
 
+    def _update_simple_live_sync_state(
+        self,
+        iid: int,
+        period_s: float,
+        sync_quality: float | None = None,
+    ) -> None:
+        """Simple live sync state update — RADAR_SYNC_MODEL='simple'.
+
+        Architecture (four explicit components):
+          A. period_base_s from DF alignment (caller-supplied period_s / existing.period_base_s).
+             No period-family selection, reacquisition, or family-hopping recovery here.
+          B. Bounded period correction: per-ICAO unwrapped slope consensus only.
+             Hard ±500 PPM cap from period_base_s.  No b_fit, no strong-fit exception,
+             no adaptive wide clamp, no wrong-period-family detection.
+          C. Absolute phase anchor: unavailable / provisional / trusted states.
+             Requires ≥2 independent ICAO validators for trusted state.
+             Stage 3 must reject provisional and untrusted.
+          D. Phase-shape (waveform) correction: DISABLED in this model.
+             Waveform learning is not called.  apply_waveform=False throughout.
+
+        The legacy model (_update_multi_aircraft_sync_state) is NOT called when
+        RADAR_SYNC_MODEL='simple'.  b_fit, period failure assessment, reacquire
+        logic, mixed failure-mode classification, and waveform participation in
+        trust/period are absent from this model.
+        """
+        existing = self._live_sync_states.get(iid)
+        if existing is None:
+            return
+
+        # A. Base period — from DF alignment model only; never re-detected here.
+        base_period_s = existing.period_base_s if existing.period_base_s > 0 else period_s
+        if base_period_s <= 0:
+            return
+        live_period_s = existing.period_s if existing.period_s > 0 else base_period_s
+        period_us = live_period_s * 1_000_000.0
+        now_ts = time.time()
+
+        # Collect recent observations.
+        _SIMPLE_WINDOW_ROTATIONS = 6
+        window_s = max(base_period_s * _SIMPLE_WINDOW_ROTATIONS, 30.0)
+        cutoff_ts = now_ts - window_s
+        if self.radar_core_event_sink is not None:
+            obs_snapshot = self._go_aligned_burst_sync_snapshot(iid, window_s=window_s)
+        else:
+            obs_buf = self._live_aligned_burst_obs.get(iid)
+            if not obs_buf:
+                return
+            obs_snapshot = list(obs_buf)
+
+        recent_obs = [o for o in obs_snapshot if o.ts >= cutoff_ts]
+        if len(recent_obs) < 3:
+            return
+
+        icao_quality = self._live_icao_sync_quality.setdefault(iid, {})
+
+        # Score observations against current model.
+        # D: apply_waveform=False — waveform correction is disabled in simple model.
+        scored: list[dict] = []
+        fit_reject_reasons: dict[str, int] = defaultdict(int)
+        for obs in recent_obs:
+            pred = predict_sync_observation(
+                existing,
+                obs.burst_centroid_us,
+                range_nm=obs.range_nm,
+                waveform_bins=None,
+                apply_propagation=True,
+                apply_waveform=False,
+                apply_motion=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
+                bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
+                motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
+                motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
+            )
+            residual = (obs.bearing_deg - pred.predicted_bearing_deg + 540.0) % 360.0 - 180.0
+            abs_r = abs(residual)
+            status = self._classify_sync_residual(abs_r)
+            base_w = self._score_sync_burst_observation(obs)
+            q_entry = icao_quality.get(obs.icao)
+            q_reject = _icao_quality_reject_reason(q_entry)
+            if q_entry is not None:
+                mad = max(q_entry.residual_mad_deg, 0.5)
+                q_multiplier = max(0.1, min(1.0, 1.0 / (1.0 + mad / 3.0)))
+            else:
+                q_multiplier = 1.0
+            if status == "rejected":
+                effective_w = 0.0
+            elif status == "soft":
+                effective_w = base_w * 0.2 * q_multiplier
+            else:
+                effective_w = base_w * q_multiplier
+
+            fit_reject_reason = None
+            if not getattr(obs, "sync_update_eligible", True):
+                fit_reject_reason = "not_sync_update_eligible"
+            elif abs_r >= 150.0:
+                fit_reject_reason = "near_wrap_residual"
+            elif abs_r > 35.0:
+                fit_reject_reason = "residual_gate"
+            elif obs.pos_age_s > 8.0:
+                fit_reject_reason = "stale_position"
+            elif q_reject is not None:
+                fit_reject_reason = q_reject
+            elif effective_w <= 0:
+                fit_reject_reason = "zero_weight"
+
+            fit_eligible = fit_reject_reason is None
+            if fit_reject_reason is not None:
+                fit_reject_reasons[fit_reject_reason] += 1
+
+            scored.append({
+                "residual": residual,
+                "weight": effective_w,
+                "anchor_weight": base_w * q_multiplier,
+                "status": status,
+                "icao": obs.icao,
+                "effective_us": pred.effective_arrival_us,
+                "phase_in_rot": pred.phase_in_rot_deg,
+                "obs_ts": obs.ts,
+                "fit_eligible": fit_eligible,
+                "fit_reject_reason": fit_reject_reason,
+                "prediction": pred,
+                "obs": obs,
+            })
+
+        contributing_icaos = {
+            e["icao"] for e in scored
+            if e["weight"] > 0 and e["status"] != "rejected"
+        }
+        n_inliers = sum(1 for e in scored if e["status"] == "inlier")
+        n_rejected = sum(1 for e in scored if e["status"] == "rejected")
+        fit_scored = [
+            e for e in scored
+            if e["fit_eligible"] and e["weight"] > 0 and e["status"] != "rejected"
+        ]
+        fit_contributing_icaos = {e["icao"] for e in fit_scored}
+
+        anchor_pool = [
+            e for e in scored
+            if e.get("anchor_weight", 0.0) > 0.0
+            and e.get("fit_reject_reason") != "near_wrap_residual"
+        ]
+        if not anchor_pool:
+            existing.holdover = True
+            existing.usable = False
+            return
+
+        new_epoch_us = max(e["effective_us"] for e in anchor_pool)
+        existing_at_new = (
+            (new_epoch_us - existing.phase_epoch_us) / period_us * 360.0
+            + existing.phase_offset_deg
+        ) % 360.0
+
+        # C. Absolute phase anchor — no b_fit correction injected into fallback.
+        anchor_resolution = self._resolve_phase_anchor_state(
+            iid=iid,
+            scored=scored,
+            existing=existing,
+            now_ts=now_ts,
+            epoch_us=new_epoch_us,
+            mixed_fallback_offset=existing_at_new,
+        )
+        anchor_selection = anchor_resolution["anchor_selection"]
+        anchor_solution = anchor_resolution["anchor_solution"]
+        validation = anchor_resolution["validation"]
+        new_offset = anchor_resolution["offset_deg"]
+        phase_anchor_icao = anchor_resolution["phase_anchor_icao"]
+        phase_anchor_score = anchor_resolution["phase_anchor_score"]
+        phase_anchor_obs_count = anchor_resolution["phase_anchor_obs_count"]
+        phase_anchor_raw = anchor_resolution["phase_anchor_offset_raw_deg"]
+        phase_anchor_smoothed = anchor_resolution["phase_anchor_offset_smoothed_deg"]
+        phase_anchor_spread = anchor_resolution["phase_anchor_spread_deg"]
+        phase_anchor_status = anchor_resolution["phase_anchor_status"]
+        phase_anchor_since_ts = anchor_resolution["phase_anchor_since_ts"]
+        phase_anchor_replacement_reason = anchor_resolution["phase_anchor_replacement_reason"]
+        phase_correction = _circular_delta_deg(new_offset, existing_at_new) or 0.0
+
+        # Phase status: trusted / provisional / untrusted.
+        phase_anchor_spread_val = (
+            phase_anchor_spread if phase_anchor_spread is not None else 999.0
+        )
+        v_status = validation["status"]
+        v_median_err = validation.get("median_error_deg")
+        if v_median_err is None:
+            v_median_err = 999.0
+        contributor_icaos_list = validation.get("contributor_icaos")
+        v_icao_count = len(contributor_icaos_list) if contributor_icaos_list else 0
+        if (
+            phase_anchor_status == "selected"
+            and phase_anchor_spread_val < 8.0
+            and v_icao_count >= 2
+            and v_status not in {"population_disagrees", "population_veto"}
+            and abs(v_median_err) < 10.0
+        ):
+            phase_status = "trusted"
+            phase_status_reason = None
+        elif (
+            phase_anchor_status in {"selected", "anchor_only"}
+            and phase_anchor_spread_val < 25.0
+            and phase_anchor_obs_count >= 2
+        ):
+            phase_status = "provisional"
+            phase_status_reason = (
+                f"spread_{phase_anchor_spread_val:.1f}_deg" if phase_anchor_spread_val >= 8.0
+                else f"icaos_{v_icao_count}" if v_icao_count < 2
+                else v_status
+            )
+        else:
+            phase_status = "untrusted"
+            phase_status_reason = (
+                phase_anchor_status if phase_anchor_status not in {"selected", "anchor_only"}
+                else f"spread_{phase_anchor_spread_val:.1f}_deg"
+            )
+
+        # B. Bounded period correction — per-ICAO unwrapped slope consensus only.
+        # b_fit (wrapped global slope) is not computed or used in this model.
+        _PERIOD_PPM_PER_UPDATE_MAX = 60.0   # max step per update cycle
+        _PERIOD_PPM_FROM_BASE_MAX = 500.0   # hard cap from period_base_s; no exceptions
+        _SLOPE_EMA_ALPHA = 0.08
+        _SLOPE_DEAD_BAND = 0.08             # deg/s; below this, direction is ambiguous
+        _PERIOD_GAIN = 0.12
+        _PERIOD_REFINE_MIN_INLIERS = 6
+        _SLOPE_HISTORY_MAX = 80
+
+        per_aircraft_result = _fit_per_aircraft_slope(fit_scored, base_period_s)
+        per_aircraft_slope = per_aircraft_result["slope_deg_per_s"]
+
+        # EMA preserved unchanged when consensus is rejected — never overwrite with b_fit.
+        smoothed_slope = existing.residual_slope_deg_per_s
+        if per_aircraft_slope is not None:
+            smoothed_slope = (
+                (1.0 - _SLOPE_EMA_ALPHA) * smoothed_slope
+                + _SLOPE_EMA_ALPHA * per_aircraft_slope
+            )
+        period_update_block_reason = (
+            per_aircraft_result.get("reject_reason") if per_aircraft_slope is None else None
+        )
+
+        # Slope history — source-tagged; persistence gate counts only consensus entries.
+        slope_history = self._live_slope_history.setdefault(iid, deque(maxlen=_SLOPE_HISTORY_MAX))
+        slope_history.append({
+            "ts": now_ts,
+            "residual_slope_deg_per_s": smoothed_slope,
+            "raw_slope_deg_per_s": per_aircraft_slope,
+            "slope_source": (
+                "per_aircraft_consensus" if per_aircraft_slope is not None else "none"
+            ),
+            "fit_span_s": per_aircraft_result.get("fit_span_s", 0.0),
+            "n_fit_observations": len(fit_scored),
+        })
+        recent_window = list(slope_history)[-8:]
+        tagged_entries = [
+            e for e in recent_window if e.get("slope_source") == "per_aircraft_consensus"
+        ]
+        persist_signs = [
+            1 if e["residual_slope_deg_per_s"] > _SLOPE_DEAD_BAND
+            else -1 if e["residual_slope_deg_per_s"] < -_SLOPE_DEAD_BAND
+            else 0
+            for e in tagged_entries
+        ]
+        nonzero_signs = [s for s in persist_signs if s != 0]
+        persistent_slope = (
+            len(nonzero_signs) >= 5
+            and len(set(nonzero_signs)) == 1
+            and abs(smoothed_slope) >= _SLOPE_DEAD_BAND
+            and per_aircraft_slope is not None
+        )
+        if not persistent_slope and period_update_block_reason is None:
+            period_update_block_reason = "slope_not_persistent"
+
+        fit_span_s = (
+            (
+                max(e["effective_us"] for e in fit_scored)
+                - min(e["effective_us"] for e in fit_scored)
+            ) / 1_000_000.0
+            if len(fit_scored) >= 2 else 0.0
+        )
+        period_update_allowed = (
+            bool(RADAR_SYNC_PERIOD_REFINE_ENABLED)
+            and persistent_slope
+            and n_inliers >= _PERIOD_REFINE_MIN_INLIERS
+            and len(fit_contributing_icaos) >= 2
+            and fit_span_s >= 2.0 * base_period_s
+        )
+        if not period_update_allowed and period_update_block_reason is None:
+            period_update_block_reason = "period_refine_disabled"
+
+        refined_period_s = live_period_s
+        period_update_applied = 0.0
+        period_update_ppm_applied = 0.0
+        period_update_ppm_from_base = (
+            (live_period_s - base_period_s) / base_period_s * 1e6
+            if base_period_s > 0 else 0.0
+        )
+        period_update_ppm_step = 0.0
+        period_update_clamp_reason = None
+
+        if period_update_allowed:
+            rate_nominal = 360.0 / base_period_s
+            rate_target = rate_nominal + smoothed_slope * _PERIOD_GAIN
+            if rate_target <= 0:
+                period_update_allowed = False
+                period_update_block_reason = "non_positive_rate_target"
+            else:
+                target_from_base_s = 360.0 / rate_target
+                step_limit_s = abs(live_period_s) * _PERIOD_PPM_PER_UPDATE_MAX * 1e-6
+                stepped_period_s = live_period_s + max(
+                    -step_limit_s,
+                    min(step_limit_s, target_from_base_s - live_period_s),
+                )
+                base_limit_s = abs(base_period_s) * _PERIOD_PPM_FROM_BASE_MAX * 1e-6
+                refined_period_s = max(
+                    base_period_s - base_limit_s,
+                    min(base_period_s + base_limit_s, stepped_period_s),
+                )
+                period_update_applied = refined_period_s - live_period_s
+                period_update_ppm_applied = (
+                    period_update_applied / live_period_s * 1e6 if live_period_s > 0 else 0.0
+                )
+                period_update_ppm_from_base = (
+                    (refined_period_s - base_period_s) / base_period_s * 1e6
+                    if base_period_s > 0 else 0.0
+                )
+                period_update_ppm_step = (
+                    (stepped_period_s - live_period_s) / live_period_s * 1e6
+                    if live_period_s > 0 else 0.0
+                )
+                period_update_clamp_reason = (
+                    "base_ppm_clamped"
+                    if abs(period_update_ppm_from_base) >= _PERIOD_PPM_FROM_BASE_MAX * 0.99
+                    else "per_update_clamped"
+                    if abs(stepped_period_s - target_from_base_s) > 1e-9
+                    else None
+                )
+
+        period_correction_ppm = (
+            (refined_period_s - base_period_s) / base_period_s * 1e6
+            if base_period_s > 0 else 0.0
+        )
+        period_correction_status = (
+            "holding" if not period_update_allowed
+            else "clamp_limited" if period_update_clamp_reason is not None
+            else "converging"
+        )
+
+        # Sync quality / jitter.
+        inlier_abs = [abs(e["residual"]) for e in scored if e["status"] == "inlier"]
+        if len(inlier_abs) >= 3:
+            try:
+                new_jitter = min(max(statistics.stdev(inlier_abs), 1.5), 15.0)
+            except statistics.StatisticsError:
+                new_jitter = existing.sync_jitter_deg
+        elif inlier_abs:
+            new_jitter = min(max(statistics.mean(inlier_abs), 1.5), 15.0)
+        else:
+            new_jitter = min(existing.sync_jitter_deg * 1.1, 15.0)
+
+        _RESIDUAL_EMA_ALPHA = 0.2
+        new_ema = (
+            (1.0 - _RESIDUAL_EMA_ALPHA) * existing.residual_ema_deg
+            + _RESIDUAL_EMA_ALPHA * abs(phase_correction)
+        )
+        q = sync_quality if sync_quality is not None else existing.sync_quality
+
+        anchor_ok = (
+            anchor_solution is not None
+            and phase_anchor_icao is not None
+            and phase_anchor_obs_count >= 3
+            and (phase_anchor_spread is None or phase_anchor_spread <= 18.0)
+            and phase_anchor_status in ("selected", "anchor_only")
+        )
+        new_usable = (
+            (anchor_ok or (n_inliers >= 3 and len(contributing_icaos) >= 2))
+            and new_jitter < 15.0
+            and (anchor_ok or n_rejected < len(recent_obs) // 2 + 1)
+        )
+
+        # Update ICAO quality memory.
+        _update_icao_sync_quality_memory(icao_quality, scored)
+
+        # Diagnostics.
+        phase_source = (
+            "anchor_consensus" if phase_anchor_status == "selected"
+            else "anchor_only" if phase_anchor_status == "anchor_only"
+            else "unavailable"
+        )
+        period_refinement_source = (
+            "per_aircraft_consensus" if per_aircraft_slope is not None else "none"
+        )
+        period_authoritative_source = "refined" if period_update_allowed else "base"
+
+        new_state = LiveSyncState(
+            iid=iid,
+            period_s=refined_period_s,
+            phase_epoch_us=new_epoch_us,
+            phase_offset_deg=new_offset,
+            sync_quality=q,
+            sync_jitter_deg=new_jitter,
+            last_sync_update_ts=now_ts,
+            source="multi_aircraft_burst",
+            usable=new_usable,
+            residual_ema_deg=new_ema,
+            n_sync_frames=existing.n_sync_frames + 1,
+            n_rejected_frames=(
+                existing.n_rejected_frames
+                + (1 if n_rejected > max(len(recent_obs) // 2, 1) else 0)
+            ),
+            last_residual_deg=phase_correction,
+            holdover=False,
+            n_burst_obs_inliers=n_inliers,
+            n_burst_obs_rejected=n_rejected,
+            contributing_icao_count=len(contributing_icaos),
+            period_base_s=base_period_s,
+            residual_slope_deg_per_s=smoothed_slope,
+            period_correction_ppm=period_correction_ppm,
+            period_refine_enabled=bool(RADAR_SYNC_PERIOD_REFINE_ENABLED),
+            period_update_allowed=period_update_allowed,
+            period_update_block_reason=period_update_block_reason,
+            period_update_clamp_reason=period_update_clamp_reason,
+            period_update_applied=period_update_applied,
+            period_update_ppm_applied=period_update_ppm_applied,
+            period_update_ppm_from_base=period_update_ppm_from_base,
+            period_update_ppm_step=period_update_ppm_step,
+            period_update_ppm_limit_from_base=_PERIOD_PPM_FROM_BASE_MAX,
+            period_update_ppm_limit_step=_PERIOD_PPM_PER_UPDATE_MAX,
+            period_update_safety_ppm_from_base=_PERIOD_PPM_FROM_BASE_MAX,
+            period_update_safety_ppm_per_update=_PERIOD_PPM_PER_UPDATE_MAX,
+            period_update_fit_support=n_inliers,
+            period_update_fit_span_s=fit_span_s,
+            period_correction_status=period_correction_status,
+            period_refine_mode="simple",
+            period_authoritative_source=period_authoritative_source,
+            period_reacquire_active=False,
+            period_failure_streak=0,
+            period_failure_primary_class="clean",
+            phase_status=phase_status,
+            phase_status_reason=phase_status_reason,
+            phase_anchor_icao=phase_anchor_icao,
+            phase_anchor_score=phase_anchor_score,
+            phase_anchor_obs_count=phase_anchor_obs_count,
+            phase_anchor_offset_raw_deg=phase_anchor_raw,
+            phase_anchor_offset_smoothed_deg=phase_anchor_smoothed,
+            phase_anchor_spread_deg=phase_anchor_spread,
+            phase_anchor_status=phase_anchor_status,
+            phase_anchor_since_ts=phase_anchor_since_ts,
+            phase_anchor_replacement_reason=phase_anchor_replacement_reason,
+            phase_anchor_candidate_count=len(anchor_selection.get("candidates") or []),
+            phase_anchor_candidates=anchor_selection.get("candidates") or [],
+            phase_validation_contributors=validation["contributor_count"],
+            phase_validation_reject_count=validation["reject_count"],
+            phase_validation_median_error_deg=validation.get("median_error_deg"),
+            phase_validation_status=validation["status"],
+            fit_time_basis="effective_beast_time_s",
+            fit_residual_basis="observed_minus_predicted_after_prop_motion_deg",
+            fit_total_observations=len(recent_obs),
+            fit_eligible_observations=len(fit_scored),
+            fit_rejected_observations=n_rejected,
+            fit_reject_reasons=dict(fit_reject_reasons),
+            fit_contributing_icao_count=len(fit_contributing_icaos),
+            fit_span_s=fit_span_s,
+            waveform_enabled=False,
+            waveform_applied=False,
+            waveform_learning_enabled=False,
+            prop_delay_enabled=bool(RADAR_SYNC_PROP_DELAY_ENABLED),
+            motion_comp_phase_enabled=bool(RADAR_SYNC_MOTION_COMP_PHASE_ENABLED),
+            motion_comp_fit_enabled=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
+            sync_model="simple",
+            period_source="df_base",
+            period_refinement_source=period_refinement_source,
+            phase_source=phase_source,
+            legacy_model_active=False,
+        )
+        self._live_sync_states[iid] = new_state
+
+        self._live_period_history.setdefault(iid, deque(maxlen=80)).append({
+            "ts": now_ts,
+            "period_s": refined_period_s,
+            "period_base_s": base_period_s,
+            "period_correction_ppm": period_correction_ppm,
+            "period_correction_status": period_correction_status,
+        })
+
+    # ── LEGACY — kept for temporary comparison only; NOT called by default ──────
+    # Set RADAR_SYNC_MODEL=legacy in the environment to route here instead of
+    # _update_simple_live_sync_state().  Do not add features to this function.
     def _update_multi_aircraft_sync_state(
         self,
         iid: int,
