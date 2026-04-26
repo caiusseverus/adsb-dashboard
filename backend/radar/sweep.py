@@ -35,7 +35,6 @@ try:
         RADAR_SYNC_MOTION_COMP_FIT_ENABLED,
         RADAR_SYNC_WAVEFORM_BIN_COUNT,
         RADAR_DIAGNOSTICS,
-        RADAR_SYNC_MODEL,
     )
 except Exception:  # pragma: no cover — config not importable in some test harnesses
     RADAR_SYNC_PERIOD_REFINE_ENABLED = True
@@ -45,12 +44,21 @@ except Exception:  # pragma: no cover — config not importable in some test har
     RADAR_SYNC_MOTION_COMP_FIT_ENABLED = True
     RADAR_SYNC_WAVEFORM_BIN_COUNT = 24
     RADAR_DIAGNOSTICS = False
+
+try:
+    from config import RADAR_SYNC_MODEL
+except Exception:  # pragma: no cover
     RADAR_SYNC_MODEL = "simple"
 
 if TYPE_CHECKING:
     from aircraft_state import AircraftState
 
 log = logging.getLogger(__name__)
+
+RADAR_SYNC_MODEL = str(RADAR_SYNC_MODEL or "simple").strip().lower()
+if RADAR_SYNC_MODEL not in {"simple", "legacy"}:
+    log.warning("Invalid RADAR_SYNC_MODEL=%r; defaulting to 'simple'", RADAR_SYNC_MODEL)
+    RADAR_SYNC_MODEL = "simple"
 
 _perf_lock = threading.Lock()
 df11_event_timings: deque[float] = deque(maxlen=4000)

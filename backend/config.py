@@ -248,6 +248,21 @@ RADAR_SYNC_MOTION_COMP_PHASE_ENABLED: bool = _bool("RADAR_SYNC_MOTION_COMP_PHASE
 RADAR_SYNC_MOTION_COMP_FIT_ENABLED: bool = _bool("RADAR_SYNC_MOTION_COMP_FIT_ENABLED", True)
 # Number of circular bins for the phase-in-rotation waveform model.
 RADAR_SYNC_WAVEFORM_BIN_COUNT: int = int(os.getenv("RADAR_SYNC_WAVEFORM_BIN_COUNT", "24"))
+# Sync model selection.
+#   "simple"  — new architecture: DF base period + bounded per-ICAO slope consensus
+#               + phase anchor with explicit trust states.  No b_fit, no reacquire,
+#               no adaptive clamp, no waveform in operational trust/period path.
+#   "legacy"  — old complex model (_update_multi_aircraft_sync_state); kept for
+#               temporary comparison only; disabled by default.
+_RADAR_SYNC_MODEL_RAW: str = os.getenv("RADAR_SYNC_MODEL", "simple").strip().lower()
+if _RADAR_SYNC_MODEL_RAW not in {"simple", "legacy"}:
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "Invalid RADAR_SYNC_MODEL=%r; defaulting to 'simple'",
+        _RADAR_SYNC_MODEL_RAW,
+    )
+    _RADAR_SYNC_MODEL_RAW = "simple"
+RADAR_SYNC_MODEL: str = _RADAR_SYNC_MODEL_RAW
 
 # ---------------------------------------------------------------------------
 # Stage 3 — aircraft localisation from known radar bearings
