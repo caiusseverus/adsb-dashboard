@@ -69,6 +69,7 @@ def _sync(
     *,
     usable: bool = True,
     period_s: float = 10.0,
+    phase_status: str = "trusted",
     phase_anchor_status: str = "selected",
     phase_anchor_icao: str | None = "TEST01",
     phase_validation_status: str = "ok",
@@ -85,6 +86,7 @@ def _sync(
         last_sync_update_ts=0.0,
         source=source,
         usable=usable,
+        phase_status=phase_status,
         phase_anchor_status=phase_anchor_status,
         phase_anchor_icao=phase_anchor_icao,
         phase_validation_status=phase_validation_status,
@@ -463,8 +465,8 @@ def test_collapse_display_selector_unique_per_iid():
 def test_untrusted_absolute_phase_rejected():
     now = __import__("time").time()
     models = {1: _radar_iid(lat=51.0, lon=-1.0)}
-    # phase_anchor_status is not in {"selected", "anchor_only"} → untrusted
-    syncs = {1: _sync(1, phase_anchor_status="fallback_mixed")}
+    # phase_status not "trusted" → gate rejects
+    syncs = {1: _sync(1, phase_status="untrusted")}
     det_by_icao = {"XYZ": [_det(1, "XYZ", now - 0.2)]}
     loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
 
@@ -473,10 +475,10 @@ def test_untrusted_absolute_phase_rejected():
     assert sel["per_radar_reasons"].get(1) == REASON_ABSOLUTE_PHASE_UNTRUSTED
 
 
-def test_untrusted_phase_population_disagrees():
+def test_provisional_phase_rejected():
     now = __import__("time").time()
     models = {1: _radar_iid(lat=51.0, lon=-1.0)}
-    syncs = {1: _sync(1, phase_validation_status="population_disagrees")}
+    syncs = {1: _sync(1, phase_status="provisional")}
     det_by_icao = {"XYZ": [_det(1, "XYZ", now - 0.2)]}
     loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
 
@@ -485,10 +487,11 @@ def test_untrusted_phase_population_disagrees():
     assert sel["per_radar_reasons"].get(1) == REASON_ABSOLUTE_PHASE_UNTRUSTED
 
 
-def test_untrusted_phase_spread_too_large():
+def test_absent_phase_status_rejected():
     now = __import__("time").time()
     models = {1: _radar_iid(lat=51.0, lon=-1.0)}
-    syncs = {1: _sync(1, phase_anchor_spread_deg=30.0)}
+    # No phase_status field → defaults to "untrusted"
+    syncs = {1: _sync(1, phase_status=None)}
     det_by_icao = {"XYZ": [_det(1, "XYZ", now - 0.2)]}
     loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
 

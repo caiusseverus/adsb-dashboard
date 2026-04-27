@@ -75,67 +75,45 @@ def test_live_bearing_uses_authoritative_sync_predictor():
 
 
 # ---------------------------------------------------------------------------
-# Absolute phase trust gate — localiser must reject relative-only Go sync
+# Absolute phase trust gate — only Python simple sync with phase_status="trusted"
 # ---------------------------------------------------------------------------
 
-def _make_go_sync(*, absolute_phase_trusted: bool, usable: bool = True) -> LiveSyncState:
-    """Build a minimal Go-sourced sync state for gating tests."""
-    return LiveSyncState(
-        iid=7,
-        period_s=4.0,
-        phase_epoch_us=0.0,
-        phase_offset_deg=45.0,
-        sync_quality=0.8,
-        sync_jitter_deg=3.0,
-        last_sync_update_ts=1000.0,
-        source="go_multi_aircraft_burst",
-        usable=usable,
-        absolute_phase_trusted=absolute_phase_trusted,
-        # Populate heuristic fields that would normally gate Python-sourced sync.
-        phase_anchor_icao="AAAAAA",
-        phase_anchor_status="selected",
-        phase_anchor_spread_deg=5.0,
-        phase_validation_status="validated",
-        phase_validation_contributors=3,
-        phase_validation_median_error_deg=2.0,
-    )
-
-
-def test_go_sync_absolute_phase_trusted_true_passes_gate():
-    """Go sync with absolute_phase_trusted=True must pass the localiser gate."""
-    sync = _make_go_sync(absolute_phase_trusted=True)
-    assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is True
-
-
-def test_go_sync_absolute_phase_trusted_false_rejected():
-    """Go sync with absolute_phase_trusted=False must be rejected by the gate
-    even when all heuristic fields look valid. The Go decision is authoritative."""
-    sync = _make_go_sync(absolute_phase_trusted=False)
-    assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is False
-
-
-def test_go_sync_without_apt_field_defaults_to_false():
-    """When Go doesn't emit the absolute_phase_trusted field (old binary), the
-    default is False — the conservative safe choice for localisation."""
-    sync = _make_go_sync(absolute_phase_trusted=False)
-    # absolute_phase_trusted=False means the gate rejects it even when heuristics pass.
-    assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is False
-
-
-def test_python_sync_not_rejected_as_go():
-    """Python-sourced sync must still pass heuristic checks (not short-circuited)."""
+def test_trusted_phase_status_passes_gate():
+    """phase_status='trusted' on multi_aircraft_burst source must pass the gate."""
     sync = LiveSyncState(
         iid=7, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=45.0,
         sync_quality=0.8, sync_jitter_deg=3.0, last_sync_update_ts=1000.0,
         source="multi_aircraft_burst", usable=True,
-        phase_anchor_icao="AAAAAA",
-        phase_anchor_status="selected",
-        phase_anchor_spread_deg=5.0,
-        phase_validation_status="validated",
-        phase_validation_contributors=3,
-        phase_validation_median_error_deg=2.0,
+        phase_status="trusted",
     )
     assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is True
+
+
+def test_non_trusted_phase_status_rejected():
+    """phase_status other than 'trusted' must be rejected regardless of other fields."""
+    for status in ("provisional", "untrusted", None):
+        sync = LiveSyncState(
+            iid=7, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=45.0,
+            sync_quality=0.8, sync_jitter_deg=3.0, last_sync_update_ts=1000.0,
+            source="multi_aircraft_burst", usable=True,
+            phase_status=status,
+        )
+        assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is False, \
+            f"expected False for phase_status={status!r}"
+
+
+def test_go_source_always_rejected():
+    """Go-sourced sync must be rejected regardless of absolute_phase_trusted value."""
+    for apt in (True, False, None):
+        sync = LiveSyncState(
+            iid=7, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=45.0,
+            sync_quality=0.8, sync_jitter_deg=3.0, last_sync_update_ts=1000.0,
+            source="go_multi_aircraft_burst", usable=True,
+            phase_status="trusted",
+            absolute_phase_trusted=bool(apt),
+        )
+        assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is False, \
+            f"expected False for Go source with absolute_phase_trusted={apt!r}"
 
 
 def test_unknown_source_rejected():

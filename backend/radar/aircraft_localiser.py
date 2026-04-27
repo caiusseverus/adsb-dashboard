@@ -1113,50 +1113,13 @@ class AircraftLocaliser:
     def _sync_state_has_trusted_absolute_phase(sync_state) -> bool:
         """Return True iff sync_state carries a trustworthy absolute phase anchor.
 
-        For Go-sourced sync (source == "go_multi_aircraft_burst"), defer to the
-        authoritative Go decision encoded in absolute_phase_trusted rather than
-        re-deriving trust from partial diagnostic fields. This ensures the localiser
-        uses the same criteria as the Go solver (period bounded to DF dominant prior,
-        anchor selected, phase validation strong).
-
-        For Python-sourced sync ("multi_aircraft_burst"), apply heuristic checks on
-        the available diagnostic fields.
+        Only the Python simple sync model (source == "multi_aircraft_burst") can
+        supply a trusted phase.  Trust is determined solely by phase_status;
+        heuristic fallbacks and Go-sourced sync are not accepted.
         """
-        source = getattr(sync_state, "source", None)
-        if source == "go_multi_aircraft_burst":
-            # Defer to the authoritative Go decision. When the Go binary predates
-            # the absolute_phase_trusted field the default is False, which is the
-            # safe conservative choice — the state won't be used for localisation
-            # until Go emits a confirmed trusted phase.
-            return bool(getattr(sync_state, "absolute_phase_trusted", False))
-        elif source != "multi_aircraft_burst":
+        if getattr(sync_state, "source", None) != "multi_aircraft_burst":
             return False
-
-        # Python-sourced sync: check new phase_status field first.
-        # "trusted"     → accept immediately.
-        # "provisional" → Stage 3 does not accept provisional phase.
-        # "untrusted"   → reject.
-        # None (absent) → old state without field; fall through to legacy heuristics.
-        phase_status = getattr(sync_state, "phase_status", None)
-        if phase_status == "trusted":
-            return True
-        elif phase_status in {"provisional", "untrusted"}:
-            return False
-        # Legacy heuristic fallback for states that predate the phase_status field.
-        if sync_state.phase_anchor_status not in {"selected", "anchor_only"}:
-            return False
-        if sync_state.phase_anchor_icao is None:
-            return False
-        if sync_state.phase_validation_status == "population_disagrees":
-            return False
-        if (sync_state.phase_anchor_spread_deg is not None
-                and sync_state.phase_anchor_spread_deg > 25.0):
-            return False
-        if (sync_state.phase_validation_contributors > 0
-                and sync_state.phase_validation_median_error_deg is not None
-                and abs(sync_state.phase_validation_median_error_deg) > 20.0):
-            return False
-        return True
+        return getattr(sync_state, "phase_status", "untrusted") == "trusted"
 
     @staticmethod
     def _bearing_matches_current_truth(

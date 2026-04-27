@@ -308,32 +308,19 @@ class TestStage3TrustGate:
         sync = _make_sync(phase_status="untrusted", source="multi_aircraft_burst")
         assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is False
 
-    def test_go_source_defers_to_absolute_phase_trusted_field(self):
-        sync = _make_sync(source="go_multi_aircraft_burst")
-        # Default absolute_phase_trusted is absent → False
+    def test_go_source_rejected(self):
+        sync = _make_sync(source="go_multi_aircraft_burst", phase_status="trusted")
         assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is False
-
-        # Explicitly set to True
-        sync.absolute_phase_trusted = True
-        assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is True
 
     def test_sweep_frame_go_source_rejected(self):
         sync = _make_sync(source="sweep_frame_go")
         assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is False
 
-    def test_old_state_without_phase_status_falls_back_to_heuristics(self):
-        """States that predate the phase_status field use legacy heuristic checks."""
-        sync = _make_sync(
-            phase_anchor_status="selected",
-            phase_anchor_spread_deg=5.0,
-            phase_validation_status="confirmed",
-            phase_validation_contributors=2,
-            phase_validation_median_error_deg=3.0,
-        )
-        # Remove the field to simulate an old state
+    def test_absent_phase_status_treated_as_untrusted(self):
+        """A state without phase_status must be rejected (defaults to 'untrusted')."""
+        sync = _make_sync(phase_status="trusted", source="multi_aircraft_burst")
         del sync.__dict__["phase_status"]
-        # With good heuristics, should still return True via legacy path
-        assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is True
+        assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is False
 
 
 # ---------------------------------------------------------------------------
