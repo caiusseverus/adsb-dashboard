@@ -579,117 +579,59 @@ def test_get_burst_sync_timeline_prefers_go_evidence_when_available(monkeypatch)
     assert retention["timeline"]["newest_burst_centroid_us"] == pytest.approx(8_200_000.0)
 
 
-def test_go_aligned_burst_sync_snapshot_rebuilds_sync_driving_observations(monkeypatch):
+def test_go_evidence_stored_diagnostically_not_as_sync_input(monkeypatch):
+    """Go burst evidence must be stored in diagnostic deques only, not in the
+    live sync observation pool (_live_aligned_burst_obs)."""
     state = RadarState()
-    now_ts = 1_000.0
-    state._models[7] = RadarIID(
-        iid=7,
-        status="SINGLE_RADAR",
-        period_s=4.0,
-        lat=51.0,
-        lon=0.0,
-    )
+    state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=51.0, lon=0.0)
     state._live_sync_states[7] = LiveSyncState(
-        iid=7,
-        period_s=4.0,
-        phase_epoch_us=0.0,
-        phase_offset_deg=0.0,
-        sync_quality=1.0,
-        sync_jitter_deg=3.0,
-        last_sync_update_ts=now_ts,
-        source="multi_aircraft_burst",
-        usable=True,
+        iid=7, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=0.0,
+        sync_quality=1.0, sync_jitter_deg=3.0, last_sync_update_ts=1_000.0,
+        source="multi_aircraft_burst", usable=True,
     )
+
     state.update_go_snapshot({
         "iids": {},
         "evidence_events": [
             {
-                "kind": "burst_fired",
-                "iid": 7,
-                "icao": int("AAAAAA", 16),
-                "arrival_us": 4_000_000.0,
-                "wall_ts": now_ts - 2.0,
-                "n_replies": 4,
-                "signal_dbfs": -15.0,
-                "truth_lat": 51.1,
-                "truth_lon": 0.1,
-                "position_age_s": 0.2,
-                "dominant_family": True,
-                "sync_eligible": True,
-                "association_confidence": 1.0,
-            },
-            {
-                "kind": "burst_fired",
-                "iid": 7,
-                "icao": int("BBBBBB", 16),
-                "arrival_us": 6_000_000.0,
-                "wall_ts": now_ts - 1.0,
-                "n_replies": 4,
-                "signal_dbfs": -14.0,
-                "truth_lat": 51.2,
-                "truth_lon": 0.2,
-                "position_age_s": 0.3,
-                "dominant_family": True,
-                "sync_eligible": False,
+                "kind": "burst_fired", "iid": 7,
+                "icao": int("AAAAAA", 16), "arrival_us": 4_000_000.0,
+                "wall_ts": 998.0, "n_replies": 4, "signal_dbfs": -15.0,
+                "truth_lat": 51.1, "truth_lon": 0.1, "position_age_s": 0.2,
+                "dominant_family": True, "sync_eligible": True,
                 "association_confidence": 1.0,
             },
         ],
     })
 
-    monkeypatch.setattr("radar.sweep.time.time", lambda: now_ts)
-    aligned = state._go_aligned_burst_sync_snapshot(7, window_s=60.0)
+    # Evidence must appear in the diagnostic buffer.
+    events = state._go_evidence_event_snapshot(iid=7)
+    assert len(events) == 1
+    # Evidence must NOT appear in the live sync observation pool.
+    assert list(state._live_aligned_burst_obs.get(7, [])) == []
 
-    assert len(aligned) == 1
-    assert aligned[0].icao == "AAAAAA"
-    assert aligned[0].sync_update_eligible is True
 
-
-def test_update_go_burst_fired_triggers_multi_sync_update_from_go_evidence(monkeypatch):
+def test_go_burst_fired_does_not_trigger_simple_sync_update(monkeypatch):
+    """Go burst events are diagnostic-only: update_go_burst_fired must never
+    call _update_simple_live_sync_state."""
     state = RadarState()
-    state._models[7] = RadarIID(
-        iid=7,
-        status="SINGLE_RADAR",
-        period_s=4.0,
-        lat=51.0,
-        lon=0.0,
-    )
+    state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=51.0, lon=0.0)
     state._live_sync_states[7] = LiveSyncState(
-        iid=7,
-        period_s=4.0,
-        phase_epoch_us=0.0,
-        phase_offset_deg=0.0,
-        sync_quality=1.0,
-        sync_jitter_deg=3.0,
-        last_sync_update_ts=1_000.0,
-        source="multi_aircraft_burst",
-        usable=True,
+        iid=7, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=0.0,
+        sync_quality=1.0, sync_jitter_deg=3.0, last_sync_update_ts=1_000.0,
+        source="multi_aircraft_burst", usable=True,
     )
-    calls: list[tuple[int, float]] = []
-
-    def fake_update(iid: int, period_s: float, sync_quality=None):
-        calls.append((iid, period_s))
-
-    # Python path always routes to _update_simple_live_sync_state.
-    monkeypatch.setattr(state, "_update_simple_live_sync_state", fake_update)
-    monkeypatch.setattr("radar.sweep.time.monotonic", lambda: 10.0)
+    calls: list[tuple] = []
+    monkeypatch.setattr(state, "_update_simple_live_sync_state",
+                        lambda *a, **kw: calls.append((a, kw)))
 
     state.update_go_burst_fired({
-        "i": 7,
-        "c": int("AAAAAA", 16),
-        "cu": 4_000_000.0,
-        "n": 4,
-        "s": -15.0,
-        "la": 51.1,
-        "lo": 0.1,
-        "pa": 0.2,
-        "df": True,
-        "se": True,
-        "ce": True,
-        "rp": True,
-        "ru": False,
+        "i": 7, "c": int("AAAAAA", 16), "cu": 4_000_000.0,
+        "n": 4, "s": -15.0, "la": 51.1, "lo": 0.1, "pa": 0.2,
+        "df": True, "se": True, "ce": True, "rp": True, "ru": False,
     })
 
-    assert calls == [(7, 4.0)]
+    assert calls == [], "_update_simple_live_sync_state must not be called from Go burst path"
     assert list(state._live_aligned_burst_obs.get(7, [])) == []
 
 
@@ -2654,8 +2596,9 @@ def test_go_iid_state_does_not_override_multi_aircraft_sync_state():
     assert state.get_go_live_sync_state(77)["phase_epoch_us"] == pytest.approx(999_000.0)
 
 
-def test_update_go_burst_fired_calls_python_solver(monkeypatch):
-    """Python solver must always be called when a burst is fired for a known IID."""
+def test_update_go_burst_fired_does_not_call_python_solver(monkeypatch):
+    """Go burst events are diagnostic-only: the Python sync solver must not be
+    invoked from the Go burst-fired path regardless of sync_eligible flags."""
     state = RadarState()
     state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=51.0, lon=0.0)
     state._live_sync_states[7] = LiveSyncState(
@@ -2664,13 +2607,9 @@ def test_update_go_burst_fired_calls_python_solver(monkeypatch):
         source="sweep_frame_go", usable=True,
     )
 
-    calls: list[tuple[int, float]] = []
-
-    def fake_update(iid: int, period_s: float, **_kw):
-        calls.append((iid, period_s))
-
-    monkeypatch.setattr(state, "_update_simple_live_sync_state", fake_update)
-    monkeypatch.setattr("radar.sweep.time.monotonic", lambda: 10.0)
+    calls: list[tuple] = []
+    monkeypatch.setattr(state, "_update_simple_live_sync_state",
+                        lambda *a, **kw: calls.append((a, kw)))
 
     state.update_go_burst_fired({
         "i": 7, "c": int("AAAAAA", 16), "cu": 4_000_000.0,
@@ -2678,7 +2617,7 @@ def test_update_go_burst_fired_calls_python_solver(monkeypatch):
         "df": True, "se": True,
     })
 
-    assert calls == [(7, 4.0)]
+    assert calls == []
 
 
 def test_burst_evidence_buffer_time_pruned_for_display_window(monkeypatch):

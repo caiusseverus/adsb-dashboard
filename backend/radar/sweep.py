@@ -4458,33 +4458,10 @@ class RadarState:
             "refined_sync_usable": refined_sync_usable,
             "sync_eligible": sync_eligible,
         })
-        sync_update_iid = None
-        sync_update_period_s = None
         with self._lock:
             self._go_track_observations.append(entry)
             if evidence is not None:
                 self._go_evidence_events.append(evidence)
-                if evidence.get("compact_sync_eligible"):
-                    iid = int(evidence["iid"])
-                    sync = self._live_sync_states.get(iid)
-                    model = self._models.get(iid)
-                    period_s = None
-                    if sync is not None and sync.period_s > 0:
-                        period_s = float(sync.period_s)
-                    elif model is not None and model.period_s:
-                        period_s = float(model.period_s)
-                    if period_s and period_s > 0:
-                        sync_update_iid = iid
-                        sync_update_period_s = period_s
-        if sync_update_iid is not None and sync_update_period_s is not None:
-            now_mono = time.monotonic()
-            last = self._last_multi_sync_update_ts.get(sync_update_iid, 0.0)
-            if (now_mono - last) >= self._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
-                self._last_multi_sync_update_ts[sync_update_iid] = now_mono
-                self._update_simple_live_sync_state(
-                    iid=sync_update_iid,
-                    period_s=sync_update_period_s,
-                )
 
     def _go_track_observation_snapshot(self) -> list[dict]:
         with self._lock:
@@ -5654,13 +5631,10 @@ class RadarState:
         _SIMPLE_WINDOW_ROTATIONS = 6
         window_s = max(base_period_s * _SIMPLE_WINDOW_ROTATIONS, 30.0)
         cutoff_ts = now_ts - window_s
-        if self.radar_core_event_sink is not None:
-            obs_snapshot = self._go_aligned_burst_sync_snapshot(iid, window_s=window_s)
-        else:
-            obs_buf = self._live_aligned_burst_obs.get(iid)
-            if not obs_buf:
-                return
-            obs_snapshot = list(obs_buf)
+        obs_buf = self._live_aligned_burst_obs.get(iid)
+        if not obs_buf:
+            return
+        obs_snapshot = list(obs_buf)
 
         recent_obs = [o for o in obs_snapshot if o.ts >= cutoff_ts]
         if len(recent_obs) < 3:
@@ -7982,24 +7956,6 @@ class RadarState:
                 ))
         observations.sort(key=lambda obs: (obs.ts, obs.burst_centroid_us, obs.icao))
         return observations
-
-    def _go_aligned_burst_sync_snapshot(
-        self,
-        iid: int,
-        window_s: float | None = None,
-    ) -> list[AlignedBurstSyncObs]:
-        """Rebuild sync-driving aligned observations from Go-owned burst evidence."""
-        observations = self._go_burst_sync_timeline_snapshot(
-            iid,
-            window_s=window_s or 300.0,
-        )
-        aligned = [
-            obs for obs in observations
-            if getattr(obs, "sync_update_eligible", False)
-        ]
-        if len(aligned) > self._MULTI_SYNC_OBS_MAX:
-            aligned = aligned[-self._MULTI_SYNC_OBS_MAX:]
-        return aligned
 
     def _prune_go_evidence_events_locked(self, now_ts: float) -> int:
         """Drop burst-evidence entries older than DF11_RESIDUAL_EVENT_MAX_AGE_S.
