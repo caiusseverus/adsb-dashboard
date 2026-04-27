@@ -511,7 +511,7 @@ def test_get_burst_sync_timeline_includes_non_sync_driving_observations():
     assert retention["timeline"]["retained_duration_s"] == pytest.approx(4.1)
 
 
-def test_get_burst_sync_timeline_prefers_go_evidence_when_available(monkeypatch):
+def test_get_burst_sync_timeline_includes_go_evidence_in_diagnostic_timeline(monkeypatch):
     state = RadarState()
     now_ts = 1_000.0
     state._models[7] = RadarIID(
@@ -635,9 +635,13 @@ def test_go_burst_fired_does_not_trigger_simple_sync_update(monkeypatch):
     assert list(state._live_aligned_burst_obs.get(7, [])) == []
 
 
-def test_update_go_burst_fired_tracks_compact_vs_refined_sync_semantics():
+def test_update_go_burst_fired_stores_go_timing_candidate_flags():
+    """Go burst payloads are stored as diagnostic timeline evidence only.
+    The normalised output uses go_* field names to prevent confusion with
+    operational sync authority."""
     state = RadarState()
 
+    # Legacy payload carrying se/rp/ru; current Go only sends ce.
     state.update_go_burst_fired({
         "i": 7,
         "c": int("AAAAAA", 16),
@@ -657,17 +661,20 @@ def test_update_go_burst_fired_tracks_compact_vs_refined_sync_semantics():
     track = state._go_track_observations[-1]
     evidence = state._go_evidence_events[-1]
 
-    assert track["sync_eligible"] is False
-    assert track["compact_sync_eligible"] is True
-    assert track["refined_sync_present"] is True
-    assert track["refined_sync_usable"] is False
-    assert evidence["sync_eligible"] is False
-    assert evidence["compact_sync_eligible"] is True
-    assert evidence["refined_sync_present"] is True
-    assert evidence["refined_sync_usable"] is False
+    # go_timing_candidate reflects refined_usable (ru=False) not raw se flag.
+    assert track["go_timing_candidate"] is False
+    assert track["go_compact_timing_candidate"] is True
+    assert track["go_refined_payload_present"] is True
+    assert track["go_refined_payload_usable"] is False
+    assert evidence["go_timing_candidate"] is False
+    assert evidence["go_compact_timing_candidate"] is True
+    assert evidence["go_refined_payload_present"] is True
+    assert evidence["go_refined_payload_usable"] is False
 
 
 def test_go_observation_normaliser_keeps_legacy_compact_only_payloads_compatible():
+    """Legacy Go payloads carrying only sync_eligible (no compact_sync_eligible) must
+    be normalised correctly — the lone flag maps to go_compact_timing_candidate."""
     entry = RadarState._normalise_go_track_observation({
         "iid": 7,
         "icao": int("AAAAAA", 16),
@@ -676,10 +683,10 @@ def test_go_observation_normaliser_keeps_legacy_compact_only_payloads_compatible
         "sync_eligible": True,
     })
 
-    assert entry["compact_sync_eligible"] is True
-    assert entry["refined_sync_present"] is False
-    assert entry["refined_sync_usable"] is False
-    assert entry["sync_eligible"] is True
+    assert entry["go_compact_timing_candidate"] is True
+    assert entry["go_refined_payload_present"] is False
+    assert entry["go_refined_payload_usable"] is False
+    assert entry["go_timing_candidate"] is True
 
 
 def test_live_sync_observation_buffers_prune_by_age_with_high_count_caps(monkeypatch):

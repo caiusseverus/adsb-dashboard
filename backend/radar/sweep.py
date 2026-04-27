@@ -4138,6 +4138,15 @@ class RadarState:
 
     @staticmethod
     def _normalise_go_sync_eligibility(entry: dict) -> tuple[bool, bool, bool, bool]:
+        """Map Go wire-format eligibility fields to diagnostic-only internal names.
+
+        Reads the original Go payload keys (kept for wire-format and legacy-snapshot
+        compatibility) and returns renamed diagnostic flags that must not be
+        mistaken for operational sync authority.
+
+        Returns: (go_compact_timing_candidate, go_refined_payload_present,
+                  go_refined_payload_usable, go_timing_candidate)
+        """
         compact_value = entry.get("compact_sync_eligible")
         refined_present_value = entry.get("refined_sync_present")
         refined_usable_value = entry.get("refined_sync_usable")
@@ -4149,27 +4158,27 @@ class RadarState:
             and refined_usable_value is None
         )
 
-        compact_sync_eligible = bool(
+        go_compact_timing_candidate = bool(
             compact_value if compact_value is not None else (
                 sync_value if legacy_compact_only else False
             )
         )
-        refined_sync_present = bool(refined_present_value)
-        refined_sync_usable = bool(
+        go_refined_payload_present = bool(refined_present_value)
+        go_refined_payload_usable = bool(
             refined_usable_value if refined_usable_value is not None else (
                 sync_value if not legacy_compact_only else False
             )
         )
-        sync_eligible = bool(
+        go_timing_candidate = bool(
             refined_usable_value if refined_usable_value is not None else (
-                sync_value if sync_value is not None else refined_sync_usable
+                sync_value if sync_value is not None else go_refined_payload_usable
             )
         )
         return (
-            compact_sync_eligible,
-            refined_sync_present,
-            refined_sync_usable,
-            sync_eligible,
+            go_compact_timing_candidate,
+            go_refined_payload_present,
+            go_refined_payload_usable,
+            go_timing_candidate,
         )
 
     @staticmethod
@@ -4178,10 +4187,10 @@ class RadarState:
             return None
         try:
             (
-                compact_sync_eligible,
-                refined_sync_present,
-                refined_sync_usable,
-                sync_eligible,
+                go_compact_timing_candidate,
+                go_refined_payload_present,
+                go_refined_payload_usable,
+                go_timing_candidate,
             ) = RadarState._normalise_go_sync_eligibility(entry)
             return {
                 "iid": int(entry["iid"]),
@@ -4206,10 +4215,11 @@ class RadarState:
                 ),
                 "association_confidence": float(entry.get("association_confidence") or 0.0),
                 "dominant_family": bool(entry.get("dominant_family")),
-                "compact_sync_eligible": compact_sync_eligible,
-                "refined_sync_present": refined_sync_present,
-                "refined_sync_usable": refined_sync_usable,
-                "sync_eligible": sync_eligible,
+                # Diagnostic-only flags — do not imply operational sync authority.
+                "go_compact_timing_candidate": go_compact_timing_candidate,
+                "go_refined_payload_present": go_refined_payload_present,
+                "go_refined_payload_usable": go_refined_payload_usable,
+                "go_timing_candidate": go_timing_candidate,
             }
         except Exception:
             return None
@@ -4334,10 +4344,10 @@ class RadarState:
             return None
         try:
             (
-                compact_sync_eligible,
-                refined_sync_present,
-                refined_sync_usable,
-                sync_eligible,
+                go_compact_timing_candidate,
+                go_refined_payload_present,
+                go_refined_payload_usable,
+                go_timing_candidate,
             ) = RadarState._normalise_go_sync_eligibility(entry)
             return {
                 "kind": str(entry.get("kind") or "burst_fired"),
@@ -4400,22 +4410,28 @@ class RadarState:
                 ),
                 "association_confidence": float(entry.get("association_confidence") or 0.0),
                 "dominant_family": bool(entry.get("dominant_family")),
-                "compact_sync_eligible": compact_sync_eligible,
-                "refined_sync_present": refined_sync_present,
-                "refined_sync_usable": refined_sync_usable,
-                "sync_eligible": sync_eligible,
+                # Diagnostic-only flags — do not imply operational sync authority.
+                "go_compact_timing_candidate": go_compact_timing_candidate,
+                "go_refined_payload_present": go_refined_payload_present,
+                "go_refined_payload_usable": go_refined_payload_usable,
+                "go_timing_candidate": go_timing_candidate,
             }
         except Exception:
             return None
 
     def update_go_burst_fired(self, burst_dict: dict) -> None:
-        compact_sync_eligible = burst_dict.get("ce")
-        refined_sync_present = burst_dict.get("rp")
-        refined_sync_usable = burst_dict.get("ru")
-        sync_eligible = burst_dict.get("ru", burst_dict.get("se"))
-        entry = self._normalise_go_track_observation({
+        # Go now only sends "ce" (compact timing candidate); legacy payloads
+        # may carry "rp"/"ru"/"se" and are handled by _normalise_go_sync_eligibility.
+        _common = {
             "iid": burst_dict.get("i"),
             "icao": burst_dict.get("c"),
+            "compact_sync_eligible": burst_dict.get("ce"),
+            "refined_sync_present": burst_dict.get("rp"),
+            "refined_sync_usable": burst_dict.get("ru"),
+            "sync_eligible": burst_dict.get("ru", burst_dict.get("se")),
+        }
+        entry = self._normalise_go_track_observation({
+            **_common,
             "arrival_us": burst_dict.get("cu"),
             "wall_ts": time.time(),
             "signal_dbfs": burst_dict.get("s"),
@@ -4424,17 +4440,12 @@ class RadarState:
             "position_age_s": burst_dict.get("pa"),
             "association_confidence": 1.0 if burst_dict.get("la") is not None and burst_dict.get("lo") is not None else 0.0,
             "dominant_family": burst_dict.get("df"),
-            "compact_sync_eligible": compact_sync_eligible,
-            "refined_sync_present": refined_sync_present,
-            "refined_sync_usable": refined_sync_usable,
-            "sync_eligible": sync_eligible,
         })
         if entry is None:
             return
         evidence = self._normalise_go_evidence_event({
+            **_common,
             "kind": "burst_fired",
-            "iid": burst_dict.get("i"),
-            "icao": burst_dict.get("c"),
             "arrival_us": burst_dict.get("cu"),
             "simple_centroid_us": burst_dict.get("cs"),
             "weighted_centroid_us": burst_dict.get("cw"),
@@ -4453,10 +4464,6 @@ class RadarState:
             "position_age_s": burst_dict.get("pa"),
             "association_confidence": entry["association_confidence"],
             "dominant_family": burst_dict.get("df"),
-            "compact_sync_eligible": compact_sync_eligible,
-            "refined_sync_present": refined_sync_present,
-            "refined_sync_usable": refined_sync_usable,
-            "sync_eligible": sync_eligible,
         })
         with self._lock:
             self._go_track_observations.append(entry)
@@ -7814,7 +7821,7 @@ class RadarState:
                 range_nm=range_nm,
                 ts=wall_ts,
                 sync_update_eligible=bool(
-                    entry.get("compact_sync_eligible", entry.get("sync_eligible", False))
+                    entry.get("go_compact_timing_candidate", entry.get("go_timing_candidate", False))
                 ),
                 raw_arrival_us=float(entry["arrival_us"]),
                 prop_delay_aircraft_to_receiver_us=prop_delay_us,

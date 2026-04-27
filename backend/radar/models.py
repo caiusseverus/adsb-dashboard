@@ -180,7 +180,7 @@ class BurstRecord:
     range_nm: Optional[float] = None
     pos_age_s: Optional[float] = None
     dominant_family: bool = False    # True if ICAO belongs to the dominant period family
-    sync_eligible: bool = False      # True if usable for sync-fit observation
+    sync_eligible: bool = False      # True if this Python burst qualified for the live sync fit
 
 
 @dataclass
