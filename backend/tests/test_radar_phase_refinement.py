@@ -625,7 +625,7 @@ class TestSimpleModelBehavior:
 
         assert sync is not None
         assert sync.sync_model == "simple"
-        assert sync.legacy_model_active is False
+
         assert sync.period_refine_mode == "simple"
         assert sync.period_source == "df_base"
         assert sync.waveform_applied is False
@@ -775,7 +775,7 @@ class TestSimpleModelBehavior:
         assert sync.period_source == "df_base"
         assert sync.period_refinement_source in {"per_aircraft_consensus", "none"}
         assert sync.phase_source in {"anchor_consensus", "anchor_only", "unavailable"}
-        assert sync.legacy_model_active is False
+
 
     def test_period_refinement_source_none_when_consensus_rejected(self, monkeypatch):
         """period_refinement_source='none' when per-aircraft consensus is unavailable."""
