@@ -103,17 +103,14 @@ def test_non_trusted_phase_status_rejected():
 
 
 def test_go_source_always_rejected():
-    """Go-sourced sync must be rejected regardless of absolute_phase_trusted value."""
-    for apt in (True, False, None):
-        sync = LiveSyncState(
-            iid=7, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=45.0,
-            sync_quality=0.8, sync_jitter_deg=3.0, last_sync_update_ts=1000.0,
-            source="go_multi_aircraft_burst", usable=True,
-            phase_status="trusted",
-            absolute_phase_trusted=bool(apt),
-        )
-        assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is False, \
-            f"expected False for Go source with absolute_phase_trusted={apt!r}"
+    """Go-sourced sync must be rejected regardless of phase_status value."""
+    sync = LiveSyncState(
+        iid=7, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=45.0,
+        sync_quality=0.8, sync_jitter_deg=3.0, last_sync_update_ts=1000.0,
+        source="go_multi_aircraft_burst", usable=True,
+        phase_status="trusted",
+    )
+    assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is False
 
 
 def test_unknown_source_rejected():

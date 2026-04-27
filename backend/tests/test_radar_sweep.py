@@ -2654,24 +2654,21 @@ def test_go_iid_state_does_not_override_multi_aircraft_sync_state():
     assert state.get_go_live_sync_state(77)["phase_epoch_us"] == pytest.approx(999_000.0)
 
 
-def test_update_go_burst_fired_calls_python_solver_even_when_go_multi_sync_present(monkeypatch):
-    """Python solver must run regardless of whether Go has multi-sync state for the IID."""
+def test_update_go_burst_fired_calls_python_solver(monkeypatch):
+    """Python solver must always be called when a burst is fired for a known IID."""
     state = RadarState()
     state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=51.0, lon=0.0)
     state._live_sync_states[7] = LiveSyncState(
         iid=7, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=0.0,
         sync_quality=1.0, sync_jitter_deg=3.0, last_sync_update_ts=1_000.0,
-        source="go_multi_aircraft_burst", usable=True,
+        source="sweep_frame_go", usable=True,
     )
-    # Simulate Go having produced multi-sync state for IID 7.
-    state._go_multi_sync_states_by_iid[7] = {"pr": True, "p": 4.0}
 
     calls: list[tuple[int, float]] = []
 
     def fake_update(iid: int, period_s: float, **_kw):
         calls.append((iid, period_s))
 
-    # Python path always routes to _update_simple_live_sync_state.
     monkeypatch.setattr(state, "_update_simple_live_sync_state", fake_update)
     monkeypatch.setattr("radar.sweep.time.monotonic", lambda: 10.0)
 
@@ -2681,315 +2678,7 @@ def test_update_go_burst_fired_calls_python_solver_even_when_go_multi_sync_prese
         "df": True, "se": True,
     })
 
-    # Python solver must have been called despite Go state being present.
     assert calls == [(7, 4.0)]
-
-
-def test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst(monkeypatch):
-    """Go MULTI_SYNC_STATE must replace Python multi_aircraft_burst sync once Go has a fit."""
-    import time as _time
-    state = RadarState()
-    state._live_sync_states[3] = LiveSyncState(
-        iid=3, period_s=4.0, phase_epoch_us=123.0, phase_offset_deg=10.0,
-        sync_quality=1.0, sync_jitter_deg=2.0, last_sync_update_ts=1_000.0,
-        source="multi_aircraft_burst", usable=True,
-    )
-
-    monkeypatch.setattr("radar.sweep.time.time", lambda: 2_000.0)
-
-    state.update_go_multi_sync_state({
-        "i": 3, "pr": True, "us": True,
-        "p": 4.01, "pb": 4.0,
-        "pe": 888_000.0, "po": 22.5,
-        "jd": 3.0, "re": 4.0, "nu": 10,
-        "ho": False, "ra": False, "ts": 2_000.0,
-        "bp": 4.0,
-        "trp": 4.005,
-        "dp": 4.0,
-        "afp": 4.0,
-        "afs": "dominant_live_df",
-        "dpa": True,
-        "pds": 0.01,
-        "pdp": 2500.0,
-        "cp": 4.16,
-        "cds": 0.16,
-        "cdp": 40000.0,
-        "cu": True,
-        "rma": True,
-        "rtr": ["compact_dominant_delta", "fit_pool_starved"],
-        "cgb": True,
-        "rla": 5,
-        "anc": 2,
-        "ant": 1_999.5,
-        "ahr": "anchor_hysteresis_switch",
-        "ahu": 4,
-        "cps": 4.03,
-        "aps": 4.01,
-        "cpo": 24.0,
-        "apo": 22.5,
-        "cai": int("BBBBBB", 16),
-        "aai": int("AAAAAA", 16),
-        "cvs": 0.52,
-        "avs": 0.87,
-        "asa": 42.0,
-        "cpr": 7,
-        "apg": 0.0,
-        "afg": 0.08,
-        "pfv": True,
-        "bas": 0.93,
-        "cdd": 11.5,
-        "vac": 1,
-        "vdc": 2,
-        "cvsn": "validator_disagreement",
-        "cabr": "validator_disagreement_too_high",
-        "cmd": "recovery",
-        "amd": "settled_authoritative",
-        "ai": int("AAAAAA", 16),
-        "as": 0.8,
-        "ft": 11,
-        "fe": 8,
-        "fr": 3,
-        "fc": 3,
-        "frr": {"no_adsb_position": 2},
-        "ac": 2,
-        "anr": "no_anchor_candidates",
-        "acs": [
-            {"i": int("AAAAAA", 16), "s": 0.8, "sp": 3.0, "o": 4, "f": 4, "ff": 1.0, "st": "candidate", "rr": []},
-            {"i": int("BBBBBB", 16), "s": 0.0, "sp": 0.0, "o": 3, "f": 0, "ff": 0.0, "st": "rejected", "rr": ["no_fit_eligible_aircraft"]},
-        ],
-    })
-
-    sync = state.get_live_sync_state(3)
-    assert sync is not None
-    assert sync.source == "go_multi_aircraft_burst"
-    assert sync.phase_epoch_us == pytest.approx(888_000.0)
-    assert sync.phase_offset_deg == pytest.approx(22.5)
-    assert sync.phase_anchor_icao == "AAAAAA"
-    assert sync.phase_anchor_candidate_count == 2
-    assert sync.fit_total_observations == 11
-    assert sync.fit_eligible_observations == 8
-    assert sync.fit_contributing_icao_count == 3
-    assert sync.phase_anchor_no_candidate_reason == "no_anchor_candidates"
-    assert sync.phase_anchor_candidates[0]["icao"] == "AAAAAA"
-    assert sync.phase_anchor_candidates[1]["reject_reasons"] == ["no_fit_eligible_aircraft"]
-    assert sync.dominant_period_s == pytest.approx(4.0)
-    assert sync.active_family_prior_s == pytest.approx(4.0)
-    assert sync.active_family_prior_source == "dominant_live_df"
-    assert sync.dominant_prior_active is True
-    assert sync.compact_period_s == pytest.approx(4.16)
-    assert sync.compact_sync_unreliable is True
-    assert sync.recovery_mode_active is True
-    assert sync.recovery_trigger_reasons == ["compact_dominant_delta", "fit_pool_starved"]
-    assert sync.compact_gating_bypassed is True
-    assert sync.recovery_relaxed_admitted_observations == 5
-    assert sync.anchor_switch_count == 2
-    assert sync.last_anchor_switch_ts == pytest.approx(1_999.5)
-    assert sync.last_anchor_switch_reason == "anchor_hysteresis_switch"
-    assert sync.anchor_hold_updates == 4
-    assert sync.candidate_period_s == pytest.approx(4.03)
-    assert sync.authoritative_period_s == pytest.approx(4.01)
-    assert sync.candidate_phase_offset_deg == pytest.approx(24.0)
-    assert sync.authoritative_phase_offset_deg == pytest.approx(22.5)
-    assert sync.candidate_anchor_icao == "BBBBBB"
-    assert sync.authoritative_anchor_icao == "AAAAAA"
-    assert sync.candidate_validation_score == pytest.approx(0.52)
-    assert sync.authoritative_validation_score == pytest.approx(0.87)
-    assert sync.authoritative_state_age_s == pytest.approx(42.0)
-    assert sync.candidate_promotion_streak == 7
-    assert sync.authoritative_period_update_gain == pytest.approx(0.0)
-    assert sync.authoritative_phase_update_gain == pytest.approx(0.08)
-    assert sync.period_frozen_due_to_phase_validation is True
-    assert sync.branch_ambiguity_score == pytest.approx(0.93)
-    assert sync.circular_dispersion_deg == pytest.approx(11.5)
-    assert sync.validator_agreement_count == 1
-    assert sync.validator_disagreement_count == 2
-    assert sync.candidate_validation_status == "validator_disagreement"
-    assert sync.candidate_application_block_reason == "validator_disagreement_too_high"
-    assert sync.phase_validation_status == "validator_disagreement"
-    assert sync.candidate_mode == "recovery"
-    assert sync.authoritative_mode == "settled_authoritative"
-
-
-def test_go_sync_decodes_absolute_phase_trusted_and_dominant_prior_inconsistent():
-    """Go MULTI_SYNC_STATE absolute_phase_trusted (apt) and dominant_prior_inconsistent
-    (dpi) fields must be decoded into the Python LiveSyncState and default to False
-    when absent from the message."""
-    state = RadarState()
-
-    # Message with both new fields present.
-    state.update_go_multi_sync_state({
-        "i": 3, "pr": True, "us": True,
-        "p": 4.0, "pb": 4.0,
-        "pe": 1_000_000.0, "po": 45.0,
-        "jd": 3.0, "re": 4.0, "nu": 5,
-        "ho": False, "ra": False, "ts": 1_000.0,
-        "apt": True,
-        "dpi": True,
-    })
-    sync = state.get_live_sync_state(3)
-    assert sync is not None
-    assert sync.absolute_phase_trusted is True
-    assert sync.dominant_prior_inconsistent is True
-
-    # Message with apt=False.
-    state.update_go_multi_sync_state({
-        "i": 4, "pr": True, "us": True,
-        "p": 4.0, "pb": 4.0,
-        "pe": 1_000_000.0, "po": 45.0,
-        "jd": 3.0, "re": 4.0, "nu": 5,
-        "ho": False, "ra": False, "ts": 1_000.0,
-        "apt": False,
-        "dpi": False,
-    })
-    sync2 = state.get_live_sync_state(4)
-    assert sync2 is not None
-    assert sync2.absolute_phase_trusted is False
-    assert sync2.dominant_prior_inconsistent is False
-
-    # Message with fields absent — must default to False.
-    state.update_go_multi_sync_state({
-        "i": 5, "pr": True, "us": True,
-        "p": 4.0, "pb": 4.0,
-        "pe": 1_000_000.0, "po": 45.0,
-        "jd": 3.0, "re": 4.0, "nu": 5,
-        "ho": False, "ra": False, "ts": 1_000.0,
-    })
-    sync3 = state.get_live_sync_state(5)
-    assert sync3 is not None
-    assert sync3.absolute_phase_trusted is False
-    assert sync3.dominant_prior_inconsistent is False
-
-
-def test_go_sync_diagnostic_history_is_retained_beyond_fit_window(monkeypatch):
-    """Go trend history must be retained independently from the short fit window."""
-    import radar.sweep as sweep_module
-
-    monkeypatch.setattr(sweep_module.time, "time", lambda: 2_000.0)
-
-    state = RadarState()
-    for idx, ts in enumerate([1_900.0, 1_960.0, 2_000.0]):
-        state.update_go_multi_sync_state({
-            "i": 5, "pr": True, "us": True,
-            "p": 4.0 + idx * 0.001, "pb": 4.0,
-            "pe": float(idx + 1) * 1_000_000.0, "po": 20.0 + idx,
-            "jd": 2.0, "re": 3.0, "nu": idx + 1,
-            "ho": False, "ra": False, "ts": ts,
-            "ft": 9, "fe": 7, "fr": 2, "fc": 3,
-            "fw": 30.0, "dw": 300.0, "fs": 28.0, "rs": 0.05 + idx * 0.01,
-            "aam": "refined_authoritative",
-            "aps": 4.0 + idx * 0.001,
-            "asa": 120.0 + idx,
-            "avs": 0.9, "vac": 3, "bas": 0.1,
-        })
-
-    snapshot = state.get_live_sync_snapshot(5, window_s=120.0, debug_limit=20)
-
-    assert snapshot["sync_horizons"]["fit_window_s"] == pytest.approx(30.0)
-    assert snapshot["sync_horizons"]["display_window_s"] == pytest.approx(120.0)
-    assert len(snapshot["slope_history"]) == 3
-    assert snapshot["slope_history"][0]["ts"] == pytest.approx(1_900.0)
-    assert snapshot["slope_history"][0]["fit_window_s"] == pytest.approx(30.0)
-    assert snapshot["slope_history"][-1]["residual_slope_deg_per_s"] == pytest.approx(0.07)
-    assert len(snapshot["period_history"]) == 3
-    assert snapshot["period_history"][-1]["authoritative_period_s"] == pytest.approx(4.002)
-
-
-def test_go_alignment_rows_use_retained_display_history_not_fit_window(monkeypatch):
-    """Go alignment projection must follow requested display history, not 30s fit window."""
-    import radar.sweep as sweep_module
-
-    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
-
-    state = RadarState()
-    state._models[6] = RadarIID(
-        iid=6,
-        status="SINGLE_RADAR",
-        period_s=4.0,
-        manual_lat=51.0,
-        manual_lon=0.0,
-        resolution_mode="locked_position",
-    )
-    state.update_go_multi_sync_state({
-        "i": 6, "pr": True, "us": True,
-        "p": 4.0, "pb": 4.0,
-        "pe": 1_000_000.0, "po": 0.0,
-        "jd": 2.0, "re": 3.0, "nu": 1,
-        "ho": False, "ra": False, "ts": 1_000.0,
-        "ft": 8, "fe": 6, "fr": 2, "fc": 3,
-        "fw": 30.0, "dw": 300.0, "fs": 29.0, "rs": 0.02,
-        "aam": "refined_authoritative",
-        "aps": 4.0, "asa": 90.0,
-        "avs": 0.9, "vac": 3, "bas": 0.1,
-    })
-    state._go_evidence_events = deque([
-        {
-            "kind": "burst_fired", "iid": 6, "icao": "AAAAAA",
-            "arrival_us": 1_000_000.0, "wall_ts": 940.0,
-            "n_replies": 4, "signal_dbfs": -15.0,
-            "truth_lat": 51.1, "truth_lon": 0.1, "position_age_s": 0.2,
-            "compact_sync_eligible": True, "sync_eligible": True,
-        },
-        {
-            "kind": "burst_fired", "iid": 6, "icao": "BBBBBB",
-            "arrival_us": 31_000_000.0, "wall_ts": 970.0,
-            "n_replies": 4, "signal_dbfs": -15.0,
-            "truth_lat": 51.2, "truth_lon": 0.1, "position_age_s": 0.2,
-            "compact_sync_eligible": True, "sync_eligible": True,
-        },
-        {
-            "kind": "burst_fired", "iid": 6, "icao": "CCCCCC",
-            "arrival_us": 61_000_000.0, "wall_ts": 1_000.0,
-            "n_replies": 4, "signal_dbfs": -15.0,
-            "truth_lat": 51.3, "truth_lon": 0.1, "position_age_s": 0.2,
-            "compact_sync_eligible": True, "sync_eligible": True,
-        },
-    ], maxlen=state._GO_EVIDENCE_EVENTS_MAX)
-
-    snapshot = state.get_live_sync_snapshot(6, window_s=90.0, debug_limit=20)
-    wall_span_s = snapshot["observations"][-1]["wall_ts"] - snapshot["observations"][0]["wall_ts"]
-
-    assert snapshot["sync_horizons"]["fit_window_s"] == pytest.approx(30.0)
-    assert snapshot["sync_horizons"]["display_window_s"] == pytest.approx(90.0)
-    assert len(snapshot["observations"]) == 3
-    assert wall_span_s == pytest.approx(60.0)
-    assert snapshot["alignment_status"]["projected_observation_count"] == 3
-
-
-def test_go_sync_display_retention_independent_of_fit_window(monkeypatch):
-    """Layer 5: varying fit_window_s across diagnostic history rows does not
-    change how many rows are retained. The display window is what governs
-    retention; the fit window is solver-internal."""
-    import radar.sweep as sweep_module
-
-    monkeypatch.setattr(sweep_module.time, "time", lambda: 2_000.0)
-
-    state = RadarState()
-    # Send 5 history entries with VARYING fit_window_s but the same display_window_s.
-    fit_windows = [24.0, 30.0, 36.0, 30.0, 28.0]
-    timestamps = [1_800.0, 1_850.0, 1_900.0, 1_950.0, 2_000.0]
-    for ts, fw in zip(timestamps, fit_windows):
-        state.update_go_multi_sync_state({
-            "i": 7, "pr": True, "us": True,
-            "p": 4.0, "pb": 4.0,
-            "pe": 1_000_000.0, "po": 20.0,
-            "jd": 2.0, "re": 3.0, "nu": 1,
-            "ho": False, "ra": False, "ts": ts,
-            "ft": 9, "fe": 7, "fr": 2, "fc": 3,
-            "fw": fw, "dw": 300.0, "fs": fw - 2.0, "rs": 0.05,
-            "aam": "refined_authoritative",
-            "aps": 4.0, "asa": 120.0,
-            "avs": 0.9, "vac": 3, "bas": 0.1,
-        })
-
-    snapshot = state.get_live_sync_snapshot(7, window_s=300.0, debug_limit=20)
-    assert snapshot["sync_horizons"]["display_window_s"] == pytest.approx(300.0)
-    # All 5 rows must be retained — display window 300s holds them all
-    # regardless of per-row fit_window_s variation.
-    assert len(snapshot["slope_history"]) == 5
-    assert len(snapshot["period_history"]) == 5
-    # Per-row fit_window_s must round-trip exactly as the solver reported it.
-    got_fits = [row["fit_window_s"] for row in snapshot["slope_history"]]
-    assert got_fits == pytest.approx(fit_windows)
 
 
 def test_burst_evidence_buffer_time_pruned_for_display_window(monkeypatch):
@@ -3051,50 +2740,6 @@ def test_burst_timeline_includes_display_retention_diagnostic(monkeypatch):
     assert diag["evidence_buffer_max"] == state._GO_EVIDENCE_EVENTS_MAX
 
 
-def test_go_long_term_estimator_fields_round_trip_through_bridge(monkeypatch):
-    """Layer 6: the new Local* / LongTerm* / Branch* protocol keys land on
-    LiveSyncState with the right types. UI consumers depend on these names."""
-    import radar.sweep as sweep_module
-
-    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
-    state = RadarState()
-    state.update_go_multi_sync_state({
-        "i": 9, "pr": True, "us": True,
-        "p": 4.0, "pb": 4.0,
-        "pe": 1_000_000.0, "po": 20.0,
-        "jd": 2.0, "re": 3.0, "nu": 1,
-        "ho": False, "ra": False, "ts": 1_000.0,
-        "ft": 9, "fe": 7, "fr": 2, "fc": 3,
-        "fw": 30.0, "dw": 300.0, "fs": 28.0, "rs": 0.05,
-        "aam": "refined_authoritative",
-        "aps": 4.0, "asa": 120.0, "avs": 0.9, "vac": 3, "bas": 0.1,
-        # Layer 6 fields:
-        "lpm": 4.0001, "lca": 0xA01F00, "lbo": 137.5, "lva": 4, "lfq": 0.85,
-        "lte": 4.0002, "ltc": 0.72, "lta": 60.0, "cpc": 12, "pud": 0.0001,
-        "lba": 0xB02F00, "lbf": 137.2, "bec": 0.65, "bcw": 10, "bcn": 1,
-        "bcc": 1, "bpb": "branch_competitor_dominant",
-    })
-
-    sync = state._live_sync_states[9]
-    assert sync.local_period_measurement_s == pytest.approx(4.0001)
-    assert sync.local_candidate_anchor_icao == "A01F00"
-    assert sync.local_branch_offset_deg == pytest.approx(137.5)
-    assert sync.local_validator_agreement == 4
-    assert sync.local_fit_quality_score == pytest.approx(0.85)
-    assert sync.long_term_period_estimate_s == pytest.approx(4.0002)
-    assert sync.long_term_period_estimator_confidence == pytest.approx(0.72)
-    assert sync.long_term_period_estimator_age_s == pytest.approx(60.0)
-    assert sync.consecutive_period_consistent_windows == 12
-    assert sync.period_update_delta_s == pytest.approx(0.0001)
-    assert sync.long_term_branch_anchor_icao == "B02F00"
-    assert sync.long_term_branch_offset_deg == pytest.approx(137.2)
-    assert sync.branch_estimator_confidence == pytest.approx(0.65)
-    assert sync.branch_consistent_windows == 10
-    assert sync.branch_contradiction_windows == 1
-    assert sync.branch_competitor_count == 1
-    assert sync.branch_promotion_block_reason == "branch_competitor_dominant"
-
-
 def test_df11_residual_dots_use_retained_residual_event_history(monkeypatch):
     """The 300s residual plot must not be limited by the 60s raw bootstrap event buffer."""
     import radar.sweep as sweep_module
@@ -3154,195 +2799,13 @@ def test_df11_residual_dots_use_retained_residual_event_history(monkeypatch):
     assert [dot["icao"] for dot in payload["df11_residual_observations"]] == ["OLD300", "RECENT"]
 
 
-def test_go_iid_state_does_not_overwrite_go_multi_sync_state():
-    state = RadarState()
-    state._live_sync_states[14] = LiveSyncState(
-        iid=14,
-        period_s=4.01,
-        phase_epoch_us=900_000.0,
-        phase_offset_deg=22.0,
-        sync_quality=0.8,
-        sync_jitter_deg=3.0,
-        last_sync_update_ts=2_000.0,
-        source="go_multi_aircraft_burst",
-        usable=True,
-        phase_anchor_icao="AAAAAA",
-        active_authority_mode="refined_authoritative",
-    )
-
-    state._adopt_go_frame_sync_locked(14, {
-        "period_s": 4.25,
-        "phase_epoch_us": 100.0,
-        "phase_offset_deg": 10.0,
-        "sync_quality": 0.4,
-        "sync_jitter_deg": 8.0,
-        "usable": False,
-        "last_updated": 2_100.0,
-    })
-
-    sync = state.get_live_sync_state(14)
-    assert sync is not None
-    assert sync.source == "go_multi_aircraft_burst"
-    assert sync.period_s == pytest.approx(4.01)
-    assert sync.phase_anchor_icao == "AAAAAA"
-
-
-def test_go_multi_sync_mode_diagnostics_report_dominant_recovery_fields():
-    state = RadarState()
-    state._live_sync_states[11] = LiveSyncState(
-        iid=11,
-        period_s=4.01,
-        phase_epoch_us=500_000.0,
-        phase_offset_deg=20.0,
-        sync_quality=0.8,
-        sync_jitter_deg=3.0,
-        last_sync_update_ts=2_000.0,
-        source="go_multi_aircraft_burst",
-        usable=True,
-        dominant_period_s=4.0,
-        active_family_prior_s=4.0,
-        active_family_prior_source="dominant_live_df",
-        dominant_prior_active=True,
-        dominant_period_delta_s=0.01,
-        dominant_period_delta_ppm=2500.0,
-        compact_period_s=4.16,
-        compact_period_delta_to_dominant_s=0.16,
-        compact_period_delta_to_dominant_ppm=40000.0,
-        compact_sync_unreliable=True,
-        recovery_mode_active=True,
-        recovery_trigger_reasons=["compact_dominant_delta", "fit_pool_starved"],
-        compact_gating_bypassed=True,
-        recovery_relaxed_admitted_observations=4,
-        anchor_switch_count=3,
-        last_anchor_switch_ts=1_995.0,
-        last_anchor_switch_reason="anchor_hysteresis_switch",
-        anchor_hold_updates=5,
-        candidate_period_s=4.03,
-        authoritative_period_s=4.01,
-        candidate_phase_offset_deg=24.0,
-        authoritative_phase_offset_deg=22.5,
-        candidate_anchor_icao="BBBBBB",
-        authoritative_anchor_icao="AAAAAA",
-        candidate_validation_score=0.52,
-        authoritative_validation_score=0.87,
-        authoritative_state_age_s=42.0,
-        candidate_promotion_streak=7,
-        authoritative_period_update_gain=0.0,
-        authoritative_phase_update_gain=0.08,
-        period_frozen_due_to_phase_validation=True,
-        branch_ambiguity_score=0.93,
-        circular_dispersion_deg=11.5,
-        validator_agreement_count=1,
-        validator_disagreement_count=2,
-        candidate_validation_status="validator_disagreement",
-        candidate_application_block_reason="validator_disagreement_too_high",
-        candidate_mode="recovery",
-        authoritative_mode="settled_authoritative",
-        fit_total_observations=12,
-        fit_eligible_observations=8,
-        fit_rejected_observations=4,
-        fit_reject_reasons={"residual_gate": 4},
-        phase_anchor_candidate_count=2,
-        phase_anchor_icao="AAAAAA",
-    )
-
-    diagnostics = state._build_sync_mode_diagnostics(11, state._live_sync_states[11], None)
-
-    assert diagnostics["dominant_period_s"] == pytest.approx(4.0)
-    assert diagnostics["active_family_prior_s"] == pytest.approx(4.0)
-    assert diagnostics["active_family_prior_source"] == "dominant_live_df"
-    assert diagnostics["dominant_prior_active"] is True
-    assert diagnostics["recovery_mode_active"] is True
-    assert diagnostics["recovery_trigger_reasons"] == ["compact_dominant_delta", "fit_pool_starved"]
-    assert diagnostics["compact_gating_bypassed"] is True
-    assert diagnostics["recovery_relaxed_admitted_observations"] == 4
-    assert diagnostics["anchor_switch_count"] == 3
-    assert diagnostics["last_anchor_switch_reason"] == "anchor_hysteresis_switch"
-    assert diagnostics["anchor_hold_updates"] == 5
-    assert diagnostics["candidate_period_s"] == pytest.approx(4.03)
-    assert diagnostics["authoritative_period_s"] == pytest.approx(4.01)
-    assert diagnostics["period_frozen_due_to_phase_validation"] is True
-    assert diagnostics["branch_ambiguity_score"] == pytest.approx(0.93)
-    assert diagnostics["validator_agreement_count"] == 1
-    assert diagnostics["candidate_validation_status"] == "validator_disagreement"
-    assert diagnostics["candidate_application_block_reason"] == "validator_disagreement_too_high"
-    assert diagnostics["authoritative_mode"] == "settled_authoritative"
-    assert diagnostics["compact"]["period_s"] == pytest.approx(4.16)
-    assert diagnostics["compact"]["unreliable"] is True
-    assert diagnostics["refined"]["period_delta_to_dominant_ppm"] == pytest.approx(2500.0)
-
-
-def test_go_refined_timeline_includes_implied_phase_offsets_without_zero_fallback(monkeypatch):
-    import radar.sweep as sweep_module
-
-    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
-    state = RadarState()
-    state._live_sync_states[12] = LiveSyncState(
-        iid=12,
-        period_s=10.0,
-        phase_epoch_us=0.0,
-        phase_offset_deg=0.0,
-        sync_quality=0.8,
-        sync_jitter_deg=3.0,
-        last_sync_update_ts=1_000.0,
-        source="go_multi_aircraft_burst",
-        usable=True,
-        phase_anchor_icao="AAAAAA",
-        phase_anchor_offset_smoothed_deg=120.0,
-        phase_anchor_candidates=[{
-            "icao": "AAAAAA",
-            "score": 80.0,
-            "spread_deg": 2.0,
-            "obs_count": 4,
-            "fit_eligible_count": 4,
-            "fit_eligible_fraction": 1.0,
-            "status": "selected",
-            "reject_reasons": [],
-        }],
-    )
-    state._live_burst_timeline_obs[12] = deque([
-        AlignedBurstSyncObs(
-            burst_centroid_us=0.0,
-            icao="AAAAAA",
-            bearing_deg=120.0,
-            n_replies=5,
-            signal_dbfs=-12.0,
-            pos_age_s=0.2,
-            range_nm=0.0,
-            ts=999.5,
-            sync_update_eligible=True,
-            raw_arrival_us=0.0,
-        )
-    ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
-
-    timeline = state.get_burst_sync_timeline(12, window_s=60.0)
-    row = timeline["observations"][0]
-
-    assert row["implied_phase_offset_deg"] == pytest.approx(120.0)
-    assert row["anchor_relative_phase_error_deg"] == pytest.approx(0.0)
-    assert row["phase_anchor_contributor"] is True
-    assert timeline["phase_anchor_candidates"][0]["icao"] == "AAAAAA"
-
-
-def test_reset_iid_clears_go_multi_sync_state():
-    """Per-IID reset must clear _go_multi_sync_states_by_iid so Python solver can resume."""
-    state = RadarState()
-    state._go_multi_sync_states_by_iid[5] = {"pr": True, "p": 4.0}
-    state._go_multi_sync_states_by_iid[6] = {"pr": True, "p": 4.0}
-
-    state.reset_iid(5)
-
-    assert 5 not in state._go_multi_sync_states_by_iid
-    assert 6 in state._go_multi_sync_states_by_iid  # unaffected IID
-
-
 def test_go_sync_burst_timeline_includes_python_waveform_bins():
     """Compact Go sync timeline must include Python-learned waveform bins when present."""
     state = RadarState()
     state._live_sync_states[9] = LiveSyncState(
         iid=9, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=0.0,
         sync_quality=0.9, sync_jitter_deg=3.0, last_sync_update_ts=1_000.0,
-        source="go_multi_aircraft_burst", usable=True,
+        source="sweep_frame_go", usable=True,
     )
     # Populate Python-learned waveform bins (24 bins).
     from radar.sweep import WaveformBin
@@ -3412,114 +2875,6 @@ def test_on_df11_batch_runs_burst_builder_without_radar_core(monkeypatch):
     assert builder_calls[0] == (7, "AAAAAA")
 
 
-def test_go_sync_decodes_per_icao_phase_offsets_and_new_diagnostic_fields():
-    """aca/vec/pio fields from Go MULTI_SYNC_STATE must decode into LiveSyncState."""
-    state = RadarState()
-    state.update_go_multi_sync_state({
-        "i": 9, "pr": True, "us": True,
-        "p": 4.0, "pb": 4.0,
-        "pe": 1_000_000.0, "po": 45.0,
-        "jd": 2.0, "re": 3.0, "nu": 5,
-        "ho": False, "ra": False, "ts": 1_000.0,
-        "aca": 0.35,
-        "vec": 3,
-        "pio": [
-            {"i": int("AAAAAA", 16), "lo": 45.0, "ad": 0.0, "r": "anchor", "rr": []},
-            {"i": int("BBBBBB", 16), "lo": 47.2, "ad": 2.2, "r": "validator_agree", "rr": []},
-            {"i": int("CCCCCC", 16), "lo": 60.0, "ad": 15.0, "r": "validator_disagree", "rr": ["phase_outlier"]},
-            {"i": int("DDDDDD", 16), "lo": 44.5, "ad": -0.5, "r": "excluded", "rr": []},
-            {"i": int("EEEEEE", 16), "lo": 0.0, "ad": 0.0, "r": "not_fit_eligible", "rr": ["no_position"]},
-        ],
-    })
-    sync = state.get_live_sync_state(9)
-    assert sync is not None
-    assert sync.anchor_competition_ambiguity == pytest.approx(0.35)
-    assert sync.validator_excluded_count == 3
-    assert len(sync.per_icao_phase_offsets) == 5
-    rows_by_icao = {r["icao"]: r for r in sync.per_icao_phase_offsets}
-    assert rows_by_icao["AAAAAA"]["role"] == "anchor"
-    assert rows_by_icao["AAAAAA"]["anchor_delta_deg"] == pytest.approx(0.0)
-    assert rows_by_icao["BBBBBB"]["role"] == "validator_agree"
-    assert rows_by_icao["BBBBBB"]["latest_offset_deg"] == pytest.approx(47.2)
-    assert rows_by_icao["CCCCCC"]["role"] == "validator_disagree"
-    assert rows_by_icao["CCCCCC"]["reject_reasons"] == ["phase_outlier"]
-    assert rows_by_icao["DDDDDD"]["role"] == "excluded"
-    assert rows_by_icao["EEEEEE"]["role"] == "not_fit_eligible"
-
-
-def test_go_sync_decodes_per_icao_phase_offsets_defaults_when_absent():
-    """anchor_competition_ambiguity, validator_excluded_count, and per_icao_phase_offsets
-    must default to None/0/[] when absent from the Go message."""
-    state = RadarState()
-    state.update_go_multi_sync_state({
-        "i": 10, "pr": True, "us": True,
-        "p": 4.0, "pb": 4.0,
-        "pe": 1_000_000.0, "po": 30.0,
-        "jd": 2.0, "re": 3.0, "nu": 3,
-        "ho": False, "ra": False, "ts": 1_000.0,
-    })
-    sync = state.get_live_sync_state(10)
-    assert sync is not None
-    assert sync.anchor_competition_ambiguity is None
-    assert sync.validator_excluded_count == 0
-    assert sync.per_icao_phase_offsets == []
-
-
-def test_burst_sync_timeline_payload_contains_per_icao_offsets(monkeypatch):
-    """get_live_sync_snapshot (used by websocket) must include per_icao_phase_offsets
-    alongside the existing observations array — not replace it."""
-    import radar.sweep as sweep_module
-
-    monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
-
-    state = RadarState()
-    state._models[12] = RadarIID(
-        iid=12, status="SINGLE_RADAR", period_s=4.0,
-        manual_lat=51.0, manual_lon=0.0, resolution_mode="locked_position",
-    )
-    state.update_go_multi_sync_state({
-        "i": 12, "pr": True, "us": True,
-        "p": 4.0, "pb": 4.0,
-        "pe": 1_000_000.0, "po": 0.0,
-        "jd": 2.0, "re": 3.0, "nu": 2,
-        "ho": False, "ra": False, "ts": 1_000.0,
-        "aam": "refined_authoritative",
-        "aps": 4.0, "asa": 60.0, "avs": 0.9, "vac": 3, "bas": 0.1,
-        "aca": 0.2, "vec": 1,
-        "pio": [
-            {"i": int("AAAAAA", 16), "lo": 20.0, "ad": 0.0, "r": "anchor", "rr": []},
-            {"i": int("BBBBBB", 16), "lo": 21.5, "ad": 1.5, "r": "validator_agree", "rr": []},
-        ],
-    })
-    from collections import deque
-    state._go_evidence_events = deque([
-        {
-            "kind": "burst_fired", "iid": 12, "icao": "AAAAAA",
-            "arrival_us": 1_000_000.0, "wall_ts": 980.0,
-            "n_replies": 4, "signal_dbfs": -15.0,
-            "truth_lat": 51.1, "truth_lon": 0.1, "position_age_seconds": 0.2,
-            "compact_sync_eligible": True, "sync_eligible": True,
-        },
-        {
-            "kind": "burst_fired", "iid": 12, "icao": "BBBBBB",
-            "arrival_us": 5_000_000.0, "wall_ts": 990.0,
-            "n_replies": 4, "signal_dbfs": -15.0,
-            "truth_lat": 51.2, "truth_lon": 0.1, "position_age_seconds": 0.2,
-            "compact_sync_eligible": True, "sync_eligible": True,
-        },
-    ], maxlen=state._GO_EVIDENCE_EVENTS_MAX)
-
-    snapshot = state.get_live_sync_snapshot(12, window_s=90.0)
-    # Existing observations array must be preserved.
-    assert len(snapshot["observations"]) == 2, "burst observations must not be replaced by per_icao table"
-    # New per_icao_phase_offsets must appear at the top level.
-    offsets = snapshot["per_icao_phase_offsets"]
-    assert len(offsets) == 2
-    roles_by_icao = {r["icao"]: r["role"] for r in offsets}
-    assert roles_by_icao["AAAAAA"] == "anchor"
-    assert roles_by_icao["BBBBBB"] == "validator_agree"
-
-
 # ---------------------------------------------------------------------------
 # Dispatch integration tests
 # ---------------------------------------------------------------------------
@@ -3551,8 +2906,8 @@ def test_python_dispatcher_always_calls_simple_live_sync(monkeypatch):
     assert simple_calls == [(7, 4.0)], "simple model must always be called on Python path"
 
 
-def test_python_sync_not_suppressed_by_go_multi_sync_state(monkeypatch):
-    """_update_simple_live_sync_state must be called even when Go state is present for the IID."""
+def test_python_sync_unconditional(monkeypatch):
+    """_update_simple_live_sync_state must always be called — there is no suppression path."""
     import radar.sweep as sweep_module
 
     state = RadarState()
@@ -3567,8 +2922,6 @@ def test_python_sync_not_suppressed_by_go_multi_sync_state(monkeypatch):
                         lambda iid, period_s: simple_calls.append((iid, period_s)))
     monkeypatch.setattr(sweep_module.time, "monotonic", lambda: 9999.0)
 
-    # Truthy Go state must not suppress the Python solver.
-    state._go_multi_sync_states_by_iid[iid] = {"authoritative": True}
     state._last_multi_sync_update_ts[iid] = 0.0
     with state._lock:
         now_mono = sweep_module.time.monotonic()
@@ -3577,7 +2930,7 @@ def test_python_sync_not_suppressed_by_go_multi_sync_state(monkeypatch):
             state._last_multi_sync_update_ts[iid] = now_mono
             state._update_simple_live_sync_state(iid=iid, period_s=4.0)
 
-    assert simple_calls == [(9, 4.0)], "Go state must not suppress Python simple sync"
+    assert simple_calls == [(9, 4.0)]
 
 
 # ---------------------------------------------------------------------------

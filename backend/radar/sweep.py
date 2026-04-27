@@ -1280,13 +1280,6 @@ class LiveSyncState:
     candidate_application_block_reason: str | None = None
     candidate_mode: str | None = None
     authoritative_mode: str | None = None
-    # Fields propagated from Go MULTI_SYNC_STATE to allow Python consumers (in particular
-    # the aircraft localiser) to gate on authoritative Go decisions rather than re-deriving
-    # them from partial diagnostic state.
-    # absolute_phase_trusted: mirrors Go AbsolutePhaseTrusted — True only when period is
-    # bounded to the DF dominant prior, anchor is selected, and phase validation is strong.
-    # Localiser must check this rather than the broader usable flag for geographic bearing.
-    absolute_phase_trusted: bool = False
     # dominant_prior_inconsistent: mirrors Go DominantPriorInconsistent — True when the
     # reacquire candidate lies outside the dominant-prior bound. Diagnostic only.
     dominant_prior_inconsistent: bool = False
@@ -2304,7 +2297,6 @@ class RadarState:
         self._GO_EVIDENCE_EVENTS_MAX = 60_000
         self._GO_SWEEP_FRAMES_MAX = 256
         self._go_sync_states_by_iid: dict[int, dict] = {}
-        self._go_multi_sync_states_by_iid: dict[int, dict] = {}
         self._go_multi_sync_admission_by_iid: dict[int, dict] = {}
         self._go_sync_diagnostic_history_revision: dict[int, int] = {}
         self._compact_sync_debug_by_iid: dict[int, dict] = {}
@@ -4511,7 +4503,7 @@ class RadarState:
 
     def _adopt_go_frame_sync_locked(self, iid: int, go_sync: dict) -> None:
         existing = self._live_sync_states.get(iid)
-        if existing is not None and existing.source in {"multi_aircraft_burst", "go_multi_aircraft_burst"}:
+        if existing is not None and existing.source == "multi_aircraft_burst":
             return
         if go_sync.get("period_s") is None:
             return
@@ -4589,239 +4581,6 @@ class RadarState:
                     event_ts=float(iid_state.get("lu") or time.time()),
                     source="sweep_frame_go",
                 )
-
-    def update_go_multi_sync_state(self, msg: dict) -> None:
-        """Mirror a Go MULTI_SYNC_STATE into _go_multi_sync_states_by_iid and _live_sync_states.
-
-        Stores the Go-produced sync state for diagnostic visibility.  The Python
-        simple sync solver (_update_simple_live_sync_state) remains the operational
-        period/phase authority regardless of whether Go state is present.
-        """
-        try:
-            iid = int(msg["i"])
-        except Exception:
-            log.debug("RadarState: malformed MULTI_SYNC_STATE ignored", exc_info=True)
-            return
-        if not bool(msg.get("pr")):
-            return  # solver ran but produced no state yet
-
-        period_s = msg.get("p")
-        phase_epoch_us = msg.get("pe")
-        phase_offset_deg = msg.get("po")
-        if period_s is None or phase_epoch_us is None or phase_offset_deg is None:
-            return
-
-        period_base_s = float(msg.get("pb") or period_s)
-        jitter_deg = float(msg.get("jd") or 5.0)
-        residual_ema_deg = float(msg.get("re") or 5.0)
-        fit_window_s = float(msg.get("fw") or self._fit_window_s_for_period(period_s))
-        display_window_s = float(msg.get("dw") or _SYNC_DISPLAY_HISTORY_WINDOW_S)
-        fit_span_s = float(msg.get("fs") or 0.0)
-        residual_slope_deg_per_s = float(msg.get("rs") or 0.0)
-        usable = bool(msg.get("us", False))
-        holdover = bool(msg.get("ho", False))
-        n_sync_updates = int(msg.get("nu") or 0)
-        reacquire_active = bool(msg.get("ra", False))
-        last_updated = float(msg.get("ts") or time.time())
-        anchor_icao_raw = msg.get("ai")
-        anchor_icao = None
-        if anchor_icao_raw is not None:
-            try:
-                anchor_icao = f"{int(anchor_icao_raw):06X}"
-            except Exception:
-                anchor_icao = None
-        candidate_anchor_icao_raw = msg.get("cai")
-        candidate_anchor_icao = None
-        if candidate_anchor_icao_raw is not None:
-            try:
-                candidate_anchor_icao = f"{int(candidate_anchor_icao_raw):06X}"
-            except Exception:
-                candidate_anchor_icao = None
-        authoritative_anchor_icao_raw = msg.get("aai")
-        authoritative_anchor_icao = None
-        if authoritative_anchor_icao_raw is not None:
-            try:
-                authoritative_anchor_icao = f"{int(authoritative_anchor_icao_raw):06X}"
-            except Exception:
-                authoritative_anchor_icao = None
-        # Layer 6: long-term / local anchors share the same hex normalisation.
-        def _norm_icao(raw):
-            if raw is None:
-                return None
-            try:
-                return f"{int(raw):06X}"
-            except Exception:
-                return None
-        local_candidate_anchor_icao = _norm_icao(msg.get("lca"))
-        long_term_branch_anchor_icao = _norm_icao(msg.get("lba"))
-        anchor_candidates = self._normalise_go_anchor_candidates(msg.get("acs"))
-        anchor_row = next((row for row in anchor_candidates if row.get("icao") == anchor_icao), None)
-        fit_reject_reasons_raw = msg.get("frr") or {}
-        if not isinstance(fit_reject_reasons_raw, dict):
-            fit_reject_reasons_raw = {}
-        fit_reject_reasons = {
-            str(key): int(value)
-            for key, value in fit_reject_reasons_raw.items()
-            if key is not None
-        }
-        recovery_trigger_reasons = [
-            str(reason) for reason in (msg.get("rtr") or []) if reason is not None
-        ]
-        active_authority_mode = msg.get("aam")
-        period_authoritative_source = (
-            "refined" if active_authority_mode == "refined_authoritative" else "base"
-        )
-
-        with self._lock:
-            self._go_multi_sync_states_by_iid[iid] = dict(msg)
-            # Carry forward anchor stability state from existing sync when anchor ICAO
-            # hasn't changed — prevents phase_anchor_since_ts from resetting each update.
-            existing_sync = self._live_sync_states.get(iid)
-            prev_anchor_icao = getattr(existing_sync, "phase_anchor_icao", None)
-            prev_anchor_since_ts = getattr(existing_sync, "phase_anchor_since_ts", None)
-            anchor_since_ts = prev_anchor_since_ts if (
-                anchor_icao is not None and anchor_icao == prev_anchor_icao and prev_anchor_since_ts is not None
-            ) else (last_updated if anchor_icao else None)
-            # Derive phase_validation_status from Go fields that are already being decoded.
-            validation_score = float(msg.get("avs") or msg.get("cvs") or 0.0)
-            validator_agreement = int(msg.get("vac") or 0)
-            validator_disagree = int(msg.get("vdc") or 0)
-            branch_ambiguity = float(msg.get("bas") or 1.0)
-            candidate_validation_status = msg.get("cvsn")
-            if candidate_validation_status:
-                phase_validation_status = str(candidate_validation_status)
-            elif validator_agreement == 0 and validator_disagree == 0:
-                phase_validation_status = "validation_unavailable"
-            elif branch_ambiguity >= 0.9:
-                phase_validation_status = "branch_ambiguous"
-            elif validator_agreement < 2:
-                phase_validation_status = "insufficient_validator_agreement"
-            elif validator_disagree >= validator_agreement:
-                phase_validation_status = "validator_disagreement"
-            elif validation_score >= 0.7:
-                phase_validation_status = "validated"
-            elif validation_score >= 0.45:
-                phase_validation_status = "weak_validation"
-            else:
-                phase_validation_status = "weak_validation"
-            new_sync = LiveSyncState(
-                iid=iid,
-                period_s=float(period_s),
-                period_base_s=period_base_s,
-                phase_epoch_us=float(phase_epoch_us),
-                phase_offset_deg=float(phase_offset_deg),
-                sync_quality=0.8 if usable else 0.4,
-                sync_jitter_deg=jitter_deg,
-                last_sync_update_ts=last_updated,
-                source="go_multi_aircraft_burst",
-                usable=usable,
-                residual_ema_deg=residual_ema_deg,
-                n_sync_frames=n_sync_updates,
-                n_rejected_frames=0,
-                last_residual_deg=0.0,
-                holdover=holdover,
-                fit_total_observations=int(msg.get("ft") or 0),
-                fit_eligible_observations=int(msg.get("fe") or 0),
-                fit_rejected_observations=int(msg.get("fr") or 0),
-                fit_reject_reasons=fit_reject_reasons,
-                fit_contributing_icao_count=int(msg.get("fc") or 0),
-                fit_span_s=fit_span_s,
-                residual_slope_deg_per_s=residual_slope_deg_per_s,
-                period_reacquire_active=reacquire_active,
-                period_reacquire_reason=msg.get("rr"),
-                recovery_mode_active=bool(msg.get("rma", reacquire_active)),
-                recovery_trigger_reasons=recovery_trigger_reasons,
-                phase_anchor_icao=anchor_icao,
-                phase_anchor_score=float(msg.get("as") or 0.0),
-                phase_anchor_obs_count=int((anchor_row or {}).get("obs_count") or 0),
-                phase_anchor_spread_deg=((anchor_row or {}).get("spread_deg")),
-                phase_anchor_offset_smoothed_deg=(float(msg["ap"]) if anchor_icao is not None and msg.get("ap") not in (None, 0) else None),
-                phase_anchor_status=("selected" if anchor_icao else "unavailable"),
-                phase_anchor_since_ts=anchor_since_ts,
-                phase_anchor_candidate_count=int(msg.get("ac") or 0),
-                phase_anchor_no_candidate_reason=msg.get("anr"),
-                phase_anchor_candidates=anchor_candidates,
-                phase_validation_status=phase_validation_status,
-                phase_validation_contributors=validator_agreement,
-                phase_validation_reject_count=validator_disagree,
-                dominant_period_s=(float(msg["dp"]) if msg.get("dp") not in (None, 0) else None),
-                dominant_prior_period_s=(float(msg["dp"]) if msg.get("dp") not in (None, 0) else None),
-                trusted_refined_period_s=(float(msg["trp"]) if msg.get("trp") not in (None, 0) else None),
-                bootstrap_period_s=(float(msg["bp"]) if msg.get("bp") not in (None, 0) else None),
-                active_family_prior_s=(float(msg["afp"]) if msg.get("afp") not in (None, 0) else None),
-                active_family_prior_source=msg.get("afs"),
-                dominant_prior_active=bool(msg.get("dpa", False)),
-                dominant_period_delta_s=(float(msg["pds"]) if msg.get("pds") is not None else None),
-                dominant_period_delta_ppm=(float(msg["pdp"]) if msg.get("pdp") is not None else None),
-                compact_period_s=(float(msg["cp"]) if msg.get("cp") not in (None, 0) else None),
-                compact_period_delta_to_dominant_s=(float(msg["cds"]) if msg.get("cds") is not None else None),
-                compact_period_delta_to_dominant_ppm=(float(msg["cdp"]) if msg.get("cdp") is not None else None),
-                compact_sync_unreliable=bool(msg.get("cu", False)),
-                compact_gating_bypassed=bool(msg.get("cgb", False)),
-                recovery_relaxed_admitted_observations=int(msg.get("rla") or 0),
-                active_authority_mode=active_authority_mode,
-                authority_switch_count=int(msg.get("asc") or 0),
-                last_authority_switch_ts=(float(msg["ast"]) if msg.get("ast") not in (None, 0) else None),
-                last_authority_switch_reason=msg.get("asr"),
-                authority_enter_streak=int(msg.get("aes") or 0),
-                authority_exit_streak=int(msg.get("axs") or 0),
-                anchor_switch_count=int(msg.get("anc") or 0),
-                last_anchor_switch_ts=(float(msg["ant"]) if msg.get("ant") not in (None, 0) else None),
-                last_anchor_switch_reason=msg.get("ahr"),
-                anchor_hold_updates=int(msg.get("ahu") or 0),
-                candidate_period_s=(float(msg["cps"]) if msg.get("cps") not in (None, 0) else None),
-                authoritative_period_s=(float(msg["aps"]) if msg.get("aps") not in (None, 0) else None),
-                candidate_phase_offset_deg=(float(msg["cpo"]) if msg.get("cpo") is not None else None),
-                authoritative_phase_offset_deg=(float(msg["apo"]) if msg.get("apo") is not None else None),
-                candidate_anchor_icao=candidate_anchor_icao,
-                authoritative_anchor_icao=authoritative_anchor_icao,
-                candidate_validation_score=(float(msg["cvs"]) if msg.get("cvs") is not None else None),
-                authoritative_validation_score=(float(msg["avs"]) if msg.get("avs") is not None else None),
-                authoritative_state_age_s=(float(msg["asa"]) if msg.get("asa") is not None else None),
-                candidate_promotion_streak=int(msg.get("cpr") or 0),
-                authoritative_period_update_gain=(float(msg["apg"]) if msg.get("apg") is not None else None),
-                authoritative_phase_update_gain=(float(msg["afg"]) if msg.get("afg") is not None else None),
-                period_frozen_due_to_phase_validation=bool(msg.get("pfv", False)),
-                branch_ambiguity_score=(float(msg["bas"]) if msg.get("bas") is not None else None),
-                circular_dispersion_deg=(float(msg["cdd"]) if msg.get("cdd") is not None else None),
-                validator_agreement_count=int(msg.get("vac") or 0),
-                validator_disagreement_count=int(msg.get("vdc") or 0),
-                candidate_validation_status=candidate_validation_status,
-                candidate_application_block_reason=msg.get("cabr"),
-                candidate_mode=msg.get("cmd"),
-                authoritative_mode=msg.get("amd"),
-                period_authoritative_source=period_authoritative_source,
-                absolute_phase_trusted=bool(msg.get("apt", False)),
-                dominant_prior_inconsistent=bool(msg.get("dpi", False)),
-                anchor_competition_ambiguity=(float(msg["aca"]) if msg.get("aca") is not None else None),
-                validator_excluded_count=int(msg.get("vec") or 0),
-                per_icao_phase_offsets=self._normalise_go_per_icao_phase_offsets(msg.get("pio")),
-                local_period_measurement_s=float(msg.get("lpm") or 0.0),
-                local_candidate_anchor_icao=local_candidate_anchor_icao,
-                local_branch_offset_deg=float(msg.get("lbo") or 0.0),
-                local_validator_agreement=int(msg.get("lva") or 0),
-                local_fit_quality_score=float(msg.get("lfq") or 0.0),
-                long_term_period_estimate_s=float(msg.get("lte") or 0.0),
-                long_term_period_estimator_confidence=float(msg.get("ltc") or 0.0),
-                long_term_period_estimator_age_s=float(msg.get("lta") or 0.0),
-                consecutive_period_consistent_windows=int(msg.get("cpc") or 0),
-                period_update_delta_s=float(msg.get("pud") or 0.0),
-                long_term_branch_anchor_icao=long_term_branch_anchor_icao,
-                long_term_branch_offset_deg=float(msg.get("lbf") or 0.0),
-                branch_estimator_confidence=float(msg.get("bec") or 0.0),
-                branch_consistent_windows=int(msg.get("bcw") or 0),
-                branch_contradiction_windows=int(msg.get("bcn") or 0),
-                branch_competitor_count=int(msg.get("bcc") or 0),
-                branch_promotion_block_reason=msg.get("bpb") or None,
-            )
-            self._live_sync_states[iid] = new_sync
-            self._append_go_sync_diagnostic_history_locked(iid, {
-                **dict(msg),
-                "fw": fit_window_s,
-                "dw": display_window_s,
-                "fs": fit_span_s,
-                "rs": residual_slope_deg_per_s,
-            }, new_sync)
 
     def _stage3_detection_from_go_observation(self, entry: dict) -> Stage3LiveDetection:
         return Stage3LiveDetection(
@@ -7408,9 +7167,6 @@ class RadarState:
             if iid in self._go_sync_states_by_iid:
                 del self._go_sync_states_by_iid[iid]
                 had_any = True
-            if iid in self._go_multi_sync_states_by_iid:
-                del self._go_multi_sync_states_by_iid[iid]
-                had_any = True
             if iid in self._go_multi_sync_admission_by_iid:
                 del self._go_multi_sync_admission_by_iid[iid]
                 had_any = True
@@ -7551,7 +7307,6 @@ class RadarState:
             self._go_sweep_frames_by_iid.clear()
             self._go_sweep_frames_revision.clear()
             self._go_sync_states_by_iid.clear()
-            self._go_multi_sync_states_by_iid.clear()
             self._go_multi_sync_admission_by_iid.clear()
             self._go_sync_diagnostic_history_revision.clear()
             self._compact_sync_debug_by_iid.clear()
@@ -8325,14 +8080,6 @@ class RadarState:
         now_ts = time.time()
         cutoff_ts = now_ts - window_s
         entries: list[dict] = []
-        refined_go_source = getattr(sync, "source", None) == "go_multi_aircraft_burst"
-        candidate_by_icao = {}
-        if refined_go_source:
-            candidate_by_icao = {
-                row.get("icao"): row
-                for row in (getattr(sync, "phase_anchor_candidates", []) or [])
-                if row.get("icao")
-            }
         for obs in obs_snapshot:
             if obs.ts < cutoff_ts:
                 continue
@@ -8351,24 +8098,6 @@ class RadarState:
             classification = self._classify_sync_residual(abs(residual_deg))
             weight = self._score_sync_burst_observation(obs)
             fit_eligible = bool(getattr(obs, "sync_update_eligible", True)) and classification != "rejected" and weight > 0
-            implied_phase_offset = None
-            anchor_relative_error = None
-            phase_anchor_contributor = False
-            phase_anchor_reject_reason = None
-            if refined_go_source:
-                implied_phase_offset = (
-                    obs.bearing_deg
-                    + float(getattr(prediction, "waveform_correction_deg", 0.0) or 0.0)
-                    - float(getattr(prediction, "phase_in_rot_deg", 0.0) or 0.0)
-                ) % 360.0
-                anchor_relative_error = _circular_delta_deg(
-                    implied_phase_offset,
-                    getattr(sync, "phase_anchor_offset_smoothed_deg", None),
-                )
-                phase_anchor_contributor = obs.icao == getattr(sync, "phase_anchor_icao", None)
-                candidate = candidate_by_icao.get(obs.icao) or {}
-                reject_reasons = candidate.get("reject_reasons") or []
-                phase_anchor_reject_reason = ",".join(reject_reasons) if reject_reasons else None
             entries.append({
                 "beam_center_us": obs.burst_centroid_us,
                 "wall_ts": obs.ts,
@@ -8389,10 +8118,10 @@ class RadarState:
                 "residual_corrected_deg": residual_deg,
                 "motion_comp_improvement_deg": 0.0,
                 "residual_for_period_fit_deg": residual_deg if fit_eligible else None,
-                "implied_phase_offset_deg": implied_phase_offset,
-                "anchor_relative_phase_error_deg": anchor_relative_error,
-                "phase_anchor_contributor": phase_anchor_contributor,
-                "phase_anchor_reject_reason": phase_anchor_reject_reason,
+                "implied_phase_offset_deg": None,
+                "anchor_relative_phase_error_deg": None,
+                "phase_anchor_contributor": False,
+                "phase_anchor_reject_reason": None,
                 "phase_in_rot_deg": prediction.phase_in_rot_deg,
                 "raw_arrival_us": getattr(obs, "raw_arrival_us", obs.burst_centroid_us),
                 "prop_corrected_beast_us": prediction.prop_corrected_beast_us,
@@ -8410,7 +8139,7 @@ class RadarState:
                 "weight": weight,
                 "classification": classification,
                 "fit_eligible": fit_eligible,
-                "fit_reject_reason": None if fit_eligible else ("go_refined_sync" if refined_go_source else "compact_go_sync"),
+                "fit_reject_reason": None if fit_eligible else "compact_go_sync",
                 "n_replies": obs.n_replies,
                 "signal_dbfs": obs.signal_dbfs,
                 "pos_age_s": obs.pos_age_s,
@@ -8422,15 +8151,6 @@ class RadarState:
                 "burst_center_delta_us": getattr(obs, "burst_center_delta_us", None),
             })
         entries.sort(key=lambda e: e["beam_center_us"])
-        if refined_go_source:
-            anchor_offset = self._apply_selected_anchor_relative_offsets(
-                entries,
-                getattr(sync, "phase_anchor_icao", None),
-            )
-            if anchor_offset is not None:
-                for entry in entries:
-                    entry["anchor_relative_reference_offset_deg"] = anchor_offset
-                    entry["anchor_relative_reference_icao"] = getattr(sync, "phase_anchor_icao", None)
         return entries
 
     @staticmethod
@@ -8479,7 +8199,6 @@ class RadarState:
         fit_eligible_count = sum(1 for row in observations if row.get("fit_eligible"))
         sync_update_eligible_count = sum(1 for row in observations if row.get("sync_update_eligible"))
         alignment_status = burst_timeline.get("alignment_status")
-        refined_source = getattr(sync, "source", None) == "go_multi_aircraft_burst"
         return {
             "iid": iid,
             "available": True,
@@ -8487,7 +8206,7 @@ class RadarState:
             "summary": {
                 "iid": iid,
                 "sync_source": getattr(sync, "source", None),
-                "diagnostics_mode": "refined_go_sync" if refined_source else "compact_go_sync",
+                "diagnostics_mode": "compact_go_sync",
                 "rich_diagnostics_available": False,
                 "compact_reason": "rich_python_multi_aircraft_diagnostics_unavailable_for_go_sync_source",
                 "wall_clock_used_operationally": False,
@@ -8501,7 +8220,7 @@ class RadarState:
             "retention_diagnostics": retention_diagnostics,
             "alignment_status": alignment_status,
             "observation_model_diagnostics": {
-                "mode": "refined_go_sync" if refined_source else "compact_go_sync",
+                "mode": "compact_go_sync",
                 "reason": "rich_python_multi_aircraft_diagnostics_unavailable_for_sync_source",
             },
         }
@@ -8516,7 +8235,7 @@ class RadarState:
             compact_debug = dict(self._compact_sync_debug_by_iid.get(iid) or {})
             go_admission = dict(self._go_multi_sync_admission_by_iid.get(iid) or {})
         sync_source = getattr(sync, "source", None) if sync is not None else None
-        refined_active = bool(sync_source in {"multi_aircraft_burst", "go_multi_aircraft_burst"})
+        refined_active = bool(sync_source == "multi_aircraft_burst")
         refined_present = bool(refined_active or (go_admission and go_admission.get("counts")))
         refined_usable = bool(sync is not None and refined_active and getattr(sync, "usable", False))
         authority_mode = getattr(sync, "active_authority_mode", None) if sync is not None else None
@@ -8890,7 +8609,7 @@ class RadarState:
                 "display_retention_diagnostic": self._build_display_retention_diagnostic(
                     sync, entries, df11_residual_observations, window_s
                 ),
-                "diagnostics_mode": "refined_go_sync" if getattr(sync, "source", None) == "go_multi_aircraft_burst" else "compact_go_sync",
+                "diagnostics_mode": "compact_go_sync",
                 "alignment_status": alignment_status,
                 "sync_mode_diagnostics": sync_mode_diagnostics,
             }
@@ -10900,16 +10619,14 @@ class RadarState:
         """Return a snapshot of all current live sync states."""
         return dict(self._live_sync_states)
 
-    _STAGE3_SYNC_SOURCES = frozenset({"multi_aircraft_burst", "go_multi_aircraft_burst"})
+    _STAGE3_SYNC_SOURCES = frozenset({"multi_aircraft_burst"})
 
     def get_stage3_live_sync_state(self, iid: int) -> LiveSyncState | None:
         """Return the Stage 3-authoritative sync state for one IID.
 
-        Stage 3 aircraft localisation remains logically separate from the
-        earlier radar-localisation stages. Only the richer
-        `multi_aircraft_burst` / `go_multi_aircraft_burst` sync models are
-        eligible Stage 3 input; earlier bootstrap sources remain available
-        through the general live-sync getters but are intentionally excluded.
+        Stage 3 aircraft localisation requires the Python `multi_aircraft_burst`
+        sync model.  Earlier bootstrap sources remain available through the
+        general live-sync getters but are intentionally excluded here.
         """
         sync = self._live_sync_states.get(iid)
         if sync is None or sync.source not in self._STAGE3_SYNC_SOURCES:
