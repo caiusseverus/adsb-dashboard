@@ -17,9 +17,8 @@ const (
 	MsgIIDState       uint8 = 12
 	MsgSnapshotResp   uint8 = 13
 	MsgHealth         uint8 = 14
-	MsgFMFrameResult  uint8 = 15
-	MsgFMState        uint8 = 16
-	MsgMultiSyncState uint8 = 17 // per-IID multi-aircraft sync refinement state
+	MsgFMFrameResult uint8 = 15
+	MsgFMState       uint8 = 16
 )
 
 // --- Inbound messages ---
@@ -92,20 +91,8 @@ type BurstFired struct {
 	BearingDeg         *float32 `codec:"br"`
 	RangeNM            *float32 `codec:"rn"`
 	PosAgeS            *float32 `codec:"pa"`
-	DominantFamily     bool     `codec:"df"`
-	// SyncEligible reports whether the refined sync state carries AbsolutePhaseTrusted,
-	// meaning it is safe to use for geographic bearing / localisation. It does NOT fire
-	// for relative-only sync (Present+Usable without anchor or phase validation).
-	// Compact/bootstrap admission is exported separately via CompactSyncEligible.
-	SyncEligible        bool `codec:"se"`
+	DominantFamily      bool `codec:"df"`
 	CompactSyncEligible bool `codec:"ce"`
-	RefinedSyncPresent  bool `codec:"rp"`
-	// RefinedSyncUsable is the relative-sync flag (Present && Usable). Safe for
-	// timing/phase work but NOT sufficient for geographic bearing prediction.
-	RefinedSyncUsable bool `codec:"ru"`
-	// RefinedSyncAbsolutePhaseTrusted mirrors snap.AbsolutePhaseTrusted. Geographic
-	// bearing consumers must check this rather than RefinedSyncUsable.
-	RefinedSyncAbsolutePhaseTrusted bool `codec:"rat"`
 }
 
 // FrameObservation is one non-reference aircraft within a SweepFrame.
@@ -258,171 +245,3 @@ type FMState struct {
 	UpdatedAt                     float64           `codec:"ts"`
 }
 
-// MultiSyncState is emitted after each multi-aircraft sync solver run.
-// It carries the full per-IID refined sync state so Python can mirror it
-// as LiveSyncState(source="go_multi_aircraft_burst") without running the
-// Python multi-aircraft sync solver.
-type MultiSyncState struct {
-	MsgType               uint8   `codec:"t"`
-	IID                   uint8   `codec:"i"`
-	Present               bool    `codec:"pr"`
-	Usable                bool    `codec:"us"`
-	PeriodS               float64 `codec:"p"`
-	PeriodBaseS           float64 `codec:"pb"`
-	PhaseEpochUS          float64 `codec:"pe"`
-	PhaseOffsetDeg        float64 `codec:"po"`
-	JitterDeg             float64 `codec:"jd"`
-	ResidualEMADeg        float64 `codec:"re"`
-	NSyncUpdates          uint32  `codec:"nu"`
-	Holdover              bool    `codec:"ho"`
-	PeriodReacquireActive bool    `codec:"ra"`
-	PeriodReacquireReason string  `codec:"rr"`
-	AnchorICAO            *uint32 `codec:"ai"`
-	AnchorPhaseDeg        float64 `codec:"ap"`
-	AnchorScore           float64 `codec:"as"`
-	UpdatedAt             float64 `codec:"ts"`
-	// Bootstrap / trust diagnostics (added for wrong-period escape tracking).
-	BootstrapPeriodS                 float64                    `codec:"bp"`
-	TrustedBasePeriodS               float64                    `codec:"tb"`
-	TrustUpdateStreak                uint16                     `codec:"tu"`
-	BaseClamped                      bool                       `codec:"bc"`
-	BaseClampDiffPPM                 float64                    `codec:"bd"`
-	WrongPeriodSuspect               bool                       `codec:"ws"`
-	ReacquireCandidatePeriod         float64                    `codec:"rcp"`
-	ReacquireCandidateScore          float64                    `codec:"rcs"`
-	FitTotalObservations             uint32                     `codec:"ft"`
-	FitEligibleObservations          uint32                     `codec:"fe"`
-	FitRejectedObservations          uint32                     `codec:"fr"`
-	FitContributingICAOs             uint16                     `codec:"fc"`
-	FitWindowS                       float64                    `codec:"fw"`
-	DisplayWindowS                   float64                    `codec:"dw"`
-	FitSpanS                         float64                    `codec:"fs"`
-	ResidualSlopeDegPerS             float64                    `codec:"rs"`
-	FitRejectReasons                 map[string]uint64          `codec:"frr"`
-	AnchorCandidateCount             uint16                     `codec:"ac"`
-	AnchorNoCandidateReason          string                     `codec:"anr"`
-	AnchorCandidates                 []MultiSyncAnchorCandidate `codec:"acs"`
-	DominantPriorPeriodS             float64                    `codec:"dp"`
-	TrustedRefinedPeriodS            float64                    `codec:"trp"`
-	ActiveFamilyPriorPeriodS         float64                    `codec:"afp"`
-	ActiveFamilyPriorSource          string                     `codec:"afs"`
-	DominantPriorActive              bool                       `codec:"dpa"`
-	CompactPeriodS                   float64                    `codec:"cp"`
-	PeriodDeltaToDominantS           float64                    `codec:"pds"`
-	PeriodDeltaToDominantPPM         float64                    `codec:"pdp"`
-	CompactDeltaToDominantS          float64                    `codec:"cds"`
-	CompactDeltaToDominantPPM        float64                    `codec:"cdp"`
-	CompactSyncUnreliable            bool                       `codec:"cu"`
-	RecoveryModeActive               bool                       `codec:"rma"`
-	RecoveryTriggerReasons           []string                   `codec:"rtr"`
-	CompactGatingBypassed            bool                       `codec:"cgb"`
-	RecoveryRelaxedAdmissions        uint32                     `codec:"rla"`
-	ActiveAuthorityMode              string                     `codec:"aam"`
-	AuthoritySwitchCount             uint32                     `codec:"asc"`
-	LastAuthoritySwitchTS            float64                    `codec:"ast"`
-	LastAuthoritySwitchReason        string                     `codec:"asr"`
-	AuthorityEnterStreak             uint16                     `codec:"aes"`
-	AuthorityExitStreak              uint16                     `codec:"axs"`
-	AnchorSwitchCount                uint32                     `codec:"anc"`
-	LastAnchorSwitchTS               float64                    `codec:"ant"`
-	LastAnchorSwitchReason           string                     `codec:"ahr"`
-	AnchorHoldUpdates                uint16                     `codec:"ahu"`
-	CandidatePeriodS                 float64                    `codec:"cps"`
-	AuthoritativePeriodS             float64                    `codec:"aps"`
-	CandidatePhaseOffsetDeg          float64                    `codec:"cpo"`
-	AuthoritativePhaseOffsetDeg      float64                    `codec:"apo"`
-	CandidateAnchorICAO              *uint32                    `codec:"cai"`
-	AuthoritativeAnchorICAO          *uint32                    `codec:"aai"`
-	CandidateValidationScore         float64                    `codec:"cvs"`
-	AuthoritativeValidationScore     float64                    `codec:"avs"`
-	AuthoritativeStateAgeS           float64                    `codec:"asa"`
-	CandidatePromotionStreak         uint16                     `codec:"cpr"`
-	AuthoritativePeriodUpdateGain    float64                    `codec:"apg"`
-	AuthoritativePhaseUpdateGain     float64                    `codec:"afg"`
-	PeriodFrozenDueToPhaseValidation bool                       `codec:"pfv"`
-	BranchAmbiguityScore             float64                    `codec:"bas"`
-	CircularDispersionDeg            float64                    `codec:"cdd"`
-	ValidatorAgreementCount          uint16                     `codec:"vac"`
-	ValidatorDisagreementCount       uint16                     `codec:"vdc"`
-	CandidateValidationStatus        string                     `codec:"cvsn"`
-	CandidateApplicationBlockReason  string                     `codec:"cabr"`
-	CandidateMode                    string                     `codec:"cmd"`
-	AuthoritativeMode                string                     `codec:"amd"`
-	// AbsolutePhaseTrusted is true only when the period is bounded to the DF dominant prior,
-	// an anchor is selected, and phase validation is strong. Localiser must gate geographic
-	// bearing prediction on this field rather than the broader Usable flag.
-	AbsolutePhaseTrusted bool `codec:"apt"`
-	// DominantPriorInconsistent is set when the reacquire candidate lies outside the allowed
-	// refinement bound around the DF dominant period. Diagnostic only — the DF alignment model
-	// should react; the refined solver does not change its published period in this case.
-	DominantPriorInconsistent bool `codec:"dpi"`
-	// Unwrapped-slope period-fit diagnostics (added for near-wrap residual recovery).
-	// PeriodFitAcceptedObservations is the count that passed the unwrapped gate.
-	// PeriodFitRejectedObservations is the count rejected before unwrapping.
-	// PeriodFitRejectedAfterUnwrap is the count that wrapped but failed the detrended gate.
-	PeriodFitAcceptedObservations uint32 `codec:"pfa"`
-	PeriodFitRejectedObservations uint32 `codec:"pfr"`
-	PeriodFitRejectedAfterUnwrap  uint32 `codec:"prw"`
-	// SlopeWindowDeg is the slope × fit-span product used for authority promotion gating.
-	// SlopePromotionGatePassed is false when the slope window blocks authority promotion.
-	SlopeWindowDeg           float64 `codec:"swd"`
-	SlopePromotionGatePassed bool    `codec:"spg"`
-	// AuthorityPromotionBlockReason is non-empty when authority promotion was blocked by slope.
-	AuthorityPromotionBlockReason string `codec:"apb"`
-	// ResidualCorrectionBasis describes which slope path produced the period slope:
-	// "wrapped_fit", "unwrapped_fit", or "ema_fallback".
-	ResidualCorrectionBasis string `codec:"rcb"`
-	// MotionGuardDegraded is true when period correction ran at reduced gain/step due to
-	// insufficient ICAOs or bearing spread (degraded motion compensation guard).
-	MotionGuardDegraded bool `codec:"mgd"`
-	// AnchorCompetitionAmbiguity is secondScore/topScore from anchor candidates (0=clear, 1=tied).
-	// Distinct from BranchAmbiguityScore which also incorporates global coherence checks.
-	AnchorCompetitionAmbiguity float64 `codec:"aca"`
-	// ValidatorExcludedCount is ICAOs with fit-eligible obs that were below validatorMinObsPerICAO.
-	ValidatorExcludedCount uint16 `codec:"vec"`
-	// PerICAOPhaseOffsets is the per-ICAO implied-offset and validator-role table.
-	PerICAOPhaseOffsets []PerICAOPhaseOffset `codec:"pio"`
-
-	// ─── Long-term estimator separation (Layer 6 plumbing) ────────────────────
-	// `Local*` fields are the short-window (current fit) measurement.
-	// `LongTerm*` / `Branch*` fields are the persistent estimator state.
-	LocalPeriodMeasurementS  float64 `codec:"lpm"`
-	LocalCandidateAnchorICAO *uint32 `codec:"lca"`
-	LocalBranchOffsetDeg     float64 `codec:"lbo"`
-	LocalValidatorAgreement  uint16  `codec:"lva"`
-	LocalFitQualityScore     float64 `codec:"lfq"`
-
-	LongTermPeriodEstimateS            float64 `codec:"lte"`
-	LongTermPeriodEstimatorConfidence  float64 `codec:"ltc"`
-	LongTermPeriodEstimatorAgeS        float64 `codec:"lta"`
-	ConsecutivePeriodConsistentWindows uint32  `codec:"cpc"`
-	PeriodUpdateDeltaS                 float64 `codec:"pud"`
-
-	LongTermBranchAnchorICAO   *uint32 `codec:"lba"`
-	LongTermBranchOffsetDeg    float64 `codec:"lbf"`
-	BranchEstimatorConfidence  float64 `codec:"bec"`
-	BranchConsistentWindows    uint32  `codec:"bcw"`
-	BranchContradictionWindows uint32  `codec:"bcn"`
-	BranchCompetitorCount      uint16  `codec:"bcc"`
-	BranchPromotionBlockReason string  `codec:"bpb"`
-}
-
-// PerICAOPhaseOffset holds the implied phase offset and validator role for one ICAO.
-type PerICAOPhaseOffset struct {
-	ICAO            uint32   `codec:"i"`
-	LatestOffsetDeg float64  `codec:"lo"`
-	AnchorDeltaDeg  float64  `codec:"ad"`
-	Role            string   `codec:"r"`
-	RejectReasons   []string `codec:"rr"`
-}
-
-type MultiSyncAnchorCandidate struct {
-	ICAO                uint32   `codec:"i"`
-	Score               float64  `codec:"s"`
-	SpreadDeg           float64  `codec:"sp"`
-	ObsCount            uint16   `codec:"o"`
-	FitEligibleCount    uint16   `codec:"f"`
-	FitEligibleFraction float64  `codec:"ff"`
-	Status              string   `codec:"st"`
-	RejectReasons       []string `codec:"rr"`
-}

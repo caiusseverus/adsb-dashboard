@@ -101,13 +101,6 @@ type engine struct {
 	framesEmitted atomic.Uint64
 }
 
-type exportSyncEligibility struct {
-	compactEligible             bool
-	refinedPresent              bool
-	refinedUsable               bool // relative sync: Present && Usable (timing/phase work)
-	refinedAbsolutePhaseTrusted bool // geographic bearing: Present && AbsolutePhaseTrusted
-}
-
 func newEngine() *engine {
 	return &engine{
 		writer:       output.NewWriter(),
@@ -188,9 +181,6 @@ func (e *engine) onRadarEvent(msg *protocol.RadarEvent) {
 		e.recordObservationExports(s, f)
 		e.emitBurstFired(s, f)
 
-		// Multi-aircraft sync refinement: feed sync-eligible bursts and run solver.
-		e.maybeUpdateMultiSync(s, f)
-
 		e.profiler.Observe("burst_processing", time.Since(tBurst))
 	}
 }
@@ -222,223 +212,6 @@ func (e *engine) maybeUpdateSync(s *iid.IIDState, f *burst.FiredBurst) {
 	e.emitIIDState(s.IID, s, uint16(minInt(snap.BurstRecordsTotal, 65535)))
 }
 
-// maybeUpdateMultiSync feeds sync-eligible bursts into the per-IID multi-aircraft
-// sync solver and emits a MultiSyncState when a solver run completes.
-func (e *engine) maybeUpdateMultiSync(s *iid.IIDState, f *burst.FiredBurst) {
-	nowUnix := float64(time.Now().UnixMicro()) / 1e6
-	if s.MultiSync == nil {
-		s.RecordMultiSyncAdmission("no_solver", f.ICAO, nowUnix)
-		return
-	}
-	// Only feed dominant-family bursts with a known ADS-B position.
-	dominantFamily := false
-	if family := s.FamilySnapshot(); family != nil && family.FoldedICAOs != nil {
-		_, dominantFamily = family.FoldedICAOs[f.ICAO]
-	}
-	if !dominantFamily {
-		s.RecordMultiSyncAdmission("not_dominant_family", f.ICAO, nowUnix)
-		return
-	}
-	pos := e.positions.Get(f.ICAO)
-	if pos == nil {
-		s.RecordMultiSyncAdmission("no_adsb_position", f.ICAO, nowUnix)
-		return
-	}
-
-	// Compute bearing and range from receiver to aircraft.
-	cfg := rcconfig.Get()
-	if !cfg.HasReceiver {
-		s.RecordMultiSyncAdmission("no_receiver_config", f.ICAO, nowUnix)
-		return
-	}
-	bearing, rangeNM := iid.BearingAndRangeNM(
-		cfg.ReceiverLat, cfg.ReceiverLon, pos.Lat, pos.Lon,
-	)
-
-	posAgeS := float32(time.Since(pos.TS).Seconds())
-	var sig *float32
-	if f.SignalDBFS != nil {
-		v := float32(*f.SignalDBFS)
-		sig = &v
-	}
-
-	obs := iid.MultiSyncObs{
-		CentroidUS: f.CentroidUS,
-		ICAO:       f.ICAO,
-		BearingDeg: bearing,
-		RangeNM:    float32(rangeNM),
-		PosAgeS:    posAgeS,
-		NReplies:   f.NReplies,
-		SignalDBFS: sig,
-		WallTS:     float64(time.Now().UnixMicro()) / 1e6,
-	}
-	s.MultiSync.AddObs(obs)
-	s.RecordMultiSyncAdmission("admitted", f.ICAO, nowUnix)
-
-	// Run the solver if the throttle interval has elapsed.
-	syncSnap, _ := s.SyncSnapshot()
-	_ = syncSnap
-	sync := s.SyncStateRef()
-	dominantPeriodS := s.DominantPeriodSnapshot()
-	if updated := s.MultiSync.TryUpdate(sync, dominantPeriodS); updated {
-		e.emitMultiSyncState(s)
-	} else {
-		s.RecordMultiSyncAdmission("solver_throttled_or_no_update", f.ICAO, nowUnix)
-	}
-}
-
-// emitMultiSyncState sends the current multi-aircraft sync state for one IID.
-func (e *engine) emitMultiSyncState(s *iid.IIDState) {
-	snap := s.MultiSync.Snapshot()
-	if !snap.Present {
-		return
-	}
-	candidates := make([]protocol.MultiSyncAnchorCandidate, 0, len(snap.AnchorCandidates))
-	for _, row := range snap.AnchorCandidates {
-		candidates = append(candidates, protocol.MultiSyncAnchorCandidate{
-			ICAO:                row.ICAO,
-			Score:               row.Score,
-			SpreadDeg:           row.SpreadDeg,
-			ObsCount:            uint16(row.ObsCount),
-			FitEligibleCount:    uint16(row.FitEligibleCount),
-			FitEligibleFraction: row.FitEligibleFraction,
-			Status:              row.Status,
-			RejectReasons:       row.RejectReasons,
-		})
-	}
-	perICAO := make([]protocol.PerICAOPhaseOffset, 0, len(snap.PerICAOPhaseOffsets))
-	for _, row := range snap.PerICAOPhaseOffsets {
-		perICAO = append(perICAO, protocol.PerICAOPhaseOffset{
-			ICAO:            row.ICAO,
-			LatestOffsetDeg: row.LatestOffsetDeg,
-			AnchorDeltaDeg:  row.AnchorDeltaDeg,
-			Role:            row.Role,
-			RejectReasons:   row.RejectReasons,
-		})
-	}
-	msg := &protocol.MultiSyncState{
-		MsgType:               protocol.MsgMultiSyncState,
-		IID:                   s.IID,
-		Present:               snap.Present,
-		Usable:                snap.Usable,
-		PeriodS:               snap.PeriodS,
-		PeriodBaseS:           snap.PeriodBaseS,
-		PhaseEpochUS:          snap.PhaseEpochUS,
-		PhaseOffsetDeg:        snap.PhaseOffsetDeg,
-		JitterDeg:             snap.JitterDeg,
-		ResidualEMADeg:        snap.ResidualEMADeg,
-		NSyncUpdates:          uint32(snap.NSyncUpdates),
-		Holdover:              snap.Holdover,
-		PeriodReacquireActive: snap.PeriodReacquireActive,
-		PeriodReacquireReason: snap.PeriodReacquireReason,
-		AnchorICAO:            snap.AnchorICAO,
-		AnchorPhaseDeg:        snap.AnchorPhaseDeg,
-		AnchorScore:           snap.AnchorScore,
-		UpdatedAt:             snap.LastUpdated,
-		// Bootstrap / trust diagnostics.
-		BootstrapPeriodS:                 snap.BootstrapPeriodS,
-		TrustedBasePeriodS:               snap.TrustedBasePeriodS,
-		TrustUpdateStreak:                uint16(snap.TrustUpdateStreak),
-		BaseClamped:                      snap.BaseClamped,
-		BaseClampDiffPPM:                 snap.BaseClampDiffPPM,
-		WrongPeriodSuspect:               snap.WrongPeriodSuspect,
-		ReacquireCandidatePeriod:         snap.ReacquireCandidatePeriod,
-		ReacquireCandidateScore:          snap.ReacquireCandidateScore,
-		FitTotalObservations:             uint32(snap.FitTotalObservations),
-		FitEligibleObservations:          uint32(snap.FitEligibleObservations),
-		FitRejectedObservations:          uint32(snap.FitRejectedObservations),
-		FitContributingICAOs:             uint16(snap.FitContributingICAOs),
-		FitWindowS:                       snap.FitWindowS,
-		DisplayWindowS:                   snap.DisplayWindowS,
-		FitSpanS:                         snap.FitSpanS,
-		ResidualSlopeDegPerS:             snap.ResidualSlopeDegPerS,
-		FitRejectReasons:                 snap.FitRejectReasons,
-		AnchorCandidateCount:             uint16(snap.AnchorCandidateCount),
-		AnchorNoCandidateReason:          snap.AnchorNoCandidateReason,
-		AnchorCandidates:                 candidates,
-		DominantPriorPeriodS:             snap.DominantPriorPeriodS,
-		TrustedRefinedPeriodS:            snap.TrustedRefinedPeriodS,
-		ActiveFamilyPriorPeriodS:         snap.ActiveFamilyPriorPeriodS,
-		ActiveFamilyPriorSource:          snap.ActiveFamilyPriorSource,
-		DominantPriorActive:              snap.DominantPriorActive,
-		CompactPeriodS:                   snap.CompactPeriodS,
-		PeriodDeltaToDominantS:           snap.PeriodDeltaToDominantS,
-		PeriodDeltaToDominantPPM:         snap.PeriodDeltaToDominantPPM,
-		CompactDeltaToDominantS:          snap.CompactDeltaToDominantS,
-		CompactDeltaToDominantPPM:        snap.CompactDeltaToDominantPPM,
-		CompactSyncUnreliable:            snap.CompactSyncUnreliable,
-		RecoveryModeActive:               snap.RecoveryModeActive,
-		RecoveryTriggerReasons:           snap.RecoveryTriggerReasons,
-		CompactGatingBypassed:            snap.CompactGatingBypassed,
-		RecoveryRelaxedAdmissions:        uint32(snap.RecoveryRelaxedAdmissions),
-		ActiveAuthorityMode:              snap.ActiveAuthorityMode,
-		AuthoritySwitchCount:             uint32(snap.AuthoritySwitchCount),
-		LastAuthoritySwitchTS:            snap.LastAuthoritySwitchTS,
-		LastAuthoritySwitchReason:        snap.LastAuthoritySwitchReason,
-		AuthorityEnterStreak:             uint16(snap.AuthorityEnterStreak),
-		AuthorityExitStreak:              uint16(snap.AuthorityExitStreak),
-		AnchorSwitchCount:                uint32(snap.AnchorSwitchCount),
-		LastAnchorSwitchTS:               snap.LastAnchorSwitchTS,
-		LastAnchorSwitchReason:           snap.LastAnchorSwitchReason,
-		AnchorHoldUpdates:                uint16(snap.AnchorHoldUpdates),
-		CandidatePeriodS:                 snap.CandidatePeriodS,
-		AuthoritativePeriodS:             snap.AuthoritativePeriodS,
-		CandidatePhaseOffsetDeg:          snap.CandidatePhaseOffsetDeg,
-		AuthoritativePhaseOffsetDeg:      snap.AuthoritativePhaseOffsetDeg,
-		CandidateAnchorICAO:              snap.CandidateAnchorICAO,
-		AuthoritativeAnchorICAO:          snap.AuthoritativeAnchorICAO,
-		CandidateValidationScore:         snap.CandidateValidationScore,
-		AuthoritativeValidationScore:     snap.AuthoritativeValidationScore,
-		AuthoritativeStateAgeS:           snap.AuthoritativeStateAgeS,
-		CandidatePromotionStreak:         uint16(snap.CandidatePromotionStreak),
-		AuthoritativePeriodUpdateGain:    snap.AuthoritativePeriodUpdateGain,
-		AuthoritativePhaseUpdateGain:     snap.AuthoritativePhaseUpdateGain,
-		PeriodFrozenDueToPhaseValidation: snap.PeriodFrozenDueToPhaseValidation,
-		BranchAmbiguityScore:             snap.BranchAmbiguityScore,
-		CircularDispersionDeg:            snap.CircularDispersionDeg,
-		ValidatorAgreementCount:          uint16(snap.ValidatorAgreementCount),
-		ValidatorDisagreementCount:       uint16(snap.ValidatorDisagreementCount),
-		CandidateValidationStatus:        snap.CandidateValidationStatus,
-		CandidateApplicationBlockReason:  snap.CandidateApplicationBlockReason,
-		CandidateMode:                    snap.CandidateMode,
-		AuthoritativeMode:                snap.AuthoritativeMode,
-		AbsolutePhaseTrusted:             snap.AbsolutePhaseTrusted,
-		DominantPriorInconsistent:        snap.DominantPriorInconsistent,
-		PeriodFitAcceptedObservations:    uint32(snap.PeriodFitAcceptedObservations),
-		PeriodFitRejectedObservations:    uint32(snap.PeriodFitRejectedObservations),
-		PeriodFitRejectedAfterUnwrap:     uint32(snap.PeriodFitRejectedAfterUnwrap),
-		SlopeWindowDeg:                   snap.SlopeWindowDeg,
-		SlopePromotionGatePassed:         snap.SlopePromotionGatePassed,
-		AuthorityPromotionBlockReason:    snap.AuthorityPromotionBlockReason,
-		ResidualCorrectionBasis:          snap.ResidualCorrectionBasis,
-		MotionGuardDegraded:              snap.MotionGuardDegraded,
-		AnchorCompetitionAmbiguity:       snap.AnchorCompetitionAmbiguity,
-		ValidatorExcludedCount:           uint16(snap.ValidatorExcludedCount),
-		PerICAOPhaseOffsets:              perICAO,
-
-		LocalPeriodMeasurementS:  snap.LocalPeriodMeasurementS,
-		LocalCandidateAnchorICAO: snap.LocalCandidateAnchorICAO,
-		LocalBranchOffsetDeg:     snap.LocalBranchOffsetDeg,
-		LocalValidatorAgreement:  uint16(snap.LocalValidatorAgreement),
-		LocalFitQualityScore:     snap.LocalFitQualityScore,
-
-		LongTermPeriodEstimateS:            snap.LongTermPeriodEstimateS,
-		LongTermPeriodEstimatorConfidence:  snap.LongTermPeriodEstimatorConfidence,
-		LongTermPeriodEstimatorAgeS:        snap.LongTermPeriodEstimatorAgeS,
-		ConsecutivePeriodConsistentWindows: uint32(snap.ConsecutivePeriodConsistentWindows),
-		PeriodUpdateDeltaS:                 snap.PeriodUpdateDeltaS,
-
-		LongTermBranchAnchorICAO:   snap.LongTermBranchAnchorICAO,
-		LongTermBranchOffsetDeg:    snap.LongTermBranchOffsetDeg,
-		BranchEstimatorConfidence:  snap.BranchEstimatorConfidence,
-		BranchConsistentWindows:    uint32(snap.BranchConsistentWindows),
-		BranchContradictionWindows: uint32(snap.BranchContradictionWindows),
-		BranchCompetitorCount:      uint16(snap.BranchCompetitorCount),
-		BranchPromotionBlockReason: snap.BranchPromotionBlockReason,
-	}
-	e.writer.Send(msg)
-}
-
 func (e *engine) emitBurstFired(s *iid.IIDState, f *burst.FiredBurst) {
 	e.burstsFired.Add(1)
 
@@ -467,7 +240,8 @@ func (e *engine) emitBurstFired(s *iid.IIDState, f *burst.FiredBurst) {
 	if family := s.FamilySnapshot(); family != nil && family.FoldedICAOs != nil {
 		_, dominantFamily = family.FoldedICAOs[f.ICAO]
 	}
-	eligibility := e.exportSyncEligibility(s, dominantFamily, assoc)
+	syncQuality, _ := s.SyncSnapshot()
+	compactEligible := dominantFamily && assoc > 0.0 && syncQuality >= 0.3
 	simpleCentroid := f.SimpleCentroidUS
 	centroidDelta := f.CentroidDeltaUS
 	firstReply := f.FirstReplyUS
@@ -498,12 +272,8 @@ func (e *engine) emitBurstFired(s *iid.IIDState, f *burst.FiredBurst) {
 		Lat:                             latPtr,
 		Lon:                             lonPtr,
 		PosAgeS:                         posAgePtr,
-		DominantFamily:                  dominantFamily,
-		SyncEligible:                    eligibility.refinedAbsolutePhaseTrusted,
-		CompactSyncEligible:             eligibility.compactEligible,
-		RefinedSyncPresent:              eligibility.refinedPresent,
-		RefinedSyncUsable:               eligibility.refinedUsable,
-		RefinedSyncAbsolutePhaseTrusted: eligibility.refinedAbsolutePhaseTrusted,
+		DominantFamily:      dominantFamily,
+		CompactSyncEligible: compactEligible,
 	})
 }
 
@@ -527,7 +297,8 @@ func (e *engine) recordObservationExports(s *iid.IIDState, f *burst.FiredBurst) 
 	if family := s.FamilySnapshot(); family != nil && family.FoldedICAOs != nil {
 		_, dominantFamily = family.FoldedICAOs[f.ICAO]
 	}
-	eligibility := e.exportSyncEligibility(s, dominantFamily, assoc)
+	syncQualityExport, _ := s.SyncSnapshot()
+	compactEligibleExport := dominantFamily && assoc > 0.0 && syncQualityExport >= 0.3
 	wallTS := float64(time.Now().UnixNano()) / float64(time.Second)
 	track := rcexport.TrackObservation{
 		IID:                   f.IID,
@@ -540,10 +311,7 @@ func (e *engine) recordObservationExports(s *iid.IIDState, f *burst.FiredBurst) 
 		PositionAgeS:          posAgePtr,
 		AssociationConfidence: assoc,
 		DominantFamily:        dominantFamily,
-		SyncEligible:          eligibility.refinedAbsolutePhaseTrusted,
-		CompactSyncEligible:   eligibility.compactEligible,
-		RefinedSyncPresent:    eligibility.refinedPresent,
-		RefinedSyncUsable:     eligibility.refinedUsable,
+		CompactSyncEligible:   compactEligibleExport,
 	}
 	tExport := time.Now()
 	e.exports.RecordTrackObservation(track)
@@ -574,28 +342,10 @@ func (e *engine) recordObservationExports(s *iid.IIDState, f *burst.FiredBurst) 
 		TruthLon:              lonPtr,
 		PositionAgeS:          posAgePtr,
 		DominantFamily:        dominantFamily,
-		SyncEligible:          eligibility.refinedAbsolutePhaseTrusted,
-		CompactSyncEligible:   eligibility.compactEligible,
-		RefinedSyncPresent:    eligibility.refinedPresent,
-		RefinedSyncUsable:     eligibility.refinedUsable,
+		CompactSyncEligible:   compactEligibleExport,
 		AssociationConfidence: assoc,
 	})
 	e.profiler.Observe("evidence_export", time.Since(tExport))
-}
-
-func (e *engine) exportSyncEligibility(s *iid.IIDState, dominantFamily bool, assoc float32) exportSyncEligibility {
-	syncQuality, _ := s.SyncSnapshot()
-	result := exportSyncEligibility{
-		compactEligible: dominantFamily && assoc > 0.0 && syncQuality >= 0.3,
-	}
-	if s.MultiSync == nil {
-		return result
-	}
-	snap := s.MultiSync.Snapshot()
-	result.refinedPresent = snap.Present
-	result.refinedUsable = snap.Present && snap.Usable
-	result.refinedAbsolutePhaseTrusted = snap.Present && snap.AbsolutePhaseTrusted
-	return result
 }
 
 func (e *engine) recordSweepFrame(frameMsg *protocol.FrameReady) {
@@ -822,19 +572,6 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 				"centroid_history_cap_per_icao":   accDiag.CentroidHistoryCapPerICAO,
 				"centroid_history_cap_hit":        accDiag.CentroidHistoryCapHit,
 				"centroid_history_cap_hits_total": accDiag.CentroidHistoryCapHitsTotal,
-			}
-		}
-		if admission := s.MultiSyncAdmissionSnapshot(); admission.Counts != nil {
-			iidPayload["multi_sync_admission"] = map[string]interface{}{
-				"last_reason": admission.LastReason,
-				"last_icao": func() interface{} {
-					if admission.LastICAO == 0 {
-						return nil
-					}
-					return admission.LastICAO
-				}(),
-				"last_ts": admission.LastTS,
-				"counts":  admission.Counts,
 			}
 		}
 		if fmState := e.fmState.Snapshot(iidNum); fmState != nil {
