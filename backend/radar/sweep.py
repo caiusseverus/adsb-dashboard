@@ -4485,18 +4485,14 @@ class RadarState:
                         sync_update_iid = iid
                         sync_update_period_s = period_s
         if sync_update_iid is not None and sync_update_period_s is not None:
-            # Skip Python solver when Go has established authoritative multi-sync
-            # state for this IID.  Go's MultiSyncSolver takes over once it has
-            # produced its first valid fit; Python resumes if radar-core resets.
-            if not self._go_multi_sync_states_by_iid.get(sync_update_iid):
-                now_mono = time.monotonic()
-                last = self._last_multi_sync_update_ts.get(sync_update_iid, 0.0)
-                if (now_mono - last) >= self._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
-                    self._last_multi_sync_update_ts[sync_update_iid] = now_mono
-                    self._update_simple_live_sync_state(
-                        iid=sync_update_iid,
-                        period_s=sync_update_period_s,
-                    )
+            now_mono = time.monotonic()
+            last = self._last_multi_sync_update_ts.get(sync_update_iid, 0.0)
+            if (now_mono - last) >= self._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
+                self._last_multi_sync_update_ts[sync_update_iid] = now_mono
+                self._update_simple_live_sync_state(
+                    iid=sync_update_iid,
+                    period_s=sync_update_period_s,
+                )
 
     def _go_track_observation_snapshot(self) -> list[dict]:
         with self._lock:
@@ -4595,13 +4591,11 @@ class RadarState:
                 )
 
     def update_go_multi_sync_state(self, msg: dict) -> None:
-        """Mirror a Go MULTI_SYNC_STATE into a Python LiveSyncState.
+        """Mirror a Go MULTI_SYNC_STATE into _go_multi_sync_states_by_iid and _live_sync_states.
 
-        Go's multi-aircraft sync solver runs the same weighted phase fit as the
-        Python _update_simple_live_sync_state() path.  When Go is authoritative,
-        Python adopts the Go-produced sync state as
-        LiveSyncState(source="go_multi_aircraft_burst") so Stage 3 can use it
-        without running the Python solver.
+        Stores the Go-produced sync state for diagnostic visibility.  The Python
+        simple sync solver (_update_simple_live_sync_state) remains the operational
+        period/phase authority regardless of whether Go state is present.
         """
         try:
             iid = int(msg["i"])

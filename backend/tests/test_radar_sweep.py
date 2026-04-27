@@ -2654,8 +2654,8 @@ def test_go_iid_state_does_not_override_multi_aircraft_sync_state():
     assert state.get_go_live_sync_state(77)["phase_epoch_us"] == pytest.approx(999_000.0)
 
 
-def test_update_go_burst_fired_skips_python_solver_when_go_multi_sync_present(monkeypatch):
-    """Python solver must not run when Go has established multi-sync state for the IID."""
+def test_update_go_burst_fired_calls_python_solver_even_when_go_multi_sync_present(monkeypatch):
+    """Python solver must run regardless of whether Go has multi-sync state for the IID."""
     state = RadarState()
     state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=51.0, lon=0.0)
     state._live_sync_states[7] = LiveSyncState(
@@ -2663,7 +2663,7 @@ def test_update_go_burst_fired_skips_python_solver_when_go_multi_sync_present(mo
         sync_quality=1.0, sync_jitter_deg=3.0, last_sync_update_ts=1_000.0,
         source="go_multi_aircraft_burst", usable=True,
     )
-    # Simulate Go having already produced multi-sync state for IID 7.
+    # Simulate Go having produced multi-sync state for IID 7.
     state._go_multi_sync_states_by_iid[7] = {"pr": True, "p": 4.0}
 
     calls: list[tuple[int, float]] = []
@@ -2681,8 +2681,8 @@ def test_update_go_burst_fired_skips_python_solver_when_go_multi_sync_present(mo
         "df": True, "se": True,
     })
 
-    # Python solver must not have been called.
-    assert calls == []
+    # Python solver must have been called despite Go state being present.
+    assert calls == [(7, 4.0)]
 
 
 def test_update_go_multi_sync_state_overrides_python_multi_aircraft_burst(monkeypatch):
@@ -3540,7 +3540,6 @@ def test_python_dispatcher_always_calls_simple_live_sync(monkeypatch):
                         lambda iid, period_s: simple_calls.append((iid, period_s)))
     monkeypatch.setattr(sweep_module.time, "monotonic", lambda: 9999.0)
 
-    state._go_multi_sync_states_by_iid[iid] = None  # Go not active → Python path
     state._last_multi_sync_update_ts[iid] = 0.0
     with state._lock:
         now_mono = sweep_module.time.monotonic()
@@ -3552,8 +3551,8 @@ def test_python_dispatcher_always_calls_simple_live_sync(monkeypatch):
     assert simple_calls == [(7, 4.0)], "simple model must always be called on Python path"
 
 
-def test_go_authoritative_state_skips_python_sync_dispatch(monkeypatch):
-    """When Go has authoritative multi-sync state for an IID the Python method is not called."""
+def test_python_sync_not_suppressed_by_go_multi_sync_state(monkeypatch):
+    """_update_simple_live_sync_state must be called even when Go state is present for the IID."""
     import radar.sweep as sweep_module
 
     state = RadarState()
@@ -3566,21 +3565,19 @@ def test_go_authoritative_state_skips_python_sync_dispatch(monkeypatch):
     simple_calls: list = []
     monkeypatch.setattr(state, "_update_simple_live_sync_state",
                         lambda iid, period_s: simple_calls.append((iid, period_s)))
-
-    # Seed a truthy Go authoritative state — Python dispatch must be skipped.
-    state._go_multi_sync_states_by_iid[iid] = {"authoritative": True}
-    state._last_multi_sync_update_ts[iid] = 0.0
     monkeypatch.setattr(sweep_module.time, "monotonic", lambda: 9999.0)
 
+    # Truthy Go state must not suppress the Python solver.
+    state._go_multi_sync_states_by_iid[iid] = {"authoritative": True}
+    state._last_multi_sync_update_ts[iid] = 0.0
     with state._lock:
-        if not state._go_multi_sync_states_by_iid.get(iid):
-            now_mono = sweep_module.time.monotonic()
-            last = state._last_multi_sync_update_ts.get(iid, 0.0)
-            if (now_mono - last) >= state._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
-                state._last_multi_sync_update_ts[iid] = now_mono
-                state._update_simple_live_sync_state(iid=iid, period_s=4.0)
+        now_mono = sweep_module.time.monotonic()
+        last = state._last_multi_sync_update_ts.get(iid, 0.0)
+        if (now_mono - last) >= state._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
+            state._last_multi_sync_update_ts[iid] = now_mono
+            state._update_simple_live_sync_state(iid=iid, period_s=4.0)
 
-    assert len(simple_calls) == 0, "simple model must not be called when Go is authoritative"
+    assert simple_calls == [(9, 4.0)], "Go state must not suppress Python simple sync"
 
 
 # ---------------------------------------------------------------------------
