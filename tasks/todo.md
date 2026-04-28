@@ -1,3 +1,133 @@
+## 2026-04-28 Radar Position Extraction
+
+- [x] Review the current authoritative radar-position helper and its call sites.
+- [x] Record the extraction plan and keep this pass limited to shared position selection only.
+- [x] Add `backend/radar/radar_position.py` with the shared authoritative radar-position helper.
+- [x] Update `sweep.py`, `aircraft_localiser.py`, and any other caller to import the shared helper.
+- [x] Run focused backend verification for Stage 2 / Stage 3 position-selection call paths.
+
+Plan confirmation:
+- Keep the existing selection policy exactly the same: manual > CI > FM > TDOA, with `locked_unresolvable` and multi-radar TDOA rejection unchanged.
+- Do not introduce duplicate position-selection logic in any caller.
+- Keep this pass structural only; no localisation or sync math changes.
+
+### Review
+- Implemented:
+  - Added [backend/radar/radar_position.py](/home/keith/claude/adsb-dashboard/backend/radar/radar_position.py) with the shared authoritative radar-position selector and its local `none` helper.
+  - Updated [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) to import the shared selector and keep `_get_authoritative_radar_position()` as a thin compatibility wrapper.
+  - Updated [backend/radar/aircraft_localiser.py](/home/keith/claude/adsb-dashboard/backend/radar/aircraft_localiser.py) to consume the shared selector directly for Stage 3 position lookup.
+- Not changed:
+  - Authoritative radar-position priority and gating: `manual > CI > FM > TDOA`, with `locked_unresolvable` and multi-radar TDOA exclusion unchanged.
+  - Stage 2 / Stage 3 localisation logic outside the shared position selection helper.
+  - `radar/api.py`, which does not currently import this helper.
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_aircraft_localiser_target_live.py tests/test_aircraft_localiser_sync_predictor.py tests/test_radar_api.py -q` -> `155 passed`
+
+## 2026-04-28 Diagnostic Extraction
+
+- [x] Review lessons and inspect the diagnostic-only radar timeline/evidence paths in `backend/radar/sweep.py`.
+- [x] Write the extraction plan and confirm the boundary that diagnostic modules must not update `LiveSyncState` or sync observation pools.
+- [x] Extract timeline/residual diagnostic payload builders into `backend/radar/sweep_diagnostics.py`.
+- [x] Extract Go diagnostic evidence normalisation and snapshot helpers into `backend/radar/go_diagnostics.py`.
+- [x] Update `backend/radar/sweep.py` to call the extracted helpers while keeping all functional simple-sync input handling and state mutation local.
+- [x] Run focused backend verification for diagnostic endpoints and the no-Go->`_update_simple_live_sync_state` boundary.
+
+Plan confirmation:
+- Keep `sweep.py` as the orchestrator and the sole owner of `LiveSyncState` mutation, sync observation pool mutation, and simple-sync dispatch.
+- Move only diagnostic payload construction, diagnostic timeline rebuilding, and Go diagnostic normalisation/snapshot shaping.
+- Preserve existing endpoint behaviour when `RADAR_DIAGNOSTICS` is enabled, and keep Go evidence strictly diagnostic-only.
+
+### Review
+- Implemented:
+  - Added [backend/radar/sweep_diagnostics.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep_diagnostics.py) for retained timeline/residual display helpers, compact Go sync timeline rebuilding, display-retention diagnostics, and sync-mode diagnostic payload shaping.
+  - Added [backend/radar/go_diagnostics.py](/home/keith/claude/adsb-dashboard/backend/radar/go_diagnostics.py) for Go diagnostic evidence/frame normalisation, signatures, snapshot shaping, and evidence-buffer pruning.
+  - Updated [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) to route diagnostic-only work through those modules while keeping observation recording, `LiveSyncState` updates, and simple-sync dispatch in `RadarState`.
+- Not changed:
+  - Functional simple sync input handling.
+  - `LiveSyncState` mutation ownership.
+  - Go sync adoption / compact bootstrap behaviour.
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -q -k 'burst_sync_timeline or go_evidence or go_burst_fired or sync_snapshot or display_retention or compact_go_sync or timeline'` -> `12 passed`
+  - `uv run --directory backend pytest tests/test_radar_api.py -q -k 'sync_snapshot or burst_sync_timeline or diagnostics or timeline'` -> `13 passed`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py -q` -> `130 passed`
+  - `rg -n "_update_simple_live_sync_state\\(" backend/radar/go_diagnostics.py backend/radar/sweep_diagnostics.py backend/radar/sweep.py` confirms the only remaining call/update surface is in `sweep.py`.
+
+## 2026-04-28 Burst And Rotation Extraction
+
+- [x] Review lessons and inspect the current burst-detection and rotation-analysis surfaces in `backend/radar/sweep.py`.
+- [x] Write the extraction plan and confirm which helpers/constants can move without changing orchestration behaviour.
+- [x] Extract burst grouping helpers into `backend/radar/burst_detection.py`.
+- [x] Extract dominant-period / family analysis helpers into `backend/radar/rotation_analysis.py`.
+- [x] Update `backend/radar/sweep.py` to import and re-export the extracted helpers while keeping orchestration, call sites, and test patch points stable.
+- [x] Run focused backend verification for burst detection, base period analysis, and API call sites.
+
+Plan confirmation:
+- Keep this pass structural. Do not change burst grouping, dominant-period scoring, harmonic folding, or rotation-model verdict logic.
+- Keep `sweep.py` as the orchestration layer and preserve existing import names there for current tests and callers.
+- Move only the pure burst/analysis stacks; shared orchestration and reinforcement logic stays in `sweep.py`.
+
+### Review
+- Implemented:
+  - Added [backend/radar/burst_detection.py](/home/keith/claude/adsb-dashboard/backend/radar/burst_detection.py) containing `BURST_GAP_US`, `detect_bursts()`, `detect_bursts_with_signals()`, `refine_burst_center()`, and `_compute_burst_timestamp_candidates()`.
+  - Added [backend/radar/rotation_analysis.py](/home/keith/claude/adsb-dashboard/backend/radar/rotation_analysis.py) containing the pure base-period analysis stack: `analyse_icao()`, `_snap_intervals()`, `_evaluate_base_candidate()`, `_fold_harmonics()`, `_analyse_iid_events()`, and `_analyse_burst_records()`.
+  - Updated [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) to import and re-export the extracted helpers so existing imports, internal orchestration, and monkeypatch-based tests still target the same names.
+- Not changed:
+  - Burst grouping thresholds and timestamp refinement behaviour.
+  - Dominant-period selection, harmonic folding, or rotation-model verdict logic.
+  - Reinforcement/orchestration logic in `RadarState`.
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py -q` -> `130 passed`
+
+## 2026-04-28 Simple Sync Extraction
+
+- [x] Review lessons and inspect the current simple-sync implementation in `backend/radar/sweep.py`.
+- [x] Write the extraction plan and confirm the low-risk module boundary before editing.
+- [x] Extract the Python simple live sync fit helpers into `backend/radar/simple_sync.py`.
+- [x] Make `RadarState._update_simple_live_sync_state()` a thin wrapper around the extracted helper while preserving current behaviour.
+- [x] Keep compatibility imports/re-exports in `sweep.py` for existing tests and callers.
+- [x] Run focused backend verification for simple-sync, sweep, and Stage 3 behaviour.
+
+Plan confirmation:
+- Keep this as a behaviour-preserving extraction only. Do not redesign state ownership or change period/phase logic.
+- Preserve `RadarState._update_simple_live_sync_state()` as the public test surface; the extracted module will operate on the existing `RadarState` instance.
+- Leave propagation delay and motion compensation untouched; this pass is only about moving the Python simple live sync model out of `sweep.py`.
+
+### Review
+- Implemented:
+  - Added [backend/radar/simple_sync.py](/home/keith/claude/adsb-dashboard/backend/radar/simple_sync.py) with `_fit_weighted_slope()`, `_is_finite_number()`, `_fit_per_aircraft_slope()`, `fit_window_s_for_period()`, and `update_simple_live_sync_state()`.
+  - Updated [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) to import the extracted helpers, keep the helper names available for current tests, route `_fit_window_s_for_period()` through the new module, and make `RadarState._update_simple_live_sync_state()` a thin wrapper.
+- Not changed:
+  - Period refinement semantics.
+  - Phase-anchor / trust semantics.
+  - Propagation-delay or motion-compensation behaviour.
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_phase_refinement.py tests/test_radar_sweep.py tests/test_aircraft_localiser_sync_predictor.py tests/test_aircraft_localiser_target_live.py tests/test_radar_api.py -q` -> `191 passed`
+
+## 2026-04-28 Sync Prediction Extraction
+
+- [x] Review lessons and current sync-cleanup state before editing.
+- [x] Extract pure sync prediction helpers from `backend/radar/sweep.py` into `backend/radar/sync_prediction.py`.
+- [x] Update `sweep.py` and Stage 3 callers to import the extracted helpers without changing behaviour.
+- [x] Keep temporary re-exports in `sweep.py` only as needed for compatibility.
+- [x] Run focused verification for predictor, sweep, API, and Stage 3 behaviour.
+
+Plan confirmation:
+- Move only the pure prediction helpers in this pass.
+- Do not change propagation delay or motion-compensation behaviour.
+- Keep `LiveSyncState` in `sweep.py`; the new module should remain a pure helper module.
+
+### Review
+- Implemented:
+  - Added [backend/radar/sync_prediction.py](/home/keith/claude/adsb-dashboard/backend/radar/sync_prediction.py) containing `SyncPrediction`, `predict_sync_observation()`, `_predict_bearing_from_sync()`, `_compute_propagation_delay_us()`, and `_compute_motion_comp_dt_us()`.
+  - Updated [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) to import those helpers from the new module, which keeps the existing names available to current tests/importers.
+  - Updated [backend/radar/aircraft_localiser.py](/home/keith/claude/adsb-dashboard/backend/radar/aircraft_localiser.py) to import `predict_sync_observation` from the new module directly.
+- Not changed:
+  - Propagation-delay semantics.
+  - Motion-compensation semantics.
+  - Stage 3 prediction behaviour.
+- Verification:
+  - `uv run --directory backend pytest tests/test_aircraft_localiser_sync_predictor.py tests/test_aircraft_localiser_target_live.py tests/test_radar_phase_refinement.py tests/test_radar_sweep.py tests/test_radar_api.py -q` -> `191 passed`
+
 ## 2026-04-28 Simple Sync Follow-Up
 
 - [x] Review lessons and the prior radar sync cleanup before editing.

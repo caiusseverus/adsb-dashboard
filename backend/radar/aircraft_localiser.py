@@ -32,7 +32,9 @@ from .aircraft_models import (
     RadarBearingObservation,
     Stage3LiveRay,
 )
-from .sweep import _get_authoritative_radar_position, LiveSyncState, predict_sync_observation
+from .radar_position import get_authoritative_radar_position
+from .sweep import LiveSyncState
+from .sync_prediction import predict_sync_observation
 
 if TYPE_CHECKING:
     from .sweep import RadarState
@@ -149,7 +151,7 @@ def _enu_to_latlon(x: float, y: float, origin_lat: float, origin_lon: float) -> 
 
 def _authoritative_position_for_model(model) -> dict:
     """Return the best-available radar position for a RadarIID model."""
-    return _get_authoritative_radar_position(model)
+    return get_authoritative_radar_position(model)
 
 
 # ---------------------------------------------------------------------------

@@ -25,6 +25,58 @@ except Exception:
 
 from .models import RadarIID, RotationModel, CalibrationPair, BurstRecord
 from .aircraft_models import Stage3LiveDetection
+from .burst_detection import (
+    BURST_GAP_US,
+    _compute_burst_timestamp_candidates,
+    detect_bursts,
+    detect_bursts_with_signals,
+    refine_burst_center,
+)
+from .go_diagnostics import (
+    GoSweepFrame as _DiagGoSweepFrame,
+    go_evidence_event_snapshot as _go_evidence_event_snapshot_helper,
+    go_frame_position_signature as _go_frame_position_signature_helper,
+    go_multi_sync_admission_snapshot as _go_multi_sync_admission_snapshot_helper,
+    go_sweep_frame_signature as _go_sweep_frame_signature_helper,
+    go_track_observation_snapshot as _go_track_observation_snapshot_helper,
+    normalise_go_anchor_candidates as _normalise_go_anchor_candidates_helper,
+    normalise_go_evidence_event as _normalise_go_evidence_event_helper,
+    normalise_go_frame_position as _normalise_go_frame_position_helper,
+    normalise_go_multi_sync_admission as _normalise_go_multi_sync_admission_helper,
+    normalise_go_sweep_frame as _normalise_go_sweep_frame_helper,
+    normalise_go_track_observation as _normalise_go_track_observation_helper,
+    prune_go_evidence_events_locked as _prune_go_evidence_events_locked_helper,
+    set_go_frame_positions_locked as _set_go_frame_positions_locked_helper,
+)
+from .radar_position import get_authoritative_radar_position
+from .rotation_analysis import _analyse_burst_records, _analyse_iid_events
+from .simple_sync import (
+    _fit_per_aircraft_slope,
+    _fit_weighted_slope,
+    _is_finite_number,
+    fit_window_s_for_period as _fit_window_s_for_period_helper,
+    update_simple_live_sync_state,
+)
+from .sweep_diagnostics import (
+    apply_selected_anchor_relative_offsets as _apply_selected_anchor_relative_offsets_helper,
+    build_compact_burst_sync_timeline_entries as _build_compact_burst_sync_timeline_entries_helper,
+    build_compact_residual_observations_from_entries as _build_compact_residual_observations_from_entries_helper,
+    build_compact_sync_debug_payload as _build_compact_sync_debug_payload_helper,
+    build_df11_residual_observations as _build_df11_residual_observations_helper,
+    build_display_retention_diagnostic as _build_display_retention_diagnostic_helper,
+    build_live_sync_retention_diagnostics as _build_live_sync_retention_diagnostics_helper,
+    build_sync_mode_diagnostics as _build_sync_mode_diagnostics_helper,
+    go_burst_sync_timeline_snapshot as _go_burst_sync_timeline_snapshot_helper,
+    go_sweep_frame_sync_timeline_snapshot as _go_sweep_frame_sync_timeline_snapshot_helper,
+    summarise_live_sync_observation_buffer as _summarise_live_sync_observation_buffer_helper,
+)
+from .sync_prediction import (
+    SyncPrediction,
+    _compute_motion_comp_dt_us,
+    _compute_propagation_delay_us,
+    _predict_bearing_from_sync,
+    predict_sync_observation,
+)
 
 try:
     from config import (
@@ -105,9 +157,6 @@ def _add_fired_burst_phase_metrics(target: dict, source: dict) -> None:
 BEAST_TICKS_PER_US = 12
 BEAST_TS_MODULUS = 1 << 48
 
-# Burst detection: replies within 200ms of each other belong to one burst
-BURST_GAP_US = 200_000
-
 # Minimum bursts for a reliable period estimate per ICAO
 MIN_BURSTS = 4
 
@@ -139,8 +188,6 @@ _ROTATION_ANALYSIS_MAX_EVENTS_PER_IID = 12_000
 # pruning cycles.
 _IID_EVENTS_MAX = 50_000
 STABLE_REANALYZE_INTERVAL_S = 300.0
-_SIMPLE_SYNC_FIT_WINDOW_ROTATIONS = 6.0
-_SIMPLE_SYNC_FIT_WINDOW_MIN_S = 30.0
 _SYNC_DISPLAY_HISTORY_WINDOW_S = 300.0
 _SYNC_DIAGNOSTIC_HISTORY_MAX = 1500
 
@@ -163,7 +210,6 @@ PRIMARY_CONFIDENCE_TARGET = 12
 SECONDARY_CONFIDENCE_TARGET = 8
 SECONDARY_DIRECT_COUNT_MIN = 3
 SECONDARY_SUPPORT_RATIO_MIN = 0.6
-SERIES_CLUSTER_TOLERANCE = 0.12
 
 # Max age for ADS-B position to be considered "current" (seconds)
 _ADSB_POSITION_MAX_AGE_S = 30.0
@@ -216,44 +262,7 @@ def _haversine_nm_simple(lat1: float, lon1: float, lat2: float, lon2: float) -> 
 
 
 def _get_authoritative_radar_position(model: RadarIID) -> dict:
-    """Return the best-available radar position for a RadarIID model.
-
-    Shared helper used by both radar/api.py and aircraft_localiser.py so that
-    Stage 2 and Stage 3 always agree on where a given radar is.
-    Priority: manual > CI > FM > TDOA (by lowest CEP).
-    Returns dict with keys: source, lat, lon, cep_m.
-    """
-    if model is None:
-        return {"source": "none", "lat": None, "lon": None, "cep_m": None}
-
-    if model.resolution_mode == "locked_unresolvable":
-        return {"source": "none", "lat": None, "lon": None, "cep_m": None}
-
-    if (
-        model.resolution_mode == "locked_position"
-        and model.manual_lat is not None
-        and model.manual_lon is not None
-    ):
-        return {
-            "source": "manual",
-            "lat": model.manual_lat,
-            "lon": model.manual_lon,
-            "cep_m": None,
-        }
-
-    candidates: list[dict] = []
-    if model.ci_lat is not None and model.ci_lon is not None:
-        candidates.append({"source": "ci", "lat": model.ci_lat, "lon": model.ci_lon, "cep_m": model.ci_cep_m})
-    if model.fm_lat is not None and model.fm_lon is not None:
-        candidates.append({"source": "fm", "lat": model.fm_lat, "lon": model.fm_lon, "cep_m": model.fm_cep_m})
-    if model.lat is not None and model.lon is not None and not model.multi_radar_flag:
-        candidates.append({"source": "tdoa", "lat": model.lat, "lon": model.lon, "cep_m": model.cep_m})
-
-    if not candidates:
-        return {"source": "none", "lat": None, "lon": None, "cep_m": None}
-
-    candidates.sort(key=lambda c: (c.get("cep_m") is None, c.get("cep_m") or float("inf")))
-    return candidates[0]
+    return get_authoritative_radar_position(model)
 
 
 def _sync_quality_from_model(model: RadarIID) -> float:
@@ -283,199 +292,6 @@ def _sync_source_has_rich_python_diagnostics(sync: "LiveSyncState | None") -> bo
     return bool(sync is not None and getattr(sync, "source", None) == "multi_aircraft_burst")
 
 
-def _fit_weighted_slope(xs: list[float], ys: list[float], ws: list[float]) -> tuple[float, float]:
-    """Weighted least-squares linear fit y = a + b*x.
-
-    Returns (a, b).  Falls back to (weighted mean, 0.0) when the fit is
-    underdetermined (fewer than 2 samples with positive weight, or zero
-    x-variance).  All three input lists must be equal length.
-    """
-    n = len(xs)
-    if n == 0 or n != len(ys) or n != len(ws):
-        return 0.0, 0.0
-    total_w = 0.0
-    sum_wx = 0.0
-    sum_wy = 0.0
-    for x, y, w in zip(xs, ys, ws):
-        if w <= 0:
-            continue
-        total_w += w
-        sum_wx += w * x
-        sum_wy += w * y
-    if total_w <= 0:
-        return 0.0, 0.0
-    mx = sum_wx / total_w
-    my = sum_wy / total_w
-    num = 0.0
-    den = 0.0
-    for x, y, w in zip(xs, ys, ws):
-        if w <= 0:
-            continue
-        dx = x - mx
-        num += w * dx * (y - my)
-        den += w * dx * dx
-    if den <= 0:
-        return my, 0.0
-    b = num / den
-    a = my - b * mx
-    return a, b
-
-
-def _is_finite_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and _math.isfinite(float(value))
-
-
-def _fit_per_aircraft_slope(scored: list[dict], period_base_s: float) -> dict:
-    """Fit residual slope per ICAO using unwrapped timelines; return consensus only when ≥2 ICAOs agree.
-
-    Operates on fit-eligible observations (entries with positive weight and finite fields).
-    Returns compact summaries only — no raw residual timelines or observation lists.
-
-    Structured reject reasons:
-        "insufficient_icaos"             fewer than 2 ICAOs after all filtering
-        "insufficient_icao_observations" an ICAO had < 3 eligible observations
-        "insufficient_icao_span"         an ICAO's timespan < 2 * period_base_s
-        "ambiguous_unwrap"               an ICAO had a consecutive delta near ±180°
-        "sign_disagreement"              ICAOs disagree on slope sign
-        "slope_magnitude_disagreement"   one ICAO's slope magnitude inconsistent with others
-        "nonfinite_input"                non-empty-ICAO entries had non-finite timing/residual/weight
-    """
-    _PER_ICAO_MIN_OBS = 3
-    _PER_ICAO_MIN_SPAN_ROT = 2.0
-    _AMBIGUOUS_UNWRAP_THRESHOLD_DEG = 160.0
-    _SLOPE_MAGNITUDE_RATIO_MAX = 4.0
-    _SLOPE_ABS_FLOOR_DEG_S = 0.01
-
-    # 1. Input validation.
-    # had_nonfinite is set only when a non-empty ICAO entry has non-finite/non-numeric
-    # timing/residual/weight.  Missing/empty ICAO and zero/negative weight do NOT set it.
-    had_nonfinite = False
-    valid: list[dict] = []
-    for e in scored:
-        icao = e.get("icao", "")
-        if not icao:
-            continue  # silently skip; contributes to insufficient_icaos if needed
-        eff = e.get("effective_us", None)
-        res = e.get("residual", None)
-        w = e.get("weight", None)
-        if not (_is_finite_number(eff) and _is_finite_number(res) and _is_finite_number(w)):
-            had_nonfinite = True  # non-empty ICAO with bad numerics
-            continue
-        if w <= 0:
-            continue  # zero/negative weight does NOT set had_nonfinite
-        valid.append({**e, "effective_us": float(eff), "residual": float(res), "weight": float(w)})
-
-    # 2. Group by ICAO.
-    by_icao: dict[str, list[dict]] = {}
-    for e in valid:
-        by_icao.setdefault(e["icao"], []).append(e)
-
-    _null = dict(
-        slope_deg_per_s=None, icao_slopes={}, icao_count=0,
-        sign_agreement=False, fit_span_s=0.0, per_icao_reject_reasons={},
-    )
-    if len(by_icao) < 2:
-        reason = "nonfinite_input" if had_nonfinite else "insufficient_icaos"
-        return {**_null, "reject_reason": reason}
-
-    # 3. Per-ICAO: filter, unwrap, fit slope.
-    icao_slopes: dict[str, float] = {}
-    per_icao_reject: dict[str, str] = {}
-    t_all_min = float("inf")
-    t_all_max = float("-inf")
-
-    for icao, entries in by_icao.items():
-        if len(entries) < _PER_ICAO_MIN_OBS:
-            per_icao_reject[icao] = "insufficient_icao_observations"
-            continue
-
-        entries_sorted = sorted(entries, key=lambda e: e["effective_us"])
-        ts_s = [e["effective_us"] / 1_000_000.0 for e in entries_sorted]
-        span = ts_s[-1] - ts_s[0]
-
-        if span < _PER_ICAO_MIN_SPAN_ROT * period_base_s:
-            per_icao_reject[icao] = "insufficient_icao_span"
-            continue
-
-        # Build unwrapped timeline using running cumulative circular deltas.
-        # The list has the same length as entries_sorted iff ambiguous is False.
-        residuals_raw = [e["residual"] for e in entries_sorted]
-        unwrapped = [residuals_raw[0]]  # seed with first value
-        prev = residuals_raw[0]
-        ambiguous = False
-        for raw in residuals_raw[1:]:
-            delta = (raw - prev + 540.0) % 360.0 - 180.0
-            if abs(delta) > _AMBIGUOUS_UNWRAP_THRESHOLD_DEG:
-                ambiguous = True
-                break
-            unwrapped.append(unwrapped[-1] + delta)
-            prev = raw
-
-        if ambiguous:
-            per_icao_reject[icao] = "ambiguous_unwrap"
-            continue
-
-        # unwrapped and ts_s have equal length (no ambiguous break occurred)
-        assert len(unwrapped) == len(ts_s)
-        t_ref = ts_s[0]
-        xs = [t - t_ref for t in ts_s]
-        ws = [e["weight"] for e in entries_sorted]
-        _, slope = _fit_weighted_slope(xs, unwrapped, ws)
-
-        icao_slopes[icao] = slope
-        t_all_min = min(t_all_min, ts_s[0])
-        t_all_max = max(t_all_max, ts_s[-1])
-
-    if len(icao_slopes) < 2:
-        reason = "nonfinite_input" if had_nonfinite else "insufficient_icaos"
-        return {**_null, "icao_slopes": icao_slopes, "icao_count": len(icao_slopes),
-                "per_icao_reject_reasons": per_icao_reject, "reject_reason": reason}
-
-    fit_span_s = t_all_max - t_all_min if t_all_max > t_all_min else 0.0
-
-    # 4. Sign agreement.
-    signs = [1 if s > 0 else -1 if s < 0 else 0 for s in icao_slopes.values()]
-    nonzero = [s for s in signs if s != 0]
-    if len(nonzero) < 2 or len(set(nonzero)) != 1:
-        return {**_null, "icao_slopes": icao_slopes, "icao_count": len(icao_slopes),
-                "fit_span_s": fit_span_s, "per_icao_reject_reasons": per_icao_reject,
-                "reject_reason": "sign_disagreement"}
-
-    # 5. Two-sided magnitude consistency with absolute floor.
-    # Near-zero slopes must not be counted as agreement with substantial slopes.
-    magnitudes = [abs(s) for s in icao_slopes.values()]
-    sorted_mags = sorted(magnitudes)
-    med_mag = sorted_mags[len(sorted_mags) // 2]
-    if med_mag < _SLOPE_ABS_FLOOR_DEG_S:
-        magnitude_disagrees = any(m > _SLOPE_ABS_FLOOR_DEG_S for m in magnitudes)
-    else:
-        magnitude_disagrees = any(
-            m > _SLOPE_MAGNITUDE_RATIO_MAX * med_mag
-            or m < med_mag / _SLOPE_MAGNITUDE_RATIO_MAX
-            for m in magnitudes
-        )
-    if magnitude_disagrees:
-        return {**_null, "icao_slopes": icao_slopes, "icao_count": len(icao_slopes),
-                "fit_span_s": fit_span_s, "per_icao_reject_reasons": per_icao_reject,
-                "reject_reason": "slope_magnitude_disagreement"}
-
-    # 6. Median aggregate slope.
-    sorted_slopes = sorted(icao_slopes.values())
-    n = len(sorted_slopes)
-    consensus = (sorted_slopes[n // 2] if n % 2
-                 else (sorted_slopes[n // 2 - 1] + sorted_slopes[n // 2]) / 2.0)
-
-    return {
-        "slope_deg_per_s": consensus,
-        "icao_slopes": icao_slopes,
-        "icao_count": len(icao_slopes),
-        "sign_agreement": True,
-        "fit_span_s": fit_span_s,
-        "reject_reason": None,
-        "per_icao_reject_reasons": per_icao_reject,
-    }
-
-
 def _median_float(values: list[float]) -> float | None:
     if not values:
         return None
@@ -503,126 +319,6 @@ def _residual_stats(values: list[float | None]) -> dict:
 
 def _clamp_float(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
-
-
-
-
-@_dataclass
-class SyncPrediction:
-    """Authoritative live sync prediction for one timestamp.
-
-    Sign convention: residuals are always observed_bearing - predicted_bearing.
-    Positive residual slope over effective Beast time means the model is rotating
-    too slowly, so period refinement must decrease period_s.
-    """
-    raw_arrival_us: float
-    effective_arrival_us: float
-    prop_corrected_beast_us: float
-    motion_corrected_beast_us: float
-    propagation_correction_us: float
-    motion_comp_dt_us: float | None
-    bearing_rate_deg_s: float | None
-    motion_comp_enabled: bool
-    motion_comp_applied: bool
-    motion_comp_block_reason: str | None
-    phase_in_rot_deg: float
-    predicted_bearing_raw_deg: float
-    predicted_bearing_deg: float
-    predictor_version: str = "authoritative_sync_v3_motion"
-    phase_status: str | None = None  # passthrough from LiveSyncState.phase_status; None = not yet evaluated
-
-
-def predict_sync_observation(
-    sync: "LiveSyncState",
-    arrival_us: float,
-    *,
-    range_nm: float | None = None,
-    apply_propagation: bool | None = None,
-    apply_motion: bool | None = None,
-    bearing_rate_deg_s: float | None = None,
-    motion_comp_dt_us: float | None = None,
-    motion_comp_block_reason: str | None = None,
-) -> SyncPrediction:
-    """Predict bearing from arrival time using the live sync model.
-
-    Update order:
-      1. compute propagation-corrected effective time,
-      2. subtract aircraft-motion timing shift when enabled and valid,
-      3. compute phase with the current period.
-    """
-    period_us = sync.period_s * 1e6
-    if period_us <= 0:
-        predicted = sync.phase_offset_deg % 360.0
-        return SyncPrediction(
-            raw_arrival_us=arrival_us,
-            effective_arrival_us=arrival_us,
-            prop_corrected_beast_us=arrival_us,
-            motion_corrected_beast_us=arrival_us,
-            propagation_correction_us=0.0,
-            motion_comp_dt_us=None,
-            bearing_rate_deg_s=bearing_rate_deg_s,
-            motion_comp_enabled=False,
-            motion_comp_applied=False,
-            motion_comp_block_reason="invalid_period",
-            phase_in_rot_deg=0.0,
-            predicted_bearing_raw_deg=predicted,
-            predicted_bearing_deg=predicted,
-        )
-    effective_us = arrival_us
-    prop_delay_us = 0.0
-    prop_enabled = sync.prop_delay_enabled if apply_propagation is None else bool(apply_propagation)
-    if prop_enabled:
-        prop_delay_us = _compute_propagation_delay_us(range_nm)
-        effective_us = arrival_us - prop_delay_us
-    prop_corrected_us = effective_us
-
-    motion_enabled = sync.motion_comp_phase_enabled if apply_motion is None else bool(apply_motion)
-    motion_dt = motion_comp_dt_us
-    if motion_dt is None:
-        motion_dt = _compute_motion_comp_dt_us(sync.period_s, bearing_rate_deg_s)
-    motion_applied = False
-    motion_block = motion_comp_block_reason
-    if not motion_enabled:
-        motion_block = "disabled"
-    elif motion_block is not None:
-        motion_applied = False
-    elif motion_dt is None:
-        motion_block = motion_block or "bearing_rate_unavailable"
-    else:
-        effective_us = prop_corrected_us - motion_dt
-        motion_applied = True
-        motion_block = None
-
-    phase_in_rot = ((effective_us - sync.phase_epoch_us) / period_us * 360.0) % 360.0
-    predicted_raw = (phase_in_rot + sync.phase_offset_deg) % 360.0
-    return SyncPrediction(
-        raw_arrival_us=arrival_us,
-        effective_arrival_us=effective_us,
-        prop_corrected_beast_us=prop_corrected_us,
-        motion_corrected_beast_us=effective_us,
-        propagation_correction_us=prop_delay_us,
-        motion_comp_dt_us=motion_dt,
-        bearing_rate_deg_s=bearing_rate_deg_s,
-        motion_comp_enabled=motion_enabled,
-        motion_comp_applied=motion_applied,
-        motion_comp_block_reason=motion_block,
-        phase_in_rot_deg=phase_in_rot,
-        predicted_bearing_raw_deg=predicted_raw,
-        predicted_bearing_deg=predicted_raw,
-        phase_status=getattr(sync, "phase_status", "untrusted"),
-    )
-
-
-def _predict_bearing_from_sync(
-    sync: "LiveSyncState",
-    arrival_us: float,
-    *,
-    range_nm: float | None = None,
-) -> tuple[float, float]:
-    """Compatibility wrapper around the authoritative predictor."""
-    prediction = predict_sync_observation(sync, arrival_us, range_nm=range_nm)
-    return prediction.predicted_bearing_deg, prediction.phase_in_rot_deg
-
 
 def _compute_sync_residual_deg(
     existing: "LiveSyncState",
@@ -752,36 +448,6 @@ def _estimate_aircraft_bearing_rate(
         "bearing_rate_deg_s": bearing_rate_deg_s,
         "motion_comp_block_reason": None,
     }
-
-
-# One-way speed-of-light delay per nautical mile, microseconds.
-# c = 299792458 m/s, 1 NM = 1852 m → 1 NM ≈ 6.18 µs.
-_US_PER_NM_LIGHT = 1852.0 / 299792458.0 * 1e6
-
-
-def _compute_propagation_delay_us(range_nm: float | None) -> float:
-    """One-way aircraft→receiver propagation delay for the given range.
-
-    Negative or missing ranges produce 0 so the observation passes through
-    unchanged.
-    """
-    if range_nm is None or range_nm <= 0:
-        return 0.0
-    return float(range_nm) * _US_PER_NM_LIGHT
-
-
-def _compute_motion_comp_dt_us(period_s: float, bearing_rate_deg_s: float | None) -> float | None:
-    """First-order beam-crossing timing shift from aircraft bearing rate.
-
-    If aircraft bearing changes by Δθ during one sweep, the apparent crossing
-    time shifts by approximately (Δθ / 360) * T.  With a bearing rate θdot this
-    is (θdot / 360) * T².  The returned value is subtracted from the
-    propagation-corrected Beast timestamp to put the observation on the raw
-    sweep-period basis used by phase/period fitting.
-    """
-    if bearing_rate_deg_s is None or period_s <= 0:
-        return None
-    return (bearing_rate_deg_s / 360.0) * (period_s ** 2) * 1_000_000.0
 
 
 @_dataclass
@@ -1151,672 +817,6 @@ class AircraftPositionTracker:
             }
 
         return None  # Stale with no velocity vector
-
-
-def _signal_weight(signal_dbfs: float | None) -> float | None:
-    """Convert canonical dBFS into a positive relative weight."""
-    if signal_dbfs is None:
-        return None
-    return 10 ** (signal_dbfs / 20.0)
-
-
-def refine_burst_center(reply_samples: list[tuple[float, float | None]]) -> dict:
-    """Estimate a better beam-centre timestamp from per-reply timing and amplitude.
-
-    The raw centroid remains the fallback. When multiple replies in a burst carry
-    usable signal strength, use an amplitude-weighted centre so stronger replies
-    pull the timestamp toward the beam centre rather than the burst edges.
-    """
-    arrivals_us = [arrival_us for arrival_us, _signal_dbfs in reply_samples]
-    raw_centroid_us = sum(arrivals_us) / len(arrivals_us)
-
-    weighted_samples: list[tuple[float, float]] = []
-    for arrival_us, signal_dbfs in reply_samples:
-        weight = _signal_weight(signal_dbfs)
-        if weight is not None and weight > 0:
-            weighted_samples.append((arrival_us, weight))
-
-    if len(weighted_samples) < 2:
-        return {
-            "beam_center_us": raw_centroid_us,
-            "beam_center_method": "centroid",
-            "beam_center_simple_us": raw_centroid_us,
-            "beam_center_weighted_us": None,
-            "beam_center_delta_us": 0.0,
-        }
-
-    weight_sum = sum(weight for _arrival_us, weight in weighted_samples)
-    if weight_sum <= 0:
-        return {
-            "beam_center_us": raw_centroid_us,
-            "beam_center_method": "centroid",
-            "beam_center_simple_us": raw_centroid_us,
-            "beam_center_weighted_us": None,
-            "beam_center_delta_us": 0.0,
-        }
-
-    weighted_center = (
-        sum(arrival_us * weight for arrival_us, weight in weighted_samples) / weight_sum
-    )
-    return {
-        "beam_center_us": weighted_center,
-        "beam_center_method": "amplitude_weighted",
-        "beam_center_simple_us": raw_centroid_us,
-        "beam_center_weighted_us": weighted_center,
-        "beam_center_delta_us": weighted_center - raw_centroid_us,
-    }
-
-
-def _compute_burst_timestamp_candidates(reply_samples: list[tuple[float, float | None]]) -> dict:
-    """Return diagnostic timestamp definitions for one burst in Beast microseconds."""
-    if not reply_samples:
-        return {
-            "burst_ts_first_reply_beast_us": None,
-            "burst_ts_strongest_reply_beast_us": None,
-            "burst_ts_simple_centroid_beast_us": None,
-            "burst_ts_weighted_centroid_beast_us": None,
-            "burst_ts_mid_strong_window_beast_us": None,
-            "burst_ts_last_reply_beast_us": None,
-            "burst_span_us": None,
-            "peak_amplitude": None,
-        }
-
-    samples = sorted(reply_samples, key=lambda item: item[0])
-    arrivals_us = [float(arrival_us) for arrival_us, _signal_dbfs in samples]
-    simple_centroid = sum(arrivals_us) / len(arrivals_us)
-    weighted_samples: list[tuple[float, float]] = []
-    strongest_ts = None
-    strongest_signal = None
-    for arrival_us, signal_dbfs in samples:
-        if signal_dbfs is None:
-            continue
-        if strongest_signal is None or signal_dbfs > strongest_signal:
-            strongest_signal = signal_dbfs
-            strongest_ts = float(arrival_us)
-        weight = _signal_weight(signal_dbfs)
-        if weight is not None and weight > 0:
-            weighted_samples.append((float(arrival_us), weight))
-
-    weighted_centroid = None
-    if len(weighted_samples) >= 2:
-        weight_sum = sum(weight for _arrival_us, weight in weighted_samples)
-        if weight_sum > 0:
-            weighted_centroid = sum(arrival_us * weight for arrival_us, weight in weighted_samples) / weight_sum
-
-    mid_strong_window = None
-    if strongest_signal is not None:
-        strong_arrivals = [
-            float(arrival_us)
-            for arrival_us, signal_dbfs in samples
-            if signal_dbfs is not None and signal_dbfs >= strongest_signal - 6.0
-        ]
-        if strong_arrivals:
-            mid_strong_window = (min(strong_arrivals) + max(strong_arrivals)) / 2.0
-
-    return {
-        "burst_ts_first_reply_beast_us": arrivals_us[0],
-        "burst_ts_strongest_reply_beast_us": strongest_ts,
-        "burst_ts_simple_centroid_beast_us": simple_centroid,
-        "burst_ts_weighted_centroid_beast_us": weighted_centroid,
-        "burst_ts_mid_strong_window_beast_us": mid_strong_window,
-        "burst_ts_last_reply_beast_us": arrivals_us[-1],
-        "burst_span_us": arrivals_us[-1] - arrivals_us[0] if len(arrivals_us) > 1 else 0.0,
-        "peak_amplitude": strongest_signal,
-    }
-
-
-def detect_bursts(arrival_us_list: list[float]) -> list[dict]:
-    """Group sorted arrival times into bursts separated by BURST_GAP_US.
-
-    Returns list of dicts: {centroid_us, n_replies, span_us, arrivals_us}
-    """
-    if not arrival_us_list:
-        return []
-
-    sorted_ts = (
-        arrival_us_list
-        if all(
-            arrival_us_list[i] <= arrival_us_list[i + 1]
-            for i in range(len(arrival_us_list) - 1)
-        )
-        else sorted(arrival_us_list)
-    )
-    groups: list[list[float]] = []
-    current = [sorted_ts[0]]
-
-    for ts in sorted_ts[1:]:
-        if ts - current[-1] > BURST_GAP_US:
-            groups.append(current)
-            current = [ts]
-        else:
-            current.append(ts)
-    groups.append(current)
-
-    return [
-        {
-            "centroid_us": sum(b) // len(b),
-            "n_replies": len(b),
-            "span_us": b[-1] - b[0] if len(b) > 1 else 0,
-            "arrivals_us": b,
-        }
-        for b in groups
-    ]
-
-
-def detect_bursts_with_signals(reply_samples: list[tuple[float, float | None]]) -> list[dict]:
-    """Group sorted `(arrival_us, signal_dbfs)` samples into bursts.
-
-    Returns list of dicts:
-    `{centroid_us, n_replies, span_us, arrivals_us, replies, signal_dbfs}`
-    where `signal_dbfs` is the average of the replies in that burst.
-    """
-    if not reply_samples:
-        return []
-
-    sorted_samples = sorted(reply_samples, key=lambda item: item[0])
-    groups: list[list[tuple[float, float | None]]] = []
-    current = [sorted_samples[0]]
-
-    for sample in sorted_samples[1:]:
-        if sample[0] - current[-1][0] > BURST_GAP_US:
-            groups.append(current)
-            current = [sample]
-        else:
-            current.append(sample)
-    groups.append(current)
-
-    bursts = []
-    for group in groups:
-        arrivals_us = [arrival_us for arrival_us, _signal_dbfs in group]
-        signals = [signal_dbfs for _arrival_us, signal_dbfs in group if signal_dbfs is not None]
-        replies = [
-            {"arrival_us": arrival_us, "signal_dbfs": signal_dbfs}
-            for arrival_us, signal_dbfs in group
-        ]
-        refinement = refine_burst_center(group)
-        timestamp_candidates = _compute_burst_timestamp_candidates(group)
-        bursts.append(
-            {
-                "centroid_us": sum(arrivals_us) / len(arrivals_us),
-                "n_replies": len(arrivals_us),
-                "span_us": arrivals_us[-1] - arrivals_us[0] if len(arrivals_us) > 1 else 0,
-                "arrivals_us": arrivals_us,
-                "replies": replies,
-                "signal_dbfs": round(sum(signals) / len(signals), 2) if signals else None,
-                "beam_center_us": refinement["beam_center_us"],
-                "beam_center_method": refinement["beam_center_method"],
-                "beam_center_simple_us": refinement.get("beam_center_simple_us"),
-                "beam_center_weighted_us": refinement.get("beam_center_weighted_us"),
-                "beam_center_delta_us": refinement.get("beam_center_delta_us"),
-                **timestamp_candidates,
-            }
-        )
-
-    return bursts
-
-
-def analyse_icao(bursts: list[dict]) -> dict | None:
-    """Compute rotation period from inter-burst intervals for one ICAO.
-
-    Returns None if insufficient bursts.
-    """
-    if len(bursts) < MIN_BURSTS:
-        return None
-
-    centroids = [b["centroid_us"] for b in bursts]
-    intervals_us = [centroids[i + 1] - centroids[i] for i in range(len(centroids) - 1)]
-    intervals_s = [iv / 1_000_000 for iv in intervals_us]
-
-    # Filter obviously wrong intervals (< 1s or > 30s)
-    valid = [iv for iv in intervals_s if 1.0 < iv < 30.0]
-    if len(valid) < 2:
-        return None
-
-    def _cluster_repeated_intervals(intervals_s: list[float]) -> list[dict]:
-        clusters: list[list[float]] = []
-        for interval_s in sorted(intervals_s):
-            placed = False
-            for cluster in clusters:
-                cluster_med = statistics.median(cluster)
-                if cluster_med > 0 and abs(interval_s - cluster_med) / cluster_med <= SERIES_CLUSTER_TOLERANCE:
-                    cluster.append(interval_s)
-                    placed = True
-                    break
-            if not placed:
-                clusters.append([interval_s])
-
-        series_candidates: list[dict] = []
-        for cluster in clusters:
-            if len(cluster) < 2:
-                continue
-            cluster_med = statistics.median(cluster)
-            series_candidates.append(
-                {
-                    "period_s": cluster_med,
-                    "n_intervals": len(cluster),
-                    "std_s": statistics.stdev(cluster) if len(cluster) > 1 else 0.0,
-                }
-            )
-
-        series_candidates.sort(
-            key=lambda item: (
-                item["n_intervals"],
-                -item["std_s"],
-                -item["period_s"],
-            ),
-            reverse=True,
-        )
-        return series_candidates
-
-    series_candidates = _cluster_repeated_intervals(valid)
-    if not series_candidates:
-        return None
-
-    strongest = series_candidates[0]
-    strongest_period = strongest["period_s"]
-    filtered = [iv for iv in valid if abs(iv - strongest_period) / strongest_period <= 0.5]
-    if len(filtered) < 2:
-        filtered = [strongest_period] * strongest["n_intervals"]
-
-    return {
-        "n_bursts": len(bursts),
-        "n_intervals": strongest["n_intervals"],
-        "centroids_us": centroids,
-        "median_period_s": strongest_period,
-        "mean_period_s": statistics.mean(filtered),
-        "std_s": strongest["std_s"],
-        "all_intervals_s": list(intervals_s),
-        "series_candidates": series_candidates,
-        "avg_replies_per_burst": round(
-            statistics.mean(b["n_replies"] for b in bursts), 1
-        ),
-    }
-
-
-def _snap_intervals(intervals_s: list[float], base_period: float,
-                    tolerance: float = 0.08) -> dict:
-    """Check how well individual intervals snap to integer multiples of base_period."""
-    mult_counts: dict[int, int] = defaultdict(int)
-    non_snapped = []
-
-    for iv in intervals_s:
-        if iv <= 0:
-            continue
-        ratio = iv / base_period
-        nearest = round(ratio)
-        if nearest < 1:
-            nearest = 1
-        if abs(ratio - nearest) / nearest < tolerance:
-            mult_counts[nearest] += 1
-        else:
-            non_snapped.append(iv)
-
-    total = len(intervals_s)
-    n_snapped = sum(mult_counts.values())
-    snap_rate = n_snapped / total if total > 0 else 0.0
-
-    total_sweeps = sum(n * c for n, c in mult_counts.items())
-    implied_detect = n_snapped / total_sweeps if total_sweeps > 0 else 0.0
-
-    return {
-        "snap_rate": snap_rate,
-        "mult_counts": dict(sorted(mult_counts.items())),
-        "non_snapped": non_snapped,
-        "implied_detect": implied_detect,
-    }
-
-
-def _evaluate_base_candidate(
-    candidate: float,
-    icao_results: dict[str, dict],
-    tolerance: float = 0.05,
-) -> dict:
-    """Score one base-period candidate against all ICAO burst series.
-
-    A shorter false period can often explain a true dominant family only as ×2/×3
-    harmonics. To avoid collapsing to that artefact, candidates are ranked by a
-    weighted support score that prefers direct ×1 alignments over harmonic-only fits.
-    """
-    folded: dict[str, dict] = {}
-    residual: dict[str, float] = {}
-    support_weight = 0.0
-    direct_count = 0
-    folded_count = 0
-
-    def _pick_centroid_sequence(centroids_us: list[int]) -> tuple[list[int], float]:
-        if candidate <= 0 or len(centroids_us) < 3:
-            return [], 0.0
-
-        best_sequence: list[int] = []
-        best_error = float("inf")
-        for anchor_idx, anchor_us in enumerate(centroids_us):
-            matched = [anchor_us]
-            error_sum = 0.0
-            for centroid_us in centroids_us[anchor_idx + 1:]:
-                delta_s = (centroid_us - anchor_us) / 1_000_000.0
-                nearest = round(delta_s / candidate)
-                if nearest < 1:
-                    continue
-                frac_error = abs(delta_s - (nearest * candidate)) / candidate
-                if frac_error <= 0.12:
-                    matched.append(centroid_us)
-                    error_sum += frac_error
-
-            if len(matched) > len(best_sequence) or (len(matched) == len(best_sequence) and error_sum < best_error):
-                best_sequence = matched
-                best_error = error_sum
-
-        coverage = len(best_sequence) / len(centroids_us) if centroids_us else 0.0
-        return best_sequence, coverage
-
-    for icao, result in icao_results.items():
-        period = result["median_period_s"]
-        series_candidates = result.get("series_candidates") or [
-            {"period_s": period, "n_intervals": result.get("n_intervals", 0), "std_s": result.get("std_s", 0.0)}
-        ]
-        best_match = None
-        for series in series_candidates:
-            series_period = series["period_s"]
-            ratio = series_period / candidate
-            nearest_int = round(ratio)
-            if nearest_int < 1:
-                nearest_int = 1
-            relative_err = abs(ratio - nearest_int) / nearest_int
-            if relative_err >= tolerance:
-                continue
-            match = {
-                "period_s": series_period,
-                "n_intervals": series.get("n_intervals", 0),
-                "nearest_int": nearest_int,
-                "relative_err": relative_err,
-                "std_s": series.get("std_s", 0.0),
-            }
-            if best_match is None or (
-                match["nearest_int"] == 1,
-                match["n_intervals"],
-                -match["relative_err"],
-                -match["std_s"],
-            ) > (
-                best_match["nearest_int"] == 1,
-                best_match["n_intervals"],
-                -best_match["relative_err"],
-                -best_match["std_s"],
-            ):
-                best_match = match
-
-        if best_match is not None:
-            nearest_int = best_match["nearest_int"]
-            detection_rate = 1.0 / nearest_int
-            folded[icao] = {
-                "raw_period_s": best_match["period_s"],
-                "multiplier": nearest_int,
-                "folded_period_s": best_match["period_s"] / nearest_int,
-                "detection_rate": detection_rate,
-                "method": "median",
-                "snap_info": None,
-            }
-            folded_count += 1
-            support_weight += best_match["n_intervals"] * detection_rate
-            if nearest_int == 1:
-                direct_count += 1
-        else:
-            residual[icao] = period
-
-    # Pass 2: interval-level snap check for residuals
-    snap_threshold = 0.80
-    still_residual: dict[str, float] = {}
-
-    for icao in list(residual.keys()):
-        all_intervals = icao_results[icao].get("all_intervals_s", [])
-        valid_intervals = [iv for iv in all_intervals if 1.0 < iv < 30.0]
-        if len(valid_intervals) < 3:
-            snap = None
-        else:
-            snap = _snap_intervals(valid_intervals, candidate)
-
-        if snap is not None and snap["snap_rate"] >= snap_threshold:
-            mult_counts = snap["mult_counts"]
-            dom_mult = max(mult_counts, key=mult_counts.get) if mult_counts else 1
-            folded[icao] = {
-                "raw_period_s": residual[icao],
-                "multiplier": dom_mult,
-                "folded_period_s": candidate,
-                "detection_rate": snap["implied_detect"],
-                "method": "interval",
-                "snap_info": snap,
-            }
-            folded_count += 1
-            support_weight += icao_results[icao].get("n_intervals", 0) * snap["implied_detect"]
-            if dom_mult == 1:
-                direct_count += 1
-            continue
-
-        centroids_us = icao_results[icao].get("centroids_us", [])
-        sequence, coverage = _pick_centroid_sequence(centroids_us)
-        if len(sequence) >= 3 and coverage >= 0.6:
-            observed_span_s = (sequence[-1] - sequence[0]) / 1_000_000.0 if len(sequence) > 1 else 0.0
-            implied_sweeps = max(1, round(observed_span_s / candidate))
-            detection_rate = ((len(sequence) - 1) / implied_sweeps) if implied_sweeps > 0 else 0.0
-            folded[icao] = {
-                "raw_period_s": residual[icao],
-                "multiplier": 1,
-                "folded_period_s": candidate,
-                "detection_rate": detection_rate,
-                "method": "centroid",
-                "snap_info": {
-                    "matched_centroids": sequence,
-                    "coverage": coverage,
-                },
-            }
-            folded_count += 1
-            support_weight += max(len(sequence) - 1, 1) * max(detection_rate, coverage)
-            direct_count += 1
-            continue
-
-        still_residual[icao] = residual[icao]
-
-    return {
-        "dominant_period_s": candidate,
-        "folded": folded,
-        "residual": still_residual,
-        "support_weight": support_weight,
-        "direct_count": direct_count,
-        "folded_count": folded_count,
-    }
-
-
-def _fold_harmonics(icao_results: dict[str, dict], tolerance: float = 0.05) -> dict:
-    """Detect and fold missed-sweep harmonics into the dominant period.
-
-    Candidate base periods are scored across all ICAOs. The chosen dominant period
-    should match the strongest visible family, rather than a shorter artefactual
-    period that only explains the true family as harmonics.
-    """
-    if not icao_results:
-        return {"dominant_period_s": None, "folded": {}, "residual": {}}
-
-    candidate_values = sorted([
-        series["period_s"]
-        for result in icao_results.values()
-        for series in (result.get("series_candidates") or [])
-        if series.get("period_s") is not None
-    ] + [
-        result["median_period_s"]
-        for result in icao_results.values()
-        if result.get("median_period_s") is not None
-    ])
-    candidates: list[float] = []
-    for value in candidate_values:
-        if not candidates or abs(value - candidates[-1]) > 1e-9:
-            candidates.append(value)
-    if not candidates:
-        return {"dominant_period_s": None, "folded": {}, "residual": {}}
-
-    evaluations = [
-        _evaluate_base_candidate(candidate, icao_results, tolerance=tolerance)
-        for candidate in candidates
-    ]
-    evaluations.sort(
-        key=lambda item: (
-            item["direct_count"],
-            item["support_weight"],
-            item["folded_count"],
-            -len(item["residual"]),
-            -item["dominant_period_s"],
-        ),
-        reverse=True,
-    )
-    best = evaluations[0]
-    return {
-        "dominant_period_s": best["dominant_period_s"],
-        "folded": best["folded"],
-        "residual": best["residual"],
-        "support_weight": best["support_weight"],
-        "direct_count": best["direct_count"],
-        "folded_count": best["folded_count"],
-    }
-
-
-def _analyse_iid_events(
-    events_for_iid: list[tuple[int, int, str, float | None]]
-) -> RotationModel:
-    """Run full rotation analysis for one IID.
-
-    events_for_iid: [(arrival_us, iid, icao, signal_dbfs), ...] filtered to one IID.
-    Returns a RotationModel.
-    """
-    # Group by ICAO
-    icao_arrivals: dict[str, list[int]] = defaultdict(list)
-    for arrival_us, _iid, icao, _sig in events_for_iid:
-        if icao:
-            icao_arrivals[icao].append(arrival_us)
-
-    icao_results: dict[str, dict] = {}
-    for icao, arrivals in icao_arrivals.items():
-        bursts = detect_bursts(arrivals)
-        result = analyse_icao(bursts)
-        if result is not None:
-            icao_results[icao] = result
-
-    if not icao_results:
-        return RotationModel(
-            status="INSUFFICIENT_DATA",
-            n_qualifying=0,
-            last_updated=time.time(),
-        )
-
-    harmonics = _fold_harmonics(icao_results)
-    dominant = harmonics["dominant_period_s"]
-    final_residual = dict(harmonics["residual"])
-    n_residual = len(final_residual)
-
-    folded_periods = [
-        f["folded_period_s"] for f in harmonics["folded"].values()
-    ]
-    if not folded_periods:
-        folded_periods = [r["median_period_s"] for r in icao_results.values()]
-
-    spread = max(folded_periods) - min(folded_periods)
-    overall_std = statistics.stdev(folded_periods) if len(folded_periods) > 1 else 0.0
-
-    if n_residual == 0 and spread < 0.1:
-        verdict = "SINGLE_RADAR"
-    elif n_residual == 0 and spread < 0.5:
-        verdict = "LIKELY_SINGLE"
-    elif n_residual > 0:
-        verdict = "CHECK_MULTI"
-    else:
-        verdict = "CHECK_MULTI"
-
-    n_harmonic = sum(
-        1 for f in harmonics["folded"].values() if f["multiplier"] > 1
-    )
-
-    rpm = 60.0 / dominant if dominant and dominant > 0 else None
-
-    return RotationModel(
-        dominant_period_s=dominant,
-        secondary_period_s=None,
-        primary_direct_count=harmonics.get("direct_count", 0),
-        secondary_direct_count=0,
-        period_std_s=round(overall_std, 6),
-        status=verdict,
-        n_qualifying=len(icao_results),
-        n_harmonic=n_harmonic,
-        n_residual=n_residual,
-        rpm=round(rpm, 3) if rpm is not None else None,
-        folded=harmonics["folded"],
-        secondary_folded={},
-        residual=final_residual,
-        last_updated=time.time(),
-    )
-
-
-def _analyse_burst_records(records: list[BurstRecord]) -> RotationModel:
-    """Run full rotation analysis for one IID from BurstRecord objects.
-
-    Equivalent to _analyse_iid_events but consumes already-computed burst
-    centroids rather than re-running burst detection on raw arrival timestamps.
-    records: BurstRecord list filtered to one IID, within the analysis window.
-    """
-    icao_bursts: dict[str, list[dict]] = defaultdict(list)
-    for r in records:
-        if r.icao:
-            icao_bursts[r.icao].append({"centroid_us": r.centroid_us, "n_replies": r.n_replies})
-    for bursts in icao_bursts.values():
-        bursts.sort(key=lambda b: b["centroid_us"])
-
-    icao_results: dict[str, dict] = {}
-    for icao, bursts in icao_bursts.items():
-        result = analyse_icao(bursts)
-        if result is not None:
-            icao_results[icao] = result
-
-    if not icao_results:
-        return RotationModel(
-            status="INSUFFICIENT_DATA",
-            n_qualifying=0,
-            last_updated=time.time(),
-        )
-
-    harmonics = _fold_harmonics(icao_results)
-    dominant = harmonics["dominant_period_s"]
-    final_residual = dict(harmonics["residual"])
-    n_residual = len(final_residual)
-
-    folded_periods = [f["folded_period_s"] for f in harmonics["folded"].values()]
-    if not folded_periods:
-        folded_periods = [r["median_period_s"] for r in icao_results.values()]
-
-    spread = max(folded_periods) - min(folded_periods)
-    overall_std = statistics.stdev(folded_periods) if len(folded_periods) > 1 else 0.0
-
-    if n_residual == 0 and spread < 0.1:
-        verdict = "SINGLE_RADAR"
-    elif n_residual == 0 and spread < 0.5:
-        verdict = "LIKELY_SINGLE"
-    else:
-        verdict = "CHECK_MULTI"
-
-    n_harmonic = sum(1 for f in harmonics["folded"].values() if f["multiplier"] > 1)
-    rpm = 60.0 / dominant if dominant and dominant > 0 else None
-
-    return RotationModel(
-        dominant_period_s=dominant,
-        secondary_period_s=None,
-        primary_direct_count=harmonics.get("direct_count", 0),
-        secondary_direct_count=0,
-        period_std_s=round(overall_std, 6),
-        status=verdict,
-        n_qualifying=len(icao_results),
-        n_harmonic=n_harmonic,
-        n_residual=n_residual,
-        rpm=round(rpm, 3) if rpm is not None else None,
-        folded=harmonics["folded"],
-        secondary_folded={},
-        residual=final_residual,
-        last_updated=time.time(),
-    )
 
 
 def _periods_match(period_a: float | None, period_b: float | None, tolerance: float = PERIOD_MATCH_TOLERANCE) -> bool:
@@ -2374,28 +1374,7 @@ class RadarState:
 
     @staticmethod
     def _summarise_live_sync_observation_buffer(obs_snapshot: list[AlignedBurstSyncObs], max_entries: int) -> dict:
-        """Return count/span diagnostics for one retained observation deque snapshot."""
-        count = len(obs_snapshot)
-        if count <= 0:
-            return {
-                "count": 0,
-                "max_entries": max_entries,
-                "cap_hit": False,
-                "oldest_burst_centroid_us": None,
-                "newest_burst_centroid_us": None,
-                "retained_duration_s": 0.0,
-            }
-        oldest_us = float(getattr(obs_snapshot[0], "burst_centroid_us", 0.0))
-        newest_us = float(getattr(obs_snapshot[-1], "burst_centroid_us", oldest_us))
-        retained_duration_s = max(0.0, (newest_us - oldest_us) / 1_000_000.0)
-        return {
-            "count": count,
-            "max_entries": max_entries,
-            "cap_hit": bool(max_entries and count >= max_entries),
-            "oldest_burst_centroid_us": oldest_us,
-            "newest_burst_centroid_us": newest_us,
-            "retained_duration_s": retained_duration_s,
-        }
+        return _summarise_live_sync_observation_buffer_helper(obs_snapshot, max_entries)
 
     def _build_live_sync_retention_diagnostics(
         self,
@@ -2403,28 +1382,12 @@ class RadarState:
         aligned_snapshot: list[AlignedBurstSyncObs],
         timeline_snapshot: list[AlignedBurstSyncObs],
     ) -> dict:
-        """Per-IID retention diagnostics for live sync/alignment observation buffers."""
-        return {
-            "iid": iid,
-            "retention_target_s": self._LIVE_SYNC_OBS_RETENTION_S,
-            "aligned": self._summarise_live_sync_observation_buffer(
-                aligned_snapshot,
-                self._MULTI_SYNC_OBS_MAX,
-            ),
-            "timeline": self._summarise_live_sync_observation_buffer(
-                timeline_snapshot,
-                self._BURST_SYNC_TIMELINE_OBS_MAX,
-            ),
-        }
+        return _build_live_sync_retention_diagnostics_helper(self, iid, aligned_snapshot, timeline_snapshot)
 
     @staticmethod
     def _fit_window_s_for_period(period_s: float | None) -> float:
         """Return the short solver window used for local multi-sync fitting."""
-        try:
-            period = float(period_s or 0.0)
-        except (TypeError, ValueError):
-            period = 0.0
-        return max(period * _SIMPLE_SYNC_FIT_WINDOW_ROTATIONS, _SIMPLE_SYNC_FIT_WINDOW_MIN_S)
+        return _fit_window_s_for_period_helper(period_s)
 
     def _sync_horizons_payload(self, sync: "LiveSyncState | None", *, display_window_s: float | None = None) -> dict:
         """Expose the distinct solver, display, and authoritative horizons."""
@@ -3374,46 +2337,14 @@ class RadarState:
 
     @staticmethod
     def _normalise_go_frame_position(entry: dict) -> dict | None:
-        try:
-            lat = entry.get("lat")
-            lon = entry.get("lon")
-            if lat is None or lon is None:
-                return None
-            return {
-                "frame_index": int(entry["frame_index"]),
-                "sweep_start_us": float(entry["sweep_start_us"]),
-                "lat": float(lat),
-                "lon": float(lon),
-                "cep_km": float(entry.get("cep_km") or 0.0),
-                "n_contributing_arcs": int(entry.get("n_contributing_arcs") or 0),
-                "azimuth_spread_deg": float(entry.get("azimuth_spread_deg") or 0.0),
-                "weight": float(entry.get("weight") or 0.0),
-            }
-        except Exception:
-            return None
+        return _normalise_go_frame_position_helper(entry)
 
     @staticmethod
     def _go_frame_position_signature(entry: dict) -> tuple:
-        return (
-            entry.get("frame_index"),
-            entry.get("sweep_start_us"),
-            entry.get("lat"),
-            entry.get("lon"),
-            entry.get("cep_km"),
-            entry.get("n_contributing_arcs"),
-            entry.get("azimuth_spread_deg"),
-            entry.get("weight"),
-        )
+        return _go_frame_position_signature_helper(entry)
 
     def _set_go_frame_positions_locked(self, iid: int, entries: list[dict]) -> bool:
-        existing = list(self._go_frame_positions.get(iid, ()))
-        existing_sig = tuple(self._go_frame_position_signature(entry) for entry in existing)
-        next_sig = tuple(self._go_frame_position_signature(entry) for entry in entries)
-        if existing_sig == next_sig:
-            return False
-        self._go_frame_positions[iid] = deque(entries, maxlen=self._GO_FRAME_POSITIONS_MAX)
-        self._go_frame_positions_revision[iid] = self._go_frame_positions_revision.get(iid, 0) + 1
-        return True
+        return _set_go_frame_positions_locked_helper(self, iid, entries)
 
     def update_go_frame_position_result(self, result_dict: dict) -> None:
         try:
@@ -3629,57 +2560,11 @@ class RadarState:
 
     @staticmethod
     def _normalise_go_multi_sync_admission(entry: dict) -> dict | None:
-        if not isinstance(entry, dict):
-            return None
-        counts_raw = entry.get("counts") or {}
-        if not isinstance(counts_raw, dict):
-            counts_raw = {}
-        try:
-            counts = {str(k): int(v) for k, v in counts_raw.items()}
-        except Exception:
-            counts = {}
-        last_icao = entry.get("last_icao")
-        if last_icao is not None:
-            try:
-                last_icao = f"{int(last_icao):06X}"
-            except Exception:
-                last_icao = None
-        return {
-            "last_reason": entry.get("last_reason"),
-            "last_icao": last_icao,
-            "last_ts": float(entry.get("last_ts") or 0.0),
-            "counts": counts,
-        }
+        return _normalise_go_multi_sync_admission_helper(entry)
 
     @staticmethod
     def _normalise_go_anchor_candidates(entries: list | None) -> list[dict]:
-        if not isinstance(entries, list):
-            return []
-        results: list[dict] = []
-        for raw in entries:
-            if not isinstance(raw, dict):
-                continue
-            icao = raw.get("i")
-            try:
-                icao_text = f"{int(icao):06X}" if icao is not None else None
-            except Exception:
-                icao_text = None
-            if not icao_text:
-                continue
-            reject_reasons = raw.get("rr") or []
-            if not isinstance(reject_reasons, list):
-                reject_reasons = []
-            results.append({
-                "icao": icao_text,
-                "score": float(raw.get("s") or 0.0),
-                "spread_deg": float(raw.get("sp") or 0.0),
-                "obs_count": int(raw.get("o") or 0),
-                "fit_eligible_count": int(raw.get("f") or 0),
-                "fit_eligible_fraction": float(raw.get("ff") or 0.0),
-                "status": raw.get("st") or "unknown",
-                "reject_reasons": [str(reason) for reason in reject_reasons if reason],
-            })
-        return results
+        return _normalise_go_anchor_candidates_helper(entries)
 
     def _record_compact_sync_transition_locked(
         self,
@@ -3749,97 +2634,17 @@ class RadarState:
 
     @staticmethod
     def _normalise_go_track_observation(entry: dict) -> dict | None:
-        if not isinstance(entry, dict):
-            return None
-        try:
-            return {
-                "iid": int(entry["iid"]),
-                "icao": f"{int(entry['icao']):06X}",
-                "arrival_us": float(entry["arrival_us"]),
-                "wall_ts": float(entry["wall_ts"]),
-                "signal_dbfs": (
-                    float(entry["signal_dbfs"])
-                    if entry.get("signal_dbfs") is not None else None
-                ),
-                "truth_lat": (
-                    float(entry["truth_lat"])
-                    if entry.get("truth_lat") is not None else None
-                ),
-                "truth_lon": (
-                    float(entry["truth_lon"])
-                    if entry.get("truth_lon") is not None else None
-                ),
-                "position_age_seconds": (
-                    float(entry["position_age_s"])
-                    if entry.get("position_age_s") is not None else None
-                ),
-                "association_confidence": float(entry.get("association_confidence") or 0.0),
-                "dominant_family": bool(entry.get("dominant_family")),
-            }
-        except Exception:
-            return None
+        return _normalise_go_track_observation_helper(entry)
 
-    @_dataclass
-    class _GoSweepFrame:
-        iid: int
-        frame: Any
+    _GoSweepFrame = _DiagGoSweepFrame
 
     @staticmethod
     def _normalise_go_sweep_frame(entry: dict) -> "RadarState._GoSweepFrame | None":
-        if not isinstance(entry, dict):
-            return None
-        try:
-            from .models import SweepFrame, SweepFrameObservation
-
-            iid = int(entry["iid"])
-            observations = []
-            for obs in entry.get("observations") or []:
-                observations.append(SweepFrameObservation(
-                    icao=f"{int(obs['icao']):06X}" if not isinstance(obs.get("icao"), str) else str(obs.get("icao")).upper(),
-                    lat=float(obs["lat"]),
-                    lon=float(obs["lon"]),
-                    arrival_us=float(obs["arrival_us"]),
-                    n_replies=int(obs.get("n_replies") or 1),
-                    position_age_seconds=float(obs.get("position_age_s") or 0.0),
-                ))
-            frame = SweepFrame(
-                frame_index=int(entry["frame_index"]),
-                sweep_start_us=float(entry["ref_arrival_us"]),
-                ref_icao=f"{int(entry['ref_icao']):06X}" if not isinstance(entry.get("ref_icao"), str) else str(entry.get("ref_icao")).upper(),
-                ref_lat=float(entry["ref_lat"]),
-                ref_lon=float(entry["ref_lon"]),
-                ref_arrival_us=float(entry["ref_arrival_us"]),
-                observations=observations,
-                quality=str(entry.get("quality") or "marginal"),
-                period_s=float(entry["period_s"]) if entry.get("period_s") is not None else None,
-            )
-            return RadarState._GoSweepFrame(iid=iid, frame=frame)
-        except Exception:
-            return None
+        return _normalise_go_sweep_frame_helper(entry)
 
     @staticmethod
     def _go_sweep_frame_signature(frames: list) -> tuple:
-        return tuple(
-            (
-                int(frame.frame_index),
-                str(frame.ref_icao),
-                round(float(frame.ref_arrival_us), 3),
-                str(frame.quality),
-                round(float(frame.period_s or 0.0), 9),
-                tuple(
-                    (
-                        str(obs.icao),
-                        round(float(obs.arrival_us), 3),
-                        round(float(obs.lat), 6),
-                        round(float(obs.lon), 6),
-                        int(getattr(obs, "n_replies", 1)),
-                        round(float(getattr(obs, "position_age_seconds", 0.0)), 3),
-                    )
-                    for obs in frame.observations
-                ),
-            )
-            for frame in frames
-        )
+        return _go_sweep_frame_signature_helper(frames)
 
     def _store_go_sweep_frame_locked(self, iid: int, frame) -> None:
         buf = self._go_sweep_frames_by_iid.setdefault(
@@ -3895,73 +2700,7 @@ class RadarState:
 
     @staticmethod
     def _normalise_go_evidence_event(entry: dict) -> dict | None:
-        if not isinstance(entry, dict):
-            return None
-        try:
-            return {
-                "kind": str(entry.get("kind") or "burst_fired"),
-                "iid": int(entry["iid"]),
-                "icao": f"{int(entry['icao']):06X}",
-                "arrival_us": float(entry["arrival_us"]),
-                "simple_centroid_us": (
-                    float(entry["simple_centroid_us"])
-                    if entry.get("simple_centroid_us") is not None else None
-                ),
-                "weighted_centroid_us": (
-                    float(entry["weighted_centroid_us"])
-                    if entry.get("weighted_centroid_us") is not None else None
-                ),
-                "centroid_delta_us": (
-                    float(entry["centroid_delta_us"])
-                    if entry.get("centroid_delta_us") is not None else None
-                ),
-                "first_reply_us": (
-                    float(entry["first_reply_us"])
-                    if entry.get("first_reply_us") is not None else None
-                ),
-                "strongest_reply_us": (
-                    float(entry["strongest_reply_us"])
-                    if entry.get("strongest_reply_us") is not None else None
-                ),
-                "mid_strong_window_us": (
-                    float(entry["mid_strong_window_us"])
-                    if entry.get("mid_strong_window_us") is not None else None
-                ),
-                "last_reply_us": (
-                    float(entry["last_reply_us"])
-                    if entry.get("last_reply_us") is not None else None
-                ),
-                "span_us": (
-                    float(entry["span_us"])
-                    if entry.get("span_us") is not None else None
-                ),
-                "peak_amplitude": (
-                    float(entry["peak_amplitude"])
-                    if entry.get("peak_amplitude") is not None else None
-                ),
-                "wall_ts": float(entry["wall_ts"]),
-                "n_replies": int(entry.get("n_replies") or 0),
-                "signal_dbfs": (
-                    float(entry["signal_dbfs"])
-                    if entry.get("signal_dbfs") is not None else None
-                ),
-                "truth_lat": (
-                    float(entry["truth_lat"])
-                    if entry.get("truth_lat") is not None else None
-                ),
-                "truth_lon": (
-                    float(entry["truth_lon"])
-                    if entry.get("truth_lon") is not None else None
-                ),
-                "position_age_seconds": (
-                    float(entry["position_age_s"])
-                    if entry.get("position_age_s") is not None else None
-                ),
-                "association_confidence": float(entry.get("association_confidence") or 0.0),
-                "dominant_family": bool(entry.get("dominant_family")),
-            }
-        except Exception:
-            return None
+        return _normalise_go_evidence_event_helper(entry)
 
     def update_go_burst_fired(self, burst_dict: dict) -> None:
         _common = {
@@ -4009,19 +2748,13 @@ class RadarState:
                 self._go_evidence_events.append(evidence)
 
     def _go_track_observation_snapshot(self) -> list[dict]:
-        with self._lock:
-            return list(self._go_track_observations)
+        return _go_track_observation_snapshot_helper(self)
 
     def _go_evidence_event_snapshot(self, iid: int | None = None) -> list[dict]:
-        with self._lock:
-            if iid is None:
-                return list(self._go_evidence_events)
-            return [entry for entry in self._go_evidence_events if int(entry.get("iid", -1)) == iid]
+        return _go_evidence_event_snapshot_helper(self, iid)
 
     def _go_multi_sync_admission_snapshot(self, iid: int) -> dict | None:
-        with self._lock:
-            payload = self._go_multi_sync_admission_by_iid.get(iid)
-            return dict(payload) if payload is not None else None
+        return _go_multi_sync_admission_snapshot_helper(self, iid)
 
     def _adopt_go_frame_sync_locked(self, iid: int, go_sync: dict) -> None:
         existing = self._live_sync_states.get(iid)
@@ -5103,453 +3836,8 @@ class RadarState:
         period_s: float,
         sync_quality: float | None = None,
     ) -> None:
-        """Simple live sync state update — the unconditional Python sync path.
-
-        Architecture (four explicit components):
-          A. period_base_s from DF alignment (caller-supplied period_s / existing.period_base_s).
-             No period-family selection, reacquisition, or family-hopping recovery here.
-          B. Bounded period correction: per-ICAO unwrapped slope consensus only.
-             Hard ±500 PPM cap from period_base_s.  No b_fit, no strong-fit exception,
-             no adaptive wide clamp, no wrong-period-family detection.
-          C. Absolute phase anchor: unavailable / provisional / trusted states.
-             Requires ≥2 independent ICAO validators for trusted state.
-             Stage 3 must reject provisional and untrusted.
-          D. Phase-shape (waveform) correction: DISABLED in this model.
-             Waveform learning is not called.  apply_waveform=False throughout.
-
-        b_fit, period failure assessment, reacquire logic, mixed failure-mode
-        classification, and waveform participation in trust/period are absent from
-        this model.
-        """
-        existing = self._live_sync_states.get(iid)
-        if existing is None:
-            return
-
-        # A. Base period — from DF alignment model only; never re-detected here.
-        base_period_s = existing.period_base_s if existing.period_base_s > 0 else period_s
-        if base_period_s <= 0:
-            return
-        live_period_s = existing.period_s if existing.period_s > 0 else base_period_s
-        period_us = live_period_s * 1_000_000.0
-        now_ts = time.time()
-
-        # Collect recent observations.
-        _SIMPLE_WINDOW_ROTATIONS = 6
-        window_s = max(base_period_s * _SIMPLE_WINDOW_ROTATIONS, 30.0)
-        cutoff_ts = now_ts - window_s
-        obs_buf = self._live_aligned_burst_obs.get(iid)
-        if not obs_buf:
-            return
-        obs_snapshot = list(obs_buf)
-
-        recent_obs = [o for o in obs_snapshot if o.ts >= cutoff_ts]
-        if len(recent_obs) < 3:
-            return
-
-        icao_quality = self._live_icao_sync_quality.setdefault(iid, {})
-
-        # Score observations against current model.
-        # D: apply_waveform=False — waveform correction is disabled in simple model.
-        scored: list[dict] = []
-        fit_reject_reasons: dict[str, int] = defaultdict(int)
-        for obs in recent_obs:
-            pred = predict_sync_observation(
-                existing,
-                obs.burst_centroid_us,
-                range_nm=obs.range_nm,
-                apply_propagation=True,
-                apply_motion=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
-                bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
-                motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
-                motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
-            )
-            residual = (obs.bearing_deg - pred.predicted_bearing_deg + 540.0) % 360.0 - 180.0
-            abs_r = abs(residual)
-            status = self._classify_sync_residual(abs_r)
-            base_w = self._score_sync_burst_observation(obs)
-            q_entry = icao_quality.get(obs.icao)
-            q_reject = _icao_quality_reject_reason(q_entry)
-            if q_entry is not None:
-                mad = max(q_entry.residual_mad_deg, 0.5)
-                q_multiplier = max(0.1, min(1.0, 1.0 / (1.0 + mad / 3.0)))
-            else:
-                q_multiplier = 1.0
-            if status == "rejected":
-                effective_w = 0.0
-            elif status == "soft":
-                effective_w = base_w * 0.2 * q_multiplier
-            else:
-                effective_w = base_w * q_multiplier
-
-            fit_reject_reason = None
-            if not getattr(obs, "sync_update_eligible", True):
-                fit_reject_reason = "not_sync_update_eligible"
-            elif abs_r >= 150.0:
-                fit_reject_reason = "near_wrap_residual"
-            elif abs_r > 35.0:
-                fit_reject_reason = "residual_gate"
-            elif obs.pos_age_s > 8.0:
-                fit_reject_reason = "stale_position"
-            elif q_reject is not None:
-                fit_reject_reason = q_reject
-            elif effective_w <= 0:
-                fit_reject_reason = "zero_weight"
-
-            fit_eligible = fit_reject_reason is None
-            if fit_reject_reason is not None:
-                fit_reject_reasons[fit_reject_reason] += 1
-
-            scored.append({
-                "residual": residual,
-                "weight": effective_w,
-                "anchor_weight": base_w * q_multiplier,
-                "status": status,
-                "icao": obs.icao,
-                "effective_us": pred.effective_arrival_us,
-                "phase_in_rot": pred.phase_in_rot_deg,
-                "obs_ts": obs.ts,
-                "fit_eligible": fit_eligible,
-                "fit_reject_reason": fit_reject_reason,
-                "prediction": pred,
-                "obs": obs,
-            })
-
-        contributing_icaos = {
-            e["icao"] for e in scored
-            if e["weight"] > 0 and e["status"] != "rejected"
-        }
-        n_inliers = sum(1 for e in scored if e["status"] == "inlier")
-        n_rejected = sum(1 for e in scored if e["status"] == "rejected")
-        fit_scored = [
-            e for e in scored
-            if e["fit_eligible"] and e["weight"] > 0 and e["status"] != "rejected"
-        ]
-        fit_contributing_icaos = {e["icao"] for e in fit_scored}
-
-        anchor_pool = [
-            e for e in scored
-            if e.get("anchor_weight", 0.0) > 0.0
-            and e.get("fit_reject_reason") != "near_wrap_residual"
-        ]
-        if not anchor_pool:
-            existing.holdover = True
-            existing.usable = False
-            return
-
-        new_epoch_us = max(e["effective_us"] for e in anchor_pool)
-        existing_at_new = (
-            (new_epoch_us - existing.phase_epoch_us) / period_us * 360.0
-            + existing.phase_offset_deg
-        ) % 360.0
-
-        # C. Absolute phase anchor — no b_fit correction injected into fallback.
-        anchor_resolution = self._resolve_phase_anchor_state(
-            iid=iid,
-            scored=scored,
-            existing=existing,
-            now_ts=now_ts,
-            epoch_us=new_epoch_us,
-            mixed_fallback_offset=existing_at_new,
-        )
-        anchor_selection = anchor_resolution["anchor_selection"]
-        anchor_solution = anchor_resolution["anchor_solution"]
-        validation = anchor_resolution["validation"]
-        new_offset = anchor_resolution["offset_deg"]
-        phase_anchor_icao = anchor_resolution["phase_anchor_icao"]
-        phase_anchor_score = anchor_resolution["phase_anchor_score"]
-        phase_anchor_obs_count = anchor_resolution["phase_anchor_obs_count"]
-        phase_anchor_raw = anchor_resolution["phase_anchor_offset_raw_deg"]
-        phase_anchor_smoothed = anchor_resolution["phase_anchor_offset_smoothed_deg"]
-        phase_anchor_spread = anchor_resolution["phase_anchor_spread_deg"]
-        phase_anchor_status = anchor_resolution["phase_anchor_status"]
-        phase_anchor_since_ts = anchor_resolution["phase_anchor_since_ts"]
-        phase_anchor_replacement_reason = anchor_resolution["phase_anchor_replacement_reason"]
-        phase_correction = _circular_delta_deg(new_offset, existing_at_new) or 0.0
-
-        # Phase status: trusted / provisional / untrusted.
-        phase_anchor_spread_val = (
-            phase_anchor_spread if phase_anchor_spread is not None else 999.0
-        )
-        v_status = validation["status"]
-        v_median_err = validation.get("median_error_deg")
-        if v_median_err is None:
-            v_median_err = 999.0
-        contributor_icaos_list = validation.get("contributor_icaos")
-        v_icao_count = len(contributor_icaos_list) if contributor_icaos_list else 0
-        if (
-            phase_anchor_status == "selected"
-            and phase_anchor_spread_val < 8.0
-            and v_icao_count >= 2
-            and v_status not in {"population_disagrees", "population_veto"}
-            and abs(v_median_err) < 10.0
-        ):
-            phase_status = "trusted"
-            phase_status_reason = None
-        elif (
-            phase_anchor_status in {"selected", "anchor_only"}
-            and phase_anchor_spread_val < 25.0
-            and phase_anchor_obs_count >= 2
-        ):
-            phase_status = "provisional"
-            phase_status_reason = (
-                f"spread_{phase_anchor_spread_val:.1f}_deg" if phase_anchor_spread_val >= 8.0
-                else f"icaos_{v_icao_count}" if v_icao_count < 2
-                else v_status
-            )
-        else:
-            phase_status = "untrusted"
-            phase_status_reason = (
-                phase_anchor_status if phase_anchor_status not in {"selected", "anchor_only"}
-                else f"spread_{phase_anchor_spread_val:.1f}_deg"
-            )
-
-        # B. Bounded period correction — per-ICAO unwrapped slope consensus only.
-        # b_fit (wrapped global slope) is not computed or used in this model.
-        _PERIOD_PPM_PER_UPDATE_MAX = 60.0   # max step per update cycle
-        _PERIOD_PPM_FROM_BASE_MAX = 500.0   # hard cap from period_base_s; no exceptions
-        _SLOPE_EMA_ALPHA = 0.08
-        _SLOPE_DEAD_BAND = 0.08             # deg/s; below this, direction is ambiguous
-        _PERIOD_GAIN = 0.12
-        _PERIOD_REFINE_MIN_INLIERS = 6
-        _SLOPE_HISTORY_MAX = 80
-
-        per_aircraft_result = _fit_per_aircraft_slope(fit_scored, base_period_s)
-        per_aircraft_slope = per_aircraft_result["slope_deg_per_s"]
-
-        # EMA preserved unchanged when consensus is rejected — never overwrite with b_fit.
-        smoothed_slope = existing.residual_slope_deg_per_s
-        if per_aircraft_slope is not None:
-            smoothed_slope = (
-                (1.0 - _SLOPE_EMA_ALPHA) * smoothed_slope
-                + _SLOPE_EMA_ALPHA * per_aircraft_slope
-            )
-        period_update_block_reason = (
-            per_aircraft_result.get("reject_reason") if per_aircraft_slope is None else None
-        )
-
-        # Slope history — source-tagged; persistence gate counts only consensus entries.
-        slope_history = self._live_slope_history.setdefault(iid, deque(maxlen=_SLOPE_HISTORY_MAX))
-        slope_history.append({
-            "ts": now_ts,
-            "residual_slope_deg_per_s": smoothed_slope,
-            "raw_slope_deg_per_s": per_aircraft_slope,
-            "slope_source": (
-                "per_aircraft_consensus" if per_aircraft_slope is not None else "none"
-            ),
-            "fit_span_s": per_aircraft_result.get("fit_span_s", 0.0),
-            "n_fit_observations": len(fit_scored),
-        })
-        recent_window = list(slope_history)[-8:]
-        tagged_entries = [
-            e for e in recent_window if e.get("slope_source") == "per_aircraft_consensus"
-        ]
-        persist_signs = [
-            1 if e["residual_slope_deg_per_s"] > _SLOPE_DEAD_BAND
-            else -1 if e["residual_slope_deg_per_s"] < -_SLOPE_DEAD_BAND
-            else 0
-            for e in tagged_entries
-        ]
-        nonzero_signs = [s for s in persist_signs if s != 0]
-        persistent_slope = (
-            len(nonzero_signs) >= 5
-            and len(set(nonzero_signs)) == 1
-            and abs(smoothed_slope) >= _SLOPE_DEAD_BAND
-            and per_aircraft_slope is not None
-        )
-        if not persistent_slope and period_update_block_reason is None:
-            period_update_block_reason = "slope_not_persistent"
-
-        fit_span_s = (
-            (
-                max(e["effective_us"] for e in fit_scored)
-                - min(e["effective_us"] for e in fit_scored)
-            ) / 1_000_000.0
-            if len(fit_scored) >= 2 else 0.0
-        )
-        period_update_allowed = (
-            bool(RADAR_SYNC_PERIOD_REFINE_ENABLED)
-            and persistent_slope
-            and n_inliers >= _PERIOD_REFINE_MIN_INLIERS
-            and len(fit_contributing_icaos) >= 2
-            and fit_span_s >= 2.0 * base_period_s
-        )
-        if not period_update_allowed and period_update_block_reason is None:
-            period_update_block_reason = "period_refine_disabled"
-
-        refined_period_s = live_period_s
-        period_update_applied = 0.0
-        period_update_ppm_applied = 0.0
-        period_update_ppm_from_base = (
-            (live_period_s - base_period_s) / base_period_s * 1e6
-            if base_period_s > 0 else 0.0
-        )
-        period_update_ppm_step = 0.0
-        period_update_clamp_reason = None
-
-        if period_update_allowed:
-            rate_nominal = 360.0 / base_period_s
-            rate_target = rate_nominal + smoothed_slope * _PERIOD_GAIN
-            if rate_target <= 0:
-                period_update_allowed = False
-                period_update_block_reason = "non_positive_rate_target"
-            else:
-                target_from_base_s = 360.0 / rate_target
-                step_limit_s = abs(live_period_s) * _PERIOD_PPM_PER_UPDATE_MAX * 1e-6
-                stepped_period_s = live_period_s + max(
-                    -step_limit_s,
-                    min(step_limit_s, target_from_base_s - live_period_s),
-                )
-                base_limit_s = abs(base_period_s) * _PERIOD_PPM_FROM_BASE_MAX * 1e-6
-                refined_period_s = max(
-                    base_period_s - base_limit_s,
-                    min(base_period_s + base_limit_s, stepped_period_s),
-                )
-                period_update_applied = refined_period_s - live_period_s
-                period_update_ppm_applied = (
-                    period_update_applied / live_period_s * 1e6 if live_period_s > 0 else 0.0
-                )
-                period_update_ppm_from_base = (
-                    (refined_period_s - base_period_s) / base_period_s * 1e6
-                    if base_period_s > 0 else 0.0
-                )
-                period_update_ppm_step = (
-                    (stepped_period_s - live_period_s) / live_period_s * 1e6
-                    if live_period_s > 0 else 0.0
-                )
-                period_update_clamp_reason = (
-                    "base_ppm_clamped"
-                    if abs(period_update_ppm_from_base) >= _PERIOD_PPM_FROM_BASE_MAX * 0.99
-                    else "per_update_clamped"
-                    if abs(stepped_period_s - target_from_base_s) > 1e-9
-                    else None
-                )
-
-        period_correction_ppm = (
-            (refined_period_s - base_period_s) / base_period_s * 1e6
-            if base_period_s > 0 else 0.0
-        )
-        period_correction_status = (
-            "holding" if not period_update_allowed
-            else "clamp_limited" if period_update_clamp_reason is not None
-            else "converging"
-        )
-
-        # Sync quality / jitter.
-        inlier_abs = [abs(e["residual"]) for e in scored if e["status"] == "inlier"]
-        if len(inlier_abs) >= 3:
-            try:
-                new_jitter = min(max(statistics.stdev(inlier_abs), 1.5), 15.0)
-            except statistics.StatisticsError:
-                new_jitter = existing.sync_jitter_deg
-        elif inlier_abs:
-            new_jitter = min(max(statistics.mean(inlier_abs), 1.5), 15.0)
-        else:
-            new_jitter = min(existing.sync_jitter_deg * 1.1, 15.0)
-
-        _RESIDUAL_EMA_ALPHA = 0.2
-        new_ema = (
-            (1.0 - _RESIDUAL_EMA_ALPHA) * existing.residual_ema_deg
-            + _RESIDUAL_EMA_ALPHA * abs(phase_correction)
-        )
-        q = sync_quality if sync_quality is not None else existing.sync_quality
-
-        anchor_ok = (
-            anchor_solution is not None
-            and phase_anchor_icao is not None
-            and phase_anchor_obs_count >= 3
-            and (phase_anchor_spread is None or phase_anchor_spread <= 18.0)
-            and phase_anchor_status in ("selected", "anchor_only")
-        )
-        new_usable = (
-            (anchor_ok or (n_inliers >= 3 and len(contributing_icaos) >= 2))
-            and new_jitter < 15.0
-            and (anchor_ok or n_rejected < len(recent_obs) // 2 + 1)
-        )
-
-        # Update ICAO quality memory.
-        _update_icao_sync_quality_memory(icao_quality, scored)
-
-        # Diagnostics.
-        period_authoritative_source = "refined" if period_update_allowed else "base"
-
-        new_state = LiveSyncState(
-            iid=iid,
-            period_s=refined_period_s,
-            phase_epoch_us=new_epoch_us,
-            phase_offset_deg=new_offset,
-            sync_quality=q,
-            sync_jitter_deg=new_jitter,
-            last_sync_update_ts=now_ts,
-            source="multi_aircraft_burst",
-            usable=new_usable,
-            residual_ema_deg=new_ema,
-            n_sync_frames=existing.n_sync_frames + 1,
-            n_rejected_frames=(
-                existing.n_rejected_frames
-                + (1 if n_rejected > max(len(recent_obs) // 2, 1) else 0)
-            ),
-            last_residual_deg=phase_correction,
-            holdover=False,
-            n_burst_obs_inliers=n_inliers,
-            n_burst_obs_rejected=n_rejected,
-            contributing_icao_count=len(contributing_icaos),
-            period_base_s=base_period_s,
-            residual_slope_deg_per_s=smoothed_slope,
-            period_correction_ppm=period_correction_ppm,
-            period_refine_enabled=bool(RADAR_SYNC_PERIOD_REFINE_ENABLED),
-            period_update_allowed=period_update_allowed,
-            period_update_block_reason=period_update_block_reason,
-            period_update_clamp_reason=period_update_clamp_reason,
-            period_update_applied=period_update_applied,
-            period_update_ppm_applied=period_update_ppm_applied,
-            period_update_ppm_from_base=period_update_ppm_from_base,
-            period_update_ppm_step=period_update_ppm_step,
-            period_update_ppm_limit_from_base=_PERIOD_PPM_FROM_BASE_MAX,
-            period_update_ppm_limit_step=_PERIOD_PPM_PER_UPDATE_MAX,
-            period_update_safety_ppm_from_base=_PERIOD_PPM_FROM_BASE_MAX,
-            period_update_safety_ppm_per_update=_PERIOD_PPM_PER_UPDATE_MAX,
-            period_update_fit_support=n_inliers,
-            period_update_fit_span_s=fit_span_s,
-            period_correction_status=period_correction_status,
-            period_authoritative_source=period_authoritative_source,
-            phase_status=phase_status,
-            phase_status_reason=phase_status_reason,
-            phase_anchor_icao=phase_anchor_icao,
-            phase_anchor_score=phase_anchor_score,
-            phase_anchor_obs_count=phase_anchor_obs_count,
-            phase_anchor_offset_raw_deg=phase_anchor_raw,
-            phase_anchor_offset_smoothed_deg=phase_anchor_smoothed,
-            phase_anchor_spread_deg=phase_anchor_spread,
-            phase_anchor_status=phase_anchor_status,
-            phase_anchor_since_ts=phase_anchor_since_ts,
-            phase_anchor_replacement_reason=phase_anchor_replacement_reason,
-            phase_anchor_candidate_count=len(anchor_selection.get("candidates") or []),
-            phase_anchor_candidates=anchor_selection.get("candidates") or [],
-            phase_validation_contributors=validation["contributor_count"],
-            phase_validation_reject_count=validation["reject_count"],
-            phase_validation_median_error_deg=validation.get("median_error_deg"),
-            phase_validation_status=validation["status"],
-            fit_time_basis="effective_beast_time_s",
-            fit_residual_basis="observed_minus_predicted_after_prop_motion_deg",
-            fit_total_observations=len(recent_obs),
-            fit_eligible_observations=len(fit_scored),
-            fit_rejected_observations=n_rejected,
-            fit_reject_reasons=dict(fit_reject_reasons),
-            fit_contributing_icao_count=len(fit_contributing_icaos),
-            fit_span_s=fit_span_s,
-            prop_delay_enabled=bool(RADAR_SYNC_PROP_DELAY_ENABLED),
-            motion_comp_phase_enabled=bool(RADAR_SYNC_MOTION_COMP_PHASE_ENABLED),
-            motion_comp_fit_enabled=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
-        )
-        self._live_sync_states[iid] = new_state
-
-        self._live_period_history.setdefault(iid, deque(maxlen=80)).append({
-            "ts": now_ts,
-            "period_s": refined_period_s,
-            "period_base_s": base_period_s,
-            "period_correction_ppm": period_correction_ppm,
-            "period_correction_status": period_correction_status,
-        })
+        """Thin wrapper around the extracted Python simple live sync updater."""
+        return update_simple_live_sync_state(self, iid=iid, period_s=period_s, sync_quality=sync_quality)
 
     def _finalize_pending_burst(
         self,
@@ -7076,375 +5364,37 @@ class RadarState:
         iid_events: list[tuple[float, int, str, "float | None"]],
         latest_arrival_us: "float | None",
     ) -> list[dict]:
-        """Compute DF11 residual observations for the burst-sync residual chart.
-
-        This is the authoritative backend path for individual DF11 arrival
-        residuals.  Uses the same predict_sync_observation() call as burst
-        observations so both chart layers share:
-          - Beast-relative timestamp basis
-          - current refined period / phase / anchor state
-          - propagation correction policy (driven by sync.prop_delay_enabled)
-          - residual wrapping convention: (obs - pred + 540) % 360 - 180
-
-        Motion compensation is intentionally omitted for individual DF11
-        arrivals: no per-message bearing-rate estimate is available, and the
-        burst-centre averaging that makes motion comp meaningful does not apply
-        to single-message events.
-
-        Individual DF11 arrivals that cannot be given a trustworthy residual
-        (no ADS-B position available at that timestamp) are omitted rather
-        than guessed — prefer omission over false precision.
-        """
-        if sync is None or not sync.usable:
-            return []
-        receiver_lat = self._receiver_lat
-        receiver_lon = self._receiver_lon
-        if receiver_lat is None or receiver_lon is None:
-            return []
-
-        results: list[dict] = []
-        for arrival_us, _iid, icao, signal_dbfs in iid_events:
-            # Estimate wall-clock time for this arrival using the same method
-            # used for burst-centre position lookup.
-            wall_ts = self._estimate_wall_time_from_arrival_us(arrival_us, latest_arrival_us)
-            if wall_ts is None:
-                continue
-            pos = self._adsb_tracker.get_position_at(icao, wall_ts)
-            if pos is None or pos.get("lat") is None or pos.get("lon") is None:
-                # No trustworthy aircraft position — omit this dot entirely.
-                continue
-            truth_lat: float = pos["lat"]
-            truth_lon: float = pos["lon"]
-            # Bearing and range from the receiver to the aircraft at arrival time.
-            # Same geometry functions used for burst observations.
-            bearing_deg = _bearing_deg_simple(receiver_lat, receiver_lon, truth_lat, truth_lon)
-            range_nm = _haversine_nm_simple(receiver_lat, receiver_lon, truth_lat, truth_lon)
-            # Authoritative residual prediction — identical predictor path to
-            # get_burst_sync_timeline() burst entries.
-            prediction = predict_sync_observation(
-                sync,
-                arrival_us,
-                range_nm=range_nm,
-                # Motion comp not applied: no bearing-rate estimate for single messages.
-                bearing_rate_deg_s=None,
-                motion_comp_dt_us=None,
-                motion_comp_block_reason="individual_df11_arrival",
-            )
-            # Residual wrapping: identical to burst observations.
-            residual_deg = (
-                bearing_deg - prediction.predicted_bearing_deg + 540.0
-            ) % 360.0 - 180.0
-            # timing_class uses the same threshold as BURST_SYNC_DF11_ON_TIME_THRESHOLD_DEG
-            # in RadarPage.jsx so the frontend colour mapping is consistent.
-            abs_res = abs(residual_deg)
-            if abs_res <= _DF11_RESIDUAL_ON_TIME_THRESHOLD_DEG:
-                timing_class = "on_time"
-            elif residual_deg > 0:
-                timing_class = "early"
-            else:
-                timing_class = "late"
-            results.append({
-                "icao": icao,
-                "arrival_beast_us": arrival_us,
-                "effective_beast_us": prediction.effective_arrival_us,
-                "true_bearing_deg": round(bearing_deg, 4),
-                "predicted_deg": round(prediction.predicted_bearing_deg, 4),
-                "residual_deg": round(residual_deg, 4),
-                "timing_class": timing_class,
-                "range_nm": round(range_nm, 2),
-                "pos_age_s": pos.get("position_age_seconds"),
-                "signal_dbfs": signal_dbfs,
-                # fit_eligible is always False for individual arrivals — only
-                # burst-centre observations drive sync fitting.
-                "fit_eligible": False,
-                "fit_reject_reason": "individual_df11_arrival",
-                "residual_source": "df11",
-            })
-        return results
+        return _build_df11_residual_observations_helper(
+            self,
+            sync,
+            iid_events,
+            latest_arrival_us,
+            _DF11_RESIDUAL_ON_TIME_THRESHOLD_DEG,
+        )
 
     @staticmethod
     def _apply_selected_anchor_relative_offsets(
         rows: list[dict],
         anchor_icao: str | None,
     ) -> float | None:
-        """Recompute displayed anchor deltas from the selected anchor's latest implied offset."""
-        if not anchor_icao:
-            return None
-        latest_anchor: dict | None = None
-        latest_ts = float("-inf")
-        for row in rows:
-            if row.get("icao") != anchor_icao:
-                continue
-            implied = row.get("implied_phase_offset_deg")
-            try:
-                implied_value = float(implied)
-            except (TypeError, ValueError):
-                continue
-            if not _math.isfinite(implied_value):
-                continue
-            ts_candidates = (
-                row.get("beam_center_us"),
-                row.get("raw_arrival_us"),
-                row.get("effective_beast_us"),
-                row.get("wall_ts"),
-            )
-            ts = next(
-                (
-                    float(value)
-                    for value in ts_candidates
-                    if value is not None and _math.isfinite(float(value))
-                ),
-                0.0,
-            )
-            if latest_anchor is None or ts >= latest_ts:
-                latest_anchor = row
-                latest_ts = ts
-        if latest_anchor is None:
-            return None
-
-        anchor_offset = float(latest_anchor["implied_phase_offset_deg"])
-        for row in rows:
-            implied = row.get("implied_phase_offset_deg")
-            try:
-                implied_value = float(implied)
-            except (TypeError, ValueError):
-                row["anchor_relative_phase_error_deg"] = None
-                continue
-            if not _math.isfinite(implied_value):
-                row["anchor_relative_phase_error_deg"] = None
-                continue
-            row["anchor_relative_phase_error_deg"] = _circular_delta_deg(implied_value, anchor_offset)
-        latest_anchor["anchor_relative_phase_error_deg"] = 0.0
-        return anchor_offset
+        return _apply_selected_anchor_relative_offsets_helper(_circular_delta_deg, rows, anchor_icao)
 
     def _go_burst_sync_timeline_snapshot(
         self,
         iid: int,
         window_s: float,
     ) -> list[AlignedBurstSyncObs]:
-        """Rebuild timeline observations lazily from Go-owned burst evidence."""
-        evidence = self._go_evidence_event_snapshot(iid)
-        if not evidence:
-            return []
-
-        with self._lock:
-            model = self._models.get(iid)
-            sync = self._live_sync_states.get(iid)
-        radar_pos = _get_authoritative_radar_position(model) if model is not None else {"lat": None, "lon": None}
-        radar_lat = radar_pos.get("lat")
-        radar_lon = radar_pos.get("lon")
-        if radar_lat is None or radar_lon is None:
-            return []
-
-        cutoff_ts = time.time() - window_s
-        period_s = sync.period_s if sync is not None and sync.period_s > 0 else 0.0
-        observations: list[AlignedBurstSyncObs] = []
-        for entry in sorted(evidence, key=lambda row: (float(row.get("wall_ts") or 0.0), float(row.get("arrival_us") or 0.0))):
-            if str(entry.get("kind") or "burst_fired") != "burst_fired":
-                continue
-            wall_ts = float(entry.get("wall_ts") or 0.0)
-            if wall_ts < cutoff_ts:
-                continue
-            truth_lat = entry.get("truth_lat")
-            truth_lon = entry.get("truth_lon")
-            if truth_lat is None or truth_lon is None:
-                continue
-            bearing_deg = _bearing_deg_simple(radar_lat, radar_lon, float(truth_lat), float(truth_lon))
-            range_nm = _haversine_nm_simple(radar_lat, radar_lon, float(truth_lat), float(truth_lon))
-            pos_age_s = float(entry.get("position_age_seconds") or 0.0)
-            motion_estimate = _estimate_aircraft_bearing_rate(
-                icao=str(entry["icao"]),
-                bearing_deg=bearing_deg,
-                burst_centroid_us=float(entry["arrival_us"]),
-                pos_age_s=pos_age_s,
-                history=observations,
-            )
-            bearing_rate_deg_s = motion_estimate.get("bearing_rate_deg_s")
-            motion_comp_dt_us = _compute_motion_comp_dt_us(period_s, bearing_rate_deg_s) if period_s > 0 else None
-            motion_block_reason = motion_estimate.get("motion_comp_block_reason")
-            motion_applied = bool(
-                RADAR_SYNC_MOTION_COMP_PHASE_ENABLED
-                and motion_comp_dt_us is not None
-                and motion_block_reason is None
-            )
-            if not RADAR_SYNC_MOTION_COMP_PHASE_ENABLED:
-                motion_block_reason = "disabled"
-            elif motion_comp_dt_us is None and motion_block_reason is None:
-                motion_block_reason = "bearing_rate_unavailable"
-            prop_delay_us = _compute_propagation_delay_us(range_nm)
-            prop_corrected_us = (
-                float(entry["arrival_us"]) - prop_delay_us
-                if RADAR_SYNC_PROP_DELAY_ENABLED else float(entry["arrival_us"])
-            )
-            effective_us = prop_corrected_us - motion_comp_dt_us if motion_applied else prop_corrected_us
-            observations.append(AlignedBurstSyncObs(
-                burst_centroid_us=float(entry["arrival_us"]),
-                icao=str(entry["icao"]),
-                bearing_deg=bearing_deg,
-                n_replies=int(entry.get("n_replies") or 0),
-                signal_dbfs=entry.get("signal_dbfs"),
-                pos_age_s=pos_age_s,
-                range_nm=range_nm,
-                ts=wall_ts,
-                sync_update_eligible=bool(
-                    entry.get("go_compact_timing_candidate", entry.get("go_timing_candidate", False))
-                ),
-                raw_arrival_us=float(entry["arrival_us"]),
-                prop_delay_aircraft_to_receiver_us=prop_delay_us,
-                prop_delay_radar_to_aircraft_us=None,
-                effective_arrival_us=effective_us,
-                bearing_rate_deg_s=bearing_rate_deg_s,
-                motion_comp_dt_us=motion_comp_dt_us,
-                motion_corrected_beast_us=effective_us,
-                motion_comp_applied=motion_applied,
-                motion_comp_block_reason=motion_block_reason,
-                burst_center_simple_us=entry.get("simple_centroid_us"),
-                burst_center_weighted_us=entry.get("weighted_centroid_us"),
-                burst_center_delta_us=entry.get("centroid_delta_us"),
-                burst_center_method=(
-                    "amplitude_weighted"
-                    if entry.get("weighted_centroid_us") is not None
-                    else "centroid"
-                ),
-                burst_ts_first_reply_beast_us=entry.get("first_reply_us"),
-                burst_ts_strongest_reply_beast_us=entry.get("strongest_reply_us"),
-                burst_ts_simple_centroid_beast_us=entry.get("simple_centroid_us"),
-                burst_ts_weighted_centroid_beast_us=entry.get("weighted_centroid_us"),
-                burst_ts_mid_strong_window_beast_us=entry.get("mid_strong_window_us"),
-                burst_ts_last_reply_beast_us=entry.get("last_reply_us"),
-                burst_span_us=entry.get("span_us"),
-                peak_amplitude=entry.get("peak_amplitude"),
-                position_interpolated=False,
-                position_extrapolated=False,
-                position_source_age_s=pos_age_s,
-                truth_position_ts_beast_us=(
-                    float(entry["arrival_us"]) - pos_age_s * 1_000_000.0
-                    if pos_age_s > 0 else float(entry["arrival_us"])
-                ),
-            ))
-        return observations
+        return _go_burst_sync_timeline_snapshot_helper(self, iid, window_s)
 
     def _go_sweep_frame_sync_timeline_snapshot(
         self,
         iid: int,
         window_s: float,
     ) -> list[AlignedBurstSyncObs]:
-        """Rebuild compact alignment observations from retained Go sweep frames.
-
-        This is a fallback when raw Go burst evidence is no longer retained but
-        the IID is still producing accepted sweep frames. The rows are compact
-        alignment evidence only; they do not restore Python's richer refined
-        diagnostics.
-        """
-        with self._lock:
-            go_frames = list(self._go_sweep_frames_by_iid.get(iid, ()))
-            model = self._models.get(iid)
-            latest_arrival_us = self._iid_latest_arrival_us.get(iid)
-            sync = self._live_sync_states.get(iid)
-        if not go_frames:
-            return []
-
-        radar_pos = _get_authoritative_radar_position(model) if model is not None else {"lat": None, "lon": None}
-        radar_lat = radar_pos.get("lat")
-        radar_lon = radar_pos.get("lon")
-        if radar_lat is None or radar_lon is None:
-            return []
-
-        cutoff_ts = time.time() - window_s
-        observations: list[AlignedBurstSyncObs] = []
-        period_s = sync.period_s if sync is not None and sync.period_s > 0 else 0.0
-        for frame in go_frames:
-            frame_rows = [
-                (frame.ref_icao, frame.ref_arrival_us, frame.ref_lat, frame.ref_lon, 1, getattr(frame, "ref_pos_age_s", 0.0)),
-            ]
-            frame_rows.extend(
-                (
-                    obs.icao,
-                    obs.arrival_us,
-                    obs.lat,
-                    obs.lon,
-                    getattr(obs, "n_replies", 1),
-                    getattr(obs, "position_age_seconds", 0.0),
-                )
-                for obs in frame.observations
-            )
-            for icao, arrival_us, lat, lon, n_replies, pos_age_s in frame_rows:
-                wall_ts = self._estimate_wall_time_from_arrival_us(float(arrival_us), latest_arrival_us)
-                if wall_ts is None or wall_ts < cutoff_ts:
-                    continue
-                bearing_deg = _bearing_deg_simple(radar_lat, radar_lon, float(lat), float(lon))
-                range_nm = _haversine_nm_simple(radar_lat, radar_lon, float(lat), float(lon))
-                motion_estimate = _estimate_aircraft_bearing_rate(
-                    icao=str(icao),
-                    bearing_deg=bearing_deg,
-                    burst_centroid_us=float(arrival_us),
-                    pos_age_s=float(pos_age_s or 0.0),
-                    history=observations,
-                )
-                bearing_rate_deg_s = motion_estimate.get("bearing_rate_deg_s")
-                motion_comp_dt_us = _compute_motion_comp_dt_us(period_s, bearing_rate_deg_s) if period_s > 0 else None
-                motion_block_reason = motion_estimate.get("motion_comp_block_reason")
-                motion_applied = bool(
-                    RADAR_SYNC_MOTION_COMP_PHASE_ENABLED
-                    and motion_comp_dt_us is not None
-                    and motion_block_reason is None
-                )
-                if not RADAR_SYNC_MOTION_COMP_PHASE_ENABLED:
-                    motion_block_reason = "disabled"
-                elif motion_comp_dt_us is None and motion_block_reason is None:
-                    motion_block_reason = "bearing_rate_unavailable"
-                prop_delay_us = _compute_propagation_delay_us(range_nm)
-                prop_corrected_us = (
-                    float(arrival_us) - prop_delay_us
-                    if RADAR_SYNC_PROP_DELAY_ENABLED else float(arrival_us)
-                )
-                effective_us = prop_corrected_us - motion_comp_dt_us if motion_applied else prop_corrected_us
-                observations.append(AlignedBurstSyncObs(
-                    burst_centroid_us=float(arrival_us),
-                    icao=str(icao),
-                    bearing_deg=bearing_deg,
-                    n_replies=int(n_replies or 1),
-                    signal_dbfs=None,
-                    pos_age_s=float(pos_age_s or 0.0),
-                    range_nm=range_nm,
-                    ts=wall_ts,
-                    sync_update_eligible=True,
-                    raw_arrival_us=float(arrival_us),
-                    prop_delay_aircraft_to_receiver_us=prop_delay_us,
-                    prop_delay_radar_to_aircraft_us=None,
-                    effective_arrival_us=effective_us,
-                    bearing_rate_deg_s=bearing_rate_deg_s,
-                    motion_comp_dt_us=motion_comp_dt_us,
-                    motion_corrected_beast_us=effective_us,
-                    motion_comp_applied=motion_applied,
-                    motion_comp_block_reason=motion_block_reason,
-                    burst_center_method="go_sweep_frame",
-                    position_interpolated=False,
-                    position_extrapolated=False,
-                    position_source_age_s=float(pos_age_s or 0.0),
-                    truth_position_ts_beast_us=(
-                        float(arrival_us) - float(pos_age_s or 0.0) * 1_000_000.0
-                        if float(pos_age_s or 0.0) > 0 else float(arrival_us)
-                    ),
-                ))
-        observations.sort(key=lambda obs: (obs.ts, obs.burst_centroid_us, obs.icao))
-        return observations
+        return _go_sweep_frame_sync_timeline_snapshot_helper(self, iid, window_s)
 
     def _prune_go_evidence_events_locked(self, now_ts: float) -> int:
-        """Drop burst-evidence entries older than DF11_RESIDUAL_EVENT_MAX_AGE_S.
-
-        Caller must hold ``self._lock``. Returns the number of entries pruned.
-        Time-based; the deque also has a count cap as a safety bound but the
-        time bound is what governs chart retention at high burst rates.
-        """
-        cutoff_ts = now_ts - DF11_RESIDUAL_EVENT_MAX_AGE_S
-        pruned = 0
-        while self._go_evidence_events and float(
-            self._go_evidence_events[0].get("wall_ts") or 0.0
-        ) < cutoff_ts:
-            self._go_evidence_events.popleft()
-            pruned += 1
-        return pruned
+        return _prune_go_evidence_events_locked_helper(self, now_ts, DF11_RESIDUAL_EVENT_MAX_AGE_S)
 
     def _build_display_retention_diagnostic(
         self,
@@ -7453,46 +5403,7 @@ class RadarState:
         df11_residual_observations: list[dict],
         window_s: float,
     ) -> dict:
-        """Diagnostic block exposing actual chart retention vs the display window.
-
-        Surfaces both the requested axis window and the realised oldest/newest
-        ages of plotted points so the UI can detect cases where the chart axis
-        is 300s but only ~30s of points actually arrived (e.g. evidence buffer
-        pruned by count rather than time, or an upstream filter using the fit
-        window). Also exposes the solver's fit window so the separation between
-        fit_window_s (solver) and display_window_s (chart) is observable.
-        """
-        now_ts = time.time()
-        all_ts = []
-        for entry in observations or []:
-            ts = entry.get("wall_ts")
-            if ts is not None:
-                all_ts.append(float(ts))
-        # df11_residual_observations carry arrival_beast_us and an estimated wall ts.
-        for entry in df11_residual_observations or []:
-            ts = entry.get("wall_ts") or entry.get("estimated_wall_ts")
-            if ts is not None:
-                all_ts.append(float(ts))
-        plotted_count = len(all_ts)
-        oldest_age = (now_ts - min(all_ts)) if all_ts else None
-        newest_age = (now_ts - max(all_ts)) if all_ts else None
-        fit_window_s = self._fit_window_s_for_period(
-            getattr(sync, "period_s", None) if sync is not None else None
-        )
-        return {
-            "axis_window_s": float(window_s),
-            "fit_window_s": float(fit_window_s),
-            "display_window_s": float(window_s),
-            "plotted_point_count": plotted_count,
-            "oldest_point_age_s": oldest_age,
-            "newest_point_age_s": newest_age,
-            "backend_payload_point_count": plotted_count,
-            "backend_payload_oldest_age_s": oldest_age,
-            "frontend_buffer_window_s": float(window_s),
-            "points_source": "backend_history" if plotted_count > 0 else "empty",
-            "evidence_buffer_size": len(getattr(self, "_go_evidence_events", []) or []),
-            "evidence_buffer_max": int(getattr(self, "_GO_EVIDENCE_EVENTS_MAX", 0) or 0),
-        }
+        return _build_display_retention_diagnostic_helper(self, sync, observations, df11_residual_observations, window_s)
 
     def _build_compact_burst_sync_timeline_entries(
         self,
@@ -7500,114 +5411,11 @@ class RadarState:
         obs_snapshot: list[AlignedBurstSyncObs],
         window_s: float,
     ) -> list[dict]:
-        """Build a compact burst timeline for Go-owned sync sources.
-
-        Non-`multi_aircraft_burst` sources do not carry Python's richer anchor,
-        waveform, or fit-history state. Avoid rebuilding those diagnostics and
-        expose only the compact predictor/residual view that is still valid.
-        """
-        now_ts = time.time()
-        cutoff_ts = now_ts - window_s
-        entries: list[dict] = []
-        for obs in obs_snapshot:
-            if obs.ts < cutoff_ts:
-                continue
-            prediction = predict_sync_observation(
-                sync,
-                obs.burst_centroid_us,
-                range_nm=getattr(obs, "range_nm", None),
-                bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
-                motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
-                motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
-            )
-            residual_deg = (
-                obs.bearing_deg - prediction.predicted_bearing_deg + 540.0
-            ) % 360.0 - 180.0
-            classification = self._classify_sync_residual(abs(residual_deg))
-            weight = self._score_sync_burst_observation(obs)
-            fit_eligible = bool(getattr(obs, "sync_update_eligible", True)) and classification != "rejected" and weight > 0
-            entries.append({
-                "beam_center_us": obs.burst_centroid_us,
-                "wall_ts": obs.ts,
-                "icao": obs.icao,
-                "bearing_deg": obs.bearing_deg,
-                "predicted_deg": prediction.predicted_bearing_deg,
-                "predicted_raw_deg": prediction.predicted_bearing_raw_deg,
-                "predicted_after_prop_deg": prediction.predicted_bearing_deg,
-                "pred_without_motion_deg": prediction.predicted_bearing_deg,
-                "pred_with_motion_deg": prediction.predicted_bearing_deg,
-                "predicted_corrected_deg": prediction.predicted_bearing_deg,
-                "residual_deg": residual_deg,
-                "residual_raw_deg": residual_deg,
-                "residual_after_prop_deg": residual_deg,
-                "residual_without_motion_deg": residual_deg,
-                "residual_with_motion_deg": residual_deg,
-                "residual_after_waveform_deg": residual_deg,
-                "residual_corrected_deg": residual_deg,
-                "motion_comp_improvement_deg": 0.0,
-                "residual_for_period_fit_deg": residual_deg if fit_eligible else None,
-                "implied_phase_offset_deg": None,
-                "anchor_relative_phase_error_deg": None,
-                "phase_anchor_contributor": False,
-                "phase_anchor_reject_reason": None,
-                "phase_in_rot_deg": prediction.phase_in_rot_deg,
-                "raw_arrival_us": getattr(obs, "raw_arrival_us", obs.burst_centroid_us),
-                "prop_corrected_beast_us": prediction.prop_corrected_beast_us,
-                "effective_arrival_us": prediction.effective_arrival_us,
-                "motion_corrected_beast_us": prediction.motion_corrected_beast_us,
-                "prop_delay_us": prediction.propagation_correction_us,
-                "bearing_rate_deg_s": prediction.bearing_rate_deg_s,
-                "motion_comp_dt_us": prediction.motion_comp_dt_us,
-                "motion_comp_enabled": prediction.motion_comp_enabled,
-                "motion_comp_applied": prediction.motion_comp_applied,
-                "motion_comp_block_reason": prediction.motion_comp_block_reason,
-                "prediction_path": prediction.predictor_version,
-                "weight": weight,
-                "classification": classification,
-                "fit_eligible": fit_eligible,
-                "fit_reject_reason": None if fit_eligible else "compact_go_sync",
-                "n_replies": obs.n_replies,
-                "signal_dbfs": obs.signal_dbfs,
-                "pos_age_s": obs.pos_age_s,
-                "range_nm": obs.range_nm,
-                "sync_update_eligible": bool(getattr(obs, "sync_update_eligible", True)),
-                "burst_center_method": getattr(obs, "burst_center_method", "centroid"),
-                "burst_center_simple_us": getattr(obs, "burst_center_simple_us", None),
-                "burst_center_weighted_us": getattr(obs, "burst_center_weighted_us", None),
-                "burst_center_delta_us": getattr(obs, "burst_center_delta_us", None),
-            })
-        entries.sort(key=lambda e: e["beam_center_us"])
-        return entries
+        return _build_compact_burst_sync_timeline_entries_helper(self, sync, obs_snapshot, window_s)
 
     @staticmethod
     def _build_compact_residual_observations_from_entries(entries: list[dict], source: str) -> list[dict]:
-        """Fallback residual-dot rows when only compact Go burst/frame evidence exists."""
-        results: list[dict] = []
-        for entry in entries:
-            residual_deg = float(entry.get("residual_deg") or 0.0)
-            abs_res = abs(residual_deg)
-            if abs_res <= _DF11_RESIDUAL_ON_TIME_THRESHOLD_DEG:
-                timing_class = "on_time"
-            elif residual_deg > 0:
-                timing_class = "early"
-            else:
-                timing_class = "late"
-            results.append({
-                "icao": entry.get("icao"),
-                "arrival_beast_us": entry.get("raw_arrival_us", entry.get("beam_center_us")),
-                "effective_beast_us": entry.get("effective_arrival_us"),
-                "true_bearing_deg": round(float(entry.get("bearing_deg") or 0.0), 4),
-                "predicted_deg": round(float(entry.get("predicted_deg") or 0.0), 4),
-                "residual_deg": round(residual_deg, 4),
-                "timing_class": timing_class,
-                "range_nm": round(float(entry.get("range_nm") or 0.0), 2),
-                "pos_age_s": entry.get("pos_age_s"),
-                "signal_dbfs": entry.get("signal_dbfs"),
-                "fit_eligible": False,
-                "fit_reject_reason": "compact_go_alignment",
-                "residual_source": source,
-            })
-        return results
+        return _build_compact_residual_observations_from_entries_helper(entries, source, _DF11_RESIDUAL_ON_TIME_THRESHOLD_DEG)
 
     def _build_compact_sync_debug_payload(
         self,
@@ -7616,40 +5424,7 @@ class RadarState:
         burst_timeline: dict,
         limit: int,
     ) -> dict:
-        """Return a compact sync-debug payload for Go-owned sync sources."""
-        observations = list(burst_timeline.get("observations") or [])
-        if limit > 0:
-            observations = observations[-limit:]
-        motion_summary = burst_timeline.get("motion_comp_summary") or {}
-        retention_diagnostics = burst_timeline.get("retention_diagnostics")
-        fit_eligible_count = sum(1 for row in observations if row.get("fit_eligible"))
-        sync_update_eligible_count = sum(1 for row in observations if row.get("sync_update_eligible"))
-        alignment_status = burst_timeline.get("alignment_status")
-        return {
-            "iid": iid,
-            "available": True,
-            "observations": observations,
-            "summary": {
-                "iid": iid,
-                "sync_source": getattr(sync, "source", None),
-                "diagnostics_mode": "compact_go_sync",
-                "rich_diagnostics_available": False,
-                "compact_reason": "rich_python_multi_aircraft_diagnostics_unavailable_for_go_sync_source",
-                "wall_clock_used_operationally": False,
-                "observation_count": len(observations),
-                "fit_eligible_count": fit_eligible_count,
-                "sync_update_eligible_count": sync_update_eligible_count,
-                "motion_comp_applied_count": int(motion_summary.get("applied_count") or 0),
-                "retention_diagnostics": retention_diagnostics,
-                "alignment_status": alignment_status,
-            },
-            "retention_diagnostics": retention_diagnostics,
-            "alignment_status": alignment_status,
-            "observation_model_diagnostics": {
-                "mode": "compact_go_sync",
-                "reason": "rich_python_multi_aircraft_diagnostics_unavailable_for_sync_source",
-            },
-        }
+        return _build_compact_sync_debug_payload_helper(self, iid, sync, burst_timeline, limit)
 
     def _build_sync_mode_diagnostics(
         self,
@@ -7657,64 +5432,7 @@ class RadarState:
         sync: LiveSyncState | None,
         alignment_status: dict | None,
     ) -> dict:
-        with self._lock:
-            compact_debug = dict(self._compact_sync_debug_by_iid.get(iid) or {})
-            go_admission = dict(self._go_multi_sync_admission_by_iid.get(iid) or {})
-        sync_source = getattr(sync, "source", None) if sync is not None else None
-        refined_active = bool(sync_source == "multi_aircraft_burst")
-        if refined_active:
-            active_mode = "refined_multi_aircraft"
-            active_label = "Python live sync"
-        else:
-            active_mode = "compact_bootstrap"
-            active_label = "Compact sync"
-        no_anchor_reason = None
-        if refined_active:
-            no_anchor_reason = getattr(sync, "phase_anchor_no_candidate_reason", None)
-            if not getattr(sync, "phase_anchor_icao", None) and not no_anchor_reason:
-                no_anchor_reason = "no_anchor_selected"
-        else:
-            no_anchor_reason = (
-                ((alignment_status or {}).get("reason"))
-                or "awaiting_refined_multi_sync"
-            )
-
-        return {
-            "active_source": sync_source,
-            "active_mode": active_mode,
-            "active_label": active_label,
-            "compact": {
-                "active": not refined_active,
-                "reference_icao": compact_debug.get("current_reference_icao"),
-                "last_reference_icao": compact_debug.get("last_reference_icao"),
-                "reference_changed_recently": bool(compact_debug.get("reference_changed_recently")),
-                "reference_change_count": int(compact_debug.get("reference_change_count") or 0),
-                "last_reference_change_ts": compact_debug.get("last_reference_change_ts"),
-                "phase_epoch_us": compact_debug.get("current_phase_epoch_us"),
-                "last_phase_epoch_us": compact_debug.get("last_phase_epoch_us"),
-                "phase_epoch_changed_recently": bool(compact_debug.get("phase_epoch_changed_recently")),
-                "sync_reset_count": int(compact_debug.get("sync_reset_count") or 0),
-                "last_sync_reset_ts": compact_debug.get("last_sync_reset_ts"),
-                "last_sync_reset_reason": compact_debug.get("last_sync_reset_reason"),
-                "holdover": compact_debug.get("holdover"),
-                "last_holdover_transition": compact_debug.get("last_holdover_transition"),
-                "last_holdover_transition_ts": compact_debug.get("last_holdover_transition_ts"),
-            },
-            "python_sync": {
-                "present": refined_active,
-                "active": refined_active,
-                "usable": bool(sync is not None and refined_active and getattr(sync, "usable", False)),
-                "period_s": getattr(sync, "period_s", None) if refined_active else None,
-                "anchor_icao": getattr(sync, "phase_anchor_icao", None) if refined_active else None,
-                "anchor_candidate_count": int(getattr(sync, "phase_anchor_candidate_count", 0) or 0) if refined_active else 0,
-                "fit_total_observations": int(getattr(sync, "fit_total_observations", 0) or 0) if refined_active else 0,
-                "fit_eligible_observations": int(getattr(sync, "fit_eligible_observations", 0) or 0) if refined_active else 0,
-                "fit_rejected_observations": int(getattr(sync, "fit_rejected_observations", 0) or 0) if refined_active else 0,
-                "phase_status": getattr(sync, "phase_status", None) if refined_active else None,
-                "no_anchor_reason": no_anchor_reason,
-            },
-            "go_admission": go_admission or None,
-        }
+        return _build_sync_mode_diagnostics_helper(self, iid, sync, alignment_status)
 
     def get_burst_sync_timeline(self, iid: int, window_s: float = 60.0) -> dict:
         """Return burst-centre sync observations with residuals for verification plotting.
