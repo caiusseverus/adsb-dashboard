@@ -139,8 +139,8 @@ _ROTATION_ANALYSIS_MAX_EVENTS_PER_IID = 12_000
 # pruning cycles.
 _IID_EVENTS_MAX = 50_000
 STABLE_REANALYZE_INTERVAL_S = 300.0
-_MULTI_SYNC_FIT_WINDOW_ROTATIONS = 6.0
-_MULTI_SYNC_FIT_WINDOW_MIN_S = 30.0
+_SIMPLE_SYNC_FIT_WINDOW_ROTATIONS = 6.0
+_SIMPLE_SYNC_FIT_WINDOW_MIN_S = 30.0
 _SYNC_DISPLAY_HISTORY_WINDOW_S = 300.0
 _SYNC_DIAGNOSTIC_HISTORY_MAX = 1500
 
@@ -281,10 +281,6 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
 def _sync_source_has_rich_python_diagnostics(sync: "LiveSyncState | None") -> bool:
     """Return True when the current sync source carries Python-only rich diagnostics."""
     return bool(sync is not None and getattr(sync, "source", None) == "multi_aircraft_burst")
-
-
-def _sync_source_is_go_compact(sync: "LiveSyncState | None") -> bool:
-    return bool(sync is not None and getattr(sync, "source", None) == "sweep_frame_go")
 
 
 def _fit_weighted_slope(xs: list[float], ys: list[float], ws: list[float]) -> tuple[float, float]:
@@ -2099,8 +2095,8 @@ class RadarState:
         # Rolling-fit work is skipped if the last update fired recently; the
         # observation buffer keeps growing in the meantime so the next update
         # sees the full set.
-        self._MULTI_SYNC_UPDATE_MIN_INTERVAL_S = 0.25
-        self._last_multi_sync_update_ts: dict[int, float] = {}
+        self._SIMPLE_SYNC_UPDATE_MIN_INTERVAL_S = 0.25
+        self._last_simple_sync_update_ts: dict[int, float] = {}
 
         # Per-IID per-ICAO residual quality memory, used to downweight
         # repeatedly noisy aircraft in slope fitting.
@@ -2428,7 +2424,7 @@ class RadarState:
             period = float(period_s or 0.0)
         except (TypeError, ValueError):
             period = 0.0
-        return max(period * _MULTI_SYNC_FIT_WINDOW_ROTATIONS, _MULTI_SYNC_FIT_WINDOW_MIN_S)
+        return max(period * _SIMPLE_SYNC_FIT_WINDOW_ROTATIONS, _SIMPLE_SYNC_FIT_WINDOW_MIN_S)
 
     def _sync_horizons_payload(self, sync: "LiveSyncState | None", *, display_window_s: float | None = None) -> dict:
         """Expose the distinct solver, display, and authoritative horizons."""
@@ -3505,7 +3501,7 @@ class RadarState:
                         phase_epoch_us=go_sync.get("phase_epoch_us"),
                         holdover=go_sync.get("holdover"),
                         event_ts=go_sync.get("last_updated"),
-                        source="sweep_frame_go",
+                        source="go_frame_sync",
                     )
                     self._adopt_go_frame_sync_locked(iid, go_sync)
                     seen_go_sync_iids.add(iid)
@@ -3516,7 +3512,7 @@ class RadarState:
                         ref_icao=ref_text,
                         sync_present=False,
                         event_ts=time.time(),
-                        source="sweep_frame_go",
+                        source="go_frame_sync",
                     )
 
                 admission = self._normalise_go_multi_sync_admission(iid_payload.get("multi_sync_admission"))
@@ -4046,7 +4042,7 @@ class RadarState:
             sync_quality=float(go_sync.get("sync_quality") or 0.0),
             sync_jitter_deg=float(go_sync.get("sync_jitter_deg") or 5.0),
             last_sync_update_ts=last_updated,
-            source="sweep_frame_go",
+            source="go_frame_sync",
             usable=bool(go_sync.get("usable", False)),
             residual_ema_deg=float(go_sync.get("residual_ema_deg") or 5.0),
             n_sync_frames=int(go_sync.get("n_sync_frames") or 0),
@@ -4094,7 +4090,7 @@ class RadarState:
                     phase_epoch_us=go_sync.get("phase_epoch_us"),
                     holdover=go_sync.get("holdover"),
                     event_ts=go_sync.get("last_updated"),
-                    source="sweep_frame_go",
+                    source="go_frame_sync",
                 )
                 self._adopt_go_frame_sync_locked(iid, go_sync)
             else:
@@ -4105,7 +4101,7 @@ class RadarState:
                     ref_icao=existing_ref,
                     sync_present=False,
                     event_ts=float(iid_state.get("lu") or time.time()),
-                    source="sweep_frame_go",
+                    source="go_frame_sync",
                 )
 
     def _stage3_detection_from_go_observation(self, entry: dict) -> Stage3LiveDetection:
@@ -4550,9 +4546,9 @@ class RadarState:
         # in obs_buf, so the next update sees the full recent window.
         if period_s > 0.0:
             now_mono = time.monotonic()
-            last = self._last_multi_sync_update_ts.get(iid, 0.0)
-            if (now_mono - last) >= self._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
-                self._last_multi_sync_update_ts[iid] = now_mono
+            last = self._last_simple_sync_update_ts.get(iid, 0.0)
+            if (now_mono - last) >= self._SIMPLE_SYNC_UPDATE_MIN_INTERVAL_S:
+                self._last_simple_sync_update_ts[iid] = now_mono
                 self._update_simple_live_sync_state(iid=iid, period_s=period_s)
 
     def _record_burst_sync_timeline_obs(
@@ -6578,7 +6574,7 @@ class RadarState:
                                self._live_aligned_burst_obs,
                                self._live_burst_timeline_obs,
                                self._live_sync_states,
-                               self._last_multi_sync_update_ts,
+                               self._last_simple_sync_update_ts,
                                self._live_icao_sync_quality,
                                self._live_period_update_history,
                                self._live_slope_history,
@@ -6714,7 +6710,7 @@ class RadarState:
                 "seen_pair_keys": len(self._seen_pair_keys),
                 "sync_states": len(self._live_sync_states),
                 "icao_sync_quality": len(self._live_icao_sync_quality),
-                "multi_sync_throttle": len(self._last_multi_sync_update_ts),
+                "simple_sync_throttle": len(self._last_simple_sync_update_ts),
                 "period_update_history": len(self._live_period_update_history),
             }
             self._models.clear()
@@ -6737,7 +6733,7 @@ class RadarState:
             self._live_aligned_burst_obs.clear()
             self._live_burst_timeline_obs.clear()
             self._live_sync_states.clear()
-            self._last_multi_sync_update_ts.clear()
+            self._last_simple_sync_update_ts.clear()
             self._live_icao_sync_quality.clear()
             self._live_period_update_history.clear()
             self._live_slope_history.clear()
@@ -7761,7 +7757,7 @@ class RadarState:
         if has_go_evidence:
             timeline_obs_snapshot = self._go_burst_sync_timeline_snapshot(iid, window_s=window_s)
             obs_snapshot = timeline_obs_snapshot or aligned_obs_snapshot
-        elif _sync_source_is_go_compact(sync) and not obs_snapshot:
+        elif sync is not None and getattr(sync, "source", None) == "go_frame_sync" and not obs_snapshot:
             timeline_obs_snapshot = self._go_sweep_frame_sync_timeline_snapshot(iid, window_s=window_s)
             if timeline_obs_snapshot:
                 obs_snapshot = timeline_obs_snapshot
@@ -7773,8 +7769,8 @@ class RadarState:
         )
         radar_pos = _get_authoritative_radar_position(model) if model is not None else {"lat": None, "lon": None, "source": "none"}
         alignment_status = None
-        if _sync_source_is_go_compact(sync) or has_go_evidence or go_admission:
-            mode = "bootstrap_go_sync" if getattr(sync, "source", None) == "sweep_frame_go" else "refined_go_sync"
+        if (sync is not None and getattr(sync, "source", None) == "go_frame_sync") or has_go_evidence or go_admission:
+            mode = "bootstrap_go_sync" if getattr(sync, "source", None) == "go_frame_sync" else "refined_go_sync"
             reason = None
             detail = None
             if timeline_obs_snapshot:
@@ -7793,7 +7789,7 @@ class RadarState:
             elif sync is None:
                 reason = "sync_state_unavailable"
                 detail = "Go evidence is present, but no live sync state is available yet."
-            elif getattr(sync, "source", None) == "sweep_frame_go":
+            elif getattr(sync, "source", None) == "go_frame_sync":
                 reason = "awaiting_refined_multi_sync"
                 detail = "Bootstrap Go frame sync is active; refined multi-aircraft sync has not been admitted yet."
             else:

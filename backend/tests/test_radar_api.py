@@ -182,7 +182,7 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
 
     payload = radar_api.build_iid_sync_snapshot_payload(state, 23, window_s=60.0, debug_limit=20)
 
-    assert payload["sync_state"]["source"] == "sweep_frame_go"
+    assert payload["sync_state"]["source"] == "go_frame_sync"
     assert payload["sync_state"]["period_authoritative_source"] == "base"
     assert payload["observations"] == []
     assert payload["alignment_status"]["reason"] == "radar_position_unavailable"
@@ -444,7 +444,7 @@ def test_get_iid_sync_snapshot_uses_compact_go_sync_diagnostics_for_go_owned_syn
         n_sync_frames=6,
         n_rejected_frames=1,
         last_sync_update_ts=now_ts,
-        source="sweep_frame_go",
+        source="go_frame_sync",
         usable=True,
     )
     state._live_burst_timeline_obs[23] = deque([
@@ -465,7 +465,7 @@ def test_get_iid_sync_snapshot_uses_compact_go_sync_diagnostics_for_go_owned_syn
     payload = radar_api.build_iid_sync_snapshot_payload(state, 23, window_s=60.0, debug_limit=20)
     debug_payload = state.get_sync_debug_payload(23, window_s=60.0, limit=20)
 
-    assert payload["sync_state"]["source"] == "sweep_frame_go"
+    assert payload["sync_state"]["source"] == "go_frame_sync"
     assert payload["phase_anchor_candidates"] == []
     assert payload["observations"][0]["phase_anchor_contributor"] is False
     assert debug_payload["summary"]["diagnostics_mode"] == "compact_go_sync"

@@ -1,3 +1,28 @@
+## 2026-04-28 Simple Sync Follow-Up
+
+- [x] Review lessons and the prior radar sync cleanup before editing.
+- [x] Remove stale Go sync-source residue and delete `_sync_source_is_go_compact()`.
+- [x] Rename remaining Python simple-sync internals from `multi_sync` to `simple_sync` / `live_sync` where they now refer to the Python updater.
+- [x] Update tests and debug/reset counters to the renamed simple-sync terminology.
+- [x] Run focused verification for Go sync adoption, Stage 3 source rejection, and simple-sync throttling.
+
+Plan confirmation:
+- Keep this as a narrow cleanup pass. Do not change propagation delay or motion compensation.
+- Remove all remaining `sweep_frame_go` references; keep compact Go snapshot behaviour if still required, but under non-stale naming.
+- Rename only internals and debug/reset counters that now describe the Python simple sync updater.
+
+### Review
+- Implemented:
+  - Deleted `_sync_source_is_go_compact()` and inlined the remaining compact-Go checks against the renamed non-Python source.
+  - Renamed the stale source tag `sweep_frame_go` to `go_frame_sync` everywhere it was still used for compact Go-adopted sync state.
+  - Renamed Python simple-sync updater internals from `multi_sync` to `simple_sync`, including `_SIMPLE_SYNC_FIT_WINDOW_*`, `_SIMPLE_SYNC_UPDATE_MIN_INTERVAL_S`, `_last_simple_sync_update_ts`, and the reset/debug counter key `simple_sync_throttle`.
+  - Updated targeted tests to the new names and source tag.
+- Not changed:
+  - Propagation delay logic.
+  - Motion-compensation logic.
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_radar_phase_refinement.py tests/test_aircraft_localiser_target_live.py -q` -> `186 passed`
+
 ## 2026-04-28 Radar Sync Cleanup Audit
 
 - [x] Review lessons, current task history, and working-tree scope before editing.

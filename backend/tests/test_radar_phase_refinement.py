@@ -312,8 +312,8 @@ class TestStage3TrustGate:
         sync = _make_sync(source="go_multi_aircraft_burst", phase_status="trusted")
         assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is False
 
-    def test_sweep_frame_go_source_rejected(self):
-        sync = _make_sync(source="sweep_frame_go")
+    def test_go_frame_sync_source_rejected(self):
+        sync = _make_sync(source="go_frame_sync")
         assert AircraftLocaliser._sync_state_has_trusted_absolute_phase(sync) is False
 
     def test_absent_phase_status_treated_as_untrusted(self):

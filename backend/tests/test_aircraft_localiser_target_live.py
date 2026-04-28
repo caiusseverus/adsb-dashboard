@@ -259,7 +259,7 @@ def test_one_observation_per_radar_newest_wins():
 def test_stage3_selection_ignores_go_frame_sync_states():
     now = __import__("time").time()
     models = {1: _radar_iid(lat=51.05, lon=-1.05)}
-    syncs = {1: _sync(1, source="sweep_frame_go")}
+    syncs = {1: _sync(1, source="go_frame_sync")}
     det_by_icao = {
         "ABC": [
             _det(1, "ABC", now - 0.5, arrival_us=999_999.0),

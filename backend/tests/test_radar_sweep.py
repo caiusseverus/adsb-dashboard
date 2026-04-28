@@ -240,7 +240,7 @@ def test_reset_iid_clears_in_memory_learning_state():
         9: deque([{"icao": "AAAAAA", "beam_center_us": 1_000_000, "replies": []}]),
         10: deque([{"icao": "CCCCCC", "beam_center_us": 3_000_000, "replies": []}]),
     }
-    state._last_multi_sync_update_ts = {9: 100.0, 10: 200.0}
+    state._last_simple_sync_update_ts = {9: 100.0, 10: 200.0}
     state._live_icao_sync_quality = {
         9: {"AAAAAA": IcaoSyncQuality(residual_mad_deg=2.0)},
         10: {"BBBBBB": IcaoSyncQuality(residual_mad_deg=1.0)},
@@ -253,13 +253,13 @@ def test_reset_iid_clears_in_memory_learning_state():
     assert 9 not in state._sweep_history
     assert 9 not in state._burst_records
     assert 9 not in state._dwell_profiles
-    assert 9 not in state._last_multi_sync_update_ts
+    assert 9 not in state._last_simple_sync_update_ts
     assert 9 not in state._live_icao_sync_quality
     assert all(event[1] != 9 for event in state._iid_events)
     assert 10 in state._models
     assert 10 in state._burst_records
     assert 10 in state._dwell_profiles
-    assert 10 in state._last_multi_sync_update_ts
+    assert 10 in state._last_simple_sync_update_ts
     assert 10 in state._live_icao_sync_quality
 
 
@@ -273,7 +273,7 @@ def test_reset_all_clears_sync_refinement_state():
     state._dwell_profiles = {
         7: deque([{"icao": "AAAAAA", "beam_center_us": 1_000_000, "replies": []}]),
     }
-    state._last_multi_sync_update_ts = {7: 123.0}
+    state._last_simple_sync_update_ts = {7: 123.0}
     state._live_icao_sync_quality = {7: {"AAAAAA": IcaoSyncQuality(residual_mad_deg=3.0)}}
     state._live_sync_states = {
         7: LiveSyncState(
@@ -294,12 +294,12 @@ def test_reset_all_clears_sync_refinement_state():
     assert cleared["sync_states"] == 1
     assert cleared["burst_records"] == 1
     assert cleared["icao_sync_quality"] == 1
-    assert cleared["multi_sync_throttle"] == 1
+    assert cleared["simple_sync_throttle"] == 1
     assert state._live_sync_states == {}
     assert state._burst_records == {}
     assert state._dwell_profiles == {}
     assert state._live_icao_sync_quality == {}
-    assert state._last_multi_sync_update_ts == {}
+    assert state._last_simple_sync_update_ts == {}
 
 
 def test_detect_bursts_with_signals_refines_beam_center_toward_stronger_replies():
@@ -1040,7 +1040,7 @@ def test_go_sync_snapshot_and_debug_use_compact_diagnostics_path(monkeypatch):
         sync_quality=1.0,
         sync_jitter_deg=2.0,
         last_sync_update_ts=999.0,
-        source="sweep_frame_go",
+        source="go_frame_sync",
         usable=True,
         period_base_s=4.0,
     )
@@ -1072,7 +1072,7 @@ def test_go_sync_snapshot_and_debug_use_compact_diagnostics_path(monkeypatch):
     snapshot = state.get_live_sync_snapshot(7, window_s=90.0, debug_limit=20)
     debug_payload = state.get_sync_debug_payload(7, window_s=60.0, limit=20)
 
-    assert snapshot["sync_state"]["source"] == "sweep_frame_go"
+    assert snapshot["sync_state"]["source"] == "go_frame_sync"
     assert snapshot["phase_anchor_candidates"] == []
     assert snapshot["observations"][0]["phase_anchor_contributor"] is False
     assert snapshot["retention_diagnostics"]["timeline"]["count"] == 1
@@ -1084,7 +1084,7 @@ def test_go_sync_snapshot_and_debug_use_compact_diagnostics_path(monkeypatch):
     assert debug_payload["available"] is True
     assert debug_payload["summary"]["diagnostics_mode"] == "compact_go_sync"
     assert debug_payload["summary"]["rich_diagnostics_available"] is False
-    assert debug_payload["summary"]["sync_source"] == "sweep_frame_go"
+    assert debug_payload["summary"]["sync_source"] == "go_frame_sync"
     assert debug_payload["observation_model_diagnostics"]["mode"] == "compact_go_sync"
     assert debug_payload["observations"][0]["icao"] == "AAAAAA"
 
@@ -1112,7 +1112,7 @@ def test_go_sync_snapshot_falls_back_to_sweep_frames_when_burst_evidence_aged_ou
         sync_quality=1.0,
         sync_jitter_deg=2.0,
         last_sync_update_ts=999.0,
-        source="sweep_frame_go",
+        source="go_frame_sync",
         usable=True,
         period_base_s=4.0,
         period_authoritative_source="base",
@@ -2483,7 +2483,7 @@ def test_go_iid_state_bootstraps_live_sync_state_when_missing():
     sync = state.get_live_sync_state(63)
     assert sync is not None
     assert sync.usable is True
-    assert sync.source == "sweep_frame_go"
+    assert sync.source == "go_frame_sync"
     assert sync.phase_epoch_us == pytest.approx(500_000.0)
     assert sync.phase_offset_deg == pytest.approx(12.0)
     debug = state.get_live_pipeline_debug(63)
@@ -2547,7 +2547,7 @@ def test_update_go_burst_fired_does_not_call_python_solver(monkeypatch):
     state._live_sync_states[7] = LiveSyncState(
         iid=7, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=0.0,
         sync_quality=1.0, sync_jitter_deg=3.0, last_sync_update_ts=1_000.0,
-        source="sweep_frame_go", usable=True,
+        source="go_frame_sync", usable=True,
     )
 
     calls: list[tuple] = []
@@ -2754,12 +2754,12 @@ def test_python_dispatcher_always_calls_simple_live_sync(monkeypatch):
                         lambda iid, period_s: simple_calls.append((iid, period_s)))
     monkeypatch.setattr(sweep_module.time, "monotonic", lambda: 9999.0)
 
-    state._last_multi_sync_update_ts[iid] = 0.0
+    state._last_simple_sync_update_ts[iid] = 0.0
     with state._lock:
         now_mono = sweep_module.time.monotonic()
-        last = state._last_multi_sync_update_ts.get(iid, 0.0)
-        if (now_mono - last) >= state._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
-            state._last_multi_sync_update_ts[iid] = now_mono
+        last = state._last_simple_sync_update_ts.get(iid, 0.0)
+        if (now_mono - last) >= state._SIMPLE_SYNC_UPDATE_MIN_INTERVAL_S:
+            state._last_simple_sync_update_ts[iid] = now_mono
             state._update_simple_live_sync_state(iid=iid, period_s=4.0)
 
     assert simple_calls == [(7, 4.0)], "simple model must always be called on Python path"
@@ -2781,12 +2781,12 @@ def test_python_sync_unconditional(monkeypatch):
                         lambda iid, period_s: simple_calls.append((iid, period_s)))
     monkeypatch.setattr(sweep_module.time, "monotonic", lambda: 9999.0)
 
-    state._last_multi_sync_update_ts[iid] = 0.0
+    state._last_simple_sync_update_ts[iid] = 0.0
     with state._lock:
         now_mono = sweep_module.time.monotonic()
-        last = state._last_multi_sync_update_ts.get(iid, 0.0)
-        if (now_mono - last) >= state._MULTI_SYNC_UPDATE_MIN_INTERVAL_S:
-            state._last_multi_sync_update_ts[iid] = now_mono
+        last = state._last_simple_sync_update_ts.get(iid, 0.0)
+        if (now_mono - last) >= state._SIMPLE_SYNC_UPDATE_MIN_INTERVAL_S:
+            state._last_simple_sync_update_ts[iid] = now_mono
             state._update_simple_live_sync_state(iid=iid, period_s=4.0)
 
     assert simple_calls == [(9, 4.0)]
