@@ -282,7 +282,6 @@ def build_sync_mode_diagnostics(state: Any, iid: int, sync: "LiveSyncState | Non
             "anchor_candidate_count": int(getattr(sync, "phase_anchor_candidate_count", 0) or 0) if refined_active else 0,
             "fit_total_observations": int(getattr(sync, "fit_total_observations", 0) or 0) if refined_active else 0,
             "fit_eligible_observations": int(getattr(sync, "fit_eligible_observations", 0) or 0) if refined_active else 0,
-            "fit_rejected_observations": int(getattr(sync, "fit_rejected_observations", 0) or 0) if refined_active else 0,
             "phase_status": getattr(sync, "phase_status", None) if refined_active else None,
             "no_anchor_reason": no_anchor_reason,
         },

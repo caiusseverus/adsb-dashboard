@@ -1215,8 +1215,7 @@ def test_resolve_phase_anchor_state_population_veto_keeps_mixed_fallback(monkeyp
     assert resolved["phase_anchor_status"] == "population_veto"
     assert resolved["phase_anchor_replacement_reason"] == "population_veto"
     assert resolved["phase_anchor_since_ts"] == pytest.approx(1_000.0)
-    assert resolved["phase_anchor_offset_raw_deg"] == pytest.approx(120.0)
-    assert resolved["phase_anchor_offset_smoothed_deg"] == pytest.approx(102.0)
+    assert resolved["phase_anchor_no_candidate_reason"] is None
     assert resolved["phase_anchor_obs_count"] == 4
     assert resolved["validation"] == veto
 

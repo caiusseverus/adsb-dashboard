@@ -235,10 +235,9 @@ def test_get_iid_sync_debug_endpoint_exposes_summary_and_observation(monkeypatch
     assert payload["summary"]["wall_clock_used_operationally"] is False
     assert payload["summary"]["predictors_consistent_burst_sync"] is True
     assert "motion_comp_applied_count" in payload["summary"]
-    assert "period_update_proposed_us" in payload["summary"]
-    assert "period_update_block_reason" in payload["summary"]
-    assert "period_update_clamp_reason" in payload["summary"]
-    assert "period_correction_status" in payload["summary"]
+    assert "period_authoritative_source" in payload["summary"]
+    assert "fit_eligible_observations" in payload["summary"]
+    assert "phase_anchor_candidate_count" in payload["summary"]
     assert payload["observations"][0]["iid"] == 23
     assert "pred_position_verification_deg" in payload["observations"][0]
     assert "pred_using_wall_clock_deg" in payload["observations"][0]

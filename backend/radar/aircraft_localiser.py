@@ -1901,18 +1901,7 @@ class AircraftLocaliser:
                 "period_base_s": getattr(sync, "period_base_s", None),
                 "residual_slope_deg_per_s": getattr(sync, "residual_slope_deg_per_s", None),
                 "period_correction_ppm": getattr(sync, "period_correction_ppm", None),
-                "period_update_term": getattr(sync, "period_update_term", None),
-                "period_update_direction": getattr(sync, "period_update_direction", None),
-                "period_update_applied": getattr(sync, "period_update_applied", None),
-                "period_update_gain": getattr(sync, "period_update_gain", None),
-                "period_refine_block_reason": getattr(sync, "period_refine_block_reason", None),
-                "fit_time_basis": getattr(sync, "fit_time_basis", None),
-                "fit_residual_basis": getattr(sync, "fit_residual_basis", None),
                 "fit_total_observations": getattr(sync, "fit_total_observations", None),
                 "fit_eligible_observations": getattr(sync, "fit_eligible_observations", None),
-                "fit_rejected_observations": getattr(sync, "fit_rejected_observations", None),
-                "fit_reject_reasons": getattr(sync, "fit_reject_reasons", None),
-                "fit_contributing_icao_count": getattr(sync, "fit_contributing_icao_count", None),
-                "fit_span_s": getattr(sync, "fit_span_s", None),
             }
         return result

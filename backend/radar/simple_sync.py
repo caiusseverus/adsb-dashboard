@@ -3,7 +3,7 @@ from __future__ import annotations
 import math as _math
 import statistics
 import time
-from collections import defaultdict, deque
+from collections import deque
 from typing import TYPE_CHECKING
 
 from .angular import _circular_delta_deg
@@ -256,7 +256,6 @@ def update_simple_live_sync_state(
     icao_quality = state._live_icao_sync_quality.setdefault(iid, {})
 
     scored: list[dict] = []
-    fit_reject_reasons: dict[str, int] = defaultdict(int)
     for obs in recent_obs:
         pred = predict_sync_observation(
             existing,
@@ -301,9 +300,6 @@ def update_simple_live_sync_state(
             fit_reject_reason = "zero_weight"
 
         fit_eligible = fit_reject_reason is None
-        if fit_reject_reason is not None:
-            fit_reject_reasons[fit_reject_reason] += 1
-
         scored.append(
             {
                 "residual": residual,
@@ -361,8 +357,6 @@ def update_simple_live_sync_state(
     phase_anchor_icao = anchor_resolution["phase_anchor_icao"]
     phase_anchor_score = anchor_resolution["phase_anchor_score"]
     phase_anchor_obs_count = anchor_resolution["phase_anchor_obs_count"]
-    phase_anchor_raw = anchor_resolution["phase_anchor_offset_raw_deg"]
-    phase_anchor_smoothed = anchor_resolution["phase_anchor_offset_smoothed_deg"]
     phase_anchor_spread = anchor_resolution["phase_anchor_spread_deg"]
     phase_anchor_status = anchor_resolution["phase_anchor_status"]
     phase_anchor_since_ts = anchor_resolution["phase_anchor_since_ts"]
@@ -384,27 +378,14 @@ def update_simple_live_sync_state(
         and abs(v_median_err) < 10.0
     ):
         phase_status = "trusted"
-        phase_status_reason = None
     elif (
         phase_anchor_status in {"selected", "anchor_only"}
         and phase_anchor_spread_val < 25.0
         and phase_anchor_obs_count >= 2
     ):
         phase_status = "provisional"
-        phase_status_reason = (
-            f"spread_{phase_anchor_spread_val:.1f}_deg"
-            if phase_anchor_spread_val >= 8.0
-            else f"icaos_{v_icao_count}"
-            if v_icao_count < 2
-            else v_status
-        )
     else:
         phase_status = "untrusted"
-        phase_status_reason = (
-            phase_anchor_status
-            if phase_anchor_status not in {"selected", "anchor_only"}
-            else f"spread_{phase_anchor_spread_val:.1f}_deg"
-        )
 
     _PERIOD_PPM_PER_UPDATE_MAX = 60.0
     _PERIOD_PPM_FROM_BASE_MAX = 500.0
@@ -476,13 +457,6 @@ def update_simple_live_sync_state(
         period_update_block_reason = "period_refine_disabled"
 
     refined_period_s = live_period_s
-    period_update_applied = 0.0
-    period_update_ppm_applied = 0.0
-    period_update_ppm_from_base = (
-        (live_period_s - base_period_s) / base_period_s * 1e6 if base_period_s > 0 else 0.0
-    )
-    period_update_ppm_step = 0.0
-    period_update_clamp_reason = None
 
     if period_update_allowed:
         rate_nominal = 360.0 / base_period_s
@@ -502,33 +476,9 @@ def update_simple_live_sync_state(
                 base_period_s - base_limit_s,
                 min(base_period_s + base_limit_s, stepped_period_s),
             )
-            period_update_applied = refined_period_s - live_period_s
-            period_update_ppm_applied = (
-                period_update_applied / live_period_s * 1e6 if live_period_s > 0 else 0.0
-            )
-            period_update_ppm_from_base = (
-                (refined_period_s - base_period_s) / base_period_s * 1e6 if base_period_s > 0 else 0.0
-            )
-            period_update_ppm_step = (
-                (stepped_period_s - live_period_s) / live_period_s * 1e6 if live_period_s > 0 else 0.0
-            )
-            period_update_clamp_reason = (
-                "base_ppm_clamped"
-                if abs(period_update_ppm_from_base) >= _PERIOD_PPM_FROM_BASE_MAX * 0.99
-                else "per_update_clamped"
-                if abs(stepped_period_s - target_from_base_s) > 1e-9
-                else None
-            )
 
     period_correction_ppm = (
         (refined_period_s - base_period_s) / base_period_s * 1e6 if base_period_s > 0 else 0.0
-    )
-    period_correction_status = (
-        "holding"
-        if not period_update_allowed
-        else "clamp_limited"
-        if period_update_clamp_reason is not None
-        else "converging"
     )
 
     inlier_abs = [abs(e["residual"]) for e in scored if e["status"] == "inlier"]
@@ -586,47 +536,24 @@ def update_simple_live_sync_state(
         period_base_s=base_period_s,
         residual_slope_deg_per_s=smoothed_slope,
         period_correction_ppm=period_correction_ppm,
-        period_refine_enabled=bool(RADAR_SYNC_PERIOD_REFINE_ENABLED),
-        period_update_allowed=period_update_allowed,
-        period_update_block_reason=period_update_block_reason,
-        period_update_clamp_reason=period_update_clamp_reason,
-        period_update_applied=period_update_applied,
-        period_update_ppm_applied=period_update_ppm_applied,
-        period_update_ppm_from_base=period_update_ppm_from_base,
-        period_update_ppm_step=period_update_ppm_step,
-        period_update_ppm_limit_from_base=_PERIOD_PPM_FROM_BASE_MAX,
-        period_update_ppm_limit_step=_PERIOD_PPM_PER_UPDATE_MAX,
-        period_update_safety_ppm_from_base=_PERIOD_PPM_FROM_BASE_MAX,
-        period_update_safety_ppm_per_update=_PERIOD_PPM_PER_UPDATE_MAX,
-        period_update_fit_support=n_inliers,
-        period_update_fit_span_s=fit_span_s,
-        period_correction_status=period_correction_status,
         period_authoritative_source=period_authoritative_source,
         phase_status=phase_status,
-        phase_status_reason=phase_status_reason,
         phase_anchor_icao=phase_anchor_icao,
         phase_anchor_score=phase_anchor_score,
         phase_anchor_obs_count=phase_anchor_obs_count,
-        phase_anchor_offset_raw_deg=phase_anchor_raw,
-        phase_anchor_offset_smoothed_deg=phase_anchor_smoothed,
         phase_anchor_spread_deg=phase_anchor_spread,
         phase_anchor_status=phase_anchor_status,
         phase_anchor_since_ts=phase_anchor_since_ts,
         phase_anchor_replacement_reason=phase_anchor_replacement_reason,
         phase_anchor_candidate_count=len(anchor_selection.get("candidates") or []),
+        phase_anchor_no_candidate_reason=anchor_selection.get("no_candidate_reason"),
         phase_anchor_candidates=anchor_selection.get("candidates") or [],
         phase_validation_contributors=validation["contributor_count"],
         phase_validation_reject_count=validation["reject_count"],
         phase_validation_median_error_deg=validation.get("median_error_deg"),
         phase_validation_status=validation["status"],
-        fit_time_basis="effective_beast_time_s",
-        fit_residual_basis="observed_minus_predicted_after_prop_motion_deg",
         fit_total_observations=len(recent_obs),
         fit_eligible_observations=len(fit_scored),
-        fit_rejected_observations=n_rejected,
-        fit_reject_reasons=dict(fit_reject_reasons),
-        fit_contributing_icao_count=len(fit_contributing_icaos),
-        fit_span_s=fit_span_s,
         prop_delay_enabled=bool(RADAR_SYNC_PROP_DELAY_ENABLED),
         motion_comp_phase_enabled=bool(RADAR_SYNC_MOTION_COMP_PHASE_ENABLED),
         motion_comp_fit_enabled=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
@@ -639,6 +566,6 @@ def update_simple_live_sync_state(
             "period_s": refined_period_s,
             "period_base_s": base_period_s,
             "period_correction_ppm": period_correction_ppm,
-            "period_correction_status": period_correction_status,
+            "period_correction_status": "converging" if period_update_allowed else "holding",
         }
     )

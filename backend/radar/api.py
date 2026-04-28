@@ -3968,7 +3968,6 @@ def build_radar_live_state_payload(state: "RadarState" | None) -> dict:
                         else (sync.period_s if sync is not None else None)
                     ),
                     "period_correction_ppm": sync.period_correction_ppm if sync is not None else None,
-                    "period_correction_status": sync.period_correction_status if sync is not None else None,
                     "sync_jitter_deg": (
                         go_sync.get("sync_jitter_deg")
                         if go_sync is not None and go_sync.get("sync_jitter_deg") is not None

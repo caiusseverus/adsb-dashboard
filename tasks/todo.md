@@ -1,3 +1,53 @@
+## 2026-04-28 LiveSyncState Audit And Simplification
+
+- [x] Audit every `LiveSyncState` field in `backend/radar/sync_models.py` and classify it as functional, Stage 3 trust, propagation/motion, frontend/API-retained, or obsolete.
+- [x] Record the pre-deletion audit report here with grouped keep/delete decisions.
+- [x] Remove obsolete compact/refined/legacy/Go-era fields from `LiveSyncState` and delete matching assignments/carry-forward code.
+- [x] Remove or update backend serialization and frontend reads for deleted fields so no dead API/UI references remain.
+- [x] Update comments/docstrings to describe the current Python simple sync model rather than compact/refined/legacy/Go authority eras.
+- [x] Add regression tests for retained prediction/Stage 3/simple-sync behavior and for absence of obsolete fields.
+- [x] Run focused backend tests, frontend build/search verification, and record the review outcome here.
+
+Plan confirmation:
+- Keep this pass structural only; do not change sync algorithm behavior, Stage 3 solver behavior, base rotation analysis, propagation correction, or motion compensation.
+- Retain fields required by `predict_sync_observation()`, `_update_simple_live_sync_state()`, `_fit_per_aircraft_slope()`, `_sync_state_has_trusted_absolute_phase()`, or the current frontend/API.
+- Treat dead compatibility payload as removable even if it still appears in serialization, provided the same pass removes the now-unused backend/frontend/test references.
+
+### Audit Report
+- Required functional fields:
+  - `period_s`, `phase_epoch_us`, `phase_offset_deg` (`KEEP_PREDICTION`)
+  - `phase_status` (`KEEP_STAGE3_TRUST`)
+  - `usable`, `holdover`, `period_base_s`, `residual_slope_deg_per_s`, `period_correction_ppm`, `period_authoritative_source` (`KEEP_SIMPLE_SYNC_FUNCTIONAL`)
+  - `prop_delay_enabled`, `motion_comp_phase_enabled`, `motion_comp_fit_enabled` (`KEEP_PROPAGATION_OR_MOTION`)
+- Frontend/API fields retained:
+  - `iid`, `sync_quality`, `sync_jitter_deg`, `last_sync_update_ts`, `source`
+  - `residual_ema_deg`, `n_sync_frames`, `n_rejected_frames`, `last_residual_deg`
+  - `n_burst_obs_inliers`, `n_burst_obs_rejected`, `contributing_icao_count`
+  - `phase_anchor_icao`, `phase_anchor_score`, `phase_anchor_obs_count`, `phase_anchor_spread_deg`, `phase_anchor_status`
+  - `phase_anchor_since_ts`, `phase_anchor_replacement_reason`, `phase_anchor_candidate_count`, `phase_anchor_no_candidate_reason`
+  - `phase_validation_contributors`, `phase_validation_reject_count`, `phase_validation_median_error_deg`, `phase_validation_status`
+  - `phase_anchor_candidates`, `fit_total_observations`, `fit_eligible_observations`
+- Fields proposed for deletion:
+  - Removed period-update/fit bookkeeping fields that only preserved old internal diagnostics: `period_refine_enabled`, all `period_update_*` fields except `period_authoritative_source`, `phase_status_reason`, `fit_time_basis`, `fit_residual_basis`, `fit_rejected_observations`, `fit_reject_reasons`, `fit_contributing_icao_count`, `fit_span_s`
+  - Removed motion-comp aggregate counters that were not part of prediction/state authority: `motion_comp_applied_count`, `motion_comp_blocked_count`, `motion_comp_mean_dt_us`, `motion_comp_mean_residual_improvement_deg`, `motion_comp_high_rate_mean_residual_improvement_deg`
+  - Removed anchor-offset state copies that were no longer needed by the active API/frontend contract: `phase_anchor_offset_raw_deg`, `phase_anchor_offset_smoothed_deg`
+  - Removed obsolete dominant/compact/refined comparison fields: `dominant_period_s`, `dominant_prior_period_s`, `trusted_refined_period_s`, `bootstrap_period_s`, `active_family_prior_s`, `active_family_prior_source`, `dominant_prior_active`, `dominant_period_delta_s`, `dominant_period_delta_ppm`, `compact_period_s`, `compact_period_delta_to_dominant_s`, `compact_period_delta_to_dominant_ppm`, `compact_sync_unreliable`
+- Unclear fields needing manual review:
+  - None after usage search across `backend/` and `frontend/src/`.
+- Likely keep fields:
+  - `sync_quality`, `residual_ema_deg`, and the retained anchor/fit summary fields stay because current API/frontend panels still consume them.
+
+### Review
+- Implemented:
+  - Simplified [backend/radar/sync_models.py](/home/keith/claude/adsb-dashboard/backend/radar/sync_models.py) so `LiveSyncState` carries only the current predictor, Stage 3 trust, simple-sync, propagation/motion, and active UI/API fields.
+  - Removed deleted-field assignments and carry-forward logic from [backend/radar/simple_sync.py](/home/keith/claude/adsb-dashboard/backend/radar/simple_sync.py) and [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py).
+  - Trimmed dead sync-state diagnostics from [backend/radar/aircraft_localiser.py](/home/keith/claude/adsb-dashboard/backend/radar/aircraft_localiser.py), [backend/radar/api.py](/home/keith/claude/adsb-dashboard/backend/radar/api.py), and [backend/radar/sweep_diagnostics.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep_diagnostics.py).
+  - Updated backend tests to assert the slimmer state contract, including an explicit obsolete-field regression in [backend/tests/test_radar_phase_refinement.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_phase_refinement.py).
+- Verification:
+  - `uv run --directory backend pytest tests/test_aircraft_localiser_sync_predictor.py tests/test_radar_phase_refinement.py tests/test_radar_sweep.py tests/test_radar_api.py -q` -> `172 passed`
+  - `npm run build` in `frontend/` -> passed
+  - `rg` over `backend/` and `frontend/src/` shows no remaining runtime/frontend references to the deleted `LiveSyncState` fields; remaining matches are only the new obsolete-field regression test and local simple-sync variables.
+
 ## 2026-04-28 Sweep Re-Export Safety Fix
 
 - [x] Inspect `backend/radar/sweep.py` for remaining duplicate local definitions and identify any still-shadowed extracted helpers.

@@ -7,6 +7,7 @@ Covers:
 - EMA preservation when per-ICAO consensus is rejected
 - Stage 3 trust gate in _sync_state_has_trusted_absolute_phase()
 """
+from dataclasses import fields
 import math
 import os
 import sys
@@ -418,16 +419,62 @@ class TestPeriodClamp:
         deviation_ppm = abs(refined_period_s - period_base_s) / period_base_s * 1e6
         assert deviation_ppm <= _PERIOD_PPM_FROM_BASE_MAX + 1e-6
 
-    def test_period_update_has_separate_base_ppm_and_step_ppm_diagnostics(self):
-        """LiveSyncState exposes period_update_ppm_from_base and period_update_ppm_step."""
-        sync = _make_sync()
-        assert hasattr(sync, "period_update_ppm_from_base")
-        assert hasattr(sync, "period_update_ppm_step")
-        assert hasattr(sync, "period_update_ppm_limit_from_base")
-        assert hasattr(sync, "period_update_ppm_limit_step")
-        # Defaults should be finite
-        assert math.isfinite(sync.period_update_ppm_from_base)
-        assert math.isfinite(sync.period_update_ppm_step)
+    def test_live_sync_state_has_no_obsolete_compact_refined_fields(self):
+        names = {f.name for f in fields(LiveSyncState)}
+        obsolete = {
+            "period_refine_enabled",
+            "period_update_term",
+            "period_update_direction",
+            "period_update_applied",
+            "period_update_gain",
+            "period_refine_block_reason",
+            "period_update_proposed_s",
+            "period_update_proposed_us",
+            "period_update_applied_s",
+            "period_update_applied_us",
+            "period_update_ppm_unclamped",
+            "period_update_ppm_applied",
+            "period_update_block_reason",
+            "period_update_clamp_reason",
+            "period_update_allowed",
+            "period_update_fit_support",
+            "period_update_fit_span_s",
+            "period_correction_status",
+            "period_update_safety_ppm_per_update",
+            "period_update_safety_ppm_from_base",
+            "period_update_ppm_from_base",
+            "period_update_ppm_step",
+            "period_update_ppm_limit_from_base",
+            "period_update_ppm_limit_step",
+            "phase_status_reason",
+            "fit_time_basis",
+            "fit_residual_basis",
+            "fit_rejected_observations",
+            "fit_reject_reasons",
+            "fit_contributing_icao_count",
+            "fit_span_s",
+            "motion_comp_applied_count",
+            "motion_comp_blocked_count",
+            "motion_comp_mean_dt_us",
+            "motion_comp_mean_residual_improvement_deg",
+            "motion_comp_high_rate_mean_residual_improvement_deg",
+            "phase_anchor_offset_raw_deg",
+            "phase_anchor_offset_smoothed_deg",
+            "dominant_period_s",
+            "dominant_prior_period_s",
+            "trusted_refined_period_s",
+            "bootstrap_period_s",
+            "active_family_prior_s",
+            "active_family_prior_source",
+            "dominant_prior_active",
+            "dominant_period_delta_s",
+            "dominant_period_delta_ppm",
+            "compact_period_s",
+            "compact_period_delta_to_dominant_s",
+            "compact_period_delta_to_dominant_ppm",
+            "compact_sync_unreliable",
+        }
+        assert names.isdisjoint(obsolete)
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +585,6 @@ class TestSimpleModelBehavior:
             usable=True,
             period_base_s=period_s,
             prop_delay_enabled=False,
-            period_refine_enabled=True,
             residual_slope_deg_per_s=residual_slope_deg_per_s,
         )
         defaults.update(kwargs)
@@ -634,7 +680,7 @@ class TestSimpleModelBehavior:
         sync = self._run(state, obs)
 
         assert sync is not None
-        assert sync.period_update_allowed is False
+        assert sync.period_authoritative_source == "base"
         assert sync.period_s == pytest.approx(4.001)  # unchanged
 
     def test_conflicting_icao_slopes_block_period_update(self, monkeypatch):
@@ -659,8 +705,7 @@ class TestSimpleModelBehavior:
         sync = self._run(state, obs)
 
         assert sync is not None
-        assert sync.period_update_allowed is False
-        assert sync.period_update_block_reason == "sign_disagreement"
+        assert sync.period_authoritative_source == "base"
         assert sync.period_s == pytest.approx(self._PERIOD_S)
 
     def test_period_cap_500ppm_enforced_under_extreme_slope(self, monkeypatch):
@@ -718,7 +763,7 @@ class TestSimpleModelBehavior:
         sync = self._run(state, obs)
 
         assert sync is not None
-        assert sync.period_update_allowed is False  # persistence gate blocks it
+        assert sync.period_authoritative_source == "base"  # persistence gate blocks period correction
         assert sync.phase_status == "trusted"       # phase trusted independently
 
     def test_fit_and_phase_diagnostics_present(self, monkeypatch):
