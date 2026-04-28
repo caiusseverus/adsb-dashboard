@@ -686,7 +686,6 @@ def predict_localiser_live_path_bearing(
     arrival_beast_us: float,
     *,
     range_nm: float | None = None,
-    waveform_bins: list | None = None,
     bearing_rate_deg_s: float | None = None,
     motion_comp_dt_us: float | None = None,
     motion_comp_block_reason: str | None = None,
@@ -701,7 +700,6 @@ def predict_localiser_live_path_bearing(
         sync_state,
         arrival_beast_us,
         range_nm=range_nm,
-        waveform_bins=waveform_bins,
         bearing_rate_deg_s=bearing_rate_deg_s,
         motion_comp_dt_us=motion_comp_dt_us,
         motion_comp_block_reason=motion_comp_block_reason,
@@ -952,7 +950,6 @@ class AircraftLocaliser:
         radar_lat: float,
         radar_lon: float,
         calibration: RadarBearingCalibration,
-        waveform_bins: list | None = None,
         effective_sync_jitter_deg: float | None = None,
     ) -> "RadarBearingObservation | None":
         """Convert one live detection to a bearing observation.
@@ -975,7 +972,6 @@ class AircraftLocaliser:
             sync_state,
             detection.arrival_us,
             range_nm=range_nm,
-            waveform_bins=waveform_bins,
             bearing_rate_deg_s=getattr(detection, "bearing_rate_deg_s", None),
             motion_comp_dt_us=getattr(detection, "motion_comp_dt_us", None),
             motion_comp_block_reason=getattr(detection, "motion_comp_block_reason", None),
@@ -1048,10 +1044,9 @@ class AircraftLocaliser:
             return []
 
         obs_out: list[RadarBearingObservation] = []
-        waveform_bins = self._radar_state.get_stage3_live_waveform_bins(iid)
         for det in detections:
             ob = self._bearing_from_live_detection(
-                det, sync_state, radar_lat, radar_lon, calibration, waveform_bins,
+                det, sync_state, radar_lat, radar_lon, calibration,
             )
             if ob is not None:
                 obs_out.append(ob)
@@ -1263,15 +1258,13 @@ class AircraftLocaliser:
             # the jitter here: clamping it down to the calibration sigma would
             # systematically under-estimate uncertainty when sync jitter is the
             # dominant term.  Shared sync state is never mutated.
-            waveform_bins = self._radar_state.get_stage3_live_waveform_bins(iid)
-
             if chosen is None:
                 per_radar_reasons[iid] = REASON_STALE_OBSERVATION
                 # Emit a rejection ray from the newest stale detection so the
                 # evidence layer can show operators which radars fell behind.
                 stale = detections[0]
                 stale_obs = self._bearing_from_live_detection(
-                    stale, sync_state, auth["lat"], auth["lon"], cal, waveform_bins,
+                    stale, sync_state, auth["lat"], auth["lon"], cal,
                 )
                 if stale_obs is not None:
                     rejected_rays.append(self._obs_to_live_ray(
@@ -1281,7 +1274,7 @@ class AircraftLocaliser:
                 continue
 
             obs = self._bearing_from_live_detection(
-                chosen, sync_state, auth["lat"], auth["lon"], cal, waveform_bins,
+                chosen, sync_state, auth["lat"], auth["lon"], cal,
             )
             if obs is None:
                 per_radar_reasons[iid] = REASON_OBS_BUILD_FAILED
@@ -1919,11 +1912,5 @@ class AircraftLocaliser:
                 "fit_reject_reasons": getattr(sync, "fit_reject_reasons", None),
                 "fit_contributing_icao_count": getattr(sync, "fit_contributing_icao_count", None),
                 "fit_span_s": getattr(sync, "fit_span_s", None),
-                "predictor_consistency": getattr(sync, "predictor_consistency", None),
-                "waveform_enabled": getattr(sync, "waveform_enabled", None),
-                "waveform_applied": getattr(sync, "waveform_applied", None),
-                "waveform_learning_enabled": getattr(sync, "waveform_learning_enabled", None),
-                "waveform_update_block_reason": getattr(sync, "waveform_update_block_reason", None),
-                "waveform_learning_residual_basis": getattr(sync, "waveform_learning_residual_basis", None),
             }
         return result

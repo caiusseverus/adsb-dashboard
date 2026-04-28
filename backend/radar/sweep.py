@@ -29,20 +29,16 @@ from .aircraft_models import Stage3LiveDetection
 try:
     from config import (
         RADAR_SYNC_PERIOD_REFINE_ENABLED,
-        RADAR_SYNC_WAVEFORM_ENABLED,
         RADAR_SYNC_PROP_DELAY_ENABLED,
         RADAR_SYNC_MOTION_COMP_PHASE_ENABLED,
         RADAR_SYNC_MOTION_COMP_FIT_ENABLED,
-        RADAR_SYNC_WAVEFORM_BIN_COUNT,
         RADAR_DIAGNOSTICS,
     )
 except Exception:  # pragma: no cover — config not importable in some test harnesses
     RADAR_SYNC_PERIOD_REFINE_ENABLED = True
-    RADAR_SYNC_WAVEFORM_ENABLED = True
     RADAR_SYNC_PROP_DELAY_ENABLED = True
     RADAR_SYNC_MOTION_COMP_PHASE_ENABLED = True
     RADAR_SYNC_MOTION_COMP_FIT_ENABLED = True
-    RADAR_SYNC_WAVEFORM_BIN_COUNT = 24
     RADAR_DIAGNOSTICS = False
 
 if TYPE_CHECKING:
@@ -291,23 +287,6 @@ def _sync_source_is_go_compact(sync: "LiveSyncState | None") -> bool:
     return bool(sync is not None and getattr(sync, "source", None) == "sweep_frame_go")
 
 
-def _serialise_waveform_bins(bins: list) -> list[dict]:
-    """Serialise a list of WaveformBin objects to JSON-safe dicts."""
-    n = len(bins)
-    if not n:
-        return []
-    bin_width = 360.0 / n
-    return [
-        {
-            "phase_center_deg": (i + 0.5) * bin_width,
-            "correction_deg": b.correction_deg,
-            "weight": b.weight,
-            "n": b.n,
-        }
-        for i, b in enumerate(bins)
-    ]
-
-
 def _fit_weighted_slope(xs: list[float], ys: list[float], ws: list[float]) -> tuple[float, float]:
     """Weighted least-squares linear fit y = a + b*x.
 
@@ -530,196 +509,6 @@ def _clamp_float(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
-def _compute_folded_phase_shape(rows: list[dict], n_bins: int = 24) -> dict:
-    """Summarise diagnostic-only detrended residual shape folded by rotation phase."""
-    if n_bins <= 0:
-        n_bins = 24
-    bins: list[list[float]] = [[] for _ in range(n_bins)]
-    cycle_bins: dict[int, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
-    for row in rows:
-        phase = row.get("phase_deg")
-        resid = row.get("residual_detrended_deg")
-        cycle_index = row.get("cycle_index")
-        if phase is None or resid is None:
-            continue
-        phase_f = float(phase) % 360.0
-        resid_f = float(resid)
-        if not _math.isfinite(phase_f) or not _math.isfinite(resid_f):
-            continue
-        idx = _waveform_bin_index(phase_f, n_bins)
-        bins[idx].append(resid_f)
-        if cycle_index is not None:
-            cycle_bins[int(cycle_index)][idx].append(resid_f)
-
-    bin_width = 360.0 / n_bins
-    phase_bins = []
-    bin_medians: list[float] = []
-    bin_spreads: list[float] = []
-    for idx, values in enumerate(bins):
-        stats = _residual_stats(values)
-        median = stats["median_residual_deg"]
-        spread = stats["robust_spread_mad_deg"]
-        if median is not None:
-            bin_medians.append(median)
-        if spread is not None:
-            bin_spreads.append(spread)
-        phase_bins.append({
-            "phase_start_deg": idx * bin_width,
-            "phase_center_deg": (idx + 0.5) * bin_width,
-            "phase_end_deg": (idx + 1) * bin_width,
-            "count": stats["count"],
-            "median_residual_detrended_deg": median,
-            "spread_mad_deg": spread,
-            "median_abs_residual_detrended_deg": stats["median_abs_residual_deg"],
-        })
-
-    cycle_summaries = []
-    cycle_shape_errors: list[float] = []
-    for cycle_index, per_bin in cycle_bins.items():
-        cycle_points = 0
-        cycle_errors = []
-        cycle_values = []
-        for idx, values in per_bin.items():
-            bin_median = phase_bins[idx]["median_residual_detrended_deg"]
-            if bin_median is None:
-                continue
-            cycle_median = _median_float(values)
-            if cycle_median is None:
-                continue
-            cycle_points += len(values)
-            cycle_values.extend(values)
-            cycle_errors.append(abs(cycle_median - bin_median))
-        error = _median_float(cycle_errors)
-        if error is not None:
-            cycle_shape_errors.append(error)
-        stats = _residual_stats(cycle_values)
-        cycle_summaries.append({
-            "cycle_index": cycle_index,
-            "count": cycle_points,
-            "median_shape_error_deg": error,
-            "median_residual_detrended_deg": stats["median_residual_deg"],
-            "spread_mad_deg": stats["robust_spread_mad_deg"],
-        })
-    cycle_summaries.sort(key=lambda row: row["cycle_index"])
-
-    phase_shape_strength = _residual_stats(bin_medians)["median_abs_residual_deg"]
-    within_bin_spread = _median_float(bin_spreads)
-    cycle_shape_error = _median_float(cycle_shape_errors)
-    if phase_shape_strength is None:
-        repeatability_score = None
-    else:
-        noise = cycle_shape_error if cycle_shape_error is not None else within_bin_spread
-        if noise is None:
-            repeatability_score = None
-        else:
-            repeatability_score = _clamp_float(
-                phase_shape_strength / max(phase_shape_strength + noise, 1.0),
-                0.0,
-                1.0,
-            )
-
-    return {
-        "phase_bin_count": n_bins,
-        "phase_bins": phase_bins,
-        "cycles": cycle_summaries,
-        "phase_shape_strength_deg": phase_shape_strength,
-        "within_bin_spread_mad_deg": within_bin_spread,
-        "cycle_shape_error_median_deg": cycle_shape_error,
-        "cycle_to_cycle_repeatability": repeatability_score,
-        "cycle_count": len(cycle_summaries),
-    }
-
-
-def _classify_sync_error_mode(
-    *,
-    slope_deg_per_s: float | None,
-    time_span_s: float,
-    raw_mad_deg: float | None,
-    detrended_mad_deg: float | None,
-    phase_shape_strength_deg: float | None,
-    repeatability: float | None,
-) -> dict:
-    """Compact rule-based interpretation for operator diagnostics only."""
-    slope = abs(float(slope_deg_per_s or 0.0))
-    drift_deg = slope * max(0.0, time_span_s)
-    period_drift_strength = _clamp_float(drift_deg / 20.0, 0.0, 1.0)
-    if raw_mad_deg is not None and detrended_mad_deg is not None and raw_mad_deg > 0:
-        drift_improvement = _clamp_float((raw_mad_deg - detrended_mad_deg) / raw_mad_deg, 0.0, 1.0)
-        period_drift_strength = max(period_drift_strength, drift_improvement)
-
-    phase_shape_strength = _clamp_float(float(phase_shape_strength_deg or 0.0) / 10.0, 0.0, 1.0)
-    repeat = repeatability if repeatability is not None else 0.0
-    unstable_strength = _clamp_float((1.0 - repeat) * (float(detrended_mad_deg or 0.0) / 12.0), 0.0, 1.0)
-
-    period_strong = period_drift_strength >= 0.35
-    shape_strong = phase_shape_strength >= 0.35 and repeat >= 0.45
-    unstable = unstable_strength >= 0.35 and repeat < 0.45
-    if period_strong and shape_strong:
-        mode = "mixed"
-    elif period_strong and not shape_strong:
-        mode = "period_drift"
-    elif shape_strong:
-        mode = "repeatable_phase_shape"
-    elif unstable:
-        mode = "unstable_cycle_shape"
-    else:
-        mode = "mixed" if period_drift_strength >= 0.2 or phase_shape_strength >= 0.2 else "unstable_cycle_shape"
-
-    return {
-        "dominant_error_mode": mode,
-        "period_drift_strength": period_drift_strength,
-        "period_drift_window_deg": drift_deg,
-        "phase_shape_strength": phase_shape_strength,
-        "phase_shape_strength_deg": phase_shape_strength_deg,
-        "cycle_to_cycle_repeatability": repeatability,
-        "unstable_cycle_strength": unstable_strength,
-    }
-
-
-def _waveform_bin_index(phase_deg: float, n_bins: int) -> int:
-    """Phase (0–360) → bin index in [0, n_bins).  Wraps negative/large phases."""
-    if n_bins <= 0:
-        return 0
-    phase = phase_deg % 360.0
-    if phase < 0:
-        phase += 360.0
-    idx = int(phase / (360.0 / n_bins))
-    if idx >= n_bins:
-        idx = n_bins - 1
-    return idx
-
-
-def _apply_phase_waveform_correction(
-    bins: list[WaveformBin] | None,
-    phase_deg: float,
-    *,
-    applied: bool,
-) -> float:
-    """Return the empirical waveform correction in degrees for this phase.
-
-    Returns 0.0 when the waveform is not yet applied or no bins exist.
-    """
-    if not applied or not bins:
-        return 0.0
-    n_bins = len(bins)
-    idx = _waveform_bin_index(phase_deg, n_bins)
-    # Simple linear interpolation between bin centres for smoothness.
-    width = 360.0 / n_bins
-    centre = (idx + 0.5) * width
-    delta = (phase_deg % 360.0) - centre
-    if delta > width:
-        delta -= 360.0
-    elif delta < -width:
-        delta += 360.0
-    if delta >= 0:
-        other = (idx + 1) % n_bins
-        frac = delta / width
-    else:
-        other = (idx - 1) % n_bins
-        frac = -delta / width
-    a = bins[idx].correction_deg
-    b = bins[other].correction_deg
-    return (1.0 - frac) * a + frac * b
 
 
 @_dataclass
@@ -743,8 +532,6 @@ class SyncPrediction:
     phase_in_rot_deg: float
     predicted_bearing_raw_deg: float
     predicted_bearing_deg: float
-    waveform_correction_deg: float
-    waveform_applied: bool
     predictor_version: str = "authoritative_sync_v3_motion"
     phase_status: str | None = None  # passthrough from LiveSyncState.phase_status; None = not yet evaluated
 
@@ -754,23 +541,18 @@ def predict_sync_observation(
     arrival_us: float,
     *,
     range_nm: float | None = None,
-    waveform_bins: list[WaveformBin] | None = None,
     apply_propagation: bool | None = None,
-    apply_waveform: bool | None = None,
     apply_motion: bool | None = None,
     bearing_rate_deg_s: float | None = None,
     motion_comp_dt_us: float | None = None,
     motion_comp_block_reason: str | None = None,
 ) -> SyncPrediction:
-    """Predict bearing from arrival time using the refined sync model.
+    """Predict bearing from arrival time using the live sync model.
 
-    This is the single authoritative predictor consumed by burst-sync
-    residual generation, live period fitting, diagnostics, and Stage 3 live
-    bearing observation construction.  Update order is explicit:
+    Update order:
       1. compute propagation-corrected effective time,
       2. subtract aircraft-motion timing shift when enabled and valid,
-      3. compute phase with the current refined period,
-      4. apply the current waveform correction to the predicted bearing.
+      3. compute phase with the current period.
     """
     period_us = sync.period_s * 1e6
     if period_us <= 0:
@@ -789,8 +571,6 @@ def predict_sync_observation(
             phase_in_rot_deg=0.0,
             predicted_bearing_raw_deg=predicted,
             predicted_bearing_deg=predicted,
-            waveform_correction_deg=0.0,
-            waveform_applied=False,
         )
     effective_us = arrival_us
     prop_delay_us = 0.0
@@ -819,15 +599,6 @@ def predict_sync_observation(
 
     phase_in_rot = ((effective_us - sync.phase_epoch_us) / period_us * 360.0) % 360.0
     predicted_raw = (phase_in_rot + sync.phase_offset_deg) % 360.0
-    predicted = predicted_raw
-    waveform_correction = 0.0
-    waveform_enabled = (sync.waveform_enabled and sync.waveform_applied) if apply_waveform is None else bool(apply_waveform)
-    waveform_applied = bool(waveform_enabled)
-    if waveform_enabled:
-        waveform_correction = _apply_phase_waveform_correction(
-            waveform_bins, phase_in_rot, applied=True,
-        )
-        predicted = (predicted - waveform_correction) % 360.0
     return SyncPrediction(
         raw_arrival_us=arrival_us,
         effective_arrival_us=effective_us,
@@ -841,9 +612,7 @@ def predict_sync_observation(
         motion_comp_block_reason=motion_block,
         phase_in_rot_deg=phase_in_rot,
         predicted_bearing_raw_deg=predicted_raw,
-        predicted_bearing_deg=predicted,
-        waveform_correction_deg=waveform_correction,
-        waveform_applied=waveform_applied,
+        predicted_bearing_deg=predicted_raw,
         phase_status=getattr(sync, "phase_status", "untrusted"),
     )
 
@@ -853,15 +622,9 @@ def _predict_bearing_from_sync(
     arrival_us: float,
     *,
     range_nm: float | None = None,
-    waveform_bins: list[WaveformBin] | None = None,
 ) -> tuple[float, float]:
     """Compatibility wrapper around the authoritative predictor."""
-    prediction = predict_sync_observation(
-        sync,
-        arrival_us,
-        range_nm=range_nm,
-        waveform_bins=waveform_bins,
-    )
+    prediction = predict_sync_observation(sync, arrival_us, range_nm=range_nm)
     return prediction.predicted_bearing_deg, prediction.phase_in_rot_deg
 
 
@@ -1026,14 +789,6 @@ def _compute_motion_comp_dt_us(period_s: float, bearing_rate_deg_s: float | None
 
 
 @_dataclass
-class WaveformBin:
-    """One circular bin in the empirical phase-in-rotation waveform model."""
-    correction_deg: float = 0.0   # EMA of residual at this phase
-    weight: float = 0.0           # summed observation weight
-    n: int = 0                    # raw observation count
-
-
-@_dataclass
 class IcaoSyncQuality:
     """Per-IID per-ICAO residual quality memory for fit downweighting."""
     residual_median_deg: float = 0.0   # circular-mean EMA of signed residual
@@ -1175,22 +930,13 @@ class LiveSyncState:
     phase_status: str | None = None
     phase_status_reason: str | None = None
     fit_time_basis: str = "effective_beast_time_s"
-    fit_residual_basis: str = "observed_minus_authoritative_prediction_after_waveform_deg"
+    fit_residual_basis: str = "observed_minus_authoritative_prediction_deg"
     fit_total_observations: int = 0
     fit_eligible_observations: int = 0
     fit_rejected_observations: int = 0
     fit_reject_reasons: dict[str, int] = _field(default_factory=dict)
     fit_contributing_icao_count: int = 0
     fit_span_s: float = 0.0
-    predictor_consistency: dict[str, bool] = _field(default_factory=dict)
-    # Phase-in-rotation waveform correction diagnostics.
-    waveform_enabled: bool = False         # config flag state
-    waveform_applied: bool = False         # True if waveform passed coverage threshold and is applied
-    waveform_bin_count: int = 0            # configured bin count
-    waveform_residual_reduction_deg: float = 0.0  # rolling |resid_raw| - |resid_corrected|
-    waveform_learning_enabled: bool = False
-    waveform_update_block_reason: str | None = None
-    waveform_learning_residual_basis: str = "residual_after_waveform_detrended_deg"
     # Propagation delay correction diagnostics.
     prop_delay_enabled: bool = False       # config flag state
     # Aircraft angular-motion timing correction diagnostics.
@@ -1221,17 +967,7 @@ class LiveSyncState:
     phase_validation_median_error_deg: float | None = None
     phase_validation_status: str = "unavailable"
     phase_anchor_candidates: list[dict] = _field(default_factory=list)
-    period_failure_score: float = 0.0
-    period_failure_streak: int = 0
-    period_reacquire_active: bool = False
-    period_reacquire_reason: str | None = None
-    period_reacquire_started_ts: float | None = None
-    period_refine_mode: str = "normal"
     period_authoritative_source: str = "refined"
-    period_failure_primary_class: str = "clean"
-    period_reacquire_trigger: str | None = None
-    period_recovery_clean_update: bool = False
-    period_recovery_clean_streak: int = 0
     dominant_period_s: float | None = None
     dominant_prior_period_s: float | None = None
     trusted_refined_period_s: float | None = None
@@ -1245,86 +981,6 @@ class LiveSyncState:
     compact_period_delta_to_dominant_s: float | None = None
     compact_period_delta_to_dominant_ppm: float | None = None
     compact_sync_unreliable: bool = False
-    recovery_mode_active: bool = False
-    recovery_trigger_reasons: list[str] = _field(default_factory=list)
-    compact_gating_bypassed: bool = False
-    recovery_relaxed_admitted_observations: int = 0
-    active_authority_mode: str | None = None
-    authority_switch_count: int = 0
-    last_authority_switch_ts: float | None = None
-    last_authority_switch_reason: str | None = None
-    authority_enter_streak: int = 0
-    authority_exit_streak: int = 0
-    anchor_switch_count: int = 0
-    last_anchor_switch_ts: float | None = None
-    last_anchor_switch_reason: str | None = None
-    anchor_hold_updates: int = 0
-    candidate_period_s: float | None = None
-    authoritative_period_s: float | None = None
-    candidate_phase_offset_deg: float | None = None
-    authoritative_phase_offset_deg: float | None = None
-    candidate_anchor_icao: str | None = None
-    authoritative_anchor_icao: str | None = None
-    candidate_validation_score: float | None = None
-    authoritative_validation_score: float | None = None
-    authoritative_state_age_s: float | None = None
-    candidate_promotion_streak: int = 0
-    authoritative_period_update_gain: float | None = None
-    authoritative_phase_update_gain: float | None = None
-    period_frozen_due_to_phase_validation: bool = False
-    branch_ambiguity_score: float | None = None
-    circular_dispersion_deg: float | None = None
-    validator_agreement_count: int = 0
-    validator_disagreement_count: int = 0
-    candidate_validation_status: str | None = None
-    candidate_application_block_reason: str | None = None
-    candidate_mode: str | None = None
-    authoritative_mode: str | None = None
-    # dominant_prior_inconsistent: mirrors Go DominantPriorInconsistent — True when the
-    # reacquire candidate lies outside the dominant-prior bound. Diagnostic only.
-    dominant_prior_inconsistent: bool = False
-    # anchor_competition_ambiguity: secondScore/topScore from anchor candidate competition.
-    # Distinct from branch_ambiguity_score which also incorporates global coherence checks.
-    anchor_competition_ambiguity: float | None = None
-    # validator_excluded_count: ICAOs with fit-eligible obs below validatorMinObsPerICAO.
-    validator_excluded_count: int = 0
-    # per_icao_phase_offsets: per-ICAO implied-offset and validator-role table from Go.
-    # Each entry: {"icao": str, "latest_offset_deg": float, "anchor_delta_deg": float,
-    #              "role": str, "reject_reasons": list[str]}
-    per_icao_phase_offsets: list[dict] = _field(default_factory=list)
-
-    # ─── Long-term estimator separation (Layer 6 plumbing) ────────────────────
-    # Local* fields are the short-window (current fit) measurement.
-    # LongTerm*/Branch* fields are the persistent estimator state. UI must
-    # plot/label these separately from the corresponding applied state.
-    local_period_measurement_s: float = 0.0
-    local_candidate_anchor_icao: str | None = None
-    local_branch_offset_deg: float = 0.0
-    local_validator_agreement: int = 0
-    local_fit_quality_score: float = 0.0
-
-    long_term_period_estimate_s: float = 0.0
-    long_term_period_estimator_confidence: float = 0.0
-    long_term_period_estimator_age_s: float = 0.0
-    consecutive_period_consistent_windows: int = 0
-    period_update_delta_s: float = 0.0
-
-    long_term_branch_anchor_icao: str | None = None
-    long_term_branch_offset_deg: float = 0.0
-    branch_estimator_confidence: float = 0.0
-    branch_consistent_windows: int = 0
-    branch_contradiction_windows: int = 0
-    branch_competitor_count: int = 0
-    branch_promotion_block_reason: str | None = None
-    # Model identification — populated by the sync update path.
-    # sync_model: always "simple" on the Python path
-    # period_source: how the operational period was derived
-    # period_refinement_source: what drove the period correction this cycle
-    # phase_source: what produced the phase offset this cycle
-    sync_model: str = "simple"
-    period_source: str = "df_base"
-    period_refinement_source: str = "none"
-    phase_source: str = "unavailable"
 
 
 @_dataclass
@@ -2446,12 +2102,8 @@ class RadarState:
         self._MULTI_SYNC_UPDATE_MIN_INTERVAL_S = 0.25
         self._last_multi_sync_update_ts: dict[int, float] = {}
 
-        # Per-IID empirical phase-in-rotation waveform model (circular bins).
-        # Learned slowly from residuals of the refined sync model; subtracted
-        # from predicted bearings when coverage is sufficient.
-        self._live_waveform_bins: dict[int, list[WaveformBin]] = {}
-        # Per-IID per-ICAO residual quality memory, used to downweight repeatedly
-        # noisy aircraft in slope fitting and waveform learning.
+        # Per-IID per-ICAO residual quality memory, used to downweight
+        # repeatedly noisy aircraft in slope fitting.
         self._live_icao_sync_quality: dict[int, dict[str, IcaoSyncQuality]] = {}
         # Per-IID short histories for convergence diagnostics.
         self._live_period_update_history: dict[int, deque] = {}
@@ -2834,12 +2486,6 @@ class RadarState:
             "n_fit_icaos": int(msg.get("fc") or 0),
             "fit_span_s": fit_span_s,
             "fit_reject_reasons": dict(sync.fit_reject_reasons),
-            "active_authority_mode": sync.active_authority_mode,
-            "candidate_period_s": sync.candidate_period_s,
-            "authoritative_period_s": sync.authoritative_period_s,
-            "candidate_validation_score": sync.candidate_validation_score,
-            "authoritative_validation_score": sync.authoritative_validation_score,
-            "authoritative_state_age_s": sync.authoritative_state_age_s,
         })
         self._live_slope_history.setdefault(
             iid, deque(maxlen=_SYNC_DIAGNOSTIC_HISTORY_MAX)
@@ -2852,7 +2498,6 @@ class RadarState:
             "raw_slope_deg_per_s": msg.get("rs"),
             "fit_span_s": fit_span_s,
             "n_fit_observations": fit_eligible,
-            "active_authority_mode": sync.active_authority_mode,
         })
         self._live_period_history.setdefault(
             iid, deque(maxlen=_SYNC_DIAGNOSTIC_HISTORY_MAX)
@@ -2865,9 +2510,6 @@ class RadarState:
             "period_base_s": sync.period_base_s,
             "period_correction_ppm": sync.period_correction_ppm,
             "period_correction_status": sync.period_correction_status,
-            "candidate_period_s": sync.candidate_period_s,
-            "authoritative_period_s": sync.authoritative_period_s,
-            "active_authority_mode": sync.active_authority_mode,
         })
         self._go_sync_diagnostic_history_revision[iid] = (
             self._go_sync_diagnostic_history_revision.get(iid, 0) + 1
@@ -4043,33 +3685,6 @@ class RadarState:
             })
         return results
 
-    @staticmethod
-    def _normalise_go_per_icao_phase_offsets(entries: list | None) -> list[dict]:
-        if not isinstance(entries, list):
-            return []
-        results: list[dict] = []
-        for raw in entries:
-            if not isinstance(raw, dict):
-                continue
-            icao = raw.get("i")
-            try:
-                icao_text = f"{int(icao):06X}" if icao is not None else None
-            except Exception:
-                icao_text = None
-            if not icao_text:
-                continue
-            reject_reasons = raw.get("rr") or []
-            if not isinstance(reject_reasons, list):
-                reject_reasons = []
-            results.append({
-                "icao": icao_text,
-                "latest_offset_deg": float(raw.get("lo") or 0.0),
-                "anchor_delta_deg": float(raw.get("ad") or 0.0),
-                "role": str(raw.get("r") or "unknown"),
-                "reject_reasons": [str(r) for r in reject_reasons if r],
-            })
-        return results
-
     def _record_compact_sync_transition_locked(
         self,
         iid: int,
@@ -4137,61 +3752,10 @@ class RadarState:
         return dict(entry)
 
     @staticmethod
-    def _normalise_go_sync_eligibility(entry: dict) -> tuple[bool, bool, bool, bool]:
-        """Map Go wire-format eligibility fields to diagnostic-only internal names.
-
-        Reads the original Go payload keys (kept for wire-format and legacy-snapshot
-        compatibility) and returns renamed diagnostic flags that must not be
-        mistaken for operational sync authority.
-
-        Returns: (go_compact_timing_candidate, go_refined_payload_present,
-                  go_refined_payload_usable, go_timing_candidate)
-        """
-        compact_value = entry.get("compact_sync_eligible")
-        refined_present_value = entry.get("refined_sync_present")
-        refined_usable_value = entry.get("refined_sync_usable")
-        sync_value = entry.get("sync_eligible")
-
-        legacy_compact_only = (
-            compact_value is None
-            and refined_present_value is None
-            and refined_usable_value is None
-        )
-
-        go_compact_timing_candidate = bool(
-            compact_value if compact_value is not None else (
-                sync_value if legacy_compact_only else False
-            )
-        )
-        go_refined_payload_present = bool(refined_present_value)
-        go_refined_payload_usable = bool(
-            refined_usable_value if refined_usable_value is not None else (
-                sync_value if not legacy_compact_only else False
-            )
-        )
-        go_timing_candidate = bool(
-            refined_usable_value if refined_usable_value is not None else (
-                sync_value if sync_value is not None else go_refined_payload_usable
-            )
-        )
-        return (
-            go_compact_timing_candidate,
-            go_refined_payload_present,
-            go_refined_payload_usable,
-            go_timing_candidate,
-        )
-
-    @staticmethod
     def _normalise_go_track_observation(entry: dict) -> dict | None:
         if not isinstance(entry, dict):
             return None
         try:
-            (
-                go_compact_timing_candidate,
-                go_refined_payload_present,
-                go_refined_payload_usable,
-                go_timing_candidate,
-            ) = RadarState._normalise_go_sync_eligibility(entry)
             return {
                 "iid": int(entry["iid"]),
                 "icao": f"{int(entry['icao']):06X}",
@@ -4215,11 +3779,6 @@ class RadarState:
                 ),
                 "association_confidence": float(entry.get("association_confidence") or 0.0),
                 "dominant_family": bool(entry.get("dominant_family")),
-                # Diagnostic-only flags — do not imply operational sync authority.
-                "go_compact_timing_candidate": go_compact_timing_candidate,
-                "go_refined_payload_present": go_refined_payload_present,
-                "go_refined_payload_usable": go_refined_payload_usable,
-                "go_timing_candidate": go_timing_candidate,
             }
         except Exception:
             return None
@@ -4343,12 +3902,6 @@ class RadarState:
         if not isinstance(entry, dict):
             return None
         try:
-            (
-                go_compact_timing_candidate,
-                go_refined_payload_present,
-                go_refined_payload_usable,
-                go_timing_candidate,
-            ) = RadarState._normalise_go_sync_eligibility(entry)
             return {
                 "kind": str(entry.get("kind") or "burst_fired"),
                 "iid": int(entry["iid"]),
@@ -4410,25 +3963,14 @@ class RadarState:
                 ),
                 "association_confidence": float(entry.get("association_confidence") or 0.0),
                 "dominant_family": bool(entry.get("dominant_family")),
-                # Diagnostic-only flags — do not imply operational sync authority.
-                "go_compact_timing_candidate": go_compact_timing_candidate,
-                "go_refined_payload_present": go_refined_payload_present,
-                "go_refined_payload_usable": go_refined_payload_usable,
-                "go_timing_candidate": go_timing_candidate,
             }
         except Exception:
             return None
 
     def update_go_burst_fired(self, burst_dict: dict) -> None:
-        # Go now only sends "ce" (compact timing candidate); legacy payloads
-        # may carry "rp"/"ru"/"se" and are handled by _normalise_go_sync_eligibility.
         _common = {
             "iid": burst_dict.get("i"),
             "icao": burst_dict.get("c"),
-            "compact_sync_eligible": burst_dict.get("ce"),
-            "refined_sync_present": burst_dict.get("rp"),
-            "refined_sync_usable": burst_dict.get("ru"),
-            "sync_eligible": burst_dict.get("ru", burst_dict.get("se")),
         }
         entry = self._normalise_go_track_observation({
             **_common,
@@ -4748,30 +4290,10 @@ class RadarState:
                 residual_slope_deg_per_s=0.0,
                 period_correction_ppm=0.0,
                 period_refine_enabled=bool(RADAR_SYNC_PERIOD_REFINE_ENABLED),
-                predictor_consistency={
-                    "burst_sync": True,
-                    "period_fit": True,
-                    "localiser_live": True,
-                    "position_verification": True,
-                },
-                waveform_enabled=bool(RADAR_SYNC_WAVEFORM_ENABLED),
-                waveform_applied=False,
-                waveform_bin_count=int(RADAR_SYNC_WAVEFORM_BIN_COUNT),
-                waveform_residual_reduction_deg=0.0,
                 prop_delay_enabled=bool(RADAR_SYNC_PROP_DELAY_ENABLED),
                 motion_comp_phase_enabled=bool(RADAR_SYNC_MOTION_COMP_PHASE_ENABLED),
                 motion_comp_fit_enabled=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
-                period_failure_score=0.0,
-                period_failure_streak=0,
-                period_reacquire_active=False,
-                period_reacquire_reason=None,
-                period_reacquire_started_ts=None,
-                period_refine_mode="normal",
                 period_authoritative_source="refined",
-                period_failure_primary_class="clean",
-                period_reacquire_trigger=None,
-                period_recovery_clean_update=False,
-                period_recovery_clean_streak=0,
             )
             return
 
@@ -4861,14 +4383,6 @@ class RadarState:
             fit_reject_reasons=dict(existing.fit_reject_reasons),
             fit_contributing_icao_count=existing.fit_contributing_icao_count,
             fit_span_s=existing.fit_span_s,
-            predictor_consistency=dict(existing.predictor_consistency),
-            waveform_enabled=existing.waveform_enabled,
-            waveform_applied=existing.waveform_applied,
-            waveform_bin_count=existing.waveform_bin_count,
-            waveform_residual_reduction_deg=existing.waveform_residual_reduction_deg,
-            waveform_learning_enabled=existing.waveform_learning_enabled,
-            waveform_update_block_reason=existing.waveform_update_block_reason,
-            waveform_learning_residual_basis=existing.waveform_learning_residual_basis,
             prop_delay_enabled=existing.prop_delay_enabled,
             motion_comp_phase_enabled=existing.motion_comp_phase_enabled,
             motion_comp_fit_enabled=existing.motion_comp_fit_enabled,
@@ -4892,17 +4406,7 @@ class RadarState:
             phase_validation_median_error_deg=existing.phase_validation_median_error_deg,
             phase_validation_status=existing.phase_validation_status,
             phase_anchor_candidates=list(existing.phase_anchor_candidates),
-            period_failure_score=existing.period_failure_score,
-            period_failure_streak=existing.period_failure_streak,
-            period_reacquire_active=existing.period_reacquire_active,
-            period_reacquire_reason=existing.period_reacquire_reason,
-            period_reacquire_started_ts=existing.period_reacquire_started_ts,
-            period_refine_mode=existing.period_refine_mode,
             period_authoritative_source=existing.period_authoritative_source,
-            period_failure_primary_class=existing.period_failure_primary_class,
-            period_reacquire_trigger=existing.period_reacquire_trigger,
-            period_recovery_clean_update=existing.period_recovery_clean_update,
-            period_recovery_clean_streak=existing.period_recovery_clean_streak,
         )
 
     def _record_live_burst_detection(
@@ -5214,9 +4718,8 @@ class RadarState:
         """
         period_us = sync.period_s * 1_000_000.0
         phase_rel = ((entry["effective_us"] - epoch_us) / period_us * 360.0) if period_us > 0 else 0.0
-        waveform_corr = getattr(entry["prediction"], "waveform_correction_deg", 0.0) or 0.0
         obs = entry["obs"]
-        return (obs.bearing_deg + waveform_corr - phase_rel) % 360.0
+        return (obs.bearing_deg - phase_rel) % 360.0
 
     def _select_phase_anchor_aircraft(
         self,
@@ -5658,9 +5161,7 @@ class RadarState:
                 existing,
                 obs.burst_centroid_us,
                 range_nm=obs.range_nm,
-                waveform_bins=None,
                 apply_propagation=True,
-                apply_waveform=False,
                 apply_motion=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
                 bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
                 motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
@@ -5973,14 +5474,6 @@ class RadarState:
         _update_icao_sync_quality_memory(icao_quality, scored)
 
         # Diagnostics.
-        phase_source = (
-            "anchor_consensus" if phase_anchor_status == "selected"
-            else "anchor_only" if phase_anchor_status == "anchor_only"
-            else "unavailable"
-        )
-        period_refinement_source = (
-            "per_aircraft_consensus" if per_aircraft_slope is not None else "none"
-        )
         period_authoritative_source = "refined" if period_update_allowed else "base"
 
         new_state = LiveSyncState(
@@ -6022,11 +5515,7 @@ class RadarState:
             period_update_fit_support=n_inliers,
             period_update_fit_span_s=fit_span_s,
             period_correction_status=period_correction_status,
-            period_refine_mode="simple",
             period_authoritative_source=period_authoritative_source,
-            period_reacquire_active=False,
-            period_failure_streak=0,
-            period_failure_primary_class="clean",
             phase_status=phase_status,
             phase_status_reason=phase_status_reason,
             phase_anchor_icao=phase_anchor_icao,
@@ -6052,16 +5541,9 @@ class RadarState:
             fit_reject_reasons=dict(fit_reject_reasons),
             fit_contributing_icao_count=len(fit_contributing_icaos),
             fit_span_s=fit_span_s,
-            waveform_enabled=False,
-            waveform_applied=False,
-            waveform_learning_enabled=False,
             prop_delay_enabled=bool(RADAR_SYNC_PROP_DELAY_ENABLED),
             motion_comp_phase_enabled=bool(RADAR_SYNC_MOTION_COMP_PHASE_ENABLED),
             motion_comp_fit_enabled=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
-            sync_model="simple",
-            period_source="df_base",
-            period_refinement_source=period_refinement_source,
-            phase_source=phase_source,
         )
         self._live_sync_states[iid] = new_state
 
@@ -6614,7 +6096,7 @@ class RadarState:
             and sync.usable
             and not sync.holdover
         ):
-            if sync.period_reacquire_active or sync.period_authoritative_source == "base":
+            if sync.period_authoritative_source == "base":
                 if sync.period_base_s and sync.period_base_s > 0:
                     return sync.period_base_s
             if sync.period_s and sync.period_s > 0:
@@ -6647,7 +6129,7 @@ class RadarState:
             and not sync.holdover
         ):
             effective_period_s = sync.period_s
-            if sync.period_reacquire_active or sync.period_authoritative_source == "base":
+            if sync.period_authoritative_source == "base":
                 effective_period_s = sync.period_base_s
             if effective_period_s and effective_period_s > 0:
                 return sync.sync_jitter_deg / 360.0 * effective_period_s if sync.sync_jitter_deg else None
@@ -7097,7 +6579,6 @@ class RadarState:
                                self._live_burst_timeline_obs,
                                self._live_sync_states,
                                self._last_multi_sync_update_ts,
-                               self._live_waveform_bins,
                                self._live_icao_sync_quality,
                                self._live_period_update_history,
                                self._live_slope_history,
@@ -7232,7 +6713,6 @@ class RadarState:
                 "pending_pairs": len(self._pending_pairs),
                 "seen_pair_keys": len(self._seen_pair_keys),
                 "sync_states": len(self._live_sync_states),
-                "waveform_bins": len(self._live_waveform_bins),
                 "icao_sync_quality": len(self._live_icao_sync_quality),
                 "multi_sync_throttle": len(self._last_multi_sync_update_ts),
                 "period_update_history": len(self._live_period_update_history),
@@ -7258,7 +6738,6 @@ class RadarState:
             self._live_burst_timeline_obs.clear()
             self._live_sync_states.clear()
             self._last_multi_sync_update_ts.clear()
-            self._live_waveform_bins.clear()
             self._live_icao_sync_quality.clear()
             self._live_period_update_history.clear()
             self._live_slope_history.clear()
@@ -7598,19 +7077,17 @@ class RadarState:
     def _build_df11_residual_observations(
         self,
         sync: "LiveSyncState",
-        waveform_bins: list,
         iid_events: list[tuple[float, int, str, "float | None"]],
         latest_arrival_us: "float | None",
     ) -> list[dict]:
         """Compute DF11 residual observations for the burst-sync residual chart.
 
         This is the authoritative backend path for individual DF11 arrival
-        residuals.  It uses the same predict_sync_observation() call as burst
+        residuals.  Uses the same predict_sync_observation() call as burst
         observations so both chart layers share:
           - Beast-relative timestamp basis
           - current refined period / phase / anchor state
           - propagation correction policy (driven by sync.prop_delay_enabled)
-          - waveform correction policy (driven by sync.waveform_enabled)
           - residual wrapping convention: (obs - pred + 540) % 360 - 180
 
         Motion compensation is intentionally omitted for individual DF11
@@ -7621,12 +7098,6 @@ class RadarState:
         Individual DF11 arrivals that cannot be given a trustworthy residual
         (no ADS-B position available at that timestamp) are omitted rather
         than guessed — prefer omission over false precision.
-
-        Previously, DF11 residual dots were computed in the frontend using a
-        local predictBearingFromSyncModel() function.  That was inconsistent
-        with the backend burst residuals because it used a stale sync snapshot,
-        a different predictor code path, and potentially different waveform/
-        propagation correction state.  This method replaces that approach.
         """
         if sync is None or not sync.usable:
             return []
@@ -7658,7 +7129,6 @@ class RadarState:
                 sync,
                 arrival_us,
                 range_nm=range_nm,
-                waveform_bins=waveform_bins,
                 # Motion comp not applied: no bearing-rate estimate for single messages.
                 bearing_rate_deg_s=None,
                 motion_comp_dt_us=None,
@@ -8050,7 +7520,6 @@ class RadarState:
                 sync,
                 obs.burst_centroid_us,
                 range_nm=getattr(obs, "range_nm", None),
-                waveform_bins=None,
                 bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
                 motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
                 motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
@@ -8096,8 +7565,6 @@ class RadarState:
                 "motion_comp_enabled": prediction.motion_comp_enabled,
                 "motion_comp_applied": prediction.motion_comp_applied,
                 "motion_comp_block_reason": prediction.motion_comp_block_reason,
-                "waveform_correction_deg": prediction.waveform_correction_deg,
-                "waveform_applied": prediction.waveform_applied,
                 "prediction_path": prediction.predictor_version,
                 "weight": weight,
                 "classification": classification,
@@ -8199,21 +7666,12 @@ class RadarState:
             go_admission = dict(self._go_multi_sync_admission_by_iid.get(iid) or {})
         sync_source = getattr(sync, "source", None) if sync is not None else None
         refined_active = bool(sync_source == "multi_aircraft_burst")
-        refined_present = bool(refined_active or (go_admission and go_admission.get("counts")))
-        refined_usable = bool(sync is not None and refined_active and getattr(sync, "usable", False))
-        authority_mode = getattr(sync, "active_authority_mode", None) if sync is not None else None
-        if authority_mode == "dominant_recovery":
-            active_mode = "dominant_recovery"
-            active_label = "Dominant-period recovery"
-        elif authority_mode == "compact_authoritative":
-            active_mode = "compact_bootstrap"
-            active_label = "Compact sync (authoritative)"
-        elif refined_active:
+        if refined_active:
             active_mode = "refined_multi_aircraft"
-            active_label = "Refined sync (multi-aircraft)"
+            active_label = "Python live sync"
         else:
             active_mode = "compact_bootstrap"
-            active_label = "Compact sync (sweep-frame)"
+            active_label = "Compact sync"
         no_anchor_reason = None
         if refined_active:
             no_anchor_reason = getattr(sync, "phase_anchor_no_candidate_reason", None)
@@ -8229,64 +7687,8 @@ class RadarState:
             "active_source": sync_source,
             "active_mode": active_mode,
             "active_label": active_label,
-            "dominant_period_s": getattr(sync, "dominant_period_s", None) if sync is not None else None,
-            "active_family_prior_s": getattr(sync, "active_family_prior_s", None) if sync is not None else None,
-            "active_family_prior_source": getattr(sync, "active_family_prior_source", None) if sync is not None else None,
-            "dominant_prior_active": bool(getattr(sync, "dominant_prior_active", False)) if sync is not None else False,
-            "recovery_mode_active": bool(
-                getattr(sync, "recovery_mode_active", getattr(sync, "period_reacquire_active", False))
-            ) if sync is not None else False,
-            "recovery_trigger_reasons": (
-                list(getattr(sync, "recovery_trigger_reasons", []) or [])
-                if sync is not None else []
-            ),
-            "compact_gating_bypassed": bool(getattr(sync, "compact_gating_bypassed", False)) if sync is not None else False,
-            "recovery_relaxed_admitted_observations": int(
-                getattr(sync, "recovery_relaxed_admitted_observations", 0) or 0
-            ) if sync is not None else 0,
-            "active_authority_mode": getattr(sync, "active_authority_mode", None) if sync is not None else None,
-            "authority_switch_count": int(getattr(sync, "authority_switch_count", 0) or 0) if sync is not None else 0,
-            "last_authority_switch_ts": getattr(sync, "last_authority_switch_ts", None) if sync is not None else None,
-            "last_authority_switch_reason": getattr(sync, "last_authority_switch_reason", None) if sync is not None else None,
-            "authority_enter_streak": int(getattr(sync, "authority_enter_streak", 0) or 0) if sync is not None else 0,
-            "authority_exit_streak": int(getattr(sync, "authority_exit_streak", 0) or 0) if sync is not None else 0,
-            "anchor_switch_count": int(getattr(sync, "anchor_switch_count", 0) or 0) if sync is not None else 0,
-            "last_anchor_switch_ts": getattr(sync, "last_anchor_switch_ts", None) if sync is not None else None,
-            "last_anchor_switch_reason": getattr(sync, "last_anchor_switch_reason", None) if sync is not None else None,
-            "anchor_hold_updates": int(getattr(sync, "anchor_hold_updates", 0) or 0) if sync is not None else 0,
-            "candidate_period_s": getattr(sync, "candidate_period_s", None) if sync is not None else None,
-            "authoritative_period_s": getattr(sync, "authoritative_period_s", None) if sync is not None else None,
-            "candidate_phase_offset_deg": getattr(sync, "candidate_phase_offset_deg", None) if sync is not None else None,
-            "authoritative_phase_offset_deg": getattr(sync, "authoritative_phase_offset_deg", None) if sync is not None else None,
-            "candidate_anchor_icao": getattr(sync, "candidate_anchor_icao", None) if sync is not None else None,
-            "authoritative_anchor_icao": getattr(sync, "authoritative_anchor_icao", None) if sync is not None else None,
-            "candidate_validation_score": getattr(sync, "candidate_validation_score", None) if sync is not None else None,
-            "authoritative_validation_score": getattr(sync, "authoritative_validation_score", None) if sync is not None else None,
-            "authoritative_state_age_s": getattr(sync, "authoritative_state_age_s", None) if sync is not None else None,
-            "candidate_promotion_streak": int(getattr(sync, "candidate_promotion_streak", 0) or 0) if sync is not None else 0,
-            "authoritative_period_update_gain": getattr(sync, "authoritative_period_update_gain", None) if sync is not None else None,
-            "authoritative_phase_update_gain": getattr(sync, "authoritative_phase_update_gain", None) if sync is not None else None,
-            "period_frozen_due_to_phase_validation": bool(getattr(sync, "period_frozen_due_to_phase_validation", False)) if sync is not None else False,
-            "branch_ambiguity_score": getattr(sync, "branch_ambiguity_score", None) if sync is not None else None,
-            "circular_dispersion_deg": getattr(sync, "circular_dispersion_deg", None) if sync is not None else None,
-            "validator_agreement_count": int(getattr(sync, "validator_agreement_count", 0) or 0) if sync is not None else 0,
-            "validator_disagreement_count": int(getattr(sync, "validator_disagreement_count", 0) or 0) if sync is not None else 0,
-            "candidate_validation_status": getattr(sync, "candidate_validation_status", None) if sync is not None else None,
-            "candidate_application_block_reason": getattr(sync, "candidate_application_block_reason", None) if sync is not None else None,
-            "candidate_mode": getattr(sync, "candidate_mode", None) if sync is not None else None,
-            "authoritative_mode": getattr(sync, "authoritative_mode", None) if sync is not None else None,
             "compact": {
                 "active": not refined_active,
-                "period_s": getattr(sync, "compact_period_s", None) if sync is not None else None,
-                "period_delta_to_dominant_s": (
-                    getattr(sync, "compact_period_delta_to_dominant_s", None)
-                    if sync is not None else None
-                ),
-                "period_delta_to_dominant_ppm": (
-                    getattr(sync, "compact_period_delta_to_dominant_ppm", None)
-                    if sync is not None else None
-                ),
-                "unreliable": bool(getattr(sync, "compact_sync_unreliable", False)) if sync is not None else False,
                 "reference_icao": compact_debug.get("current_reference_icao"),
                 "last_reference_icao": compact_debug.get("last_reference_icao"),
                 "reference_changed_recently": bool(compact_debug.get("reference_changed_recently")),
@@ -8302,36 +7704,20 @@ class RadarState:
                 "last_holdover_transition": compact_debug.get("last_holdover_transition"),
                 "last_holdover_transition_ts": compact_debug.get("last_holdover_transition_ts"),
             },
-            "refined": {
-                "present": refined_present,
+            "python_sync": {
+                "present": refined_active,
                 "active": refined_active,
-                "usable": refined_usable,
+                "usable": bool(sync is not None and refined_active and getattr(sync, "usable", False)),
                 "period_s": getattr(sync, "period_s", None) if refined_active else None,
-                "period_delta_to_dominant_s": (
-                    getattr(sync, "dominant_period_delta_s", None) if refined_active else None
-                ),
-                "period_delta_to_dominant_ppm": (
-                    getattr(sync, "dominant_period_delta_ppm", None) if refined_active else None
-                ),
-                "active_authority_mode": getattr(sync, "active_authority_mode", None) if refined_active else None,
                 "anchor_icao": getattr(sync, "phase_anchor_icao", None) if refined_active else None,
                 "anchor_candidate_count": int(getattr(sync, "phase_anchor_candidate_count", 0) or 0) if refined_active else 0,
                 "fit_total_observations": int(getattr(sync, "fit_total_observations", 0) or 0) if refined_active else 0,
                 "fit_eligible_observations": int(getattr(sync, "fit_eligible_observations", 0) or 0) if refined_active else 0,
                 "fit_rejected_observations": int(getattr(sync, "fit_rejected_observations", 0) or 0) if refined_active else 0,
-                "fit_contributing_icao_count": int(getattr(sync, "fit_contributing_icao_count", 0) or 0) if refined_active else 0,
-                "fit_reject_reasons": (
-                    dict(getattr(sync, "fit_reject_reasons", {}) or {})
-                    if refined_active else {}
-                ),
+                "phase_status": getattr(sync, "phase_status", None) if refined_active else None,
                 "no_anchor_reason": no_anchor_reason,
-                "candidate_validation_status": getattr(sync, "candidate_validation_status", None) if refined_active else None,
-                "candidate_application_block_reason": (
-                    getattr(sync, "candidate_application_block_reason", None)
-                    if refined_active else None
-                ),
-                "admission": go_admission or None,
             },
+            "go_admission": go_admission or None,
         }
 
     def get_burst_sync_timeline(self, iid: int, window_s: float = 60.0) -> dict:
@@ -8361,7 +7747,6 @@ class RadarState:
             if obs_buf is None:
                 obs_buf = aligned_obs_buf
             obs_snapshot = [] if has_go_evidence else (list(obs_buf) if obs_buf else [])
-            waveform_bins = list(self._live_waveform_bins.get(iid) or [])
             icao_quality = dict(self._live_icao_sync_quality.get(iid) or {})
             update_history = list(self._live_period_update_history.get(iid) or [])
             slope_history = list(self._live_slope_history.get(iid) or [])
@@ -8447,7 +7832,6 @@ class RadarState:
                 "last_multisync_ts": float(sync.last_sync_update_ts) if sync else None,
                 "last_multisync_iid": iid if sync else None,
                 "anchor_candidate_count": len(getattr(sync, "phase_anchor_candidates", []) or []) if sync else 0,
-                "per_icao_offsets_count": len(getattr(sync, "per_icao_phase_offsets", []) or []) if sync else 0,
                 "evidence_total": len(go_evidence),
                 "evidence_with_position": evidence_with_position,
                 "observations_emitted": 0,
@@ -8465,15 +7849,12 @@ class RadarState:
                 "observations": [],
                 "sync_state": _live_sync_state_to_dict(sync) if sync else None,
                 "window_s": window_s,
-                "waveform_bins": _serialise_waveform_bins(waveform_bins),
                 "per_icao_quality": [],
                 "period_update_history": update_history,
                 "slope_history": slope_history,
                 "period_history": period_history,
                 "sync_horizons": self._sync_horizons_payload(sync, display_window_s=window_s),
-                "predictor_consistency": getattr(sync, "predictor_consistency", None) if sync else None,
                 "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []) if sync else [],
-                "per_icao_phase_offsets": list(getattr(sync, "per_icao_phase_offsets", []) or []) if sync else [],
                 # No sync state → no authoritative residuals possible.
                 "df11_residual_observations": [],
                 "chart_overlay_consistent": False,
@@ -8515,7 +7896,6 @@ class RadarState:
 
             df11_residual_observations = self._build_df11_residual_observations(
                 sync=sync,
-                waveform_bins=waveform_bins,
                 iid_events=iid_events_for_df11,
                 latest_arrival_us=latest_arrival_us_for_iid,
             )
@@ -8530,7 +7910,6 @@ class RadarState:
                 "last_multisync_ts": float(sync.last_sync_update_ts),
                 "last_multisync_iid": iid,
                 "anchor_candidate_count": len(getattr(sync, "phase_anchor_candidates", []) or []),
-                "per_icao_offsets_count": len(getattr(sync, "per_icao_phase_offsets", []) or []),
                 "evidence_total": len(go_evidence),
                 "evidence_with_position": evidence_with_position,
                 "observations_emitted": len(entries),
@@ -8542,15 +7921,12 @@ class RadarState:
                 "observations": entries,
                 "sync_state": _live_sync_state_to_dict(sync),
                 "window_s": window_s,
-                "waveform_bins": _serialise_waveform_bins(waveform_bins),
                 "per_icao_quality": [],
                 "period_update_history": update_history,
                 "slope_history": slope_history,
                 "period_history": period_history,
                 "sync_horizons": self._sync_horizons_payload(sync, display_window_s=window_s),
-                "predictor_consistency": getattr(sync, "predictor_consistency", None),
                 "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []),
-                "per_icao_phase_offsets": list(getattr(sync, "per_icao_phase_offsets", []) or []),
                 "burst_sync_diagnostic": burst_sync_diagnostic,
                 "motion_comp_summary": {
                     "phase_enabled": bool(getattr(sync, "motion_comp_phase_enabled", False)),
@@ -8594,31 +7970,25 @@ class RadarState:
                 sync,
                 obs.burst_centroid_us,
                 range_nm=getattr(obs, "range_nm", None),
-                waveform_bins=None,
                 apply_propagation=False,
-                apply_waveform=False,
                 apply_motion=False,
             )
             raw_prediction = predict_sync_observation(
                 sync,
                 obs.burst_centroid_us,
                 range_nm=getattr(obs, "range_nm", None),
-                waveform_bins=None,
-                apply_waveform=False,
                 apply_motion=False,
             )
             without_motion_prediction = predict_sync_observation(
                 sync,
                 obs.burst_centroid_us,
                 range_nm=getattr(obs, "range_nm", None),
-                waveform_bins=waveform_bins,
                 apply_motion=False,
             )
             corrected_prediction = predict_sync_observation(
                 sync,
                 obs.burst_centroid_us,
                 range_nm=getattr(obs, "range_nm", None),
-                waveform_bins=waveform_bins,
                 bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
                 motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
                 motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
@@ -8637,7 +8007,6 @@ class RadarState:
             ) % 360.0 - 180.0
             implied_phase_offset = (
                 obs.bearing_deg
-                + corrected_prediction.waveform_correction_deg
                 - corrected_prediction.phase_in_rot_deg
             ) % 360.0
             anchor_relative_error = _circular_delta_deg(
@@ -8701,8 +8070,6 @@ class RadarState:
                 "motion_comp_enabled": corrected_prediction.motion_comp_enabled,
                 "motion_comp_applied": corrected_prediction.motion_comp_applied,
                 "motion_comp_block_reason": corrected_prediction.motion_comp_block_reason,
-                "waveform_correction_deg": corrected_prediction.waveform_correction_deg,
-                "waveform_applied": corrected_prediction.waveform_applied,
                 "prediction_path": corrected_prediction.predictor_version,
                 "weight": weight,
                 "classification": classification,
@@ -8735,8 +8102,6 @@ class RadarState:
             for e in motion_applied_entries
             if e.get("motion_comp_improvement_deg") is not None
         ]
-
-        waveform_payload = _serialise_waveform_bins(waveform_bins)
 
         # Serialise per-ICAO quality memory.
         quality_payload = [
@@ -8776,7 +8141,6 @@ class RadarState:
         # propagation correction, waveform correction, and residual wrapping.
         df11_residual_observations = self._build_df11_residual_observations(
             sync=sync,
-            waveform_bins=waveform_bins,
             iid_events=iid_events_for_df11,
             latest_arrival_us=latest_arrival_us_for_iid,
         )
@@ -8785,13 +8149,11 @@ class RadarState:
             "observations": entries,
             "sync_state": _live_sync_state_to_dict(sync),
             "window_s": window_s,
-            "waveform_bins": waveform_payload,
             "per_icao_quality": quality_payload,
             "period_update_history": update_history,
             "slope_history": slope_history,
             "period_history": period_history,
             "sync_horizons": self._sync_horizons_payload(sync, display_window_s=window_s),
-            "predictor_consistency": getattr(sync, "predictor_consistency", None),
             "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []),
             "motion_comp_summary": {
                 "phase_enabled": bool(getattr(sync, "motion_comp_phase_enabled", False)),
@@ -8897,9 +8259,7 @@ class RadarState:
             # chart_overlay_consistent=True confirms they are directly comparable.
             "df11_residual_observations": burst_timeline.get("df11_residual_observations", []),
             "chart_overlay_consistent": burst_timeline.get("chart_overlay_consistent", False),
-            "waveform_bins": burst_timeline.get("waveform_bins", []),
             "phase_anchor_candidates": burst_timeline.get("phase_anchor_candidates", []),
-            "per_icao_phase_offsets": burst_timeline.get("per_icao_phase_offsets", []),
             "burst_sync_diagnostic": burst_timeline.get("burst_sync_diagnostic"),
             "period_update_history": burst_timeline.get("period_update_history", []),
             "slope_history": burst_timeline.get("slope_history", []),
@@ -8943,7 +8303,6 @@ class RadarState:
             if obs_buf is None:
                 obs_buf = aligned_obs_buf
             obs_snapshot = [] if has_go_evidence else (list(obs_buf) if obs_buf else [])
-            waveform_bins = list(self._live_waveform_bins.get(iid) or [])
             icao_quality = dict(self._live_icao_sync_quality.get(iid) or {})
             latest_arrival_beast_us = self._iid_latest_arrival_us.get(iid)
 
@@ -9003,7 +8362,6 @@ class RadarState:
                 sync,
                 input_beast_us,
                 range_nm=None,
-                waveform_bins=waveform_bins,
                 apply_propagation=False,
             )
 
@@ -9054,7 +8412,6 @@ class RadarState:
                 sync,
                 burst_center_beast_us,
                 range_nm=range_nm,
-                waveform_bins=waveform_bins,
                 bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
                 motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
                 motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
@@ -9063,7 +8420,6 @@ class RadarState:
                 sync,
                 burst_center_beast_us,
                 range_nm=range_nm,
-                waveform_bins=waveform_bins,
                 apply_motion=False,
             )
             effective_beast_us = authoritative.effective_arrival_us
@@ -9086,7 +8442,6 @@ class RadarState:
                     sync,
                     burst_center_beast_us,
                     range_nm=range_nm,
-                    waveform_bins=waveform_bins,
                     bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
                     motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
                     motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
@@ -9101,7 +8456,6 @@ class RadarState:
                 sync,
                 burst_center_beast_us,
                 range_nm=range_nm,
-                waveform_bins=waveform_bins,
                 bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
                 motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
                 motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
@@ -9131,7 +8485,6 @@ class RadarState:
                     sync,
                     float(ts_beast_us),
                     range_nm=range_nm,
-                    waveform_bins=waveform_bins,
                     bearing_rate_deg_s=getattr(obs, "bearing_rate_deg_s", None),
                     motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
                     motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
@@ -9187,7 +8540,6 @@ class RadarState:
             phase_after_epoch_deg = authoritative.phase_in_rot_deg
             implied_phase_offset = (
                 obs.bearing_deg
-                + authoritative.waveform_correction_deg
                 - authoritative.phase_in_rot_deg
             ) % 360.0
             anchor_relative_error = _circular_delta_deg(
@@ -9291,8 +8643,6 @@ class RadarState:
                 "anchor_relative_phase_error_deg": anchor_relative_error,
                 "phase_anchor_contributor": obs.icao == getattr(sync, "phase_anchor_icao", None),
                 "phase_anchor_reject_reason": ",".join(candidate_reasons) if candidate_reasons else None,
-                "waveform_correction_deg": authoritative.waveform_correction_deg,
-                "pred_after_waveform_deg": pred_authoritative_deg,
                 "wall_to_beast_roundtrip_error_us": wall_roundtrip_error_us,
                 "classification": classification,
                 "weight": weight,
@@ -9417,15 +8767,6 @@ class RadarState:
         effective_span_s = (
             (max(all_effective_candidates) - min(all_effective_candidates)) / 1_000_000.0
             if len(all_effective_candidates) >= 2 else 0.0
-        )
-        phase_shape_diagnostics = _compute_folded_phase_shape(observations)
-        error_mode = _classify_sync_error_mode(
-            slope_deg_per_s=fit_slope_deg_per_s,
-            time_span_s=effective_span_s,
-            raw_mad_deg=raw_residual_stats["robust_spread_mad_deg"],
-            detrended_mad_deg=detrended_residual_stats["robust_spread_mad_deg"],
-            phase_shape_strength_deg=phase_shape_diagnostics["phase_shape_strength_deg"],
-            repeatability=phase_shape_diagnostics["cycle_to_cycle_repeatability"],
         )
 
         def _method_unavailable_reasons(rows: list[dict]) -> dict[str, str | None]:
@@ -9669,9 +9010,6 @@ class RadarState:
             "operational_burst_timestamp_method": operational_method,
             "operational_residual_field": "resid_authoritative_deg",
             "detrended_residual_field": "residual_detrended_deg",
-            "folded_phase_shape": phase_shape_diagnostics,
-            "dominant_error_mode": error_mode["dominant_error_mode"],
-            "error_mode_diagnostics": error_mode,
             "best_diagnostic_burst_timestamp_method": best_method_name,
             "best_diagnostic_method_median_abs_residual_deg": best_method_median,
             "best_vs_operational_median_abs_improvement_deg": best_improvement,
@@ -9742,48 +9080,7 @@ class RadarState:
             "compact_period_delta_to_dominant_ppm": getattr(sync, "compact_period_delta_to_dominant_ppm", None),
             "compact_sync_unreliable": getattr(sync, "compact_sync_unreliable", None),
             "recovery_mode_active": getattr(sync, "recovery_mode_active", None),
-            "recovery_trigger_reasons": getattr(sync, "recovery_trigger_reasons", None),
-            "compact_gating_bypassed": getattr(sync, "compact_gating_bypassed", None),
-            "recovery_relaxed_admitted_observations": getattr(sync, "recovery_relaxed_admitted_observations", None),
-            "active_authority_mode": getattr(sync, "active_authority_mode", None),
-            "authority_switch_count": getattr(sync, "authority_switch_count", None),
-            "last_authority_switch_ts": getattr(sync, "last_authority_switch_ts", None),
-            "last_authority_switch_reason": getattr(sync, "last_authority_switch_reason", None),
-            "authority_enter_streak": getattr(sync, "authority_enter_streak", None),
-            "authority_exit_streak": getattr(sync, "authority_exit_streak", None),
-            "anchor_switch_count": getattr(sync, "anchor_switch_count", None),
-            "last_anchor_switch_ts": getattr(sync, "last_anchor_switch_ts", None),
-            "last_anchor_switch_reason": getattr(sync, "last_anchor_switch_reason", None),
-            "anchor_hold_updates": getattr(sync, "anchor_hold_updates", None),
-            "candidate_period_s": getattr(sync, "candidate_period_s", None),
-            "authoritative_period_s": getattr(sync, "authoritative_period_s", None),
-            "candidate_phase_offset_deg": getattr(sync, "candidate_phase_offset_deg", None),
-            "authoritative_phase_offset_deg": getattr(sync, "authoritative_phase_offset_deg", None),
-            "candidate_anchor_icao": getattr(sync, "candidate_anchor_icao", None),
-            "authoritative_anchor_icao": getattr(sync, "authoritative_anchor_icao", None),
-            "candidate_validation_score": getattr(sync, "candidate_validation_score", None),
-            "authoritative_validation_score": getattr(sync, "authoritative_validation_score", None),
-            "authoritative_state_age_s": getattr(sync, "authoritative_state_age_s", None),
-            "candidate_promotion_streak": getattr(sync, "candidate_promotion_streak", None),
-            "authoritative_period_update_gain": getattr(sync, "authoritative_period_update_gain", None),
-            "authoritative_phase_update_gain": getattr(sync, "authoritative_phase_update_gain", None),
-            "period_frozen_due_to_phase_validation": getattr(sync, "period_frozen_due_to_phase_validation", None),
-            "branch_ambiguity_score": getattr(sync, "branch_ambiguity_score", None),
-            "circular_dispersion_deg": getattr(sync, "circular_dispersion_deg", None),
-            "validator_agreement_count": getattr(sync, "validator_agreement_count", None),
-            "validator_disagreement_count": getattr(sync, "validator_disagreement_count", None),
-            "candidate_mode": getattr(sync, "candidate_mode", None),
-            "authoritative_mode": getattr(sync, "authoritative_mode", None),
-            "period_refine_mode": getattr(sync, "period_refine_mode", None),
             "period_authoritative_source": getattr(sync, "period_authoritative_source", None),
-            "period_failure_score": getattr(sync, "period_failure_score", None),
-            "period_failure_streak": getattr(sync, "period_failure_streak", None),
-            "period_reacquire_active": getattr(sync, "period_reacquire_active", None),
-            "period_reacquire_reason": getattr(sync, "period_reacquire_reason", None),
-            "period_failure_primary_class": getattr(sync, "period_failure_primary_class", None),
-            "period_reacquire_trigger": getattr(sync, "period_reacquire_trigger", None),
-            "period_recovery_clean_update": getattr(sync, "period_recovery_clean_update", None),
-            "period_recovery_clean_streak": getattr(sync, "period_recovery_clean_streak", None),
             "current_slope_deg_per_s": getattr(sync, "residual_slope_deg_per_s", None),
             "fit_slope_deg_per_s": fit_slope_deg_per_s,
             "fit_time_origin_beast_us": fit_time_origin_beast_us,
@@ -9792,12 +9089,6 @@ class RadarState:
             "detrended_median_abs_residual_deg": detrended_residual_stats["median_abs_residual_deg"],
             "raw_mad_deg": raw_residual_stats["robust_spread_mad_deg"],
             "detrended_mad_deg": detrended_residual_stats["robust_spread_mad_deg"],
-            "dominant_error_mode": error_mode["dominant_error_mode"],
-            "period_drift_strength": error_mode["period_drift_strength"],
-            "phase_shape_strength": error_mode["phase_shape_strength"],
-            "phase_shape_strength_deg": error_mode["phase_shape_strength_deg"],
-            "cycle_to_cycle_repeatability": error_mode["cycle_to_cycle_repeatability"],
-            "phase_shape_repeatability_score": error_mode["cycle_to_cycle_repeatability"],
             "phase_epoch_us": sync.phase_epoch_us,
             "phase_offset_deg": sync.phase_offset_deg,
             "phase_anchor_icao": getattr(sync, "phase_anchor_icao", None),
@@ -9835,8 +9126,6 @@ class RadarState:
             "period_correction_status": getattr(sync, "period_correction_status", None),
             "period_update_safety_ppm_per_update": getattr(sync, "period_update_safety_ppm_per_update", None),
             "period_update_safety_ppm_from_base": getattr(sync, "period_update_safety_ppm_from_base", None),
-            "waveform_enabled": getattr(sync, "waveform_enabled", None),
-            "waveform_applied": getattr(sync, "waveform_applied", None),
             "prop_delay_enabled": getattr(sync, "prop_delay_enabled", None),
             "motion_comp_phase_enabled": getattr(sync, "motion_comp_phase_enabled", None),
             "motion_comp_fit_enabled": getattr(sync, "motion_comp_fit_enabled", None),
@@ -9878,29 +9167,8 @@ class RadarState:
             "max_raw_vs_effective_prediction_delta_deg": _max_abs(raw_effective_deltas),
             "mean_wall_vs_effective_prediction_delta_deg": _mean_abs(wall_effective_deltas),
             "max_wall_vs_effective_prediction_delta_deg": _max_abs(wall_effective_deltas),
-            "predictor_consistency_metrics": {
-                "localiser": {
-                    "mean_abs_delta_deg": _mean_abs(localiser_deltas),
-                    "max_abs_delta_deg": _max_abs(localiser_deltas),
-                    "tolerance_deg": tolerance_deg,
-                },
-                "position_verification": {
-                    "mean_abs_delta_deg": _mean_abs(position_deltas),
-                    "max_abs_delta_deg": _max_abs(position_deltas),
-                    "tolerance_deg": tolerance_deg,
-                },
-                "burst_sync": {
-                    "mean_abs_delta_deg": _mean_abs(burstsync_deltas),
-                    "max_abs_delta_deg": _max_abs(burstsync_deltas),
-                    "tolerance_deg": tolerance_deg,
-                },
-            },
             "observation_model_diagnosis": {
                 "operational_burst_timestamp_method": operational_method,
-                "dominant_error_mode": error_mode["dominant_error_mode"],
-                "period_drift_strength": error_mode["period_drift_strength"],
-                "phase_shape_strength": error_mode["phase_shape_strength"],
-                "cycle_to_cycle_repeatability": error_mode["cycle_to_cycle_repeatability"],
                 "best_diagnostic_burst_timestamp_method": best_method_name,
                 "best_diagnostic_method_median_abs_residual_deg": best_method_median,
                 "best_vs_operational_median_abs_improvement_deg": best_improvement,
@@ -10614,17 +9882,6 @@ class RadarState:
     def get_all_go_live_sync_states(self) -> dict[int, dict]:
         """Return a snapshot of compact mirrored Go sync state for all IIDs."""
         return {iid: dict(state) for iid, state in self._go_sync_states_by_iid.items()}
-
-    def get_live_waveform_bins(self, iid: int) -> list[WaveformBin]:
-        """Return a snapshot of the learned waveform bins for one IID."""
-        return list(self._live_waveform_bins.get(iid) or [])
-
-    def get_stage3_live_waveform_bins(self, iid: int) -> list[WaveformBin]:
-        """Return waveform bins only when the IID has Stage 3-authoritative sync."""
-        sync = self._live_sync_states.get(iid)
-        if sync is None or sync.source not in self._STAGE3_SYNC_SOURCES:
-            return []
-        return list(self._live_waveform_bins.get(iid) or [])
 
     def update_live_sync_state(self, iid: int, **kwargs) -> None:
         """Merge updated fields into an existing LiveSyncState (e.g. jitter from calibration)."""

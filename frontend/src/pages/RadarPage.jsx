@@ -35,7 +35,6 @@ const BURST_SYNC_VIEW_MODE_RESIDUALS = 'burst_sync_residuals'
 const BURST_SYNC_VIEW_MODE_LEGACY = 'legacy_live_df_alignment'
 const RESIDUAL_BASIS_ACTIVE = 'active_authority'
 const RESIDUAL_BASIS_ANCHOR = 'anchor_relative'
-const CANDIDATE_PROMOTION_MIN_STREAK = 6
 function getRadarPageMetricsStore() {
   if (typeof window === 'undefined') return null
   if (!window.__RADAR_PAGE_REQUEST_METRICS__) {
@@ -1824,20 +1823,7 @@ function isFiniteValue(value) {
 function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
   if (!syncState || !modeDiagnostics) return null
   const compact = modeDiagnostics.compact ?? {}
-  const refined = modeDiagnostics.refined ?? {}
-  const authorityMode = modeDiagnostics.active_authority_mode ?? refined.active_authority_mode ?? '—'
-  const anchorIcao = syncState.candidate_anchor_icao ?? syncState.phase_anchor_icao
-  const candidateAnchorSelected = Boolean(anchorIcao)
-  const refinedAuthorityApplied = authorityMode === 'refined_authoritative'
-    && syncState.authoritative_anchor_icao
-    && syncState.authoritative_anchor_icao === anchorIcao
-  const insufficientValidatorICAOs = candidateAnchorSelected
-    && !refinedAuthorityApplied
-    && Number(syncState.validator_agreement_count ?? syncState.phase_validation_contributors ?? 0) < 2
-    && Number(refined.fit_contributing_icao_count ?? syncState.fit_contributing_icao_count ?? 0) <= 1
-  const candidateBlockReason = syncState.candidate_application_block_reason
-    ?? refined.candidate_application_block_reason
-    ?? (insufficientValidatorICAOs ? 'insufficient_fit_icaos' : (syncState.candidate_validation_status ?? syncState.phase_validation_status ?? 'validation_unavailable'))
+  const pythonSync = modeDiagnostics.python_sync ?? {}
   return (
     <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
@@ -1845,31 +1831,17 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
           <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Sync Source</div>
           <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>
             {modeDiagnostics.active_mode === 'refined_multi_aircraft'
-              ? 'Residuals are currently driven by the refined multi-aircraft sync state.'
-              : modeDiagnostics.active_mode === 'dominant_recovery'
-                ? 'Residuals are currently in dominant-period recovery; refined sync is rebuilding anchors around the live DF family prior.'
-                : 'Residuals are currently driven by compact sweep-frame sync; abrupt jumps can come from bootstrap reference churn.'}
+              ? 'Residuals are driven by the Python live sync state.'
+              : 'Residuals are driven by compact sweep-frame sync.'}
           </div>
         </div>
         <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: '4px', fontSize: '0.72rem' }}>
           <span className={styles.metricPill}>Mode <span className={styles.metricValue}>{modeDiagnostics.active_label ?? '—'}</span></span>
           <span className={styles.metricPill}>Source <span className={styles.metricValue}>{modeDiagnostics.active_source ?? '—'}</span></span>
-          <span className={styles.metricPill}>Authority <span className={styles.metricValue}>{authorityMode}</span></span>
-          <span className={styles.metricPill}>Switches <span className={styles.metricValue}>{modeDiagnostics.authority_switch_count ?? 0}</span></span>
-          <span className={styles.metricPill}>Refined usable <span className={styles.metricValue}>{refined.usable ? 'yes' : 'no'}</span></span>
+          <span className={styles.metricPill}>Python sync <span className={styles.metricValue}>{pythonSync.usable ? 'usable' : pythonSync.present ? 'present' : 'absent'}</span></span>
           <span className={styles.metricPill}>Holdover <span className={styles.metricValue}>{syncState.holdover ? 'yes' : 'no'}</span></span>
         </div>
       </div>
-
-      {candidateAnchorSelected && !refinedAuthorityApplied && (
-        <div style={{ marginBottom: '0.5rem', border: '1px solid #8b6f1f', background: '#16130b', color: '#d29922', fontSize: '0.72rem', lineHeight: 1.45, padding: '6px 8px' }}>
-          Candidate anchor selected: <span className={styles.metricValue}>{anchorIcao}</span>.
-          {' '}
-          Not applied: {humanizeSyncReason(candidateBlockReason)}.
-          {' '}
-          Active residuals are still <span className={styles.metricValue}>{authorityMode}</span> residuals.
-        </div>
-      )}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '10px' }}>
         <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '6px 8px' }}>
@@ -1889,20 +1861,18 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
         </div>
 
         <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '6px 8px' }}>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Refined / multi-aircraft</div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Python live sync</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px' }}>
-            <span className={styles.metricPill}>Present <span className={styles.metricValue}>{refined.present ? 'yes' : 'no'}</span></span>
-            <span className={styles.metricPill}>Anchor <span className={styles.metricValue}>{refined.anchor_icao ?? '—'}</span></span>
-            <span className={styles.metricPill}>Candidates <span className={styles.metricValue}>{refined.anchor_candidate_count ?? 0}</span></span>
-            <span className={styles.metricPill}>Fit obs <span className={styles.metricValue}>{refined.fit_eligible_observations ?? 0}/{refined.fit_total_observations ?? 0}</span></span>
-            <span className={styles.metricPill}>ICAOs <span className={styles.metricValue}>{refined.fit_contributing_icao_count ?? 0}</span></span>
+            <span className={styles.metricPill}>Present <span className={styles.metricValue}>{pythonSync.present ? 'yes' : 'no'}</span></span>
+            <span className={styles.metricPill}>Anchor <span className={styles.metricValue}>{pythonSync.anchor_icao ?? '—'}</span></span>
+            <span className={styles.metricPill}>Candidates <span className={styles.metricValue}>{pythonSync.anchor_candidate_count ?? 0}</span></span>
+            <span className={styles.metricPill}>Fit obs <span className={styles.metricValue}>{pythonSync.fit_eligible_observations ?? 0}/{pythonSync.fit_total_observations ?? 0}</span></span>
+            <span className={styles.metricPill}>Phase trust <span className={styles.metricValue}>{pythonSync.phase_status ?? '—'}</span></span>
           </div>
           <div style={{ color: '#8b949e', fontSize: '0.72rem', lineHeight: 1.45 }}>
-            {refined.active
-              ? (refined.no_anchor_reason ? `No refined anchor selected: ${humanizeSyncReason(refined.no_anchor_reason)}.` : 'Refined sync is active.')
-              : `Refined sync is not active: ${humanizeSyncReason(refined.no_anchor_reason)}.`}
-            {modeDiagnostics.last_authority_switch_reason ? ` Last authority switch: ${humanizeSyncReason(modeDiagnostics.last_authority_switch_reason)}.` : ''}
-            {refined.admission?.last_reason ? ` Last admission result: ${humanizeSyncReason(refined.admission.last_reason)}${refined.admission.last_icao ? ` (${refined.admission.last_icao})` : ''}.` : ''}
+            {pythonSync.active
+              ? (pythonSync.no_anchor_reason ? `No anchor selected: ${humanizeSyncReason(pythonSync.no_anchor_reason)}.` : 'Python live sync is active.')
+              : `Python live sync is not active: ${humanizeSyncReason(pythonSync.no_anchor_reason)}.`}
           </div>
         </div>
       </div>
@@ -1910,38 +1880,16 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
   )
 }
 
-function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics, perIcaoOffsets }) {
+function PhaseAnchorPanel({ syncState, observations, candidates }) {
   if (!syncState) {
     return (
       <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
         <div style={{ color: '#c9d1d9', fontWeight: 600, marginBottom: '0.25rem' }}>Phase Anchor</div>
-        <div style={{ color: '#8b949e', fontSize: '0.74rem' }}>
-          No multisync state received yet. Waiting for Go radar-core to emit a MsgMultiSyncState for this IID.
-          {Array.isArray(perIcaoOffsets) && perIcaoOffsets.length > 0 && (
-            <span> ({perIcaoOffsets.length} per-ICAO offsets available from protocol.)</span>
-          )}
-        </div>
+        <div style={{ color: '#8b949e', fontSize: '0.74rem' }}>No live sync state received yet.</div>
       </div>
     )
   }
-  const refined = modeDiagnostics?.refined ?? {}
-  const refinedActive = Boolean(refined.active)
-  const appliedAnchorIcao = syncState.phase_anchor_icao
-  const candidateAnchorIcao = syncState.candidate_anchor_icao ?? appliedAnchorIcao
-  const anchorIcao = candidateAnchorIcao
-  const authorityMode = modeDiagnostics?.active_authority_mode ?? syncState.active_authority_mode
-  const refinedAuthorityApplied = Boolean(
-    authorityMode === 'refined_authoritative'
-    && syncState.authoritative_anchor_icao
-    && syncState.authoritative_anchor_icao === candidateAnchorIcao,
-  )
-  const validatorAgreement = Number(syncState.validator_agreement_count ?? syncState.phase_validation_contributors ?? 0)
-  const validatorDisagreement = Number(syncState.validator_disagreement_count ?? syncState.phase_validation_reject_count ?? 0)
-  const fitIcaoCount = Number(syncState.fit_contributing_icao_count ?? refined.fit_contributing_icao_count ?? 0)
-  const insufficientValidatorICAOs = Boolean(anchorIcao && !refinedAuthorityApplied && validatorAgreement < 2 && fitIcaoCount <= 1)
-  const candidateBlockReason = syncState.candidate_application_block_reason
-    ?? refined.candidate_application_block_reason
-    ?? (insufficientValidatorICAOs ? 'insufficient_fit_icaos' : (syncState.candidate_validation_status ?? syncState.phase_validation_status ?? 'validation_unavailable'))
+  const anchorIcao = syncState.phase_anchor_icao
   const candidateRowsRaw = Array.isArray(candidates) && candidates.length > 0
     ? candidates
     : (Array.isArray(syncState.phase_anchor_candidates) ? syncState.phase_anchor_candidates : [])
@@ -1967,21 +1915,8 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
     if (!obs || !isFiniteValue(obs.implied_phase_offset_deg) || !Number.isFinite(Number(anchorReferenceOffsetDeg))) {
       return null
     }
-    if (obs.icao === anchorIcao) {
-      const ts = Number(obs?.beam_center_us ?? obs?.raw_arrival_us ?? obs?.effective_beast_us ?? obs?.wall_ts ?? 0)
-      const latestAnchor = impliedRows
-        .filter(row => row?.icao === anchorIcao && isFiniteValue(row?.implied_phase_offset_deg))
-        .reduce((best, row) => {
-          const rowTs = Number(row?.beam_center_us ?? row?.raw_arrival_us ?? row?.effective_beast_us ?? row?.wall_ts ?? 0)
-          if (!best || (Number.isFinite(rowTs) ? rowTs : 0) >= best.ts) {
-            return { row, ts: Number.isFinite(rowTs) ? rowTs : 0 }
-          }
-          return best
-        }, null)
-      if (latestAnchor?.row === obs || (Number.isFinite(ts) && latestAnchor && ts === latestAnchor.ts)) return 0
-    }
     return circularDeltaDeg(obs.implied_phase_offset_deg, anchorReferenceOffsetDeg)
-  }, [anchorIcao, anchorReferenceOffsetDeg, impliedRows])
+  }, [anchorReferenceOffsetDeg])
   const candidateStatusPriority = useCallback((status) => {
     if (status === 'selected') return 0
     if (status === 'candidate') return 1
@@ -2022,19 +1957,6 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
     })
   }, [anchorIcao, candidateRows, candidateStatusPriority, impliedRows])
 
-  // Per-ICAO validator role table: prefer Go-populated diagnostic rows; fall back to
-  // observation-derived rows for backwards compat when per_icao_phase_offsets is absent.
-  const goPerIcaoRows = useMemo(() => {
-    const rows = Array.isArray(perIcaoOffsets) ? perIcaoOffsets : []
-    return [...rows].sort((a, b) => {
-      const roleOrder = r => r === 'anchor' ? 0 : r === 'validator_agree' ? 1 : r === 'validator_disagree' ? 2 : r === 'validator_neutral' ? 3 : r === 'excluded' ? 4 : 5
-      const rd = roleOrder(a?.role) - roleOrder(b?.role)
-      if (rd !== 0) return rd
-      return String(a?.icao ?? '').localeCompare(String(b?.icao ?? ''))
-    })
-  }, [perIcaoOffsets])
-  const useGoPerIcaoTable = goPerIcaoRows.length > 0
-
   const scatterW = 520
   const scatterH = 132
   const times = impliedRows.map(obs => Number(obs.beam_center_us ?? obs.raw_arrival_us)).filter(Number.isFinite)
@@ -2048,34 +1970,18 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
   const tdRight = { textAlign: 'right', padding: '2px 5px', fontFamily: 'SFMono-Regular, Consolas, monospace', borderTop: '1px solid #21262d' }
   const tdLeft = { textAlign: 'left', padding: '2px 5px', borderTop: '1px solid #21262d' }
 
-  if (!refinedActive) {
-    return (
-      <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
-        <div style={{ color: '#c9d1d9', fontWeight: 600, marginBottom: '0.2rem' }}>Phase Anchor</div>
-        <div style={{ color: '#8b949e', fontSize: '0.72rem', lineHeight: 1.45 }}>
-          Refined anchor diagnostics are inactive while the panel is running in compact/bootstrap mode.
-          {' '}
-          {humanizeSyncReason(refined.no_anchor_reason)}
-        </div>
-      </div>
-    )
-  }
-
   return (
     <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
         <div>
           <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Phase Anchor</div>
           <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>
-            {refinedAuthorityApplied
-              ? 'Refined authoritative phase is active; anchor diagnostics show the applied phase branch.'
-              : 'Candidate anchor diagnostics are not operational authority until validator ICAOs promote the phase branch.'}
+            Anchor selection and validation from the Python live sync model.
           </div>
         </div>
         <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: '4px', fontSize: '0.72rem' }}>
-          <span className={styles.metricPill}>Candidate anchor <span className={styles.metricValue}>{candidateAnchorIcao || '—'}</span></span>
-          <span className={styles.metricPill}>Applied anchor <span className={styles.metricValue}>{refinedAuthorityApplied ? (syncState.authoritative_anchor_icao || appliedAnchorIcao || '—') : '—'}</span></span>
-          <span className={styles.metricPill}>Status <span className={styles.metricValue}>{refinedAuthorityApplied ? 'applied authority' : (candidateAnchorIcao ? 'candidate anchor selected' : (syncState.phase_anchor_status || '—'))}</span></span>
+          <span className={styles.metricPill}>Anchor <span className={styles.metricValue}>{anchorIcao || '—'}</span></span>
+          <span className={styles.metricPill}>Status <span className={styles.metricValue}>{syncState.phase_anchor_status || '—'}</span></span>
           <span className={styles.metricPill}>Score <span className={styles.metricValue}>{fmtNumber(syncState.phase_anchor_score, 1)}</span></span>
           <span className={styles.metricPill}>Spread <span className={styles.metricValue}>{fmtNumber(syncState.phase_anchor_spread_deg, 2, '°')}</span></span>
           <span className={styles.metricPill}>Obs <span className={styles.metricValue}>{syncState.phase_anchor_obs_count ?? anchorObs.length ?? '—'}</span></span>
@@ -2083,46 +1989,11 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
           <span className={styles.metricPill}>Validation <span className={styles.metricValue}>{syncState.phase_validation_status || '—'}</span></span>
           <span className={styles.metricPill} title="Phase trust status: trusted = Stage 3 eligible; provisional = display only; untrusted = blocked">Phase trust <span className={styles.metricValue} style={{ color: syncState.phase_status === 'trusted' ? '#3fb950' : syncState.phase_status === 'provisional' ? '#e3b341' : '#8b949e' }}>{syncState.phase_status ?? '—'}</span></span>
           <span className={styles.metricPill}>Agree/reject <span className={styles.metricValue}>{syncState.phase_validation_contributors ?? 0}/{syncState.phase_validation_reject_count ?? 0}</span></span>
-          <span className={styles.metricPill}>Promotion <span className={styles.metricValue}>{syncState.candidate_promotion_streak ?? 0}/{CANDIDATE_PROMOTION_MIN_STREAK}</span></span>
           <span className={styles.metricPill}>Median Δ <span className={styles.metricValue}>{fmtNumber(syncState.phase_validation_median_error_deg, 2, '°')}</span></span>
           <span className={styles.metricPill}>Fit obs <span className={styles.metricValue}>{syncState.fit_eligible_observations ?? 0}/{syncState.fit_total_observations ?? 0}</span></span>
-          <span className={styles.metricPill}>Fit ICAOs <span className={styles.metricValue}>{syncState.fit_contributing_icao_count ?? 0}</span></span>
           <span className={styles.metricPill}>Candidates <span className={styles.metricValue}>{syncState.phase_anchor_candidate_count ?? candidateRows.length}</span></span>
-          <span className={styles.metricPill}>Authority <span className={styles.metricValue}>{authorityMode ?? '—'}</span></span>
         </div>
       </div>
-
-      {(syncState.long_term_period_estimate_s || syncState.branch_estimator_confidence) && (
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', fontSize: '0.71rem', marginBottom: '0.35rem', padding: '4px 6px', background: '#0c1117', border: '1px dashed #21262d', borderRadius: '3px' }}>
-          <span style={{ color: '#8b949e' }}>Long-term:</span>
-          <span className={styles.metricPill} title="Short-window (≈30s) local period measurement; may wobble — that's expected.">Local period <span className={styles.metricValue}>{fmtNumber(syncState.local_period_measurement_s, 4, 's')}</span></span>
-          <span className={styles.metricPill} title="Persistent long-term EMA estimate, bounded to ±300 PPM of the dominant prior.">LT period <span className={styles.metricValue}>{fmtNumber(syncState.long_term_period_estimate_s, 4, 's')}</span></span>
-          <span className={styles.metricPill} title="Published refined period — what the predictor uses. Should follow LT period after seed.">Published period <span className={styles.metricValue}>{fmtNumber(syncState.period_s, 4, 's')}</span></span>
-          <span className={styles.metricPill}>LT period conf <span className={styles.metricValue}>{fmtNumber(syncState.long_term_period_estimator_confidence, 2)}</span></span>
-          <span className={styles.metricPill}>Δ this window <span className={styles.metricValue}>{fmtNumber((syncState.period_update_delta_s ?? 0) * 1e6, 2, ' µs')}</span></span>
-          <span className={styles.metricPill}>Consistent windows <span className={styles.metricValue}>{syncState.consecutive_period_consistent_windows ?? 0}</span></span>
-          <span className={styles.metricPill}>LT branch anchor <span className={styles.metricValue}>{syncState.long_term_branch_anchor_icao || '—'}</span></span>
-          <span className={styles.metricPill}>LT branch offset <span className={styles.metricValue}>{fmtNumber(syncState.long_term_branch_offset_deg, 2, '°')}</span></span>
-          <span className={styles.metricPill}>Branch conf <span className={styles.metricValue}>{fmtNumber(syncState.branch_estimator_confidence, 2)}</span></span>
-          <span className={styles.metricPill}>Branch supports <span className={styles.metricValue}>{syncState.branch_consistent_windows ?? 0}</span></span>
-          <span className={styles.metricPill}>Competitors <span className={styles.metricValue}>{syncState.branch_competitor_count ?? 0}</span></span>
-          {syncState.branch_promotion_block_reason && (
-            <span className={styles.metricPill} style={{ color: '#d29922' }}>Block <span className={styles.metricValue}>{humanizeSyncReason(syncState.branch_promotion_block_reason)}</span></span>
-          )}
-        </div>
-      )}
-
-      {candidateAnchorIcao && !refinedAuthorityApplied && (
-        <div style={{ color: '#d29922', background: '#16130b', border: '1px solid #8b6f1f', fontSize: '0.72rem', lineHeight: 1.45, padding: '5px 6px', marginBottom: '0.35rem' }}>
-          Candidate anchor selected. Not applied: {humanizeSyncReason(candidateBlockReason)}.
-          {' '}
-          Agreement/rejection: <span className={styles.metricValue}>{validatorAgreement}/{validatorDisagreement}</span>.
-          {' '}
-          Candidate promotion streak: <span className={styles.metricValue}>{syncState.candidate_promotion_streak ?? 0}/{CANDIDATE_PROMOTION_MIN_STREAK}</span>.
-          {' '}
-          Active residuals are still <span className={styles.metricValue}>{authorityMode ?? 'compact_authoritative'}</span> residuals.
-        </div>
-      )}
 
       {syncState.phase_anchor_replacement_reason && (
         <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '0.35rem' }}>
@@ -2157,7 +2028,7 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
                   <td style={tdRight}>{fmtNumber(row.spread_deg, 2, '°')}</td>
                   <td style={tdRight}>{row.obs_count ?? '—'}</td>
                   <td style={tdRight}>{fmtNumber(Number(row.fit_eligible_fraction) * 100, 0, '%')}</td>
-                  <td style={tdLeft}>{row.status === 'rejected' ? humanizeSyncReason(row.reject_reasons?.join(', ') || 'rejected') : (row.warning_reasons?.length ? `candidate: ${humanizeSyncReason(row.warning_reasons.join(', '))}` : humanizeSyncReason(row.status || 'candidate'))}</td>
+                  <td style={tdLeft}>{row.status === 'rejected' ? humanizeSyncReason(row.reject_reasons?.join(', ') || 'rejected') : humanizeSyncReason(row.status || 'candidate')}</td>
                 </tr>
               ))}
               {candidateRows.length === 0 && (
@@ -2201,68 +2072,30 @@ function PhaseAnchorPanel({ syncState, observations, candidates, modeDiagnostics
         </div>
 
         <div style={{ overflow: 'auto', border: '1px solid #30363d', background: '#0f141b', minWidth: 0 }}>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>
-            Per-aircraft implied offsets{useGoPerIcaoTable ? ' (Go diagnostic)' : ''}
-          </div>
-          {useGoPerIcaoTable ? (
-            <table style={tableStyle}>
-              <thead>
-                <tr>
-                  <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
-                  <th style={thStyle}>latest offset</th>
-                  <th style={thStyle}>anchor Δ</th>
-                  <th style={{ ...thStyle, textAlign: 'left' }}>role</th>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>Per-aircraft implied offsets</div>
+          <table style={tableStyle}>
+            <thead>
+              <tr>
+                <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
+                <th style={thStyle}>latest offset</th>
+                <th style={thStyle}>anchor Δ</th>
+                <th style={{ ...thStyle, textAlign: 'left' }}>role</th>
+              </tr>
+            </thead>
+            <tbody>
+              {latestImpliedRows.slice(0, 20).map((obs, idx) => (
+                <tr key={`${obs.icao}-${obs.beam_center_us}-${idx}`}>
+                  <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</td>
+                  <td style={tdRight}>{isFiniteValue(obs.implied_phase_offset_deg) ? fmtNumber(obs.implied_phase_offset_deg, 2, '°') : '—'}</td>
+                  <td style={tdRight}>{isFiniteValue(anchorRelativeDelta(obs)) ? fmtNumber(anchorRelativeDelta(obs), 2, '°') : '—'}</td>
+                  <td style={tdLeft}>{obs.phase_anchor_contributor ? 'anchor contributor' : (obs.phase_anchor_reject_reason || 'validator')}</td>
                 </tr>
-              </thead>
-              <tbody>
-                {goPerIcaoRows.slice(0, 30).map((row) => {
-                  const roleColor = row.role === 'anchor' ? '#ffd166'
-                    : row.role === 'validator_agree' ? '#3fb950'
-                    : row.role === 'validator_disagree' ? '#ff7b72'
-                    : row.role === 'excluded' ? '#8b949e'
-                    : row.role === 'not_fit_eligible' ? '#6e7681'
-                    : '#c9d1d9'
-                  return (
-                    <tr key={row.icao}>
-                      <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{row.icao}</td>
-                      <td style={tdRight}>{fmtNumber(row.latest_offset_deg, 2, '°')}</td>
-                      <td style={tdRight}>{row.role === 'anchor' ? '0.00°' : fmtNumber(row.anchor_delta_deg, 2, '°')}</td>
-                      <td style={{ ...tdLeft, color: roleColor }}>
-                        {row.role}{row.reject_reasons?.length ? ` (${row.reject_reasons.join(', ')})` : ''}
-                      </td>
-                    </tr>
-                  )
-                })}
-                {goPerIcaoRows.length === 0 && (
-                  <tr><td colSpan={4} style={{ ...tdLeft, color: '#8b949e' }}>No burst sync diagnostic rows received.</td></tr>
-                )}
-              </tbody>
-            </table>
-          ) : (
-            <table style={tableStyle}>
-              <thead>
-                <tr>
-                  <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
-                  <th style={thStyle}>latest offset</th>
-                  <th style={thStyle}>anchor Δ</th>
-                  <th style={{ ...thStyle, textAlign: 'left' }}>role</th>
-                </tr>
-              </thead>
-              <tbody>
-                {latestImpliedRows.slice(0, 20).map((obs, idx) => (
-                  <tr key={`${obs.icao}-${obs.beam_center_us}-${idx}`}>
-                    <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</td>
-                    <td style={tdRight}>{isFiniteValue(obs.implied_phase_offset_deg) ? fmtNumber(obs.implied_phase_offset_deg, 2, '°') : '—'}</td>
-                    <td style={tdRight}>{isFiniteValue(anchorRelativeDelta(obs)) ? fmtNumber(anchorRelativeDelta(obs), 2, '°') : '—'}</td>
-                    <td style={tdLeft}>{obs.phase_anchor_contributor ? (refinedAuthorityApplied ? 'applied anchor' : 'candidate anchor') : (obs.phase_anchor_reject_reason || 'validator')}</td>
-                  </tr>
-                ))}
-                {latestImpliedRows.length === 0 && (
-                  <tr><td colSpan={4} style={{ ...tdLeft, color: '#8b949e' }}>No implied-offset observations yet.</td></tr>
-                )}
-              </tbody>
-            </table>
-          )}
+              ))}
+              {latestImpliedRows.length === 0 && (
+                <tr><td colSpan={4} style={{ ...tdLeft, color: '#8b949e' }}>No implied-offset observations yet.</td></tr>
+              )}
+            </tbody>
+          </table>
         </div>
       </div>
     </div>
@@ -2408,8 +2241,8 @@ function RotationAlignmentPanel({
     if (selectedIcao && obs?.icao !== selectedIcao) return false
     return true
   })
-  const activeAuthorityMode = syncModeDiagnostics?.active_authority_mode ?? syncState?.active_authority_mode ?? 'compact_authoritative'
-  const candidateAnchorIcao = syncState?.candidate_anchor_icao ?? syncState?.phase_anchor_icao
+  const activeAuthorityMode = syncModeDiagnostics?.active_mode ?? syncState?.source ?? 'compact_bootstrap'
+  const candidateAnchorIcao = syncState?.phase_anchor_icao
   const selectedIcaoIsAnchor = Boolean(selectedIcao && candidateAnchorIcao && selectedIcao === candidateAnchorIcao)
   const hasAnchorRelativeResiduals = filteredObservations.some(obs => Number.isFinite(Number(obs?.anchor_relative_phase_error_deg)))
   const anchorRelativeBasisAvailable = Boolean(selectedIcaoIsAnchor && hasAnchorRelativeResiduals)
@@ -2834,8 +2667,6 @@ function RotationAlignmentPanel({
         syncState={syncState}
         observations={filteredObservations}
         candidates={burstTimeline?.phase_anchor_candidates}
-        modeDiagnostics={syncModeDiagnostics}
-        perIcaoOffsets={Array.isArray(burstTimeline?.per_icao_phase_offsets) ? burstTimeline.per_icao_phase_offsets : []}
       />
 
       {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS ? (
@@ -3372,33 +3203,7 @@ function computePropagationDelayUs(rangeNm) {
   return rangeNm * US_PER_NM_LIGHT
 }
 
-function waveformBinIndex(phaseDeg, nBins) {
-  const phase = ((phaseDeg % 360) + 360) % 360
-  const width = 360 / nBins
-  let idx = Math.floor(phase / width)
-  if (idx < 0) idx = 0
-  if (idx >= nBins) idx = nBins - 1
-  return idx
-}
-
-function applyPhaseWaveformCorrection(waveformBins, phaseDeg, applied) {
-  if (!applied || !Array.isArray(waveformBins) || waveformBins.length === 0) return 0
-  const nBins = waveformBins.length
-  const idx = waveformBinIndex(phaseDeg, nBins)
-  const width = 360 / nBins
-  const centre = (idx + 0.5) * width
-  let delta = (((phaseDeg % 360) + 360) % 360) - centre
-  if (delta > width) delta -= 360
-  else if (delta < -width) delta += 360
-  const other = delta >= 0 ? (idx + 1) % nBins : (idx - 1 + nBins) % nBins
-  const frac = Math.abs(delta) / width
-  const a = Number(waveformBins[idx]?.correction_deg ?? 0)
-  const b = Number(waveformBins[other]?.correction_deg ?? 0)
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0
-  return ((1 - frac) * a) + (frac * b)
-}
-
-function predictBearingFromSyncModel(syncState, arrivalUs, { rangeNm = null, waveformBins = null } = {}) {
+function predictBearingFromSyncModel(syncState, arrivalUs, { rangeNm = null } = {}) {
   if (!syncState) return null
   const periodUs = Number(syncState.period_s) * 1_000_000
   const phaseEpochUs = Number(syncState.phase_epoch_us)
@@ -3409,11 +3214,7 @@ function predictBearingFromSyncModel(syncState, arrivalUs, { rangeNm = null, wav
   const propDelayEnabled = Boolean(syncState.prop_delay_enabled)
   const effectiveUs = propDelayEnabled ? (arrivalUs - computePropagationDelayUs(rangeNm)) : arrivalUs
   const phaseInRotDeg = ((((effectiveUs - phaseEpochUs) / periodUs) * 360) % 360 + 360) % 360
-  let predictedDeg = (phaseInRotDeg + phaseOffsetDeg) % 360
-  if (Boolean(syncState.waveform_enabled) && Boolean(syncState.waveform_applied)) {
-    const corr = applyPhaseWaveformCorrection(waveformBins, phaseInRotDeg, true)
-    predictedDeg = (predictedDeg - corr + 360) % 360
-  }
+  const predictedDeg = (phaseInRotDeg + phaseOffsetDeg) % 360
   return { predictedDeg, phaseInRotDeg }
 }
 
@@ -3492,7 +3293,6 @@ function ReceiverCentredRadarField({
     return currentRefIcao ? f.ref_icao === currentRefIcao : true
   }) ?? [...frames].reverse().find(f => f.quality === 'good' || f.quality === 'marginal')
   const syncState = burstTimeline?.sync_state ?? null
-  const syncWaveformBins = Array.isArray(burstTimeline?.waveform_bins) ? burstTimeline.waveform_bins : []
   const hasAuthoritativeSync = (
     Boolean(syncState?.usable)
     && Number.isFinite(Number(syncState?.period_s))
@@ -3675,9 +3475,7 @@ function ReceiverCentredRadarField({
           y: cy + Math.sin(radarTheta) * radarRadius,
         }
         if (hasAuthoritativeSync) {
-          const prediction = predictBearingFromSyncModel(syncState, renderNowUs, {
-            waveformBins: syncWaveformBins,
-          })
+          const prediction = predictBearingFromSyncModel(syncState, renderNowUs)
           if (prediction) {
             beamSweepDeg = prediction.predictedDeg
           }
@@ -3728,7 +3526,6 @@ function ReceiverCentredRadarField({
           ? (() => {
             const prediction = predictBearingFromSyncModel(syncState, ev.arrival_us, {
               rangeNm: Number(ev?.range_nm),
-              waveformBins: syncWaveformBins,
             })
             return prediction ? wrapSignedResidualDeg(ev.bearing_deg, prediction.predictedDeg) : null
           })()
@@ -3777,7 +3574,6 @@ function ReceiverCentredRadarField({
     receiverPos?.lat,
     receiverPos?.lon,
     syncState,
-    syncWaveformBins,
   ])
 
   const syncLabel = hasAuthoritativeSync

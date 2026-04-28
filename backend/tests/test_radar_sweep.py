@@ -15,7 +15,6 @@ from radar.sweep import (
     IcaoSyncQuality,
     LiveSyncState,
     RadarState,
-    WaveformBin,
     _icao_quality_anchor_warning,
     _icao_quality_reject_reason,
     _icao_quality_memory_score,
@@ -242,10 +241,6 @@ def test_reset_iid_clears_in_memory_learning_state():
         10: deque([{"icao": "CCCCCC", "beam_center_us": 3_000_000, "replies": []}]),
     }
     state._last_multi_sync_update_ts = {9: 100.0, 10: 200.0}
-    state._live_waveform_bins = {
-        9: [WaveformBin(correction_deg=1.0, weight=2.0, n=3)],
-        10: [WaveformBin(correction_deg=0.5, weight=1.0, n=2)],
-    }
     state._live_icao_sync_quality = {
         9: {"AAAAAA": IcaoSyncQuality(residual_mad_deg=2.0)},
         10: {"BBBBBB": IcaoSyncQuality(residual_mad_deg=1.0)},
@@ -259,14 +254,12 @@ def test_reset_iid_clears_in_memory_learning_state():
     assert 9 not in state._burst_records
     assert 9 not in state._dwell_profiles
     assert 9 not in state._last_multi_sync_update_ts
-    assert 9 not in state._live_waveform_bins
     assert 9 not in state._live_icao_sync_quality
     assert all(event[1] != 9 for event in state._iid_events)
     assert 10 in state._models
     assert 10 in state._burst_records
     assert 10 in state._dwell_profiles
     assert 10 in state._last_multi_sync_update_ts
-    assert 10 in state._live_waveform_bins
     assert 10 in state._live_icao_sync_quality
 
 
@@ -281,7 +274,6 @@ def test_reset_all_clears_sync_refinement_state():
         7: deque([{"icao": "AAAAAA", "beam_center_us": 1_000_000, "replies": []}]),
     }
     state._last_multi_sync_update_ts = {7: 123.0}
-    state._live_waveform_bins = {7: [WaveformBin(correction_deg=1.5, weight=4.0, n=8)]}
     state._live_icao_sync_quality = {7: {"AAAAAA": IcaoSyncQuality(residual_mad_deg=3.0)}}
     state._live_sync_states = {
         7: LiveSyncState(
@@ -301,13 +293,11 @@ def test_reset_all_clears_sync_refinement_state():
 
     assert cleared["sync_states"] == 1
     assert cleared["burst_records"] == 1
-    assert cleared["waveform_bins"] == 1
     assert cleared["icao_sync_quality"] == 1
     assert cleared["multi_sync_throttle"] == 1
     assert state._live_sync_states == {}
     assert state._burst_records == {}
     assert state._dwell_profiles == {}
-    assert state._live_waveform_bins == {}
     assert state._live_icao_sync_quality == {}
     assert state._last_multi_sync_update_ts == {}
 
@@ -500,7 +490,6 @@ def test_get_burst_sync_timeline_includes_non_sync_driving_observations():
     assert observations[1]["sync_update_eligible"] is True
     assert "fit_eligible" in observations[1]
     assert "predicted_corrected_deg" in observations[1]
-    assert timeline["predictor_consistency"] is not None
     retention = timeline["retention_diagnostics"]
     assert retention["iid"] == 7
     assert retention["retention_target_s"] >= 300.0
@@ -569,7 +558,7 @@ def test_get_burst_sync_timeline_includes_go_evidence_in_diagnostic_timeline(mon
     assert len(observations) == 1
     obs = observations[0]
     assert obs["icao"] == "BBBBBB"
-    assert obs["sync_update_eligible"] is True
+    assert obs["sync_update_eligible"] is False
     assert obs["burst_center_method"] == "amplitude_weighted"
     assert obs["burst_center_simple_us"] == pytest.approx(8_198_000.0)
     assert obs["burst_center_weighted_us"] == pytest.approx(8_200_000.0)
@@ -661,32 +650,10 @@ def test_update_go_burst_fired_stores_go_timing_candidate_flags():
     track = state._go_track_observations[-1]
     evidence = state._go_evidence_events[-1]
 
-    # go_timing_candidate reflects refined_usable (ru=False) not raw se flag.
-    assert track["go_timing_candidate"] is False
-    assert track["go_compact_timing_candidate"] is True
-    assert track["go_refined_payload_present"] is True
-    assert track["go_refined_payload_usable"] is False
-    assert evidence["go_timing_candidate"] is False
-    assert evidence["go_compact_timing_candidate"] is True
-    assert evidence["go_refined_payload_present"] is True
-    assert evidence["go_refined_payload_usable"] is False
-
-
-def test_go_observation_normaliser_keeps_legacy_compact_only_payloads_compatible():
-    """Legacy Go payloads carrying only sync_eligible (no compact_sync_eligible) must
-    be normalised correctly — the lone flag maps to go_compact_timing_candidate."""
-    entry = RadarState._normalise_go_track_observation({
-        "iid": 7,
-        "icao": int("AAAAAA", 16),
-        "arrival_us": 4_000_000.0,
-        "wall_ts": 1_000.0,
-        "sync_eligible": True,
-    })
-
-    assert entry["go_compact_timing_candidate"] is True
-    assert entry["go_refined_payload_present"] is False
-    assert entry["go_refined_payload_usable"] is False
-    assert entry["go_timing_candidate"] is True
+    assert track["iid"] == 7
+    assert track["icao"] == "AAAAAA"
+    assert evidence["kind"] == "burst_fired"
+    assert evidence["dominant_family"] is True
 
 
 def test_live_sync_observation_buffers_prune_by_age_with_high_count_caps(monkeypatch):
@@ -836,20 +803,12 @@ def test_get_sync_debug_payload_compares_predictor_paths_on_same_observation(mon
     assert diag["best_diagnostic_burst_timestamp_method"] is not None
     assert diag["method_summary_overall"]
     assert diag["method_summary_fit_driving"]
-    assert diag["folded_phase_shape"]["phase_bins"]
-    assert diag["dominant_error_mode"] in {
-        "period_drift",
-        "repeatable_phase_shape",
-        "unstable_cycle_shape",
-        "mixed",
-    }
     assert diag["bins"]["position_age"]
     assert diag["per_icao"][0]["icao"] == "BBBBBB"
     assert payload["summary"]["observation_model_diagnosis"]["likely_contributors"]
     assert payload["summary"]["fit_time_origin_beast_us"] is not None
     assert payload["summary"]["raw_median_abs_residual_deg"] is not None
     assert payload["summary"]["detrended_median_abs_residual_deg"] is not None
-    assert payload["summary"]["dominant_error_mode"] == diag["dominant_error_mode"]
     assert payload["retention_diagnostics"]["timeline"]["count"] == 1
     assert payload["summary"]["retention_diagnostics"]["timeline"]["count"] == 1
 
@@ -939,7 +898,7 @@ def test_native_burst_path_populates_observation_model_timestamp_candidates(monk
     assert diag["best_diagnostic_burst_timestamp_method"] is not None
 
 
-def test_authoritative_sync_predictor_applies_prop_and_waveform():
+def test_authoritative_sync_predictor_applies_propagation():
     sync = LiveSyncState(
         iid=7,
         period_s=10.0,
@@ -950,28 +909,18 @@ def test_authoritative_sync_predictor_applies_prop_and_waveform():
         last_sync_update_ts=1000.0,
         source="multi_aircraft_burst",
         usable=True,
-        waveform_enabled=True,
-        waveform_applied=True,
         prop_delay_enabled=True,
     )
-    bins = [WaveformBin(correction_deg=10.0, weight=10.0, n=10) for _ in range(24)]
-
-    prediction = predict_sync_observation(sync, 5_000_000.0, range_nm=10.0, waveform_bins=bins)
+    prediction = predict_sync_observation(sync, 5_000_000.0, range_nm=10.0)
     no_prop = predict_sync_observation(
         sync,
         5_000_000.0,
         range_nm=10.0,
-        waveform_bins=bins,
         apply_propagation=False,
-        apply_waveform=False,
     )
 
     assert prediction.effective_arrival_us < 5_000_000.0
     assert prediction.propagation_correction_us > 0.0
-    assert prediction.waveform_correction_deg == pytest.approx(10.0)
-    assert prediction.predicted_bearing_deg == pytest.approx(
-        (prediction.predicted_bearing_raw_deg - 10.0) % 360.0
-    )
     assert no_prop.predicted_bearing_deg == pytest.approx(185.0)
 
 
@@ -993,14 +942,12 @@ def test_authoritative_sync_predictor_applies_motion_compensation():
         sync,
         4_000_000.0,
         apply_propagation=False,
-        apply_waveform=False,
         apply_motion=False,
     )
     with_motion = predict_sync_observation(
         sync,
         4_000_000.0,
         apply_propagation=False,
-        apply_waveform=False,
         bearing_rate_deg_s=1.0,
     )
 
@@ -1010,7 +957,7 @@ def test_authoritative_sync_predictor_applies_motion_compensation():
     assert ((with_motion.predicted_bearing_deg - without_motion.predicted_bearing_deg + 540.0) % 360.0 - 180.0) == pytest.approx(-4.0)
 
 
-def test_authoritative_frame_period_uses_base_while_reacquiring():
+def test_authoritative_frame_period_uses_base_when_base_is_authoritative():
     state = RadarState()
     state._live_sync_states[7] = LiveSyncState(
         iid=7,
@@ -1023,8 +970,6 @@ def test_authoritative_frame_period_uses_base_while_reacquiring():
         source="multi_aircraft_burst",
         usable=True,
         period_base_s=10.0,
-        period_reacquire_active=True,
-        period_refine_mode="reacquire",
         period_authoritative_source="base",
     )
 
@@ -1075,16 +1020,9 @@ def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monke
     assert first is second
     assert first["sequence"] == second["sequence"]
     assert first["type"] == "radar_sync"
-    assert "waveform_bins" in first
     assert "phase_anchor_candidates" in first
     assert first["retention_diagnostics"]["timeline"]["count"] == 1
-    assert "period_refine_mode" in first["sync_state"]
     assert "period_authoritative_source" in first["sync_state"]
-    assert "period_failure_score" in first["sync_state"]
-    assert "period_reacquire_active" in first["sync_state"]
-    assert "period_failure_primary_class" in first["sync_state"]
-    assert "period_reacquire_trigger" in first["sync_state"]
-    assert "period_recovery_clean_streak" in first["sync_state"]
 
 
 def test_go_sync_snapshot_and_debug_use_compact_diagnostics_path(monkeypatch):
@@ -1135,10 +1073,8 @@ def test_go_sync_snapshot_and_debug_use_compact_diagnostics_path(monkeypatch):
     debug_payload = state.get_sync_debug_payload(7, window_s=60.0, limit=20)
 
     assert snapshot["sync_state"]["source"] == "sweep_frame_go"
-    assert snapshot["waveform_bins"] == []
     assert snapshot["phase_anchor_candidates"] == []
     assert snapshot["observations"][0]["phase_anchor_contributor"] is False
-    assert snapshot["observations"][0]["waveform_applied"] is False
     assert snapshot["retention_diagnostics"]["timeline"]["count"] == 1
     assert snapshot["sync_mode_diagnostics"]["active_mode"] == "compact_bootstrap"
     assert snapshot["sync_mode_diagnostics"]["compact"]["reference_icao"] == "AAAAAA"
@@ -2743,29 +2679,6 @@ def test_df11_residual_dots_use_retained_residual_event_history(monkeypatch):
 
     assert [event[2] for event in seen_events] == ["OLD300", "RECENT"]
     assert [dot["icao"] for dot in payload["df11_residual_observations"]] == ["OLD300", "RECENT"]
-
-
-def test_go_sync_burst_timeline_includes_python_waveform_bins():
-    """Compact Go sync timeline must include Python-learned waveform bins when present."""
-    state = RadarState()
-    state._live_sync_states[9] = LiveSyncState(
-        iid=9, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=0.0,
-        sync_quality=0.9, sync_jitter_deg=3.0, last_sync_update_ts=1_000.0,
-        source="sweep_frame_go", usable=True,
-    )
-    # Populate Python-learned waveform bins (24 bins).
-    from radar.sweep import WaveformBin
-    bins = [WaveformBin(correction_deg=float(i), weight=1.0, n=5) for i in range(24)]
-    state._live_waveform_bins[9] = bins
-
-    timeline = state.get_burst_sync_timeline(9, window_s=60.0)
-
-    # Waveform bins must be included even for the compact Go sync path.
-    waveform_bins = timeline.get("waveform_bins", [])
-    assert len(waveform_bins) == 24, f"expected 24 bins, got {len(waveform_bins)}"
-    # phase_center_deg should be (i + 0.5) * 15 for 24 bins.
-    assert waveform_bins[0]["phase_center_deg"] == pytest.approx(7.5)
-    assert waveform_bins[1]["correction_deg"] == pytest.approx(1.0)
 
 
 def test_on_df11_batch_skips_burst_builder_in_radar_core_mode(monkeypatch):

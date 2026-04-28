@@ -600,8 +600,7 @@ class TestSimpleModelBehavior:
     # ------------------------------------------------------------------
     # Tests
 
-    def test_simple_model_flag_fields(self, monkeypatch):
-        """sync_model, waveform_applied, period_refine_mode etc. must all be set correctly."""
+    def test_simple_model_sets_base_period_and_no_reacquire_state(self, monkeypatch):
         import radar.sweep as sweep_module
         monkeypatch.setattr(sweep_module.time, "time", lambda: self._NOW_TS)
 
@@ -611,33 +610,8 @@ class TestSimpleModelBehavior:
         sync = self._run(state, obs)
 
         assert sync is not None
-        assert sync.sync_model == "simple"
-
-        assert sync.period_refine_mode == "simple"
-        assert sync.period_source == "df_base"
-        assert sync.waveform_applied is False
-        assert sync.waveform_enabled is False
-        assert sync.period_reacquire_active is False
-
-    def test_waveform_never_applied_regardless_of_observations(self, monkeypatch):
-        """waveform_applied=False is a hard invariant of the simple model."""
-        import radar.sweep as sweep_module
-        monkeypatch.setattr(sweep_module.time, "time", lambda: self._NOW_TS)
-
-        state = RadarState()
-        state._live_sync_states[self._IID] = self._base_sync_state()
-        # Many observations from many ICAOs — waveform still must not be applied
-        obs = self._make_burst_obs(
-            period_s=self._PERIOD_S, now_ts=self._NOW_TS,
-            icaos=("AAAAAA", "BBBBBB", "CCCCCC"),
-            n_per_icao=6,
-        )
-        sync = self._run(state, obs)
-
-        assert sync is not None
-        assert sync.waveform_applied is False
-        assert sync.waveform_enabled is False
-        assert sync.waveform_learning_enabled is False
+        assert sync.period_base_s == pytest.approx(self._PERIOD_S)
+        assert sync.period_authoritative_source in {"base", "refined"}
 
     def test_single_icao_cannot_drive_period_update(self, monkeypatch):
         """A single ICAO cannot produce per-aircraft consensus — period stays unchanged."""
@@ -747,8 +721,7 @@ class TestSimpleModelBehavior:
         assert sync.period_update_allowed is False  # persistence gate blocks it
         assert sync.phase_status == "trusted"       # phase trusted independently
 
-    def test_diagnostic_fields_all_present(self, monkeypatch):
-        """All five model-identification diagnostic fields must be present and correctly typed."""
+    def test_fit_and_phase_diagnostics_present(self, monkeypatch):
         import radar.sweep as sweep_module
         monkeypatch.setattr(sweep_module.time, "time", lambda: self._NOW_TS)
 
@@ -758,42 +731,5 @@ class TestSimpleModelBehavior:
         sync = self._run(state, obs)
 
         assert sync is not None
-        assert sync.sync_model == "simple"
-        assert sync.period_source == "df_base"
-        assert sync.period_refinement_source in {"per_aircraft_consensus", "none"}
-        assert sync.phase_source in {"anchor_consensus", "anchor_only", "unavailable"}
-
-
-    def test_period_refinement_source_none_when_consensus_rejected(self, monkeypatch):
-        """period_refinement_source='none' when per-aircraft consensus is unavailable."""
-        import radar.sweep as sweep_module
-        monkeypatch.setattr(sweep_module.time, "time", lambda: self._NOW_TS)
-
-        state = RadarState()
-        state._live_sync_states[self._IID] = self._base_sync_state()
-
-        obs = self._make_burst_obs(
-            period_s=self._PERIOD_S, now_ts=self._NOW_TS,
-            icaos=("AAAAAA",), n_per_icao=12,  # single ICAO → rejected
-        )
-        sync = self._run(state, obs)
-
-        assert sync is not None
-        assert sync.period_refinement_source == "none"
-
-    def test_period_refinement_source_set_when_consensus_available(self, monkeypatch):
-        """period_refinement_source='per_aircraft_consensus' when 2+ ICAOs agree on slope."""
-        import radar.sweep as sweep_module
-        monkeypatch.setattr(sweep_module.time, "time", lambda: self._NOW_TS)
-
-        state = RadarState()
-        state._live_sync_states[self._IID] = self._base_sync_state()
-
-        obs = self._make_burst_obs(
-            period_s=self._PERIOD_S, now_ts=self._NOW_TS,
-            icaos=("AAAAAA", "BBBBBB"), n_per_icao=8, slope_deg_per_s=0.5,
-        )
-        sync = self._run(state, obs)
-
-        assert sync is not None
-        assert sync.period_refinement_source == "per_aircraft_consensus"
+        assert sync.fit_total_observations >= sync.fit_eligible_observations
+        assert sync.phase_status in {"trusted", "provisional", "untrusted"}

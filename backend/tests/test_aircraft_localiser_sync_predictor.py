@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from radar.aircraft_localiser import AircraftLocaliser, _haversine_m
 from radar.aircraft_models import RadarBearingCalibration, Stage3LiveDetection
-from radar.sweep import LiveSyncState, WaveformBin, predict_sync_observation
+from radar.sweep import LiveSyncState, predict_sync_observation
 
 
 def test_live_bearing_uses_authoritative_sync_predictor():
@@ -28,11 +28,8 @@ def test_live_bearing_uses_authoritative_sync_predictor():
         last_sync_update_ts=1000.0,
         source="multi_aircraft_burst",
         usable=True,
-        waveform_enabled=True,
-        waveform_applied=True,
         prop_delay_enabled=True,
     )
-    bins = [WaveformBin(correction_deg=8.0, weight=10.0, n=10) for _ in range(24)]
     detection = Stage3LiveDetection(
         iid=7,
         icao="ABC123",
@@ -58,7 +55,7 @@ def test_live_bearing_uses_authoritative_sync_predictor():
     )
 
     obs = localiser._bearing_from_live_detection(
-        detection, sync, 51.0, -1.0, calibration, bins,
+        detection, sync, 51.0, -1.0, calibration,
     )
     # Recompute with the same range basis used by _bearing_from_live_detection.
     range_nm = _haversine_m(51.0, -1.0, detection.truth_lat, detection.truth_lon) / 1852.0
@@ -66,7 +63,6 @@ def test_live_bearing_uses_authoritative_sync_predictor():
         sync,
         detection.arrival_us,
         range_nm=range_nm,
-        waveform_bins=bins,
     )
 
     assert obs is not None

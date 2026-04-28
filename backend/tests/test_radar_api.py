@@ -247,13 +247,7 @@ def test_get_iid_sync_debug_endpoint_exposes_summary_and_observation(monkeypatch
     assert "phase_deg" in payload["observations"][0]
     assert "cycle_index" in payload["observations"][0]
     assert "observation_model_diagnostics" in payload
-    assert payload["observation_model_diagnostics"]["folded_phase_shape"]["phase_bins"]
-    assert payload["summary"]["dominant_error_mode"] in {
-        "period_drift",
-        "repeatable_phase_shape",
-        "unstable_cycle_shape",
-        "mixed",
-    }
+    assert payload["observation_model_diagnostics"]["method_summary_overall"]
     assert payload["summary"]["operational_burst_timestamp_method"] is not None
     assert payload["retention_diagnostics"]["timeline"]["count"] == 1
     assert payload["summary"]["retention_diagnostics"]["timeline"]["count"] == 1
@@ -306,7 +300,6 @@ def test_get_iid_sync_snapshot_endpoint_combines_fast_sync_payloads(monkeypatch)
     assert payload["rotation"]["iid"] == 23
     assert "observations" in payload
     assert "sync_state" in payload
-    assert "waveform_bins" in payload
     assert "phase_anchor_candidates" in payload
     assert payload["retention_diagnostics"]["timeline"]["count"] == 1
 
@@ -473,7 +466,6 @@ def test_get_iid_sync_snapshot_uses_compact_go_sync_diagnostics_for_go_owned_syn
     debug_payload = state.get_sync_debug_payload(23, window_s=60.0, limit=20)
 
     assert payload["sync_state"]["source"] == "sweep_frame_go"
-    assert payload["waveform_bins"] == []
     assert payload["phase_anchor_candidates"] == []
     assert payload["observations"][0]["phase_anchor_contributor"] is False
     assert debug_payload["summary"]["diagnostics_mode"] == "compact_go_sync"

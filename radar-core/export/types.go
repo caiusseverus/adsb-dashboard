@@ -84,7 +84,6 @@ type EvidenceEvent struct {
 	TruthLon           *float64 `codec:"truth_lon" json:"truth_lon"`
 	PositionAgeS       *float32 `codec:"position_age_s" json:"position_age_s"`
 	DominantFamily        bool    `codec:"dominant_family" json:"dominant_family"`
-	CompactSyncEligible   bool    `codec:"compact_sync_eligible" json:"compact_sync_eligible"`
 	AssociationConfidence float32 `codec:"association_confidence" json:"association_confidence"`
 }
 
@@ -99,8 +98,7 @@ type TrackObservation struct {
 	TruthLon              *float64 `codec:"truth_lon" json:"truth_lon"`
 	PositionAgeS          *float32 `codec:"position_age_s" json:"position_age_s"`
 	AssociationConfidence float32  `codec:"association_confidence" json:"association_confidence"`
-	DominantFamily      bool `codec:"dominant_family" json:"dominant_family"`
-	CompactSyncEligible bool `codec:"compact_sync_eligible" json:"compact_sync_eligible"`
+	DominantFamily        bool     `codec:"dominant_family" json:"dominant_family"`
 }
 
 // StageProfile is one exported timing aggregate.

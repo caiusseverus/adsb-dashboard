@@ -1,3 +1,52 @@
+## 2026-04-28 Radar Sync Cleanup Audit
+
+- [x] Review lessons, current task history, and working-tree scope before editing.
+- [x] Audit Python and Go for remaining radar sync/refinement surfaces against the intended architecture.
+- [x] Write a short keep/delete inventory and use it to drive the cleanup.
+- [x] Remove obsolete Python legacy/refined-sync diagnostics, compatibility fields, and dead config.
+- [x] Simplify `LiveSyncState` and API payloads to only active predictor / Stage 3 / current frontend fields.
+- [x] Remove frontend references to deleted sync diagnostics and compatibility fields.
+- [x] Remove or rewrite tests that only preserve removed diagnostics/compatibility behavior.
+- [x] Run focused backend tests, Go tests/build, and frontend build.
+- [x] Document what was deleted, what was kept, and why.
+
+Plan confirmation:
+- Keep the functional path only: DF/IID burst accumulation -> base rotation analysis -> Python simple live sync -> `LiveSyncState` -> `predict_sync_observation()` -> Stage 3 trusted-phase gate -> localisation.
+- Do not reintroduce Go sync authority, Python legacy sync selection, old waveform/refined-solver diagnostics, or fallback trust heuristics.
+- Treat Go as keep-only for burst/frame/FM/radar-position support unless a remaining sync-facing field is still required by the compact functional path.
+- Remove UI/API compatibility surfaces in the same pass when their backing backend fields are deleted.
+
+Inventory before deletion:
+- `KEEP_FUNCTIONAL`
+  - Python: `RadarIID`, `RotationModel`, `BurstRecord`, `_analyse_iid_events()`, `_reinforce_radar_characteristics()`, `_fit_per_aircraft_slope()`, `_update_simple_live_sync_state()`, `predict_sync_observation()`, `_sync_state_has_trusted_absolute_phase()`, active `phase_status` / `phase_anchor_*` / `phase_validation_*` fields used by Stage 3 and current sync display.
+  - Go: compact `SyncState`, `IIDState`, `BurstFired`, `IIDState`, `FRAME_READY`, FM state/result paths, frame/burst parsing and radar-position support.
+- `KEEP_TEMPORARILY_FOR_FRONTEND`
+  - Python/UI payloads around `burst_sync_timeline` that still drive the Radar page: core observation rows, `phase_anchor_candidates`, and currently-used fit / validation counts. These stay only if still read after the UI cleanup.
+- `DELETE`
+  - Python dead/obsolete surfaces: `WaveformBin`, `_live_waveform_bins`, `_serialise_waveform_bins`, any waveform-only predictor/localiser plumbing, `_compute_folded_phase_shape()`, `_classify_sync_error_mode()`, `dominant_error_mode`, `phase_shape_strength`, `cycle_to_cycle_repeatability`, `predictor_consistency`, `period_refine_mode`, `period_reacquire_*`, `sync_model`, `period_source`, `period_refinement_source`, `phase_source`, long-term-estimator placeholder fields, and tests asserting disabled waveform/refined behavior.
+  - Go/Python compatibility leftovers: `go_timing_candidate`, `go_compact_timing_candidate`, `go_refined_payload_present`, `go_refined_payload_usable`, `_go_multi_sync_admission_by_iid`, `_compact_sync_debug_by_iid`, and UI/API surfaces that exist only to describe removed Go authority/refined sync states.
+- `MOVE_TO_DIAGNOSTIC_ONLY`
+  - None planned. Anything not required by the active predictor, Stage 3 gate, or still-needed Radar UI will be deleted rather than preserved as compatibility baggage.
+
+### Review
+- Audit outcome:
+  - The active Python path was already the real authority path: base rotation analysis -> `_update_simple_live_sync_state()` -> `LiveSyncState` -> `predict_sync_observation()` -> Stage 3 trusted phase gate.
+  - Most remaining cleanup was in Python/API/frontend compatibility and diagnostics, not active Go sync authority logic. Current `radar-core` still contains frame/FM functionality and generic burst evidence, but the old multi-sync solver / authority payload path described in the prompt is not present in the checked-out tree.
+- Deleted:
+  - Stale `LiveSyncState` fields tied to authority switching, candidate/authoritative dual-state bookkeeping, period reacquire/recovery bookkeeping, long-term branch estimators, and old model provenance placeholders.
+  - Waveform/refined-solver compatibility payloads and debug exports, including `waveform_bins`, waveform application flags, phase-shape/error-mode summary fields, and per-ICAO offset compatibility surfaces.
+  - Frontend Radar page references to candidate-vs-authoritative sync authority, long-term branch diagnostics, and Go per-ICAO offset compatibility tables.
+  - Tests that only preserved removed waveform/error-mode/compatibility behavior.
+- Kept:
+  - Base period detection and the simple Python period-refinement path.
+  - `phase_anchor_*`, `phase_validation_*`, and `phase_status` fields that still drive prediction trust and Stage 3 eligibility.
+  - Compact sync diagnostics for reference-aircraft churn and reset/holdover state, because the current UI still uses them and they describe active compact behaviour rather than removed refined authority.
+  - Go frame/FM functionality and generic burst evidence paths.
+- Verification:
+  - `uv run --directory backend pytest tests/test_aircraft_localiser_sync_predictor.py tests/test_radar_phase_refinement.py tests/test_radar_sweep.py tests/test_radar_api.py -q` -> `171 passed`
+  - `cd frontend && npm run build` -> passed
+  - `GOCACHE=/tmp/go-build go test ./...` under `radar-core/` -> most packages passed; `cmd/radar-core` still fails with pre-existing `declared and not used: assoc` in `main.go`
+
 ## 2026-04-24 Refined Sync Authority Promotion
 
 - [x] Review lessons, current task history, and working-tree scope before editing.
@@ -305,4 +354,3 @@ Plan confirmation points (please confirm before I start):
 4. Bootstrap exception: on first entry from compact → refined, the short-window candidate IS allowed to seed long-term state directly. After that, long-term wins.
 5. Display window default 300s, exposed but not user-configurable in this task (UI control deferred).
 6. Out of scope here: validator threshold tuning, anchor scoring changes, recovery threshold edits, waveform correction.
-

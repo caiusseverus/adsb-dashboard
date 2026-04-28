@@ -130,18 +130,14 @@ func TestBurstFiredRoundTrip(t *testing.T) {
 		BearingDeg:          pf32(275.3),
 		RangeNM:             pf32(42.1),
 		PosAgeS:             pf32(1.2),
-		DominantFamily:      true,
-		CompactSyncEligible: true,
+		DominantFamily: true,
 	}
 	got := roundTrip(t, orig).(*protocol.BurstFired)
 	if got.CentroidUS != orig.CentroidUS {
 		t.Errorf("CentroidUS: got %v want %v", got.CentroidUS, orig.CentroidUS)
 	}
-	if !got.DominantFamily || !got.CompactSyncEligible {
-		t.Errorf(
-			"bool fields lost: DominantFamily=%v CompactSyncEligible=%v",
-			got.DominantFamily, got.CompactSyncEligible,
-		)
+	if !got.DominantFamily {
+		t.Errorf("bool field lost: DominantFamily=%v", got.DominantFamily)
 	}
 	if got.Lat == nil || math.Abs(*got.Lat-*orig.Lat) > 1e-9 {
 		t.Errorf("Lat: got %v want %v", got.Lat, orig.Lat)

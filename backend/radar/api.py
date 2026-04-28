@@ -1182,7 +1182,6 @@ def build_iid_sync_snapshot_payload(
             "observations": [],
             "df11_residual_observations": [],
             "chart_overlay_consistent": False,
-            "waveform_bins": [],
             "phase_anchor_candidates": [],
             "motion_comp_summary": None,
             "retention_diagnostics": None,

@@ -240,8 +240,6 @@ func (e *engine) emitBurstFired(s *iid.IIDState, f *burst.FiredBurst) {
 	if family := s.FamilySnapshot(); family != nil && family.FoldedICAOs != nil {
 		_, dominantFamily = family.FoldedICAOs[f.ICAO]
 	}
-	syncQuality, _ := s.SyncSnapshot()
-	compactEligible := dominantFamily && assoc > 0.0 && syncQuality >= 0.3
 	simpleCentroid := f.SimpleCentroidUS
 	centroidDelta := f.CentroidDeltaUS
 	firstReply := f.FirstReplyUS
@@ -272,8 +270,7 @@ func (e *engine) emitBurstFired(s *iid.IIDState, f *burst.FiredBurst) {
 		Lat:                             latPtr,
 		Lon:                             lonPtr,
 		PosAgeS:                         posAgePtr,
-		DominantFamily:      dominantFamily,
-		CompactSyncEligible: compactEligible,
+		DominantFamily: dominantFamily,
 	})
 }
 
@@ -297,8 +294,6 @@ func (e *engine) recordObservationExports(s *iid.IIDState, f *burst.FiredBurst) 
 	if family := s.FamilySnapshot(); family != nil && family.FoldedICAOs != nil {
 		_, dominantFamily = family.FoldedICAOs[f.ICAO]
 	}
-	syncQualityExport, _ := s.SyncSnapshot()
-	compactEligibleExport := dominantFamily && assoc > 0.0 && syncQualityExport >= 0.3
 	wallTS := float64(time.Now().UnixNano()) / float64(time.Second)
 	track := rcexport.TrackObservation{
 		IID:                   f.IID,
@@ -311,7 +306,6 @@ func (e *engine) recordObservationExports(s *iid.IIDState, f *burst.FiredBurst) 
 		PositionAgeS:          posAgePtr,
 		AssociationConfidence: assoc,
 		DominantFamily:        dominantFamily,
-		CompactSyncEligible:   compactEligibleExport,
 	}
 	tExport := time.Now()
 	e.exports.RecordTrackObservation(track)
@@ -342,7 +336,6 @@ func (e *engine) recordObservationExports(s *iid.IIDState, f *burst.FiredBurst) 
 		TruthLon:              lonPtr,
 		PositionAgeS:          posAgePtr,
 		DominantFamily:        dominantFamily,
-		CompactSyncEligible:   compactEligibleExport,
 		AssociationConfidence: assoc,
 	})
 	e.profiler.Observe("evidence_export", time.Since(tExport))

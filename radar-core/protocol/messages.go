@@ -91,8 +91,7 @@ type BurstFired struct {
 	BearingDeg         *float32 `codec:"br"`
 	RangeNM            *float32 `codec:"rn"`
 	PosAgeS            *float32 `codec:"pa"`
-	DominantFamily      bool `codec:"df"`
-	CompactSyncEligible bool `codec:"ce"`
+	DominantFamily bool `codec:"df"`
 }
 
 // FrameObservation is one non-reference aircraft within a SweepFrame.

@@ -233,9 +233,6 @@ RADAR_DIAGNOSTICS: bool = _bool("RADAR_DIAGNOSTICS", False)
 # slope of recent multi-aircraft burst observations, on top of the aggregate
 # estimator's base period.
 RADAR_SYNC_PERIOD_REFINE_ENABLED: bool = _bool("RADAR_SYNC_PERIOD_REFINE_ENABLED", True)
-# waveform correction: learn an empirical phase-in-rotation residual waveform
-# and subtract it when predicting bearing from arrival time.
-RADAR_SYNC_WAVEFORM_ENABLED: bool = _bool("RADAR_SYNC_WAVEFORM_ENABLED", True)
 # propagation delay: subtract aircraft-to-receiver (and, where available,
 # radar-to-aircraft) light-time from observation arrival timestamps before
 # using them in the sync model.
@@ -246,8 +243,6 @@ RADAR_SYNC_PROP_DELAY_ENABLED: bool = _bool("RADAR_SYNC_PROP_DELAY_ENABLED", Tru
 # both paths even if one side is disabled.
 RADAR_SYNC_MOTION_COMP_PHASE_ENABLED: bool = _bool("RADAR_SYNC_MOTION_COMP_PHASE_ENABLED", True)
 RADAR_SYNC_MOTION_COMP_FIT_ENABLED: bool = _bool("RADAR_SYNC_MOTION_COMP_FIT_ENABLED", True)
-# Number of circular bins for the phase-in-rotation waveform model.
-RADAR_SYNC_WAVEFORM_BIN_COUNT: int = int(os.getenv("RADAR_SYNC_WAVEFORM_BIN_COUNT", "24"))
 
 # ---------------------------------------------------------------------------
 # Stage 3 — aircraft localisation from known radar bearings
