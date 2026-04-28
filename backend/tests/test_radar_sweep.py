@@ -969,11 +969,13 @@ def test_authoritative_sync_predictor_applies_motion_compensation():
     assert ((with_motion.predicted_bearing_deg - without_motion.predicted_bearing_deg + 540.0) % 360.0 - 180.0) == pytest.approx(-4.0)
 
 
-def test_authoritative_frame_period_uses_base_when_base_is_authoritative():
+def test_authoritative_frame_period_uses_period_s_directly():
+    # period_s is authoritative by invariant — helpers use it without any selector field.
+    # Simulate a state where a bounded correction has been applied (period_s != period_base_s).
     state = RadarState()
     state._live_sync_states[7] = LiveSyncState(
         iid=7,
-        period_s=10.4,
+        period_s=10.02,
         phase_epoch_us=0.0,
         phase_offset_deg=0.0,
         sync_quality=1.0,
@@ -982,12 +984,11 @@ def test_authoritative_frame_period_uses_base_when_base_is_authoritative():
         source="multi_aircraft_burst",
         usable=True,
         period_base_s=10.0,
-        period_authoritative_source="base",
     )
 
-    assert state._get_authoritative_frame_period_s(7, 9.8) == pytest.approx(10.0)
-    assert state.get_authoritative_display_period_s(7) == pytest.approx(10.0)
-    assert state.get_authoritative_display_period_std_s(7) == pytest.approx((2.0 / 360.0) * 10.0)
+    assert state._get_authoritative_frame_period_s(7, 9.8) == pytest.approx(10.02)
+    assert state.get_authoritative_display_period_s(7) == pytest.approx(10.02)
+    assert state.get_authoritative_display_period_std_s(7) == pytest.approx((2.0 / 360.0) * 10.02)
 
 
 def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monkeypatch):
@@ -1034,7 +1035,7 @@ def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monke
     assert first["type"] == "radar_sync"
     assert "phase_anchor_candidates" in first
     assert first["retention_diagnostics"]["timeline"]["count"] == 1
-    assert "period_authoritative_source" in first["sync_state"]
+    assert "period_authoritative_source" not in first["sync_state"]
 
 
 def test_go_sync_snapshot_and_debug_use_compact_diagnostics_path(monkeypatch):
@@ -1127,7 +1128,6 @@ def test_go_sync_snapshot_falls_back_to_sweep_frames_when_burst_evidence_aged_ou
         source="go_frame_sync",
         usable=True,
         period_base_s=4.0,
-        period_authoritative_source="base",
     )
     state.update_go_frame_ready({
         "i": 9,

@@ -456,7 +456,7 @@ def update_simple_live_sync_state(
     if not period_update_allowed and period_update_block_reason is None:
         period_update_block_reason = "period_refine_disabled"
 
-    refined_period_s = live_period_s
+    refined_period_s = base_period_s
 
     if period_update_allowed:
         rate_nominal = 360.0 / base_period_s
@@ -513,8 +513,6 @@ def update_simple_live_sync_state(
 
     _update_icao_sync_quality_memory(icao_quality, scored)
 
-    period_authoritative_source = "refined" if period_update_allowed else "base"
-
     new_state = LiveSyncState(
         iid=iid,
         period_s=refined_period_s,
@@ -536,7 +534,6 @@ def update_simple_live_sync_state(
         period_base_s=base_period_s,
         residual_slope_deg_per_s=smoothed_slope,
         period_correction_ppm=period_correction_ppm,
-        period_authoritative_source=period_authoritative_source,
         phase_status=phase_status,
         phase_anchor_icao=phase_anchor_icao,
         phase_anchor_score=phase_anchor_score,

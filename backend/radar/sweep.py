@@ -2342,7 +2342,6 @@ class RadarState:
             last_residual_deg=float(go_sync.get("last_residual_deg") or 0.0),
             holdover=bool(go_sync.get("holdover", False)),
             period_base_s=float(go_sync["period_s"]),
-            period_authoritative_source="base",
         )
 
     def update_go_iid_state(self, iid_state: dict) -> None:
@@ -2580,7 +2579,6 @@ class RadarState:
                 prop_delay_enabled=bool(RADAR_SYNC_PROP_DELAY_ENABLED),
                 motion_comp_phase_enabled=bool(RADAR_SYNC_MOTION_COMP_PHASE_ENABLED),
                 motion_comp_fit_enabled=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
-                period_authoritative_source="refined",
             )
             return
 
@@ -2661,7 +2659,6 @@ class RadarState:
             phase_validation_median_error_deg=existing.phase_validation_median_error_deg,
             phase_validation_status=existing.phase_validation_status,
             phase_anchor_candidates=list(existing.phase_anchor_candidates),
-            period_authoritative_source=existing.period_authoritative_source,
         )
 
     def _record_live_burst_detection(
@@ -3905,9 +3902,6 @@ class RadarState:
             and sync.usable
             and not sync.holdover
         ):
-            if sync.period_authoritative_source == "base":
-                if sync.period_base_s and sync.period_base_s > 0:
-                    return sync.period_base_s
             if sync.period_s and sync.period_s > 0:
                 return sync.period_s
         return fallback_period_s
@@ -3937,11 +3931,8 @@ class RadarState:
             and sync.usable
             and not sync.holdover
         ):
-            effective_period_s = sync.period_s
-            if sync.period_authoritative_source == "base":
-                effective_period_s = sync.period_base_s
-            if effective_period_s and effective_period_s > 0:
-                return sync.sync_jitter_deg / 360.0 * effective_period_s if sync.sync_jitter_deg else None
+            if sync.period_s and sync.period_s > 0:
+                return sync.sync_jitter_deg / 360.0 * sync.period_s if sync.sync_jitter_deg else None
         model = self._models.get(iid)
         return model.period_std_s if model is not None else None
 
@@ -5046,7 +5037,6 @@ class RadarState:
                 "projected_observation_count": len(timeline_obs_snapshot),
                 "go_sweep_frame_revision": go_frame_revision,
                 "sync_source": getattr(sync, "source", None) if sync is not None else None,
-                "period_authoritative_source": getattr(sync, "period_authoritative_source", None) if sync is not None else None,
                 "radar_position_source": radar_pos.get("source"),
                 "multi_sync_admission": go_admission or None,
             }
@@ -6305,7 +6295,6 @@ class RadarState:
             "best_vs_operational_median_abs_improvement_deg": best_improvement,
             "current_period_s": sync.period_s,
             "base_period_s": getattr(sync, "period_base_s", None),
-            "period_authoritative_source": getattr(sync, "period_authoritative_source", None),
             "current_slope_deg_per_s": getattr(sync, "residual_slope_deg_per_s", None),
             "fit_slope_deg_per_s": fit_slope_deg_per_s,
             "fit_time_origin_beast_us": fit_time_origin_beast_us,

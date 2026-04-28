@@ -657,7 +657,6 @@ class TestSimpleModelBehavior:
 
         assert sync is not None
         assert sync.period_base_s == pytest.approx(self._PERIOD_S)
-        assert sync.period_authoritative_source in {"base", "refined"}
 
     def test_single_icao_cannot_drive_period_update(self, monkeypatch):
         """A single ICAO cannot produce per-aircraft consensus — period stays unchanged."""
@@ -680,8 +679,7 @@ class TestSimpleModelBehavior:
         sync = self._run(state, obs)
 
         assert sync is not None
-        assert sync.period_authoritative_source == "base"
-        assert sync.period_s == pytest.approx(4.001)  # unchanged
+        assert sync.period_s == pytest.approx(self._PERIOD_S)  # snaps to base, not carry-forward
 
     def test_conflicting_icao_slopes_block_period_update(self, monkeypatch):
         """Two ICAOs with opposite drift cannot reach consensus — period stays frozen."""
@@ -705,7 +703,6 @@ class TestSimpleModelBehavior:
         sync = self._run(state, obs)
 
         assert sync is not None
-        assert sync.period_authoritative_source == "base"
         assert sync.period_s == pytest.approx(self._PERIOD_S)
 
     def test_period_cap_500ppm_enforced_under_extreme_slope(self, monkeypatch):
@@ -763,7 +760,7 @@ class TestSimpleModelBehavior:
         sync = self._run(state, obs)
 
         assert sync is not None
-        assert sync.period_authoritative_source == "base"  # persistence gate blocks period correction
+        assert sync.period_s == pytest.approx(self._PERIOD_S)  # blocked → snaps to base
         assert sync.phase_status == "trusted"       # phase trusted independently
 
     def test_fit_and_phase_diagnostics_present(self, monkeypatch):
@@ -778,3 +775,164 @@ class TestSimpleModelBehavior:
         assert sync is not None
         assert sync.fit_total_observations >= sync.fit_eligible_observations
         assert sync.phase_status in {"trusted", "provisional", "untrusted"}
+
+
+# ---------------------------------------------------------------------------
+# period_s invariant tests
+# ---------------------------------------------------------------------------
+
+class TestPeriodSInvariant:
+    """Verify the LiveSyncState.period_s-is-authoritative invariant.
+
+    period_s must always hold the period downstream code should use.
+    Blocked refinement snaps to period_base_s; accepted refinement stores
+    the bounded corrected value.  No selector field should exist.
+    """
+
+    _IID = 7
+    _PERIOD_S = 4.0
+    _NOW_TS = 1000.0
+
+    def _base_sync_state(self, period_s=None, period_base_s=None, **kwargs):
+        ps = period_s if period_s is not None else self._PERIOD_S
+        pb = period_base_s if period_base_s is not None else self._PERIOD_S
+        defaults = dict(
+            iid=self._IID,
+            period_s=ps,
+            phase_epoch_us=0.0,
+            phase_offset_deg=0.0,
+            sync_quality=1.0,
+            sync_jitter_deg=2.0,
+            last_sync_update_ts=self._NOW_TS - 1.0,
+            source="multi_aircraft_burst",
+            usable=True,
+            period_base_s=pb,
+            prop_delay_enabled=False,
+            residual_slope_deg_per_s=0.0,
+        )
+        defaults.update(kwargs)
+        return LiveSyncState(**defaults)
+
+    def _make_burst_obs(self, *, period_s, now_ts, icaos=("AAAAAA", "BBBBBB"),
+                        n_per_icao=8, slope_deg_per_s=0.0):
+        window_s = max(period_s * 6, 30.0)
+        t_start = now_ts - window_s + period_s
+        n_total = n_per_icao * len(icaos)
+        obs = []
+        for idx in range(n_total):
+            frac = idx / max(n_total - 1, 1)
+            t_s = t_start + frac * (window_s - period_s)
+            icao = icaos[idx % len(icaos)]
+            burst_us = t_s * 1_000_000.0
+            predicted = (burst_us / (period_s * 1_000_000.0) * 360.0) % 360.0
+            drift = slope_deg_per_s * (t_s - t_start)
+            bearing = (predicted + drift) % 360.0
+            obs.append(AlignedBurstSyncObs(
+                burst_centroid_us=burst_us,
+                icao=icao,
+                bearing_deg=bearing,
+                n_replies=4,
+                signal_dbfs=-12.0,
+                pos_age_s=0.2,
+                range_nm=0.0,
+                ts=t_s,
+                sync_update_eligible=True,
+            ))
+        return obs
+
+    def _run(self, state, obs_list, period_s=None):
+        from collections import deque as _deque
+        period_s = period_s if period_s is not None else self._PERIOD_S
+        buf = _deque(maxlen=state._MULTI_SYNC_OBS_MAX)
+        for o in obs_list:
+            buf.append(o)
+        state._live_aligned_burst_obs[self._IID] = buf
+        state._update_simple_live_sync_state(self._IID, period_s=period_s)
+        return state.get_live_sync_state(self._IID)
+
+    def _seed_slope_history(self, state, slope=0.5, n=6):
+        from collections import deque as _deque
+        state._live_slope_history[self._IID] = _deque(maxlen=80)
+        for _ in range(n):
+            state._live_slope_history[self._IID].append({
+                "ts": self._NOW_TS - 2.0,
+                "residual_slope_deg_per_s": slope,
+                "raw_slope_deg_per_s": slope,
+                "fit_span_s": 28.0,
+                "n_fit_observations": 12,
+                "slope_source": "per_aircraft_consensus",
+            })
+
+    # A. Blocked refinement stores base period, not carry-forward
+    def test_blocked_refinement_stores_base_period(self, monkeypatch):
+        """When refinement is blocked period_s == period_base_s, never a drifted carry-forward."""
+        import radar.sweep as sweep_module
+        monkeypatch.setattr(sweep_module.time, "time", lambda: self._NOW_TS)
+
+        # Seed existing state with a deliberately drifted period_s
+        state = RadarState()
+        state._live_sync_states[self._IID] = self._base_sync_state(
+            period_s=4.05,           # drifted carry-forward
+            period_base_s=self._PERIOD_S,
+        )
+        # No slope history → persistence gate blocks refinement
+
+        obs = self._make_burst_obs(period_s=self._PERIOD_S, now_ts=self._NOW_TS)
+        sync = self._run(state, obs)
+
+        assert sync is not None
+        assert sync.period_s == pytest.approx(self._PERIOD_S)   # snaps to base
+        assert sync.period_correction_ppm == pytest.approx(0.0)
+        assert sync.period_base_s == pytest.approx(self._PERIOD_S)
+
+    # B. Accepted refinement stores bounded corrected period
+    def test_accepted_refinement_stores_corrected_period(self, monkeypatch):
+        """When refinement is accepted period_s holds the bounded correction."""
+        import radar.sweep as sweep_module
+        monkeypatch.setattr(sweep_module.time, "time", lambda: self._NOW_TS)
+
+        state = RadarState()
+        state._live_sync_states[self._IID] = self._base_sync_state(
+            residual_slope_deg_per_s=0.5,
+        )
+        self._seed_slope_history(state, slope=0.5, n=6)
+
+        obs = self._make_burst_obs(
+            period_s=self._PERIOD_S, now_ts=self._NOW_TS,
+            icaos=("AAAAAA", "BBBBBB"), n_per_icao=12, slope_deg_per_s=0.5,
+        )
+        sync = self._run(state, obs)
+
+        assert sync is not None
+        # If refinement fired, period_s deviates from base but within ±500 PPM
+        if sync.period_correction_ppm != 0.0:
+            assert sync.period_s != pytest.approx(self._PERIOD_S)
+            deviation_ppm = abs(sync.period_s - self._PERIOD_S) / self._PERIOD_S * 1e6
+            assert deviation_ppm <= 500.0 + 1e-6
+            assert sync.period_correction_ppm == pytest.approx(
+                (sync.period_s - sync.period_base_s) / sync.period_base_s * 1e6
+            )
+        # Either way period_s is always the value downstream should use
+        assert sync.period_s > 0.0
+
+    # C. Frame/display helpers use period_s directly — no selector field needed
+    def test_frame_period_helpers_use_period_s_directly(self):
+        """Helpers return period_s verbatim; period_base_s has no effect on result."""
+        state = RadarState()
+        # Construct a state where period_s differs from period_base_s
+        state._live_sync_states[self._IID] = self._base_sync_state(
+            period_s=4.001,
+            period_base_s=self._PERIOD_S,
+        )
+        assert state._get_authoritative_frame_period_s(self._IID, 9.8) == pytest.approx(4.001)
+        assert state.get_authoritative_display_period_s(self._IID) == pytest.approx(4.001)
+        assert state.get_authoritative_display_period_std_s(self._IID) == pytest.approx(
+            2.0 / 360.0 * 4.001
+        )
+
+    # D. Obsolete field is absent from the dataclass
+    def test_period_authoritative_source_field_absent(self):
+        """period_authoritative_source must not exist on LiveSyncState."""
+        from dataclasses import fields
+        field_names = {f.name for f in fields(LiveSyncState)}
+        assert "period_authoritative_source" not in field_names

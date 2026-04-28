@@ -16,9 +16,14 @@ class IcaoSyncQuality:
 class LiveSyncState:
     """Python simple sync state for prediction and Stage 3 bearing derivation.
 
-    Seeded from the base rotation period, it may apply a bounded per-aircraft
-    consensus correction. It also carries phase trust and propagation/motion
-    compensation settings.
+    period_s is the authoritative rotation period that all downstream code
+    (frame-building, display helpers, prediction) should use.  When period
+    refinement is accepted period_s holds the bounded corrected value; when
+    refinement is blocked or unavailable period_s is set to period_base_s so
+    callers never need to choose between the two.
+
+    period_base_s is retained as the coarse DF/model period used as the
+    refinement anchor and for diagnostic comparison only.
     """
 
     iid: int
@@ -61,7 +66,6 @@ class LiveSyncState:
     phase_validation_median_error_deg: float | None = None
     phase_validation_status: str = "unavailable"
     phase_anchor_candidates: list[dict] = field(default_factory=list)
-    period_authoritative_source: str = "refined"
 
 
 @dataclass

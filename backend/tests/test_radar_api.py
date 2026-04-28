@@ -183,7 +183,7 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     payload = radar_api.build_iid_sync_snapshot_payload(state, 23, window_s=60.0, debug_limit=20)
 
     assert payload["sync_state"]["source"] == "go_frame_sync"
-    assert payload["sync_state"]["period_authoritative_source"] == "base"
+    assert "period_authoritative_source" not in payload["sync_state"]
     assert payload["observations"] == []
     assert payload["alignment_status"]["reason"] == "radar_position_unavailable"
     assert payload["alignment_status"]["multi_sync_admission"]["last_reason"] == "no_receiver_config"
@@ -235,7 +235,7 @@ def test_get_iid_sync_debug_endpoint_exposes_summary_and_observation(monkeypatch
     assert payload["summary"]["wall_clock_used_operationally"] is False
     assert payload["summary"]["predictors_consistent_burst_sync"] is True
     assert "motion_comp_applied_count" in payload["summary"]
-    assert "period_authoritative_source" in payload["summary"]
+    assert "period_authoritative_source" not in payload["summary"]
     assert "fit_eligible_observations" in payload["summary"]
     assert "phase_anchor_candidate_count" in payload["summary"]
     assert payload["observations"][0]["iid"] == 23
