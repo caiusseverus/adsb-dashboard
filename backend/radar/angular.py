@@ -54,6 +54,19 @@ def _clamp_float(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+def _compute_sync_residual_deg(
+    existing,
+    new_epoch_us: float,
+    new_offset_deg: float,
+    period_us: float,
+) -> float:
+    """Circular residual between a new frame bearing and the existing sync prediction."""
+    existing_at_new_epoch = (
+        (new_epoch_us - existing.phase_epoch_us) / period_us * 360.0 + existing.phase_offset_deg
+    ) % 360.0
+    return (new_offset_deg - existing_at_new_epoch + 540.0) % 360.0 - 180.0
+
+
 def _residual_stats(values: list[float | None]) -> dict:
     clean = [float(v) for v in values if v is not None and _math.isfinite(float(v))]
     abs_clean = [abs(v) for v in clean]

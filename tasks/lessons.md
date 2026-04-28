@@ -1,5 +1,9 @@
 # Lessons
 
+## 2026-04-28
+
+- After a structural extraction, verify the source file no longer defines local copies of the moved symbols. Do not stop at adding imports; confirm that imported helpers and dataclasses are not shadowed later in the file, and add an identity test when a module is meant to re-export shared classes.
+
 ## 2026-04-23
 
 - For Go multi-sync phase work, do not treat an exported candidate anchor as operational authority. Keep `PhaseOffsetDeg` aligned with the active authority mode, expose candidate-anchor diagnostics separately, and label residual plots by their actual basis.

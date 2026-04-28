@@ -26,6 +26,7 @@ except Exception:
 from .models import RadarIID, RotationModel, CalibrationPair, BurstRecord
 from .aircraft_models import Stage3LiveDetection
 from .angular import (
+    _compute_sync_residual_deg,
     _circular_delta_deg,
     _circular_mad_deg,
     _circular_weighted_mean_deg,
@@ -263,23 +264,6 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
 def _sync_source_has_rich_python_diagnostics(sync: "LiveSyncState | None") -> bool:
     """Return True when the current sync source carries Python-only rich diagnostics."""
     return bool(sync is not None and getattr(sync, "source", None) == "multi_aircraft_burst")
-
-def _compute_sync_residual_deg(
-    existing: "LiveSyncState",
-    new_epoch_us: float,
-    new_offset_deg: float,
-    period_us: float,
-) -> float:
-    """Circular residual between a new frame's bearing and the existing sync prediction.
-
-    Converts the existing sync state forward to new_epoch_us, then returns the
-    signed angular difference in (-180, 180].  A residual near 0 means the new
-    frame agrees well with the current sync anchor.
-    """
-    existing_at_new_epoch = (
-        (new_epoch_us - existing.phase_epoch_us) / period_us * 360.0 + existing.phase_offset_deg
-    ) % 360.0
-    return (new_offset_deg - existing_at_new_epoch + 540.0) % 360.0 - 180.0
 
 
 class AircraftPositionTracker:

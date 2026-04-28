@@ -1,3 +1,29 @@
+## 2026-04-28 Sweep Re-Export Safety Fix
+
+- [x] Inspect `backend/radar/sweep.py` for remaining duplicate local definitions and identify any still-shadowed extracted helpers.
+- [x] Record the correction pattern in `tasks/lessons.md` and keep this pass limited to restoring safe shared re-exports.
+- [x] Move `_compute_sync_residual_deg` to a shared helper module and make `sweep.py` import it instead of defining it locally.
+- [x] Add a regression test proving `radar.sweep` re-exports the exact `LiveSyncState`, `AlignedBurstSyncObs`, and `IcaoSyncQuality` objects from `radar.sync_models`.
+- [x] Run grep and focused backend verification, then document the result.
+
+Plan confirmation:
+- Keep this pass structural only; do not change sync, prediction, or Stage 3 behavior.
+- `sweep.py` may keep compatibility re-exports through imports, but it must not define local duplicates of moved helpers or dataclasses.
+- Treat the authoritative acceptance checks as source-of-truth: `rg` on `sweep.py` for the moved classes/helpers must come back empty after the edit.
+
+### Review
+- Implemented:
+  - Moved `_compute_sync_residual_deg` into [backend/radar/angular.py](/home/keith/claude/adsb-dashboard/backend/radar/angular.py).
+  - Updated [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) to import `_compute_sync_residual_deg` from `angular.py` and removed the last local helper copy.
+  - Added a regression test in [backend/tests/test_radar_sweep.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_sweep.py) asserting `radar.sweep` re-exports the exact shared `LiveSyncState`, `AlignedBurstSyncObs`, and `IcaoSyncQuality` objects from `radar.sync_models`.
+- Not changed:
+  - Sync behavior.
+  - Prediction semantics.
+  - Stage 3 behavior.
+- Verification:
+  - `rg -n "class LiveSyncState|class AlignedBurstSyncObs|class IcaoSyncQuality|def _bearing_deg_simple|def _estimate_aircraft_bearing_rate|def _compute_sync_residual_deg|def _haversine_nm_simple|def _median_float|def _residual_stats|def _clamp_float|def _circular_delta_deg|def _circular_weighted_mean_deg|def _circular_mad_deg|def _icao_quality_memory_score|def _icao_quality_reject_reason|def _icao_quality_anchor_warning|def _update_icao_sync_quality_memory" backend/radar/sweep.py` -> no matches
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_phase_refinement.py tests/test_aircraft_localiser_sync_predictor.py tests/test_aircraft_localiser_target_live.py tests/test_radar_api.py -q` -> `192 passed`
+
 ## 2026-04-28 Sweep Helper Extraction
 
 - [x] Review lessons and inspect the remaining dataclasses and pure helper definitions in `backend/radar/sweep.py`.

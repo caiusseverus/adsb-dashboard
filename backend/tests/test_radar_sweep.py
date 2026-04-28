@@ -8,8 +8,14 @@ from types import SimpleNamespace
 
 import config
 import pytest
+from radar import sweep
 from radar.sweep import _analyse_iid_events
 from radar.models import BurstRecord, LiveFrameState, RadarIID, ReferenceAircraftInfo, RotationModel
+from radar.sync_models import (
+    AlignedBurstSyncObs as SharedAlignedBurstSyncObs,
+    IcaoSyncQuality as SharedIcaoSyncQuality,
+    LiveSyncState as SharedLiveSyncState,
+)
 from radar.sweep import (
     AlignedBurstSyncObs,
     IcaoSyncQuality,
@@ -24,6 +30,12 @@ from radar.sweep import (
     detect_bursts,
     detect_bursts_with_signals,
 )
+
+
+def test_sweep_reexports_sync_model_identities():
+    assert sweep.LiveSyncState is SharedLiveSyncState
+    assert sweep.AlignedBurstSyncObs is SharedAlignedBurstSyncObs
+    assert sweep.IcaoSyncQuality is SharedIcaoSyncQuality
 
 
 def _make_events(iid: int, icao: str, arrivals_s: list[float]) -> list[tuple[int, int, str, None]]:
