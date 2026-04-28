@@ -1,3 +1,29 @@
+## 2026-04-28 Sweep Helper Extraction
+
+- [x] Review lessons and inspect the remaining dataclasses and pure helper definitions in `backend/radar/sweep.py`.
+- [x] Write the extraction plan and keep this pass limited to helper/module moves with no behavior changes.
+- [x] Add `backend/radar/sync_models.py`, `backend/radar/geo.py`, `backend/radar/angular.py`, `backend/radar/sync_quality.py`, and `backend/radar/motion_comp.py` as the new shared helper modules.
+- [x] Update `sweep.py` and internal radar modules to import the extracted helpers while keeping temporary `radar.sweep` re-exports for current tests.
+- [x] Run focused backend verification and document the results.
+
+Plan confirmation:
+- Keep this pass structural only. Do not change simple sync, prediction semantics, or Stage 3 behavior.
+- Move `LiveSyncState`, `AlignedBurstSyncObs`, and `IcaoSyncQuality` out of `sweep.py`, but keep them importable from `radar.sweep` for the current tests.
+- Use the new modules as the internal source of truth so extracted code no longer reaches back into `sweep.py` for these helpers.
+
+### Review
+- Implemented:
+  - Added [backend/radar/sync_models.py](/home/keith/claude/adsb-dashboard/backend/radar/sync_models.py) for `LiveSyncState`, `AlignedBurstSyncObs`, and `IcaoSyncQuality`.
+  - Added [backend/radar/geo.py](/home/keith/claude/adsb-dashboard/backend/radar/geo.py), [backend/radar/angular.py](/home/keith/claude/adsb-dashboard/backend/radar/angular.py), [backend/radar/sync_quality.py](/home/keith/claude/adsb-dashboard/backend/radar/sync_quality.py), and [backend/radar/motion_comp.py](/home/keith/claude/adsb-dashboard/backend/radar/motion_comp.py) for the extracted pure helpers.
+  - Updated [backend/radar/sweep.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep.py) to import and re-export those helpers instead of defining them locally.
+  - Updated [backend/radar/simple_sync.py](/home/keith/claude/adsb-dashboard/backend/radar/simple_sync.py), [backend/radar/sweep_diagnostics.py](/home/keith/claude/adsb-dashboard/backend/radar/sweep_diagnostics.py), [backend/radar/sync_prediction.py](/home/keith/claude/adsb-dashboard/backend/radar/sync_prediction.py), and [backend/radar/aircraft_localiser.py](/home/keith/claude/adsb-dashboard/backend/radar/aircraft_localiser.py) to import the shared helpers directly rather than reaching back into `sweep.py`.
+- Not changed:
+  - `LiveSyncState` fields.
+  - Simple sync fitting behavior.
+  - Prediction, propagation-delay, motion-compensation, or Stage 3 semantics.
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_phase_refinement.py tests/test_aircraft_localiser_sync_predictor.py tests/test_aircraft_localiser_target_live.py tests/test_radar_api.py -q` -> `191 passed`
+
 ## 2026-04-28 Radar Position Extraction
 
 - [x] Review the current authoritative radar-position helper and its call sites.

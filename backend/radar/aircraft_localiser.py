@@ -33,7 +33,7 @@ from .aircraft_models import (
     Stage3LiveRay,
 )
 from .radar_position import get_authoritative_radar_position
-from .sweep import LiveSyncState
+from .sync_models import LiveSyncState
 from .sync_prediction import predict_sync_observation
 
 if TYPE_CHECKING:

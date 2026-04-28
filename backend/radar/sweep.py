@@ -11,11 +11,11 @@ in-process operation.
 from __future__ import annotations
 
 import logging
+import math as _math
 import statistics
 import threading
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass as _dataclass, field as _field
 from typing import TYPE_CHECKING, Optional, Any
 
 try:
@@ -25,6 +25,14 @@ except Exception:
 
 from .models import RadarIID, RotationModel, CalibrationPair, BurstRecord
 from .aircraft_models import Stage3LiveDetection
+from .angular import (
+    _circular_delta_deg,
+    _circular_mad_deg,
+    _circular_weighted_mean_deg,
+    _clamp_float,
+    _median_float,
+    _residual_stats,
+)
 from .burst_detection import (
     BURST_GAP_US,
     _compute_burst_timestamp_candidates,
@@ -32,6 +40,7 @@ from .burst_detection import (
     detect_bursts_with_signals,
     refine_burst_center,
 )
+from .geo import _bearing_deg_simple, _haversine_nm_simple
 from .go_diagnostics import (
     GoSweepFrame as _DiagGoSweepFrame,
     go_evidence_event_snapshot as _go_evidence_event_snapshot_helper,
@@ -48,6 +57,7 @@ from .go_diagnostics import (
     prune_go_evidence_events_locked as _prune_go_evidence_events_locked_helper,
     set_go_frame_positions_locked as _set_go_frame_positions_locked_helper,
 )
+from .motion_comp import _estimate_aircraft_bearing_rate
 from .radar_position import get_authoritative_radar_position
 from .rotation_analysis import _analyse_burst_records, _analyse_iid_events
 from .simple_sync import (
@@ -57,6 +67,7 @@ from .simple_sync import (
     fit_window_s_for_period as _fit_window_s_for_period_helper,
     update_simple_live_sync_state,
 )
+from .sync_models import AlignedBurstSyncObs, IcaoSyncQuality, LiveSyncState
 from .sweep_diagnostics import (
     apply_selected_anchor_relative_offsets as _apply_selected_anchor_relative_offsets_helper,
     build_compact_burst_sync_timeline_entries as _build_compact_burst_sync_timeline_entries_helper,
@@ -69,6 +80,13 @@ from .sweep_diagnostics import (
     go_burst_sync_timeline_snapshot as _go_burst_sync_timeline_snapshot_helper,
     go_sweep_frame_sync_timeline_snapshot as _go_sweep_frame_sync_timeline_snapshot_helper,
     summarise_live_sync_observation_buffer as _summarise_live_sync_observation_buffer_helper,
+)
+from .sync_quality import (
+    _icao_quality_anchor_warning,
+    _icao_quality_memory_score,
+    _icao_quality_reject_reason,
+    _sync_quality_from_model,
+    _update_icao_sync_quality_memory,
 )
 from .sync_prediction import (
     SyncPrediction,
@@ -221,10 +239,6 @@ _DF11_RESIDUAL_ON_TIME_THRESHOLD_DEG = 6.0
 _MIN_FRAME_START_SEPARATION_FRACTION = 0.5
 _PHASE_FAMILY_HISTORY_MIN = 2
 _PHASE_FAMILY_TOLERANCE_FRACTION = 0.15
-_MOTION_RATE_MIN_DT_S = 1.0
-_MOTION_RATE_MAX_DT_S = 60.0
-_MOTION_RATE_MAX_POS_AGE_S = 8.0
-_MOTION_RATE_MAX_ABS_DEG_S = 20.0
 
 _BURST_TIMESTAMP_METHODS = (
     ("first_reply", "burst_ts_first_reply_beast_us", "resid_first_reply_deg"),
@@ -236,49 +250,8 @@ _BURST_TIMESTAMP_METHODS = (
 )
 
 
-import math as _math
-
-
-def _bearing_deg_simple(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Forward azimuth from point 1 to point 2 in [0, 360)."""
-    phi1 = _math.radians(lat1)
-    phi2 = _math.radians(lat2)
-    dlam = _math.radians(lon2 - lon1)
-    x = _math.cos(phi1) * _math.sin(phi2) - _math.sin(phi1) * _math.cos(phi2) * _math.cos(dlam)
-    y = _math.sin(dlam) * _math.cos(phi2)
-    return (_math.degrees(_math.atan2(y, x)) + 360) % 360
-
-
-def _haversine_nm_simple(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance between two lat/lon points in nautical miles."""
-    r_m = 6_371_000.0
-    phi1 = _math.radians(lat1)
-    phi2 = _math.radians(lat2)
-    dphi = _math.radians(lat2 - lat1)
-    dlam = _math.radians(lon2 - lon1)
-    a = _math.sin(dphi / 2.0) ** 2 + _math.cos(phi1) * _math.cos(phi2) * _math.sin(dlam / 2.0) ** 2
-    c = 2.0 * _math.asin(_math.sqrt(max(0.0, min(1.0, a))))
-    return (r_m * c) / 1852.0
-
-
 def _get_authoritative_radar_position(model: RadarIID) -> dict:
     return get_authoritative_radar_position(model)
-
-
-def _sync_quality_from_model(model: RadarIID) -> float:
-    """Derive a 0-1 sync quality score from the rotation model status."""
-    if model is None or model.period_s is None:
-        return 0.0
-    status = getattr(model, "status", "UNKNOWN")
-    if status == "SINGLE_RADAR":
-        return 1.0
-    if status == "LIKELY_SINGLE":
-        return 0.8
-    if status == "CHECK_MULTI":
-        return 0.5
-    if status == "MULTI_RADAR":
-        return 0.3
-    return 0.0
 
 
 def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
@@ -290,35 +263,6 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
 def _sync_source_has_rich_python_diagnostics(sync: "LiveSyncState | None") -> bool:
     """Return True when the current sync source carries Python-only rich diagnostics."""
     return bool(sync is not None and getattr(sync, "source", None) == "multi_aircraft_burst")
-
-
-def _median_float(values: list[float]) -> float | None:
-    if not values:
-        return None
-    clean = sorted(values)
-    mid = len(clean) // 2
-    if len(clean) % 2:
-        return clean[mid]
-    return (clean[mid - 1] + clean[mid]) / 2.0
-
-
-def _residual_stats(values: list[float | None]) -> dict:
-    clean = [float(v) for v in values if v is not None and _math.isfinite(float(v))]
-    abs_clean = [abs(v) for v in clean]
-    median = _median_float(clean)
-    deviations = [abs(v - median) for v in clean] if median is not None else []
-    return {
-        "count": len(clean),
-        "mean_abs_residual_deg": (sum(abs_clean) / len(abs_clean)) if abs_clean else None,
-        "median_abs_residual_deg": _median_float(abs_clean),
-        "robust_spread_mad_deg": _median_float(deviations),
-        "mean_residual_deg": (sum(clean) / len(clean)) if clean else None,
-        "median_residual_deg": median,
-    }
-
-
-def _clamp_float(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
 
 def _compute_sync_residual_deg(
     existing: "LiveSyncState",
@@ -336,367 +280,6 @@ def _compute_sync_residual_deg(
         (new_epoch_us - existing.phase_epoch_us) / period_us * 360.0 + existing.phase_offset_deg
     ) % 360.0
     return (new_offset_deg - existing_at_new_epoch + 540.0) % 360.0 - 180.0
-
-
-def _circular_delta_deg(a_deg: float | None, b_deg: float | None) -> float | None:
-    """Signed circular delta a-b in degrees, or None when either side is absent."""
-    if a_deg is None or b_deg is None:
-        return None
-    return (a_deg - b_deg + 540.0) % 360.0 - 180.0
-
-
-def _circular_weighted_mean_deg(values: list[float], weights: list[float] | None = None) -> float | None:
-    """Weighted circular mean in [0, 360), or None when no finite values exist."""
-    if weights is None:
-        weights = [1.0] * len(values)
-    sin_sum = 0.0
-    cos_sum = 0.0
-    total_w = 0.0
-    for value, weight in zip(values, weights):
-        if not _math.isfinite(float(value)) or not _math.isfinite(float(weight)) or weight <= 0:
-            continue
-        rad = _math.radians(float(value))
-        sin_sum += _math.sin(rad) * float(weight)
-        cos_sum += _math.cos(rad) * float(weight)
-        total_w += float(weight)
-    if total_w <= 0.0 or (abs(sin_sum) < 1e-12 and abs(cos_sum) < 1e-12):
-        return None
-    return (_math.degrees(_math.atan2(sin_sum, cos_sum)) + 360.0) % 360.0
-
-
-def _circular_mad_deg(values: list[float], centre_deg: float | None = None) -> float | None:
-    """Median absolute circular deviation from centre_deg."""
-    clean = [float(v) for v in values if _math.isfinite(float(v))]
-    if not clean:
-        return None
-    centre = centre_deg if centre_deg is not None else _circular_weighted_mean_deg(clean)
-    if centre is None:
-        return None
-    return _median_float([abs(_circular_delta_deg(v, centre) or 0.0) for v in clean])
-
-
-def _estimate_aircraft_bearing_rate(
-    *,
-    icao: str,
-    bearing_deg: float,
-    burst_centroid_us: float,
-    pos_age_s: float,
-    history: list["AlignedBurstSyncObs"],
-) -> dict:
-    """Estimate aircraft angular motion relative to the radar.
-
-    The relevant sync term is bearing rate as seen from the radar, not linear
-    speed or radial speed.  This first implementation uses finite differences
-    over recent trusted burst-position observations for the same ICAO.  Bearing
-    wrap is handled with a signed circular delta.
-    """
-    if not icao:
-        return {
-            "bearing_rate_deg_s": None,
-            "motion_comp_block_reason": "missing_icao",
-        }
-    if pos_age_s is None or pos_age_s > _MOTION_RATE_MAX_POS_AGE_S:
-        return {
-            "bearing_rate_deg_s": None,
-            "motion_comp_block_reason": "stale_position",
-        }
-
-    previous = None
-    for candidate in reversed(history):
-        if getattr(candidate, "icao", None) != icao:
-            continue
-        previous = candidate
-        break
-
-    if previous is None:
-        return {
-            "bearing_rate_deg_s": None,
-            "motion_comp_block_reason": "insufficient_history",
-        }
-    if getattr(previous, "pos_age_s", None) is None or previous.pos_age_s > _MOTION_RATE_MAX_POS_AGE_S:
-        return {
-            "bearing_rate_deg_s": None,
-            "motion_comp_block_reason": "previous_position_stale",
-        }
-
-    dt_s = (burst_centroid_us - previous.burst_centroid_us) / 1_000_000.0
-    if dt_s < _MOTION_RATE_MIN_DT_S:
-        return {
-            "bearing_rate_deg_s": None,
-            "motion_comp_block_reason": "time_delta_too_small",
-        }
-    if dt_s > _MOTION_RATE_MAX_DT_S:
-        return {
-            "bearing_rate_deg_s": None,
-            "motion_comp_block_reason": "time_delta_too_large",
-        }
-
-    delta_deg = _circular_delta_deg(bearing_deg, previous.bearing_deg)
-    if delta_deg is None:
-        return {
-            "bearing_rate_deg_s": None,
-            "motion_comp_block_reason": "bearing_delta_unavailable",
-        }
-    bearing_rate_deg_s = delta_deg / dt_s
-    if abs(bearing_rate_deg_s) > _MOTION_RATE_MAX_ABS_DEG_S:
-        return {
-            "bearing_rate_deg_s": bearing_rate_deg_s,
-            "motion_comp_block_reason": "bearing_rate_absurd",
-        }
-
-    return {
-        "bearing_rate_deg_s": bearing_rate_deg_s,
-        "motion_comp_block_reason": None,
-    }
-
-
-@_dataclass
-class IcaoSyncQuality:
-    """Per-IID per-ICAO residual quality memory for fit downweighting."""
-    residual_median_deg: float = 0.0   # circular-mean EMA of signed residual
-    residual_mad_deg: float = 5.0      # EMA of |residual − median|
-    n_recent: int = 0
-    last_ts: float = 0.0
-
-
-def _icao_quality_memory_score(entry: IcaoSyncQuality | None) -> float:
-    """Return a 0-1 quality multiplier derived from residual spread memory."""
-    if entry is None:
-        return 1.0
-    return max(0.0, min(1.0, 1.0 - entry.residual_mad_deg / 25.0))
-
-
-def _icao_quality_reject_reason(entry: IcaoSyncQuality | None) -> str | None:
-    """Return the hard-reject reason for poor ICAO quality memory, if any."""
-    if entry is None or entry.n_recent < 6:
-        return None
-    if entry.residual_mad_deg > 25.0 or abs(entry.residual_median_deg) > 45.0:
-        return "poor_icao_quality"
-    return None
-
-
-def _icao_quality_anchor_warning(entry: IcaoSyncQuality | None) -> str | None:
-    """Return the anchor-selection warning for degraded ICAO quality memory, if any."""
-    if entry is None or entry.n_recent < 6:
-        return None
-    if entry.residual_mad_deg > 25.0 or abs(entry.residual_median_deg) > 60.0:
-        return "poor_icao_quality_memory"
-    return None
-
-
-def _update_icao_sync_quality_memory(
-    quality_dict: dict[str, IcaoSyncQuality],
-    scored: list[dict],
-) -> None:
-    """Update per-ICAO residual quality memory from scored sync observations."""
-    quality_alpha = 0.1
-    for entry in scored:
-        residual_c = entry["residual"]
-        weight = entry["weight"]
-        status = entry["status"]
-        icao = entry["icao"]
-        ts_obs = entry["obs_ts"]
-        if weight <= 0 or status == "rejected":
-            continue
-        q_entry = quality_dict.get(icao)
-        if q_entry is None:
-            quality_dict[icao] = IcaoSyncQuality(
-                residual_median_deg=residual_c,
-                residual_mad_deg=abs(residual_c),
-                n_recent=1,
-                last_ts=ts_obs,
-            )
-            continue
-        q_entry.residual_median_deg = (
-            (1.0 - quality_alpha) * q_entry.residual_median_deg
-            + quality_alpha * residual_c
-        )
-        dev = abs(residual_c - q_entry.residual_median_deg)
-        q_entry.residual_mad_deg = (
-            (1.0 - quality_alpha) * q_entry.residual_mad_deg
-            + quality_alpha * dev
-        )
-        q_entry.n_recent += 1
-        q_entry.last_ts = ts_obs
-
-
-@_dataclass
-class LiveSyncState:
-    """Per-IID live synchronisation state for Stage 3 bearing computation.
-
-    Updated each time a sweep frame is completed. The localiser converts
-    burst-centre arrival times to bearings using:
-        bearing = (arrival_us - phase_epoch_us) / period_us * 360 % 360 + phase_offset_deg.
-
-    The phase epoch is advanced each accepted frame so long-baseline period
-    errors do not accumulate.  sync_jitter_deg is derived from the residual EMA
-    rather than a fixed constant.
-    """
-    iid: int
-    period_s: float
-    phase_epoch_us: float       # burst-centre timestamp of last accepted frame
-    phase_offset_deg: float     # bearing from radar to ref aircraft at phase_epoch_us
-    sync_quality: float         # 0.0–1.0; derived from rotation model status
-    sync_jitter_deg: float      # residual-EMA-derived bearing jitter (1-sigma estimate)
-    last_sync_update_ts: float  # wall-clock time of last accepted update
-    source: str                 # "sweep_frame"
-    usable: bool                # sync_quality is above the minimum threshold
-    # Residual tracking for robust sync (all fields have defaults for backwards compat)
-    residual_ema_deg: float = 5.0        # EMA of |residual| over accepted frames
-    n_sync_frames: int = 0               # count of accepted sync frame updates
-    n_rejected_frames: int = 0           # count of rejected frame updates (diagnostics)
-    last_residual_deg: float = 0.0       # most recent circular residual in degrees
-    holdover: bool = False               # True when the last update was rejected or too weak
-    # Multi-aircraft sync diagnostics (populated by _update_simple_live_sync_state)
-    n_burst_obs_inliers: int = 0         # inlier burst observations in last sync update
-    n_burst_obs_rejected: int = 0        # rejected burst observations in last update
-    contributing_icao_count: int = 0     # distinct ICAOs contributing to current sync estimate
-    # Live period refinement diagnostics.
-    # period_base_s is the aggregate estimator's coarse period at the time this
-    # state was seeded; period_s above is the live-refined period that may drift
-    # slightly from period_base_s as the residual slope is corrected.
-    period_base_s: float = 0.0
-    residual_slope_deg_per_s: float = 0.0  # fitted residual-vs-time slope last update
-    period_correction_ppm: float = 0.0     # (period_s - period_base_s) / period_base_s * 1e6
-    period_refine_enabled: bool = False    # True if period refinement is active this session
-    period_update_term: float = 0.0         # unclamped candidate period delta in seconds
-    period_update_direction: str = "none"   # increase/decrease/none; positive residual slope decreases period
-    period_update_applied: float = 0.0      # actual applied period delta in seconds after clamps
-    period_update_gain: float = 0.0         # gain applied to residual_slope_deg_per_s
-    period_refine_block_reason: str | None = None
-    period_update_proposed_s: float = 0.0
-    period_update_proposed_us: float = 0.0
-    period_update_applied_s: float = 0.0
-    period_update_applied_us: float = 0.0
-    period_update_ppm_unclamped: float = 0.0
-    period_update_ppm_applied: float = 0.0
-    period_update_block_reason: str | None = None
-    period_update_clamp_reason: str | None = None
-    period_update_allowed: bool = False
-    period_update_fit_support: int = 0
-    period_update_fit_span_s: float = 0.0
-    period_correction_status: str = "unknown"
-    period_update_safety_ppm_per_update: float = 0.0
-    period_update_safety_ppm_from_base: float = 0.0
-    # Separate diagnostics for base-anchored and per-step clamps (new fields; do not
-    # change the meaning of period_update_ppm_applied which remains relative to live).
-    period_update_ppm_from_base: float = 0.0
-    period_update_ppm_step: float = 0.0
-    period_update_ppm_limit_from_base: float = 0.0
-    period_update_ppm_limit_step: float = 0.0
-    # Absolute phase trust status — set by the active sync update path.
-    # "trusted": phase anchor confirmed by ≥2 independent ICAOs, spread < 8°.
-    # "provisional": single-anchor or wide spread; Stage 3 does not accept this.
-    # "untrusted": insufficient evidence / population_disagrees.
-    # None: not yet evaluated (new state); Stage 3 falls back to legacy heuristics.
-    phase_status: str | None = None
-    phase_status_reason: str | None = None
-    fit_time_basis: str = "effective_beast_time_s"
-    fit_residual_basis: str = "observed_minus_authoritative_prediction_deg"
-    fit_total_observations: int = 0
-    fit_eligible_observations: int = 0
-    fit_rejected_observations: int = 0
-    fit_reject_reasons: dict[str, int] = _field(default_factory=dict)
-    fit_contributing_icao_count: int = 0
-    fit_span_s: float = 0.0
-    # Propagation delay correction diagnostics.
-    prop_delay_enabled: bool = False       # config flag state
-    # Aircraft angular-motion timing correction diagnostics.
-    motion_comp_phase_enabled: bool = False
-    motion_comp_fit_enabled: bool = False
-    motion_comp_applied_count: int = 0
-    motion_comp_blocked_count: int = 0
-    motion_comp_mean_dt_us: float = 0.0
-    motion_comp_mean_residual_improvement_deg: float = 0.0
-    motion_comp_high_rate_mean_residual_improvement_deg: float | None = None
-    # Absolute phase anchoring.  Period refinement and absolute phase are
-    # separate estimation problems: period_s is fitted from the multi-aircraft
-    # residual slope, while these fields describe the selected aircraft that
-    # currently defines the absolute sweep branch.
-    phase_anchor_icao: str | None = None
-    phase_anchor_score: float = 0.0
-    phase_anchor_obs_count: int = 0
-    phase_anchor_offset_raw_deg: float | None = None
-    phase_anchor_offset_smoothed_deg: float | None = None
-    phase_anchor_spread_deg: float | None = None
-    phase_anchor_status: str = "unavailable"
-    phase_anchor_since_ts: float | None = None
-    phase_anchor_replacement_reason: str | None = None
-    phase_anchor_candidate_count: int = 0
-    phase_anchor_no_candidate_reason: str | None = None
-    phase_validation_contributors: int = 0
-    phase_validation_reject_count: int = 0
-    phase_validation_median_error_deg: float | None = None
-    phase_validation_status: str = "unavailable"
-    phase_anchor_candidates: list[dict] = _field(default_factory=list)
-    period_authoritative_source: str = "refined"
-    dominant_period_s: float | None = None
-    dominant_prior_period_s: float | None = None
-    trusted_refined_period_s: float | None = None
-    bootstrap_period_s: float | None = None
-    active_family_prior_s: float | None = None
-    active_family_prior_source: str | None = None
-    dominant_prior_active: bool = False
-    dominant_period_delta_s: float | None = None
-    dominant_period_delta_ppm: float | None = None
-    compact_period_s: float | None = None
-    compact_period_delta_to_dominant_s: float | None = None
-    compact_period_delta_to_dominant_ppm: float | None = None
-    compact_sync_unreliable: bool = False
-
-
-@_dataclass
-class AlignedBurstSyncObs:
-    """One burst-centre bearing observation for multi-aircraft sync maintenance.
-
-    Recorded for each dominant-family burst that has an ADS-B position.
-    The rolling buffer of these observations is used by the Python sync
-    solver to fit a robust phase correction without depending on any
-    single reference aircraft.
-    """
-    burst_centroid_us: float    # Beast-monotonic burst-centre timestamp
-    icao: str                   # Aircraft ICAO
-    bearing_deg: float          # Geometric bearing from radar to aircraft (pre-computed)
-    n_replies: int              # Burst reply count (quality factor for burst-centre accuracy)
-    signal_dbfs: float | None   # Average signal strength (dBFS, negative; None if unknown)
-    pos_age_s: float            # ADS-B position age at burst time (seconds)
-    range_nm: float             # Geometric range from radar to aircraft (nautical miles)
-    ts: float                   # Wall-clock time for rolling-window age filtering
-    sync_update_eligible: bool = True  # True if this burst was eligible to steer sync
-    # Propagation-corrected timing.  burst_centroid_us above is preserved as the
-    # raw Beast-monotonic timestamp so downstream consumers are unaffected.
-    # raw_arrival_us mirrors burst_centroid_us for API clarity; effective_arrival_us
-    # is the propagation-corrected time used by the sync model when the
-    # RADAR_SYNC_PROP_DELAY_ENABLED flag is on.
-    raw_arrival_us: float = 0.0
-    prop_delay_aircraft_to_receiver_us: float = 0.0
-    prop_delay_radar_to_aircraft_us: float | None = None
-    effective_arrival_us: float = 0.0
-    # Aircraft-motion compensation diagnostics.  bearing_rate_deg_s is the
-    # angular motion of this aircraft as seen from the radar; radial speed is
-    # not the term that changes apparent sweep recurrence.
-    bearing_rate_deg_s: float | None = None
-    motion_comp_dt_us: float | None = None
-    motion_corrected_beast_us: float | None = None
-    motion_comp_applied: bool = False
-    motion_comp_block_reason: str | None = None
-    # Burst-centre estimator diagnostics.
-    burst_center_simple_us: float | None = None
-    burst_center_weighted_us: float | None = None
-    burst_center_delta_us: float | None = None
-    burst_center_method: str = "centroid"
-    burst_ts_first_reply_beast_us: float | None = None
-    burst_ts_strongest_reply_beast_us: float | None = None
-    burst_ts_simple_centroid_beast_us: float | None = None
-    burst_ts_weighted_centroid_beast_us: float | None = None
-    burst_ts_mid_strong_window_beast_us: float | None = None
-    burst_ts_last_reply_beast_us: float | None = None
-    burst_span_us: float | None = None
-    peak_amplitude: float | None = None
-    position_interpolated: bool = False
-    position_extrapolated: bool = False
-    position_source_age_s: float | None = None
-    truth_position_ts_beast_us: float | None = None
 
 
 class AircraftPositionTracker:
