@@ -258,6 +258,7 @@ func TestIIDState_UpdateSyncEpoch(t *testing.T) {
 	s := NewIIDState(7)
 	period := 4.0
 	s.PeriodS = &period
+	s.SetBasePeriod(period)
 	s.Status = "SINGLE_RADAR"
 
 	// Bootstrap sync on first reference burst.

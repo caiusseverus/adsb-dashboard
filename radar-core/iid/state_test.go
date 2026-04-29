@@ -6,6 +6,7 @@ func TestRefreshReference_PrefersDominantFamily(t *testing.T) {
 	s := NewIIDState(7)
 	period := 4.0
 	s.PeriodS = &period
+	s.SetBasePeriod(period)
 	s.LastRotationModel = &RotationModel{
 		Family: &ICAOFamily{
 			FoldedICAOs:   map[uint32]struct{}{0xAAAAAA: {}},
@@ -39,6 +40,7 @@ func TestRefreshReference_ClearsWhenNoDominantCandidates(t *testing.T) {
 	s := NewIIDState(9)
 	period := 4.0
 	s.PeriodS = &period
+	s.SetBasePeriod(period)
 	s.LastRotationModel = &RotationModel{
 		Family: &ICAOFamily{
 			FoldedICAOs:   map[uint32]struct{}{0xCCCCCC: {}}, // not present in records
@@ -58,6 +60,33 @@ func TestRefreshReference_ClearsWhenNoDominantCandidates(t *testing.T) {
 
 	if s.RefICAO != nil {
 		t.Fatalf("reference ICAO not cleared, got 0x%X", *s.RefICAO)
+	}
+}
+
+func TestDFBasePeriodOverridesDisagreeingCompactPeriod(t *testing.T) {
+	s := NewIIDState(12)
+	compactPeriod := 2.01
+	s.PeriodS = &compactPeriod
+	s.Status = "SINGLE_RADAR"
+
+	dfBasePeriod := 4.79
+	s.SetBasePeriod(dfBasePeriod)
+
+	if got := s.OperationalPeriodSnapshot(); got == nil || *got != dfBasePeriod {
+		t.Fatalf("operational period=%v, want DF base %.2f", got, dfBasePeriod)
+	}
+	snap := s.DebugStateSnapshot()
+	if snap.PeriodAgreesWithDF {
+		t.Fatal("expected compact/DF period disagreement")
+	}
+	if snap.PeriodRejectReason != "compact_period_disagrees_with_df" {
+		t.Fatalf("period reject reason=%q", snap.PeriodRejectReason)
+	}
+	if snap.EffectivePeriodS != dfBasePeriod {
+		t.Fatalf("effective period=%.2f, want DF base %.2f", snap.EffectivePeriodS, dfBasePeriod)
+	}
+	if snap.PeriodDeltaS != 0 {
+		t.Fatalf("period delta=%.6f, want 0", snap.PeriodDeltaS)
 	}
 }
 

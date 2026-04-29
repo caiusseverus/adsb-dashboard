@@ -12,18 +12,24 @@ import (
 //
 //	bearing_deg = ((arrival_us - PhaseEpochUS) / (PeriodS*1e6) * 360 + PhaseOffsetDeg) mod 360
 type SyncState struct {
-	IID             uint8
-	PeriodS         float64
-	PhaseEpochUS    float64 // Beast-monotonic centroid of last accepted reference burst
-	PhaseOffsetDeg  float64 // Geometric bearing from radar to ref aircraft at epoch (0 until radar pos known)
-	SyncQuality     float64 // 0.0–1.0 from rotation model status
-	SyncJitterDeg   float64 // 1-sigma jitter estimate from residual EMA
-	ResidualEMA     float64 // EMA of |circular residual| degrees
-	NSyncFrames     int     // accepted frame count
-	NRejectedFrames int     // rejected frame count
-	LastResidualDeg float64
-	Holdover        bool      // true when last update was rejected / too weak
-	LastUpdated     time.Time
+	IID                uint8
+	PeriodS            float64 // deprecated alias for EffectivePeriodS; kept for tests/compatibility only.
+	BasePeriodS        float64
+	PeriodDeltaS       float64
+	EffectivePeriodS   float64
+	PhaseEpochUS       float64 // Beast-monotonic centroid of last accepted reference burst
+	PhaseOffsetDeg     float64 // Geometric bearing from radar to ref aircraft at epoch (0 until radar pos known)
+	SyncQuality        float64 // 0.0–1.0 from rotation model status
+	SyncJitterDeg      float64 // 1-sigma jitter estimate from residual EMA
+	ResidualEMA        float64 // EMA of |circular residual| degrees
+	NSyncFrames        int     // accepted frame count
+	NRejectedFrames    int     // rejected frame count
+	LastResidualDeg    float64
+	Holdover           bool // true when last update was rejected / too weak
+	LastUpdated        time.Time
+	PeriodSource       string
+	PeriodAgreesWithDF bool
+	PeriodRejectReason string
 }
 
 const (
@@ -56,16 +62,21 @@ func syncQuality(status string, hasPeriod bool) float64 {
 // (0.0 when the radar position is unknown — Stage 3 default).
 func NewSyncState(iid uint8, periodS, epochUS, phaseOffsetDeg, quality float64) *SyncState {
 	return &SyncState{
-		IID:            iid,
-		PeriodS:        periodS,
-		PhaseEpochUS:   epochUS,
-		PhaseOffsetDeg: phaseOffsetDeg,
-		SyncQuality:    quality,
-		SyncJitterDeg:  5.0,
-		ResidualEMA:    5.0,
-		NSyncFrames:    1,
-		Holdover:       false,
-		LastUpdated:    time.Now(),
+		IID:                iid,
+		PeriodS:            periodS,
+		BasePeriodS:        periodS,
+		PeriodDeltaS:       0,
+		EffectivePeriodS:   periodS,
+		PhaseEpochUS:       epochUS,
+		PhaseOffsetDeg:     phaseOffsetDeg,
+		SyncQuality:        quality,
+		SyncJitterDeg:      5.0,
+		ResidualEMA:        5.0,
+		NSyncFrames:        1,
+		Holdover:           false,
+		LastUpdated:        time.Now(),
+		PeriodSource:       "df_alignment",
+		PeriodAgreesWithDF: true,
 	}
 }
 
@@ -113,7 +124,13 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 	existingAtNewEpoch := wrap360((newEpochUS-s.PhaseEpochUS)/periodUS*360.0 + s.PhaseOffsetDeg)
 	blendedOffset := wrap360(existingAtNewEpoch + alpha*residual)
 
+	s.BasePeriodS = periodS
+	s.PeriodDeltaS = 0
+	s.EffectivePeriodS = periodS
 	s.PeriodS = periodS
+	s.PeriodSource = "df_alignment"
+	s.PeriodAgreesWithDF = true
+	s.PeriodRejectReason = ""
 	s.PhaseEpochUS = newEpochUS
 	s.PhaseOffsetDeg = blendedOffset
 	s.SyncQuality = quality
@@ -135,10 +152,10 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 // returned value is a geographic bearing unless PhaseOffsetDeg has been
 // properly initialised with a geometric reference.
 func (s *SyncState) PredictBearing(arrivalUS float64) float64 {
-	if s.PeriodS <= 0 {
+	if s.EffectivePeriodS <= 0 {
 		return -1
 	}
-	periodUS := s.PeriodS * 1e6
+	periodUS := s.EffectivePeriodS * 1e6
 	return wrap360(s.predictBearingAt(arrivalUS, periodUS))
 }
 

@@ -1,3 +1,32 @@
+## 2026-04-29 Radar-Core DF Period Authority
+
+- [x] Identify every Go compact/bootstrap/frame-sync path that establishes or updates operational period.
+- [x] Add Python-to-Go per-IID DF base-period propagation.
+- [x] Change Go sync/frame generation to require `base_period_s` and use only bounded `period_delta_s` refinement.
+- [x] Expose agreement diagnostics: `period_source`, `base_period_s`, `period_delta_s`, `effective_period_s`, `period_agrees_with_df`, and `period_reject_reason`.
+- [x] Update Python protocol/client/API diagnostics and frontend period display to separate DF base, Go delta, and effective period.
+- [x] Add regression coverage for DF base period around 4.79s versus compact bootstrap around 2.01s.
+- [x] Run Go, backend, and frontend verification and document results.
+
+Plan confirmation:
+- Python DF alignment / reinforced `RadarIID.period_s` is the base-period authority for Go-backed operational sync.
+- Go `AnalyseBurstRecords` and reinforced `IIDState.PeriodS` remain diagnostic/reference-family helpers but must not bootstrap or replace operational frame/sync period.
+- Go may expose an accepted residual-slope correction only as `period_delta_s`; if out of tolerance, reject it and keep `effective_period_s == base_period_s`.
+- If no valid DF base period has been received for an IID, Go reports sync unavailable and the frame accumulator gates on missing DF base period.
+
+### Review
+- Implemented:
+  - Added per-IID DF base-period propagation from Python rotation reinforcement into radar-core via `IID_BASE_PERIOD_S:<iid>` config updates.
+  - Changed Go frame accumulation and sync epoch updates to require `IIDState.EffectivePeriodS`, which is derived from the DF base period, not the compact rotation model.
+  - Kept Go compact `PeriodS` as diagnostic rotation analysis output; disagreement with the DF base period now reports `compact_period_disagrees_with_df` while `effective_period_s` remains the DF base period.
+  - Added protocol/snapshot diagnostics for `period_source`, `base_period_s`, `period_delta_s`, `effective_period_s`, `period_agrees_with_df`, and `period_reject_reason`.
+  - Updated Radar page compact sync diagnostics to show DF base, Go delta, effective period, and DF agreement separately.
+  - Added Go regression coverage for compact period `2.01s` versus DF base `4.79s`.
+- Verification:
+  - `env GOCACHE=/tmp/go-build go test ./...` in `radar-core/` -> passed
+  - `uv run --directory backend pytest tests/test_radar_core_protocol.py tests/test_radar_core_client.py tests/test_radar_core_integration.py -q` -> `43 passed`
+  - `npm run build` in `frontend/` -> passed
+
 ## 2026-04-28 LiveSyncState Audit And Simplification
 
 - [x] Audit every `LiveSyncState` field in `backend/radar/sync_models.py` and classify it as functional, Stage 3 trust, propagation/motion, frontend/API-retained, or obsolete.

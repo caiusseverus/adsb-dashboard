@@ -114,11 +114,12 @@ func (a *Accumulator) OnBurst(
 	// Append to centroid history first — used by phase-family check.
 	a.appendCentroid(icao, centroidUS)
 
-	status, periodSPtr, _, _ := state.Snapshot()
+	status, _, _, _ := state.Snapshot()
 	_ = status
+	periodSPtr := state.OperationalPeriodSnapshot()
 	if periodSPtr == nil {
-		a.recordGate("no_period", icao)
-		return // no period estimate yet — can't accumulate frames
+		a.recordGate("no_df_base_period", icao)
+		return // no DF-authoritative base period — can't accumulate frames
 	}
 	periodS := *periodSPtr
 	periodUS := periodS * 1_000_000.0

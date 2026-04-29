@@ -228,13 +228,11 @@ func (e *engine) emitBurstFired(s *iid.IIDState, f *burst.FiredBurst) {
 
 	var latPtr, lonPtr *float64
 	var posAgePtr *float32
-	var assoc float32
 	if pos := e.positions.Get(f.ICAO); pos != nil {
 		lat, lon := pos.Lat, pos.Lon
 		latPtr, lonPtr = &lat, &lon
 		posAge := float32(time.Since(pos.TS).Seconds())
 		posAgePtr = &posAge
-		assoc = 1.0
 	}
 	dominantFamily := false
 	if family := s.FamilySnapshot(); family != nil && family.FoldedICAOs != nil {
@@ -252,25 +250,25 @@ func (e *engine) emitBurstFired(s *iid.IIDState, f *burst.FiredBurst) {
 	}
 
 	e.writer.Send(&protocol.BurstFired{
-		MsgType:                         protocol.MsgBurstFired,
-		IID:                             f.IID,
-		ICAO:                            f.ICAO,
-		CentroidUS:                      f.CentroidUS,
-		SimpleCentroidUS:                &simpleCentroid,
-		WeightedCentroidUS:              f.WeightedCentroidUS,
-		CentroidDeltaUS:                 &centroidDelta,
-		FirstReplyUS:                    &firstReply,
-		StrongestReplyUS:                f.StrongestReplyUS,
-		MidStrongWindowUS:               f.MidStrongWindowUS,
-		LastReplyUS:                     &lastReply,
-		SpanUS:                          &spanUS,
-		PeakAmplitude:                   peakAmplitude,
-		NReplies:                        uint8(nReplies),
-		SignalDBFS:                      sig,
-		Lat:                             latPtr,
-		Lon:                             lonPtr,
-		PosAgeS:                         posAgePtr,
-		DominantFamily: dominantFamily,
+		MsgType:            protocol.MsgBurstFired,
+		IID:                f.IID,
+		ICAO:               f.ICAO,
+		CentroidUS:         f.CentroidUS,
+		SimpleCentroidUS:   &simpleCentroid,
+		WeightedCentroidUS: f.WeightedCentroidUS,
+		CentroidDeltaUS:    &centroidDelta,
+		FirstReplyUS:       &firstReply,
+		StrongestReplyUS:   f.StrongestReplyUS,
+		MidStrongWindowUS:  f.MidStrongWindowUS,
+		LastReplyUS:        &lastReply,
+		SpanUS:             &spanUS,
+		PeakAmplitude:      peakAmplitude,
+		NReplies:           uint8(nReplies),
+		SignalDBFS:         sig,
+		Lat:                latPtr,
+		Lon:                lonPtr,
+		PosAgeS:            posAgePtr,
+		DominantFamily:     dominantFamily,
 	})
 }
 
@@ -373,12 +371,52 @@ func (e *engine) onPositionUpdate(msg *protocol.PositionUpdate) {
 }
 
 func (e *engine) onConfigUpdate(msg *protocol.ConfigUpdate) {
+	if strings.HasPrefix(msg.Key, "IID_BASE_PERIOD_S:") {
+		rawIID := strings.TrimPrefix(msg.Key, "IID_BASE_PERIOD_S:")
+		parsed, err := strconv.Atoi(rawIID)
+		if err != nil || parsed < 0 || parsed > 255 {
+			slog.Warn("radar-core: invalid IID base period key", "key", msg.Key)
+			return
+		}
+		period, ok := numericConfigValue(msg.Value)
+		if !ok {
+			slog.Warn("radar-core: invalid IID base period value", "key", msg.Key)
+			return
+		}
+		iidNum := uint8(parsed)
+		s, ok := e.states[iidNum]
+		if !ok {
+			s = iid.NewIIDState(iidNum)
+			e.states[iidNum] = s
+		}
+		s.SetBasePeriod(period)
+		e.emitIIDState(iidNum, s, 0)
+		slog.Info("radar-core: IID DF base period updated", "iid", iidNum, "base_period_s", period)
+		return
+	}
 	rcconfig.Apply(msg.Key, msg.Value)
 	cfg := rcconfig.Get()
 	if cfg.HasReceiver {
 		e.fmState.SetReceiver(cfg.ReceiverLat, cfg.ReceiverLon)
 	}
 	slog.Info("radar-core: config updated", "key", msg.Key)
+}
+
+func numericConfigValue(v interface{}) (float64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return x, true
+	case float32:
+		return float64(x), true
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	case uint64:
+		return float64(x), true
+	default:
+		return 0, false
+	}
 }
 
 func (e *engine) onSnapshotReq(msg *protocol.SnapshotReq) {
@@ -441,6 +479,12 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 			"sync_n_frames":          snap.SyncNSyncFrames,
 			"sync_n_rejected_frames": snap.SyncNRejectedFrames,
 			"sync_last_updated":      nil,
+			"period_source":          snap.PeriodSource,
+			"base_period_s":          nil,
+			"period_delta_s":         snap.PeriodDeltaS,
+			"effective_period_s":     nil,
+			"period_agrees_with_df":  snap.PeriodAgreesWithDF,
+			"period_reject_reason":   snap.PeriodRejectReason,
 			"retained_state": map[string]interface{}{
 				"active_aircraft_estimate":           snap.ActiveAircraftEstimate,
 				"burst_records_total":                snap.BurstRecordsTotal,
@@ -471,6 +515,12 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 			iidPayload["sync_residual_ema_deg"] = snap.SyncResidualEMA
 			iidPayload["sync_last_residual_deg"] = snap.SyncLastResidualDeg
 			iidPayload["sync_last_updated"] = snap.SyncLastUpdatedUnix
+		}
+		if snap.BasePeriodS > 0 {
+			iidPayload["base_period_s"] = snap.BasePeriodS
+		}
+		if snap.EffectivePeriodS > 0 {
+			iidPayload["effective_period_s"] = snap.EffectivePeriodS
 		}
 		stableIIDs[key] = rcexport.IIDSnapshot{
 			IID:    iidNum,
@@ -701,6 +751,12 @@ func (e *engine) emitIIDState(iidNum uint8, s *iid.IIDState, nBurstRecords uint1
 		SyncNFrames:        syncNFrames,
 		SyncNRejected:      syncNRejected,
 		SyncHoldover:       syncHoldover,
+		PeriodSource:       snapPeriodSource(s),
+		BasePeriodS:        snapBasePeriod(s),
+		PeriodDeltaS:       snapPeriodDelta(s),
+		EffectivePeriodS:   snapEffectivePeriod(s),
+		PeriodAgreesWithDF: snapPeriodAgrees(s),
+		PeriodRejectReason: snapPeriodRejectReason(s),
 		NBurstRecords:      nBurstRecords,
 		LastUpdated:        float64(time.Now().UnixMicro()) / 1e6,
 		Revision:           rev,
@@ -715,6 +771,42 @@ func (e *engine) emitIIDState(iidNum uint8, s *iid.IIDState, nBurstRecords uint1
 		"sync_present", syncPresent,
 		"revision", rev,
 	)
+}
+
+func snapBasePeriod(s *iid.IIDState) *float64 {
+	snap := s.DebugStateSnapshot()
+	if snap.BasePeriodS <= 0 {
+		return nil
+	}
+	v := snap.BasePeriodS
+	return &v
+}
+
+func snapPeriodDelta(s *iid.IIDState) *float64 {
+	snap := s.DebugStateSnapshot()
+	v := snap.PeriodDeltaS
+	return &v
+}
+
+func snapEffectivePeriod(s *iid.IIDState) *float64 {
+	snap := s.DebugStateSnapshot()
+	if snap.EffectivePeriodS <= 0 {
+		return nil
+	}
+	v := snap.EffectivePeriodS
+	return &v
+}
+
+func snapPeriodSource(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().PeriodSource
+}
+
+func snapPeriodAgrees(s *iid.IIDState) bool {
+	return s.DebugStateSnapshot().PeriodAgreesWithDF
+}
+
+func snapPeriodRejectReason(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().PeriodRejectReason
 }
 
 func (e *engine) runFMWorker(stop <-chan struct{}) {

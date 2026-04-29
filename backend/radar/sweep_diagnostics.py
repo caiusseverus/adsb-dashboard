@@ -241,6 +241,7 @@ def build_compact_sync_debug_payload(state: Any, iid: int, sync: "LiveSyncState"
 def build_sync_mode_diagnostics(state: Any, iid: int, sync: "LiveSyncState | None", alignment_status: dict | None) -> dict:
     with state._lock:
         compact_debug = dict(state._compact_sync_debug_by_iid.get(iid) or {})
+        go_sync = dict(state._go_sync_states_by_iid.get(iid) or {})
         go_admission = dict(state._go_multi_sync_admission_by_iid.get(iid) or {})
     sync_source = getattr(sync, "source", None) if sync is not None else None
     refined_active = bool(sync_source == "multi_aircraft_burst")
@@ -272,6 +273,12 @@ def build_sync_mode_diagnostics(state: Any, iid: int, sync: "LiveSyncState | Non
             "holdover": compact_debug.get("holdover"),
             "last_holdover_transition": compact_debug.get("last_holdover_transition"),
             "last_holdover_transition_ts": compact_debug.get("last_holdover_transition_ts"),
+            "period_source": go_sync.get("period_source"),
+            "base_period_s": go_sync.get("base_period_s"),
+            "period_delta_s": go_sync.get("period_delta_s"),
+            "effective_period_s": go_sync.get("effective_period_s") or go_sync.get("period_s"),
+            "period_agrees_with_df": go_sync.get("period_agrees_with_df"),
+            "period_reject_reason": go_sync.get("period_reject_reason"),
         },
         "python_sync": {
             "present": refined_active,

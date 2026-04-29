@@ -46,14 +46,20 @@ type IIDState struct {
 	lastActiveAircraft int
 
 	// Reinforced period state (updated by reinforce).
-	PeriodS           *float64
-	PrimarySupport    int
-	PeriodStdS        float64
-	RPM               *float64
-	Status            string
-	MultiRadarFlag    bool
-	LastRotationModel *RotationModel
-	LastUpdated       time.Time
+	PeriodS            *float64
+	PrimarySupport     int
+	PeriodStdS         float64
+	RPM                *float64
+	Status             string
+	MultiRadarFlag     bool
+	LastRotationModel  *RotationModel
+	LastUpdated        time.Time
+	BasePeriodS        *float64
+	PeriodDeltaS       float64
+	EffectivePeriodS   *float64
+	PeriodSource       string
+	PeriodAgreesWithDF bool
+	PeriodRejectReason string
 
 	// Stage 3: reference aircraft and compact sync state.
 	RefICAO *uint32 // selected reference aircraft (nil until stable)
@@ -80,6 +86,12 @@ type DebugSnapshot struct {
 	SyncNSyncFrames                 int
 	SyncNRejectedFrames             int
 	SyncLastUpdatedUnix             float64
+	BasePeriodS                     float64
+	PeriodDeltaS                    float64
+	EffectivePeriodS                float64
+	PeriodSource                    string
+	PeriodAgreesWithDF              bool
+	PeriodRejectReason              string
 	ActiveAircraftEstimate          int
 	BurstRecordsTotal               int
 	BurstRecordsDynamicCap          int
@@ -100,6 +112,7 @@ const (
 	burstRecordsHeadroom                = 1.4
 	burstRecordsMinPerIID               = 800
 	burstRecordsMaxPerIID               = 8000
+	dfAgreementToleranceFraction        = 0.01
 )
 
 // NewIIDState creates an IIDState for the given IID.
@@ -206,6 +219,65 @@ func (s *IIDState) Reset() {
 	s.LastRotationModel = nil
 	s.RefICAO = nil
 	s.Sync = nil
+	s.BasePeriodS = nil
+	s.PeriodDeltaS = 0
+	s.EffectivePeriodS = nil
+	s.PeriodSource = ""
+	s.PeriodAgreesWithDF = false
+	s.PeriodRejectReason = ""
+}
+
+// SetBasePeriod stores the Python DF-alignment-derived period used by
+// operational sync and frame generation. Go rotation analysis is diagnostic
+// only for this authority path.
+func (s *IIDState) SetBasePeriod(periodS float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if periodS <= 0 || math.IsNaN(periodS) || math.IsInf(periodS, 0) {
+		s.BasePeriodS = nil
+		s.EffectivePeriodS = nil
+		s.PeriodDeltaS = 0
+		s.PeriodSource = ""
+		s.PeriodAgreesWithDF = false
+		s.PeriodRejectReason = "missing_df_base_period"
+		if s.Sync != nil {
+			s.Sync.Holdover = true
+			s.Sync.PeriodS = 0
+			s.Sync.PeriodRejectReason = "missing_df_base_period"
+			s.Sync.PeriodAgreesWithDF = false
+		}
+		return
+	}
+	s.BasePeriodS = &periodS
+	s.PeriodDeltaS = 0
+	s.EffectivePeriodS = &periodS
+	s.PeriodSource = "df_alignment"
+	s.PeriodAgreesWithDF = true
+	s.PeriodRejectReason = ""
+	if s.PeriodS != nil && !periodsAgree(*s.PeriodS, periodS) {
+		s.PeriodAgreesWithDF = false
+		s.PeriodRejectReason = "compact_period_disagrees_with_df"
+	}
+	if s.Sync != nil {
+		s.Sync.BasePeriodS = periodS
+		s.Sync.PeriodDeltaS = 0
+		s.Sync.EffectivePeriodS = periodS
+		s.Sync.PeriodS = periodS
+		s.Sync.PeriodSource = "df_alignment"
+		s.Sync.PeriodAgreesWithDF = s.PeriodAgreesWithDF
+		s.Sync.PeriodRejectReason = s.PeriodRejectReason
+	}
+}
+
+// OperationalPeriodSnapshot returns the DF-authoritative effective period.
+func (s *IIDState) OperationalPeriodSnapshot() *float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.EffectivePeriodS == nil || *s.EffectivePeriodS <= 0 {
+		return nil
+	}
+	v := *s.EffectivePeriodS
+	return &v
 }
 
 // RefreshReference re-evaluates reference aircraft selection from current records.
@@ -214,7 +286,7 @@ func (s *IIDState) Reset() {
 func (s *IIDState) RefreshReference(records []BurstRecord, nowUS float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.PeriodS == nil {
+	if s.EffectivePeriodS == nil {
 		return
 	}
 	cur := uint32(0)
@@ -238,7 +310,7 @@ func (s *IIDState) RefreshReference(records []BurstRecord, nowUS float64) {
 		}
 	}
 
-	chosen := SelectReference(filtered, *s.PeriodS, cur, nowUS)
+	chosen := SelectReference(filtered, *s.EffectivePeriodS, cur, nowUS)
 	if chosen != 0 {
 		s.RefICAO = &chosen
 		return
@@ -257,20 +329,29 @@ func (s *IIDState) RefreshReference(records []BurstRecord, nowUS float64) {
 func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft int, refPosAgeS float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.PeriodS == nil {
+	if s.EffectivePeriodS == nil || *s.EffectivePeriodS <= 0 {
+		if s.Sync != nil {
+			s.Sync.Holdover = true
+			s.Sync.PeriodAgreesWithDF = false
+			s.Sync.PeriodRejectReason = "missing_df_base_period"
+		}
 		return
 	}
-	quality := syncQuality(s.Status, s.PeriodS != nil)
+	quality := syncQuality(s.Status, s.EffectivePeriodS != nil)
 	if s.Sync == nil {
 		// Bootstrap on first reference burst.
 		eligible := nAircraft >= 4 || (nAircraft >= 3 && refPosAgeS <= 2.0)
 		if !eligible {
 			return
 		}
-		s.Sync = NewSyncState(s.IID, *s.PeriodS, epochUS, phaseOffsetDeg, quality)
+		s.Sync = NewSyncState(s.IID, *s.EffectivePeriodS, epochUS, phaseOffsetDeg, quality)
+		s.Sync.PeriodAgreesWithDF = s.PeriodAgreesWithDF
+		s.Sync.PeriodRejectReason = s.PeriodRejectReason
 		return
 	}
-	s.Sync.UpdateEpoch(epochUS, phaseOffsetDeg, *s.PeriodS, quality, nAircraft, refPosAgeS)
+	s.Sync.UpdateEpoch(epochUS, phaseOffsetDeg, *s.EffectivePeriodS, quality, nAircraft, refPosAgeS)
+	s.Sync.PeriodAgreesWithDF = s.PeriodAgreesWithDF
+	s.Sync.PeriodRejectReason = s.PeriodRejectReason
 }
 
 // FamilySnapshot returns the current ICAO family membership (may be nil).
@@ -316,7 +397,7 @@ func (s *IIDState) SyncProtocolSnapshot() (
 	present = true
 	usable = s.Sync.SyncQuality >= 0.3 && !s.Sync.Holdover
 	holdover = s.Sync.Holdover
-	periodValue := s.Sync.PeriodS
+	periodValue := s.Sync.EffectivePeriodS
 	phaseEpochValue := s.Sync.PhaseEpochUS
 	phaseOffsetValue := s.Sync.PhaseOffsetDeg
 	jitterValue := float32(s.Sync.SyncJitterDeg)
@@ -363,6 +444,16 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.HasPeriod = true
 		out.PeriodS = *s.PeriodS
 	}
+	if s.BasePeriodS != nil {
+		out.BasePeriodS = *s.BasePeriodS
+	}
+	if s.EffectivePeriodS != nil {
+		out.EffectivePeriodS = *s.EffectivePeriodS
+	}
+	out.PeriodDeltaS = s.PeriodDeltaS
+	out.PeriodSource = s.PeriodSource
+	out.PeriodAgreesWithDF = s.PeriodAgreesWithDF
+	out.PeriodRejectReason = s.PeriodRejectReason
 	if s.RefICAO != nil {
 		out.HasRefICAO = true
 		out.RefICAO = *s.RefICAO
@@ -370,7 +461,7 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 	if s.Sync != nil {
 		out.SyncPresent = true
 		out.SyncQuality = s.Sync.SyncQuality
-		out.SyncPeriodS = s.Sync.PeriodS
+		out.SyncPeriodS = s.Sync.EffectivePeriodS
 		out.SyncPhaseEpochUS = s.Sync.PhaseEpochUS
 		out.SyncPhaseOffsetDeg = s.Sync.PhaseOffsetDeg
 		out.SyncJitterDeg = s.Sync.SyncJitterDeg
@@ -444,6 +535,13 @@ func periodsMatch(a, b float64) bool {
 		return false
 	}
 	return math.Abs(a-b)/math.Max(a, b) <= periodMatchTolerance
+}
+
+func periodsAgree(a, b float64) bool {
+	if a <= 0 || b <= 0 {
+		return false
+	}
+	return math.Abs(a-b)/math.Max(a, b) <= dfAgreementToleranceFraction
 }
 
 func blendPeriod(existing float64, support int, observed float64) (float64, int) {
@@ -531,6 +629,18 @@ func reinforce(s *IIDState, model *RotationModel) {
 		s.RPM = &rpm
 	} else {
 		s.RPM = nil
+	}
+
+	if s.BasePeriodS != nil {
+		s.EffectivePeriodS = s.BasePeriodS
+		s.PeriodDeltaS = 0
+		s.PeriodSource = "df_alignment"
+		s.PeriodAgreesWithDF = s.PeriodS == nil || periodsAgree(*s.PeriodS, *s.BasePeriodS)
+		if s.PeriodAgreesWithDF {
+			s.PeriodRejectReason = ""
+		} else {
+			s.PeriodRejectReason = "compact_period_disagrees_with_df"
+		}
 	}
 
 	confidence := confidenceFromSupport(primarySupport)

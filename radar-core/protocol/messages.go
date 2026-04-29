@@ -12,11 +12,11 @@ const (
 
 // Message type constants — outbound (radar-core → Python).
 const (
-	MsgBurstFired     uint8 = 10
-	MsgFrameReady     uint8 = 11
-	MsgIIDState       uint8 = 12
-	MsgSnapshotResp   uint8 = 13
-	MsgHealth         uint8 = 14
+	MsgBurstFired    uint8 = 10
+	MsgFrameReady    uint8 = 11
+	MsgIIDState      uint8 = 12
+	MsgSnapshotResp  uint8 = 13
+	MsgHealth        uint8 = 14
 	MsgFMFrameResult uint8 = 15
 	MsgFMState       uint8 = 16
 )
@@ -91,7 +91,7 @@ type BurstFired struct {
 	BearingDeg         *float32 `codec:"br"`
 	RangeNM            *float32 `codec:"rn"`
 	PosAgeS            *float32 `codec:"pa"`
-	DominantFamily bool `codec:"df"`
+	DominantFamily     bool     `codec:"df"`
 }
 
 // FrameObservation is one non-reference aircraft within a SweepFrame.
@@ -148,6 +148,12 @@ type IIDState struct {
 	SyncNFrames        uint16   `codec:"snf"`
 	SyncNRejected      uint16   `codec:"snr"`
 	SyncHoldover       bool     `codec:"sh"`
+	PeriodSource       string   `codec:"psrc"`
+	BasePeriodS        *float64 `codec:"bps"`
+	PeriodDeltaS       *float64 `codec:"pds"`
+	EffectivePeriodS   *float64 `codec:"eps"`
+	PeriodAgreesWithDF bool     `codec:"pag"`
+	PeriodRejectReason string   `codec:"prr"`
 	NBurstRecords      uint16   `codec:"nb"`
 	LastUpdated        float64  `codec:"lu"`
 	Revision           uint32   `codec:"rv"`
@@ -243,4 +249,3 @@ type FMState struct {
 	LastFrameCEPM                 *float64          `codec:"fcep"`
 	UpdatedAt                     float64           `codec:"ts"`
 }
-

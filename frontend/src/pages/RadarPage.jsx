@@ -1848,11 +1848,16 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
           <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Compact / bootstrap</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px' }}>
             <span className={styles.metricPill}>Ref ICAO <span className={styles.metricValue}>{compact.reference_icao ?? '—'}</span></span>
+            <span className={styles.metricPill}>DF base <span className={styles.metricValue}>{fmtNumber(compact.base_period_s, 3, 's')}</span></span>
+            <span className={styles.metricPill}>Go Δ <span className={styles.metricValue}>{fmtNumber(Number(compact.period_delta_s ?? 0) * 1000, 2, 'ms')}</span></span>
+            <span className={styles.metricPill}>Effective <span className={styles.metricValue}>{fmtNumber(compact.effective_period_s, 3, 's')}</span></span>
+            <span className={styles.metricPill}>DF agreement <span className={styles.metricValue}>{compact.period_agrees_with_df === false ? 'rejected' : compact.period_agrees_with_df === true ? 'yes' : '—'}</span></span>
             <span className={styles.metricPill}>Prev ref <span className={styles.metricValue}>{compact.last_reference_icao ?? '—'}</span></span>
             <span className={styles.metricPill}>Ref churn <span className={styles.metricValue}>{compact.reference_changed_recently ? 'recent' : 'stable'}</span></span>
             <span className={styles.metricPill}>Resets <span className={styles.metricValue}>{compact.sync_reset_count ?? 0}</span></span>
           </div>
           <div style={{ color: '#8b949e', fontSize: '0.72rem', lineHeight: 1.45 }}>
+            {compact.period_reject_reason ? `Period refinement rejected: ${humanizeSyncReason(compact.period_reject_reason)}. ` : ''}
             {compact.reference_changed_recently ? `Reference changed recently from ${compact.last_reference_icao ?? '—'} to ${compact.reference_icao ?? '—'}. ` : ''}
             {compact.phase_epoch_changed_recently ? 'Phase epoch changed recently. ' : ''}
             {compact.last_holdover_transition ? `Last holdover transition: ${humanizeSyncReason(compact.last_holdover_transition)}. ` : ''}

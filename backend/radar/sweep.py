@@ -649,6 +649,7 @@ class RadarState:
         # for each unwrapped DF11 event, outside any lock.
         # The tap must be non-blocking; failures are silently swallowed.
         self.radar_core_event_sink = None
+        self.radar_core_config_sink = None
 
         # Per-IID latest-frame mailbox: a background FM worker consumes frames
         # from here so the radar worker thread is never blocked by FM solves.
@@ -2113,6 +2114,21 @@ class RadarState:
                     float(entry["sync_last_updated"])
                     if entry.get("sync_last_updated") is not None else None
                 ),
+                "period_source": str(entry.get("period_source") or ""),
+                "base_period_s": (
+                    float(entry["base_period_s"])
+                    if entry.get("base_period_s") is not None else None
+                ),
+                "period_delta_s": (
+                    float(entry["period_delta_s"])
+                    if entry.get("period_delta_s") is not None else None
+                ),
+                "effective_period_s": (
+                    float(entry["effective_period_s"])
+                    if entry.get("effective_period_s") is not None else None
+                ),
+                "period_agrees_with_df": bool(entry.get("period_agrees_with_df", False)),
+                "period_reject_reason": str(entry.get("period_reject_reason") or ""),
             }
         except Exception:
             return None
@@ -2319,7 +2335,9 @@ class RadarState:
         existing = self._live_sync_states.get(iid)
         if existing is not None and existing.source == "multi_aircraft_burst":
             return
-        if go_sync.get("period_s") is None:
+        effective_period_s = go_sync.get("effective_period_s") or go_sync.get("period_s")
+        base_period_s = go_sync.get("base_period_s") or effective_period_s
+        if effective_period_s is None or base_period_s is None:
             return
         phase_epoch_us = go_sync.get("phase_epoch_us")
         phase_offset_deg = go_sync.get("phase_offset_deg")
@@ -2328,7 +2346,7 @@ class RadarState:
         last_updated = float(go_sync.get("last_updated") or time.time())
         self._live_sync_states[iid] = LiveSyncState(
             iid=iid,
-            period_s=float(go_sync["period_s"]),
+            period_s=float(effective_period_s),
             phase_epoch_us=float(phase_epoch_us),
             phase_offset_deg=float(phase_offset_deg),
             sync_quality=float(go_sync.get("sync_quality") or 0.0),
@@ -2341,7 +2359,7 @@ class RadarState:
             n_rejected_frames=int(go_sync.get("n_rejected_frames") or 0),
             last_residual_deg=float(go_sync.get("last_residual_deg") or 0.0),
             holdover=bool(go_sync.get("holdover", False)),
-            period_base_s=float(go_sync["period_s"]),
+            period_base_s=float(base_period_s),
         )
 
     def update_go_iid_state(self, iid_state: dict) -> None:
@@ -2370,6 +2388,12 @@ class RadarState:
                 "sync_n_rejected_frames": iid_state.get("snr"),
                 "sync_holdover": iid_state.get("sh"),
                 "sync_last_updated": iid_state.get("lu"),
+                "period_source": iid_state.get("psrc"),
+                "base_period_s": iid_state.get("bps"),
+                "period_delta_s": iid_state.get("pds"),
+                "effective_period_s": iid_state.get("eps"),
+                "period_agrees_with_df": iid_state.get("pag"),
+                "period_reject_reason": iid_state.get("prr"),
             })
             if go_sync is not None:
                 self._go_sync_states_by_iid[iid] = go_sync
@@ -4208,6 +4232,12 @@ class RadarState:
                     radar_iid.rotation_model = model
                     _reinforce_radar_characteristics(radar_iid, model)
                     radar_iid.last_updated = model.last_updated or time.time()
+                    config_sink = self.radar_core_config_sink
+                    if config_sink is not None and radar_iid.period_s is not None and radar_iid.period_s > 0:
+                        try:
+                            config_sink(f"IID_BASE_PERIOD_S:{iid}", float(radar_iid.period_s))
+                        except Exception:
+                            log.debug("RadarState: failed to publish DF base period to radar-core", exc_info=True)
             analyse_swap_s = time.perf_counter() - t_analyse
             record_rotation_update_timing({
                 "ts_s": time.time(),

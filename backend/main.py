@@ -135,6 +135,7 @@ if config.RADAR_CORE_ENABLED:
         reconnect_delay_s=config.RADAR_CORE_RECONNECT_DELAY_S,
     )
     radar_state.radar_core_event_sink = _radar_core_client.send_radar_event
+    radar_state.radar_core_config_sink = _radar_core_client.send_config_update
 
 # FM solve runs on a dedicated worker thread that drains RadarState's per-IID
 # mailbox.  Keeping FM work off the radar worker thread prevents burst
