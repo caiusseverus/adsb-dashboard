@@ -117,6 +117,79 @@ func TestDFBasePeriodAliasImmunityDuringSyncRefinement(t *testing.T) {
 	}
 }
 
+func TestSetBasePeriod_MaterialChangeResetsRefinementDeltaAndHistory(t *testing.T) {
+	s := NewIIDState(19)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Status = "SINGLE_RADAR"
+	s.UpdateSyncEpoch(0.0, 0.0, 4, 0.5)
+	if s.Sync == nil {
+		t.Fatal("expected sync state")
+	}
+
+	// Build a non-zero refinement delta and residual history.
+	for i := 1; i <= 12; i++ {
+		s.UpdateSyncEpoch(float64(i)*4_000_000.0, float64(i)*0.8, 4, 0.5)
+	}
+	if s.Sync.PeriodDeltaS == 0 {
+		t.Fatal("expected non-zero refinement delta before base change")
+	}
+	if len(s.Sync.residualHistory) == 0 {
+		t.Fatal("expected residual history before base change")
+	}
+
+	newBase := 4.2 // >0.1% change
+	s.SetBasePeriod(newBase)
+	if s.Sync.PeriodDeltaS != 0 {
+		t.Fatalf("delta=%.9f, want 0 after material base change", s.Sync.PeriodDeltaS)
+	}
+	if len(s.Sync.residualHistory) != 0 {
+		t.Fatalf("residual history len=%d, want 0 after reset", len(s.Sync.residualHistory))
+	}
+	if s.Sync.EffectivePeriodS != newBase {
+		t.Fatalf("effective=%.6f, want new base %.6f", s.Sync.EffectivePeriodS, newBase)
+	}
+	if s.Sync.PeriodSource != "df_alignment" {
+		t.Fatalf("period source=%q, want df_alignment", s.Sync.PeriodSource)
+	}
+	if s.Sync.PeriodRefinementStatus != "base_period_changed_reset" {
+		t.Fatalf("refinement status=%q, want base_period_changed_reset", s.Sync.PeriodRefinementStatus)
+	}
+}
+
+func TestSetBasePeriod_SmallChangePreservesRefinementDeltaAndHistory(t *testing.T) {
+	s := NewIIDState(20)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Status = "SINGLE_RADAR"
+	s.UpdateSyncEpoch(0.0, 0.0, 4, 0.5)
+	if s.Sync == nil {
+		t.Fatal("expected sync state")
+	}
+
+	for i := 1; i <= 12; i++ {
+		s.UpdateSyncEpoch(float64(i)*4_000_000.0, float64(i)*0.8, 4, 0.5)
+	}
+	if s.Sync.PeriodDeltaS == 0 {
+		t.Fatal("expected non-zero refinement delta before base change")
+	}
+	prevDelta := s.Sync.PeriodDeltaS
+	prevHistLen := len(s.Sync.residualHistory)
+
+	// 0.2% change (<0.5% reset threshold): preserve refinement.
+	newBase := 4.008
+	s.SetBasePeriod(newBase)
+	if s.Sync.PeriodDeltaS == 0 {
+		t.Fatal("delta was reset on small base change")
+	}
+	if math.Abs(s.Sync.PeriodDeltaS-prevDelta) > 1e-9 {
+		t.Fatalf("delta changed unexpectedly: got %.9f want %.9f", s.Sync.PeriodDeltaS, prevDelta)
+	}
+	if len(s.Sync.residualHistory) != prevHistLen {
+		t.Fatalf("residual history len changed: got %d want %d", len(s.Sync.residualHistory), prevHistLen)
+	}
+}
+
 func TestSyncProtocolSnapshotRejectsDFPeriodDisagreement(t *testing.T) {
 	s := NewIIDState(13)
 	compactPeriod := 2.01

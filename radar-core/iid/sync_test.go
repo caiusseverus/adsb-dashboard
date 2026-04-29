@@ -274,6 +274,56 @@ func TestSyncState_PeriodRefinement_RejectsExcessiveSlope(t *testing.T) {
 	}
 }
 
+func TestSyncState_UpdateEpoch_UsesEffectivePeriodForPrediction(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	s.PeriodDeltaS = -0.2
+	s.EffectivePeriodS = 3.8
+	s.PeriodS = 3.8
+
+	accepted := s.UpdateEpoch(3_800_000.0, 0.0, 4.0, 1.0, 4, 0.5)
+	if !accepted {
+		t.Fatal("expected update accepted")
+	}
+	if math.Abs(s.LastResidualDeg) > 1.0 {
+		t.Fatalf("residual %.3f too large; prediction likely did not use effective period", s.LastResidualDeg)
+	}
+}
+
+func TestSyncState_PeriodRefinement_ClosedLoopReducesSlope(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+
+	// Initial consistent drift pushes correction.
+	for i := 1; i <= 16; i++ {
+		accepted := s.UpdateEpoch(float64(i)*4_000_000.0, float64(i)*0.8, 4.0, 1.0, 4, 0.5)
+		if !accepted {
+			t.Fatalf("initial update %d rejected", i)
+		}
+	}
+	if s.PeriodDeltaS >= 0 {
+		t.Fatalf("expected negative correction, got %.9f", s.PeriodDeltaS)
+	}
+	initialSlope := s.ResidualSlopeDegPerS
+	if initialSlope <= 0 {
+		t.Fatalf("expected positive initial slope, got %.6f", initialSlope)
+	}
+
+	// Continue with observations that follow corrected prediction; loop should settle.
+	for i := 17; i <= 32; i++ {
+		newEpochUS := float64(i) * 4_000_000.0
+		predicted := wrap360(s.predictBearingAt(newEpochUS, s.EffectivePeriodS*1e6))
+		accepted := s.UpdateEpoch(newEpochUS, predicted, 4.0, 1.0, 4, 0.5)
+		if !accepted {
+			t.Fatalf("settling update %d rejected", i)
+		}
+	}
+	if math.Abs(s.ResidualSlopeDegPerS) >= math.Abs(initialSlope) {
+		t.Fatalf("residual slope did not reduce: initial=%.6f current=%.6f", initialSlope, s.ResidualSlopeDegPerS)
+	}
+	if math.Abs(s.PeriodDeltaS) > 4.0*refinementAbsBoundFraction+1e-9 {
+		t.Fatalf("delta exceeded bound: %.9f", s.PeriodDeltaS)
+	}
+}
+
 // TestSelectReference verifies the reference aircraft selection scoring.
 func TestSelectReference_BasicSelection(t *testing.T) {
 	// Two ICAOs: 0xAA has a perfect 4s period; 0xBB has a noisy period.

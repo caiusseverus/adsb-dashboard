@@ -11,6 +11,7 @@ package main
 import (
 	"flag"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -206,10 +207,28 @@ func (e *engine) maybeUpdateSync(s *iid.IIDState, f *burst.FiredBurst) {
 		nAircraft = b.ActiveICAOs()
 	}
 
-	// phaseOffsetDeg = 0 until radar position is known (Stage 4+).
-	s.UpdateSyncEpoch(f.CentroidUS, 0.0, nAircraft, refPosAgeS)
+	phaseOffsetDeg := 0.0
+	cfg := rcconfig.Get()
+	if pos != nil && cfg.HasReceiver {
+		phaseOffsetDeg = bearingDeg(cfg.ReceiverLat, cfg.ReceiverLon, pos.Lat, pos.Lon)
+	}
+	s.UpdateSyncEpoch(f.CentroidUS, phaseOffsetDeg, nAircraft, refPosAgeS)
 	snap := s.DebugStateSnapshot()
 	e.emitIIDState(s.IID, s, uint16(minInt(snap.BurstRecordsTotal, 65535)))
+}
+
+func bearingDeg(lat1, lon1, lat2, lon2 float64) float64 {
+	phi1 := lat1 * math.Pi / 180.0
+	phi2 := lat2 * math.Pi / 180.0
+	dlam := (lon2 - lon1) * math.Pi / 180.0
+	y := math.Sin(dlam) * math.Cos(phi2)
+	x := math.Cos(phi1)*math.Sin(phi2) - math.Sin(phi1)*math.Cos(phi2)*math.Cos(dlam)
+	b := math.Atan2(y, x) * 180.0 / math.Pi
+	b = math.Mod(b+360.0, 360.0)
+	if b < 0 {
+		b += 360.0
+	}
+	return b
 }
 
 func (e *engine) emitBurstFired(s *iid.IIDState, f *burst.FiredBurst) {

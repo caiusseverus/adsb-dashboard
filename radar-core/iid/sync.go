@@ -123,7 +123,11 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 		return false
 	}
 
-	periodUS := periodS * 1e6
+	predictionPeriodS := s.EffectivePeriodS
+	if predictionPeriodS <= 0 || math.IsNaN(predictionPeriodS) || math.IsInf(predictionPeriodS, 0) {
+		predictionPeriodS = periodS
+	}
+	periodUS := predictionPeriodS * 1e6
 
 	// Circular residual between the new observation and our current prediction.
 	predicted := s.predictBearingAt(newEpochUS, periodUS)
@@ -180,6 +184,17 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 	s.Holdover = false
 	s.LastUpdated = time.Now()
 	return true
+}
+
+func (s *SyncState) resetPeriodRefinement(reason string) {
+	s.PeriodDeltaS = 0
+	s.ResidualSlopeDegPerS = 0
+	s.PeriodRefinementStatus = reason
+	s.PeriodRejectReason = ""
+	s.residualHistory = nil
+	s.EffectivePeriodS = s.BasePeriodS
+	s.PeriodS = s.EffectivePeriodS
+	s.PeriodSource = "df_alignment"
 }
 
 func (s *SyncState) appendResidualObservation(epochUS, residualDeg float64, nAircraft int, refPosAgeS float64) {

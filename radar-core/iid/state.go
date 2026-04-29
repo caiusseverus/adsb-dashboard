@@ -115,6 +115,10 @@ const (
 	burstRecordsMinPerIID               = 800
 	burstRecordsMaxPerIID               = 8000
 	dfAgreementToleranceFraction        = 0.01
+	// Reset refinement only when DF base changes materially. 0.5% is large
+	// enough to ignore normal DF-estimate jitter while still handling true base
+	// period shifts.
+	basePeriodChangeResetThreshold = 0.005
 )
 
 // NewIIDState creates an IIDState for the given IID.
@@ -250,13 +254,25 @@ func (s *IIDState) SetBasePeriod(periodS float64) {
 		}
 		return
 	}
+	var prevBase float64
+	hadPrevBase := s.BasePeriodS != nil && *s.BasePeriodS > 0
+	if hadPrevBase {
+		prevBase = *s.BasePeriodS
+	}
 	s.BasePeriodS = &periodS
 	if s.Sync != nil {
+		if !hadPrevBase {
+			s.Sync.resetPeriodRefinement("base_period_initialized")
+		} else {
+			relChange := math.Abs(periodS-prevBase) / math.Max(prevBase, periodS)
+			if relChange > basePeriodChangeResetThreshold {
+				s.Sync.resetPeriodRefinement("base_period_changed_reset")
+			}
+		}
 		s.Sync.BasePeriodS = periodS
 		s.Sync.EffectivePeriodS = s.Sync.BasePeriodS + s.Sync.PeriodDeltaS
 		if s.Sync.EffectivePeriodS <= 0 {
-			s.Sync.PeriodDeltaS = 0
-			s.Sync.EffectivePeriodS = s.Sync.BasePeriodS
+			s.Sync.resetPeriodRefinement("reset_invalid_effective_period")
 		}
 		s.Sync.PeriodS = s.Sync.EffectivePeriodS
 		if math.Abs(s.Sync.PeriodDeltaS) > 1e-12 {
