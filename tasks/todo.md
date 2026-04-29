@@ -716,3 +716,10 @@ Plan confirmation:
   - Added tests covering multi-aircraft slope driving, non-reference-only driving, outlier rejection, and reference-only path insufficiency.
 - Verification:
   - `env GOCACHE=/tmp/go-build go test ./...` in `radar-core/` -> passed
+
+### Follow-up: Refinement Path Activation Fix
+- Wired holdover-safe burst residual learning (holdover no longer blocks refinement ingestion).
+- Added residual-value ingestion API to avoid prediction double-subtraction when upstream already has residual.
+- Added diagnostics for refinement reject reason, last observation age, and history length.
+- Added tests for holdover learning, residual-value ingestion, rejected/non-dominant counters, and reference-vs-burst counter separation.
+- Verification: `env GOCACHE=/tmp/go-build go test ./...` in `radar-core/` -> passed.

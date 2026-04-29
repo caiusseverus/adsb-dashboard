@@ -98,6 +98,9 @@ type DebugSnapshot struct {
 	RefinementEligibleCount         uint64
 	RefinementRejectedCount         uint64
 	RefinementReferenceUpdates      uint64
+	RefinementLastRejectReason      string
+	RefinementLastObservationAgeS   float64
+	RefinementHistoryLen            int
 	ActiveAircraftEstimate          int
 	BurstRecordsTotal               int
 	BurstRecordsDynamicCap          int
@@ -413,10 +416,7 @@ func (s *IIDState) RecordBurstResidualObservation(
 	}
 	if s.RefICAO == nil {
 		s.Sync.PeriodRefinementStatus = "no_reference"
-		return
-	}
-	if s.Sync.Holdover {
-		s.Sync.PeriodRefinementStatus = "holdover"
+		s.Sync.RefinementLastRejectReason = "no_reference"
 		return
 	}
 	predicted := s.Sync.PredictBearing(epochUS)
@@ -424,7 +424,37 @@ func (s *IIDState) RecordBurstResidualObservation(
 		return
 	}
 	residual := circularDiff(observedBearingDeg, predicted)
-	s.Sync.AddRefinementResidualObservation(epochUS, residual, icao, dominantFamily, nAircraft, refPosAgeS)
+	s.Sync.AddRefinementResidualValue(epochUS, residual, icao, dominantFamily, nAircraft, refPosAgeS)
+	s.PeriodDeltaS = s.Sync.PeriodDeltaS
+	effective := s.Sync.EffectivePeriodS
+	s.EffectivePeriodS = &effective
+	s.PeriodSource = s.Sync.PeriodSource
+}
+
+func (s *IIDState) RecordBurstResidualValue(
+	epochUS float64,
+	icao uint32,
+	residualDeg float64,
+	nAircraft int,
+	refPosAgeS float64,
+	dominantFamily bool,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Sync == nil {
+		return
+	}
+	if s.BasePeriodS == nil || *s.BasePeriodS <= 0 {
+		s.Sync.PeriodRefinementStatus = "missing_df_base_period"
+		s.Sync.RefinementLastRejectReason = "missing_df_base_period"
+		return
+	}
+	if s.RefICAO == nil {
+		s.Sync.PeriodRefinementStatus = "no_reference"
+		s.Sync.RefinementLastRejectReason = "no_reference"
+		return
+	}
+	s.Sync.AddRefinementResidualValue(epochUS, residualDeg, icao, dominantFamily, nAircraft, refPosAgeS)
 	s.PeriodDeltaS = s.Sync.PeriodDeltaS
 	effective := s.Sync.EffectivePeriodS
 	s.EffectivePeriodS = &effective
@@ -541,6 +571,15 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.RefinementEligibleCount = s.Sync.RefinementEligibleCount
 		out.RefinementRejectedCount = s.Sync.RefinementRejectedCount
 		out.RefinementReferenceUpdates = s.Sync.RefinementReferenceUpdates
+		out.RefinementLastRejectReason = s.Sync.RefinementLastRejectReason
+		out.RefinementHistoryLen = len(s.Sync.residualHistory)
+		if s.Sync.RefinementLastObservationUnix > 0 {
+			ageS := float64(time.Now().UnixNano())/1e9 - s.Sync.RefinementLastObservationUnix
+			if ageS < 0 {
+				ageS = 0
+			}
+			out.RefinementLastObservationAgeS = ageS
+		}
 	}
 	if s.RefICAO != nil {
 		out.HasRefICAO = true

@@ -274,6 +274,12 @@ func TestPeriodRefinement_ReferenceUpdatesNotOnlyPath(t *testing.T) {
 	if s.PeriodDeltaS != 0 {
 		t.Fatalf("reference-only path unexpectedly refined period: %.9f", s.PeriodDeltaS)
 	}
+	if s.Sync.RefinementReferenceUpdates == 0 {
+		t.Fatal("expected reference update counter to increment")
+	}
+	if s.Sync.RefinementEligibleCount != 0 {
+		t.Fatalf("expected zero burst-refinement eligible observations before burst path calls, got %d", s.Sync.RefinementEligibleCount)
+	}
 
 	// Add non-reference residual slope; now refinement should engage.
 	for i := 11; i <= 30; i++ {
@@ -285,6 +291,75 @@ func TestPeriodRefinement_ReferenceUpdatesNotOnlyPath(t *testing.T) {
 	}
 	if s.PeriodDeltaS == 0 {
 		t.Fatal("expected refinement after non-reference eligible residual stream")
+	}
+}
+
+func TestPeriodRefinement_AllowsLearningDuringHoldoverButSyncRemainsUnusable(t *testing.T) {
+	s := NewIIDState(25)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Sync = NewSyncState(s.IID, base, 0.0, 0.0, 1.0)
+	s.Sync.Holdover = true
+	ref := uint32(0xAAAAAA)
+	s.RefICAO = &ref
+
+	for i := 1; i <= 30; i++ {
+		epochUS := float64(i) * 1_000_000.0
+		predicted := s.Sync.PredictBearing(epochUS)
+		observedBearingDeg := wrap360(predicted + float64(i)*0.2)
+		s.RecordBurstResidualObservation(epochUS, uint32(0xEE0000+i%3), observedBearingDeg, 6, 0.5, true)
+	}
+	if s.PeriodDeltaS == 0 {
+		t.Fatal("expected holdover refinement learning to move period delta")
+	}
+	_, usable, _, _, _, _, _, _, _, _, holdover := s.SyncProtocolSnapshot()
+	if usable {
+		t.Fatal("sync should remain unusable during holdover")
+	}
+	if !holdover {
+		t.Fatal("expected holdover flag true")
+	}
+}
+
+func TestPeriodRefinement_RecordResidualValueDoesNotDoubleSubtractPrediction(t *testing.T) {
+	s := NewIIDState(26)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Sync = NewSyncState(s.IID, base, 0.0, 0.0, 1.0)
+	ref := uint32(0xAAAAAA)
+	s.RefICAO = &ref
+
+	for i := 1; i <= 30; i++ {
+		epochUS := float64(i) * 1_000_000.0
+		s.RecordBurstResidualValue(epochUS, uint32(0xAB0000+i%4), float64(i)*0.2, 6, 0.5, true)
+	}
+	if s.PeriodDeltaS == 0 {
+		t.Fatal("expected non-zero delta from direct residual-value stream")
+	}
+}
+
+func TestPeriodRefinement_NonDominantRejectedCountersIncrement(t *testing.T) {
+	s := NewIIDState(27)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Sync = NewSyncState(s.IID, base, 0.0, 0.0, 1.0)
+	ref := uint32(0xAAAAAA)
+	s.RefICAO = &ref
+
+	for i := 1; i <= 10; i++ {
+		epochUS := float64(i) * 1_000_000.0
+		predicted := s.Sync.PredictBearing(epochUS)
+		observedBearingDeg := wrap360(predicted + float64(i)*0.2)
+		s.RecordBurstResidualObservation(epochUS, uint32(0xFA0000+i), observedBearingDeg, 5, 0.5, false)
+	}
+	if s.PeriodDeltaS != 0 {
+		t.Fatalf("non-dominant residuals should not drive delta, got %.9f", s.PeriodDeltaS)
+	}
+	if s.Sync.RefinementRejectedCount == 0 {
+		t.Fatal("expected rejected counter to increment")
+	}
+	if s.Sync.RefinementLastRejectReason != "no_dominant_family" {
+		t.Fatalf("last reject reason=%q", s.Sync.RefinementLastRejectReason)
 	}
 }
 

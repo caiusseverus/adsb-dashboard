@@ -12,31 +12,33 @@ import (
 //
 //	bearing_deg = ((arrival_us - PhaseEpochUS) / (PeriodS*1e6) * 360 + PhaseOffsetDeg) mod 360
 type SyncState struct {
-	IID                        uint8
-	PeriodS                    float64 // deprecated alias for EffectivePeriodS; kept for tests/compatibility only.
-	BasePeriodS                float64
-	PeriodDeltaS               float64
-	EffectivePeriodS           float64
-	PhaseEpochUS               float64 // Beast-monotonic centroid of last accepted reference burst
-	PhaseOffsetDeg             float64 // Geometric bearing from radar to ref aircraft at epoch (0 until radar pos known)
-	SyncQuality                float64 // 0.0–1.0 from rotation model status
-	SyncJitterDeg              float64 // 1-sigma jitter estimate from residual EMA
-	ResidualEMA                float64 // EMA of |circular residual| degrees
-	NSyncFrames                int     // accepted frame count
-	NRejectedFrames            int     // rejected frame count
-	LastResidualDeg            float64
-	Holdover                   bool // true when last update was rejected / too weak
-	LastUpdated                time.Time
-	PeriodSource               string
-	PeriodAgreesWithDF         bool
-	PeriodRejectReason         string
-	ResidualSlopeDegPerS       float64
-	PeriodRefinementStatus     string
-	RefinementPlottedCount     uint64
-	RefinementEligibleCount    uint64
-	RefinementRejectedCount    uint64
-	RefinementReferenceUpdates uint64
-	residualHistory            []residualObservation
+	IID                           uint8
+	PeriodS                       float64 // deprecated alias for EffectivePeriodS; kept for tests/compatibility only.
+	BasePeriodS                   float64
+	PeriodDeltaS                  float64
+	EffectivePeriodS              float64
+	PhaseEpochUS                  float64 // Beast-monotonic centroid of last accepted reference burst
+	PhaseOffsetDeg                float64 // Geometric bearing from radar to ref aircraft at epoch (0 until radar pos known)
+	SyncQuality                   float64 // 0.0–1.0 from rotation model status
+	SyncJitterDeg                 float64 // 1-sigma jitter estimate from residual EMA
+	ResidualEMA                   float64 // EMA of |circular residual| degrees
+	NSyncFrames                   int     // accepted frame count
+	NRejectedFrames               int     // rejected frame count
+	LastResidualDeg               float64
+	Holdover                      bool // true when last update was rejected / too weak
+	LastUpdated                   time.Time
+	PeriodSource                  string
+	PeriodAgreesWithDF            bool
+	PeriodRejectReason            string
+	ResidualSlopeDegPerS          float64
+	PeriodRefinementStatus        string
+	RefinementPlottedCount        uint64
+	RefinementEligibleCount       uint64
+	RefinementRejectedCount       uint64
+	RefinementReferenceUpdates    uint64
+	RefinementLastRejectReason    string
+	RefinementLastObservationUnix float64
+	residualHistory               []residualObservation
 }
 
 const (
@@ -244,23 +246,29 @@ func (s *SyncState) AddRefinementResidualObservation(
 	refPosAgeS float64,
 ) {
 	s.RefinementPlottedCount++
+	s.RefinementLastObservationUnix = float64(time.Now().UnixNano()) / 1e9
 	if s.BasePeriodS <= 0 {
 		s.PeriodRefinementStatus = "missing_df_base_period"
-		return
-	}
-	if s.Holdover {
-		s.PeriodRefinementStatus = "holdover"
+		s.RefinementLastRejectReason = "missing_df_base_period"
 		return
 	}
 	if !dominant {
 		s.RefinementRejectedCount++
 		s.PeriodRefinementStatus = "no_dominant_family"
+		s.RefinementLastRejectReason = "no_dominant_family"
+		return
+	}
+	if epochUS <= 0 || math.IsNaN(epochUS) || math.IsInf(epochUS, 0) || math.IsNaN(residualDeg) || math.IsInf(residualDeg, 0) {
+		s.RefinementRejectedCount++
+		s.PeriodRefinementStatus = "all_rejected"
+		s.RefinementLastRejectReason = "invalid_observation"
 		return
 	}
 	absResidual := math.Abs(residualDeg)
 	if absResidual > residualRejectDeg {
 		s.RefinementRejectedCount++
 		s.PeriodRefinementStatus = "all_rejected"
+		s.RefinementLastRejectReason = "hard_outlier"
 		return
 	}
 	soft := absResidual > residualSoftDeg
@@ -282,6 +290,18 @@ func (s *SyncState) AddRefinementResidualObservation(
 	} else {
 		s.PeriodSource = "df_alignment"
 	}
+	s.RefinementLastRejectReason = ""
+}
+
+func (s *SyncState) AddRefinementResidualValue(
+	epochUS float64,
+	residualDeg float64,
+	icao uint32,
+	dominant bool,
+	nAircraft int,
+	refPosAgeS float64,
+) {
+	s.AddRefinementResidualObservation(epochUS, residualDeg, icao, dominant, nAircraft, refPosAgeS)
 }
 
 func (s *SyncState) applyBoundedPeriodRefinement() {
