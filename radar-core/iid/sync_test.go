@@ -324,6 +324,104 @@ func TestSyncState_PeriodRefinement_ClosedLoopReducesSlope(t *testing.T) {
 	}
 }
 
+func TestFitResidualSlopeDegPerS_PositiveNoWrap(t *testing.T) {
+	obs := make([]residualObservation, 0, 24)
+	for i := 0; i < 24; i++ {
+		obs = append(obs, residualObservation{
+			EpochUS:     float64(i+1) * 1_000_000.0,
+			ResidualDeg: -20.0 + float64(i)*0.5,
+			Weight:      1.0,
+		})
+	}
+	slope, ok, _ := fitResidualSlopeDegPerS(obs)
+	if !ok {
+		t.Fatal("expected fit success")
+	}
+	if slope <= 0 {
+		t.Fatalf("slope=%.6f, want positive", slope)
+	}
+}
+
+func TestFitResidualSlopeDegPerS_NegativeNoWrap(t *testing.T) {
+	obs := make([]residualObservation, 0, 24)
+	for i := 0; i < 24; i++ {
+		obs = append(obs, residualObservation{
+			EpochUS:     float64(i+1) * 1_000_000.0,
+			ResidualDeg: 30.0 - float64(i)*0.6,
+			Weight:      1.0,
+		})
+	}
+	slope, ok, _ := fitResidualSlopeDegPerS(obs)
+	if !ok {
+		t.Fatal("expected fit success")
+	}
+	if slope >= 0 {
+		t.Fatalf("slope=%.6f, want negative", slope)
+	}
+}
+
+func TestFitResidualSlopeDegPerS_NegativeAcrossWrap(t *testing.T) {
+	obs := make([]residualObservation, 0, 24)
+	for i := 0; i < 24; i++ {
+		unwrapped := 170.0 - float64(i)*20.0
+		wrapped := circularDiff(unwrapped, 0.0)
+		obs = append(obs, residualObservation{
+			EpochUS:     float64(i+1) * 1_000_000.0,
+			ResidualDeg: wrapped,
+			Weight:      1.0,
+		})
+	}
+	slope, ok, _ := fitResidualSlopeDegPerS(obs)
+	if !ok {
+		t.Fatal("expected fit success")
+	}
+	if slope >= 0 {
+		t.Fatalf("slope=%.6f, want negative", slope)
+	}
+}
+
+func TestFitResidualSlopeDegPerS_PositiveAcrossWrap(t *testing.T) {
+	obs := make([]residualObservation, 0, 24)
+	for i := 0; i < 24; i++ {
+		unwrapped := -170.0 + float64(i)*20.0
+		wrapped := circularDiff(unwrapped, 0.0)
+		obs = append(obs, residualObservation{
+			EpochUS:     float64(i+1) * 1_000_000.0,
+			ResidualDeg: wrapped,
+			Weight:      1.0,
+		})
+	}
+	slope, ok, _ := fitResidualSlopeDegPerS(obs)
+	if !ok {
+		t.Fatal("expected fit success")
+	}
+	if slope <= 0 {
+		t.Fatalf("slope=%.6f, want positive", slope)
+	}
+}
+
+func TestFitResidualSlopeDegPerS_SoftWeightsPreserved(t *testing.T) {
+	obs := make([]residualObservation, 0, 24)
+	for i := 0; i < 24; i++ {
+		w := 1.0
+		if i%3 == 0 {
+			w = 0.35
+		}
+		obs = append(obs, residualObservation{
+			EpochUS:     float64(i+1) * 1_000_000.0,
+			ResidualDeg: -40.0 + float64(i)*0.4,
+			Weight:      w,
+		})
+	}
+	slope, ok, _ := fitResidualSlopeDegPerS(obs)
+	if !ok {
+		t.Fatal("expected fit success")
+	}
+	if slope <= 0 {
+		t.Fatalf("slope=%.6f, want positive", slope)
+	}
+}
+
 // TestSelectReference verifies the reference aircraft selection scoring.
 func TestSelectReference_BasicSelection(t *testing.T) {
 	// Two ICAOs: 0xAA has a perfect 4s period; 0xBB has a noisy period.

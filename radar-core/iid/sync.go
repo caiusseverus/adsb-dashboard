@@ -2,6 +2,7 @@ package iid
 
 import (
 	"math"
+	"sort"
 	"time"
 )
 
@@ -364,21 +365,54 @@ func fitResidualSlopeDegPerS(obs []residualObservation) (float64, bool, string) 
 	if len(obs) < residualFitMinObs {
 		return 0, false, "insufficient_history"
 	}
-	t0US := obs[0].EpochUS
-	spanS := (obs[len(obs)-1].EpochUS - t0US) / 1e6
-	if spanS < residualFitMinSpanS {
-		return 0, false, "insufficient_fit_span"
-	}
-	var sumW, sumT, sumY float64
+
+	valid := make([]residualObservation, 0, len(obs))
 	for _, o := range obs {
+		if o.EpochUS <= 0 || math.IsNaN(o.EpochUS) || math.IsInf(o.EpochUS, 0) {
+			continue
+		}
+		if math.IsNaN(o.ResidualDeg) || math.IsInf(o.ResidualDeg, 0) {
+			continue
+		}
 		w := o.Weight
 		if w <= 0 || math.IsNaN(w) || math.IsInf(w, 0) {
 			continue
 		}
+		valid = append(valid, o)
+	}
+	if len(valid) < residualFitMinObs {
+		return 0, false, "insufficient_history"
+	}
+	sort.Slice(valid, func(i, j int) bool { return valid[i].EpochUS < valid[j].EpochUS })
+
+	t0US := valid[0].EpochUS
+	spanS := (valid[len(valid)-1].EpochUS - t0US) / 1e6
+	if spanS < residualFitMinSpanS {
+		return 0, false, "insufficient_fit_span"
+	}
+
+	unwrapped := make([]float64, len(valid))
+	unwrapped[0] = valid[0].ResidualDeg
+	prev := unwrapped[0]
+	for i := 1; i < len(valid); i++ {
+		candidate := valid[i].ResidualDeg
+		for candidate-prev > 180.0 {
+			candidate -= 360.0
+		}
+		for candidate-prev < -180.0 {
+			candidate += 360.0
+		}
+		unwrapped[i] = candidate
+		prev = candidate
+	}
+
+	var sumW, sumT, sumY float64
+	for i, o := range valid {
+		w := o.Weight
 		t := (o.EpochUS - t0US) / 1e6
 		sumW += w
 		sumT += w * t
-		sumY += w * o.ResidualDeg
+		sumY += w * unwrapped[i]
 	}
 	if sumW <= 0 {
 		return 0, false, "fit_degenerate"
@@ -386,14 +420,11 @@ func fitResidualSlopeDegPerS(obs []residualObservation) (float64, bool, string) 
 	meanT := sumT / sumW
 	meanY := sumY / sumW
 	var num, den float64
-	for _, o := range obs {
+	for i, o := range valid {
 		w := o.Weight
-		if w <= 0 || math.IsNaN(w) || math.IsInf(w, 0) {
-			continue
-		}
 		t := (o.EpochUS - t0US) / 1e6
 		dt := t - meanT
-		num += w * dt * (o.ResidualDeg - meanY)
+		num += w * dt * (unwrapped[i] - meanY)
 		den += w * dt * dt
 	}
 	if den <= 0 || math.IsNaN(den) || math.IsInf(den, 0) {

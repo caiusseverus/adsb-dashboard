@@ -338,6 +338,56 @@ func TestPeriodRefinement_RecordResidualValueDoesNotDoubleSubtractPrediction(t *
 	}
 }
 
+func TestPeriodRefinement_NegativeSlopeDrivesPositiveDelta(t *testing.T) {
+	s := NewIIDState(28)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Sync = NewSyncState(s.IID, base, 0.0, 0.0, 1.0)
+	ref := uint32(0xAAAAAA)
+	s.RefICAO = &ref
+
+	for i := 1; i <= 30; i++ {
+		epochUS := float64(i) * 1_000_000.0
+		predicted := s.Sync.PredictBearing(epochUS)
+		observedBearingDeg := wrap360(predicted - float64(i)*0.2)
+		s.RecordBurstResidualObservation(epochUS, uint32(0xBC0000+i%4), observedBearingDeg, 6, 0.5, true)
+	}
+	if s.PeriodDeltaS <= 0 {
+		t.Fatalf("period delta=%.9f, want positive for negative observed-minus-predicted slope", s.PeriodDeltaS)
+	}
+}
+
+func TestPeriodRefinement_WrapCrossingRegression_3971s(t *testing.T) {
+	base := 3.971
+	sync := NewSyncState(29, base, 0.0, 0.0, 1.0)
+	sync.BasePeriodS = base
+
+	// Diagonal residual band crossing ±180° across ~300s.
+	for i := 1; i <= 300; i++ {
+		epochUS := float64(i) * 1_000_000.0
+		unwrappedResidual := 170.0 + float64(i)*0.4
+		wrappedResidual := circularDiff(unwrappedResidual, 0.0)
+		sync.residualHistory = append(sync.residualHistory, residualObservation{
+			EpochUS: epochUS, ResidualDeg: wrappedResidual, Weight: 1.0,
+		})
+	}
+	sync.applyBoundedPeriodRefinement()
+	sync.EffectivePeriodS = sync.BasePeriodS + sync.PeriodDeltaS
+	if sync.PeriodDeltaS >= 0 {
+		t.Fatalf("period delta=%.9f, want negative correction for positive observed-minus-predicted slope", sync.PeriodDeltaS)
+	}
+	if math.Abs(sync.EffectivePeriodS-(base+sync.PeriodDeltaS)) > 1e-9 {
+		t.Fatalf("effective period=%.9f not base+delta", sync.EffectivePeriodS)
+	}
+	if math.Abs(sync.EffectivePeriodS-base) > base*0.005+1e-9 {
+		t.Fatalf("effective period=%.9f exceeds bounded delta around base %.6f", sync.EffectivePeriodS, base)
+	}
+	alias := 2.0133
+	if math.Abs(sync.EffectivePeriodS-alias) < 0.5 {
+		t.Fatalf("effective period drifted toward alias %.4f: got %.9f", alias, sync.EffectivePeriodS)
+	}
+}
+
 func TestPeriodRefinement_NonDominantRejectedCountersIncrement(t *testing.T) {
 	s := NewIIDState(27)
 	base := 4.0
