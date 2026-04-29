@@ -135,3 +135,7 @@
 - For a folded residual-by-phase/bearing plot, do not use a live rephased model coordinate for historical observations if the operator expects a visually fixed spatial domain. Use a stable per-observation bearing/rotation position for x, and reserve live model-phase overlays for explicitly diagnostic views.
 - After changing a backend-managed native/Go worker protocol or snapshot shape, do not stop at source edits and unit tests. Verify that the actual runtime binary used by the service has been rebuilt or restarted, otherwise the Python side can still be talking to an old executable and the live behavior will contradict the patched code.
 - When fixing a Go-owned UI data path, do not stop at the first retained-evidence fallback. Check the next retained source in the operational chain as well; an IID can lose raw burst evidence while still retaining accepted sweep frames, and the UI must either use that fallback or explain why it cannot.
+
+## 2026-04-30
+
+- When introducing a new recorded-vs-recomputed data split in a live chart, do not let the default recorded mode blindly bind to an empty recorded buffer while recomputed data is available; add an explicit warm-up fallback path and a visible label so secondary plots (for example residual-vs-bearing and residual-vs-range) remain populated during recorder startup.

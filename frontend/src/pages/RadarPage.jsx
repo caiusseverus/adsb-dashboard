@@ -35,6 +35,8 @@ const BURST_SYNC_VIEW_MODE_RESIDUALS = 'burst_sync_residuals'
 const BURST_SYNC_VIEW_MODE_LEGACY = 'legacy_live_df_alignment'
 const RESIDUAL_BASIS_ACTIVE = 'active_authority'
 const RESIDUAL_BASIS_ANCHOR = 'anchor_relative'
+const RESIDUAL_CHART_MODE_RECORDED = 'recorded'
+const RESIDUAL_CHART_MODE_RECOMPUTED = 'recomputed'
 function getRadarPageMetricsStore() {
   if (typeof window === 'undefined') return null
   if (!window.__RADAR_PAGE_REQUEST_METRICS__) {
@@ -2124,6 +2126,7 @@ function RotationAlignmentPanel({
   timingPacket,
 }) {
   const [alignmentMode, setAlignmentMode] = useState(BURST_SYNC_VIEW_MODE_RESIDUALS)
+  const [residualChartMode, setResidualChartMode] = useState(RESIDUAL_CHART_MODE_RECORDED)
   const [resetting, setResetting] = useState(false)
   const [legacyTimeline, setLegacyTimeline] = useState(null)
   const [legacyLoading, setLegacyLoading] = useState(false)
@@ -2193,7 +2196,18 @@ function RotationAlignmentPanel({
 
   const burstTimeline = syncSnapshot
   const rotation = syncSnapshot?.rotation ?? null
-  const observations = Array.isArray(burstTimeline?.observations) ? burstTimeline.observations : []
+  const recordedObservations = Array.isArray(burstTimeline?.recorded_observations)
+    ? burstTimeline.recorded_observations
+    : (Array.isArray(burstTimeline?.observations) ? burstTimeline.observations : [])
+  const recomputedObservations = Array.isArray(burstTimeline?.recomputed_observations)
+    ? burstTimeline.recomputed_observations
+    : []
+  const recordedObservationsForDisplay = recordedObservations.length > 0
+    ? recordedObservations
+    : recomputedObservations
+  const observations = residualChartMode === RESIDUAL_CHART_MODE_RECOMPUTED
+    ? recomputedObservations
+    : recordedObservationsForDisplay
   const alignmentStatus = burstTimeline?.alignment_status ?? null
   const syncModeDiagnostics = burstTimeline?.sync_mode_diagnostics ?? null
   const burstSyncDiagnostic = burstTimeline?.burst_sync_diagnostic ?? null
@@ -2522,6 +2536,27 @@ function RotationAlignmentPanel({
             Sync mode <span className={styles.metricValue}>{syncModeDiagnostics?.active_label ?? '—'}</span>
           </span>
           {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS && (
+            <span className={styles.metricPill} title="Recorded keeps immutable history captured at event time. Recomputed redraws retained burst buffer against current sync state.">
+              Chart mode
+              <select
+                value={residualChartMode}
+                onChange={e => setResidualChartMode(e.target.value)}
+                style={{
+                  background: 'transparent',
+                  border: '1px solid #30363d',
+                  borderRadius: '3px',
+                  color: '#c9d1d9',
+                  fontSize: '0.72rem',
+                  marginLeft: '4px',
+                  padding: '1px 3px',
+                }}
+              >
+                <option value={RESIDUAL_CHART_MODE_RECORDED}>Recorded residuals</option>
+                <option value={RESIDUAL_CHART_MODE_RECOMPUTED}>Recomputed residuals</option>
+              </select>
+            </span>
+          )}
+          {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS && (
             <span className={styles.metricPill} title="Choose whether residual plots show the operational authority frame or the diagnostic selected-anchor-relative frame.">
               Residual basis
               <select
@@ -2551,6 +2586,19 @@ function RotationAlignmentPanel({
           <span className={styles.metricPill}>
             Period <span className={styles.metricValue}>{shownPeriodS != null ? `${shownPeriodS.toFixed(4)}s` : '—'}</span>
           </span>
+          {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS && residualChartMode === RESIDUAL_CHART_MODE_RECOMPUTED && (
+            <span className={styles.metricPill} style={{ color: '#d29922' }}>
+              Recomputed projection
+            </span>
+          )}
+          {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS
+            && residualChartMode === RESIDUAL_CHART_MODE_RECORDED
+            && recordedObservations.length === 0
+            && recomputedObservations.length > 0 && (
+            <span className={styles.metricPill} style={{ color: '#d29922' }}>
+              Recorded warming up (showing recomputed fallback)
+            </span>
+          )}
           <span className={styles.metricPill} title="Short local solver window used for fitting only.">
             Fit window <span className={styles.metricValue}>{syncHorizons?.fit_window_s != null ? `${Number(syncHorizons.fit_window_s).toFixed(0)}s` : '—'}</span>
           </span>

@@ -1,3 +1,31 @@
+## 2026-04-30 Burst Sync Residual Recorder Stream
+
+- [x] Add immutable burst residual event recorder stream in backend and retain/prune by timestamp window.
+- [x] Snapshot all required residual-event fields at generation time (including period/phase/basis/classification/refinement/source/revision metadata).
+- [x] Keep existing recomputation path as explicit recomputed mode and label it clearly in payload/UI.
+- [x] Make Burst Sync Residuals default to recorded mode in frontend with explicit mode selector.
+- [x] Add backend tests proving recorder immutability across period changes and timestamp-window pruning behavior.
+- [x] Add frontend mode wiring verification (recorded default, recomputed labelled).
+- [x] Run focused backend tests and frontend build; document review and acceptance outcomes.
+
+Plan confirmation:
+- Recorded mode becomes source-of-truth for chart points and never rewrites historical event values.
+- Recomputed mode intentionally projects retained burst observations against current sync state and is explicitly marked as recomputed.
+- Pruning operates on event timestamps/window bounds only; no retroactive recomputation of recorded events.
+
+### Review
+- Implemented:
+  - Added per-IID immutable burst residual recorder buffers in `RadarState`, with append-time residual snapshots and time-based pruning.
+  - Recorded events now store generation-time sync/period/phase/basis/classification metadata and retain historical values after sync parameter changes.
+  - `get_burst_sync_timeline()` now exposes `recorded_observations`, `recomputed_observations`, and default chart mode `recorded`.
+  - Updated live sync snapshot payload to pass both recorded/recomputed series and prefer recomputed only as compatibility fallback when recorded history is empty.
+  - Added frontend chart mode selector with explicit `Recorded residuals` vs `Recomputed residuals`; default is recorded and recomputed is labelled.
+  - Added backend regression tests for immutable history across period changes and window-based event pruning.
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -q -k 'burst_sync_timeline or burst_residual_recorded_events or period_fit_rejects_large_residuals'` -> `5 passed`
+  - `uv run --directory backend pytest tests/test_radar_api.py -q -k 'get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_labels or get_iid_sync_snapshot_uses_compact_go_sync_diagnostics_for_go_owned_sync'` -> `2 passed`
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py -q -k 'burst_residual_recorded_events or burst_sync_timeline or iid_sync_snapshot'` -> `9 passed`
+  - `cd frontend && npm run build` -> passed
 ## 2026-04-29 Radar-Core DF Period Authority
 
 - [x] Identify every Go compact/bootstrap/frame-sync path that establishes or updates operational period.

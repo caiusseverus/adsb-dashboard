@@ -628,6 +628,9 @@ class RadarState:
         # remain populated at real traffic rates.
         self._BURST_SYNC_TIMELINE_OBS_MAX = 8_000
         self._live_burst_timeline_obs: dict[int, deque] = {}  # {iid: deque[AlignedBurstSyncObs]}
+        self._LIVE_BURST_RESIDUAL_EVENTS_RETENTION_S = 360.0
+        self._BURST_SYNC_RESIDUAL_EVENTS_MAX = 12_000
+        self._live_burst_residual_events: dict[int, deque] = {}  # {iid: deque[dict]}
         # Bounded buffer of recent Stage 3-usable live detections.
         # One entry per fired burst; Stage 3 solver queries with max_age_s=30.
         # At Pi density (~50 aircraft, 15 bursts/min each = ~12/s × 30s ≈ 375 entries).
@@ -797,6 +800,8 @@ class RadarState:
             self._live_aligned_burst_obs[iid] = deque(maxlen=self._MULTI_SYNC_OBS_MAX)
         if iid not in self._live_burst_timeline_obs:
             self._live_burst_timeline_obs[iid] = deque(maxlen=self._BURST_SYNC_TIMELINE_OBS_MAX)
+        if iid not in self._live_burst_residual_events:
+            self._live_burst_residual_events[iid] = deque(maxlen=self._BURST_SYNC_RESIDUAL_EVENTS_MAX)
 
     @staticmethod
     def _density_scaled_cap(
@@ -939,6 +944,15 @@ class RadarState:
         if max_entries is not None and max_entries > 0:
             while len(obs_buf) > max_entries:
                 obs_buf.popleft()
+
+    def _prune_burst_residual_event_buffer(self, event_buf: deque, *, now_ts: float) -> None:
+        cutoff_ts = now_ts - self._LIVE_BURST_RESIDUAL_EVENTS_RETENTION_S
+        while event_buf and float(event_buf[0].get("wall_ts") or now_ts) < cutoff_ts:
+            event_buf.popleft()
+        max_entries = event_buf.maxlen
+        if max_entries is not None and max_entries > 0:
+            while len(event_buf) > max_entries:
+                event_buf.popleft()
 
     @staticmethod
     def _summarise_live_sync_observation_buffer(obs_snapshot: list[AlignedBurstSyncObs], max_entries: int) -> dict:
@@ -2934,6 +2948,71 @@ class RadarState:
         )
         timeline_buf.append(obs)
         self._prune_live_sync_observation_buffer(timeline_buf, now_ts=obs.ts)
+        if sync is not None and sync.period_s > 0:
+            prediction = predict_sync_observation(
+                sync,
+                obs.burst_centroid_us,
+                range_nm=obs.range_nm,
+                bearing_rate_deg_s=obs.bearing_rate_deg_s,
+                motion_comp_dt_us=obs.motion_comp_dt_us,
+                motion_comp_block_reason=obs.motion_comp_block_reason,
+            )
+            residual_deg = (obs.bearing_deg - prediction.predicted_bearing_deg + 540.0) % 360.0 - 180.0
+            abs_res = abs(residual_deg)
+            residual_class = self._classify_sync_residual(abs_res)
+            if abs_res <= _DF11_RESIDUAL_ON_TIME_THRESHOLD_DEG:
+                timing_class = "on_time"
+            elif residual_deg > 0:
+                timing_class = "early"
+            else:
+                timing_class = "late"
+            fit_reject_reason = None
+            if not sync_update_eligible:
+                fit_reject_reason = "not_sync_update_eligible"
+            elif abs_res >= 150.0:
+                fit_reject_reason = "near_wrap_residual"
+            elif abs_res > 35.0:
+                fit_reject_reason = "residual_gate"
+            elif pos_age_s > 8.0:
+                fit_reject_reason = "stale_position"
+            elif residual_class == "rejected" or self._score_sync_burst_observation(obs) <= 0:
+                fit_reject_reason = "zero_weight"
+            fit_eligible = fit_reject_reason is None
+            event_buf = self._live_burst_residual_events.setdefault(
+                iid, deque(maxlen=self._BURST_SYNC_RESIDUAL_EVENTS_MAX)
+            )
+            event_buf.append({
+                "wall_ts": obs.ts,
+                "arrival_beast_us": obs.raw_arrival_us,
+                "beam_center_us": obs.burst_centroid_us,
+                "iid": iid,
+                "icao": icao,
+                "centroid_timestamp_us": obs.burst_centroid_us,
+                "bearing_deg": obs.bearing_deg,
+                "range_nm": obs.range_nm,
+                "n_replies": obs.n_replies,
+                "signal_dbfs": obs.signal_dbfs,
+                "sync_update_eligible": bool(sync_update_eligible),
+                "predicted_deg": prediction.predicted_bearing_deg,
+                "residual_deg": residual_deg,
+                "residual_basis": "active_authority",
+                "sync_source": getattr(sync, "source", None),
+                "base_period_s": float(getattr(sync, "period_base_s", 0.0) or 0.0),
+                "period_delta_s": float((sync.period_s or 0.0) - (getattr(sync, "period_base_s", sync.period_s) or 0.0)),
+                "effective_period_s": float(sync.period_s),
+                "phase_epoch_us": float(sync.phase_epoch_us),
+                "phase_offset_deg": float(sync.phase_offset_deg),
+                "classification": residual_class,
+                "timing_class": timing_class,
+                "dominant_family": bool(sync_update_eligible),
+                "refinement_eligible": bool(fit_eligible),
+                "fit_eligible": bool(fit_eligible),
+                "reject_reason": fit_reject_reason,
+                "fit_reject_reason": fit_reject_reason,
+                "reference_icao": getattr(getattr(self._models.get(iid), "reference_aircraft", None), "ref_icao", None),
+                "sync_revision": int(self._go_sync_diagnostic_history_revision.get(iid, 0)),
+            })
+            self._prune_burst_residual_event_buffer(event_buf, now_ts=obs.ts)
 
     @staticmethod
     def _score_sync_burst_observation(obs: AlignedBurstSyncObs) -> float:
@@ -4406,6 +4485,7 @@ class RadarState:
                                self._live_frame_counters,
                                self._live_aligned_burst_obs,
                                self._live_burst_timeline_obs,
+                               self._live_burst_residual_events,
                                self._live_sync_states,
                                self._last_simple_sync_update_ts,
                                self._live_icao_sync_quality,
@@ -4565,6 +4645,7 @@ class RadarState:
             self._live_frame_counters.clear()
             self._live_aligned_burst_obs.clear()
             self._live_burst_timeline_obs.clear()
+            self._live_burst_residual_events.clear()
             self._live_sync_states.clear()
             self._last_simple_sync_update_ts.clear()
             self._live_icao_sync_quality.clear()
@@ -4996,11 +5077,13 @@ class RadarState:
             sync = self._live_sync_states.get(iid)
             model = self._models.get(iid)
             timeline_obs_buf = self._live_burst_timeline_obs.get(iid)
+            residual_events_buf = self._live_burst_residual_events.get(iid)
             aligned_obs_buf = self._live_aligned_burst_obs.get(iid)
             go_evidence = [entry for entry in self._go_evidence_events if int(entry.get("iid", -1)) == iid]
             go_frame_revision = self._go_sweep_frames_revision.get(iid, 0)
             has_go_evidence = bool(go_evidence)
             timeline_obs_snapshot = [] if has_go_evidence else (list(timeline_obs_buf) if timeline_obs_buf else [])
+            residual_events_snapshot = list(residual_events_buf) if residual_events_buf else []
             aligned_obs_snapshot = list(aligned_obs_buf) if aligned_obs_buf else []
             obs_buf = timeline_obs_buf
             if obs_buf is None:
@@ -5076,6 +5159,10 @@ class RadarState:
             _ev for _ev in _iid_events_copy
             if _ev[0] >= _df11_cutoff_us and _ev[1] == iid
         ]
+        residual_events = [
+            event for event in residual_events_snapshot
+            if float(event.get("beam_center_us") or 0.0) >= _df11_cutoff_us
+        ]
 
         evidence_with_position = sum(
             1 for ev in go_evidence
@@ -5104,7 +5191,10 @@ class RadarState:
                 ),
             }
             return {
-                "observations": [],
+                "observations": residual_events,
+                "recorded_observations": residual_events,
+                "recomputed_observations": [],
+                "residual_chart_default_mode": "recorded",
                 "sync_state": _live_sync_state_to_dict(sync) if sync else None,
                 "window_s": window_s,
                 "per_icao_quality": [],
@@ -5176,7 +5266,10 @@ class RadarState:
                 "no_obs_reason": None,
             }
             return {
-                "observations": entries,
+                "observations": residual_events if residual_events else entries,
+                "recorded_observations": residual_events,
+                "recomputed_observations": entries,
+                "residual_chart_default_mode": "recorded",
                 "sync_state": _live_sync_state_to_dict(sync),
                 "window_s": window_s,
                 "per_icao_quality": [],
@@ -5404,7 +5497,10 @@ class RadarState:
         )
 
         return {
-            "observations": entries,
+            "observations": residual_events if residual_events else entries,
+            "recorded_observations": residual_events,
+            "recomputed_observations": entries,
+            "residual_chart_default_mode": "recorded",
             "sync_state": _live_sync_state_to_dict(sync),
             "window_s": window_s,
             "per_icao_quality": quality_payload,
@@ -5503,6 +5599,11 @@ class RadarState:
             self._live_sync_snapshot_last_cache_hit[iid] = False
 
         burst_timeline = self.get_burst_sync_timeline(iid, window_s=window_s)
+        recorded_observations = burst_timeline.get("recorded_observations", [])
+        recomputed_observations = burst_timeline.get("recomputed_observations", [])
+        display_observations = burst_timeline.get("observations", [])
+        if not display_observations and recomputed_observations:
+            display_observations = recomputed_observations
         snapshot = {
             "type": "radar_sync",
             "iid": iid,
@@ -5510,7 +5611,10 @@ class RadarState:
             "server_ts": time.time(),
             "window_s": window_s,
             "sync_state": burst_timeline.get("sync_state"),
-            "observations": burst_timeline.get("observations", []),
+            "observations": display_observations,
+            "recorded_observations": recorded_observations,
+            "recomputed_observations": recomputed_observations,
+            "residual_chart_default_mode": burst_timeline.get("residual_chart_default_mode", "recorded"),
             # Backend-computed DF11 residual observations for the burst-sync chart overlay.
             # Both "observations" (burst) and "df11_residual_observations" are derived from
             # the same authoritative sync snapshot and predict_sync_observation() path.

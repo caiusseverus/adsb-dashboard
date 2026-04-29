@@ -512,6 +512,95 @@ def test_get_burst_sync_timeline_includes_non_sync_driving_observations():
     assert retention["timeline"]["retained_duration_s"] == pytest.approx(4.1)
 
 
+def test_burst_residual_recorded_events_are_immutable_across_period_change(monkeypatch):
+    state = RadarState()
+    now = {"ts": 1_000.0}
+    monkeypatch.setattr("radar.sweep.time.time", lambda: now["ts"])
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=4.0,
+    )
+
+    state._record_burst_sync_timeline_obs(
+        iid=7,
+        icao="AAAAAA",
+        burst_centroid_us=4_000_000.0,
+        radar_lat=51.0,
+        radar_lon=0.0,
+        aircraft_lat=51.2,
+        aircraft_lon=0.2,
+        n_replies=4,
+        signal_dbfs=-14.0,
+        pos_age_s=0.2,
+        sync_update_eligible=True,
+    )
+    first_payload = state.get_burst_sync_timeline(7, window_s=300.0)
+    first_recorded = first_payload["recorded_observations"][0]
+
+    state._live_sync_states[7].period_s = 5.0
+    state._live_sync_states[7].period_base_s = 5.0
+    state._live_sync_states[7].phase_offset_deg = 45.0
+    now["ts"] = 1_001.0
+    state._record_burst_sync_timeline_obs(
+        iid=7,
+        icao="AAAAAA",
+        burst_centroid_us=5_000_000.0,
+        radar_lat=51.0,
+        radar_lon=0.0,
+        aircraft_lat=51.2,
+        aircraft_lon=0.2,
+        n_replies=4,
+        signal_dbfs=-14.0,
+        pos_age_s=0.2,
+        sync_update_eligible=True,
+    )
+    payload = state.get_burst_sync_timeline(7, window_s=300.0)
+    recorded = payload["recorded_observations"]
+    recomputed = payload["recomputed_observations"]
+
+    assert len(recorded) == 2
+    assert recorded[0]["effective_period_s"] == pytest.approx(4.0)
+    assert recorded[1]["effective_period_s"] == pytest.approx(5.0)
+    assert recorded[0]["residual_deg"] == pytest.approx(first_recorded["residual_deg"])
+    assert recorded[0]["classification"] == first_recorded["classification"]
+    assert payload["residual_chart_default_mode"] == "recorded"
+    assert len(recomputed) == 2
+    assert abs(recomputed[0]["residual_deg"] - recorded[0]["residual_deg"]) > 0.01
+
+
+def test_burst_residual_recorded_events_prune_by_window_timestamp():
+    state = RadarState()
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=4.0,
+    )
+    state._live_burst_residual_events[7] = deque([
+        {"beam_center_us": 100_000.0, "wall_ts": 900.0, "icao": "OLD", "residual_deg": 1.0},
+        {"beam_center_us": 9_900_000.0, "wall_ts": 999.0, "icao": "NEW", "residual_deg": 2.0},
+    ], maxlen=state._BURST_SYNC_RESIDUAL_EVENTS_MAX)
+    state._iid_latest_arrival_us[7] = 10_000_000.0
+
+    payload = state.get_burst_sync_timeline(7, window_s=2.0)
+
+    assert [row["icao"] for row in payload["recorded_observations"]] == ["NEW"]
+
+
 def test_get_burst_sync_timeline_includes_go_evidence_in_diagnostic_timeline(monkeypatch):
     state = RadarState()
     now_ts = 1_000.0
