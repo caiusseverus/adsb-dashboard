@@ -210,6 +210,70 @@ func TestSyncState_QualityGate_3Aircraft_LargeAge(t *testing.T) {
 	}
 }
 
+func TestSyncState_PeriodRefinement_ZeroResidualSlope(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 12; i++ {
+		accepted := s.UpdateEpoch(float64(i)*4_000_000.0, 0.0, 4.0, 1.0, 4, 0.5)
+		if !accepted {
+			t.Fatalf("update %d rejected", i)
+		}
+	}
+	if math.Abs(s.PeriodDeltaS) > 1e-6 {
+		t.Fatalf("period delta=%.9f, want near zero", s.PeriodDeltaS)
+	}
+}
+
+func TestSyncState_PeriodRefinement_PositiveSlopeMovesDeltaNegative(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 12; i++ {
+		// Increasing residual drift over time.
+		newOffset := float64(i) * 1.0
+		accepted := s.UpdateEpoch(float64(i)*4_000_000.0, newOffset, 4.0, 1.0, 4, 0.5)
+		if !accepted {
+			t.Fatalf("update %d rejected", i)
+		}
+	}
+	if s.ResidualSlopeDegPerS <= 0 {
+		t.Fatalf("residual slope=%.6f, want positive", s.ResidualSlopeDegPerS)
+	}
+	if s.PeriodDeltaS >= 0 {
+		t.Fatalf("period delta=%.9f, want negative correction", s.PeriodDeltaS)
+	}
+	if math.Abs(s.EffectivePeriodS-4.0) > 4.0*refinementAbsBoundFraction+1e-9 {
+		t.Fatalf("effective period=%.9f out of bound around base", s.EffectivePeriodS)
+	}
+}
+
+func TestSyncState_PeriodRefinement_RejectsExcessiveSlope(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 8; i++ {
+		accepted := s.UpdateEpoch(float64(i)*4_000_000.0, float64(i)*0.2, 4.0, 1.0, 4, 0.5)
+		if !accepted {
+			t.Fatalf("warm-up update %d rejected", i)
+		}
+	}
+	for i := 9; i <= 14; i++ {
+		// Large drift slope (while staying under hard residual reject gate)
+		// => out-of-bounds proposed correction.
+		accepted := s.UpdateEpoch(float64(i)*4_000_000.0, float64(i-8)*8.0, 4.0, 1.0, 4, 0.5)
+		if !accepted {
+			t.Fatalf("high-slope update %d rejected", i)
+		}
+	}
+	if s.PeriodRefinementStatus != "proposed_out_of_bounds_decay" {
+		t.Fatalf("status=%q, want proposed_out_of_bounds_decay", s.PeriodRefinementStatus)
+	}
+	if s.PeriodRejectReason != "refinement_out_of_bounds" {
+		t.Fatalf("reject reason=%q, want refinement_out_of_bounds", s.PeriodRejectReason)
+	}
+	if math.Abs(s.PeriodDeltaS) > 4.0*refinementAbsBoundFraction+1e-9 {
+		t.Fatalf("period delta=%.9f exceeds absolute bound", s.PeriodDeltaS)
+	}
+	if math.Abs(s.EffectivePeriodS-(4.0+s.PeriodDeltaS)) > 1e-9 {
+		t.Fatalf("effective period=%.9f not base+delta", s.EffectivePeriodS)
+	}
+}
+
 // TestSelectReference verifies the reference aircraft selection scoring.
 func TestSelectReference_BasicSelection(t *testing.T) {
 	// Two ICAOs: 0xAA has a perfect 4s period; 0xBB has a noisy period.

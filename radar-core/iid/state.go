@@ -92,6 +92,8 @@ type DebugSnapshot struct {
 	PeriodSource                    string
 	PeriodAgreesWithDF              bool
 	PeriodRejectReason              string
+	ResidualSlopeDegPerS            float64
+	PeriodRefinementStatus          string
 	ActiveAircraftEstimate          int
 	BurstRecordsTotal               int
 	BurstRecordsDynamicCap          int
@@ -249,9 +251,28 @@ func (s *IIDState) SetBasePeriod(periodS float64) {
 		return
 	}
 	s.BasePeriodS = &periodS
-	s.PeriodDeltaS = 0
-	s.EffectivePeriodS = &periodS
-	s.PeriodSource = "df_alignment"
+	if s.Sync != nil {
+		s.Sync.BasePeriodS = periodS
+		s.Sync.EffectivePeriodS = s.Sync.BasePeriodS + s.Sync.PeriodDeltaS
+		if s.Sync.EffectivePeriodS <= 0 {
+			s.Sync.PeriodDeltaS = 0
+			s.Sync.EffectivePeriodS = s.Sync.BasePeriodS
+		}
+		s.Sync.PeriodS = s.Sync.EffectivePeriodS
+		if math.Abs(s.Sync.PeriodDeltaS) > 1e-12 {
+			s.Sync.PeriodSource = "df_alignment_plus_residual_slope"
+		} else {
+			s.Sync.PeriodSource = "df_alignment"
+		}
+		s.PeriodDeltaS = s.Sync.PeriodDeltaS
+		effective := s.Sync.EffectivePeriodS
+		s.EffectivePeriodS = &effective
+		s.PeriodSource = s.Sync.PeriodSource
+	} else {
+		s.PeriodDeltaS = 0
+		s.EffectivePeriodS = &periodS
+		s.PeriodSource = "df_alignment"
+	}
 	s.PeriodAgreesWithDF = true
 	s.PeriodRejectReason = ""
 	if s.PeriodS != nil && !periodsAgree(*s.PeriodS, periodS) {
@@ -259,11 +280,6 @@ func (s *IIDState) SetBasePeriod(periodS float64) {
 		s.PeriodRejectReason = "compact_period_disagrees_with_df"
 	}
 	if s.Sync != nil {
-		s.Sync.BasePeriodS = periodS
-		s.Sync.PeriodDeltaS = 0
-		s.Sync.EffectivePeriodS = periodS
-		s.Sync.PeriodS = periodS
-		s.Sync.PeriodSource = "df_alignment"
 		s.Sync.PeriodAgreesWithDF = s.PeriodAgreesWithDF
 		s.Sync.PeriodRejectReason = s.PeriodRejectReason
 	}
@@ -329,7 +345,7 @@ func (s *IIDState) RefreshReference(records []BurstRecord, nowUS float64) {
 func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft int, refPosAgeS float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.EffectivePeriodS == nil || *s.EffectivePeriodS <= 0 {
+	if s.BasePeriodS == nil || *s.BasePeriodS <= 0 {
 		if s.Sync != nil {
 			s.Sync.Holdover = true
 			s.Sync.PeriodAgreesWithDF = false
@@ -337,7 +353,7 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 		}
 		return
 	}
-	quality := syncQuality(s.Status, s.EffectivePeriodS != nil)
+	quality := syncQuality(s.Status, s.BasePeriodS != nil)
 	if s.Sync == nil {
 		// Bootstrap on first reference burst.
 		eligible := nAircraft >= 4 || (nAircraft >= 3 && refPosAgeS <= 2.0)
@@ -349,7 +365,11 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 		s.Sync.PeriodRejectReason = s.PeriodRejectReason
 		return
 	}
-	s.Sync.UpdateEpoch(epochUS, phaseOffsetDeg, *s.EffectivePeriodS, quality, nAircraft, refPosAgeS)
+	s.Sync.UpdateEpoch(epochUS, phaseOffsetDeg, *s.BasePeriodS, quality, nAircraft, refPosAgeS)
+	s.PeriodDeltaS = s.Sync.PeriodDeltaS
+	effective := s.Sync.EffectivePeriodS
+	s.EffectivePeriodS = &effective
+	s.PeriodSource = s.Sync.PeriodSource
 	s.Sync.PeriodAgreesWithDF = s.PeriodAgreesWithDF
 	s.Sync.PeriodRejectReason = s.PeriodRejectReason
 }
@@ -457,6 +477,10 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 	out.PeriodSource = s.PeriodSource
 	out.PeriodAgreesWithDF = s.PeriodAgreesWithDF
 	out.PeriodRejectReason = s.PeriodRejectReason
+	if s.Sync != nil {
+		out.ResidualSlopeDegPerS = s.Sync.ResidualSlopeDegPerS
+		out.PeriodRefinementStatus = s.Sync.PeriodRefinementStatus
+	}
 	if s.RefICAO != nil {
 		out.HasRefICAO = true
 		out.RefICAO = *s.RefICAO
@@ -645,9 +669,23 @@ func reinforce(s *IIDState, model *RotationModel) {
 	}
 
 	if s.BasePeriodS != nil {
-		s.EffectivePeriodS = s.BasePeriodS
-		s.PeriodDeltaS = 0
-		s.PeriodSource = "df_alignment"
+		if s.Sync != nil {
+			s.PeriodDeltaS = s.Sync.PeriodDeltaS
+			effective := s.BasePeriodS
+			if effective != nil {
+				v := *effective + s.PeriodDeltaS
+				s.EffectivePeriodS = &v
+			}
+			if math.Abs(s.PeriodDeltaS) > 1e-12 {
+				s.PeriodSource = "df_alignment_plus_residual_slope"
+			} else {
+				s.PeriodSource = "df_alignment"
+			}
+		} else {
+			s.EffectivePeriodS = s.BasePeriodS
+			s.PeriodDeltaS = 0
+			s.PeriodSource = "df_alignment"
+		}
 		s.PeriodAgreesWithDF = model.DominantPeriodS != nil && periodsAgree(*model.DominantPeriodS, *s.BasePeriodS)
 		if s.PeriodAgreesWithDF {
 			s.PeriodRejectReason = ""

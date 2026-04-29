@@ -672,3 +672,27 @@ Plan confirmation points (please confirm before I start):
 4. Bootstrap exception: on first entry from compact → refined, the short-window candidate IS allowed to seed long-term state directly. After that, long-term wins.
 5. Display window default 300s, exposed but not user-configurable in this task (UI control deferred).
 6. Out of scope here: validator threshold tuning, anchor scoring changes, recovery threshold edits, waveform correction.
+
+## 2026-04-29 Radar-Core Bounded Period Refinement On DF Base
+
+- [x] Add bounded residual-history period refinement in `radar-core/iid/sync.go` (history buffer, slope fit, bounded/slew-limited `PeriodDeltaS`, reject/decay behavior).
+- [x] Keep DF base period authoritative in `radar-core/iid/state.go` and stop zeroing `PeriodDeltaS` on normal updates/reinforce.
+- [x] Expose refinement diagnostics in snapshots/protocol payloads (`residual_slope_deg_per_s`, `period_refinement_status`, `period_reject_reason`) with base/delta/effective period.
+- [x] Add regression tests for zero slope, positive slope sign, excessive slope rejection, and alias-period immunity around DF base 4.7906s.
+- [x] Run focused Go tests and document results.
+
+Plan confirmation:
+- `BasePeriodS` remains strictly Python DF authority; Go refinement only adjusts `PeriodDeltaS` within hard bounds.
+- Refinement uses a recent residual-vs-time fit from accepted sync updates and rejects unstable/excessive corrections while retaining or decaying prior accepted delta.
+- `EffectivePeriodS` is always `BasePeriodS + PeriodDeltaS` when a valid DF base exists; no independent compact/bootstrap period takeover is allowed.
+
+### Review
+- Implemented:
+  - Added rolling residual observation history in Go sync (`epoch_us`, `residual_deg`, `n_aircraft`, `ref_pos_age_s`) and least-squares residual-slope fitting over a recent window.
+  - Added bounded residual-slope period refinement: `PeriodDeltaS` computed from fitted slope, absolute bound (`±0.5%` of DF base), per-update slew limit, and reject/decay behavior for unstable/out-of-bounds fits.
+  - Preserved DF authority: `BasePeriodS` remains Python-derived, `EffectivePeriodS` is always `BasePeriodS + PeriodDeltaS`, and sync remains unavailable when base period is missing.
+  - Stopped wiping delta on each accepted sync update and on normal DF base refresh/reinforcement paths.
+  - Exposed diagnostics for refinement in snapshot/protocol payloads: `base_period_s`, `period_delta_s`, `effective_period_s`, `residual_slope_deg_per_s`, `period_refinement_status`, and `period_reject_reason`.
+  - Added Go regression tests for zero slope stability, positive-slope sign behavior, excessive-slope rejection, and alias-period immunity (`4.7906s` base vs `2.0133s` alias).
+- Verification:
+  - `env GOCACHE=/tmp/go-build go test ./...` in `radar-core/` -> passed

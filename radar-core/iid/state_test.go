@@ -1,6 +1,9 @@
 package iid
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestRefreshReference_PrefersDominantFamily(t *testing.T) {
 	s := NewIIDState(7)
@@ -89,6 +92,28 @@ func TestDFBasePeriodOverridesDisagreeingCompactPeriod(t *testing.T) {
 	}
 	if snap.PeriodDeltaS != 0 {
 		t.Fatalf("period delta=%.6f, want 0", snap.PeriodDeltaS)
+	}
+}
+
+func TestDFBasePeriodAliasImmunityDuringSyncRefinement(t *testing.T) {
+	s := NewIIDState(18)
+	compactAlias := 2.0133
+	base := 4.7906
+	s.PeriodS = &compactAlias
+	s.SetBasePeriod(base)
+	s.Status = "SINGLE_RADAR"
+
+	s.UpdateSyncEpoch(0.0, 0.0, 4, 0.5)
+	for i := 1; i <= 14; i++ {
+		acceptedOffset := float64(i) * 2.0
+		s.UpdateSyncEpoch(float64(i)*base*1e6, acceptedOffset, 4, 0.5)
+	}
+	snap := s.DebugStateSnapshot()
+	if math.Abs(snap.EffectivePeriodS-base) > base*0.005+1e-9 {
+		t.Fatalf("effective period=%.6f not bounded near base %.6f", snap.EffectivePeriodS, base)
+	}
+	if math.Abs(snap.EffectivePeriodS-compactAlias) < 0.5 {
+		t.Fatalf("effective period moved toward alias %.4f: got %.6f", compactAlias, snap.EffectivePeriodS)
 	}
 }
 

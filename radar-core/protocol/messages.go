@@ -152,6 +152,8 @@ type IIDState struct {
 	BasePeriodS        *float64 `codec:"bps"`
 	PeriodDeltaS       *float64 `codec:"pds"`
 	EffectivePeriodS   *float64 `codec:"eps"`
+	ResidualSlopeDegPS *float64 `codec:"rsps"`
+	PeriodRefineStatus string   `codec:"prs"`
 	PeriodAgreesWithDF bool     `codec:"pag"`
 	PeriodRejectReason string   `codec:"prr"`
 	NBurstRecords      uint16   `codec:"nb"`

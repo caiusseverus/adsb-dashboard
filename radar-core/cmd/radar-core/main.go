@@ -461,30 +461,32 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 		key := strconv.Itoa(int(iidNum))
 		snap := s.DebugStateSnapshot()
 		iidPayload := map[string]interface{}{
-			"status":                 snap.Status,
-			"has_period":             snap.HasPeriod,
-			"period_s":               nil,
-			"has_reference_icao":     snap.HasRefICAO,
-			"reference_icao":         nil,
-			"sync_state_present":     snap.SyncPresent,
-			"sync_quality":           snap.SyncQuality,
-			"sync_state_usable":      snap.SyncUsable,
-			"sync_period_s":          nil,
-			"sync_phase_epoch_us":    nil,
-			"sync_phase_offset_deg":  nil,
-			"sync_jitter_deg":        nil,
-			"sync_residual_ema_deg":  nil,
-			"sync_last_residual_deg": nil,
-			"sync_holdover":          snap.SyncHoldover,
-			"sync_n_frames":          snap.SyncNSyncFrames,
-			"sync_n_rejected_frames": snap.SyncNRejectedFrames,
-			"sync_last_updated":      nil,
-			"period_source":          snap.PeriodSource,
-			"base_period_s":          nil,
-			"period_delta_s":         snap.PeriodDeltaS,
-			"effective_period_s":     nil,
-			"period_agrees_with_df":  snap.PeriodAgreesWithDF,
-			"period_reject_reason":   snap.PeriodRejectReason,
+			"status":                   snap.Status,
+			"has_period":               snap.HasPeriod,
+			"period_s":                 nil,
+			"has_reference_icao":       snap.HasRefICAO,
+			"reference_icao":           nil,
+			"sync_state_present":       snap.SyncPresent,
+			"sync_quality":             snap.SyncQuality,
+			"sync_state_usable":        snap.SyncUsable,
+			"sync_period_s":            nil,
+			"sync_phase_epoch_us":      nil,
+			"sync_phase_offset_deg":    nil,
+			"sync_jitter_deg":          nil,
+			"sync_residual_ema_deg":    nil,
+			"sync_last_residual_deg":   nil,
+			"sync_holdover":            snap.SyncHoldover,
+			"sync_n_frames":            snap.SyncNSyncFrames,
+			"sync_n_rejected_frames":   snap.SyncNRejectedFrames,
+			"sync_last_updated":        nil,
+			"period_source":            snap.PeriodSource,
+			"base_period_s":            nil,
+			"period_delta_s":           snap.PeriodDeltaS,
+			"effective_period_s":       nil,
+			"residual_slope_deg_per_s": snap.ResidualSlopeDegPerS,
+			"period_refinement_status": snap.PeriodRefinementStatus,
+			"period_agrees_with_df":    snap.PeriodAgreesWithDF,
+			"period_reject_reason":     snap.PeriodRejectReason,
 			"retained_state": map[string]interface{}{
 				"active_aircraft_estimate":           snap.ActiveAircraftEstimate,
 				"burst_records_total":                snap.BurstRecordsTotal,
@@ -755,6 +757,8 @@ func (e *engine) emitIIDState(iidNum uint8, s *iid.IIDState, nBurstRecords uint1
 		BasePeriodS:        snapBasePeriod(s),
 		PeriodDeltaS:       snapPeriodDelta(s),
 		EffectivePeriodS:   snapEffectivePeriod(s),
+		ResidualSlopeDegPS: snapResidualSlope(s),
+		PeriodRefineStatus: snapPeriodRefineStatus(s),
 		PeriodAgreesWithDF: snapPeriodAgrees(s),
 		PeriodRejectReason: snapPeriodRejectReason(s),
 		NBurstRecords:      nBurstRecords,
@@ -803,6 +807,16 @@ func snapPeriodSource(s *iid.IIDState) string {
 
 func snapPeriodAgrees(s *iid.IIDState) bool {
 	return s.DebugStateSnapshot().PeriodAgreesWithDF
+}
+
+func snapResidualSlope(s *iid.IIDState) *float64 {
+	snap := s.DebugStateSnapshot()
+	v := snap.ResidualSlopeDegPerS
+	return &v
+}
+
+func snapPeriodRefineStatus(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().PeriodRefinementStatus
 }
 
 func snapPeriodRejectReason(s *iid.IIDState) string {
