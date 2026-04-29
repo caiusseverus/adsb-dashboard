@@ -696,3 +696,23 @@ Plan confirmation:
   - Added Go regression tests for zero slope stability, positive-slope sign behavior, excessive-slope rejection, and alias-period immunity (`4.7906s` base vs `2.0133s` alias).
 - Verification:
   - `env GOCACHE=/tmp/go-build go test ./...` in `radar-core/` -> passed
+
+## 2026-04-29 Go Multi-Aircraft Residual Stream For Period Refinement
+
+- [x] Add a Go refinement-observation path from burst events (not reference-only sync epochs).
+- [x] Gate refinement observations to dominant-family + non-rejected residuals and downweight soft residuals.
+- [x] Fit residual slope from rolling multi-aircraft observations and keep DF base-period authority.
+- [x] Expose diagnostics for plotted/eligible/rejected refinement observations and reference sync updates.
+- [x] Add regression tests for multi-aircraft/non-reference driving, outlier rejection, and reference-only non-sufficiency.
+- [x] Run radar-core Go tests.
+
+### Review
+- Implemented:
+  - Added `IIDState.RecordBurstResidualObservation()` and `SyncState.AddRefinementResidualObservation()` so period refinement can be driven by burst residual observations across aircraft, not only reference sync updates.
+  - Wired burst ingestion in `engine.onRadarEvent` to compute observed geometric bearing and feed dominant-family residual observations into the refiner.
+  - Added eligibility filtering and weighting: dominant-family required; hard outliers rejected; soft residuals downweighted.
+  - Kept authority invariants: `BasePeriodS` remains DF-alignment authority; `EffectivePeriodS = BasePeriodS + PeriodDeltaS`; compact/bootstrap period does not override base.
+  - Added diagnostics counters and reasons in Go snapshot payload for plotted, eligible, rejected refinement observations and reference sync update count.
+  - Added tests covering multi-aircraft slope driving, non-reference-only driving, outlier rejection, and reference-only path insufficiency.
+- Verification:
+  - `env GOCACHE=/tmp/go-build go test ./...` in `radar-core/` -> passed

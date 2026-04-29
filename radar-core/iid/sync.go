@@ -12,27 +12,31 @@ import (
 //
 //	bearing_deg = ((arrival_us - PhaseEpochUS) / (PeriodS*1e6) * 360 + PhaseOffsetDeg) mod 360
 type SyncState struct {
-	IID                    uint8
-	PeriodS                float64 // deprecated alias for EffectivePeriodS; kept for tests/compatibility only.
-	BasePeriodS            float64
-	PeriodDeltaS           float64
-	EffectivePeriodS       float64
-	PhaseEpochUS           float64 // Beast-monotonic centroid of last accepted reference burst
-	PhaseOffsetDeg         float64 // Geometric bearing from radar to ref aircraft at epoch (0 until radar pos known)
-	SyncQuality            float64 // 0.0–1.0 from rotation model status
-	SyncJitterDeg          float64 // 1-sigma jitter estimate from residual EMA
-	ResidualEMA            float64 // EMA of |circular residual| degrees
-	NSyncFrames            int     // accepted frame count
-	NRejectedFrames        int     // rejected frame count
-	LastResidualDeg        float64
-	Holdover               bool // true when last update was rejected / too weak
-	LastUpdated            time.Time
-	PeriodSource           string
-	PeriodAgreesWithDF     bool
-	PeriodRejectReason     string
-	ResidualSlopeDegPerS   float64
-	PeriodRefinementStatus string
-	residualHistory        []residualObservation
+	IID                        uint8
+	PeriodS                    float64 // deprecated alias for EffectivePeriodS; kept for tests/compatibility only.
+	BasePeriodS                float64
+	PeriodDeltaS               float64
+	EffectivePeriodS           float64
+	PhaseEpochUS               float64 // Beast-monotonic centroid of last accepted reference burst
+	PhaseOffsetDeg             float64 // Geometric bearing from radar to ref aircraft at epoch (0 until radar pos known)
+	SyncQuality                float64 // 0.0–1.0 from rotation model status
+	SyncJitterDeg              float64 // 1-sigma jitter estimate from residual EMA
+	ResidualEMA                float64 // EMA of |circular residual| degrees
+	NSyncFrames                int     // accepted frame count
+	NRejectedFrames            int     // rejected frame count
+	LastResidualDeg            float64
+	Holdover                   bool // true when last update was rejected / too weak
+	LastUpdated                time.Time
+	PeriodSource               string
+	PeriodAgreesWithDF         bool
+	PeriodRejectReason         string
+	ResidualSlopeDegPerS       float64
+	PeriodRefinementStatus     string
+	RefinementPlottedCount     uint64
+	RefinementEligibleCount    uint64
+	RefinementRejectedCount    uint64
+	RefinementReferenceUpdates uint64
+	residualHistory            []residualObservation
 }
 
 const (
@@ -53,6 +57,10 @@ type residualObservation struct {
 	ResidualDeg float64
 	NAircraft   int
 	RefPosAgeS  float64
+	ICAO        uint32
+	Dominant    bool
+	Soft        bool
+	Weight      float64
 }
 
 // syncQuality derives a 0-1 quality score from a rotation status string.
@@ -158,7 +166,8 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 	blendedOffset := wrap360(existingAtNewEpoch + alpha*residual)
 
 	s.BasePeriodS = periodS
-	s.appendResidualObservation(newEpochUS, residual, nAircraft, refPosAgeS)
+	s.appendResidualObservation(newEpochUS, residual, 0, true, false, 1.0, nAircraft, refPosAgeS)
+	s.RefinementReferenceUpdates++
 	s.applyBoundedPeriodRefinement()
 	s.EffectivePeriodS = s.BasePeriodS + s.PeriodDeltaS
 	if s.EffectivePeriodS <= 0 {
@@ -197,9 +206,21 @@ func (s *SyncState) resetPeriodRefinement(reason string) {
 	s.PeriodSource = "df_alignment"
 }
 
-func (s *SyncState) appendResidualObservation(epochUS, residualDeg float64, nAircraft int, refPosAgeS float64) {
+func (s *SyncState) appendResidualObservation(
+	epochUS, residualDeg float64,
+	icao uint32,
+	dominant bool,
+	soft bool,
+	weight float64,
+	nAircraft int,
+	refPosAgeS float64,
+) {
+	if weight <= 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
+		weight = 1.0
+	}
 	s.residualHistory = append(s.residualHistory, residualObservation{
 		EpochUS: epochUS, ResidualDeg: residualDeg, NAircraft: nAircraft, RefPosAgeS: refPosAgeS,
+		ICAO: icao, Dominant: dominant, Soft: soft, Weight: weight,
 	})
 	if len(s.residualHistory) > residualHistoryMax {
 		s.residualHistory = s.residualHistory[len(s.residualHistory)-residualHistoryMax:]
@@ -211,6 +232,55 @@ func (s *SyncState) appendResidualObservation(epochUS, residualDeg float64, nAir
 	}
 	if idx > 0 {
 		s.residualHistory = s.residualHistory[idx:]
+	}
+}
+
+func (s *SyncState) AddRefinementResidualObservation(
+	epochUS float64,
+	residualDeg float64,
+	icao uint32,
+	dominant bool,
+	nAircraft int,
+	refPosAgeS float64,
+) {
+	s.RefinementPlottedCount++
+	if s.BasePeriodS <= 0 {
+		s.PeriodRefinementStatus = "missing_df_base_period"
+		return
+	}
+	if s.Holdover {
+		s.PeriodRefinementStatus = "holdover"
+		return
+	}
+	if !dominant {
+		s.RefinementRejectedCount++
+		s.PeriodRefinementStatus = "no_dominant_family"
+		return
+	}
+	absResidual := math.Abs(residualDeg)
+	if absResidual > residualRejectDeg {
+		s.RefinementRejectedCount++
+		s.PeriodRefinementStatus = "all_rejected"
+		return
+	}
+	soft := absResidual > residualSoftDeg
+	weight := 1.0
+	if soft {
+		weight = 0.35
+	}
+	s.RefinementEligibleCount++
+	s.appendResidualObservation(epochUS, residualDeg, icao, dominant, soft, weight, nAircraft, refPosAgeS)
+	s.applyBoundedPeriodRefinement()
+	s.EffectivePeriodS = s.BasePeriodS + s.PeriodDeltaS
+	if s.EffectivePeriodS <= 0 {
+		s.EffectivePeriodS = s.BasePeriodS
+		s.PeriodDeltaS = 0
+	}
+	s.PeriodS = s.EffectivePeriodS
+	if math.Abs(s.PeriodDeltaS) > 1e-12 {
+		s.PeriodSource = "df_alignment_plus_residual_slope"
+	} else {
+		s.PeriodSource = "df_alignment"
 	}
 }
 
@@ -279,21 +349,32 @@ func fitResidualSlopeDegPerS(obs []residualObservation) (float64, bool, string) 
 	if spanS < residualFitMinSpanS {
 		return 0, false, "insufficient_fit_span"
 	}
-	var sumT, sumY float64
+	var sumW, sumT, sumY float64
 	for _, o := range obs {
+		w := o.Weight
+		if w <= 0 || math.IsNaN(w) || math.IsInf(w, 0) {
+			continue
+		}
 		t := (o.EpochUS - t0US) / 1e6
-		sumT += t
-		sumY += o.ResidualDeg
+		sumW += w
+		sumT += w * t
+		sumY += w * o.ResidualDeg
 	}
-	n := float64(len(obs))
-	meanT := sumT / n
-	meanY := sumY / n
+	if sumW <= 0 {
+		return 0, false, "fit_degenerate"
+	}
+	meanT := sumT / sumW
+	meanY := sumY / sumW
 	var num, den float64
 	for _, o := range obs {
+		w := o.Weight
+		if w <= 0 || math.IsNaN(w) || math.IsInf(w, 0) {
+			continue
+		}
 		t := (o.EpochUS - t0US) / 1e6
 		dt := t - meanT
-		num += dt * (o.ResidualDeg - meanY)
-		den += dt * dt
+		num += w * dt * (o.ResidualDeg - meanY)
+		den += w * dt * dt
 	}
 	if den <= 0 || math.IsNaN(den) || math.IsInf(den, 0) {
 		return 0, false, "fit_degenerate"

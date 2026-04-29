@@ -190,6 +190,104 @@ func TestSetBasePeriod_SmallChangePreservesRefinementDeltaAndHistory(t *testing.
 	}
 }
 
+func TestPeriodRefinement_MultiAircraftResidualStreamDrivesDelta(t *testing.T) {
+	s := NewIIDState(21)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Sync = NewSyncState(s.IID, base, 0.0, 0.0, 1.0)
+	ref := uint32(0xAAAAAA)
+	s.RefICAO = &ref
+
+	for i := 1; i <= 30; i++ {
+		epochUS := float64(i) * 1_000_000.0
+		predicted := s.Sync.PredictBearing(epochUS)
+		observedBearingDeg := wrap360(predicted + float64(i)*0.2)
+		icao := uint32(0x100000 + i%5)
+		s.RecordBurstResidualObservation(epochUS, icao, observedBearingDeg, 6, 0.5, true)
+	}
+	if s.PeriodDeltaS == 0 {
+		t.Fatal("expected non-zero period delta from multi-aircraft residual slope")
+	}
+	if s.PeriodSource != "df_alignment_plus_residual_slope" {
+		t.Fatalf("period source=%q, want df_alignment_plus_residual_slope", s.PeriodSource)
+	}
+}
+
+func TestPeriodRefinement_NonReferenceResidualsDriveDelta(t *testing.T) {
+	s := NewIIDState(22)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Sync = NewSyncState(s.IID, base, 0.0, 0.0, 1.0)
+	ref := uint32(0xAAAAAA)
+	s.RefICAO = &ref
+
+	for i := 1; i <= 30; i++ {
+		epochUS := float64(i) * 1_000_000.0
+		predicted := s.Sync.PredictBearing(epochUS)
+		observedBearingDeg := wrap360(predicted + float64(i)*0.2)
+		icao := uint32(0xBBBB00 + i%7) // all non-reference
+		s.RecordBurstResidualObservation(epochUS, icao, observedBearingDeg, 5, 0.5, true)
+	}
+	if s.PeriodDeltaS == 0 {
+		t.Fatal("expected non-zero period delta from non-reference residuals")
+	}
+}
+
+func TestPeriodRefinement_RejectedOutliersDoNotDriveDelta(t *testing.T) {
+	s := NewIIDState(23)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Sync = NewSyncState(s.IID, base, 0.0, 0.0, 1.0)
+	ref := uint32(0xAAAAAA)
+	s.RefICAO = &ref
+
+	for i := 1; i <= 20; i++ {
+		epochUS := float64(i) * 1_000_000.0
+		predicted := s.Sync.PredictBearing(epochUS)
+		observedBearingDeg := wrap360(predicted + 100.0) // guaranteed hard outlier residual
+		icao := uint32(0xCC0000 + i%3)
+		s.RecordBurstResidualObservation(epochUS, icao, observedBearingDeg, 5, 0.5, true)
+	}
+	if s.PeriodDeltaS != 0 {
+		t.Fatalf("expected zero period delta from rejected-only stream, got %.9f", s.PeriodDeltaS)
+	}
+	if s.Sync.RefinementEligibleCount != 0 {
+		t.Fatalf("eligible count=%d, want 0", s.Sync.RefinementEligibleCount)
+	}
+	if s.Sync.RefinementRejectedCount == 0 {
+		t.Fatal("expected rejected refinement observations")
+	}
+}
+
+func TestPeriodRefinement_ReferenceUpdatesNotOnlyPath(t *testing.T) {
+	s := NewIIDState(24)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Sync = NewSyncState(s.IID, base, 0.0, 0.0, 1.0)
+	ref := uint32(0xAAAAAA)
+	s.RefICAO = &ref
+
+	// Reference updates alone with zero residual should not create refinement.
+	for i := 1; i <= 10; i++ {
+		s.UpdateSyncEpoch(float64(i)*4_000_000.0, 0.0, 6, 0.5)
+	}
+	if s.PeriodDeltaS != 0 {
+		t.Fatalf("reference-only path unexpectedly refined period: %.9f", s.PeriodDeltaS)
+	}
+
+	// Add non-reference residual slope; now refinement should engage.
+	for i := 11; i <= 30; i++ {
+		epochUS := float64(i) * 1_000_000.0
+		predicted := s.Sync.PredictBearing(epochUS)
+		observedBearingDeg := wrap360(predicted + float64(i-10)*0.2)
+		icao := uint32(0xDD0000 + i%5)
+		s.RecordBurstResidualObservation(epochUS, icao, observedBearingDeg, 6, 0.5, true)
+	}
+	if s.PeriodDeltaS == 0 {
+		t.Fatal("expected refinement after non-reference eligible residual stream")
+	}
+}
+
 func TestSyncProtocolSnapshotRejectsDFPeriodDisagreement(t *testing.T) {
 	s := NewIIDState(13)
 	compactPeriod := 2.01

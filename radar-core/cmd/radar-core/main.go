@@ -176,6 +176,7 @@ func (e *engine) onRadarEvent(msg *protocol.RadarEvent) {
 		tSync := time.Now()
 		e.maybeUpdateSync(s, f)
 		e.profiler.Observe("sync_update", time.Since(tSync))
+		e.maybeObserveRefinementResidual(s, f)
 
 		// Stage 4: feed the frame accumulator.
 		acc.OnBurst(f.ICAO, f.CentroidUS, f.NReplies, f.SignalDBFS, s)
@@ -215,6 +216,28 @@ func (e *engine) maybeUpdateSync(s *iid.IIDState, f *burst.FiredBurst) {
 	s.UpdateSyncEpoch(f.CentroidUS, phaseOffsetDeg, nAircraft, refPosAgeS)
 	snap := s.DebugStateSnapshot()
 	e.emitIIDState(s.IID, s, uint16(minInt(snap.BurstRecordsTotal, 65535)))
+}
+
+func (e *engine) maybeObserveRefinementResidual(s *iid.IIDState, f *burst.FiredBurst) {
+	cfg := rcconfig.Get()
+	if !cfg.HasReceiver {
+		return
+	}
+	pos := e.positions.Get(f.ICAO)
+	if pos == nil {
+		return
+	}
+	observedBearingDeg := bearingDeg(cfg.ReceiverLat, cfg.ReceiverLon, pos.Lat, pos.Lon)
+	refPosAgeS := time.Since(pos.TS).Seconds()
+	nAircraft := 1
+	if b, ok := e.builders[s.IID]; ok {
+		nAircraft = b.ActiveICAOs()
+	}
+	dominantFamily := false
+	if family := s.FamilySnapshot(); family != nil && family.FoldedICAOs != nil {
+		_, dominantFamily = family.FoldedICAOs[f.ICAO]
+	}
+	s.RecordBurstResidualObservation(f.CentroidUS, f.ICAO, observedBearingDeg, nAircraft, refPosAgeS, dominantFamily)
 }
 
 func bearingDeg(lat1, lon1, lat2, lon2 float64) float64 {
@@ -480,32 +503,36 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 		key := strconv.Itoa(int(iidNum))
 		snap := s.DebugStateSnapshot()
 		iidPayload := map[string]interface{}{
-			"status":                   snap.Status,
-			"has_period":               snap.HasPeriod,
-			"period_s":                 nil,
-			"has_reference_icao":       snap.HasRefICAO,
-			"reference_icao":           nil,
-			"sync_state_present":       snap.SyncPresent,
-			"sync_quality":             snap.SyncQuality,
-			"sync_state_usable":        snap.SyncUsable,
-			"sync_period_s":            nil,
-			"sync_phase_epoch_us":      nil,
-			"sync_phase_offset_deg":    nil,
-			"sync_jitter_deg":          nil,
-			"sync_residual_ema_deg":    nil,
-			"sync_last_residual_deg":   nil,
-			"sync_holdover":            snap.SyncHoldover,
-			"sync_n_frames":            snap.SyncNSyncFrames,
-			"sync_n_rejected_frames":   snap.SyncNRejectedFrames,
-			"sync_last_updated":        nil,
-			"period_source":            snap.PeriodSource,
-			"base_period_s":            nil,
-			"period_delta_s":           snap.PeriodDeltaS,
-			"effective_period_s":       nil,
-			"residual_slope_deg_per_s": snap.ResidualSlopeDegPerS,
-			"period_refinement_status": snap.PeriodRefinementStatus,
-			"period_agrees_with_df":    snap.PeriodAgreesWithDF,
-			"period_reject_reason":     snap.PeriodRejectReason,
+			"status":                           snap.Status,
+			"has_period":                       snap.HasPeriod,
+			"period_s":                         nil,
+			"has_reference_icao":               snap.HasRefICAO,
+			"reference_icao":                   nil,
+			"sync_state_present":               snap.SyncPresent,
+			"sync_quality":                     snap.SyncQuality,
+			"sync_state_usable":                snap.SyncUsable,
+			"sync_period_s":                    nil,
+			"sync_phase_epoch_us":              nil,
+			"sync_phase_offset_deg":            nil,
+			"sync_jitter_deg":                  nil,
+			"sync_residual_ema_deg":            nil,
+			"sync_last_residual_deg":           nil,
+			"sync_holdover":                    snap.SyncHoldover,
+			"sync_n_frames":                    snap.SyncNSyncFrames,
+			"sync_n_rejected_frames":           snap.SyncNRejectedFrames,
+			"sync_last_updated":                nil,
+			"period_source":                    snap.PeriodSource,
+			"base_period_s":                    nil,
+			"period_delta_s":                   snap.PeriodDeltaS,
+			"effective_period_s":               nil,
+			"residual_slope_deg_per_s":         snap.ResidualSlopeDegPerS,
+			"period_refinement_status":         snap.PeriodRefinementStatus,
+			"period_agrees_with_df":            snap.PeriodAgreesWithDF,
+			"period_reject_reason":             snap.PeriodRejectReason,
+			"period_refinement_plotted_count":  snap.RefinementPlottedCount,
+			"period_refinement_eligible_count": snap.RefinementEligibleCount,
+			"period_refinement_rejected_count": snap.RefinementRejectedCount,
+			"sync_reference_update_count":      snap.RefinementReferenceUpdates,
 			"retained_state": map[string]interface{}{
 				"active_aircraft_estimate":           snap.ActiveAircraftEstimate,
 				"burst_records_total":                snap.BurstRecordsTotal,

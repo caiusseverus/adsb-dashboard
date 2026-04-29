@@ -94,6 +94,10 @@ type DebugSnapshot struct {
 	PeriodRejectReason              string
 	ResidualSlopeDegPerS            float64
 	PeriodRefinementStatus          string
+	RefinementPlottedCount          uint64
+	RefinementEligibleCount         uint64
+	RefinementRejectedCount         uint64
+	RefinementReferenceUpdates      uint64
 	ActiveAircraftEstimate          int
 	BurstRecordsTotal               int
 	BurstRecordsDynamicCap          int
@@ -390,6 +394,43 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 	s.Sync.PeriodRejectReason = s.PeriodRejectReason
 }
 
+func (s *IIDState) RecordBurstResidualObservation(
+	epochUS float64,
+	icao uint32,
+	observedBearingDeg float64,
+	nAircraft int,
+	refPosAgeS float64,
+	dominantFamily bool,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Sync == nil {
+		return
+	}
+	if s.BasePeriodS == nil || *s.BasePeriodS <= 0 {
+		s.Sync.PeriodRefinementStatus = "missing_df_base_period"
+		return
+	}
+	if s.RefICAO == nil {
+		s.Sync.PeriodRefinementStatus = "no_reference"
+		return
+	}
+	if s.Sync.Holdover {
+		s.Sync.PeriodRefinementStatus = "holdover"
+		return
+	}
+	predicted := s.Sync.PredictBearing(epochUS)
+	if predicted < 0 || math.IsNaN(predicted) || math.IsInf(predicted, 0) {
+		return
+	}
+	residual := circularDiff(observedBearingDeg, predicted)
+	s.Sync.AddRefinementResidualObservation(epochUS, residual, icao, dominantFamily, nAircraft, refPosAgeS)
+	s.PeriodDeltaS = s.Sync.PeriodDeltaS
+	effective := s.Sync.EffectivePeriodS
+	s.EffectivePeriodS = &effective
+	s.PeriodSource = s.Sync.PeriodSource
+}
+
 // FamilySnapshot returns the current ICAO family membership (may be nil).
 // The returned pointer is read-only — callers must not mutate it.
 func (s *IIDState) FamilySnapshot() *ICAOFamily {
@@ -496,6 +537,10 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 	if s.Sync != nil {
 		out.ResidualSlopeDegPerS = s.Sync.ResidualSlopeDegPerS
 		out.PeriodRefinementStatus = s.Sync.PeriodRefinementStatus
+		out.RefinementPlottedCount = s.Sync.RefinementPlottedCount
+		out.RefinementEligibleCount = s.Sync.RefinementEligibleCount
+		out.RefinementRejectedCount = s.Sync.RefinementRejectedCount
+		out.RefinementReferenceUpdates = s.Sync.RefinementReferenceUpdates
 	}
 	if s.RefICAO != nil {
 		out.HasRefICAO = true
