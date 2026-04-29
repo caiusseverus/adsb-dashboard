@@ -1326,6 +1326,41 @@ def test_update_rotation_models_requeues_iids_left_outside_runtime_budget(monkey
     assert 8 in state._dirty_iids
 
 
+def test_update_rotation_models_emits_radar_core_base_period_each_valid_update(monkeypatch):
+    import radar.sweep as sweep_module
+
+    state = RadarState()
+    state._burst_records[7] = deque([
+        BurstRecord(iid=7, icao="AAAAAA", centroid_us=1_000_000, n_replies=1),
+        BurstRecord(iid=7, icao="AAAAAA", centroid_us=5_000_000, n_replies=1),
+    ])
+    state._dirty_iids = {7}
+    sent = []
+    state.radar_core_config_sink = lambda key, value: sent.append((key, value))
+
+    periods = iter([4.0, 4.05])
+
+    def fake_analyse(_records):
+        return RotationModel(
+            dominant_period_s=next(periods),
+            primary_direct_count=4,
+            period_std_s=0.01,
+            status="SINGLE_RADAR",
+        )
+
+    monkeypatch.setattr(sweep_module, "_analyse_burst_records", fake_analyse)
+
+    state.update_rotation_models()
+    state._burst_records[7].append(BurstRecord(iid=7, icao="AAAAAA", centroid_us=9_050_000, n_replies=1))
+    state._models[7].status = "UNKNOWN"
+    state._models[7].rotation_model = None
+    state._dirty_iids = {7}
+    state.update_rotation_models()
+
+    assert [key for key, _value in sent] == ["IID_BASE_PERIOD_S:7", "IID_BASE_PERIOD_S:7"]
+    assert all(value > 0 for _key, value in sent)
+
+
 def test_live_frame_builder_uses_fixed_reference_window_and_period_family_admission(monkeypatch):
     monkeypatch.setattr("radar.sweep.time.time", lambda: 1000.0)
 
@@ -1575,6 +1610,44 @@ def test_fired_burst_processing_emits_burst_records_and_diagnostic_dwell():
         {"arrival_us": 12_345_000.0, "signal_dbfs": -15.0},
         {"arrival_us": 12_346_000.0, "signal_dbfs": -9.5},
     ]
+
+
+def test_fired_burst_processing_records_sync_obs_when_radar_core_sink_enabled(monkeypatch):
+    class NativeProcessor:
+        def select_reference(self, **kwargs):
+            return "AAAAAA"
+
+        def matches_dominant_period(self, *args, **kwargs):
+            return True
+
+        def matches_phase_family(self, *args, **kwargs):
+            return True
+
+    monkeypatch.setattr("radar.sweep.time.time", lambda: 1000.0)
+
+    state = RadarState()
+    state.radar_core_event_sink = lambda *_args, **_kwargs: None
+    state._models[26] = RadarIID(
+        iid=26,
+        period_s=4.0,
+        manual_lat=51.0,
+        manual_lon=0.0,
+        resolution_mode="locked_position",
+        rotation_model=RotationModel(folded={"AAAAAA": {"multiplier": 1}}),
+    )
+    state._native_burst_processors[26] = NativeProcessor()
+    state._adsb_tracker.update("AAAAAA", 51.1, 0.1, ts=1000.0)
+    state._estimate_wall_time_from_arrival_us = lambda *_args, **_kwargs: 1000.0
+
+    state._process_fired_bursts(26, [{
+        "icao": "AAAAAA",
+        "burst_centroid_us": 12_345_678.0,
+        "burst_signal": -9.5,
+        "n_replies": 2,
+    }])
+
+    assert len(state._live_burst_timeline_obs[26]) == 1
+    assert len(state._live_aligned_burst_obs[26]) == 1
 
 
 def test_dwell_profile_uses_diagnostic_replies_after_burst_record_rebuild():

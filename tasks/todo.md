@@ -27,6 +27,38 @@ Plan confirmation:
   - `uv run --directory backend pytest tests/test_radar_core_protocol.py tests/test_radar_core_client.py tests/test_radar_core_integration.py -q` -> `43 passed`
   - `npm run build` in `frontend/` -> passed
 
+### Follow-Up Tightening
+- [x] Make Go sync usability require DF period agreement and no period reject reason.
+- [x] Prevent Go-derived family membership from gating operational reference/frame selection unless it agrees with the DF base period.
+- [x] Keep Go-derived reinforcement status diagnostic-only when a DF base exists and mark DF disagreement explicitly instead of reporting `SINGLE_RADAR`.
+- [x] Verify Python emits `IID_BASE_PERIOD_S:<iid>` on every valid `RadarIID.period_s` update and add focused coverage.
+- [x] Run focused Go/backend verification and document results.
+
+Follow-up review:
+- Implemented:
+  - Tightened `SyncProtocolSnapshot()` and debug sync usability so Go sync is usable only when quality is sufficient, not in holdover, `PeriodAgreesWithDF` is true, and `PeriodRejectReason` is empty.
+  - Gated operational use of `LastRotationModel.Family` in `RefreshReference()` behind compact-period agreement with the DF base period.
+  - Changed `reinforce()` so DF-base disagreement reports `DF_PERIOD_DISAGREE` instead of promoting `SINGLE_RADAR`.
+  - Added Go tests for sync usability rejection, family-gate bypass on period disagreement, and disagreement status.
+  - Added backend coverage proving each valid Python rotation-model period update emits `IID_BASE_PERIOD_S:<iid>` through `radar_core_config_sink`.
+- Verification:
+  - `env GOCACHE=/tmp/go-build go test ./...` in `radar-core/` -> passed
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_core_protocol.py tests/test_radar_core_client.py -q` -> `122 passed`
+
+Regression correction:
+- Fixed the remaining operational family leak by making `FamilySnapshot()` return nil when the Go family period does not agree with the DF base period; otherwise the frame accumulator could still reject all bursts through `ref_not_dominant` / `obs_not_dominant`.
+- Updated Go frame test helpers to seed the required DF base period so frame tests prove generation instead of skipping reference setup.
+- Verification:
+  - `env GOCACHE=/tmp/go-build go test ./...` in `radar-core/` -> passed
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -q -k 'radar_core_base_period or burst_sync_timeline or live_frame_builder'` -> `7 passed`
+
+Burst-sync refinement correction:
+- Fixed the radar-core-enabled Python burst path so fired bursts still populate timeline observations and aligned sync observations. Previously `radar_core_event_sink is None` guarded those calls, starving Python multi-aircraft burst sync of the evidence needed for phase locking and residual-slope period correction whenever radar-core was enabled.
+- Added a regression test for radar-core-enabled fired-burst processing.
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -q -k 'radar_core_sink_enabled or radar_core_base_period or burst_sync_timeline or live_frame_builder'` -> `8 passed`
+  - `env GOCACHE=/tmp/go-build go test ./...` in `radar-core/` -> passed
+
 ## 2026-04-28 LiveSyncState Audit And Simplification
 
 - [x] Audit every `LiveSyncState` field in `backend/radar/sync_models.py` and classify it as functional, Stage 3 trust, propagation/motion, frontend/API-retained, or obsolete.
@@ -74,7 +106,7 @@ Plan confirmation:
   - Updated backend tests to assert the slimmer state contract, including an explicit obsolete-field regression in [backend/tests/test_radar_phase_refinement.py](/home/keith/claude/adsb-dashboard/backend/tests/test_radar_phase_refinement.py).
 - Verification:
   - `uv run --directory backend pytest tests/test_aircraft_localiser_sync_predictor.py tests/test_radar_phase_refinement.py tests/test_radar_sweep.py tests/test_radar_api.py -q` -> `172 passed`
-  - `npm run build` in `frontend/` -> passed
+- `npm run build` in `frontend/` -> passed
   - `rg` over `backend/` and `frontend/src/` shows no remaining runtime/frontend references to the deleted `LiveSyncState` fields; remaining matches are only the new obsolete-field regression test and local simple-sync variables.
 
 ## 2026-04-28 Sweep Re-Export Safety Fix

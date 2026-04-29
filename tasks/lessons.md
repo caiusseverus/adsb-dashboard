@@ -1,5 +1,11 @@
 # Lessons
 
+## 2026-04-29
+
+- When demoting a Go-derived model from authority to diagnostics, gate every operational export of that model, not just the first selector. If `RefreshReference()` ignores an unvalidated family but `FamilySnapshot()` still exposes it to frame admission, frames can stop while the period path looks fixed.
+- When introducing a required base-period authority, update test helpers to seed that authority explicitly. Otherwise frame tests can pass by skipping reference setup instead of proving the frame path still works.
+- When enabling Go as the frame generator, do not disable Python-side diagnostic/refinement observation recording. Performance ownership and frame ownership can move to Go, but Python burst-sync refinement still needs aligned burst observations unless an equivalent Go refinement feed exists.
+
 ## 2026-04-28
 
 - After a structural extraction, verify the source file no longer defines local copies of the moved symbols. Do not stop at adding imports; confirm that imported helpers and dataclasses are not shadowed later in the file, and add an identity test when a module is meant to re-export shared classes.

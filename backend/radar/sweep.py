@@ -1190,40 +1190,39 @@ class RadarState:
                 and _radar_pos_cache["lon"] is not None
             ):
                 matches_dominant_for_sync = _matches_dominant(fired_icao)
-                if self.radar_core_event_sink is None:
-                    self._record_burst_sync_timeline_obs(
-                        iid=iid,
-                        icao=fired_icao,
-                        burst_centroid_us=burst_centroid_us,
-                        radar_lat=_radar_pos_cache["lat"],
-                        radar_lon=_radar_pos_cache["lon"],
-                        aircraft_lat=lat,
-                        aircraft_lon=lon,
-                        n_replies=n_replies,
-                        signal_dbfs=burst_signal,
-                        pos_age_s=position_age_seconds,
-                        sync_update_eligible=matches_dominant_for_sync,
-                        burst_center_method=fired_burst.get("burst_center_method", "centroid"),
-                        burst_center_simple_us=fired_burst.get("burst_center_simple_us"),
-                        burst_center_weighted_us=fired_burst.get("burst_center_weighted_us"),
-                        burst_center_delta_us=fired_burst.get("burst_center_delta_us"),
-                        burst_ts_first_reply_beast_us=fired_burst.get("burst_ts_first_reply_beast_us"),
-                        burst_ts_strongest_reply_beast_us=fired_burst.get("burst_ts_strongest_reply_beast_us"),
-                        burst_ts_simple_centroid_beast_us=fired_burst.get("burst_ts_simple_centroid_beast_us"),
-                        burst_ts_weighted_centroid_beast_us=fired_burst.get("burst_ts_weighted_centroid_beast_us"),
-                        burst_ts_mid_strong_window_beast_us=fired_burst.get("burst_ts_mid_strong_window_beast_us"),
-                        burst_ts_last_reply_beast_us=fired_burst.get("burst_ts_last_reply_beast_us"),
-                        burst_span_us=fired_burst.get("burst_span_us"),
-                        peak_amplitude=fired_burst.get("peak_amplitude"),
-                        position_interpolated=interpolated,
-                        position_extrapolated=position_extrapolated,
-                        position_source_age_s=position_source_age_s,
-                        truth_position_ts_beast_us=(
-                            burst_centroid_us - position_source_age_s * 1_000_000.0
-                            if position_source_age_s is not None else None
-                        ),
-                    )
-                if matches_dominant_for_sync and self.radar_core_event_sink is None:
+                self._record_burst_sync_timeline_obs(
+                    iid=iid,
+                    icao=fired_icao,
+                    burst_centroid_us=burst_centroid_us,
+                    radar_lat=_radar_pos_cache["lat"],
+                    radar_lon=_radar_pos_cache["lon"],
+                    aircraft_lat=lat,
+                    aircraft_lon=lon,
+                    n_replies=n_replies,
+                    signal_dbfs=burst_signal,
+                    pos_age_s=position_age_seconds,
+                    sync_update_eligible=matches_dominant_for_sync,
+                    burst_center_method=fired_burst.get("burst_center_method", "centroid"),
+                    burst_center_simple_us=fired_burst.get("burst_center_simple_us"),
+                    burst_center_weighted_us=fired_burst.get("burst_center_weighted_us"),
+                    burst_center_delta_us=fired_burst.get("burst_center_delta_us"),
+                    burst_ts_first_reply_beast_us=fired_burst.get("burst_ts_first_reply_beast_us"),
+                    burst_ts_strongest_reply_beast_us=fired_burst.get("burst_ts_strongest_reply_beast_us"),
+                    burst_ts_simple_centroid_beast_us=fired_burst.get("burst_ts_simple_centroid_beast_us"),
+                    burst_ts_weighted_centroid_beast_us=fired_burst.get("burst_ts_weighted_centroid_beast_us"),
+                    burst_ts_mid_strong_window_beast_us=fired_burst.get("burst_ts_mid_strong_window_beast_us"),
+                    burst_ts_last_reply_beast_us=fired_burst.get("burst_ts_last_reply_beast_us"),
+                    burst_span_us=fired_burst.get("burst_span_us"),
+                    peak_amplitude=fired_burst.get("peak_amplitude"),
+                    position_interpolated=interpolated,
+                    position_extrapolated=position_extrapolated,
+                    position_source_age_s=position_source_age_s,
+                    truth_position_ts_beast_us=(
+                        burst_centroid_us - position_source_age_s * 1_000_000.0
+                        if position_source_age_s is not None else None
+                    ),
+                )
+                if matches_dominant_for_sync:
                     self._record_aligned_burst_sync_obs(
                         iid=iid,
                         icao=fired_icao,

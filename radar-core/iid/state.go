@@ -297,7 +297,7 @@ func (s *IIDState) RefreshReference(records []BurstRecord, nowUS float64) {
 	// Keep reference selection aligned with Stage-4 frame gating:
 	// frames only open when the reference is in the dominant family.
 	filtered := records
-	if s.LastRotationModel != nil && s.LastRotationModel.Family != nil && len(s.LastRotationModel.Family.FoldedICAOs) > 0 {
+	if s.goFamilyAgreesWithDFLocked() && s.LastRotationModel != nil && s.LastRotationModel.Family != nil && len(s.LastRotationModel.Family.FoldedICAOs) > 0 {
 		folded := s.LastRotationModel.Family.FoldedICAOs
 		filtered = make([]BurstRecord, 0, len(records))
 		for _, r := range records {
@@ -359,6 +359,9 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 func (s *IIDState) FamilySnapshot() *ICAOFamily {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.goFamilyAgreesWithDFLocked() {
+		return nil
+	}
 	if s.LastRotationModel == nil {
 		return nil
 	}
@@ -395,7 +398,7 @@ func (s *IIDState) SyncProtocolSnapshot() (
 		return false, false, nil, nil, nil, nil, nil, nil, 0, 0, false
 	}
 	present = true
-	usable = s.Sync.SyncQuality >= 0.3 && !s.Sync.Holdover
+	usable = s.Sync.SyncQuality >= 0.3 && !s.Sync.Holdover && s.Sync.PeriodAgreesWithDF && s.Sync.PeriodRejectReason == ""
 	holdover = s.Sync.Holdover
 	periodValue := s.Sync.EffectivePeriodS
 	phaseEpochValue := s.Sync.PhaseEpochUS
@@ -471,7 +474,7 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.SyncNSyncFrames = s.Sync.NSyncFrames
 		out.SyncNRejectedFrames = s.Sync.NRejectedFrames
 		out.SyncLastUpdatedUnix = float64(s.Sync.LastUpdated.UnixNano()) / 1e9
-		out.SyncUsable = s.Sync.SyncQuality >= 0.3 && !s.Sync.Holdover
+		out.SyncUsable = s.Sync.SyncQuality >= 0.3 && !s.Sync.Holdover && s.Sync.PeriodAgreesWithDF && s.Sync.PeriodRejectReason == ""
 	}
 	out.ActiveAircraftEstimate = s.lastActiveAircraft
 	out.BurstRecordsTotal = len(s.records)
@@ -542,6 +545,16 @@ func periodsAgree(a, b float64) bool {
 		return false
 	}
 	return math.Abs(a-b)/math.Max(a, b) <= dfAgreementToleranceFraction
+}
+
+func (s *IIDState) goFamilyAgreesWithDFLocked() bool {
+	if s.BasePeriodS == nil {
+		return true
+	}
+	if s.LastRotationModel == nil || s.LastRotationModel.DominantPeriodS == nil {
+		return false
+	}
+	return periodsAgree(*s.LastRotationModel.DominantPeriodS, *s.BasePeriodS)
 }
 
 func blendPeriod(existing float64, support int, observed float64) (float64, int) {
@@ -635,7 +648,7 @@ func reinforce(s *IIDState, model *RotationModel) {
 		s.EffectivePeriodS = s.BasePeriodS
 		s.PeriodDeltaS = 0
 		s.PeriodSource = "df_alignment"
-		s.PeriodAgreesWithDF = s.PeriodS == nil || periodsAgree(*s.PeriodS, *s.BasePeriodS)
+		s.PeriodAgreesWithDF = model.DominantPeriodS != nil && periodsAgree(*model.DominantPeriodS, *s.BasePeriodS)
 		if s.PeriodAgreesWithDF {
 			s.PeriodRejectReason = ""
 		} else {
@@ -644,6 +657,11 @@ func reinforce(s *IIDState, model *RotationModel) {
 	}
 
 	confidence := confidenceFromSupport(primarySupport)
+	if s.BasePeriodS != nil && !s.PeriodAgreesWithDF {
+		s.Status = "DF_PERIOD_DISAGREE"
+		s.MultiRadarFlag = true
+		return
+	}
 	switch {
 	case s.PeriodS != nil && confidence >= 0.75:
 		s.Status = "SINGLE_RADAR"

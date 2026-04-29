@@ -38,6 +38,7 @@ func makeIIDState(iidNum uint8, periodS float64, status string, refICAO uint32) 
 // injectRef builds burst records for the given ICAO with a uniform period
 // and calls RefreshReference so that ICAO is selected as reference.
 func injectRef(s *iid.IIDState, refICAO uint32, periodS float64, count int) {
+	s.SetBasePeriod(periodS)
 	now := time.Now()
 	for i := 0; i < count; i++ {
 		s.AddBurst(refICAO, float64(i)*periodS*1_000_000.0, 2, 1)
