@@ -119,6 +119,16 @@ type DebugSnapshot struct {
 	LastSlewLimited                 bool
 	LastHardBound                   bool
 	SlopeSignConvention             string
+	HoldoverReason                  string
+	HoldoverQualityGateFailed       uint64
+	HoldoverMissingDFBasePeriod     uint64
+	HoldoverHardResidualReject      uint64
+	HoldoverNoReference             uint64
+	HoldoverStaleReferencePosition  uint64
+	HoldoverPeriodDisagreement      uint64
+	HoldoverInsufficientAircraft    uint64
+	HoldoverNoDominantFamily        uint64
+	HoldoverSyncStateMissing        uint64
 	ActiveAircraftEstimate          int
 	BurstRecordsTotal               int
 	BurstRecordsDynamicCap          int
@@ -323,6 +333,9 @@ func (s *IIDState) SetBasePeriod(periodS float64) {
 	if s.Sync != nil {
 		s.Sync.PeriodAgreesWithDF = s.PeriodAgreesWithDF
 		s.Sync.PeriodRejectReason = s.PeriodRejectReason
+		if s.PeriodRejectReason == "compact_period_disagrees_with_df" {
+			s.Sync.enterHoldover("period_disagreement")
+		}
 	}
 }
 
@@ -388,7 +401,7 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 	defer s.mu.Unlock()
 	if s.BasePeriodS == nil || *s.BasePeriodS <= 0 {
 		if s.Sync != nil {
-			s.Sync.Holdover = true
+			s.Sync.enterHoldover("missing_df_base_period")
 			s.Sync.PeriodAgreesWithDF = false
 			s.Sync.PeriodRejectReason = "missing_df_base_period"
 		}
@@ -399,6 +412,8 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 		// Bootstrap on first reference burst.
 		eligible := nAircraft >= 4 || (nAircraft >= 3 && refPosAgeS <= 2.0)
 		if !eligible {
+			// No live sync state to update yet, but preserve a diagnostic reason bucket.
+			// This is mirrored in DebugStateSnapshot as sync_state_missing-related holdover pressure.
 			return
 		}
 		s.Sync = NewSyncState(s.IID, *s.EffectivePeriodS, epochUS, phaseOffsetDeg, quality)
@@ -413,6 +428,9 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 	s.PeriodSource = s.Sync.PeriodSource
 	s.Sync.PeriodAgreesWithDF = s.PeriodAgreesWithDF
 	s.Sync.PeriodRejectReason = s.PeriodRejectReason
+	if s.PeriodRejectReason == "compact_period_disagrees_with_df" {
+		s.Sync.enterHoldover("period_disagreement")
+	}
 }
 
 func (s *IIDState) RecordBurstResidualObservation(
@@ -430,11 +448,13 @@ func (s *IIDState) RecordBurstResidualObservation(
 	}
 	if s.BasePeriodS == nil || *s.BasePeriodS <= 0 {
 		s.Sync.PeriodRefinementStatus = "missing_df_base_period"
+		s.Sync.enterHoldover("missing_df_base_period")
 		return
 	}
 	if s.RefICAO == nil {
 		s.Sync.PeriodRefinementStatus = "no_reference"
 		s.Sync.RefinementLastRejectReason = "no_reference"
+		s.Sync.enterHoldover("no_reference")
 		return
 	}
 	predicted := s.Sync.PredictBearing(epochUS)
@@ -465,13 +485,12 @@ func (s *IIDState) RecordBurstResidualValue(
 	if s.BasePeriodS == nil || *s.BasePeriodS <= 0 {
 		s.Sync.PeriodRefinementStatus = "missing_df_base_period"
 		s.Sync.RefinementLastRejectReason = "missing_df_base_period"
+		s.Sync.enterHoldover("missing_df_base_period")
 		return
 	}
-	if s.RefICAO == nil {
-		s.Sync.PeriodRefinementStatus = "no_reference"
-		s.Sync.RefinementLastRejectReason = "no_reference"
-		return
-	}
+	// Direct residual-value ingestion path: residualDeg is already computed as
+	// observed-minus-predicted in the producer path, so this path does not require
+	// a selected Go reference aircraft.
 	s.Sync.AddRefinementResidualValue(epochUS, residualDeg, icao, dominantFamily, nAircraft, refPosAgeS)
 	s.PeriodDeltaS = s.Sync.PeriodDeltaS
 	effective := s.Sync.EffectivePeriodS
@@ -591,6 +610,16 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.LastSlewLimited = s.Sync.LastSlewLimited
 		out.LastHardBound = s.Sync.LastHardBound
 		out.SlopeSignConvention = s.Sync.SlopeSignConvention
+		out.HoldoverReason = s.Sync.HoldoverReason
+		out.HoldoverQualityGateFailed = s.Sync.HoldoverReasonCounts["quality_gate_failed"]
+		out.HoldoverMissingDFBasePeriod = s.Sync.HoldoverReasonCounts["missing_df_base_period"]
+		out.HoldoverHardResidualReject = s.Sync.HoldoverReasonCounts["hard_residual_reject"]
+		out.HoldoverNoReference = s.Sync.HoldoverReasonCounts["no_reference"]
+		out.HoldoverStaleReferencePosition = s.Sync.HoldoverReasonCounts["stale_reference_position"]
+		out.HoldoverPeriodDisagreement = s.Sync.HoldoverReasonCounts["period_disagreement"]
+		out.HoldoverInsufficientAircraft = s.Sync.HoldoverReasonCounts["insufficient_aircraft"]
+		out.HoldoverNoDominantFamily = s.Sync.HoldoverReasonCounts["no_dominant_family"]
+		out.HoldoverSyncStateMissing = s.Sync.HoldoverReasonCounts["sync_state_missing"]
 		out.PeriodRefinementStatus = s.Sync.PeriodRefinementStatus
 		out.RefinementPlottedCount = s.Sync.RefinementPlottedCount
 		out.RefinementEligibleCount = s.Sync.RefinementEligibleCount

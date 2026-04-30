@@ -338,6 +338,24 @@ func TestPeriodRefinement_RecordResidualValueDoesNotDoubleSubtractPrediction(t *
 	}
 }
 
+func TestPeriodRefinement_RecordResidualValueWithoutReferenceAllowed(t *testing.T) {
+	s := NewIIDState(26)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Sync = NewSyncState(s.IID, base, 0.0, 0.0, 1.0)
+	// No RefICAO on purpose: direct residual-value path should still accumulate.
+	for i := 1; i <= 30; i++ {
+		epochUS := float64(i) * 1_000_000.0
+		s.RecordBurstResidualValue(epochUS, uint32(0xAB1000+i%5), float64(i)*0.2, 6, 0.5, true)
+	}
+	if s.PeriodDeltaS == 0 {
+		t.Fatal("expected non-zero delta from direct residual stream without RefICAO")
+	}
+	if s.Sync.RefinementLastRejectReason == "no_reference" {
+		t.Fatal("direct residual path should not require Go RefICAO")
+	}
+}
+
 func TestPeriodRefinement_NegativeSlopeDrivesPositiveDelta(t *testing.T) {
 	s := NewIIDState(28)
 	base := 4.0

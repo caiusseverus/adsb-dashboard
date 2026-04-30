@@ -1214,6 +1214,9 @@ def test_holdover_and_unavailable_states_are_conservative():
     assert holdover_payload["period_authority"] == "holdover"
     assert holdover_payload["sync_authority"] == "holdover"
     assert holdover_payload["period_refinement_status"] == "holdover"
+    assert holdover_payload["base_period_s"] == pytest.approx(4.0)
+    assert holdover_payload["effective_period_s"] == pytest.approx(4.1)
+    assert holdover_payload["period_delta_s"] == pytest.approx(0.1)
 
     unavailable_sync = LiveSyncState(
         iid=55,
@@ -2853,6 +2856,21 @@ def test_go_handoff_rejects_holdover_when_python_base_valid():
     assert payload["handoff_state"] == "BASE_PERIOD_READY"
     assert payload["handoff_reason"] == "go_holdover"
     assert payload["period_authority"] == "holdover"
+
+
+def test_go_sync_snapshot_exposes_holdover_reason_counters():
+    state = RadarState()
+    state._models[34] = RadarIID(iid=34, status="SINGLE_RADAR", period_s=4.0, primary_support_count=6)
+    state.update_go_iid_state({
+        "i": 34, "sp": True, "su": True, "sps": 4.0, "sep": 1000.0, "sod": 10.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": True, "lu": 2000.0, "rv": 1, "bps": 4.0, "eps": 4.0, "pag": True,
+        "shr": "hard_residual_reject", "shh": 5, "shq": 2,
+    })
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(34))
+    assert payload["holdover_reason"] == "hard_residual_reject"
+    assert payload["last_sync_reject_reason"] == "hard_residual_reject"
+    assert payload["holdover_hard_residual_reject"] == 5
+    assert payload["holdover_quality_gate_failed"] == 2
 
 
 def test_go_handoff_rejects_period_disagreement():

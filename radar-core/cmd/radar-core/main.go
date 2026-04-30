@@ -533,6 +533,16 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 			"period_refinement_status":          snap.PeriodRefinementStatus,
 			"period_agrees_with_df":             snap.PeriodAgreesWithDF,
 			"period_reject_reason":              snap.PeriodRejectReason,
+			"holdover_reason":                   snap.HoldoverReason,
+			"holdover_quality_gate_failed":      snap.HoldoverQualityGateFailed,
+			"holdover_missing_df_base_period":   snap.HoldoverMissingDFBasePeriod,
+			"holdover_hard_residual_reject":     snap.HoldoverHardResidualReject,
+			"holdover_no_reference":             snap.HoldoverNoReference,
+			"holdover_stale_reference_position": snap.HoldoverStaleReferencePosition,
+			"holdover_period_disagreement":      snap.HoldoverPeriodDisagreement,
+			"holdover_insufficient_aircraft":    snap.HoldoverInsufficientAircraft,
+			"holdover_no_dominant_family":       snap.HoldoverNoDominantFamily,
+			"holdover_sync_state_missing":       snap.HoldoverSyncStateMissing,
 			"period_refinement_plotted_count":   snap.RefinementPlottedCount,
 			"period_refinement_eligible_count":  snap.RefinementEligibleCount,
 			"period_refinement_rejected_count":  snap.RefinementRejectedCount,
@@ -792,53 +802,63 @@ func (e *engine) emitIIDState(iidNum uint8, s *iid.IIDState, nBurstRecords uint1
 	}
 
 	msg := &protocol.IIDState{
-		MsgType:                  protocol.MsgIIDState,
-		IID:                      iidNum,
-		PeriodS:                  periodS,
-		RPM:                      rpmMsg,
-		Status:                   status,
-		RefICAO:                  refICAO,
-		SyncQuality:              syncQuality,
-		SyncStatePresent:         syncPresent,
-		SyncStateUsable:          syncUsable,
-		SyncPeriodS:              syncPeriodS,
-		SyncPhaseEpochUS:         syncPhaseEpochUS,
-		SyncPhaseOffsetDeg:       syncPhaseOffsetDeg,
-		SyncJitterDeg:            syncJitterDeg,
-		SyncResidualEMA:          syncResidualEMA,
-		SyncLastResidual:         syncLastResidual,
-		SyncNFrames:              syncNFrames,
-		SyncNRejected:            syncNRejected,
-		SyncHoldover:             syncHoldover,
-		PeriodSource:             snapPeriodSource(s),
-		BasePeriodS:              snapBasePeriod(s),
-		PeriodDeltaS:             snapPeriodDelta(s),
-		EffectivePeriodS:         snapEffectivePeriod(s),
-		ResidualSlopeDegPS:       snapResidualSlope(s),
-		ResidualSlopeEMADegPS:    snapResidualSlopeEMA(s),
-		ResidualSlopeStdDegPS:    snapResidualSlopeStd(s),
-		ProposedDeltaS:           snapProposedDelta(s),
-		AppliedDeltaS:            snapAppliedDelta(s),
-		LastSlewLimited:          snapLastSlewLimited(s),
-		LastHardBound:            snapLastHardBound(s),
-		PeriodRefineStatus:       snapPeriodRefineStatus(s),
-		PeriodAgreesWithDF:       snapPeriodAgrees(s),
-		PeriodRejectReason:       snapPeriodRejectReason(s),
-		FitObservationCount:      snapFitObservationCount(s),
-		FitSpanS:                 snapFitSpanS(s),
-		FitICAOCount:             snapFitICAOCount(s),
-		FitPerICAOMin:            snapFitPerICAOMin(s),
-		FitPerICAOMedian:         snapFitPerICAOMedian(s),
-		FitPerICAOMax:            snapFitPerICAOMax(s),
-		FitRetentionWindowS:      snapFitRetentionWindowS(s),
-		FitGlobalCapHit:          snapFitGlobalCapHit(s),
-		FitLastEvictionReason:    snapFitLastEvictionReason(s),
-		SuspiciousICAOCount:      snapSuspiciousICAOCount(s),
-		SuspiciousICAOLastReason: snapSuspiciousICAOLastReason(s),
-		SlopeSignConvention:      snapSlopeSignConvention(s),
-		NBurstRecords:            nBurstRecords,
-		LastUpdated:              float64(time.Now().UnixMicro()) / 1e6,
-		Revision:                 rev,
+		MsgType:                        protocol.MsgIIDState,
+		IID:                            iidNum,
+		PeriodS:                        periodS,
+		RPM:                            rpmMsg,
+		Status:                         status,
+		RefICAO:                        refICAO,
+		SyncQuality:                    syncQuality,
+		SyncStatePresent:               syncPresent,
+		SyncStateUsable:                syncUsable,
+		SyncPeriodS:                    syncPeriodS,
+		SyncPhaseEpochUS:               syncPhaseEpochUS,
+		SyncPhaseOffsetDeg:             syncPhaseOffsetDeg,
+		SyncJitterDeg:                  syncJitterDeg,
+		SyncResidualEMA:                syncResidualEMA,
+		SyncLastResidual:               syncLastResidual,
+		SyncNFrames:                    syncNFrames,
+		SyncNRejected:                  syncNRejected,
+		SyncHoldover:                   syncHoldover,
+		PeriodSource:                   snapPeriodSource(s),
+		BasePeriodS:                    snapBasePeriod(s),
+		PeriodDeltaS:                   snapPeriodDelta(s),
+		EffectivePeriodS:               snapEffectivePeriod(s),
+		ResidualSlopeDegPS:             snapResidualSlope(s),
+		ResidualSlopeEMADegPS:          snapResidualSlopeEMA(s),
+		ResidualSlopeStdDegPS:          snapResidualSlopeStd(s),
+		ProposedDeltaS:                 snapProposedDelta(s),
+		AppliedDeltaS:                  snapAppliedDelta(s),
+		LastSlewLimited:                snapLastSlewLimited(s),
+		LastHardBound:                  snapLastHardBound(s),
+		PeriodRefineStatus:             snapPeriodRefineStatus(s),
+		PeriodAgreesWithDF:             snapPeriodAgrees(s),
+		PeriodRejectReason:             snapPeriodRejectReason(s),
+		FitObservationCount:            snapFitObservationCount(s),
+		FitSpanS:                       snapFitSpanS(s),
+		FitICAOCount:                   snapFitICAOCount(s),
+		FitPerICAOMin:                  snapFitPerICAOMin(s),
+		FitPerICAOMedian:               snapFitPerICAOMedian(s),
+		FitPerICAOMax:                  snapFitPerICAOMax(s),
+		FitRetentionWindowS:            snapFitRetentionWindowS(s),
+		FitGlobalCapHit:                snapFitGlobalCapHit(s),
+		FitLastEvictionReason:          snapFitLastEvictionReason(s),
+		SuspiciousICAOCount:            snapSuspiciousICAOCount(s),
+		SuspiciousICAOLastReason:       snapSuspiciousICAOLastReason(s),
+		SlopeSignConvention:            snapSlopeSignConvention(s),
+		HoldoverReason:                 snapHoldoverReason(s),
+		HoldoverQualityGateFailed:      snapHoldoverCount(s, "quality_gate_failed"),
+		HoldoverMissingDFBasePeriod:    snapHoldoverCount(s, "missing_df_base_period"),
+		HoldoverHardResidualReject:     snapHoldoverCount(s, "hard_residual_reject"),
+		HoldoverNoReference:            snapHoldoverCount(s, "no_reference"),
+		HoldoverStaleReferencePosition: snapHoldoverCount(s, "stale_reference_position"),
+		HoldoverPeriodDisagreement:     snapHoldoverCount(s, "period_disagreement"),
+		HoldoverInsufficientAircraft:   snapHoldoverCount(s, "insufficient_aircraft"),
+		HoldoverNoDominantFamily:       snapHoldoverCount(s, "no_dominant_family"),
+		HoldoverSyncStateMissing:       snapHoldoverCount(s, "sync_state_missing"),
+		NBurstRecords:                  nBurstRecords,
+		LastUpdated:                    float64(time.Now().UnixMicro()) / 1e6,
+		Revision:                       rev,
 	}
 	e.writer.SendIIDState(msg)
 
@@ -980,6 +1000,35 @@ func snapSuspiciousICAOLastReason(s *iid.IIDState) string {
 }
 func snapSlopeSignConvention(s *iid.IIDState) string {
 	return s.DebugStateSnapshot().SlopeSignConvention
+}
+func snapHoldoverReason(s *iid.IIDState) string { return s.DebugStateSnapshot().HoldoverReason }
+func snapHoldoverCount(s *iid.IIDState, reason string) uint32 {
+	snap := s.DebugStateSnapshot()
+	var v uint64
+	switch reason {
+	case "quality_gate_failed":
+		v = snap.HoldoverQualityGateFailed
+	case "missing_df_base_period":
+		v = snap.HoldoverMissingDFBasePeriod
+	case "hard_residual_reject":
+		v = snap.HoldoverHardResidualReject
+	case "no_reference":
+		v = snap.HoldoverNoReference
+	case "stale_reference_position":
+		v = snap.HoldoverStaleReferencePosition
+	case "period_disagreement":
+		v = snap.HoldoverPeriodDisagreement
+	case "insufficient_aircraft":
+		v = snap.HoldoverInsufficientAircraft
+	case "no_dominant_family":
+		v = snap.HoldoverNoDominantFamily
+	case "sync_state_missing":
+		v = snap.HoldoverSyncStateMissing
+	}
+	if v > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(v)
 }
 
 func (e *engine) runFMWorker(stop <-chan struct{}) {

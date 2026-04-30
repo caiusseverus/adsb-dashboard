@@ -94,6 +94,16 @@ class LiveSyncState:
     last_slew_limited: bool | None = None
     last_hard_bound: bool | None = None
     slope_sign_convention: str | None = None
+    holdover_reason: str | None = None
+    holdover_quality_gate_failed: int = 0
+    holdover_missing_df_base_period: int = 0
+    holdover_hard_residual_reject: int = 0
+    holdover_no_reference: int = 0
+    holdover_stale_reference_position: int = 0
+    holdover_period_disagreement: int = 0
+    holdover_insufficient_aircraft: int = 0
+    holdover_no_dominant_family: int = 0
+    holdover_sync_state_missing: int = 0
 
 
 @dataclass

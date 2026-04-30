@@ -174,6 +174,9 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
                 "suspicious_icao_count": 1,
                 "suspicious_icao_last_reason": "hard_outlier",
                 "slope_sign_convention": "observed_minus_predicted",
+                "holdover_reason": "hard_residual_reject",
+                "holdover_quality_gate_failed": 2,
+                "holdover_hard_residual_reject": 7,
                 "period_agrees_with_df": True,
                 "multi_sync_admission": {
                     "last_reason": "no_receiver_config",
@@ -243,6 +246,9 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     assert payload["sync_state"]["proposed_delta_s"] == pytest.approx(0.0005)
     assert payload["sync_state"]["applied_delta_s"] == pytest.approx(0.0001)
     assert payload["sync_state"]["suspicious_icao_count"] == 1
+    assert payload["sync_state"]["holdover_reason"] == "hard_residual_reject"
+    assert payload["sync_state"]["last_sync_reject_reason"] == "hard_residual_reject"
+    assert payload["sync_state"]["holdover_hard_residual_reject"] == 7
     assert payload["sync_state"]["effective_period_source"] == "go_runtime.base_period_s"
     assert "handoff_state" in payload["sync_state"]
     assert "handoff_gate_failures" in payload["sync_state"]

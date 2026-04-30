@@ -482,6 +482,17 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
         "applied_delta_s": getattr(sync, "applied_delta_s", None),
         "last_slew_limited": getattr(sync, "last_slew_limited", None),
         "last_hard_bound": getattr(sync, "last_hard_bound", None),
+        "holdover_reason": getattr(sync, "holdover_reason", None),
+        "last_sync_reject_reason": getattr(sync, "holdover_reason", None),
+        "holdover_quality_gate_failed": getattr(sync, "holdover_quality_gate_failed", None),
+        "holdover_missing_df_base_period": getattr(sync, "holdover_missing_df_base_period", None),
+        "holdover_hard_residual_reject": getattr(sync, "holdover_hard_residual_reject", None),
+        "holdover_no_reference": getattr(sync, "holdover_no_reference", None),
+        "holdover_stale_reference_position": getattr(sync, "holdover_stale_reference_position", None),
+        "holdover_period_disagreement": getattr(sync, "holdover_period_disagreement", None),
+        "holdover_insufficient_aircraft": getattr(sync, "holdover_insufficient_aircraft", None),
+        "holdover_no_dominant_family": getattr(sync, "holdover_no_dominant_family", None),
+        "holdover_sync_state_missing": getattr(sync, "holdover_sync_state_missing", None),
     })
     return payload
 
@@ -2412,6 +2423,16 @@ class RadarState:
                 "last_slew_limited": bool(entry.get("last_slew_limited", False)),
                 "last_hard_bound": bool(entry.get("last_hard_bound", False)),
                 "slope_sign_convention": str(entry.get("slope_sign_convention") or ""),
+                "holdover_reason": str(entry.get("holdover_reason") or ""),
+                "holdover_quality_gate_failed": int(entry.get("holdover_quality_gate_failed") or 0),
+                "holdover_missing_df_base_period": int(entry.get("holdover_missing_df_base_period") or 0),
+                "holdover_hard_residual_reject": int(entry.get("holdover_hard_residual_reject") or 0),
+                "holdover_no_reference": int(entry.get("holdover_no_reference") or 0),
+                "holdover_stale_reference_position": int(entry.get("holdover_stale_reference_position") or 0),
+                "holdover_period_disagreement": int(entry.get("holdover_period_disagreement") or 0),
+                "holdover_insufficient_aircraft": int(entry.get("holdover_insufficient_aircraft") or 0),
+                "holdover_no_dominant_family": int(entry.get("holdover_no_dominant_family") or 0),
+                "holdover_sync_state_missing": int(entry.get("holdover_sync_state_missing") or 0),
             }
         except Exception:
             return None
@@ -2871,6 +2892,16 @@ class RadarState:
             last_slew_limited=bool(go_sync.get("last_slew_limited", False)),
             last_hard_bound=bool(go_sync.get("last_hard_bound", False)),
             slope_sign_convention=str(go_sync.get("slope_sign_convention") or "") or None,
+            holdover_reason=str(go_sync.get("holdover_reason") or "") or None,
+            holdover_quality_gate_failed=int(go_sync.get("holdover_quality_gate_failed") or 0),
+            holdover_missing_df_base_period=int(go_sync.get("holdover_missing_df_base_period") or 0),
+            holdover_hard_residual_reject=int(go_sync.get("holdover_hard_residual_reject") or 0),
+            holdover_no_reference=int(go_sync.get("holdover_no_reference") or 0),
+            holdover_stale_reference_position=int(go_sync.get("holdover_stale_reference_position") or 0),
+            holdover_period_disagreement=int(go_sync.get("holdover_period_disagreement") or 0),
+            holdover_insufficient_aircraft=int(go_sync.get("holdover_insufficient_aircraft") or 0),
+            holdover_no_dominant_family=int(go_sync.get("holdover_no_dominant_family") or 0),
+            holdover_sync_state_missing=int(go_sync.get("holdover_sync_state_missing") or 0),
             handoff_state=(
                 str(getattr(existing, "handoff_state", "") or "UNTRUSTED")
                 if existing is not None else
@@ -2937,6 +2968,16 @@ class RadarState:
                 "suspicious_icao_count": iid_state.get("sic"),
                 "suspicious_icao_last_reason": iid_state.get("sir"),
                 "slope_sign_convention": iid_state.get("ssc"),
+                "holdover_reason": iid_state.get("shr"),
+                "holdover_quality_gate_failed": iid_state.get("shq"),
+                "holdover_missing_df_base_period": iid_state.get("shm"),
+                "holdover_hard_residual_reject": iid_state.get("shh"),
+                "holdover_no_reference": iid_state.get("shn"),
+                "holdover_stale_reference_position": iid_state.get("shs"),
+                "holdover_period_disagreement": iid_state.get("shp"),
+                "holdover_insufficient_aircraft": iid_state.get("shi"),
+                "holdover_no_dominant_family": iid_state.get("shd"),
+                "holdover_sync_state_missing": iid_state.get("shx"),
             })
             if go_sync is not None:
                 self._go_sync_states_by_iid[iid] = go_sync

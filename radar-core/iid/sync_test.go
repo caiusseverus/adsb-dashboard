@@ -274,6 +274,27 @@ func TestSyncState_PeriodRefinement_RejectsExcessiveSlope(t *testing.T) {
 	}
 }
 
+func TestSyncState_HoldoverReason_QualityGateAndHardResidual(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	accepted := s.UpdateEpoch(4_000_000.0, 0.0, 4.0, 1.0, 2, 0.5)
+	if accepted {
+		t.Fatal("expected reject on insufficient aircraft")
+	}
+	if s.HoldoverReason != "insufficient_aircraft" {
+		t.Fatalf("holdover reason=%q", s.HoldoverReason)
+	}
+	if s.HoldoverReasonCounts["quality_gate_failed"] == 0 {
+		t.Fatal("expected quality_gate_failed count")
+	}
+	accepted = s.UpdateEpoch(8_000_000.0, 80.0, 4.0, 1.0, 6, 0.5)
+	if accepted {
+		t.Fatal("expected hard residual reject")
+	}
+	if s.HoldoverReason != "hard_residual_reject" {
+		t.Fatalf("holdover reason=%q", s.HoldoverReason)
+	}
+}
+
 func TestSyncState_UpdateEpoch_UsesEffectivePeriodForPrediction(t *testing.T) {
 	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
 	s.PeriodDeltaS = -0.2

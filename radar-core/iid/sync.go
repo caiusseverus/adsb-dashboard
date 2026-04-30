@@ -59,6 +59,8 @@ type SyncState struct {
 	LastSlewLimited               bool
 	LastHardBound                 bool
 	SlopeSignConvention           string
+	HoldoverReason                string
+	HoldoverReasonCounts          map[string]uint64
 	residualHistory               []residualObservation
 	icaoRejectHistory             map[uint32][]float64
 	icaoSuspiciousUntil           map[uint32]float64
@@ -142,8 +144,17 @@ func NewSyncState(iid uint8, periodS, epochUS, phaseOffsetDeg, quality float64) 
 		PeriodRefinementStatus: "base_only",
 		FitRetentionWindowS:    refinementFitWindowS,
 		SlopeSignConvention:    "observed_minus_predicted",
+		HoldoverReasonCounts:   make(map[string]uint64),
 		icaoRejectHistory:      make(map[uint32][]float64),
 		icaoSuspiciousUntil:    make(map[uint32]float64),
+	}
+}
+
+func (s *SyncState) enterHoldover(reason string) {
+	s.Holdover = true
+	s.HoldoverReason = reason
+	if reason != "" {
+		s.HoldoverReasonCounts[reason] = s.HoldoverReasonCounts[reason] + 1
 	}
 }
 
@@ -155,7 +166,7 @@ func NewSyncState(iid uint8, periodS, epochUS, phaseOffsetDeg, quality float64) 
 // Returns true if the update was accepted.
 func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float64, nAircraft int, refPosAgeS float64) bool {
 	if periodS <= 0 || math.IsNaN(periodS) || math.IsInf(periodS, 0) {
-		s.Holdover = true
+		s.enterHoldover("missing_df_base_period")
 		s.PeriodRejectReason = "missing_df_base_period"
 		s.PeriodRefinementStatus = "missing_df_base_period"
 		s.PeriodDeltaS = 0
@@ -168,7 +179,12 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 	// Quality gate: frame must have >= 4 aircraft, or >= 3 with fresh ref position.
 	eligible := nAircraft >= 4 || (nAircraft >= 3 && refPosAgeS <= 2.0)
 	if !eligible {
-		s.Holdover = true
+		s.enterHoldover("quality_gate_failed")
+		if nAircraft < 3 {
+			s.enterHoldover("insufficient_aircraft")
+		} else {
+			s.enterHoldover("stale_reference_position")
+		}
 		return false
 	}
 
@@ -191,7 +207,7 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 		s.LastResidualDeg = residual
 		s.ResidualEMA = newResidualEMA
 		s.SyncJitterDeg = clamp(newResidualEMA, 2.0, 20.0)
-		s.Holdover = true
+		s.enterHoldover("hard_residual_reject")
 		return false
 	}
 
@@ -232,6 +248,7 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 	s.NSyncFrames++
 	s.LastResidualDeg = residual
 	s.Holdover = false
+	s.HoldoverReason = ""
 	s.LastUpdated = time.Now()
 	return true
 }
@@ -408,6 +425,7 @@ func (s *SyncState) AddRefinementResidualObservation(
 		s.FitRejectedObservations++
 		s.PeriodRefinementStatus = "no_dominant_family"
 		s.RefinementLastRejectReason = "no_dominant_family"
+		s.HoldoverReasonCounts["no_dominant_family"] = s.HoldoverReasonCounts["no_dominant_family"] + 1
 		s.markICAORejectLocked(icao, nowS, "no_dominant_family")
 		return
 	}

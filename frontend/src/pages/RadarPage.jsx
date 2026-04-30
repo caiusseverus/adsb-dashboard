@@ -1860,9 +1860,13 @@ function authorityModeLabel(syncState) {
 
 function getOperationalPeriodTriple(syncState) {
   if (!syncState) return null
-  const base = Number(syncState.base_period_s)
-  const delta = Number(syncState.period_delta_s)
-  const effective = Number(syncState.effective_period_s)
+  const baseRaw = syncState.base_period_s
+  const deltaRaw = syncState.period_delta_s
+  const effectiveRaw = syncState.effective_period_s
+  if (![baseRaw, deltaRaw, effectiveRaw].every(isFiniteValue)) return null
+  const base = Number(baseRaw)
+  const delta = Number(deltaRaw)
+  const effective = Number(effectiveRaw)
   if ([base, delta, effective].every(Number.isFinite)) return { base, delta, effective }
   return null
 }
@@ -2289,7 +2293,9 @@ function RotationAlignmentPanel({
   const legacyIcaosRaw = Array.isArray(legacyTimeline?.icaos) ? legacyTimeline.icaos : []
   const syncState = burstTimeline?.sync_state ?? null
   const loading = legacyLoading || streamStatus.mode === 'connecting' || streamStatus.mode === 'reconnecting'
-  const periodS = syncState?.period_s ?? rotation?.period_s ?? selectedRow?.period_s ?? null
+  const periodS = isFiniteValue(syncState?.effective_period_s)
+    ? Number(syncState.effective_period_s)
+    : (rotation?.period_s ?? selectedRow?.period_s ?? null)
   const legacyPeriodS = legacyTimeline?.dominant_period_s ?? rotation?.period_s ?? selectedRow?.period_s ?? null
   const legacyPeriodUs = legacyPeriodS != null ? legacyPeriodS * 1_000_000 : null
   const latestBurstUs = observations.reduce((max, obs) => {
@@ -2711,6 +2717,7 @@ function RotationAlignmentPanel({
           <span className={styles.metricPill}>Diag: phase authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.phase_authority)}</span></span>
           <span className={styles.metricPill}>Diag: handoff state <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.handoff_state)}</span></span>
           <span className={styles.metricPill}>Diag: handoff reason <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.handoff_reason)}</span></span>
+          <span className={styles.metricPill}>Diag: holdover reason <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.holdover_reason ?? syncState?.last_sync_reject_reason)}</span></span>
           <span className={styles.metricPill}>Diag: effective period source <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.effective_period_source)}</span></span>
           <span className={styles.metricPill}>Diag: period Δ source <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.period_delta_source)}</span></span>
           <span className={styles.metricPill}>Phase basis <span className={styles.metricValue}>{syncState?.phase_basis ?? '—'}</span></span>
