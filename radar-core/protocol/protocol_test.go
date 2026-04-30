@@ -119,17 +119,17 @@ func TestResetIIDRoundTrip(t *testing.T) {
 
 func TestBurstFiredRoundTrip(t *testing.T) {
 	orig := &protocol.BurstFired{
-		MsgType:             protocol.MsgBurstFired,
-		IID:                 2,
-		ICAO:                0x3C4B4A,
-		CentroidUS:          9876543210.75,
-		NReplies:            5,
-		SignalDBFS:          pf32(-33.0),
-		Lat:                 pf64(51.5),
-		Lon:                 pf64(-0.1),
-		BearingDeg:          pf32(275.3),
-		RangeNM:             pf32(42.1),
-		PosAgeS:             pf32(1.2),
+		MsgType:        protocol.MsgBurstFired,
+		IID:            2,
+		ICAO:           0x3C4B4A,
+		CentroidUS:     9876543210.75,
+		NReplies:       5,
+		SignalDBFS:     pf32(-33.0),
+		Lat:            pf64(51.5),
+		Lon:            pf64(-0.1),
+		BearingDeg:     pf32(275.3),
+		RangeNM:        pf32(42.1),
+		PosAgeS:        pf32(1.2),
 		DominantFamily: true,
 	}
 	got := roundTrip(t, orig).(*protocol.BurstFired)
@@ -235,16 +235,18 @@ func TestIIDStateRoundTrip(t *testing.T) {
 	rpm := float32(14.97)
 	refICAO := uint32(0xDEAD01)
 	orig := &protocol.IIDState{
-		MsgType:       protocol.MsgIIDState,
-		IID:           3,
-		PeriodS:       &period,
-		RPM:           &rpm,
-		Status:        "SINGLE_RADAR",
-		RefICAO:       &refICAO,
-		SyncQuality:   0.95,
-		NBurstRecords: 212,
-		LastUpdated:   1714000100.0,
-		Revision:      7,
+		MsgType:             protocol.MsgIIDState,
+		IID:                 3,
+		PeriodS:             &period,
+		RPM:                 &rpm,
+		Status:              "SINGLE_RADAR",
+		RefICAO:             &refICAO,
+		SyncQuality:         0.95,
+		FitObservationCount: 32,
+		SlopeSignConvention: "observed_minus_predicted",
+		NBurstRecords:       212,
+		LastUpdated:         1714000100.0,
+		Revision:            7,
 	}
 	got := roundTrip(t, orig).(*protocol.IIDState)
 	if got.Status != orig.Status {
@@ -255,6 +257,12 @@ func TestIIDStateRoundTrip(t *testing.T) {
 	}
 	if got.PeriodS == nil || math.Abs(*got.PeriodS-*orig.PeriodS) > 1e-9 {
 		t.Errorf("PeriodS: got %v want %v", got.PeriodS, orig.PeriodS)
+	}
+	if got.FitObservationCount != orig.FitObservationCount {
+		t.Errorf("FitObservationCount: got %v want %v", got.FitObservationCount, orig.FitObservationCount)
+	}
+	if got.SlopeSignConvention != orig.SlopeSignConvention {
+		t.Errorf("SlopeSignConvention: got %q want %q", got.SlopeSignConvention, orig.SlopeSignConvention)
 	}
 }
 

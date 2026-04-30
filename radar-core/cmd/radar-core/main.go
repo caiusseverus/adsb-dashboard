@@ -792,35 +792,53 @@ func (e *engine) emitIIDState(iidNum uint8, s *iid.IIDState, nBurstRecords uint1
 	}
 
 	msg := &protocol.IIDState{
-		MsgType:            protocol.MsgIIDState,
-		IID:                iidNum,
-		PeriodS:            periodS,
-		RPM:                rpmMsg,
-		Status:             status,
-		RefICAO:            refICAO,
-		SyncQuality:        syncQuality,
-		SyncStatePresent:   syncPresent,
-		SyncStateUsable:    syncUsable,
-		SyncPeriodS:        syncPeriodS,
-		SyncPhaseEpochUS:   syncPhaseEpochUS,
-		SyncPhaseOffsetDeg: syncPhaseOffsetDeg,
-		SyncJitterDeg:      syncJitterDeg,
-		SyncResidualEMA:    syncResidualEMA,
-		SyncLastResidual:   syncLastResidual,
-		SyncNFrames:        syncNFrames,
-		SyncNRejected:      syncNRejected,
-		SyncHoldover:       syncHoldover,
-		PeriodSource:       snapPeriodSource(s),
-		BasePeriodS:        snapBasePeriod(s),
-		PeriodDeltaS:       snapPeriodDelta(s),
-		EffectivePeriodS:   snapEffectivePeriod(s),
-		ResidualSlopeDegPS: snapResidualSlope(s),
-		PeriodRefineStatus: snapPeriodRefineStatus(s),
-		PeriodAgreesWithDF: snapPeriodAgrees(s),
-		PeriodRejectReason: snapPeriodRejectReason(s),
-		NBurstRecords:      nBurstRecords,
-		LastUpdated:        float64(time.Now().UnixMicro()) / 1e6,
-		Revision:           rev,
+		MsgType:                  protocol.MsgIIDState,
+		IID:                      iidNum,
+		PeriodS:                  periodS,
+		RPM:                      rpmMsg,
+		Status:                   status,
+		RefICAO:                  refICAO,
+		SyncQuality:              syncQuality,
+		SyncStatePresent:         syncPresent,
+		SyncStateUsable:          syncUsable,
+		SyncPeriodS:              syncPeriodS,
+		SyncPhaseEpochUS:         syncPhaseEpochUS,
+		SyncPhaseOffsetDeg:       syncPhaseOffsetDeg,
+		SyncJitterDeg:            syncJitterDeg,
+		SyncResidualEMA:          syncResidualEMA,
+		SyncLastResidual:         syncLastResidual,
+		SyncNFrames:              syncNFrames,
+		SyncNRejected:            syncNRejected,
+		SyncHoldover:             syncHoldover,
+		PeriodSource:             snapPeriodSource(s),
+		BasePeriodS:              snapBasePeriod(s),
+		PeriodDeltaS:             snapPeriodDelta(s),
+		EffectivePeriodS:         snapEffectivePeriod(s),
+		ResidualSlopeDegPS:       snapResidualSlope(s),
+		ResidualSlopeEMADegPS:    snapResidualSlopeEMA(s),
+		ResidualSlopeStdDegPS:    snapResidualSlopeStd(s),
+		ProposedDeltaS:           snapProposedDelta(s),
+		AppliedDeltaS:            snapAppliedDelta(s),
+		LastSlewLimited:          snapLastSlewLimited(s),
+		LastHardBound:            snapLastHardBound(s),
+		PeriodRefineStatus:       snapPeriodRefineStatus(s),
+		PeriodAgreesWithDF:       snapPeriodAgrees(s),
+		PeriodRejectReason:       snapPeriodRejectReason(s),
+		FitObservationCount:      snapFitObservationCount(s),
+		FitSpanS:                 snapFitSpanS(s),
+		FitICAOCount:             snapFitICAOCount(s),
+		FitPerICAOMin:            snapFitPerICAOMin(s),
+		FitPerICAOMedian:         snapFitPerICAOMedian(s),
+		FitPerICAOMax:            snapFitPerICAOMax(s),
+		FitRetentionWindowS:      snapFitRetentionWindowS(s),
+		FitGlobalCapHit:          snapFitGlobalCapHit(s),
+		FitLastEvictionReason:    snapFitLastEvictionReason(s),
+		SuspiciousICAOCount:      snapSuspiciousICAOCount(s),
+		SuspiciousICAOLastReason: snapSuspiciousICAOLastReason(s),
+		SlopeSignConvention:      snapSlopeSignConvention(s),
+		NBurstRecords:            nBurstRecords,
+		LastUpdated:              float64(time.Now().UnixMicro()) / 1e6,
+		Revision:                 rev,
 	}
 	e.writer.SendIIDState(msg)
 
@@ -878,6 +896,90 @@ func snapPeriodRefineStatus(s *iid.IIDState) string {
 
 func snapPeriodRejectReason(s *iid.IIDState) string {
 	return s.DebugStateSnapshot().PeriodRejectReason
+}
+func snapResidualSlopeEMA(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().ResidualSlopeEMADegPerS
+	return &v
+}
+func snapResidualSlopeStd(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().ResidualSlopeStdDegPerS
+	return &v
+}
+func snapProposedDelta(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().ProposedDeltaS
+	return &v
+}
+func snapAppliedDelta(s *iid.IIDState) *float64 { v := s.DebugStateSnapshot().AppliedDeltaS; return &v }
+func snapLastSlewLimited(s *iid.IIDState) bool  { return s.DebugStateSnapshot().LastSlewLimited }
+func snapLastHardBound(s *iid.IIDState) bool    { return s.DebugStateSnapshot().LastHardBound }
+func snapFitObservationCount(s *iid.IIDState) uint16 {
+	v := s.DebugStateSnapshot().FitObservationCount
+	if v < 0 {
+		return 0
+	}
+	if v > math.MaxUint16 {
+		return math.MaxUint16
+	}
+	return uint16(v)
+}
+func snapFitSpanS(s *iid.IIDState) *float64 { v := s.DebugStateSnapshot().FitSpanS; return &v }
+func snapFitICAOCount(s *iid.IIDState) uint16 {
+	v := s.DebugStateSnapshot().FitICAOCount
+	if v < 0 {
+		return 0
+	}
+	if v > math.MaxUint16 {
+		return math.MaxUint16
+	}
+	return uint16(v)
+}
+func snapFitPerICAOMin(s *iid.IIDState) uint16 {
+	v := s.DebugStateSnapshot().FitObservationsPerICAOMin
+	if v < 0 {
+		return 0
+	}
+	if v > math.MaxUint16 {
+		return math.MaxUint16
+	}
+	return uint16(v)
+}
+func snapFitPerICAOMedian(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().FitObservationsPerICAOMedian
+	return &v
+}
+func snapFitPerICAOMax(s *iid.IIDState) uint16 {
+	v := s.DebugStateSnapshot().FitObservationsPerICAOMax
+	if v < 0 {
+		return 0
+	}
+	if v > math.MaxUint16 {
+		return math.MaxUint16
+	}
+	return uint16(v)
+}
+func snapFitRetentionWindowS(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().FitRetentionWindowS
+	return &v
+}
+func snapFitGlobalCapHit(s *iid.IIDState) bool { return s.DebugStateSnapshot().FitGlobalCapHit }
+func snapFitLastEvictionReason(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().FitLastEvictionReason
+}
+func snapSuspiciousICAOCount(s *iid.IIDState) uint16 {
+	v := s.DebugStateSnapshot().SuspiciousICAOCount
+	if v < 0 {
+		return 0
+	}
+	if v > math.MaxUint16 {
+		return math.MaxUint16
+	}
+	return uint16(v)
+}
+func snapSuspiciousICAOLastReason(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().SuspiciousICAOLastReason
+}
+func snapSlopeSignConvention(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().SlopeSignConvention
 }
 
 func (e *engine) runFMWorker(stop <-chan struct{}) {

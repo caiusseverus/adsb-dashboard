@@ -428,6 +428,14 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
         else:
             period_refinement_status = "unavailable"
 
+    slope_sign_convention = None
+    source_name = str(getattr(sync, "source", "") or "")
+    if source_name in {"multi_aircraft_burst", "go_frame_sync"}:
+        slope_sign_convention = "observed_minus_predicted"
+    explicit_sign = str(getattr(sync, "slope_sign_convention", "") or "").strip()
+    if explicit_sign:
+        slope_sign_convention = explicit_sign
+
     payload.update({
         "base_period_s": base_period_s,
         "period_delta_s": period_delta_s,
@@ -456,8 +464,24 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
         "period_delta_source": period_delta_source,
         "fit_observation_count": fit_observation_count,
         "fit_span_s": fit_span_s,
-        "slope_sign_convention": "observed_minus_predicted",
+        "slope_sign_convention": slope_sign_convention,
         "effective_period_source": effective_period_source,
+        "fit_icao_count": getattr(sync, "fit_icao_count", None),
+        "fit_observations_per_icao_min": getattr(sync, "fit_observations_per_icao_min", None),
+        "fit_observations_per_icao_median": getattr(sync, "fit_observations_per_icao_median", None),
+        "fit_observations_per_icao_max": getattr(sync, "fit_observations_per_icao_max", None),
+        "fit_retention_window_s": getattr(sync, "fit_retention_window_s", None),
+        "fit_global_cap_hit": getattr(sync, "fit_global_cap_hit", None),
+        "fit_last_eviction_reason": getattr(sync, "fit_last_eviction_reason", None),
+        "suspicious_icao_count": getattr(sync, "suspicious_icao_count", None),
+        "suspicious_icao_last_reason": getattr(sync, "suspicious_icao_last_reason", None),
+        "residual_slope_deg_per_s": getattr(sync, "residual_slope_deg_per_s", None),
+        "slope_ema_deg_per_s": getattr(sync, "slope_ema_deg_per_s", None),
+        "slope_std_deg_per_s": getattr(sync, "slope_std_deg_per_s", None),
+        "proposed_delta_s": getattr(sync, "proposed_delta_s", None),
+        "applied_delta_s": getattr(sync, "applied_delta_s", None),
+        "last_slew_limited": getattr(sync, "last_slew_limited", None),
+        "last_hard_bound": getattr(sync, "last_hard_bound", None),
     })
     return payload
 
@@ -2351,6 +2375,43 @@ class RadarState:
                 ),
                 "period_agrees_with_df": bool(entry.get("period_agrees_with_df", False)),
                 "period_reject_reason": str(entry.get("period_reject_reason") or ""),
+                "fit_observation_count": int(entry.get("fit_observation_count") or 0),
+                "fit_span_s": (float(entry["fit_span_s"]) if entry.get("fit_span_s") is not None else None),
+                "fit_icao_count": int(entry.get("fit_icao_count") or 0),
+                "fit_observations_per_icao_min": int(entry.get("fit_observations_per_icao_min") or 0),
+                "fit_observations_per_icao_median": (
+                    float(entry["fit_observations_per_icao_median"])
+                    if entry.get("fit_observations_per_icao_median") is not None else None
+                ),
+                "fit_observations_per_icao_max": int(entry.get("fit_observations_per_icao_max") or 0),
+                "fit_retention_window_s": (
+                    float(entry["fit_retention_window_s"]) if entry.get("fit_retention_window_s") is not None else None
+                ),
+                "fit_global_cap_hit": bool(entry.get("fit_global_cap_hit", False)),
+                "fit_last_eviction_reason": str(entry.get("fit_last_eviction_reason") or ""),
+                "suspicious_icao_count": int(entry.get("suspicious_icao_count") or 0),
+                "suspicious_icao_last_reason": str(entry.get("suspicious_icao_last_reason") or ""),
+                "residual_slope_deg_per_s": (
+                    float(entry["residual_slope_deg_per_s"])
+                    if entry.get("residual_slope_deg_per_s") is not None else None
+                ),
+                "slope_ema_deg_per_s": (
+                    float(entry["slope_ema_deg_per_s"])
+                    if entry.get("slope_ema_deg_per_s") is not None else None
+                ),
+                "slope_std_deg_per_s": (
+                    float(entry["slope_std_deg_per_s"])
+                    if entry.get("slope_std_deg_per_s") is not None else None
+                ),
+                "proposed_delta_s": (
+                    float(entry["proposed_delta_s"]) if entry.get("proposed_delta_s") is not None else None
+                ),
+                "applied_delta_s": (
+                    float(entry["applied_delta_s"]) if entry.get("applied_delta_s") is not None else None
+                ),
+                "last_slew_limited": bool(entry.get("last_slew_limited", False)),
+                "last_hard_bound": bool(entry.get("last_hard_bound", False)),
+                "slope_sign_convention": str(entry.get("slope_sign_convention") or ""),
             }
         except Exception:
             return None
@@ -2773,6 +2834,43 @@ class RadarState:
             last_residual_deg=float(go_sync.get("last_residual_deg") or 0.0),
             holdover=bool(go_sync.get("holdover", False)),
             period_base_s=float(base_period_s),
+            fit_total_observations=int(go_sync.get("fit_observation_count") or 0),
+            fit_span_s=float(go_sync.get("fit_span_s") or 0.0),
+            fit_icao_count=int(go_sync.get("fit_icao_count") or 0),
+            fit_observations_per_icao_min=int(go_sync.get("fit_observations_per_icao_min") or 0),
+            fit_observations_per_icao_median=(
+                float(go_sync["fit_observations_per_icao_median"])
+                if go_sync.get("fit_observations_per_icao_median") is not None else None
+            ),
+            fit_observations_per_icao_max=int(go_sync.get("fit_observations_per_icao_max") or 0),
+            fit_retention_window_s=(
+                float(go_sync["fit_retention_window_s"])
+                if go_sync.get("fit_retention_window_s") is not None else None
+            ),
+            fit_global_cap_hit=bool(go_sync.get("fit_global_cap_hit", False)),
+            fit_last_eviction_reason=str(go_sync.get("fit_last_eviction_reason") or ""),
+            suspicious_icao_count=int(go_sync.get("suspicious_icao_count") or 0),
+            suspicious_icao_last_reason=str(go_sync.get("suspicious_icao_last_reason") or ""),
+            residual_slope_deg_per_s=float(go_sync.get("residual_slope_deg_per_s") or 0.0),
+            slope_ema_deg_per_s=(
+                float(go_sync["slope_ema_deg_per_s"])
+                if go_sync.get("slope_ema_deg_per_s") is not None else None
+            ),
+            slope_std_deg_per_s=(
+                float(go_sync["slope_std_deg_per_s"])
+                if go_sync.get("slope_std_deg_per_s") is not None else None
+            ),
+            proposed_delta_s=(
+                float(go_sync["proposed_delta_s"])
+                if go_sync.get("proposed_delta_s") is not None else None
+            ),
+            applied_delta_s=(
+                float(go_sync["applied_delta_s"])
+                if go_sync.get("applied_delta_s") is not None else None
+            ),
+            last_slew_limited=bool(go_sync.get("last_slew_limited", False)),
+            last_hard_bound=bool(go_sync.get("last_hard_bound", False)),
+            slope_sign_convention=str(go_sync.get("slope_sign_convention") or "") or None,
             handoff_state=(
                 str(getattr(existing, "handoff_state", "") or "UNTRUSTED")
                 if existing is not None else
@@ -2820,6 +2918,25 @@ class RadarState:
                 "effective_period_s": iid_state.get("eps"),
                 "period_agrees_with_df": iid_state.get("pag"),
                 "period_reject_reason": iid_state.get("prr"),
+                "residual_slope_deg_per_s": iid_state.get("rsps"),
+                "slope_ema_deg_per_s": iid_state.get("rse"),
+                "slope_std_deg_per_s": iid_state.get("rss"),
+                "proposed_delta_s": iid_state.get("ppd"),
+                "applied_delta_s": iid_state.get("pad"),
+                "last_slew_limited": iid_state.get("lsl"),
+                "last_hard_bound": iid_state.get("lhb"),
+                "fit_observation_count": iid_state.get("foc"),
+                "fit_span_s": iid_state.get("fsp"),
+                "fit_icao_count": iid_state.get("fic"),
+                "fit_observations_per_icao_min": iid_state.get("fmn"),
+                "fit_observations_per_icao_median": iid_state.get("fmd"),
+                "fit_observations_per_icao_max": iid_state.get("fmx"),
+                "fit_retention_window_s": iid_state.get("frw"),
+                "fit_global_cap_hit": iid_state.get("fgh"),
+                "fit_last_eviction_reason": iid_state.get("fer"),
+                "suspicious_icao_count": iid_state.get("sic"),
+                "suspicious_icao_last_reason": iid_state.get("sir"),
+                "slope_sign_convention": iid_state.get("ssc"),
             })
             if go_sync is not None:
                 self._go_sync_states_by_iid[iid] = go_sync

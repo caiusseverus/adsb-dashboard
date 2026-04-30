@@ -405,7 +405,7 @@ func TestFitResidualSlopeDegPerS_SoftWeightsPreserved(t *testing.T) {
 	for i := 0; i < 24; i++ {
 		w := 1.0
 		if i%3 == 0 {
-			w = 0.35
+			w = 0.25
 		}
 		obs = append(obs, residualObservation{
 			EpochUS:     float64(i+1) * 1_000_000.0,
@@ -419,6 +419,95 @@ func TestFitResidualSlopeDegPerS_SoftWeightsPreserved(t *testing.T) {
 	}
 	if slope <= 0 {
 		t.Fatalf("slope=%.6f, want positive", slope)
+	}
+}
+
+func TestSyncState_AddRefinementResidualValue_UsesProvidedResidualDirectly(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 0; i < 80; i++ {
+		s.AddRefinementResidualValue(float64(i+1)*1_000_000.0, float64(i+1)*0.05, 0xAA+uint32(i%8), true, 4, 0.2)
+	}
+	if s.RefinementEligibleCount == 0 {
+		t.Fatal("expected eligible observations")
+	}
+	if s.PeriodDeltaS >= 0 {
+		t.Fatalf("expected negative correction for positive residual slope, got %.9f", s.PeriodDeltaS)
+	}
+}
+
+func TestSyncState_ResidualRetentionPerICAOAndGlobalCap(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 0; i < 400; i++ {
+		icao := uint32(0xAA + uint32(i%40))
+		s.AddRefinementResidualObservation(float64(i+1)*100_000.0, 2.0, icao, true, 4, 0.2)
+	}
+	if len(s.residualHistory) > refinementGlobalCap {
+		t.Fatalf("history len=%d exceeds global cap %d", len(s.residualHistory), refinementGlobalCap)
+	}
+	if !s.FitGlobalCapHit {
+		t.Fatal("expected global cap hit")
+	}
+	perICAO := map[uint32]int{}
+	for _, o := range s.residualHistory {
+		perICAO[o.ICAO]++
+	}
+	for icao, n := range perICAO {
+		if n > refinementPerICAOCap {
+			t.Fatalf("icao 0x%X retained %d > cap %d", icao, n, refinementPerICAOCap)
+		}
+	}
+}
+
+func TestSyncState_RejectsStaleRefPositionForRefinement(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	s.AddRefinementResidualObservation(1_000_000.0, 1.0, 0xAA, true, 4, 9.0)
+	if s.RefinementLastRejectReason != "stale_ref_position" {
+		t.Fatalf("reject reason=%q, want stale_ref_position", s.RefinementLastRejectReason)
+	}
+}
+
+func TestSyncState_SuspiciousICAOExclusion(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	now := float64(time.Now().Unix())
+	for i := 0; i < 5; i++ {
+		s.RefinementLastObservationUnix = now + float64(i)
+		s.AddRefinementResidualObservation(float64(i+1)*1_000_000.0, 90.0, 0xAA, true, 4, 0.2)
+	}
+	if s.SuspiciousICAOCount == 0 {
+		t.Fatal("expected suspicious ICAO count > 0")
+	}
+	s.AddRefinementResidualObservation(10_000_000.0, 1.0, 0xAA, true, 4, 0.2)
+	if s.RefinementLastRejectReason != "suspicious_icao_excluded" {
+		t.Fatalf("reject reason=%q, want suspicious_icao_excluded", s.RefinementLastRejectReason)
+	}
+}
+
+func TestSyncState_PeriodRefinementSignForPPMDrift(t *testing.T) {
+	makeResidual := func(i int, periodTrue, base float64) float64 {
+		tS := float64(i) * base
+		return circularDiff(tS*(360.0/periodTrue), tS*(360.0/base))
+	}
+	{
+		s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+		truePeriod := 4.0 * (1.0 + 50.0/1e6)
+		for i := 1; i <= 40; i++ {
+			r := makeResidual(i, truePeriod, 4.0)
+			s.AddRefinementResidualObservation(float64(i)*4_000_000.0, r, 0xAB+uint32(i%4), true, 4, 0.2)
+		}
+		if s.PeriodDeltaS <= 0 {
+			t.Fatalf("+50ppm expected positive delta, got %.9f", s.PeriodDeltaS)
+		}
+	}
+	{
+		s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+		truePeriod := 4.0 * (1.0 - 50.0/1e6)
+		for i := 1; i <= 40; i++ {
+			r := makeResidual(i, truePeriod, 4.0)
+			s.AddRefinementResidualObservation(float64(i)*4_000_000.0, r, 0xCD+uint32(i%4), true, 4, 0.2)
+		}
+		if s.PeriodDeltaS >= 0 {
+			t.Fatalf("-50ppm expected negative delta, got %.9f", s.PeriodDeltaS)
+		}
 	}
 }
 

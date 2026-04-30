@@ -153,7 +153,27 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
                 "sync_holdover": False,
                 "sync_last_updated": 1_000.0,
                 "base_period_s": 4.25,
+                "period_delta_s": 0.001,
                 "effective_period_s": 4.25,
+                "residual_slope_deg_per_s": -0.02,
+                "slope_ema_deg_per_s": -0.01,
+                "slope_std_deg_per_s": 0.003,
+                "proposed_delta_s": 0.0005,
+                "applied_delta_s": 0.0001,
+                "last_slew_limited": True,
+                "last_hard_bound": False,
+                "fit_observation_count": 14,
+                "fit_span_s": 87.0,
+                "fit_icao_count": 4,
+                "fit_observations_per_icao_min": 2,
+                "fit_observations_per_icao_median": 3.0,
+                "fit_observations_per_icao_max": 5,
+                "fit_retention_window_s": 120.0,
+                "fit_global_cap_hit": False,
+                "fit_last_eviction_reason": "window_prune",
+                "suspicious_icao_count": 1,
+                "suspicious_icao_last_reason": "hard_outlier",
+                "slope_sign_convention": "observed_minus_predicted",
                 "period_agrees_with_df": True,
                 "multi_sync_admission": {
                     "last_reason": "no_receiver_config",
@@ -218,6 +238,11 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     assert payload["sync_state"]["phase_status_display"] == "unavailable"
     assert payload["sync_state"]["period_delta_source"] == "none"
     assert payload["sync_state"]["slope_sign_convention"] == "observed_minus_predicted"
+    assert payload["sync_state"]["fit_icao_count"] == 4
+    assert payload["sync_state"]["fit_observations_per_icao_max"] == 5
+    assert payload["sync_state"]["proposed_delta_s"] == pytest.approx(0.0005)
+    assert payload["sync_state"]["applied_delta_s"] == pytest.approx(0.0001)
+    assert payload["sync_state"]["suspicious_icao_count"] == 1
     assert payload["sync_state"]["effective_period_source"] == "go_runtime.base_period_s"
     assert "handoff_state" in payload["sync_state"]
     assert "handoff_gate_failures" in payload["sync_state"]

@@ -39,20 +39,54 @@ type SyncState struct {
 	RefinementReferenceUpdates    uint64
 	RefinementLastRejectReason    string
 	RefinementLastObservationUnix float64
+	FitObservationCount           int
+	FitSpanS                      float64
+	FitICAOCount                  int
+	FitPerICAOMin                 int
+	FitPerICAOMedian              float64
+	FitPerICAOMax                 int
+	FitRetentionWindowS           float64
+	FitGlobalCapHit               bool
+	FitLastEvictionReason         string
+	FitEligibleObservations       int
+	FitRejectedObservations       int
+	SuspiciousICAOCount           int
+	SuspiciousICAOLastReason      string
+	ResidualSlopeEMADegPerS       float64
+	ResidualSlopeStdDegPerS       float64
+	ProposedDeltaS                float64
+	AppliedDeltaS                 float64
+	LastSlewLimited               bool
+	LastHardBound                 bool
+	SlopeSignConvention           string
 	residualHistory               []residualObservation
+	icaoRejectHistory             map[uint32][]float64
+	icaoSuspiciousUntil           map[uint32]float64
+	slopeHistory                  []float64
 }
 
 const (
+	// Residual convention used by all refiner inputs:
+	// residual_deg = observed_bearing_deg - predicted_bearing_deg, wrapped to [-180, +180].
 	residualRejectDeg             = 50.0 // hard-reject threshold (degrees)
 	residualSoftDeg               = 20.0 // soft-accept threshold
+	residualSoftWeight            = 0.25
 	residualEMAAlpha              = 0.2
-	residualHistoryMax            = 32
 	residualFitMinObs             = 8
 	residualFitMinSpanS           = 20.0
+	residualFitMinICAOs           = 1
 	refinementFitWindowS          = 120.0
+	refinementPerICAOCap          = 8
+	refinementGlobalCap           = 256
 	refinementAbsBoundFraction    = 0.005
 	refinementSlewFractionPerStep = 0.00025
 	refinementDecayOnReject       = 0.98
+	refinementStalePositionMaxS   = 8.0
+	suspiciousRejectThreshold     = 3
+	suspiciousRejectWindowS       = 30.0
+	suspiciousExcludeWindowS      = 60.0
+	slopeEMAAlpha                 = 0.2
+	slopeStdWindow                = 12
 )
 
 type residualObservation struct {
@@ -106,6 +140,10 @@ func NewSyncState(iid uint8, periodS, epochUS, phaseOffsetDeg, quality float64) 
 		PeriodSource:           "df_alignment",
 		PeriodAgreesWithDF:     true,
 		PeriodRefinementStatus: "base_only",
+		FitRetentionWindowS:    refinementFitWindowS,
+		SlopeSignConvention:    "observed_minus_predicted",
+		icaoRejectHistory:      make(map[uint32][]float64),
+		icaoSuspiciousUntil:    make(map[uint32]float64),
 	}
 }
 
@@ -169,7 +207,7 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 	blendedOffset := wrap360(existingAtNewEpoch + alpha*residual)
 
 	s.BasePeriodS = periodS
-	s.appendResidualObservation(newEpochUS, residual, 0, true, false, 1.0, nAircraft, refPosAgeS)
+	s.appendResidualObservationLocked(newEpochUS, residual, 0, true, false, 1.0, nAircraft, refPosAgeS)
 	s.RefinementReferenceUpdates++
 	s.applyBoundedPeriodRefinement()
 	s.EffectivePeriodS = s.BasePeriodS + s.PeriodDeltaS
@@ -204,12 +242,29 @@ func (s *SyncState) resetPeriodRefinement(reason string) {
 	s.PeriodRefinementStatus = reason
 	s.PeriodRejectReason = ""
 	s.residualHistory = nil
+	s.slopeHistory = nil
 	s.EffectivePeriodS = s.BasePeriodS
 	s.PeriodS = s.EffectivePeriodS
 	s.PeriodSource = "df_alignment"
+	s.FitObservationCount = 0
+	s.FitSpanS = 0
+	s.FitICAOCount = 0
+	s.FitPerICAOMin = 0
+	s.FitPerICAOMedian = 0
+	s.FitPerICAOMax = 0
+	s.FitEligibleObservations = 0
+	s.FitRejectedObservations = 0
+	s.FitGlobalCapHit = false
+	s.FitLastEvictionReason = ""
+	s.ProposedDeltaS = 0
+	s.AppliedDeltaS = 0
+	s.LastSlewLimited = false
+	s.LastHardBound = false
+	s.ResidualSlopeEMADegPerS = 0
+	s.ResidualSlopeStdDegPerS = 0
 }
 
-func (s *SyncState) appendResidualObservation(
+func (s *SyncState) appendResidualObservationLocked(
 	epochUS, residualDeg float64,
 	icao uint32,
 	dominant bool,
@@ -221,13 +276,24 @@ func (s *SyncState) appendResidualObservation(
 	if weight <= 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
 		weight = 1.0
 	}
-	s.residualHistory = append(s.residualHistory, residualObservation{
+	obs := residualObservation{
 		EpochUS: epochUS, ResidualDeg: residualDeg, NAircraft: nAircraft, RefPosAgeS: refPosAgeS,
 		ICAO: icao, Dominant: dominant, Soft: soft, Weight: weight,
-	})
-	if len(s.residualHistory) > residualHistoryMax {
-		s.residualHistory = s.residualHistory[len(s.residualHistory)-residualHistoryMax:]
 	}
+	if icao != 0 {
+		count := 0
+		for i := len(s.residualHistory) - 1; i >= 0; i-- {
+			if s.residualHistory[i].ICAO == icao {
+				count++
+				if count >= refinementPerICAOCap {
+					s.residualHistory = append(s.residualHistory[:i], s.residualHistory[i+1:]...)
+					s.FitLastEvictionReason = "per_icao_cap"
+					break
+				}
+			}
+		}
+	}
+	s.residualHistory = append(s.residualHistory, obs)
 	cutoffUS := epochUS - refinementFitWindowS*1e6
 	idx := 0
 	for idx < len(s.residualHistory) && s.residualHistory[idx].EpochUS < cutoffUS {
@@ -235,7 +301,88 @@ func (s *SyncState) appendResidualObservation(
 	}
 	if idx > 0 {
 		s.residualHistory = s.residualHistory[idx:]
+		s.FitLastEvictionReason = "window_prune"
 	}
+	for len(s.residualHistory) > refinementGlobalCap {
+		s.residualHistory = s.residualHistory[1:]
+		s.FitGlobalCapHit = true
+		s.FitLastEvictionReason = "global_cap"
+	}
+	s.FitObservationCount = len(s.residualHistory)
+	s.computeFitDistributionLocked()
+}
+
+func (s *SyncState) computeFitDistributionLocked() {
+	if len(s.residualHistory) == 0 {
+		s.FitSpanS = 0
+		s.FitICAOCount = 0
+		s.FitPerICAOMin = 0
+		s.FitPerICAOMedian = 0
+		s.FitPerICAOMax = 0
+		return
+	}
+	first := s.residualHistory[0].EpochUS
+	last := s.residualHistory[len(s.residualHistory)-1].EpochUS
+	s.FitSpanS = (last - first) / 1e6
+	byICAO := map[uint32]int{}
+	for _, o := range s.residualHistory {
+		if o.ICAO != 0 {
+			byICAO[o.ICAO]++
+		}
+	}
+	s.FitICAOCount = len(byICAO)
+	if len(byICAO) == 0 {
+		s.FitPerICAOMin = 0
+		s.FitPerICAOMedian = 0
+		s.FitPerICAOMax = 0
+		return
+	}
+	per := make([]int, 0, len(byICAO))
+	for _, c := range byICAO {
+		per = append(per, c)
+	}
+	sort.Ints(per)
+	s.FitPerICAOMin = per[0]
+	s.FitPerICAOMax = per[len(per)-1]
+	if len(per)%2 == 0 {
+		i := len(per) / 2
+		s.FitPerICAOMedian = float64(per[i-1]+per[i]) / 2.0
+	} else {
+		s.FitPerICAOMedian = float64(per[len(per)/2])
+	}
+}
+
+func (s *SyncState) markICAORejectLocked(icao uint32, nowS float64, reason string) {
+	if icao == 0 {
+		return
+	}
+	h := append(s.icaoRejectHistory[icao], nowS)
+	cutoff := nowS - suspiciousRejectWindowS
+	idx := 0
+	for idx < len(h) && h[idx] < cutoff {
+		idx++
+	}
+	if idx > 0 {
+		h = h[idx:]
+	}
+	s.icaoRejectHistory[icao] = h
+	if len(h) > suspiciousRejectThreshold {
+		s.icaoSuspiciousUntil[icao] = nowS + suspiciousExcludeWindowS
+		s.SuspiciousICAOLastReason = reason
+	}
+	s.updateSuspiciousCountLocked(nowS)
+}
+
+func (s *SyncState) updateSuspiciousCountLocked(nowS float64) {
+	count := 0
+	for icao, until := range s.icaoSuspiciousUntil {
+		if until <= nowS {
+			delete(s.icaoSuspiciousUntil, icao)
+			continue
+		}
+		count++
+	}
+	s.SuspiciousICAOCount = count
 }
 
 func (s *SyncState) AddRefinementResidualObservation(
@@ -248,37 +395,70 @@ func (s *SyncState) AddRefinementResidualObservation(
 ) {
 	s.RefinementPlottedCount++
 	s.RefinementLastObservationUnix = float64(time.Now().UnixNano()) / 1e9
+	nowS := s.RefinementLastObservationUnix
+	s.updateSuspiciousCountLocked(nowS)
 	if s.BasePeriodS <= 0 {
 		s.PeriodRefinementStatus = "missing_df_base_period"
 		s.RefinementLastRejectReason = "missing_df_base_period"
+		s.FitRejectedObservations++
 		return
 	}
 	if !dominant {
 		s.RefinementRejectedCount++
+		s.FitRejectedObservations++
 		s.PeriodRefinementStatus = "no_dominant_family"
 		s.RefinementLastRejectReason = "no_dominant_family"
+		s.markICAORejectLocked(icao, nowS, "no_dominant_family")
 		return
 	}
 	if epochUS <= 0 || math.IsNaN(epochUS) || math.IsInf(epochUS, 0) || math.IsNaN(residualDeg) || math.IsInf(residualDeg, 0) {
 		s.RefinementRejectedCount++
+		s.FitRejectedObservations++
 		s.PeriodRefinementStatus = "all_rejected"
 		s.RefinementLastRejectReason = "invalid_observation"
+		s.markICAORejectLocked(icao, nowS, "invalid_observation")
+		return
+	}
+	if refPosAgeS < 0 || math.IsNaN(refPosAgeS) || math.IsInf(refPosAgeS, 0) {
+		s.RefinementRejectedCount++
+		s.FitRejectedObservations++
+		s.PeriodRefinementStatus = "all_rejected"
+		s.RefinementLastRejectReason = "invalid_ref_position_age"
+		s.markICAORejectLocked(icao, nowS, "invalid_ref_position_age")
+		return
+	}
+	if refPosAgeS > refinementStalePositionMaxS {
+		s.RefinementRejectedCount++
+		s.FitRejectedObservations++
+		s.PeriodRefinementStatus = "all_rejected"
+		s.RefinementLastRejectReason = "stale_ref_position"
+		s.markICAORejectLocked(icao, nowS, "stale_ref_position")
 		return
 	}
 	absResidual := math.Abs(residualDeg)
 	if absResidual > residualRejectDeg {
 		s.RefinementRejectedCount++
+		s.FitRejectedObservations++
 		s.PeriodRefinementStatus = "all_rejected"
 		s.RefinementLastRejectReason = "hard_outlier"
+		s.markICAORejectLocked(icao, nowS, "hard_outlier")
+		return
+	}
+	if until, ok := s.icaoSuspiciousUntil[icao]; ok && until > nowS {
+		s.RefinementRejectedCount++
+		s.FitRejectedObservations++
+		s.PeriodRefinementStatus = "all_rejected"
+		s.RefinementLastRejectReason = "suspicious_icao_excluded"
 		return
 	}
 	soft := absResidual > residualSoftDeg
 	weight := 1.0
 	if soft {
-		weight = 0.35
+		weight = residualSoftWeight
 	}
 	s.RefinementEligibleCount++
-	s.appendResidualObservation(epochUS, residualDeg, icao, dominant, soft, weight, nAircraft, refPosAgeS)
+	s.FitEligibleObservations++
+	s.appendResidualObservationLocked(epochUS, residualDeg, icao, dominant, soft, weight, nAircraft, refPosAgeS)
 	s.applyBoundedPeriodRefinement()
 	s.EffectivePeriodS = s.BasePeriodS + s.PeriodDeltaS
 	if s.EffectivePeriodS <= 0 {
@@ -319,6 +499,18 @@ func (s *SyncState) applyBoundedPeriodRefinement() {
 		s.PeriodRejectReason = ""
 		return
 	}
+	if s.FitSpanS < residualFitMinSpanS {
+		s.ResidualSlopeDegPerS = 0
+		s.PeriodRefinementStatus = "insufficient_span"
+		s.PeriodRejectReason = ""
+		return
+	}
+	if s.FitICAOCount > 0 && s.FitICAOCount < residualFitMinICAOs {
+		s.ResidualSlopeDegPerS = 0
+		s.PeriodRefinementStatus = "insufficient_icaos"
+		s.PeriodRejectReason = ""
+		return
+	}
 
 	slope, ok, reason := fitResidualSlopeDegPerS(s.residualHistory)
 	if !ok {
@@ -329,23 +521,34 @@ func (s *SyncState) applyBoundedPeriodRefinement() {
 		return
 	}
 	s.ResidualSlopeDegPerS = slope
+	s.updateSlopeDiagnosticsLocked(slope)
 
 	// residual = observed - predicted. Positive residual slope means prediction lags;
 	// negative period correction increases predicted phase growth and reduces that drift.
 	proposedDelta := -slope * s.BasePeriodS * s.BasePeriodS / 360.0
+	s.ProposedDeltaS = proposedDelta
+	s.LastSlewLimited = false
+	s.LastHardBound = false
 	absBound := s.BasePeriodS * refinementAbsBoundFraction
 	if math.Abs(proposedDelta) > absBound {
 		s.PeriodDeltaS *= refinementDecayOnReject
 		s.PeriodRefinementStatus = "proposed_out_of_bounds_decay"
 		s.PeriodRejectReason = "refinement_out_of_bounds"
+		s.LastHardBound = true
+		s.AppliedDeltaS = 0
 		return
 	}
 
 	slew := s.BasePeriodS * refinementSlewFractionPerStep
 	target := clamp(proposedDelta, -absBound, absBound)
 	step := target - s.PeriodDeltaS
+	rawStep := step
 	step = clamp(step, -slew, slew)
+	if math.Abs(rawStep-step) > 1e-12 {
+		s.LastSlewLimited = true
+	}
 	s.PeriodDeltaS = clamp(s.PeriodDeltaS+step, -absBound, absBound)
+	s.AppliedDeltaS = step
 	if math.Abs(s.PeriodDeltaS) < 1e-12 {
 		s.PeriodDeltaS = 0
 	}
@@ -359,6 +562,29 @@ func (s *SyncState) applyBoundedPeriodRefinement() {
 		return
 	}
 	s.PeriodRefinementStatus = "held"
+}
+
+func (s *SyncState) updateSlopeDiagnosticsLocked(slope float64) {
+	s.ResidualSlopeEMADegPerS = (1.0-slopeEMAAlpha)*s.ResidualSlopeEMADegPerS + slopeEMAAlpha*slope
+	s.slopeHistory = append(s.slopeHistory, slope)
+	if len(s.slopeHistory) > slopeStdWindow {
+		s.slopeHistory = s.slopeHistory[len(s.slopeHistory)-slopeStdWindow:]
+	}
+	if len(s.slopeHistory) == 0 {
+		s.ResidualSlopeStdDegPerS = 0
+		return
+	}
+	var mean float64
+	for _, v := range s.slopeHistory {
+		mean += v
+	}
+	mean /= float64(len(s.slopeHistory))
+	var ss float64
+	for _, v := range s.slopeHistory {
+		d := v - mean
+		ss += d * d
+	}
+	s.ResidualSlopeStdDegPerS = math.Sqrt(ss / float64(len(s.slopeHistory)))
 }
 
 func fitResidualSlopeDegPerS(obs []residualObservation) (float64, bool, string) {

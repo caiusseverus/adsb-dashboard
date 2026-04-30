@@ -101,6 +101,24 @@ type DebugSnapshot struct {
 	RefinementLastRejectReason      string
 	RefinementLastObservationAgeS   float64
 	RefinementHistoryLen            int
+	FitObservationCount             int
+	FitSpanS                        float64
+	FitICAOCount                    int
+	FitObservationsPerICAOMin       int
+	FitObservationsPerICAOMedian    float64
+	FitObservationsPerICAOMax       int
+	FitRetentionWindowS             float64
+	FitGlobalCapHit                 bool
+	FitLastEvictionReason           string
+	SuspiciousICAOCount             int
+	SuspiciousICAOLastReason        string
+	ResidualSlopeEMADegPerS         float64
+	ResidualSlopeStdDegPerS         float64
+	ProposedDeltaS                  float64
+	AppliedDeltaS                   float64
+	LastSlewLimited                 bool
+	LastHardBound                   bool
+	SlopeSignConvention             string
 	ActiveAircraftEstimate          int
 	BurstRecordsTotal               int
 	BurstRecordsDynamicCap          int
@@ -566,6 +584,13 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 	out.PeriodRejectReason = s.PeriodRejectReason
 	if s.Sync != nil {
 		out.ResidualSlopeDegPerS = s.Sync.ResidualSlopeDegPerS
+		out.ResidualSlopeEMADegPerS = s.Sync.ResidualSlopeEMADegPerS
+		out.ResidualSlopeStdDegPerS = s.Sync.ResidualSlopeStdDegPerS
+		out.ProposedDeltaS = s.Sync.ProposedDeltaS
+		out.AppliedDeltaS = s.Sync.AppliedDeltaS
+		out.LastSlewLimited = s.Sync.LastSlewLimited
+		out.LastHardBound = s.Sync.LastHardBound
+		out.SlopeSignConvention = s.Sync.SlopeSignConvention
 		out.PeriodRefinementStatus = s.Sync.PeriodRefinementStatus
 		out.RefinementPlottedCount = s.Sync.RefinementPlottedCount
 		out.RefinementEligibleCount = s.Sync.RefinementEligibleCount
@@ -573,6 +598,17 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.RefinementReferenceUpdates = s.Sync.RefinementReferenceUpdates
 		out.RefinementLastRejectReason = s.Sync.RefinementLastRejectReason
 		out.RefinementHistoryLen = len(s.Sync.residualHistory)
+		out.FitObservationCount = s.Sync.FitObservationCount
+		out.FitSpanS = s.Sync.FitSpanS
+		out.FitICAOCount = s.Sync.FitICAOCount
+		out.FitObservationsPerICAOMin = s.Sync.FitPerICAOMin
+		out.FitObservationsPerICAOMedian = s.Sync.FitPerICAOMedian
+		out.FitObservationsPerICAOMax = s.Sync.FitPerICAOMax
+		out.FitRetentionWindowS = s.Sync.FitRetentionWindowS
+		out.FitGlobalCapHit = s.Sync.FitGlobalCapHit
+		out.FitLastEvictionReason = s.Sync.FitLastEvictionReason
+		out.SuspiciousICAOCount = s.Sync.SuspiciousICAOCount
+		out.SuspiciousICAOLastReason = s.Sync.SuspiciousICAOLastReason
 		if s.Sync.RefinementLastObservationUnix > 0 {
 			ageS := float64(time.Now().UnixNano())/1e9 - s.Sync.RefinementLastObservationUnix
 			if ageS < 0 {

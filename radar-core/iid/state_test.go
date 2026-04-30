@@ -367,9 +367,7 @@ func TestPeriodRefinement_WrapCrossingRegression_3971s(t *testing.T) {
 		epochUS := float64(i) * 1_000_000.0
 		unwrappedResidual := 170.0 + float64(i)*0.4
 		wrappedResidual := circularDiff(unwrappedResidual, 0.0)
-		sync.residualHistory = append(sync.residualHistory, residualObservation{
-			EpochUS: epochUS, ResidualDeg: wrappedResidual, Weight: 1.0,
-		})
+		sync.appendResidualObservationLocked(epochUS, wrappedResidual, uint32(0xAB+i%6), true, false, 1.0, 6, 0.2)
 	}
 	sync.applyBoundedPeriodRefinement()
 	sync.EffectivePeriodS = sync.BasePeriodS + sync.PeriodDeltaS

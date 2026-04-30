@@ -78,6 +78,22 @@ class LiveSyncState:
     handoff_reason: str | None = None
     last_handoff_transition_ts: float | None = None
     handoff_gate_failures: dict = field(default_factory=dict)
+    fit_icao_count: int = 0
+    fit_observations_per_icao_min: int = 0
+    fit_observations_per_icao_median: float | None = None
+    fit_observations_per_icao_max: int = 0
+    fit_retention_window_s: float | None = None
+    fit_global_cap_hit: bool = False
+    fit_last_eviction_reason: str | None = None
+    suspicious_icao_count: int = 0
+    suspicious_icao_last_reason: str | None = None
+    slope_ema_deg_per_s: float | None = None
+    slope_std_deg_per_s: float | None = None
+    proposed_delta_s: float | None = None
+    applied_delta_s: float | None = None
+    last_slew_limited: bool | None = None
+    last_hard_bound: bool | None = None
+    slope_sign_convention: str | None = None
 
 
 @dataclass

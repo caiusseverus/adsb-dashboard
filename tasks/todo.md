@@ -90,3 +90,32 @@ Plan confirmation:
 - Verification:
 - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_radar_ui_labels.py -q` -> `149 passed`
 - `cd frontend && npm run build` -> passed
+
+## 2026-04-30 Stage 4 Harden Go Refiner as Operational Engine (Preparation Only)
+
+- [x] Audit and document residual sign convention across Go/Python paths feeding Go refinement.
+- [x] Run best-effort impact scan for touched sync/refiner symbols/files (no direct `gitnexus_impact` MCP tool available in this session).
+- [x] Add/standardize Go residual sign helper and boundary conversions; emit explicit `slope_sign_convention` only when true.
+- [x] Replace Go count-tail residual retention with 120s + per-ICAO cap + global cap retention policy and diagnostics.
+- [x] Tighten Go refinement observation eligibility (hard rejects, soft weights, family gating, stale position, suspicious ICAO handling).
+- [x] Keep Go base-period authority constraints intact and enforce `effective_period_s = base_period_s + period_delta_s` diagnostics invariant.
+- [x] Extend Go diagnostics payload/schema for fit/span/ICAO/slope/delta/reject/bounds/suspicion fields.
+- [x] Wire new Go diagnostic fields through Python ingestion/API and keep operational triple authority unchanged.
+- [x] Update RadarPage diagnostics rendering for additive Go diagnostic fields only.
+- [x] Add/update Go tests for sign correctness, unwrap, retention, eligibility, suspicion, bounds, and invariants.
+- [x] Add/update backend tests for diagnostic ingestion/exposure and operational-field non-regression.
+- [x] Run focused verification (Go tests + backend pytest + frontend build) and replay/synthetic validation where available.
+
+Plan confirmation:
+- Stage 4 only; no Stage 5 authority flip or Python operational refiner demotion.
+- Python DF/base period bootstrap and operational authority stay unchanged.
+
+### Review (Stage 4)
+- Go refiner hardening implemented in `sync.go`/`state.go`: explicit observed-minus-predicted sign contract, 120s window retention with per-ICAO/global caps, stale-position and family hard-rejects, soft outlier weight 0.25, suspicious ICAO quarantine, and bounded fit diagnostics.
+- Go protocol + emitter updated with additive diagnostics for fit composition/span, slope EMA/std, proposed/applied delta, bounds/slew flags, suspicious ICAO state, and sign convention.
+- Python ingest/snapshot serialization updated to consume and expose additive Go diagnostic fields while preserving canonical operational authority behavior from Stage 3.
+- Radar page diagnostics now surfaces additional Go fit/slope/delta metadata in diagnostic pills; operational period triple remains canonical/authority-gated.
+- Verification:
+  - `cd radar-core && GOCACHE=/tmp/go-build-cache go test ./iid ./protocol` -> passed.
+  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py -q` -> `146 passed`.
+  - `cd frontend && npm run build` -> passed.
