@@ -199,6 +199,8 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     assert payload["sync_state"]["sync_authority"] == "go_runtime"
     assert payload["sync_state"]["phase_basis"] == "sweep_epoch_only"
     assert payload["sync_state"]["phase_is_absolute"] is False
+    assert payload["sync_state"]["phase_status"] is None
+    assert payload["sync_state"]["phase_status_display"] == "unavailable"
     assert payload["sync_state"]["period_delta_source"] == "none"
     assert payload["sync_state"]["slope_sign_convention"] == "observed_minus_predicted"
     assert payload["sync_state"]["effective_period_source"] == "go_runtime.base_period_s"
@@ -206,6 +208,30 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     assert payload["alignment_status"]["reason"] == "radar_position_unavailable"
     assert payload["alignment_status"]["multi_sync_admission"]["last_reason"] == "no_receiver_config"
     assert payload["alignment_status"]["multi_sync_admission"]["counts"]["no_receiver_config"] == 7
+
+
+def test_sync_state_exposes_phase_status_alias_without_removing_legacy_value():
+    state = RadarState()
+    now_ts = 1_000.0
+    state._iid_latest_arrival_us[99] = 4_100_000.0
+    state._live_sync_states[99] = LiveSyncState(
+        iid=99,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=now_ts,
+        source="multi_aircraft_burst",
+        usable=True,
+        phase_status="trusted",
+        phase_anchor_icao="ABC123",
+        phase_anchor_status="selected",
+    )
+
+    payload = radar_api.build_iid_sync_snapshot_payload(state, 99, window_s=60.0, debug_limit=20)
+    assert payload["sync_state"]["phase_status"] == "trusted"
+    assert payload["sync_state"]["phase_status_display"] == "anchor_trusted"
 
 
 def test_get_iid_sync_debug_endpoint_exposes_summary_and_observation(monkeypatch):

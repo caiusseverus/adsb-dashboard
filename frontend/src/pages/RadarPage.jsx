@@ -1818,6 +1818,70 @@ function humanizeSyncReason(value) {
   return String(value).replaceAll('_', ' ')
 }
 
+function formatAuthorityLabel(value) {
+  if (!value) return 'unavailable'
+  return String(value).replaceAll('_', ' ')
+}
+
+function phaseStatusDisplayLabel(value) {
+  switch (value) {
+    case 'trusted': return 'anchor_trusted'
+    case 'provisional': return 'anchor_provisional'
+    case 'untrusted': return 'anchor_untrusted'
+    default: return 'unavailable'
+  }
+}
+
+function authorityModeLabel(syncState) {
+  if (!syncState) return 'unavailable'
+  const periodAuthority = String(syncState.period_authority ?? '')
+  const effectiveSource = String(syncState.effective_period_source ?? '')
+  if (periodAuthority.includes('holdover')) return 'holdover'
+  if (periodAuthority.includes('python_base_bootstrap') || effectiveSource.includes('period_base_s')) return 'Python base/bootstrap'
+  if (periodAuthority.includes('python_refined') || effectiveSource.includes('python_simple_sync.period_s')) return 'Python refined'
+  if (periodAuthority.includes('go_refined') || effectiveSource.includes('go_runtime.effective_period_s')) return 'Go refined/runtime'
+  if (periodAuthority.includes('go_base_bootstrap') || effectiveSource.includes('go_runtime.base_period_s')) return 'Go base/bootstrap'
+  return 'unavailable'
+}
+
+function getOperationalPeriodTriple(syncState, modeDiagnostics) {
+  if (!syncState) return null
+  const compact = modeDiagnostics?.compact ?? {}
+  const source = String(syncState.effective_period_source ?? '')
+  const periodSource = String(syncState.period_delta_source ?? '')
+  const syncSource = String(syncState.source ?? '')
+
+  if (source.startsWith('go_runtime.') && (periodSource === 'go_runtime_delta' || syncSource === 'go_frame_sync')) {
+    const base = Number(compact.base_period_s)
+    const delta = Number(compact.period_delta_s)
+    const effective = Number(compact.effective_period_s)
+    if ([base, delta, effective].every(Number.isFinite)) {
+      return { base, delta, effective, sourceLabel: 'go_runtime_operational' }
+    }
+  }
+
+  const base = Number(syncState.period_base_s)
+  const effective = Number(syncState.period_s)
+  if (Number.isFinite(base) && Number.isFinite(effective)) {
+    return {
+      base,
+      delta: effective - base,
+      effective,
+      sourceLabel: 'python_operational',
+    }
+  }
+
+  if (Number.isFinite(effective)) {
+    return {
+      base: effective,
+      delta: 0,
+      effective,
+      sourceLabel: 'bootstrap_only',
+    }
+  }
+  return null
+}
+
 function isFiniteValue(value) {
   return value !== null && value !== undefined && Number.isFinite(Number(value))
 }
@@ -1826,6 +1890,11 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
   if (!syncState || !modeDiagnostics) return null
   const compact = modeDiagnostics.compact ?? {}
   const pythonSync = modeDiagnostics.python_sync ?? {}
+  const operationalPeriod = getOperationalPeriodTriple(syncState, modeDiagnostics)
+  const authoritySummary = authorityModeLabel(syncState)
+  const goDeltaVisible = syncState.period_delta_source === 'go_runtime_delta'
+    && syncState.effective_period_source !== 'go_runtime.effective_period_s'
+    && Number.isFinite(Number(compact.period_delta_s))
   return (
     <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
@@ -1840,6 +1909,11 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
         <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: '4px', fontSize: '0.72rem' }}>
           <span className={styles.metricPill}>Mode <span className={styles.metricValue}>{modeDiagnostics.active_label ?? '—'}</span></span>
           <span className={styles.metricPill}>Source <span className={styles.metricValue}>{modeDiagnostics.active_source ?? '—'}</span></span>
+          <span className={styles.metricPill}>Operational period mode <span className={styles.metricValue}>{authoritySummary}</span></span>
+          <span className={styles.metricPill}>Sync authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.sync_authority)}</span></span>
+          <span className={styles.metricPill}>Period authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.period_authority)}</span></span>
+          <span className={styles.metricPill}>Effective period source <span className={styles.metricValue}>{formatAuthorityLabel(syncState.effective_period_source)}</span></span>
+          <span className={styles.metricPill}>Period Δ source <span className={styles.metricValue}>{formatAuthorityLabel(syncState.period_delta_source)}</span></span>
           <span className={styles.metricPill}>Python sync <span className={styles.metricValue}>{pythonSync.usable ? 'usable' : pythonSync.present ? 'present' : 'absent'}</span></span>
           <span className={styles.metricPill}>Holdover <span className={styles.metricValue}>{syncState.holdover ? 'yes' : 'no'}</span></span>
         </div>
@@ -1847,12 +1921,12 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '10px' }}>
         <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '6px 8px' }}>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Compact / bootstrap</div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Operational period triple</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px' }}>
             <span className={styles.metricPill}>Ref ICAO <span className={styles.metricValue}>{compact.reference_icao ?? '—'}</span></span>
-            <span className={styles.metricPill}>DF base <span className={styles.metricValue}>{fmtNumber(compact.base_period_s, 3, 's')}</span></span>
-            <span className={styles.metricPill}>Go Δ <span className={styles.metricValue}>{fmtNumber(Number(compact.period_delta_s ?? 0) * 1000, 2, 'ms')}</span></span>
-            <span className={styles.metricPill}>Effective <span className={styles.metricValue}>{fmtNumber(compact.effective_period_s, 3, 's')}</span></span>
+            <span className={styles.metricPill}>Base <span className={styles.metricValue}>{fmtNumber(operationalPeriod?.base, 4, 's')}</span></span>
+            <span className={styles.metricPill}>Δ <span className={styles.metricValue}>{fmtNumber(Number(operationalPeriod?.delta ?? 0) * 1000, 2, 'ms')}</span></span>
+            <span className={styles.metricPill}>Effective <span className={styles.metricValue}>{fmtNumber(operationalPeriod?.effective, 4, 's')}</span></span>
             <span className={styles.metricPill}>DF agreement <span className={styles.metricValue}>{compact.period_agrees_with_df === false ? 'rejected' : compact.period_agrees_with_df === true ? 'yes' : '—'}</span></span>
             <span className={styles.metricPill}>Prev ref <span className={styles.metricValue}>{compact.last_reference_icao ?? '—'}</span></span>
             <span className={styles.metricPill}>Ref churn <span className={styles.metricValue}>{compact.reference_changed_recently ? 'recent' : 'stable'}</span></span>
@@ -1868,15 +1942,20 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
         </div>
 
         <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '6px 8px' }}>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Python live sync</div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Diagnostic / shadow refiner</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px' }}>
             <span className={styles.metricPill}>Present <span className={styles.metricValue}>{pythonSync.present ? 'yes' : 'no'}</span></span>
             <span className={styles.metricPill}>Anchor <span className={styles.metricValue}>{pythonSync.anchor_icao ?? '—'}</span></span>
             <span className={styles.metricPill}>Candidates <span className={styles.metricValue}>{pythonSync.anchor_candidate_count ?? 0}</span></span>
             <span className={styles.metricPill}>Fit obs <span className={styles.metricValue}>{pythonSync.fit_eligible_observations ?? 0}/{pythonSync.fit_total_observations ?? 0}</span></span>
-            <span className={styles.metricPill}>Phase trust <span className={styles.metricValue}>{pythonSync.phase_status ?? '—'}</span></span>
+            <span className={styles.metricPill}>Anchor-relative phase trust <span className={styles.metricValue}>{phaseStatusDisplayLabel(pythonSync.phase_status_display ?? pythonSync.phase_status)}</span></span>
+            {goDeltaVisible && (
+              <span className={styles.metricPill}>Go Δ (diagnostic) <span className={styles.metricValue}>{fmtNumber(Number(compact.period_delta_s) * 1000, 2, 'ms')}</span></span>
+            )}
           </div>
           <div style={{ color: '#8b949e', fontSize: '0.72rem', lineHeight: 1.45 }}>
+            Non-operational values in this section do not drive current frame timing or effective period.
+            {' '}
             {pythonSync.active
               ? (pythonSync.no_anchor_reason ? `No anchor selected: ${humanizeSyncReason(pythonSync.no_anchor_reason)}.` : 'Python live sync is active.')
               : `Python live sync is not active: ${humanizeSyncReason(pythonSync.no_anchor_reason)}.`}
@@ -1981,9 +2060,9 @@ function PhaseAnchorPanel({ syncState, observations, candidates }) {
     <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
         <div>
-          <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Phase Anchor</div>
+          <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Anchor-relative phase</div>
           <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>
-            Anchor selection and validation from the Python live sync model.
+            Phase is referenced to the selected anchor aircraft. Geographic radar beam direction is not yet known.
           </div>
         </div>
         <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: '4px', fontSize: '0.72rem' }}>
@@ -1994,7 +2073,10 @@ function PhaseAnchorPanel({ syncState, observations, candidates }) {
           <span className={styles.metricPill}>Obs <span className={styles.metricValue}>{syncState.phase_anchor_obs_count ?? anchorObs.length ?? '—'}</span></span>
           <span className={styles.metricPill}>Since <span className={styles.metricValue}>{Number.isFinite(sinceAgeS) ? `${Math.max(0, sinceAgeS).toFixed(0)}s` : '—'}</span></span>
           <span className={styles.metricPill}>Validation <span className={styles.metricValue}>{syncState.phase_validation_status || '—'}</span></span>
-          <span className={styles.metricPill} title="Phase trust status: trusted = Stage 3 eligible; provisional = display only; untrusted = blocked">Phase trust <span className={styles.metricValue} style={{ color: syncState.phase_status === 'trusted' ? '#3fb950' : syncState.phase_status === 'provisional' ? '#e3b341' : '#8b949e' }}>{syncState.phase_status ?? '—'}</span></span>
+          <span className={styles.metricPill} title="Phase is anchor-relative only. Geographic radar beam direction is unavailable in Stage 1.">Phase basis <span className={styles.metricValue}>{syncState.phase_basis ?? '—'}</span></span>
+          <span className={styles.metricPill}>Phase absolute? <span className={styles.metricValue}>{syncState.phase_is_absolute ? 'yes' : 'no'}</span></span>
+          <span className={styles.metricPill}>Anchor age <span className={styles.metricValue}>{Number.isFinite(sinceAgeS) ? `${Math.max(0, sinceAgeS).toFixed(0)}s` : '—'}</span></span>
+          <span className={styles.metricPill} title="Anchor-relative phase status: trusted = Stage 3 eligible; provisional = display only; untrusted = blocked">Anchor-relative phase trust <span className={styles.metricValue} style={{ color: syncState.phase_status === 'trusted' ? '#3fb950' : syncState.phase_status === 'provisional' ? '#e3b341' : '#8b949e' }}>{phaseStatusDisplayLabel(syncState.phase_status_display ?? syncState.phase_status)}</span></span>
           <span className={styles.metricPill}>Agree/reject <span className={styles.metricValue}>{syncState.phase_validation_contributors ?? 0}/{syncState.phase_validation_reject_count ?? 0}</span></span>
           <span className={styles.metricPill}>Median Δ <span className={styles.metricValue}>{fmtNumber(syncState.phase_validation_median_error_deg, 2, '°')}</span></span>
           <span className={styles.metricPill}>Fit obs <span className={styles.metricValue}>{syncState.fit_eligible_observations ?? 0}/{syncState.fit_total_observations ?? 0}</span></span>
@@ -2633,6 +2715,16 @@ function RotationAlignmentPanel({
               {syncState?.sync_jitter_deg != null ? `±${syncState.sync_jitter_deg.toFixed(1)}°` : '—'}
             </span>
           </span>
+          <span className={styles.metricPill}>Sync authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.sync_authority)}</span></span>
+          <span className={styles.metricPill}>Period authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.period_authority)}</span></span>
+          <span className={styles.metricPill}>Effective period source <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.effective_period_source)}</span></span>
+          <span className={styles.metricPill}>Period Δ source <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.period_delta_source)}</span></span>
+          <span className={styles.metricPill}>Phase basis <span className={styles.metricValue}>{syncState?.phase_basis ?? '—'}</span></span>
+          <span className={styles.metricPill}>Phase absolute? <span className={styles.metricValue}>{syncState?.phase_is_absolute ? 'yes' : 'no'}</span></span>
+          <span className={styles.metricPill}>Anchor ICAO <span className={styles.metricValue}>{syncState?.phase_anchor_icao ?? '—'}</span></span>
+          <span className={styles.metricPill}>Anchor age <span className={styles.metricValue}>{syncState?.phase_anchor_since_ts ? `${Math.max(0, (Date.now() / 1000) - Number(syncState.phase_anchor_since_ts)).toFixed(0)}s` : '—'}</span></span>
+          <span className={styles.metricPill}>Residual source <span className={styles.metricValue}>{burstTimeline?.residual_chart_default_mode ?? '—'}</span></span>
+          <span className={styles.metricPill}>Convergence <span className={styles.metricValue}>{syncState?.fit_observation_count != null ? `${syncState.fit_observation_count} obs / ${fmtNumber(syncState.fit_span_s, 1, 's')}` : '—'}</span></span>
           {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS ? (
             <>
               <span className={styles.metricPill}>

@@ -256,7 +256,11 @@ def _get_authoritative_radar_position(model: RadarIID) -> dict:
 
 
 def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
-    """Serialise a LiveSyncState to a plain dict for API/verification payloads."""
+    """Serialise a LiveSyncState to a plain dict for API/verification payloads.
+
+    Exposed phase metadata is anchor-relative/sweep-relative in current stages.
+    Geographic/absolute radar beam direction is not available.
+    """
     import dataclasses
     payload: dict = {}
     for field in dataclasses.fields(sync):
@@ -332,6 +336,12 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
         "sync_authority": sync_authority,
         "phase_basis": phase_basis,
         "phase_is_absolute": False,
+        "phase_status_display": (
+            "anchor_trusted" if str(getattr(sync, "phase_status", "") or "") == "trusted" else
+            "anchor_provisional" if str(getattr(sync, "phase_status", "") or "") == "provisional" else
+            "anchor_untrusted" if str(getattr(sync, "phase_status", "") or "") == "untrusted" else
+            "unavailable"
+        ),
         "period_delta_source": period_delta_source,
         "fit_observation_count": fit_observation_count,
         "fit_span_s": fit_span_s,
@@ -3164,7 +3174,7 @@ class RadarState:
         epoch_us: float,
         now_ts: float,
     ) -> dict:
-        """Rank and select the aircraft used for absolute phase anchoring.
+        """Rank and select the aircraft used for anchor-relative phase anchoring.
 
         This is deliberately separate from period fitting.  Candidates are
         scored on their own short-window coherence: enough recent observations,
@@ -3308,7 +3318,7 @@ class RadarState:
         existing: LiveSyncState,
         epoch_us: float,
     ) -> dict | None:
-        """Solve absolute phase offset from one selected aircraft."""
+        """Solve anchor-relative phase offset from one selected aircraft."""
         rows = [
             row for row in scored
             if row["icao"] == anchor_icao
@@ -3447,9 +3457,9 @@ class RadarState:
         now_ts: float,
         mixed_fallback_offset: float,
     ) -> dict:
-        """Resolve absolute-phase anchor selection, solve, and validation.
+        """Resolve anchor-relative phase anchor selection, solve, and validation.
 
-        This keeps the absolute-phase branch as one coherent unit separate from
+        This keeps the anchor-relative branch as one coherent unit separate from
         the broader multi-aircraft period-fit state machine.
         """
         anchor_selection = self._select_phase_anchor_aircraft(
