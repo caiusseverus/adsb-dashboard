@@ -2706,32 +2706,32 @@ function RotationAlignmentPanel({
               {syncState?.sync_jitter_deg != null ? `±${syncState.sync_jitter_deg.toFixed(1)}°` : '—'}
             </span>
           </span>
-          <span className={styles.metricPill}>Sync authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.sync_authority)}</span></span>
-          <span className={styles.metricPill}>Period authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.period_authority)}</span></span>
-          <span className={styles.metricPill}>Phase authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.phase_authority)}</span></span>
-          <span className={styles.metricPill}>Handoff state <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.handoff_state)}</span></span>
-          <span className={styles.metricPill}>Handoff reason <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.handoff_reason)}</span></span>
-          <span className={styles.metricPill}>Effective period source <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.effective_period_source)}</span></span>
-          <span className={styles.metricPill}>Period Δ source <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.period_delta_source)}</span></span>
+          <span className={styles.metricPill}>Diag: sync authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.sync_authority)}</span></span>
+          <span className={styles.metricPill}>Diag: period authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.period_authority)}</span></span>
+          <span className={styles.metricPill}>Diag: phase authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.phase_authority)}</span></span>
+          <span className={styles.metricPill}>Diag: handoff state <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.handoff_state)}</span></span>
+          <span className={styles.metricPill}>Diag: handoff reason <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.handoff_reason)}</span></span>
+          <span className={styles.metricPill}>Diag: effective period source <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.effective_period_source)}</span></span>
+          <span className={styles.metricPill}>Diag: period Δ source <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.period_delta_source)}</span></span>
           <span className={styles.metricPill}>Phase basis <span className={styles.metricValue}>{syncState?.phase_basis ?? '—'}</span></span>
           <span className={styles.metricPill}>Phase absolute? <span className={styles.metricValue}>{syncState?.phase_is_absolute ? 'yes' : 'no'}</span></span>
           <span className={styles.metricPill}>Anchor ICAO <span className={styles.metricValue}>{syncState?.phase_anchor_icao ?? '—'}</span></span>
           <span className={styles.metricPill}>Anchor age <span className={styles.metricValue}>{syncState?.phase_anchor_since_ts ? `${Math.max(0, (Date.now() / 1000) - Number(syncState.phase_anchor_since_ts)).toFixed(0)}s` : '—'}</span></span>
           <span className={styles.metricPill}>Residual source <span className={styles.metricValue}>{burstTimeline?.residual_chart_default_mode ?? '—'}</span></span>
-          <span className={styles.metricPill}>Convergence <span className={styles.metricValue}>{syncState?.fit_observation_count != null ? `${syncState.fit_observation_count} obs / ${fmtNumber(syncState.fit_span_s, 1, 's')}` : '—'}</span></span>
-          <span className={styles.metricPill}>Fit ICAOs <span className={styles.metricValue}>{syncState?.fit_icao_count ?? '—'}</span></span>
-          <span className={styles.metricPill}>Obs/ICAO min|med|max <span className={styles.metricValue}>
+          <span className={styles.metricPill}>Diag: convergence <span className={styles.metricValue}>{syncState?.fit_observation_count != null ? `${syncState.fit_observation_count} obs / ${fmtNumber(syncState.fit_span_s, 1, 's')}` : '—'}</span></span>
+          <span className={styles.metricPill}>Diag: fit ICAOs <span className={styles.metricValue}>{syncState?.fit_icao_count ?? '—'}</span></span>
+          <span className={styles.metricPill}>Diag: obs/ICAO min|med|max <span className={styles.metricValue}>
             {syncState?.fit_observations_per_icao_median != null
               ? `${syncState.fit_observations_per_icao_min}|${Number(syncState.fit_observations_per_icao_median).toFixed(1)}|${syncState.fit_observations_per_icao_max}`
               : '—'}
           </span></span>
-          <span className={styles.metricPill}>Slope sign <span className={styles.metricValue}>{syncState?.slope_sign_convention ?? '—'}</span></span>
-          <span className={styles.metricPill}>Go slope/EMA/σ <span className={styles.metricValue}>
+          <span className={styles.metricPill}>Diag: slope sign <span className={styles.metricValue}>{syncState?.slope_sign_convention ?? '—'}</span></span>
+          <span className={styles.metricPill}>Diag: Go slope/EMA/σ <span className={styles.metricValue}>
             {syncState?.residual_slope_deg_per_s != null
               ? `${Number(syncState.residual_slope_deg_per_s).toFixed(3)} / ${fmtNumber(syncState?.slope_ema_deg_per_s, 3)} / ${fmtNumber(syncState?.slope_std_deg_per_s, 3)}`
               : '—'}
           </span></span>
-          <span className={styles.metricPill}>Go Δ proposed/applied <span className={styles.metricValue}>
+          <span className={styles.metricPill}>Diag: Go Δ proposed/applied <span className={styles.metricValue}>
             {syncState?.proposed_delta_s != null
               ? `${Number(syncState.proposed_delta_s).toExponential(2)} / ${fmtNumber(syncState?.applied_delta_s, 6)}`
               : '—'}

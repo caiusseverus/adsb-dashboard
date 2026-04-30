@@ -483,6 +483,11 @@ func TestSyncState_SuspiciousICAOExclusion(t *testing.T) {
 }
 
 func TestSyncState_PeriodRefinementSignForPPMDrift(t *testing.T) {
+	// Sign convention for the synthetic drift cases:
+	// ppm error = (true_period - base_period) / base_period.
+	// Therefore:
+	//   +ppm => true period is longer than base, so expected correction delta is positive.
+	//   -ppm => true period is shorter than base, so expected correction delta is negative.
 	makeResidual := func(i int, periodTrue, base float64) float64 {
 		tS := float64(i) * base
 		return circularDiff(tS*(360.0/periodTrue), tS*(360.0/base))
