@@ -1823,6 +1823,22 @@ function formatAuthorityLabel(value) {
   return String(value).replaceAll('_', ' ')
 }
 
+function collectBlockingHandoffGates(syncState) {
+  const failures = syncState?.handoff_gate_failures
+  if (!failures || typeof failures !== 'object') return []
+  const blocking = []
+  Object.entries(failures).forEach(([groupName, groupValue]) => {
+    if (!groupValue || typeof groupValue !== 'object') return
+    Object.entries(groupValue).forEach(([gateName, gateState]) => {
+      if (!gateState || typeof gateState !== 'object') return
+      if (gateState.passed === false) {
+        blocking.push(`${groupName}.${gateName}`)
+      }
+    })
+  })
+  return blocking
+}
+
 function phaseStatusDisplayLabel(value) {
   switch (value) {
     case 'trusted': return 'anchor_trusted'
@@ -1881,6 +1897,9 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
           <span className={styles.metricPill}>Operational period mode <span className={styles.metricValue}>{authoritySummary}</span></span>
           <span className={styles.metricPill}>Sync authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.sync_authority)}</span></span>
           <span className={styles.metricPill}>Period authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.period_authority)}</span></span>
+          <span className={styles.metricPill}>Phase authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.phase_authority)}</span></span>
+          <span className={styles.metricPill}>Handoff state <span className={styles.metricValue}>{formatAuthorityLabel(syncState.handoff_state)}</span></span>
+          <span className={styles.metricPill}>Handoff reason <span className={styles.metricValue}>{formatAuthorityLabel(syncState.handoff_reason)}</span></span>
           <span className={styles.metricPill}>Refinement status <span className={styles.metricValue}>{formatAuthorityLabel(syncState.period_refinement_status)}</span></span>
           <span className={styles.metricPill}>Effective period source <span className={styles.metricValue}>{formatAuthorityLabel(syncState.effective_period_source)}</span></span>
           <span className={styles.metricPill}>Period Δ source <span className={styles.metricValue}>{formatAuthorityLabel(syncState.period_delta_source)}</span></span>
@@ -1907,6 +1926,8 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
             {compact.reference_changed_recently ? `Reference changed recently from ${compact.last_reference_icao ?? '—'} to ${compact.reference_icao ?? '—'}. ` : ''}
             {compact.phase_epoch_changed_recently ? 'Phase epoch changed recently. ' : ''}
             {compact.last_holdover_transition ? `Last holdover transition: ${humanizeSyncReason(compact.last_holdover_transition)}. ` : ''}
+            {syncState.last_handoff_transition_ts ? `Last handoff transition: ${new Date(Number(syncState.last_handoff_transition_ts) * 1000).toLocaleTimeString()}. ` : ''}
+            {collectBlockingHandoffGates(syncState).length ? `Blocking gates: ${collectBlockingHandoffGates(syncState).join(', ')}. ` : ''}
             {compact.last_sync_reset_reason ? `Last reset: ${humanizeSyncReason(compact.last_sync_reset_reason)}.` : (alignmentStatus?.detail ?? '')}
           </div>
         </div>
@@ -2687,6 +2708,9 @@ function RotationAlignmentPanel({
           </span>
           <span className={styles.metricPill}>Sync authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.sync_authority)}</span></span>
           <span className={styles.metricPill}>Period authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.period_authority)}</span></span>
+          <span className={styles.metricPill}>Phase authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.phase_authority)}</span></span>
+          <span className={styles.metricPill}>Handoff state <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.handoff_state)}</span></span>
+          <span className={styles.metricPill}>Handoff reason <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.handoff_reason)}</span></span>
           <span className={styles.metricPill}>Effective period source <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.effective_period_source)}</span></span>
           <span className={styles.metricPill}>Period Δ source <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.period_delta_source)}</span></span>
           <span className={styles.metricPill}>Phase basis <span className={styles.metricValue}>{syncState?.phase_basis ?? '—'}</span></span>

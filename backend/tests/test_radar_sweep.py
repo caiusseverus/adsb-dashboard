@@ -2781,8 +2781,10 @@ def test_go_iid_state_bootstraps_live_sync_state_when_missing():
 
     sync = state.get_live_sync_state(63)
     assert sync is not None
-    assert sync.usable is True
+    assert sync.usable is False
     assert sync.source == "go_frame_sync"
+    assert sync.handoff_state == "BOOTSTRAPPING_PY"
+    assert sync.handoff_reason == "missing_python_base_period"
     assert sync.phase_epoch_us == pytest.approx(500_000.0)
     assert sync.phase_offset_deg == pytest.approx(12.0)
     debug = state.get_live_pipeline_debug(63)
@@ -2792,7 +2794,7 @@ def test_go_iid_state_bootstraps_live_sync_state_when_missing():
 
 def _make_base_radar_state_for_go_sync_seed_tests():
     state = RadarState()
-    state._models[77] = RadarIID(iid=77, status="SINGLE_RADAR", period_s=4.0)
+    state._models[77] = RadarIID(iid=77, status="SINGLE_RADAR", period_s=4.0, primary_support_count=6)
     return state
 
 
@@ -2833,9 +2835,67 @@ def test_go_iid_state_does_not_override_multi_aircraft_sync_state():
 
     sync = state.get_live_sync_state(77)
     assert sync is not None
-    assert sync.source == "multi_aircraft_burst"
-    assert sync.phase_epoch_us == pytest.approx(123.0)
+    assert sync.source == "go_frame_sync"
+    assert sync.handoff_state == "BASE_PERIOD_READY"
+    assert sync.handoff_reason == "go_not_ready"
+    assert sync.usable is False
     assert state.get_go_live_sync_state(77)["phase_epoch_us"] == pytest.approx(999_000.0)
+
+
+def test_go_handoff_rejects_holdover_when_python_base_valid():
+    state = RadarState()
+    state._models[31] = RadarIID(iid=31, status="SINGLE_RADAR", period_s=4.0, primary_support_count=6)
+    state.update_go_iid_state({
+        "i": 31, "sp": True, "su": True, "sps": 4.0, "sep": 1000.0, "sod": 10.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": True, "lu": 2000.0, "rv": 1, "bps": 4.0, "eps": 4.0, "pag": True,
+    })
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(31))
+    assert payload["handoff_state"] == "BASE_PERIOD_READY"
+    assert payload["handoff_reason"] == "go_holdover"
+    assert payload["period_authority"] == "holdover"
+
+
+def test_go_handoff_rejects_period_disagreement():
+    state = RadarState()
+    state._models[32] = RadarIID(iid=32, status="SINGLE_RADAR", period_s=4.0, primary_support_count=6)
+    state.update_go_iid_state({
+        "i": 32, "sp": True, "su": True, "sps": 4.8, "sep": 1000.0, "sod": 10.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1, "bps": 4.8, "eps": 4.8, "pag": True,
+    })
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(32))
+    assert payload["period_authority"] == "py_base"
+    assert payload["handoff_state"] == "BASE_PERIOD_READY"
+    assert payload["handoff_reason"] == "go_not_ready"
+
+
+def test_go_handoff_allows_period_authority_when_gates_pass():
+    state = RadarState()
+    state._models[33] = RadarIID(iid=33, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state.update_go_iid_state({
+        "i": 33, "sp": True, "su": True, "sps": 4.0, "sep": 1000.0, "sod": 10.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1, "bps": 4.0, "eps": 4.0, "pag": True,
+    })
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(33))
+    assert payload["period_authority"] == "go_refined"
+    assert payload["sync_authority"] == "go_runtime"
+    assert payload["handoff_state"] == "GO_REFINED_READY"
+    assert payload["phase_authority"] != "go_runtime"
+
+
+def test_handoff_transition_log_only_on_state_change(caplog):
+    state = RadarState()
+    state._models[34] = RadarIID(iid=34, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    caplog.set_level("INFO")
+    msg = {
+        "i": 34, "sp": True, "su": True, "sps": 4.0, "sep": 1000.0, "sod": 10.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1, "bps": 4.0, "eps": 4.0, "pag": True,
+    }
+    state.update_go_iid_state(msg)
+    first_count = sum(1 for rec in caplog.records if "radar_sync_handoff_transition" in rec.message)
+    state.update_go_iid_state({**msg, "rv": 2})
+    second_count = sum(1 for rec in caplog.records if "radar_sync_handoff_transition" in rec.message)
+    assert first_count == 1
+    assert second_count == 1
 
 
 def test_update_go_burst_fired_does_not_call_python_solver(monkeypatch):

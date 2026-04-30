@@ -58,3 +58,35 @@ Plan confirmation:
 - Frontend: Added explicit operational labels for `period_authority`, `sync_authority`, and `period_refinement_status`; diagnostic/shadow section remains separate.
 - Tests: Added/updated backend and static UI tests for canonical field presence, conservative authority handling, invariant behavior, and operational-vs-diagnostic source separation.
 - Verification: `uv run --directory backend pytest tests/test_radar_api.py tests/test_radar_sweep.py tests/test_radar_ui_labels.py -q` passed (`145 passed`), and `cd frontend && npm run build` passed.
+
+## 2026-04-30 Stage 3 Formal Python→Go Authority Handoff
+
+- [x] Run impact scan for handoff/authority symbols and current Go adoption path.
+- [x] Add explicit handoff state model and gate payload fields to sync snapshot serialization.
+- [x] Implement Python base-validity gate helper and Go-readiness gate helper with per-gate pass/fail/unknown reporting.
+- [x] Replace silent Go sync adoption with explicit gated transitions:
+- [x] Frame diagnostics mode (Go data accepted, no operational authority adoption).
+- [x] Period authority adoption mode (gated; requires valid Python base + Go readiness).
+- [x] Phase authority adoption mode (separate gating; anchor-relative/geographic basis + fresh/trusted phase state).
+- [x] Add handoff transition tracking (`handoff_state`, `handoff_reason`, `last_handoff_transition_ts`) and non-spam structured logging.
+- [x] Wire new handoff fields through API selected-IID and compact sync payloads.
+- [x] Update Radar diagnostics panel to show handoff state/reason, authority split, and blocking gates.
+- [x] Add/update backend tests for gate behavior, authority separation, transition updates/logging, and payload fields.
+- [x] Add/update frontend static tests for handoff labels/blocking reason rendering and phase-authority truthfulness.
+- [x] Run focused verification (`pytest` changed tests, frontend build) and document results.
+
+Plan confirmation:
+- Stage 3 only. No Stage 4+ implementation.
+- No period-refinement math, phase math, burst classification, reference selection, or frame-generation algorithm changes except explicit authority gating/visibility.
+
+### Review (Stage 3)
+- Backend: Added explicit handoff metadata fields to live sync state (`handoff_state`, `handoff_reason`, `last_handoff_transition_ts`, `handoff_gate_failures`, `phase_authority`).
+- Backend: Replaced implicit Go authority adoption with explicit diagnostic ingest + gate-driven handoff evaluation.
+- Backend: Added centralized Python base-validity, Go readiness, and phase-authority gate evaluators with per-gate `passed`/`reason` entries and unknown/not-evaluated states.
+- Backend: Added structured transition logging on handoff-state change only (`radar_sync_handoff_transition` with iid/old/new/reason).
+- Backend/API: Sync snapshot payload now includes handoff state/reason/timestamp/gate failures and explicit phase authority, while preserving canonical period fields and legacy fields.
+- Frontend: Radar diagnostics now shows handoff state, handoff reason, phase authority, and compact blocking gate list.
+- Tests: Added/updated backend and UI tests for Stage 3 authority gating, handoff fields, and transition logging behavior.
+- Verification:
+- `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_radar_ui_labels.py -q` -> `149 passed`
+- `cd frontend && npm run build` -> passed

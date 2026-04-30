@@ -135,6 +135,7 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
 
     monkeypatch.setattr(sweep_module.time, "time", lambda: 1_000.0)
     state = RadarState()
+    state._models[23] = RadarIID(iid=23, status="SINGLE_RADAR", period_s=4.25, primary_support_count=6)
     state.update_go_snapshot({
         "iids": {
             "23": {
@@ -151,6 +152,9 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
                 "sync_n_rejected_frames": 3,
                 "sync_holdover": False,
                 "sync_last_updated": 1_000.0,
+                "base_period_s": 4.25,
+                "effective_period_s": 4.25,
+                "period_agrees_with_df": True,
                 "multi_sync_admission": {
                     "last_reason": "no_receiver_config",
                     "last_icao": 0xABCDEF,
@@ -163,7 +167,6 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
             }
         }
     })
-    state._models[23] = RadarIID(iid=23, status="SINGLE_RADAR", period_s=4.25)
     state._go_evidence_events = deque([
         {
             "kind": "burst_fired",
@@ -195,6 +198,10 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
         "fit_span_s",
         "slope_sign_convention",
         "effective_period_source",
+        "handoff_state",
+        "handoff_reason",
+        "handoff_gate_failures",
+        "last_handoff_transition_ts",
     }
 
     assert payload["sync_state"]["source"] == "go_frame_sync"
@@ -212,6 +219,8 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     assert payload["sync_state"]["period_delta_source"] == "none"
     assert payload["sync_state"]["slope_sign_convention"] == "observed_minus_predicted"
     assert payload["sync_state"]["effective_period_source"] == "go_runtime.base_period_s"
+    assert "handoff_state" in payload["sync_state"]
+    assert "handoff_gate_failures" in payload["sync_state"]
     assert payload["observations"] == []
     assert payload["alignment_status"]["reason"] == "radar_position_unavailable"
     assert payload["alignment_status"]["multi_sync_admission"]["last_reason"] == "no_receiver_config"

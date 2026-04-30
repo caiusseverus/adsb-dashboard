@@ -25,4 +25,8 @@ def test_radar_page_shows_authority_labels_and_separates_diagnostic_delta():
     assert "Refinement status" in text
     assert "Sync authority" in text
     assert "Period authority" in text
+    assert "Phase authority" in text
+    assert "Handoff state" in text
+    assert "Handoff reason" in text
+    assert "Blocking gates:" in text
     assert "Go Δ (diagnostic)" in text

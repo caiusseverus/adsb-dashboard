@@ -73,6 +73,11 @@ class LiveSyncState:
     period_authority: str | None = None
     period_refinement_status: str | None = None
     sync_authority: str | None = None
+    phase_authority: str | None = None
+    handoff_state: str | None = None
+    handoff_reason: str | None = None
+    last_handoff_transition_ts: float | None = None
+    handoff_gate_failures: dict = field(default_factory=dict)
 
 
 @dataclass

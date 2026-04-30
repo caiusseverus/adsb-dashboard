@@ -118,6 +118,9 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 _CANONICAL_PERIOD_INVARIANT_TOL_S = 1e-9
 _canonical_period_invariant_mismatch_count = 0
+_GO_BASE_AGREE_TOL_S = 0.15
+_GO_EFFECTIVE_AGREE_TOL_S = 0.15
+_PHASE_FRESH_MAX_AGE_S = 15.0
 
 _perf_lock = threading.Lock()
 df11_event_timings: deque[float] = deque(maxlen=4000)
@@ -320,8 +323,13 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
     base_period_s: float | None = None
     effective_period_s: float | None = None
     period_delta_s: float | None = None
-    period_authority = "unavailable"
-    sync_authority = "unavailable"
+    period_authority = str(getattr(sync, "period_authority", "") or "unavailable")
+    sync_authority = str(getattr(sync, "sync_authority", "") or "unavailable")
+    phase_authority = str(getattr(sync, "phase_authority", "") or "unavailable")
+    handoff_state = str(getattr(sync, "handoff_state", "") or "")
+    handoff_reason = str(getattr(sync, "handoff_reason", "") or "")
+    last_handoff_transition_ts = getattr(sync, "last_handoff_transition_ts", None)
+    handoff_gate_failures = getattr(sync, "handoff_gate_failures", None) or {}
     period_refinement_status = str(getattr(sync, "period_refinement_status", "") or "").strip() or None
 
     usable = bool(getattr(sync, "usable", False))
@@ -343,12 +351,12 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
         elif base_period_s is not None and effective_period_s is not None:
             period_delta_s = effective_period_s - base_period_s
 
-        if source == "go_frame_sync":
+        if source == "go_frame_sync" and period_authority == "unavailable":
             period_authority = "go_refined" if effective_period_s is not None else "unavailable"
             sync_authority = "go_runtime" if effective_period_s is not None else "unavailable"
             if period_refinement_status is None:
                 period_refinement_status = "stable" if effective_period_s is not None else "unavailable"
-        elif source == "multi_aircraft_burst":
+        elif source == "multi_aircraft_burst" and period_authority == "unavailable":
             refined = bool(
                 base_period_s is not None
                 and effective_period_s is not None
@@ -363,7 +371,7 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
                     period_refinement_status = "refining"
                 else:
                     period_refinement_status = "bootstrapping"
-        else:
+        elif source not in {"go_frame_sync", "multi_aircraft_burst"}:
             period_authority = "unavailable"
             sync_authority = "unavailable"
             if period_refinement_status is None:
@@ -374,6 +382,11 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
     if holdover:
         period_authority = "holdover"
         sync_authority = "holdover"
+        phase_authority = "holdover"
+        if not handoff_state:
+            handoff_state = "HOLDOVER"
+        if not handoff_reason:
+            handoff_reason = "go_holdover" if source == "go_frame_sync" else "python_holdover"
         period_refinement_status = "holdover"
         if base_period_s is None or effective_period_s is None:
             base_period_s = None
@@ -405,7 +418,15 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
             )
             period_delta_s = effective_period_s - base_period_s
 
-    period_refinement_status = period_refinement_status or "unavailable"
+    if period_refinement_status is None:
+        if period_authority == "go_refined":
+            period_refinement_status = "stable"
+        elif period_authority == "py_base":
+            period_refinement_status = "bootstrapping"
+        elif period_authority == "py_refined":
+            period_refinement_status = "stable"
+        else:
+            period_refinement_status = "unavailable"
 
     payload.update({
         "base_period_s": base_period_s,
@@ -414,6 +435,16 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
         "period_authority": period_authority,
         "sync_authority": sync_authority,
         "period_refinement_status": period_refinement_status,
+        "phase_authority": phase_authority,
+        "handoff_state": handoff_state or (
+            "UNTRUSTED" if source == "go_frame_sync" else
+            "GO_REFINING" if period_authority == "py_refined" else
+            "BASE_PERIOD_READY" if period_authority == "py_base" else
+            "BOOTSTRAPPING_PY"
+        ),
+        "handoff_reason": handoff_reason or ("derived_from_sync_source" if source else "sync_state_unavailable"),
+        "last_handoff_transition_ts": last_handoff_transition_ts,
+        "handoff_gate_failures": handoff_gate_failures,
         "phase_basis": phase_basis,
         "phase_is_absolute": False,
         "phase_status_display": (
@@ -434,6 +465,14 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
 def _sync_source_has_rich_python_diagnostics(sync: "LiveSyncState | None") -> bool:
     """Return True when the current sync source carries Python-only rich diagnostics."""
     return bool(sync is not None and getattr(sync, "source", None) == "multi_aircraft_burst")
+
+
+def _gate_value(passed: bool | None, reason: str | None = None) -> dict:
+    return {"passed": passed, "reason": reason}
+
+
+def _finite_positive(value: float | None) -> bool:
+    return _is_finite_number(value) and float(value) > 0.0
 
 
 class AircraftPositionTracker:
@@ -2177,7 +2216,7 @@ class RadarState:
                         event_ts=go_sync.get("last_updated"),
                         source="go_frame_sync",
                     )
-                    self._adopt_go_frame_sync_locked(iid, go_sync)
+                    self._ingest_go_frame_sync_diagnostic_locked(iid, go_sync)
                     seen_go_sync_iids.add(iid)
                 elif iid in self._go_sync_states_by_iid:
                     self._go_sync_states_by_iid.pop(iid, None)
@@ -2390,6 +2429,199 @@ class RadarState:
         self._compact_sync_debug_by_iid[iid] = entry
         return dict(entry)
 
+    def _evaluate_python_base_validity_gates_locked(self, iid: int) -> dict:
+        sync = self._live_sync_states.get(iid)
+        model = self._models.get(iid)
+        now_ts = time.time()
+        sync_is_python = bool(sync is not None and str(getattr(sync, "source", "") or "") == "multi_aircraft_burst")
+        gates: dict[str, dict] = {}
+        enough_icaos = None
+        if sync_is_python:
+            enough_icaos = int(getattr(sync, "contributing_icao_count", 0) or 0) >= MIN_QUALIFYING_ICAOS
+        elif model is not None:
+            enough_icaos = int(getattr(model, "primary_support_count", 0) or 0) >= MIN_QUALIFYING_ICAOS
+        gates["enough_icaos"] = _gate_value(enough_icaos, None if enough_icaos is not False else "insufficient_contributing_icaos")
+        confidence_ok = None
+        if model is not None and _is_finite_number(getattr(model, "primary_confidence", None)):
+            confidence_ok = float(model.primary_confidence) >= 0.35
+        gates["dominant_confidence"] = _gate_value(confidence_ok, None if confidence_ok is not False else "dominant_period_confidence_low")
+        gates["period_stable"] = _gate_value(None, "not_evaluated")
+        fresh_data = None
+        if sync_is_python and _is_finite_number(getattr(sync, "last_sync_update_ts", None)):
+            fresh_data = (now_ts - float(sync.last_sync_update_ts)) <= self._LIVE_SYNC_OBS_RETENTION_S
+        gates["fresh_data"] = _gate_value(fresh_data, None if fresh_data is not False else "python_sync_stale")
+        gates["harmonic_ambiguity"] = _gate_value(None, "not_evaluated")
+        py_base = None
+        if (
+            sync_is_python
+            and _finite_positive(getattr(sync, "period_base_s", None))
+        ):
+            py_base = float(sync.period_base_s)
+        elif model is not None and _finite_positive(getattr(model, "period_s", None)):
+            py_base = float(model.period_s)
+        finite_base = _finite_positive(py_base)
+        gates["python_base_period_finite_positive"] = _gate_value(
+            finite_base,
+            None if finite_base else "missing_python_base_period",
+        )
+        base_period_valid = all(v["passed"] is not False for v in gates.values()) and finite_base
+        return {"base_period_valid": bool(base_period_valid), "python_base_period_s": py_base, "gates": gates}
+
+    def _evaluate_go_readiness_gates_locked(self, iid: int, python_base_period_s: float | None) -> dict:
+        go_sync = self._go_sync_states_by_iid.get(iid)
+        gates: dict[str, dict] = {}
+        present = go_sync is not None
+        gates["go_state_present"] = _gate_value(present, None if present else "go_sync_state_absent")
+        go_base = float(go_sync["base_period_s"]) if present and _finite_positive(go_sync.get("base_period_s")) else None
+        gates["go_mirrored_base_period_valid"] = _gate_value(
+            _finite_positive(go_base),
+            None if _finite_positive(go_base) else "go_mirrored_base_period_invalid",
+        )
+        base_agrees = None
+        if _finite_positive(python_base_period_s) and _finite_positive(go_base):
+            base_agrees = abs(float(go_base) - float(python_base_period_s)) <= _GO_BASE_AGREE_TOL_S
+        gates["go_base_agrees_with_python_base"] = _gate_value(
+            base_agrees,
+            None if base_agrees is not False else "go_base_disagrees_with_python_base",
+        )
+        usable = bool(go_sync.get("usable", False)) if present else False
+        gates["go_sync_state_usable"] = _gate_value(usable if present else None, None if usable else "go_sync_unusable")
+        period_agrees = bool(go_sync.get("period_agrees_with_df", False)) if present else False
+        gates["go_period_agrees_with_df"] = _gate_value(period_agrees if present else None, None if period_agrees else "go_period_disagrees_with_df")
+        n_sync_frames = int(go_sync.get("n_sync_frames") or 0) if present else 0
+        history_sufficient = n_sync_frames >= 3 if present else None
+        gates["go_refinement_history_sufficient"] = _gate_value(history_sufficient, None if history_sufficient is not False else "go_refinement_history_insufficient")
+        holdover = bool(go_sync.get("holdover", False)) if present else False
+        gates["go_not_holdover"] = _gate_value((not holdover) if present else None, None if not holdover else "go_holdover")
+        gates["go_contamination_state"] = _gate_value(None, "not_evaluated")
+        effective = float(go_sync["effective_period_s"]) if present and _finite_positive(go_sync.get("effective_period_s")) else None
+        gates["go_effective_period_finite_positive"] = _gate_value(
+            _finite_positive(effective),
+            None if _finite_positive(effective) else "go_effective_period_invalid",
+        )
+        effective_agrees = None
+        if _finite_positive(python_base_period_s) and _finite_positive(effective):
+            effective_agrees = abs(float(effective) - float(python_base_period_s)) <= _GO_EFFECTIVE_AGREE_TOL_S
+        gates["go_effective_agrees_with_python_base"] = _gate_value(
+            effective_agrees,
+            None if effective_agrees is not False else "go_effective_disagrees_with_python_base",
+        )
+        ready = all(v["passed"] is not False for v in gates.values())
+        return {"go_ready": bool(ready), "go_base_period_s": go_base, "go_effective_period_s": effective, "gates": gates}
+
+    def _evaluate_phase_authority_gates_locked(self, iid: int, sync: LiveSyncState | None) -> dict:
+        gates: dict[str, dict] = {}
+        if sync is None:
+            gates["phase_basis_supported"] = _gate_value(False, "sync_state_absent")
+            gates["phase_anchor_fresh_if_anchor_relative"] = _gate_value(None, "not_evaluated")
+            gates["phase_state_trusted"] = _gate_value(False, "phase_state_unavailable")
+            return {"phase_ready": False, "gates": gates, "phase_basis": "sweep_epoch_only"}
+        phase_basis = "sweep_epoch_only"
+        if getattr(sync, "phase_anchor_icao", None) and str(getattr(sync, "phase_anchor_status", "") or "") in {"selected", "anchor_only"}:
+            phase_basis = "anchor_relative"
+        gates["phase_basis_supported"] = _gate_value(
+            phase_basis in {"anchor_relative", "geographic"},
+            None if phase_basis in {"anchor_relative", "geographic"} else "phase_basis_not_supported",
+        )
+        anchor_fresh = None
+        if phase_basis == "anchor_relative":
+            updated = float(getattr(sync, "last_sync_update_ts", 0.0) or 0.0)
+            anchor_fresh = (time.time() - updated) <= _PHASE_FRESH_MAX_AGE_S
+        gates["phase_anchor_fresh_if_anchor_relative"] = _gate_value(anchor_fresh, None if anchor_fresh is not False else "anchor_stale")
+        trusted = str(getattr(sync, "phase_status", "") or "") == "trusted"
+        gates["phase_state_trusted"] = _gate_value(trusted, None if trusted else "phase_untrusted")
+        ready = all(v["passed"] is not False for v in gates.values())
+        return {"phase_ready": bool(ready), "gates": gates, "phase_basis": phase_basis}
+
+    def _set_handoff_state_locked(
+        self,
+        iid: int,
+        sync: LiveSyncState,
+        *,
+        handoff_state: str,
+        handoff_reason: str,
+        handoff_gate_failures: dict,
+        period_authority: str,
+        sync_authority: str,
+        phase_authority: str,
+    ) -> None:
+        previous = str(getattr(sync, "handoff_state", "") or "")
+        if previous != handoff_state:
+            now_ts = time.time()
+            sync.last_handoff_transition_ts = now_ts
+            log.info(
+                "radar_sync_handoff_transition iid=%s old_state=%s new_state=%s reason=%s",
+                iid,
+                previous or "unset",
+                handoff_state,
+                handoff_reason,
+            )
+        sync.handoff_state = handoff_state
+        sync.handoff_reason = handoff_reason
+        sync.handoff_gate_failures = handoff_gate_failures
+        sync.period_authority = period_authority
+        sync.sync_authority = sync_authority
+        sync.phase_authority = phase_authority
+
+    def _apply_go_handoff_state_locked(self, iid: int) -> None:
+        sync = self._live_sync_states.get(iid)
+        if sync is None or str(getattr(sync, "source", "") or "") != "go_frame_sync":
+            return
+        py_gates = self._evaluate_python_base_validity_gates_locked(iid)
+        go_gates = self._evaluate_go_readiness_gates_locked(iid, py_gates.get("python_base_period_s"))
+        phase_eval = self._evaluate_phase_authority_gates_locked(iid, sync)
+        failures = {
+            "python_base": py_gates["gates"],
+            "go_readiness": go_gates["gates"],
+            "phase_readiness": phase_eval["gates"],
+        }
+        if not py_gates["base_period_valid"]:
+            reason = "missing_python_base_period"
+            for gate_name, gate_state in py_gates["gates"].items():
+                if gate_state.get("passed") is False:
+                    reason = str(gate_state.get("reason") or gate_name)
+                    break
+            sync.usable = False
+            self._set_handoff_state_locked(
+                iid,
+                sync,
+                handoff_state="BOOTSTRAPPING_PY",
+                handoff_reason=reason,
+                handoff_gate_failures=failures,
+                period_authority="py_bootstrap",
+                sync_authority="py_bootstrap",
+                phase_authority="py_bootstrap",
+            )
+            return
+        if not go_gates["go_ready"]:
+            sync.usable = False
+            reason = "go_not_ready"
+            if bool((self._go_sync_states_by_iid.get(iid) or {}).get("holdover", False)):
+                reason = "go_holdover"
+            self._set_handoff_state_locked(
+                iid,
+                sync,
+                handoff_state="BASE_PERIOD_READY",
+                handoff_reason=reason,
+                handoff_gate_failures=failures,
+                period_authority="py_base",
+                sync_authority="py_bootstrap",
+                phase_authority="py_bootstrap",
+            )
+            return
+        sync.usable = True
+        phase_authority = "go_runtime" if phase_eval["phase_ready"] else "py_anchor_relative"
+        self._set_handoff_state_locked(
+            iid,
+            sync,
+            handoff_state="GO_REFINED_READY",
+            handoff_reason="go_ready",
+            handoff_gate_failures=failures,
+            period_authority="go_refined",
+            sync_authority="go_runtime",
+            phase_authority=phase_authority,
+        )
+
     @staticmethod
     def _normalise_go_track_observation(entry: dict) -> dict | None:
         return _normalise_go_track_observation_helper(entry)
@@ -2514,10 +2746,8 @@ class RadarState:
     def _go_multi_sync_admission_snapshot(self, iid: int) -> dict | None:
         return _go_multi_sync_admission_snapshot_helper(self, iid)
 
-    def _adopt_go_frame_sync_locked(self, iid: int, go_sync: dict) -> None:
+    def _ingest_go_frame_sync_diagnostic_locked(self, iid: int, go_sync: dict) -> None:
         existing = self._live_sync_states.get(iid)
-        if existing is not None and existing.source == "multi_aircraft_burst":
-            return
         effective_period_s = go_sync.get("effective_period_s") or go_sync.get("period_s")
         base_period_s = go_sync.get("base_period_s") or effective_period_s
         if effective_period_s is None or base_period_s is None:
@@ -2536,14 +2766,27 @@ class RadarState:
             sync_jitter_deg=float(go_sync.get("sync_jitter_deg") or 5.0),
             last_sync_update_ts=last_updated,
             source="go_frame_sync",
-            usable=bool(go_sync.get("usable", False)),
+            usable=False,
             residual_ema_deg=float(go_sync.get("residual_ema_deg") or 5.0),
             n_sync_frames=int(go_sync.get("n_sync_frames") or 0),
             n_rejected_frames=int(go_sync.get("n_rejected_frames") or 0),
             last_residual_deg=float(go_sync.get("last_residual_deg") or 0.0),
             holdover=bool(go_sync.get("holdover", False)),
             period_base_s=float(base_period_s),
+            handoff_state=(
+                str(getattr(existing, "handoff_state", "") or "UNTRUSTED")
+                if existing is not None else
+                "UNTRUSTED"
+            ),
+            handoff_reason=(
+                str(getattr(existing, "handoff_reason", "") or "diagnostic_frame_accumulation_only")
+                if existing is not None else
+                "diagnostic_frame_accumulation_only"
+            ),
+            last_handoff_transition_ts=getattr(existing, "last_handoff_transition_ts", None) if existing is not None else None,
+            handoff_gate_failures=dict(getattr(existing, "handoff_gate_failures", {}) or {}) if existing is not None else {},
         )
+        self._apply_go_handoff_state_locked(iid)
 
     def update_go_iid_state(self, iid_state: dict) -> None:
         try:
@@ -2590,7 +2833,7 @@ class RadarState:
                     event_ts=go_sync.get("last_updated"),
                     source="go_frame_sync",
                 )
-                self._adopt_go_frame_sync_locked(iid, go_sync)
+                self._ingest_go_frame_sync_diagnostic_locked(iid, go_sync)
             else:
                 self._go_sync_states_by_iid.pop(iid, None)
                 existing_ref = (self._go_reference_aircraft_by_iid.get(iid) or {}).get("ref_icao")
