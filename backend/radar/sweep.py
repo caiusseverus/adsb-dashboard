@@ -116,6 +116,8 @@ if TYPE_CHECKING:
     from aircraft_state import AircraftState
 
 log = logging.getLogger(__name__)
+_CANONICAL_PERIOD_INVARIANT_TOL_S = 1e-9
+_canonical_period_invariant_mismatch_count = 0
 
 _perf_lock = threading.Lock()
 df11_event_timings: deque[float] = deque(maxlen=4000)
@@ -315,25 +317,103 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
     if fit_observation_count <= 0:
         fit_span_s = None
 
-    if source == "multi_aircraft_burst":
-        period_authority = "python_refined" if has_period_delta else "python_base_bootstrap"
-        sync_authority = "python_refined_sync" if has_period_delta else "python_bootstrap_sync"
-    elif source == "go_frame_sync":
-        period_authority = "go_refined" if has_period_delta else "go_base_bootstrap"
-        sync_authority = "go_runtime"
-    elif source == "sweep_frame":
-        period_authority = "python_sweep_frame_bootstrap"
-        sync_authority = "python_sweep_frame"
+    base_period_s: float | None = None
+    effective_period_s: float | None = None
+    period_delta_s: float | None = None
+    period_authority = "unavailable"
+    sync_authority = "unavailable"
+    period_refinement_status = str(getattr(sync, "period_refinement_status", "") or "").strip() or None
+
+    usable = bool(getattr(sync, "usable", False))
+    if usable:
+        canonical_base = getattr(sync, "base_period_s", None)
+        canonical_effective = getattr(sync, "effective_period_s", None)
+        canonical_delta = getattr(sync, "period_delta_s", None)
+
+        if _is_finite_number(canonical_base) and float(canonical_base) > 0.0:
+            base_period_s = float(canonical_base)
+        elif period_base_s > 0.0:
+            base_period_s = period_base_s
+        if _is_finite_number(canonical_effective) and float(canonical_effective) > 0.0:
+            effective_period_s = float(canonical_effective)
+        elif period_s > 0.0:
+            effective_period_s = period_s
+        if _is_finite_number(canonical_delta):
+            period_delta_s = float(canonical_delta)
+        elif base_period_s is not None and effective_period_s is not None:
+            period_delta_s = effective_period_s - base_period_s
+
+        if source == "go_frame_sync":
+            period_authority = "go_refined" if effective_period_s is not None else "unavailable"
+            sync_authority = "go_runtime" if effective_period_s is not None else "unavailable"
+            if period_refinement_status is None:
+                period_refinement_status = "stable" if effective_period_s is not None else "unavailable"
+        elif source == "multi_aircraft_burst":
+            refined = bool(
+                base_period_s is not None
+                and effective_period_s is not None
+                and abs(effective_period_s - base_period_s) > _CANONICAL_PERIOD_INVARIANT_TOL_S
+            )
+            period_authority = "py_refined" if refined else "py_base"
+            sync_authority = "py_refined" if refined else "py_bootstrap"
+            if period_refinement_status is None:
+                if refined:
+                    period_refinement_status = "stable"
+                elif fit_observation_count > 0:
+                    period_refinement_status = "refining"
+                else:
+                    period_refinement_status = "bootstrapping"
+        else:
+            period_authority = "unavailable"
+            sync_authority = "unavailable"
+            if period_refinement_status is None:
+                period_refinement_status = "diagnostic_only"
     else:
-        period_authority = source or "unknown"
-        sync_authority = source or "unknown"
+        period_refinement_status = period_refinement_status or "unavailable"
+
     if holdover:
-        period_authority = f"{period_authority}_holdover"
-        sync_authority = f"{sync_authority}_holdover"
+        period_authority = "holdover"
+        sync_authority = "holdover"
+        period_refinement_status = "holdover"
+        if base_period_s is None or effective_period_s is None:
+            base_period_s = None
+            effective_period_s = None
+            period_delta_s = None
+
+    if period_authority == "unavailable":
+        base_period_s = None
+        effective_period_s = None
+        period_delta_s = None
+
+    if (
+        base_period_s is not None
+        and effective_period_s is not None
+        and period_delta_s is not None
+    ):
+        delta_mismatch_s = (base_period_s + period_delta_s) - effective_period_s
+        if abs(delta_mismatch_s) > _CANONICAL_PERIOD_INVARIANT_TOL_S:
+            global _canonical_period_invariant_mismatch_count
+            _canonical_period_invariant_mismatch_count += 1
+            log.warning(
+                "sync canonical period invariant mismatch for iid=%s; recomputing delta (base=%s delta=%s effective=%s mismatch=%s count=%s)",
+                getattr(sync, "iid", None),
+                base_period_s,
+                period_delta_s,
+                effective_period_s,
+                delta_mismatch_s,
+                _canonical_period_invariant_mismatch_count,
+            )
+            period_delta_s = effective_period_s - base_period_s
+
+    period_refinement_status = period_refinement_status or "unavailable"
 
     payload.update({
+        "base_period_s": base_period_s,
+        "period_delta_s": period_delta_s,
+        "effective_period_s": effective_period_s,
         "period_authority": period_authority,
         "sync_authority": sync_authority,
+        "period_refinement_status": period_refinement_status,
         "phase_basis": phase_basis,
         "phase_is_absolute": False,
         "phase_status_display": (

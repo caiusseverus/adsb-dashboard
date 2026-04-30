@@ -1834,51 +1834,20 @@ function phaseStatusDisplayLabel(value) {
 
 function authorityModeLabel(syncState) {
   if (!syncState) return 'unavailable'
-  const periodAuthority = String(syncState.period_authority ?? '')
-  const effectiveSource = String(syncState.effective_period_source ?? '')
-  if (periodAuthority.includes('holdover')) return 'holdover'
-  if (periodAuthority.includes('python_base_bootstrap') || effectiveSource.includes('period_base_s')) return 'Python base/bootstrap'
-  if (periodAuthority.includes('python_refined') || effectiveSource.includes('python_simple_sync.period_s')) return 'Python refined'
-  if (periodAuthority.includes('go_refined') || effectiveSource.includes('go_runtime.effective_period_s')) return 'Go refined/runtime'
-  if (periodAuthority.includes('go_base_bootstrap') || effectiveSource.includes('go_runtime.base_period_s')) return 'Go base/bootstrap'
+  const periodAuthority = String(syncState.period_authority ?? '').toLowerCase()
+  if (periodAuthority === 'holdover') return 'holdover'
+  if (periodAuthority === 'py_base') return 'Python base/bootstrap'
+  if (periodAuthority === 'py_refined') return 'Python refined'
+  if (periodAuthority === 'go_refined') return 'Go refined/runtime'
   return 'unavailable'
 }
 
-function getOperationalPeriodTriple(syncState, modeDiagnostics) {
+function getOperationalPeriodTriple(syncState) {
   if (!syncState) return null
-  const compact = modeDiagnostics?.compact ?? {}
-  const source = String(syncState.effective_period_source ?? '')
-  const periodSource = String(syncState.period_delta_source ?? '')
-  const syncSource = String(syncState.source ?? '')
-
-  if (source.startsWith('go_runtime.') && (periodSource === 'go_runtime_delta' || syncSource === 'go_frame_sync')) {
-    const base = Number(compact.base_period_s)
-    const delta = Number(compact.period_delta_s)
-    const effective = Number(compact.effective_period_s)
-    if ([base, delta, effective].every(Number.isFinite)) {
-      return { base, delta, effective, sourceLabel: 'go_runtime_operational' }
-    }
-  }
-
-  const base = Number(syncState.period_base_s)
-  const effective = Number(syncState.period_s)
-  if (Number.isFinite(base) && Number.isFinite(effective)) {
-    return {
-      base,
-      delta: effective - base,
-      effective,
-      sourceLabel: 'python_operational',
-    }
-  }
-
-  if (Number.isFinite(effective)) {
-    return {
-      base: effective,
-      delta: 0,
-      effective,
-      sourceLabel: 'bootstrap_only',
-    }
-  }
+  const base = Number(syncState.base_period_s)
+  const delta = Number(syncState.period_delta_s)
+  const effective = Number(syncState.effective_period_s)
+  if ([base, delta, effective].every(Number.isFinite)) return { base, delta, effective }
   return null
 }
 
@@ -1890,7 +1859,7 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
   if (!syncState || !modeDiagnostics) return null
   const compact = modeDiagnostics.compact ?? {}
   const pythonSync = modeDiagnostics.python_sync ?? {}
-  const operationalPeriod = getOperationalPeriodTriple(syncState, modeDiagnostics)
+  const operationalPeriod = getOperationalPeriodTriple(syncState)
   const authoritySummary = authorityModeLabel(syncState)
   const goDeltaVisible = syncState.period_delta_source === 'go_runtime_delta'
     && syncState.effective_period_source !== 'go_runtime.effective_period_s'
@@ -1912,6 +1881,7 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
           <span className={styles.metricPill}>Operational period mode <span className={styles.metricValue}>{authoritySummary}</span></span>
           <span className={styles.metricPill}>Sync authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.sync_authority)}</span></span>
           <span className={styles.metricPill}>Period authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.period_authority)}</span></span>
+          <span className={styles.metricPill}>Refinement status <span className={styles.metricValue}>{formatAuthorityLabel(syncState.period_refinement_status)}</span></span>
           <span className={styles.metricPill}>Effective period source <span className={styles.metricValue}>{formatAuthorityLabel(syncState.effective_period_source)}</span></span>
           <span className={styles.metricPill}>Period Δ source <span className={styles.metricValue}>{formatAuthorityLabel(syncState.period_delta_source)}</span></span>
           <span className={styles.metricPill}>Python sync <span className={styles.metricValue}>{pythonSync.usable ? 'usable' : pythonSync.present ? 'present' : 'absent'}</span></span>
@@ -1925,7 +1895,7 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px' }}>
             <span className={styles.metricPill}>Ref ICAO <span className={styles.metricValue}>{compact.reference_icao ?? '—'}</span></span>
             <span className={styles.metricPill}>Base <span className={styles.metricValue}>{fmtNumber(operationalPeriod?.base, 4, 's')}</span></span>
-            <span className={styles.metricPill}>Δ <span className={styles.metricValue}>{fmtNumber(Number(operationalPeriod?.delta ?? 0) * 1000, 2, 'ms')}</span></span>
+            <span className={styles.metricPill}>Δ <span className={styles.metricValue}>{fmtNumber(operationalPeriod?.delta != null ? operationalPeriod.delta * 1000 : null, 2, 'ms')}</span></span>
             <span className={styles.metricPill}>Effective <span className={styles.metricValue}>{fmtNumber(operationalPeriod?.effective, 4, 's')}</span></span>
             <span className={styles.metricPill}>DF agreement <span className={styles.metricValue}>{compact.period_agrees_with_df === false ? 'rejected' : compact.period_agrees_with_df === true ? 'yes' : '—'}</span></span>
             <span className={styles.metricPill}>Prev ref <span className={styles.metricValue}>{compact.last_reference_icao ?? '—'}</span></span>

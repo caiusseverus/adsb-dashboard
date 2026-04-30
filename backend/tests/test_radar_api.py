@@ -182,8 +182,12 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
 
     payload = radar_api.build_iid_sync_snapshot_payload(state, 23, window_s=60.0, debug_limit=20)
     stage0_keys = {
+        "base_period_s",
+        "period_delta_s",
+        "effective_period_s",
         "period_authority",
         "sync_authority",
+        "period_refinement_status",
         "phase_basis",
         "phase_is_absolute",
         "period_delta_source",
@@ -195,8 +199,12 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
 
     assert payload["sync_state"]["source"] == "go_frame_sync"
     assert stage0_keys.issubset(set(payload["sync_state"].keys()))
-    assert payload["sync_state"]["period_authority"] == "go_base_bootstrap"
+    assert payload["sync_state"]["period_authority"] == "go_refined"
     assert payload["sync_state"]["sync_authority"] == "go_runtime"
+    assert payload["sync_state"]["period_refinement_status"] == "stable"
+    assert payload["sync_state"]["base_period_s"] == pytest.approx(4.25)
+    assert payload["sync_state"]["period_delta_s"] == pytest.approx(0.0)
+    assert payload["sync_state"]["effective_period_s"] == pytest.approx(4.25)
     assert payload["sync_state"]["phase_basis"] == "sweep_epoch_only"
     assert payload["sync_state"]["phase_is_absolute"] is False
     assert payload["sync_state"]["phase_status"] is None

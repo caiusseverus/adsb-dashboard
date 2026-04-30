@@ -1124,8 +1124,12 @@ def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monke
     assert first["type"] == "radar_sync"
     assert "phase_anchor_candidates" in first
     assert first["retention_diagnostics"]["timeline"]["count"] == 1
-    assert first["sync_state"]["period_authority"] == "python_base_bootstrap"
-    assert first["sync_state"]["sync_authority"] == "python_bootstrap_sync"
+    assert first["sync_state"]["period_authority"] == "py_base"
+    assert first["sync_state"]["sync_authority"] == "py_bootstrap"
+    assert first["sync_state"]["period_refinement_status"] == "bootstrapping"
+    assert first["sync_state"]["base_period_s"] == pytest.approx(4.0)
+    assert first["sync_state"]["period_delta_s"] == pytest.approx(0.0)
+    assert first["sync_state"]["effective_period_s"] == pytest.approx(4.0)
     assert first["sync_state"]["phase_basis"] == "sweep_epoch_only"
     assert first["sync_state"]["phase_is_absolute"] is False
     assert first["sync_state"]["period_delta_source"] == "none"
@@ -1133,6 +1137,120 @@ def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monke
     assert first["sync_state"]["fit_span_s"] is None
     assert first["sync_state"]["slope_sign_convention"] == "observed_minus_predicted"
     assert first["sync_state"]["effective_period_source"] == "python_simple_sync.period_base_s"
+
+
+def test_canonical_period_invariant_for_python_refined_state():
+    sync = LiveSyncState(
+        iid=51,
+        period_s=4.005,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1_000.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=4.0,
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["period_authority"] == "py_refined"
+    assert payload["sync_authority"] == "py_refined"
+    assert payload["effective_period_s"] == pytest.approx(payload["base_period_s"] + payload["period_delta_s"], abs=1e-9)
+
+
+def test_canonical_period_invariant_for_python_base_state():
+    sync = LiveSyncState(
+        iid=52,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1_000.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=4.0,
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["period_authority"] == "py_base"
+    assert payload["sync_authority"] == "py_bootstrap"
+    assert payload["period_delta_s"] == pytest.approx(0.0)
+    assert payload["effective_period_s"] == pytest.approx(payload["base_period_s"] + payload["period_delta_s"], abs=1e-9)
+
+
+def test_go_diagnostic_delta_not_used_as_canonical_when_python_operational():
+    sync = LiveSyncState(
+        iid=53,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1_000.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=4.0,
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["period_delta_source"] != "go_runtime_delta"
+    assert payload["period_authority"] in {"py_base", "py_refined"}
+
+
+def test_holdover_and_unavailable_states_are_conservative():
+    holdover_sync = LiveSyncState(
+        iid=54,
+        period_s=4.1,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1_000.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        holdover=True,
+        period_base_s=4.0,
+    )
+    holdover_payload = sweep._live_sync_state_to_dict(holdover_sync)
+    assert holdover_payload["period_authority"] == "holdover"
+    assert holdover_payload["sync_authority"] == "holdover"
+    assert holdover_payload["period_refinement_status"] == "holdover"
+
+    unavailable_sync = LiveSyncState(
+        iid=55,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.0,
+        sync_jitter_deg=10.0,
+        last_sync_update_ts=1_000.0,
+        source="multi_aircraft_burst",
+        usable=False,
+        period_base_s=4.0,
+    )
+    unavailable_payload = sweep._live_sync_state_to_dict(unavailable_sync)
+    assert unavailable_payload["period_authority"] == "unavailable"
+    assert unavailable_payload["sync_authority"] == "unavailable"
+    assert unavailable_payload["base_period_s"] is None
+    assert unavailable_payload["period_delta_s"] is None
+    assert unavailable_payload["effective_period_s"] is None
+
+
+def test_canonical_mismatch_recomputes_delta_safely():
+    sync = LiveSyncState(
+        iid=56,
+        period_s=4.01,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1_000.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=4.0,
+        period_delta_s=123.0,
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["period_delta_s"] == pytest.approx(payload["effective_period_s"] - payload["base_period_s"], abs=1e-9)
 
 
 def test_go_sync_snapshot_and_debug_use_compact_diagnostics_path(monkeypatch):

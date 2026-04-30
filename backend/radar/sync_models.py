@@ -67,6 +67,12 @@ class LiveSyncState:
     phase_validation_median_error_deg: float | None = None
     phase_validation_status: str = "unavailable"
     phase_anchor_candidates: list[dict] = field(default_factory=list)
+    base_period_s: float | None = None
+    period_delta_s: float | None = None
+    effective_period_s: float | None = None
+    period_authority: str | None = None
+    period_refinement_status: str | None = None
+    sync_authority: str | None = None
 
 
 @dataclass
