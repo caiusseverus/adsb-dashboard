@@ -258,7 +258,58 @@ def _get_authoritative_radar_position(model: RadarIID) -> dict:
 def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
     """Serialise a LiveSyncState to a plain dict for API/verification payloads."""
     import dataclasses
-    return dataclasses.asdict(sync)
+    payload: dict = {}
+    for field in dataclasses.fields(sync):
+        try:
+            value = getattr(sync, field.name)
+        except Exception:
+            if field.default_factory is not dataclasses.MISSING:
+                value = field.default_factory()
+            elif field.default is not dataclasses.MISSING:
+                value = field.default
+            else:
+                value = None
+        payload[field.name] = value
+    source = str(getattr(sync, "source", "") or "")
+    phase_anchor_status = str(getattr(sync, "phase_anchor_status", "") or "")
+    phase_anchor_icao = getattr(sync, "phase_anchor_icao", None)
+
+    phase_basis = "sweep_epoch_only"
+    if phase_anchor_icao and phase_anchor_status in {"selected", "anchor_only"}:
+        phase_basis = "anchor_relative"
+
+    period_delta_source = "none"
+    if source == "multi_aircraft_burst":
+        period_delta_source = "python_simple_sync_delta"
+    elif source == "go_frame_sync":
+        period_delta_source = "go_runtime_delta"
+
+    effective_period_source = "none"
+    if source == "multi_aircraft_burst":
+        effective_period_source = "python_simple_sync.period_s"
+    elif source == "go_frame_sync":
+        effective_period_source = "go_runtime.effective_period_s"
+    elif source == "sweep_frame":
+        effective_period_source = "sweep_frame.period_s"
+
+    payload.update({
+        "period_authority": (
+            "python_simple_sync"
+            if source == "multi_aircraft_burst"
+            else "go_runtime"
+            if source == "go_frame_sync"
+            else source or "unknown"
+        ),
+        "sync_authority": source or "unknown",
+        "phase_basis": phase_basis,
+        "phase_is_absolute": False,
+        "period_delta_source": period_delta_source,
+        "fit_observation_count": int(getattr(sync, "fit_total_observations", 0) or 0),
+        "fit_span_s": float(getattr(sync, "fit_span_s", 0.0) or 0.0),
+        "slope_sign_convention": "observed_minus_predicted",
+        "effective_period_source": effective_period_source,
+    })
+    return payload
 
 
 def _sync_source_has_rich_python_diagnostics(sync: "LiveSyncState | None") -> bool:
@@ -2679,6 +2730,7 @@ class RadarState:
             period_correction_ppm=existing.period_correction_ppm,
             fit_total_observations=existing.fit_total_observations,
             fit_eligible_observations=existing.fit_eligible_observations,
+            fit_span_s=existing.fit_span_s,
             prop_delay_enabled=existing.prop_delay_enabled,
             motion_comp_phase_enabled=existing.motion_comp_phase_enabled,
             motion_comp_fit_enabled=existing.motion_comp_fit_enabled,

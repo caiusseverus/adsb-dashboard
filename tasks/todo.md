@@ -1,3 +1,33 @@
+## 2026-04-30 Stage 0 Radar Sync Baseline & Instrumentation Freeze
+
+- [x] Identify sync snapshot serialization points and add required additive diagnostic fields without changing existing semantics.
+- [x] Add additive diagnostics into Python sync snapshot payload paths and ensure conservative defaults for missing derivations.
+- [x] Add additive diagnostics into Go protocol snapshot shape for parity/forward compatibility without changing authority logic.
+- [x] Implement `tools/radar_sync_capture.py` for periodic sync/timeline capture with resilient error recording and summary output.
+- [x] Add baseline capture documentation under `tasks/radar_sync_baseline/README.md`.
+- [x] Add tests for new sync snapshot keys/types, partial-state resilience, capture tool arg parsing, and failed-request recording behavior.
+- [x] Run focused backend tests for touched areas and document review outcomes.
+
+Plan confirmation:
+- Stage 0 is strictly additive observability/capture; no period/refinement/phase/readiness/authority behavior changes.
+- Existing payload fields remain intact; new fields are appended with conservative values when exact derivation is unavailable.
+- Capture utility must continue through intermittent endpoint failures and persist both successes and failures.
+
+### Review
+- Implemented:
+  - Added Stage 0 sync snapshot diagnostics in `backend/radar/sweep.py` via additive `sync_state` keys:
+    `period_authority`, `sync_authority`, `phase_basis`, `phase_is_absolute`,
+    `period_delta_source`, `fit_observation_count`, `fit_span_s`,
+    `slope_sign_convention`, and `effective_period_source`.
+  - Added `fit_span_s` to `LiveSyncState` and populated it from simple-sync fit output.
+  - Hardened sync-state serialization to tolerate partial/missing fields without crashing snapshot payload generation.
+  - Added additive protocol fields in `radar-core/protocol/messages.go` for forward compatibility of IID sync diagnostics.
+  - Added baseline capture utility `tools/radar_sync_capture.py` (1 Hz default polling, resilient per-endpoint error records, NDJSON output, run summary).
+  - Added baseline scenario capture instructions in `tasks/radar_sync_baseline/README.md`.
+- Verification:
+  - `uv run --directory backend pytest tests/test_radar_api.py tests/test_radar_sweep.py tests/test_radar_sync_capture.py -q` -> `138 passed`
+  - `cd radar-core && env GOCACHE=/tmp/go-build go test ./protocol` -> `ok`
+
 ## 2026-04-30 Burst Sync Residual Recorder Stream
 
 - [x] Add immutable burst residual event recorder stream in backend and retain/prune by timestamp window.

@@ -183,7 +183,13 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     payload = radar_api.build_iid_sync_snapshot_payload(state, 23, window_s=60.0, debug_limit=20)
 
     assert payload["sync_state"]["source"] == "go_frame_sync"
-    assert "period_authoritative_source" not in payload["sync_state"]
+    assert payload["sync_state"]["period_authority"] == "go_runtime"
+    assert payload["sync_state"]["sync_authority"] == "go_frame_sync"
+    assert payload["sync_state"]["phase_basis"] == "sweep_epoch_only"
+    assert payload["sync_state"]["phase_is_absolute"] is False
+    assert payload["sync_state"]["period_delta_source"] == "go_runtime_delta"
+    assert payload["sync_state"]["slope_sign_convention"] == "observed_minus_predicted"
+    assert payload["sync_state"]["effective_period_source"] == "go_runtime.effective_period_s"
     assert payload["observations"] == []
     assert payload["alignment_status"]["reason"] == "radar_position_unavailable"
     assert payload["alignment_status"]["multi_sync_admission"]["last_reason"] == "no_receiver_config"
@@ -469,6 +475,31 @@ def test_get_iid_sync_snapshot_uses_compact_go_sync_diagnostics_for_go_owned_syn
     assert payload["observations"][0]["phase_anchor_contributor"] is False
     assert debug_payload["summary"]["diagnostics_mode"] == "compact_go_sync"
     assert debug_payload["summary"]["rich_diagnostics_available"] is False
+
+
+def test_get_iid_sync_snapshot_partial_sync_state_does_not_crash():
+    state = RadarState()
+    state._models[33] = RadarIID(iid=33, status="SINGLE_RADAR", period_s=4.0)
+    state._iid_latest_arrival_us[33] = 5_000_000.0
+    sync = LiveSyncState(
+        iid=33,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=1_000.0,
+        source="multi_aircraft_burst",
+        usable=True,
+    )
+    del sync.__dict__["fit_total_observations"]
+    del sync.__dict__["fit_span_s"]
+    state._live_sync_states[33] = sync
+
+    payload = radar_api.build_iid_sync_snapshot_payload(state, 33, window_s=60.0, debug_limit=20)
+
+    assert payload["sync_state"]["fit_observation_count"] == 0
+    assert payload["sync_state"]["fit_span_s"] == 0.0
 
 
 def test_get_iid_sync_snapshot_marks_cache_hits(monkeypatch):

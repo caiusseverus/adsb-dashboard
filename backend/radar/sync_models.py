@@ -49,6 +49,7 @@ class LiveSyncState:
     phase_status: str | None = None
     fit_total_observations: int = 0
     fit_eligible_observations: int = 0
+    fit_span_s: float = 0.0
     prop_delay_enabled: bool = False
     motion_comp_phase_enabled: bool = False
     motion_comp_fit_enabled: bool = False

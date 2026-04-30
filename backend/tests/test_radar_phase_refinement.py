@@ -452,7 +452,6 @@ class TestPeriodClamp:
             "fit_rejected_observations",
             "fit_reject_reasons",
             "fit_contributing_icao_count",
-            "fit_span_s",
             "motion_comp_applied_count",
             "motion_comp_blocked_count",
             "motion_comp_mean_dt_us",

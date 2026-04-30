@@ -551,6 +551,7 @@ def update_simple_live_sync_state(
         phase_validation_status=validation["status"],
         fit_total_observations=len(recent_obs),
         fit_eligible_observations=len(fit_scored),
+        fit_span_s=fit_span_s,
         prop_delay_enabled=bool(RADAR_SYNC_PROP_DELAY_ENABLED),
         motion_comp_phase_enabled=bool(RADAR_SYNC_MOTION_COMP_PHASE_ENABLED),
         motion_comp_fit_enabled=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
