@@ -1124,15 +1124,15 @@ def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monke
     assert first["type"] == "radar_sync"
     assert "phase_anchor_candidates" in first
     assert first["retention_diagnostics"]["timeline"]["count"] == 1
-    assert first["sync_state"]["period_authority"] == "python_simple_sync"
-    assert first["sync_state"]["sync_authority"] == "multi_aircraft_burst"
+    assert first["sync_state"]["period_authority"] == "python_base_bootstrap"
+    assert first["sync_state"]["sync_authority"] == "python_bootstrap_sync"
     assert first["sync_state"]["phase_basis"] == "sweep_epoch_only"
     assert first["sync_state"]["phase_is_absolute"] is False
-    assert first["sync_state"]["period_delta_source"] == "python_simple_sync_delta"
+    assert first["sync_state"]["period_delta_source"] == "none"
     assert isinstance(first["sync_state"]["fit_observation_count"], int)
-    assert isinstance(first["sync_state"]["fit_span_s"], float)
+    assert first["sync_state"]["fit_span_s"] is None
     assert first["sync_state"]["slope_sign_convention"] == "observed_minus_predicted"
-    assert first["sync_state"]["effective_period_source"] == "python_simple_sync.period_s"
+    assert first["sync_state"]["effective_period_source"] == "python_simple_sync.period_base_s"
 
 
 def test_go_sync_snapshot_and_debug_use_compact_diagnostics_path(monkeypatch):

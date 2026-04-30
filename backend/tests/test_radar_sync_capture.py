@@ -28,6 +28,25 @@ def test_capture_argparse_requires_iid_or_all_active():
     assert args.base_url == "http://localhost:8000"
     assert args.duration_s == 900.0
 
+    args_all = mod.parse_args(["--all-active"])
+    assert args_all.all_active is True
+
+
+def test_capture_argparse_rejects_invalid_duration_and_interval():
+    mod = _load_capture_module()
+
+    try:
+        mod.parse_args(["--iid", "7", "--duration-s", "0"])
+        assert False, "expected SystemExit"
+    except SystemExit as exc:
+        assert exc.code == 2
+
+    try:
+        mod.parse_args(["--iid", "7", "--interval-s", "0"])
+        assert False, "expected SystemExit"
+    except SystemExit as exc:
+        assert exc.code == 2
+
 
 def test_capture_records_http_failures_without_aborting(tmp_path, monkeypatch):
     mod = _load_capture_module()

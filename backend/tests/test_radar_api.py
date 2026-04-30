@@ -181,15 +181,27 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     ], maxlen=state._GO_EVIDENCE_EVENTS_MAX)
 
     payload = radar_api.build_iid_sync_snapshot_payload(state, 23, window_s=60.0, debug_limit=20)
+    stage0_keys = {
+        "period_authority",
+        "sync_authority",
+        "phase_basis",
+        "phase_is_absolute",
+        "period_delta_source",
+        "fit_observation_count",
+        "fit_span_s",
+        "slope_sign_convention",
+        "effective_period_source",
+    }
 
     assert payload["sync_state"]["source"] == "go_frame_sync"
-    assert payload["sync_state"]["period_authority"] == "go_runtime"
-    assert payload["sync_state"]["sync_authority"] == "go_frame_sync"
+    assert stage0_keys.issubset(set(payload["sync_state"].keys()))
+    assert payload["sync_state"]["period_authority"] == "go_base_bootstrap"
+    assert payload["sync_state"]["sync_authority"] == "go_runtime"
     assert payload["sync_state"]["phase_basis"] == "sweep_epoch_only"
     assert payload["sync_state"]["phase_is_absolute"] is False
-    assert payload["sync_state"]["period_delta_source"] == "go_runtime_delta"
+    assert payload["sync_state"]["period_delta_source"] == "none"
     assert payload["sync_state"]["slope_sign_convention"] == "observed_minus_predicted"
-    assert payload["sync_state"]["effective_period_source"] == "go_runtime.effective_period_s"
+    assert payload["sync_state"]["effective_period_source"] == "go_runtime.base_period_s"
     assert payload["observations"] == []
     assert payload["alignment_status"]["reason"] == "radar_position_unavailable"
     assert payload["alignment_status"]["multi_sync_admission"]["last_reason"] == "no_receiver_config"
@@ -499,7 +511,7 @@ def test_get_iid_sync_snapshot_partial_sync_state_does_not_crash():
     payload = radar_api.build_iid_sync_snapshot_payload(state, 33, window_s=60.0, debug_limit=20)
 
     assert payload["sync_state"]["fit_observation_count"] == 0
-    assert payload["sync_state"]["fit_span_s"] == 0.0
+    assert payload["sync_state"]["fit_span_s"] is None
 
 
 def test_get_iid_sync_snapshot_marks_cache_hits(monkeypatch):

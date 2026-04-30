@@ -278,34 +278,63 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
     if phase_anchor_icao and phase_anchor_status in {"selected", "anchor_only"}:
         phase_basis = "anchor_relative"
 
+    holdover = bool(getattr(sync, "holdover", False))
+    period_s = float(getattr(sync, "period_s", 0.0) or 0.0)
+    period_base_s = float(getattr(sync, "period_base_s", 0.0) or 0.0)
+    has_period_delta = period_base_s > 0.0 and abs(period_s - period_base_s) > 1e-12
+
     period_delta_source = "none"
-    if source == "multi_aircraft_burst":
+    if has_period_delta and source == "multi_aircraft_burst":
         period_delta_source = "python_simple_sync_delta"
-    elif source == "go_frame_sync":
+    elif has_period_delta and source == "go_frame_sync":
         period_delta_source = "go_runtime_delta"
 
     effective_period_source = "none"
     if source == "multi_aircraft_burst":
-        effective_period_source = "python_simple_sync.period_s"
+        effective_period_source = (
+            "python_simple_sync.period_s"
+            if has_period_delta else
+            "python_simple_sync.period_base_s"
+        )
     elif source == "go_frame_sync":
-        effective_period_source = "go_runtime.effective_period_s"
+        effective_period_source = (
+            "go_runtime.effective_period_s"
+            if has_period_delta else
+            "go_runtime.base_period_s"
+        )
     elif source == "sweep_frame":
         effective_period_source = "sweep_frame.period_s"
 
+    fit_observation_count = int(getattr(sync, "fit_total_observations", 0) or 0)
+    fit_span_raw = getattr(sync, "fit_span_s", None)
+    fit_span_s = float(fit_span_raw) if fit_span_raw is not None else None
+    if fit_observation_count <= 0:
+        fit_span_s = None
+
+    if source == "multi_aircraft_burst":
+        period_authority = "python_refined" if has_period_delta else "python_base_bootstrap"
+        sync_authority = "python_refined_sync" if has_period_delta else "python_bootstrap_sync"
+    elif source == "go_frame_sync":
+        period_authority = "go_refined" if has_period_delta else "go_base_bootstrap"
+        sync_authority = "go_runtime"
+    elif source == "sweep_frame":
+        period_authority = "python_sweep_frame_bootstrap"
+        sync_authority = "python_sweep_frame"
+    else:
+        period_authority = source or "unknown"
+        sync_authority = source or "unknown"
+    if holdover:
+        period_authority = f"{period_authority}_holdover"
+        sync_authority = f"{sync_authority}_holdover"
+
     payload.update({
-        "period_authority": (
-            "python_simple_sync"
-            if source == "multi_aircraft_burst"
-            else "go_runtime"
-            if source == "go_frame_sync"
-            else source or "unknown"
-        ),
-        "sync_authority": source or "unknown",
+        "period_authority": period_authority,
+        "sync_authority": sync_authority,
         "phase_basis": phase_basis,
         "phase_is_absolute": False,
         "period_delta_source": period_delta_source,
-        "fit_observation_count": int(getattr(sync, "fit_total_observations", 0) or 0),
-        "fit_span_s": float(getattr(sync, "fit_span_s", 0.0) or 0.0),
+        "fit_observation_count": fit_observation_count,
+        "fit_span_s": fit_span_s,
         "slope_sign_convention": "observed_minus_predicted",
         "effective_period_source": effective_period_source,
     })
