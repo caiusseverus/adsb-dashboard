@@ -8,8 +8,10 @@ of whether later stages have converged.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
+import threading
 import time
 from collections import deque
 from types import SimpleNamespace
@@ -66,10 +68,15 @@ _DIAG_CACHE_TTL_S = 30.0
 _frame_geometry_cache: dict[tuple, dict] = {}
 _selected_iid_state_section_cache: dict[int, dict[str, dict]] = {}
 _selected_iid_state_section_signatures: dict[int, dict[str, tuple]] = {}
+_selected_iid_state_section_signature_maps: dict[int, dict[str, dict]] = {}
 _selected_iid_state_section_revisions: dict[int, dict[str, int]] = {}
 _selected_iid_state_snapshot_cache: dict[int, tuple[tuple, dict]] = {}
 _selected_iid_state_snapshot_seq: dict[int, int] = {}
 _selected_iid_state_last_cache_hit: dict[int, bool] = {}
+_selected_iid_state_ttl_cache: dict[tuple[int, float, int], tuple[float, dict]] = {}
+_selected_iid_state_build_locks: dict[tuple[int, float, int], threading.Lock] = {}
+_selected_iid_state_build_locks_guard = threading.Lock()
+_SELECTED_IID_STATE_TTL_S = 1.5
 
 
 def _frame_geometry_signature(frame, period_s: float | None, sweep_direction: int) -> tuple:
@@ -1457,14 +1464,18 @@ async def get_iid_selected_state(
             and all(bool(meta.get("cached")) for meta in section_meta.values())
         )
         if payload is not None:
+            current_transport = payload.get("transport") or {}
+            source = (
+                current_transport.get("source")
+                if cache_hit and current_transport.get("source")
+                else ("selected_iid_state_snapshot_cache" if cache_hit else (current_transport.get("source") or "selected_iid_state_snapshot"))
+            )
             payload = {
                 **payload,
                 "transport": {
-                    **(payload.get("transport") or {}),
+                    **current_transport,
                     "cached": cache_hit,
-                    "source": "selected_iid_state_snapshot_cache" if cache_hit else (
-                        payload.get("transport", {}).get("source") or "selected_iid_state_snapshot"
-                    ),
+                    "source": source,
                 },
             }
         return payload
@@ -1505,6 +1516,28 @@ async def get_iid_control(iid: int):
         }
     finally:
         _record_api_timing("iid_control", t0)
+
+
+@router.get("/iids/{iid}/position-accumulation")
+async def get_iid_position_accumulation(iid: int):
+    """Dedicated position-accumulation payload for frame-position map/history."""
+    t0 = time.perf_counter()
+    try:
+        if _state is None:
+            return {"iid": iid, "available": False, "reason": "radar module not initialised", "frame_positions": []}
+        model = _state.get_rotation_model(iid)
+        if model is None:
+            return {"iid": iid, "available": False, "reason": "IID not seen", "frame_positions": []}
+        control_payload = _control_payload(model)
+        payload = _build_selected_iid_evidence_light(iid, model, control_payload)
+        payload["available"] = True
+        payload["transport"] = {
+            "cached": False,
+            "source": "iid_position_accumulation",
+        }
+        return payload
+    finally:
+        _record_api_timing("iid_position_accumulation", t0)
 
 
 @router.get("/iids/{iid}/solution-comparison")
@@ -2211,24 +2244,90 @@ _FM_DIAG_CACHE_TTL_S = 3.0
 _fm_diag_cache: dict[int, tuple[float, dict]] = {}
 
 
+def _json_size_bytes(payload: object) -> int:
+    try:
+        return len(json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8"))
+    except Exception:
+        return 0
+
+
+def _section_item_count(payload: object) -> int:
+    if isinstance(payload, list):
+        return len(payload)
+    if isinstance(payload, dict):
+        for key in ("n_frames", "frame_position_count", "count", "n_observations"):
+            value = payload.get(key)
+            if isinstance(value, (int, float)):
+                return int(value)
+        return len(payload)
+    return 1 if payload is not None else 0
+
+
+def _signature_changed_fields(previous: dict | None, current: dict) -> list[str]:
+    if previous is None:
+        return ["initial_build"]
+    keys = set(previous.keys()) | set(current.keys())
+    changed = [key for key in sorted(keys) if previous.get(key) != current.get(key)]
+    return changed if changed else ["none"]
+
+
 def _selected_iid_section_entry(
     iid: int,
     section: str,
-    signature: tuple,
+    signature_map: dict,
     builder: Callable[[], dict],
-) -> tuple[dict, int, bool]:
+) -> tuple[dict, int, bool, dict]:
     section_cache = _selected_iid_state_section_cache.setdefault(iid, {})
     section_signatures = _selected_iid_state_section_signatures.setdefault(iid, {})
+    section_signature_maps = _selected_iid_state_section_signature_maps.setdefault(iid, {})
     section_revisions = _selected_iid_state_section_revisions.setdefault(iid, {})
+    signature = tuple(sorted(signature_map.items()))
     cached_payload = section_cache.get(section)
+    previous_map = section_signature_maps.get(section)
     if cached_payload is not None and section_signatures.get(section) == signature:
-        return cached_payload, int(section_revisions.get(section, 0)), True
-    revision = int(section_revisions.get(section, 0)) + 1
+        revision = int(section_revisions.get(section, 0))
+        section_meta = {
+            "name": section,
+            "cache": "hit",
+            "signature": signature,
+            "signature_changed_fields": [],
+            "signature_change_reason": "unchanged",
+            "build_ms": 0.0,
+            "payload_size_bytes": _json_size_bytes(cached_payload),
+            "item_count": _section_item_count(cached_payload),
+            "revision": revision,
+        }
+        return cached_payload, revision, True, section_meta
+
+    t0 = time.perf_counter()
     payload = builder()
+    build_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+    revision = int(section_revisions.get(section, 0)) + 1
+    changed_fields = _signature_changed_fields(previous_map, signature_map)
     section_cache[section] = payload
     section_signatures[section] = signature
+    section_signature_maps[section] = dict(signature_map)
     section_revisions[section] = revision
-    return payload, revision, False
+    section_meta = {
+        "name": section,
+        "cache": "miss",
+        "signature": signature,
+        "signature_changed_fields": changed_fields,
+        "signature_change_reason": "signature_changed" if changed_fields and changed_fields != ["initial_build"] else "initial_build",
+        "build_ms": build_ms,
+        "payload_size_bytes": _json_size_bytes(payload),
+        "item_count": _section_item_count(payload),
+        "revision": revision,
+    }
+    log.debug(
+        "selected-state section=%s iid=%s cache=miss changed=%s build_ms=%.3f size=%s",
+        section,
+        iid,
+        ",".join(changed_fields),
+        build_ms,
+        section_meta["payload_size_bytes"],
+    )
+    return payload, revision, False, section_meta
 
 
 def _build_selected_iid_fm_summary(iid: int, model, frame_counts: dict) -> dict:
@@ -2417,6 +2516,15 @@ def _build_selected_iid_solution_summary(iid: int, model, fm_summary: dict, cont
     }
 
 
+def _selected_iid_state_lock_key(iid: int, window_s: float, debug_limit: int) -> tuple[int, float, int]:
+    return (int(iid), float(window_s), int(debug_limit))
+
+
+def _selected_iid_state_build_lock(lock_key: tuple[int, float, int]) -> threading.Lock:
+    with _selected_iid_state_build_locks_guard:
+        return _selected_iid_state_build_locks.setdefault(lock_key, threading.Lock())
+
+
 def build_selected_iid_page_state_payload(
     state: "RadarState" | None,
     iid: int,
@@ -2424,288 +2532,335 @@ def build_selected_iid_page_state_payload(
     window_s: float = 90.0,
     debug_limit: int = 120,
 ) -> dict:
-    if state is None:
-        return {
-            "type": "radar_selected_iid_state",
-            "iid": iid,
-            "sequence": 0,
-            "server_ts": time.time(),
-            "revisions": {
-                "selected": 0,
-                "sync": 0,
-                "frames": 0,
-                "reference": 0,
-                "pipeline": 0,
-                "fm": 0,
-                "solution": 0,
-                "control": 0,
-                "evidence": 0,
-            },
-            "selected": {"iid": iid, "available": False, "reason": "radar module not initialised"},
-            "sync": build_iid_sync_snapshot_payload(None, iid, window_s=window_s, debug_limit=debug_limit),
-            "data_path_diagnostics": {"iid": iid, "available": False, "reason": "radar module not initialised"},
-            "frames": {"iid": iid, "n_frames": 0, "frames": []},
-            "reference": {"iid": iid, "status": "NOT_INITIALISED"},
-            "pipeline": {
+    lock_key = _selected_iid_state_lock_key(iid, window_s, debug_limit)
+    build_lock = _selected_iid_state_build_lock(lock_key)
+    with build_lock:
+        now_mono = time.monotonic()
+        cached_entry = _selected_iid_state_ttl_cache.get(lock_key)
+        if cached_entry is not None and (now_mono - cached_entry[0]) <= _SELECTED_IID_STATE_TTL_S:
+            cached_payload = cached_entry[1]
+            cached_transport = dict(cached_payload.get("transport") or {})
+            payload = {
+                **cached_payload,
+                "transport": {
+                    **cached_transport,
+                    "cached": True,
+                    "cache_ttl_s": _SELECTED_IID_STATE_TTL_S,
+                    "cache_age_s": round(max(0.0, now_mono - cached_entry[0]), 3),
+                    "source": "selected_iid_state_ttl_cache",
+                },
+            }
+            _selected_iid_state_last_cache_hit[iid] = True
+            _selected_iid_state_ttl_cache[lock_key] = (cached_entry[0], payload)
+            return payload
+
+        started_at = time.perf_counter()
+        now_ts = time.time()
+        section_timings: dict[str, dict] = {}
+        sections_transport: dict[str, dict] = {}
+
+        if state is None:
+            payload = {
+                "type": "radar_selected_iid_state",
                 "iid": iid,
-                "stages": {
-                    "period": {"status": "not_started", "detail": "Radar module not initialised"},
-                    "reference": {"status": "not_started", "detail": ""},
-                    "frames": {"status": "not_started", "detail": ""},
-                    "scoring": {"status": "not_started", "detail": ""},
-                    "optimisation": {"status": "not_started", "detail": ""},
+                "sequence": int(_selected_iid_state_snapshot_seq.get(iid, 0)),
+                "server_ts": now_ts,
+                "summary": {
+                    "iid": iid,
+                    "available": False,
+                    "reason": "radar module not initialised",
+                    "status": None,
+                    "period_s": None,
+                    "rpm": None,
+                    "sync": {"present": False, "usable": False, "reason": "sync_state_unavailable"},
+                    "frames": {"n_frames": 0, "n_good": 0, "n_marginal": 0, "reason": "no_frames_for_this_iid"},
+                    "ages": {"model_update_age_s": None, "sync_update_age_s": None},
+                    "availability": {
+                        "burst_sync": {"available": False, "reason": "use /iids/{iid}/burst_sync_timeline"},
+                        "df_alignment": {"available": False, "reason": "use /iids/{iid}/timeline"},
+                        "sweep_frames": {"available": False, "reason": "use /iids/{iid}/sweep-frames"},
+                        "fm_diagnostics": {"available": False, "reason": "use /iids/{iid}/fm-diagnostics"},
+                        "position_accumulation": {"available": False, "reason": "use /iids/{iid}/position-accumulation"},
+                    },
+                },
+                "transport": {
+                    "cached": False,
+                    "source": "selected_iid_state_unavailable",
+                    "cache_ttl_s": _SELECTED_IID_STATE_TTL_S,
+                },
+            }
+            payload_bytes = _json_size_bytes(payload)
+            payload["transport"]["performance"] = {
+                "build_ms": round((time.perf_counter() - started_at) * 1000.0, 3),
+                "serialization_ms": 0.0,
+                "payload_size_bytes": payload_bytes,
+                "sections": section_timings,
+            }
+            _selected_iid_state_last_cache_hit[iid] = False
+            _selected_iid_state_ttl_cache[lock_key] = (time.monotonic(), payload)
+            return payload
+
+        model = state.get_rotation_model(iid)
+        frame_counts = state.get_live_frame_counts(iid)
+        with state._lock:
+            sync = state._live_sync_states.get(iid)
+            latest_arrival_us = state._iid_latest_arrival_us.get(iid)
+
+        selected_payload, selected_revision, selected_cached, selected_meta = _selected_iid_section_entry(
+            iid,
+            "selected",
+            {
+                "model_present": bool(model is not None),
+                "status": getattr(model, "status", None) if model is not None else None,
+            },
+            lambda: {
+                "iid": iid,
+                "available": model is not None,
+                "reason": None if model is not None else "IID not seen",
+            },
+        )
+        section_timings["core_iid_sync_summary"] = dict(selected_meta)
+        sections_transport["selected"] = {
+            "cached": selected_cached,
+            "revision": selected_revision,
+            "signature": selected_meta.get("signature"),
+            "signature_change_reason": selected_meta.get("signature_change_reason"),
+            "signature_changed_fields": selected_meta.get("signature_changed_fields"),
+            "build_ms": selected_meta.get("build_ms"),
+            "payload_size_bytes": selected_meta.get("payload_size_bytes"),
+            "item_count": selected_meta.get("item_count"),
+        }
+
+        sync_summary_payload, sync_revision, sync_cached, sync_meta = _selected_iid_section_entry(
+            iid,
+            "sync_summary",
+            {
+                "sync_present": bool(sync is not None),
+                "sync_source": getattr(sync, "source", None) if sync is not None else None,
+                "sync_usable": bool(getattr(sync, "usable", False)) if sync is not None else False,
+                "sync_quality": getattr(sync, "sync_quality", None) if sync is not None else None,
+                "sync_ts": getattr(sync, "last_sync_update_ts", None) if sync is not None else None,
+                "period_s": getattr(sync, "period_s", None) if sync is not None else None,
+                "period_authority": getattr(sync, "period_authority", None) if sync is not None else None,
+                "sync_authority": getattr(sync, "sync_authority", None) if sync is not None else None,
+            },
+            lambda: {
+                "present": sync is not None,
+                "usable": bool(getattr(sync, "usable", False)) if sync is not None else False,
+                "source": getattr(sync, "source", None) if sync is not None else None,
+                "sync_quality": getattr(sync, "sync_quality", None) if sync is not None else None,
+                "period_s": getattr(sync, "period_s", None) if sync is not None else None,
+                "period_authority": getattr(sync, "period_authority", None) if sync is not None else None,
+                "sync_authority": getattr(sync, "sync_authority", None) if sync is not None else None,
+                "phase_authority": getattr(sync, "phase_authority", None) if sync is not None else None,
+                "handoff_state": getattr(sync, "handoff_state", None) if sync is not None else None,
+                "handoff_reason": getattr(sync, "handoff_reason", None) if sync is not None else None,
+                "last_sync_update_ts": getattr(sync, "last_sync_update_ts", None) if sync is not None else None,
+            },
+        )
+        section_timings["sync_authority_summary"] = dict(sync_meta)
+        sections_transport["sync_summary"] = {
+            "cached": sync_cached,
+            "revision": sync_revision,
+            "signature": sync_meta.get("signature"),
+            "signature_change_reason": sync_meta.get("signature_change_reason"),
+            "signature_changed_fields": sync_meta.get("signature_changed_fields"),
+            "build_ms": sync_meta.get("build_ms"),
+            "payload_size_bytes": sync_meta.get("payload_size_bytes"),
+            "item_count": sync_meta.get("item_count"),
+        }
+
+        frame_summary_payload, frames_revision, frames_cached, frames_meta = _selected_iid_section_entry(
+            iid,
+            "frame_counts",
+            {
+                "n_frames": frame_counts.get("n_frames", 0),
+                "n_good": frame_counts.get("n_good", 0),
+                "n_marginal": frame_counts.get("n_marginal", 0),
+                "latest_arrival_us": latest_arrival_us,
+            },
+            lambda: {
+                "n_frames": int(frame_counts.get("n_frames", 0)),
+                "n_good": int(frame_counts.get("n_good", 0)),
+                "n_marginal": int(frame_counts.get("n_marginal", 0)),
+                "reason": (
+                    "no_frames_for_this_iid"
+                    if int(frame_counts.get("n_frames", 0)) <= 0
+                    else "frames_available"
+                ),
+            },
+        )
+        section_timings["frame_counts"] = dict(frames_meta)
+        sections_transport["frame_counts"] = {
+            "cached": frames_cached,
+            "revision": frames_revision,
+            "signature": frames_meta.get("signature"),
+            "signature_change_reason": frames_meta.get("signature_change_reason"),
+            "signature_changed_fields": frames_meta.get("signature_changed_fields"),
+            "build_ms": frames_meta.get("build_ms"),
+            "payload_size_bytes": frames_meta.get("payload_size_bytes"),
+            "item_count": frames_meta.get("item_count"),
+        }
+
+        availability_payload, availability_revision, availability_cached, availability_meta = _selected_iid_section_entry(
+            iid,
+            "availability",
+            {
+                "model_present": bool(model is not None),
+                "sync_present": bool(sync is not None),
+                "n_frames": frame_summary_payload.get("n_frames", 0),
+                "fm_present": bool(model is not None and model.fm_lat is not None and model.fm_lon is not None),
+            },
+            lambda: {
+                "burst_sync": {
+                    "available": bool(sync is not None),
+                    "reason": "use /api/radar/iids/{iid}/burst_sync_timeline",
+                },
+                "df_alignment": {
+                    "available": bool(sync is not None),
+                    "reason": "use /api/radar/iids/{iid}/timeline",
+                },
+                "sweep_frames": {
+                    "available": int(frame_summary_payload.get("n_frames", 0)) > 0,
+                    "reason": "use /api/radar/iids/{iid}/sweep-frames",
+                },
+                "frame_accumulation": {
+                    "available": bool(model is not None and model.fm_lat is not None and model.fm_lon is not None),
+                    "reason": "use /api/radar/iids/{iid}/fm-diagnostics",
+                },
+                "fm_location": {
+                    "available": bool(model is not None and model.fm_lat is not None and model.fm_lon is not None),
+                    "reason": "use /api/radar/iids/{iid}/fm-location",
+                },
+                "position_accumulation": {
+                    "available": True,
+                    "reason": "use /api/radar/iids/{iid}/position-accumulation",
+                },
+                "recorded_residuals": {
+                    "available": True,
+                    "reason": "use /api/radar/iids/{iid}/burst_sync_timeline",
                 },
             },
-            "fm": {"iid": iid, "available": False, "reason": "radar module not initialised"},
-            "solution": {"iid": iid, "available": False, "reason": "radar module not initialised", "methods": []},
-            "control": {"iid": iid, "available": False, "reason": "radar module not initialised"},
-            "evidence": {"iid": iid, "available": False, "reason": "radar module not initialised", "frame_positions": []},
-            "transport": {"cached": False, "source": "selected_iid_state_unavailable"},
+        )
+        section_timings["availability_reasons"] = dict(availability_meta)
+        sections_transport["availability"] = {
+            "cached": availability_cached,
+            "revision": availability_revision,
+            "signature": availability_meta.get("signature"),
+            "signature_change_reason": availability_meta.get("signature_change_reason"),
+            "signature_changed_fields": availability_meta.get("signature_changed_fields"),
+            "build_ms": availability_meta.get("build_ms"),
+            "payload_size_bytes": availability_meta.get("payload_size_bytes"),
+            "item_count": availability_meta.get("item_count"),
         }
 
-    model = state.get_rotation_model(iid)
-    frame_counts = state.get_live_frame_counts(iid)
-    frame_payload_snapshot = state.get_sweep_frame_summary_payload(iid)
-    frame_revision = int((frame_payload_snapshot.get("transport") or {}).get("revision", 0))
-    sync_payload = build_iid_sync_snapshot_payload(state, iid, window_s=window_s, debug_limit=debug_limit)
-    sync_signature = (
-        sync_payload.get("sequence"),
-        sync_payload.get("window_s"),
-        tuple((sync_payload.get("sync_horizons") or {}).items()),
-        len(sync_payload.get("observations") or []),
-        len(sync_payload.get("period_update_history") or []),
-        len(sync_payload.get("slope_history") or []),
-        len(sync_payload.get("period_history") or []),
-        sync_payload.get("rotation", {}).get("period_s"),
-        sync_payload.get("rotation", {}).get("status"),
-    )
-
-    selected_payload, selected_revision, selected_cached = _selected_iid_section_entry(
-        iid,
-        "selected",
-        ("present", model is not None),
-        lambda: {
-            "iid": iid,
-            "available": model is not None,
-            "reason": None if model is not None else "IID not seen",
-        },
-    )
-    sync_section, sync_revision, sync_cached = _selected_iid_section_entry(
-        iid,
-        "sync",
-        sync_signature,
-        lambda: sync_payload,
-    )
-    data_path_diag = state.get_data_path_diagnostics(iid)
-    frames_payload, frames_revision, frames_cached = _selected_iid_section_entry(
-        iid,
-        "frames",
-        (frame_revision,),
-        lambda: frame_payload_snapshot,
-    )
-
-    reference = model.reference_aircraft if model is not None else None
-    reference_signature = (
-        reference.ref_icao if reference is not None else None,
-        reference.ref_score if reference is not None else None,
-        reference.ref_since_sweep if reference is not None else None,
-        reference.hysteresis_margin if reference is not None else None,
-        tuple(
-            (
-                challenger.get("icao"),
-                challenger.get("score"),
-                challenger.get("ratio_to_best"),
-                challenger.get("status"),
-            )
-            for challenger in (reference.challengers or [])
-        ) if reference is not None else (),
-    )
-    reference_payload, reference_revision, reference_cached = _selected_iid_section_entry(
-        iid,
-        "reference",
-        reference_signature,
-        lambda: {"iid": iid, **state.get_reference_aircraft(iid)},
-    )
-
-    pipeline_signature = (
-        model.period_s if model is not None else None,
-        model.status if model is not None else None,
-        model.multi_radar_flag if model is not None else None,
-        reference.ref_icao if reference is not None else None,
-        frame_revision,
-        model.fm_lat if model is not None else None,
-        model.fm_lon if model is not None else None,
-        (model.airport_hypothesis[0].get("airport_icao"), model.airport_hypothesis[0].get("score"))
-        if model is not None and model.airport_hypothesis else None,
-    )
-    pipeline_payload, pipeline_revision, pipeline_cached = _selected_iid_section_entry(
-        iid,
-        "pipeline",
-        pipeline_signature,
-        lambda: {"iid": iid, **state.get_pipeline_health(iid, sweep_frames=[
-            SimpleNamespace(quality="good") for _ in range(frame_counts.get("n_good", 0))
-        ] + [
-            SimpleNamespace(quality="marginal") for _ in range(frame_counts.get("n_frames", 0) - frame_counts.get("n_good", 0))
-        ])},
-    )
-
-    fm_signature = (
-        frame_revision,
-        model.fm_lat if model is not None else None,
-        model.fm_lon if model is not None else None,
-        model.fm_cep_m if model is not None else None,
-        model.fm_source if model is not None else None,
-        model.fm_n_observations if model is not None else None,
-        model.fm_window_s if model is not None else None,
-        model.last_updated if model is not None else None,
-        len(model.fm_convergence_history) if model is not None else 0,
-        (getattr(model, "fm_last_run", None) or {}).get("ts") if model is not None else None,
-        (getattr(model, "fm_last_run", None) or {}).get("stage") if model is not None else None,
-        (getattr(model, "fm_last_run", None) or {}).get("stored") if model is not None else None,
-        (model.airport_hypothesis[0].get("airport_icao"), model.airport_hypothesis[0].get("score"))
-        if model is not None and model.airport_hypothesis else None,
-    )
-    fm_payload, fm_revision, fm_cached = _selected_iid_section_entry(
-        iid,
-        "fm",
-        fm_signature,
-        lambda: _build_selected_iid_fm_summary(iid, model, frame_counts),
-    )
-
-    control_signature = (
-        model.resolution_mode if model is not None else None,
-        model.manual_lat if model is not None else None,
-        model.manual_lon if model is not None else None,
-        model.manual_note if model is not None else None,
-        model.manual_updated_ts if model is not None else None,
-        model.unresolvable_reason if model is not None else None,
-        model.unresolvable_updated_ts if model is not None else None,
-        model.lat if model is not None else None,
-        model.lon if model is not None else None,
-        model.cep_m if model is not None else None,
-        model.fm_lat if model is not None else None,
-        model.fm_lon if model is not None else None,
-        model.fm_cep_m if model is not None else None,
-        model.fm_source if model is not None else None,
-        model.last_updated if model is not None else None,
-    )
-    control_payload, control_revision, control_cached = _selected_iid_section_entry(
-        iid,
-        "control",
-        control_signature,
-        lambda: {
-            "iid": iid,
-            "available": model is not None,
-            **_control_payload(model),
-        },
-    )
-
-    frame_position_revision = state.get_go_frame_positions_revision(iid)
-    evidence_signature = (
-        frame_position_revision,
-        control_revision,
-    )
-    evidence_payload, evidence_revision, evidence_cached = _selected_iid_section_entry(
-        iid,
-        "evidence",
-        evidence_signature,
-        lambda: _build_selected_iid_evidence_light(iid, model, control_payload),
-    )
-
-    solution_signature = (
-        control_signature,
-        fm_signature,
-        frame_revision,
-    )
-    solution_payload, solution_revision, solution_cached = _selected_iid_section_entry(
-        iid,
-        "solution",
-        solution_signature,
-        lambda: _build_selected_iid_solution_summary(iid, model, fm_payload, control_payload),
-    )
-
-    revisions = {
-        "selected": selected_revision,
-        "sync": sync_revision,
-        "frames": frames_revision,
-        "reference": reference_revision,
-        "pipeline": pipeline_revision,
-        "fm": fm_revision,
-        "solution": solution_revision,
-        "control": control_revision,
-        "evidence": evidence_revision,
-    }
-    snapshot_signature = (
-        revisions["selected"],
-        revisions["sync"],
-        revisions["frames"],
-        revisions["reference"],
-        revisions["pipeline"],
-        revisions["fm"],
-        revisions["solution"],
-        revisions["control"],
-        revisions["evidence"],
-    )
-    cached_snapshot = _selected_iid_state_snapshot_cache.get(iid)
-    if cached_snapshot is not None and cached_snapshot[0] == snapshot_signature:
-        _selected_iid_state_last_cache_hit[iid] = True
-        cached_payload = cached_snapshot[1]
-        cached_transport = dict(cached_payload.get("transport") or {})
-        cached_sections = {
-            key: {
-                **(meta or {}),
-                "cached": True,
+        skipped_sections = {
+            "burst_sync_timeline_summary": "dedicated_endpoint:/api/radar/iids/{iid}/burst_sync_timeline",
+            "df_alignment_data": "dedicated_endpoint:/api/radar/iids/{iid}/timeline",
+            "sweep_frames": "dedicated_endpoint:/api/radar/iids/{iid}/sweep-frames",
+            "frame_accumulation": "dedicated_endpoint:/api/radar/iids/{iid}/fm-diagnostics",
+            "fm_location": "dedicated_endpoint:/api/radar/iids/{iid}/fm-location",
+            "fm_diagnostics": "dedicated_endpoint:/api/radar/iids/{iid}/fm-diagnostics",
+            "position_accumulation_convergence": "dedicated_endpoint:/api/radar/iids/{iid}/position-accumulation,/api/radar/iids/{iid}/fm-convergence",
+            "recorded_residual_diagnostics": "dedicated_endpoint:/api/radar/iids/{iid}/burst_sync_timeline",
+            "geometry_enrichment": "dedicated_endpoint:/api/radar/iids/{iid}/evidence/{method}",
+            "database_reads": "none",
+        }
+        for section_name, reason in skipped_sections.items():
+            section_timings[section_name] = {
+                "name": section_name,
+                "cache": "dedicated",
+                "signature": None,
+                "signature_changed_fields": [],
+                "signature_change_reason": reason,
+                "build_ms": 0.0,
+                "payload_size_bytes": 0,
+                "item_count": 0,
+                "skipped": True,
             }
-            for key, meta in (cached_transport.get("sections") or {}).items()
-        }
-        cached_payload = {
-            **cached_payload,
-            "transport": {
-                **cached_transport,
-                "cached": True,
-                "sections": cached_sections,
-            },
-        }
-        _selected_iid_state_snapshot_cache[iid] = (snapshot_signature, cached_payload)
-        return cached_payload
 
-    sequence = int(_selected_iid_state_snapshot_seq.get(iid, 0)) + 1
-    _selected_iid_state_snapshot_seq[iid] = sequence
-    payload = {
-        "type": "radar_selected_iid_state",
-        "iid": iid,
-        "sequence": sequence,
-        "server_ts": time.time(),
-        "revisions": revisions,
-        "selected": selected_payload,
-        "sync": sync_section,
-        "data_path_diagnostics": data_path_diag,
-        "frames": frames_payload,
-        "reference": reference_payload,
-        "pipeline": pipeline_payload,
-        "fm": fm_payload,
-        "solution": solution_payload,
-        "control": control_payload,
-        "evidence": evidence_payload,
-        "transport": {
-            "cached": False,
-            "source": "selected_iid_state_cache",
-            "sections": {
-                "selected": {"cached": selected_cached, "revision": selected_revision},
-                "sync": {"cached": sync_cached, "revision": sync_revision},
-                "frames": {"cached": frames_cached, "revision": frames_revision},
-                "reference": {"cached": reference_cached, "revision": reference_revision},
-                "pipeline": {"cached": pipeline_cached, "revision": pipeline_revision},
-                "fm": {"cached": fm_cached, "revision": fm_revision},
-                "solution": {"cached": solution_cached, "revision": solution_revision},
-                "control": {"cached": control_cached, "revision": control_revision},
-                "evidence": {"cached": evidence_cached, "revision": evidence_revision},
+        model_update_age_s = (
+            max(0.0, now_ts - float(model.last_updated))
+            if model is not None and model.last_updated is not None else None
+        )
+        sync_update_ts = getattr(sync, "last_sync_update_ts", None) if sync is not None else None
+        sync_update_age_s = (
+            max(0.0, now_ts - float(sync_update_ts))
+            if sync_update_ts is not None else None
+        )
+        summary_payload = {
+            "iid": iid,
+            "available": bool(model is not None),
+            "reason": None if model is not None else "IID not seen",
+            "status": model.status if model is not None else None,
+            "period_s": model.period_s if model is not None else None,
+            "rpm": model.rpm if model is not None else None,
+            "period_std_s": model.period_std_s if model is not None else None,
+            "sync": sync_summary_payload,
+            "frames": frame_summary_payload,
+            "ages": {
+                "model_update_age_s": model_update_age_s,
+                "sync_update_age_s": sync_update_age_s,
             },
-        },
-    }
-    _selected_iid_state_snapshot_cache[iid] = (snapshot_signature, payload)
-    _selected_iid_state_last_cache_hit[iid] = False
-    return payload
+            "availability": availability_payload,
+            "display_source": _control_payload(model).get("display_source") if model is not None else "none",
+        }
+
+        revisions = {
+            "selected": selected_revision,
+            "sync_summary": sync_revision,
+            "frame_counts": frames_revision,
+            "availability": availability_revision,
+        }
+        snapshot_signature = tuple(revisions.values())
+        cached_snapshot = _selected_iid_state_snapshot_cache.get(iid)
+        if cached_snapshot is not None and cached_snapshot[0] == snapshot_signature:
+            cached_payload = cached_snapshot[1]
+            cached_transport = dict(cached_payload.get("transport") or {})
+            cached_payload = {
+                **cached_payload,
+                "transport": {
+                    **cached_transport,
+                    "cached": True,
+                    "source": "selected_iid_state_snapshot_cache",
+                    "cache_ttl_s": _SELECTED_IID_STATE_TTL_S,
+                    "sections": sections_transport,
+                },
+            }
+            _selected_iid_state_last_cache_hit[iid] = True
+            _selected_iid_state_ttl_cache[lock_key] = (time.monotonic(), cached_payload)
+            _selected_iid_state_snapshot_cache[iid] = (snapshot_signature, cached_payload)
+            return cached_payload
+
+        sequence = int(_selected_iid_state_snapshot_seq.get(iid, 0)) + 1
+        _selected_iid_state_snapshot_seq[iid] = sequence
+        payload = {
+            "type": "radar_selected_iid_state",
+            "iid": iid,
+            "sequence": sequence,
+            "server_ts": now_ts,
+            "revisions": revisions,
+            "summary": summary_payload,
+            "transport": {
+                "cached": False,
+                "source": "selected_iid_state_summary",
+                "cache_ttl_s": _SELECTED_IID_STATE_TTL_S,
+                "sections": sections_transport,
+            },
+        }
+        serialization_t0 = time.perf_counter()
+        payload_size_bytes = _json_size_bytes(payload)
+        serialization_ms = round((time.perf_counter() - serialization_t0) * 1000.0, 3)
+        payload["transport"]["performance"] = {
+            "build_ms": round((time.perf_counter() - started_at) * 1000.0, 3),
+            "serialization_ms": serialization_ms,
+            "payload_size_bytes": payload_size_bytes,
+            "sections": section_timings,
+        }
+        _selected_iid_state_snapshot_cache[iid] = (snapshot_signature, payload)
+        _selected_iid_state_last_cache_hit[iid] = False
+        _selected_iid_state_ttl_cache[lock_key] = (time.monotonic(), payload)
+        return payload
 
 
 def get_selected_iid_page_state_last_cache_hit(iid: int) -> bool:

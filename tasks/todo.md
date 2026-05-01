@@ -124,3 +124,32 @@ Residual risk:
 - [x] Add temporary frontend diagnostics (URL/status/age/seq-or-ts/count/empty/schema-rejected/polling-active) per selected-IID data source.
 - [ ] Add backend/frontend regression tests for source independence, lifecycle polling, empty recorded behavior, and schema-mismatch handling.
 - [ ] Run verification (backend pytest + frontend tests/build + manual acceptance flow) and document review results.
+
+## 2026-05-01 /state Performance Regression Fix (In Progress)
+
+- [x] Add detailed per-section timing, size, count, cache diagnostics, and serialization timing for `/api/radar/iids/{iid}/state`.
+- [x] Identify and remove volatile signature invalidators causing unnecessary section rebuilds.
+- [x] Slim `/state` to lightweight selected-IID summary/status only (no large arrays/heavy payload sections).
+- [x] Add backend single-flight + short TTL cache for slim `/state` to prevent overlapping builds per IID.
+- [x] Keep heavy data in dedicated endpoints and ensure `/state` does not trigger heavy builders.
+- [x] Rewire frontend so panel data comes from dedicated endpoints, not `/state` bulk fallback.
+- [x] Ensure selected-IID fallback does not overlap requests and remains stale-safe under slow responses.
+- [x] Add regression tests for slim `/state`, cache behavior, frontend endpoint usage boundaries, and failure isolation.
+- [x] Run verification (backend tests + frontend build + live endpoint latency checks) and record results.
+
+Review:
+- `/api/radar/iids/{iid}/state` now returns summary-only payload (`summary` + revisions + transport performance/cache metadata) and no heavy section arrays.
+- Added per-section timing/size/count and signature-based cache diagnostics in `transport.performance.sections`.
+- Added single-flight per-(iid,window,debugLimit) build lock and 1.5s TTL cache for `/state` summary payloads.
+- Added dedicated `GET /api/radar/iids/{iid}/position-accumulation` endpoint for frame-position history map data.
+- Frontend panels now fetch dedicated endpoints directly (`sync-snapshot`, `timeline`, `sweep-frames`, `control`, `solution-comparison`, `fm-location`, `fm-diagnostics`, `position-accumulation`) and no longer hydrate panel data from `/state`.
+
+Verification:
+- `uv run --directory backend pytest tests/test_radar_api.py -k "selected_state or position_accumulation" -q`
+- `uv run --directory backend pytest tests/test_radar_ui_labels.py -q`
+- `cd frontend && npm run build`
+- Elevated local probe on patched backend (port `8011`): 5x `/api/radar/iids/{iid}/state` calls returned `200` in `~1.0–3.2ms`, payload keys were summary-only (`iid/revisions/sequence/server_ts/summary/transport/type`), and TTL cache hits were observed (`transport.source=selected_iid_state_ttl_cache`).
+- In-process benchmark for `/state` summary path with large mocked buffers: min 0.053ms, median 0.06ms, p95 0.163ms, max 0.47ms (non-Pi dev host).
+
+Residual risk:
+- Existing long-running backend on port `8000` appears to still be pre-fix build; live environment validation still requires restart/deploy of patched backend before UI-level acceptance can reflect these changes.

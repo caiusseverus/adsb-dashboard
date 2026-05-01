@@ -659,7 +659,7 @@ def test_get_iid_sync_snapshot_marks_cache_hits(monkeypatch):
     assert second["transport"]["source"] == "shared_snapshot_cache"
 
 
-def test_get_iid_selected_state_combines_lightweight_sections(monkeypatch):
+def test_get_iid_selected_state_is_summary_only(monkeypatch):
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", False)
     monkeypatch.setattr("radar.sweep.RADAR_DIAGNOSTICS", False)
@@ -697,20 +697,7 @@ def test_get_iid_selected_state_combines_lightweight_sections(monkeypatch):
         source="multi_aircraft_burst",
         usable=True,
     )
-    state._live_burst_timeline_obs[91] = deque([
-        AlignedBurstSyncObs(
-            burst_centroid_us=7_000_000.0,
-            icao="AAAAAA",
-            bearing_deg=14.0,
-            n_replies=4,
-            signal_dbfs=-16.0,
-            pos_age_s=0.3,
-            range_nm=14.0,
-            ts=now_ts,
-            sync_update_eligible=True,
-            raw_arrival_us=7_000_000.0,
-        )
-    ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+    state._live_burst_timeline_obs[91] = deque([], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
     state._live_completed_frames[91] = deque([
         SweepFrame(
             frame_index=3,
@@ -737,17 +724,21 @@ def test_get_iid_selected_state_combines_lightweight_sections(monkeypatch):
 
     assert payload["type"] == "radar_selected_iid_state"
     assert payload["iid"] == 91
-    assert payload["selected"]["available"] is True
-    assert payload["sync"]["type"] == "radar_sync"
-    assert payload["frames"]["n_frames"] == 1
-    assert payload["reference"]["ref_icao"] == "AAAAAA"
-    assert payload["pipeline"]["stages"]["frames"]["status"] == "working"
-    assert payload["fm"]["location"]["status"] == "LOCALISED"
-    assert payload["solution"]["selected"]["source"] == payload["control"]["display_source"]
-    assert payload["evidence"]["available"] is True
-    assert payload["revisions"]["evidence"] >= 1
-    assert payload["transport"]["sections"]["evidence"]["revision"] == payload["revisions"]["evidence"]
-    assert payload["transport"]["sections"]["frames"]["revision"] >= 1
+    assert payload["summary"]["available"] is True
+    assert payload["summary"]["status"] == "SINGLE_RADAR"
+    assert payload["summary"]["sync"]["present"] is True
+    assert payload["summary"]["frames"]["n_frames"] == 1
+    assert payload["summary"]["availability"]["sweep_frames"]["reason"].endswith("/sweep-frames")
+    assert "sync" not in payload
+    assert "frames" not in payload
+    assert "reference" not in payload
+    assert "pipeline" not in payload
+    assert "fm" not in payload
+    assert "solution" not in payload
+    assert "control" not in payload
+    assert "evidence" not in payload
+    assert payload["transport"]["performance"]["payload_size_bytes"] > 0
+    assert payload["transport"]["performance"]["sections"]["sweep_frames"]["skipped"] is True
 
 
 def test_get_iid_selected_state_marks_cache_hits(monkeypatch):
@@ -782,9 +773,10 @@ def test_get_iid_selected_state_marks_cache_hits(monkeypatch):
     assert second["transport"]["cached"] is True
     assert second["sequence"] == first["sequence"]
     assert second["revisions"] == first["revisions"]
+    assert second["transport"]["source"] in {"selected_iid_state_snapshot_cache", "selected_iid_state_ttl_cache"}
 
 
-def test_get_iid_selected_state_evidence_uses_go_frame_positions_and_revisions(monkeypatch):
+def test_get_iid_selected_state_stays_small_with_large_buffers(monkeypatch):
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_DIAGNOSTICS", False)
     monkeypatch.setattr("radar.sweep.RADAR_DIAGNOSTICS", False)
@@ -800,10 +792,48 @@ def test_get_iid_selected_state_evidence_uses_go_frame_positions_and_revisions(m
         fm_source="go_frame_accumulation",
         last_updated=4_000.0,
     )
+    state._go_evidence_events = deque(
+        [{"iid": 93, "arrival_us": float(i), "wall_ts": 4_000.0 + i / 10.0} for i in range(50_000)],
+        maxlen=100_000,
+    )
+    state._live_burst_residual_events[93] = deque(
+        [{"beam_center_us": float(i), "event_id": f"b{i}"} for i in range(25_000)],
+        maxlen=30_000,
+    )
+    state._live_df11_recorded_residual_events[93] = deque(
+        [{"arrival_beast_us": float(i), "event_id": f"d{i}"} for i in range(25_000)],
+        maxlen=30_000,
+    )
+
+    prior_state = radar_api._state
+    radar_api._state = state
+    try:
+        payload = asyncio.run(radar_api.get_iid_selected_state(93, window_s=60.0, debug_limit=20))
+    finally:
+        radar_api._state = prior_state
+
+    assert "summary" in payload
+    assert "sync" not in payload
+    assert "evidence" not in payload
+    assert payload["transport"]["performance"]["payload_size_bytes"] < 40_000
+
+
+def test_get_iid_position_accumulation_returns_frame_positions(monkeypatch):
+    state = RadarState()
+    state._models[95] = RadarIID(
+        iid=95,
+        status="SINGLE_RADAR",
+        period_s=4.0,
+        fm_lat=51.5,
+        fm_lon=-0.2,
+        fm_cep_m=1000.0,
+        fm_source="go_frame_accumulation",
+        last_updated=5_000.0,
+    )
     state.update_go_snapshot({
         "iids": {
-            "93": {
-                "iid": 93,
+            "95": {
+                "iid": 95,
                 "frame_positions": [
                     {
                         "frame_index": 5,
@@ -819,35 +849,82 @@ def test_get_iid_selected_state_evidence_uses_go_frame_positions_and_revisions(m
             }
         }
     })
-
     prior_state = radar_api._state
     radar_api._state = state
     try:
-        first = asyncio.run(radar_api.get_iid_selected_state(93, window_s=60.0, debug_limit=20))
-        state.update_go_frame_position_result({
-            "i": 93,
-            "fi": 6,
-            "su": 14_000_000.0,
-            "aa": True,
-            "la": 51.5008,
-            "lo": -0.1998,
-            "cep": 900.0,
-            "na": 7,
-            "az": 92.0,
-            "w": 3.0,
-        })
-        second = asyncio.run(radar_api.get_iid_selected_state(93, window_s=60.0, debug_limit=20))
+        payload = asyncio.run(radar_api.get_iid_position_accumulation(95))
     finally:
         radar_api._state = prior_state
 
-    assert first["evidence"]["frame_position_count"] == 1
-    assert first["evidence"]["frame_positions"][0]["frame_index"] == 5
-    assert first["evidence"]["frame_positions"][0]["sweep_start_us"] == 10_000_000.0
-    assert first["evidence"]["fm_estimate"]["source"] == "fm"
-    assert second["evidence"]["frame_position_count"] == 2
-    assert {row["frame_index"] for row in second["evidence"]["frame_positions"]} == {5, 6}
-    assert second["revisions"]["evidence"] > first["revisions"]["evidence"]
-    assert second["transport"]["sections"]["evidence"]["revision"] == second["revisions"]["evidence"]
+    assert payload["available"] is True
+    assert payload["frame_position_count"] == 1
+    assert payload["frame_positions"][0]["frame_index"] == 5
+
+
+def test_get_iid_selected_state_does_not_call_heavy_builders(monkeypatch):
+    state = RadarState()
+    state._models[96] = RadarIID(iid=96, status="SINGLE_RADAR", period_s=4.0, last_updated=6_000.0)
+    state._live_sync_states[96] = LiveSyncState(
+        iid=96,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=6_000.0,
+        source="multi_aircraft_burst",
+        usable=True,
+    )
+
+    def fail_builder(*_args, **_kwargs):
+        raise AssertionError("heavy FM builder should not be called by /state")
+
+    prior_state = radar_api._state
+    radar_api._state = state
+    monkeypatch.setattr(radar_api, "_build_selected_iid_fm_summary", fail_builder)
+    try:
+        payload = asyncio.run(radar_api.get_iid_selected_state(96, window_s=60.0, debug_limit=20))
+    finally:
+        radar_api._state = prior_state
+
+    assert payload["summary"]["available"] is True
+
+
+def test_get_iid_selected_state_signature_ignores_unrelated_recorded_event_buffers(monkeypatch):
+    state = RadarState()
+    state._models[97] = RadarIID(iid=97, status="SINGLE_RADAR", period_s=4.0, last_updated=7_000.0)
+    state._live_sync_states[97] = LiveSyncState(
+        iid=97,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=7_000.0,
+        source="multi_aircraft_burst",
+        usable=True,
+    )
+
+    prior_state = radar_api._state
+    prior_ttl = radar_api._SELECTED_IID_STATE_TTL_S
+    radar_api._state = state
+    monkeypatch.setattr(radar_api, "_SELECTED_IID_STATE_TTL_S", 0.0)
+    try:
+        first = asyncio.run(radar_api.get_iid_selected_state(97, window_s=60.0, debug_limit=20))
+        state._live_burst_residual_events[97] = deque(
+            [{"beam_center_us": float(i), "event_id": f"x{i}"} for i in range(500)],
+            maxlen=1_000,
+        )
+        state._live_df11_recorded_residual_events[97] = deque(
+            [{"arrival_beast_us": float(i), "event_id": f"y{i}"} for i in range(500)],
+            maxlen=1_000,
+        )
+        second = asyncio.run(radar_api.get_iid_selected_state(97, window_s=60.0, debug_limit=20))
+    finally:
+        radar_api._state = prior_state
+        monkeypatch.setattr(radar_api, "_SELECTED_IID_STATE_TTL_S", prior_ttl)
+
+    assert first["revisions"] == second["revisions"]
 
 
 def test_get_iid_sweep_frame_fm_geometry_uses_cache(monkeypatch):

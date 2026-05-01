@@ -75,6 +75,20 @@ def test_radar_page_has_http_safety_polls_for_live_stream_and_selected_state():
     assert "selected_state_stream_fallback" in text
 
 
+def test_radar_page_uses_dedicated_endpoints_not_state_bulk_sections():
+    radar_page = Path(__file__).resolve().parents[2] / "frontend" / "src" / "pages" / "RadarPage.jsx"
+    text = radar_page.read_text(encoding="utf-8")
+    assert "/api/radar/iids/${iid}/sync-snapshot" in text
+    assert "/api/radar/iids/${iid}/sweep-frames" in text
+    assert "/api/radar/iids/${iid}/control" in text
+    assert "/api/radar/iids/${iid}/solution-comparison" in text
+    assert "/api/radar/iids/${iid}/position-accumulation" in text
+    assert "selectedIidState?.frames" not in text
+    assert "selectedIidState?.sync" not in text
+    assert "selectedIidState?.fm" not in text
+    assert "selectedIidState?.evidence" not in text
+
+
 def test_radar_page_all_icaos_chip_uses_distinct_recorded_burst_icaos():
     radar_page = Path(__file__).resolve().parents[2] / "frontend" / "src" / "pages" / "RadarPage.jsx"
     text = radar_page.read_text(encoding="utf-8")

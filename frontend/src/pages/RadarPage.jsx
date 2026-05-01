@@ -575,6 +575,109 @@ function useTdoaDiagnostics(iid, refreshKey = 0) {
   return data
 }
 
+function useIidControl(iid, refreshKey = 0) {
+  const [data, setData] = useState(null)
+
+  useEffect(() => {
+    if (iid == null) { setData(null); return }
+    const controller = new AbortController()
+    async function poll() {
+      const d = await trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/control`, {
+        endpoint: 'iid_control',
+        trigger: refreshKey ? 'control_change_or_poll' : 'iid_change_or_poll',
+        signal: controller.signal,
+      })
+      if (!controller.signal.aborted && d) setData(d)
+    }
+    poll()
+    const id = setInterval(poll, 10_000)
+    return () => { controller.abort(); clearInterval(id) }
+  }, [iid, refreshKey])
+
+  return data
+}
+
+function useIidSolutionComparison(iid, refreshKey = 0) {
+  const [data, setData] = useState(null)
+
+  useEffect(() => {
+    if (iid == null) { setData(null); return }
+    const controller = new AbortController()
+    async function poll() {
+      const d = await trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/solution-comparison`, {
+        endpoint: 'iid_solution_comparison',
+        trigger: refreshKey ? 'control_change_or_poll' : 'iid_change_or_poll',
+        signal: controller.signal,
+      })
+      if (!controller.signal.aborted && d) setData(d)
+    }
+    poll()
+    const id = setInterval(poll, 10_000)
+    return () => { controller.abort(); clearInterval(id) }
+  }, [iid, refreshKey])
+
+  return data
+}
+
+function useIidPositionAccumulation(iid, refreshKey = 0) {
+  const [data, setData] = useState(null)
+
+  useEffect(() => {
+    if (iid == null) { setData(null); return }
+    const controller = new AbortController()
+    async function poll() {
+      const d = await trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/position-accumulation`, {
+        endpoint: 'iid_position_accumulation',
+        trigger: refreshKey ? 'control_change_or_poll' : 'iid_change_or_poll',
+        signal: controller.signal,
+      })
+      if (!controller.signal.aborted && d) setData(d)
+    }
+    poll()
+    const id = setInterval(poll, 5_000)
+    return () => { controller.abort(); clearInterval(id) }
+  }, [iid, refreshKey])
+
+  return data
+}
+
+function useIidSyncSnapshot(iid, windowS, debugLimit = 120) {
+  const [data, setData] = useState(null)
+  const [status, setStatus] = useState({ connected: false, mode: 'idle', lastUpdateAt: null, sequence: null })
+
+  useEffect(() => {
+    if (iid == null) {
+      setData(null)
+      setStatus({ connected: false, mode: 'idle', lastUpdateAt: null, sequence: null })
+      return
+    }
+    const controller = new AbortController()
+    async function poll() {
+      const d = await trackedRadarFetchJson(
+        `${API_BASE}/api/radar/iids/${iid}/sync-snapshot?window_s=${windowS}&debug_limit=${debugLimit}`,
+        {
+          endpoint: 'iid_sync_snapshot',
+          trigger: 'iid_change_or_poll',
+          signal: controller.signal,
+        },
+      )
+      if (controller.signal.aborted || !d) return
+      setData(d)
+      setStatus({
+        connected: true,
+        mode: 'poll',
+        lastUpdateAt: Date.now(),
+        sequence: d.sequence ?? null,
+      })
+    }
+    poll()
+    const id = setInterval(poll, BURST_SYNC_POLL_MS)
+    return () => { controller.abort(); clearInterval(id) }
+  }, [iid, windowS, debugLimit])
+
+  return { data, status }
+}
+
 function RadarEndpointDiagnostics({ iid }) {
   const [tick, setTick] = useState(0)
   useEffect(() => {
@@ -5355,6 +5458,7 @@ export default function RadarPage() {
   const [selectedIcao, setSelectedIcao] = useState(null)
   const [selectedFrame, setSelectedFrame] = useState(null)
   const [resettingAll, setResettingAll] = useState(false)
+  const [panelRefreshKey, setPanelRefreshKey] = useState(0)
   const selectedRow = rows.find(row => row.iid === selectedIid) ?? null
   const receiverPosition = useReceiverPosition()
   const sharedTimingPacket = useTimingEventStream({
@@ -5363,19 +5467,17 @@ export default function RadarPage() {
     df11Only: true,
     debugLabel: 'radar_page_df11',
   })
-  const { snapshot: selectedIidState, status: selectedIidStateStatus } = useSelectedIidPageState(
+  const sharedSweepFrames = useSweepFrames(selectedIid)
+  const sharedReferenceAircraft = useReferenceAircraft(selectedIid)
+  const { data: sharedFmLocation } = useFmLocation(selectedIid)
+  const sharedControl = useIidControl(selectedIid, panelRefreshKey)
+  const sharedSolution = useIidSolutionComparison(selectedIid, panelRefreshKey)
+  const { data: sharedFmSummary } = useFmDiagnostics(selectedIid, panelRefreshKey)
+  const sharedEvidence = useIidPositionAccumulation(selectedIid, panelRefreshKey)
+  const { data: syncSnapshot, status: syncFeedStatus } = useIidSyncSnapshot(
     selectedIid,
     BURST_SYNC_ALIGNMENT_WINDOW_S,
   )
-  const sharedSweepFrames = selectedIidState?.frames ?? null
-  const sharedReferenceAircraft = selectedIidState?.reference ?? null
-  const sharedFmLocation = selectedIidState?.fm?.location ?? null
-  const sharedControl = selectedIidState?.control ?? null
-  const sharedSolution = selectedIidState?.solution ?? null
-  const sharedFmSummary = selectedIidState?.fm ?? null
-  const sharedEvidence = selectedIidState?.evidence ?? null
-  const syncSnapshot = selectedIidState?.sync ?? null
-  const syncFeedStatus = selectedIidStateStatus
 
   useEffect(() => {
     if (rows.length === 0) return
@@ -5391,6 +5493,10 @@ export default function RadarPage() {
     setSelectedIcao(null)
     setSelectedFrame(null)
   }
+
+  const handlePanelChanged = useCallback(() => {
+    setPanelRefreshKey(key => key + 1)
+  }, [])
 
   async function handleResetAll() {
     if (resettingAll) return
@@ -5425,7 +5531,8 @@ return (
         <LocalisationControlPanel
           iid={selectedIid}
           controlData={sharedControl}
-          feedStatus={selectedIidStateStatus}
+          feedStatus={syncFeedStatus}
+          onChanged={handlePanelChanged}
         />
       </div>
 
@@ -5461,7 +5568,7 @@ return (
             iid={selectedIid}
             controlData={sharedControl}
             evidenceData={sharedEvidence}
-            evidenceRevision={selectedIidState?.revisions?.evidence ?? 0}
+            evidenceRevision={sharedEvidence?.frame_position_count ?? 0}
           />
         </div>
       )}
