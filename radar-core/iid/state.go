@@ -121,6 +121,9 @@ type DebugSnapshot struct {
 	HardBoundReason                          string
 	HardBoundLimitS                          float64
 	HardBoundLimitPPM                        float64
+	LastRejectedDeltaS                       float64
+	LastRejectedDeltaReason                  string
+	LastRejectedDeltaEpochID                 uint64
 	RequestedDeltaS                          float64
 	RequestedDeltaPPM                        float64
 	CurrentDeltaS                            float64
@@ -720,6 +723,9 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.HardBoundReason = s.Sync.HardBoundReason
 		out.HardBoundLimitS = s.Sync.HardBoundLimitS
 		out.HardBoundLimitPPM = s.Sync.HardBoundLimitPPM
+		out.LastRejectedDeltaS = s.Sync.LastRejectedDeltaS
+		out.LastRejectedDeltaReason = s.Sync.LastRejectedDeltaReason
+		out.LastRejectedDeltaEpochID = s.Sync.LastRejectedDeltaEpochID
 		out.RequestedDeltaS = s.Sync.RequestedDeltaS
 		out.RequestedDeltaPPM = s.Sync.RequestedDeltaPPM
 		out.CurrentDeltaS = s.Sync.CurrentDeltaS

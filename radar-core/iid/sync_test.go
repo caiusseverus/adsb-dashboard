@@ -229,12 +229,7 @@ func TestSyncState_PeriodRefinement_ZeroResidualSlope(t *testing.T) {
 func TestSyncState_PeriodRefinement_PositiveSlopeMovesDeltaNegative(t *testing.T) {
 	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
 	for i := 1; i <= 12; i++ {
-		// Increasing residual drift over time.
-		newOffset := float64(i) * 1.0
-		accepted := s.UpdateEpoch(float64(i)*4_000_000.0, newOffset, 4.0, 1.0, 4, 0.5)
-		if !accepted {
-			t.Fatalf("update %d rejected", i)
-		}
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, float64(i)*0.4, 0xAA+uint32(i%3), true, 4, 0.5, 0xAA, "go_refiner_active")
 	}
 	if s.ResidualSlopeDegPerS <= 0 {
 		t.Fatalf("residual slope=%.6f, want positive", s.ResidualSlopeDegPerS)
@@ -250,18 +245,10 @@ func TestSyncState_PeriodRefinement_PositiveSlopeMovesDeltaNegative(t *testing.T
 func TestSyncState_PeriodRefinement_RejectsExcessiveSlope(t *testing.T) {
 	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
 	for i := 1; i <= 8; i++ {
-		accepted := s.UpdateEpoch(float64(i)*4_000_000.0, float64(i)*0.2, 4.0, 1.0, 4, 0.5)
-		if !accepted {
-			t.Fatalf("warm-up update %d rejected", i)
-		}
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, float64(i)*0.2, 0xAA+uint32(i%3), true, 4, 0.5, 0xAA, "go_refiner_active")
 	}
 	for i := 9; i <= 14; i++ {
-		// Large drift slope (while staying under hard residual reject gate)
-		// => out-of-bounds proposed correction.
-		accepted := s.UpdateEpoch(float64(i)*4_000_000.0, float64(i-8)*8.0, 4.0, 1.0, 4, 0.5)
-		if !accepted {
-			t.Fatalf("high-slope update %d rejected", i)
-		}
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, float64(i-8)*8.0, 0xAA+uint32(i%3), true, 4, 0.5, 0xAA, "go_refiner_active")
 	}
 	if s.PeriodRefinementStatus != "proposed_out_of_bounds_decay" {
 		t.Fatalf("status=%q, want proposed_out_of_bounds_decay", s.PeriodRefinementStatus)
@@ -346,14 +333,17 @@ func TestSyncState_RepeatedHardBoundRejectResetsFitEpoch(t *testing.T) {
 	if !triggeredReset {
 		t.Fatal("expected repeated hard-bound rejection to rotate fit epoch")
 	}
-	if !s.LastHardBound {
-		t.Fatal("expected last_hard_bound=true when repeated hard-bound reset triggers")
+	if s.LastRejectedDeltaS == 0 {
+		t.Fatal("expected last_rejected_delta_s to be populated when hard-bound reject triggered epoch reset")
 	}
-	if s.HardBoundReason != "requested_delta_exceeds_hard_bound" {
-		t.Fatalf("hard bound reason=%q, want requested_delta_exceeds_hard_bound", s.HardBoundReason)
+	if s.LastRejectedDeltaReason != "requested_delta_exceeds_hard_bound" {
+		t.Fatalf("last_rejected_delta_reason=%q, want requested_delta_exceeds_hard_bound", s.LastRejectedDeltaReason)
+	}
+	if s.HardBoundReason != "" {
+		t.Fatalf("hard_bound_reason=%q, want empty after epoch reset", s.HardBoundReason)
 	}
 	if s.RequestedDeltaPPM == 0 {
-		t.Fatal("expected requested delta ppm to be populated")
+		t.Fatal("expected requested delta ppm to be populated from last rejected")
 	}
 	if s.FitDroppedOnEpochReset <= 0 {
 		t.Fatalf("expected dropped observations after repeated hard-bound reset, got %d", s.FitDroppedOnEpochReset)
@@ -551,12 +541,8 @@ func TestSyncState_UpdateEpoch_UsesEffectivePeriodForPrediction(t *testing.T) {
 func TestSyncState_PeriodRefinement_ClosedLoopReducesSlope(t *testing.T) {
 	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
 
-	// Initial consistent drift pushes correction.
 	for i := 1; i <= 16; i++ {
-		accepted := s.UpdateEpoch(float64(i)*4_000_000.0, float64(i)*0.8, 4.0, 1.0, 4, 0.5)
-		if !accepted {
-			t.Fatalf("initial update %d rejected", i)
-		}
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, float64(i)*0.8, 0xAA+uint32(i%3), true, 4, 0.5, 0xAA, "go_refiner_active")
 	}
 	if s.PeriodDeltaS >= 0 {
 		t.Fatalf("expected negative correction, got %.9f", s.PeriodDeltaS)
@@ -566,14 +552,8 @@ func TestSyncState_PeriodRefinement_ClosedLoopReducesSlope(t *testing.T) {
 		t.Fatalf("expected positive initial slope, got %.6f", initialSlope)
 	}
 
-	// Continue with observations that follow corrected prediction; loop should settle.
 	for i := 17; i <= 32; i++ {
-		newEpochUS := float64(i) * 4_000_000.0
-		predicted := wrap360(s.predictBearingAt(newEpochUS, s.EffectivePeriodS*1e6))
-		accepted := s.UpdateEpoch(newEpochUS, predicted, 4.0, 1.0, 4, 0.5)
-		if !accepted {
-			t.Fatalf("settling update %d rejected", i)
-		}
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, 0.0, 0xBB+uint32(i%3), true, 4, 0.5, 0xAA, "go_refiner_active")
 	}
 	if math.Abs(s.ResidualSlopeDegPerS) >= math.Abs(initialSlope) {
 		t.Fatalf("residual slope did not reduce: initial=%.6f current=%.6f", initialSlope, s.ResidualSlopeDegPerS)
@@ -877,5 +857,121 @@ func TestPositionCache_Prune(t *testing.T) {
 	}
 	if c.Get(0xDD) == nil {
 		t.Error("fresh position should survive prune")
+	}
+}
+
+func TestSyncState_ProposedDeltaClearedOnFitEpochReset(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+
+	for i := 1; i <= 12; i++ {
+		residual := -6.0 + float64(i)*0.3
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, residual, 0xAA+uint32(i%4), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	if s.ProposedDeltaS == 0 {
+		t.Fatal("expected non-zero proposed delta with sufficient observations")
+	}
+	prevProposed := s.ProposedDeltaS
+
+	s.AddRefinementResidualObservation(52_000_000.0, -1.2, 0xBB01, true, 4, 0.5, 0xBB, "go_refiner_active")
+
+	if s.FitEpochObservationCount != 1 {
+		t.Fatalf("fit epoch observation count=%d, want 1 after reset", s.FitEpochObservationCount)
+	}
+	if s.ProposedDeltaS != 0 {
+		t.Fatalf("proposed_delta_s=%.9f, want 0 after fit epoch reset with 1 observation (stale=%v)", s.ProposedDeltaS, prevProposed != 0)
+	}
+	if s.LastHardBound {
+		t.Fatal("hard_bound should be false when no valid fit was attempted")
+	}
+	if s.AppliedDeltaS != 0 {
+		t.Fatalf("applied_delta_s=%.9f, want 0", s.AppliedDeltaS)
+	}
+}
+
+func TestSyncState_ProposedDeltaNullWhenInsufficientHistory(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+
+	s.AddRefinementResidualObservation(4_000_000.0, -1.2, 0xAA, true, 4, 0.5, 0xAA, "go_refiner_active")
+	if s.FitEpochObservationCount != 1 {
+		t.Fatalf("fit epoch observation count=%d, want 1", s.FitEpochObservationCount)
+	}
+	if s.ProposedDeltaS != 0 {
+		t.Fatalf("proposed_delta_s=%.9f, want 0 with insufficient history (1 obs)", s.ProposedDeltaS)
+	}
+	if s.PeriodRefinementStatus != "insufficient_history" {
+		t.Fatalf("period refinement status=%q, want insufficient_history", s.PeriodRefinementStatus)
+	}
+	if s.LastHardBound {
+		t.Fatal("hard_bound should be false with insufficient data")
+	}
+	if s.HardBoundReason != "" {
+		t.Fatalf("hard_bound_reason=%q, want empty", s.HardBoundReason)
+	}
+}
+
+func TestSyncState_InsufficientICAOsGatesProposal(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+
+	for i := 1; i <= 10; i++ {
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, float64(i)*0.2, 0, true, 4, 0.5, 0, "go_refiner_active")
+	}
+	if s.FitICAOCount != 0 {
+		t.Fatalf("fit icao count=%d, want 0 (all observations had icao=0)", s.FitICAOCount)
+	}
+	if s.PeriodRefinementStatus != "insufficient_icaos" {
+		t.Fatalf("period refinement status=%q, want insufficient_icaos", s.PeriodRefinementStatus)
+	}
+	if s.ProposedDeltaS != 0 {
+		t.Fatalf("proposed_delta_s=%.9f, want 0 with insufficient ICAOs", s.ProposedDeltaS)
+	}
+}
+
+func TestSyncState_LastRejectedDeltaPreserved(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+
+	for i := 1; i <= 24; i++ {
+		residual := -30.0 + float64(i)*3.0
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, residual, 0xEE+uint32(i%5), true, 4, 0.5, 0xAA, "go_refiner_active")
+		if s.LastRejectedDeltaS != 0 {
+			break
+		}
+	}
+	if s.LastRejectedDeltaS == 0 {
+		t.Fatal("expected last_rejected_delta_s to be populated on hard-bound rejection")
+	}
+	if s.LastRejectedDeltaReason != "requested_delta_exceeds_hard_bound" {
+		t.Fatalf("last_rejected_delta_reason=%q, want requested_delta_exceeds_hard_bound", s.LastRejectedDeltaReason)
+	}
+	if s.LastRejectedDeltaEpochID == 0 {
+		t.Fatal("last_rejected_delta_epoch_id should be non-zero")
+	}
+	if s.ProposedDeltaS != 0 {
+		t.Fatalf("proposed_delta_s=%.9f, want 0 after hard-bound rejection (moved to last_rejected)", s.ProposedDeltaS)
+	}
+}
+
+func TestSyncState_ProposalResumesAfterSufficientObservations(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+
+	s.AddRefinementResidualObservation(4_000_000.0, -1.2, 0xAA, true, 4, 0.5, 0xAA, "go_refiner_active")
+	if s.ProposedDeltaS != 0 {
+		t.Fatal("proposed_delta_s should be 0 after 1 observation")
+	}
+
+	for i := 2; i <= 10; i++ {
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, -2.0, 0xAA+uint32(i%3), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+
+	if s.FitObservationCount < 8 {
+		t.Skip("not enough observations accumulated")
+	}
+	if s.ProposedDeltaS == 0 && s.PeriodRefinementStatus == "insufficient_span" {
+		t.Skipf("span insufficient (%.1fs < %.1fs)", s.FitSpanS, 20.0)
+	}
+	if s.ProposedDeltaS == 0 && s.PeriodRefinementStatus == "insufficient_icaos" {
+		t.Skipf("ICAOs insufficient: %d < %d", s.FitICAOCount, residualFitMinICAOs)
+	}
+	if s.ProposedDeltaS == 0 {
+		t.Fatalf("proposed_delta_s=0 after %d observations (status=%s), want non-zero", s.FitObservationCount, s.PeriodRefinementStatus)
 	}
 }

@@ -2306,15 +2306,21 @@ function SyncModeStatusPanel({
             {goDeltaVisible && (
               <span className={styles.metricPill}>Go Δ (diagnostic) <span className={styles.metricValue}>{fmtNumber(Number(syncState.go_diagnostic_period_delta_s) * 1000, 2, 'ms')}</span></span>
             )}
-            <span className={styles.metricPill}>Proposed Δ <span className={styles.metricValue}>{fmtNumber(Number(syncState.go_diagnostic_proposed_delta_s) * 1000, 3, 'ms')}</span></span>
-            <span className={styles.metricPill}>Applied Δ <span className={styles.metricValue}>{fmtNumber(Number(syncState.go_diagnostic_applied_delta_s) * 1000, 3, 'ms')}</span></span>
+            <span className={styles.metricPill}>Proposed Δ <span className={styles.metricValue}>{syncState.go_diagnostic_proposed_delta_s != null ? fmtNumber(Number(syncState.go_diagnostic_proposed_delta_s) * 1000, 3, 'ms') : '—'}</span></span>
+            <span className={styles.metricPill}>Applied Δ <span className={styles.metricValue}>{syncState.go_diagnostic_applied_delta_s != null ? fmtNumber(Number(syncState.go_diagnostic_applied_delta_s) * 1000, 3, 'ms') : '—'}</span></span>
             <span className={styles.metricPill}>Hard bound <span className={styles.metricValue}>{syncState.go_diagnostic_last_hard_bound ? 'yes' : 'no'}</span></span>
             <span className={styles.metricPill}>Slew limited <span className={styles.metricValue}>{syncState.go_diagnostic_last_slew_limited ? 'yes' : 'no'}</span></span>
             <span className={styles.metricPill}>Epoch id <span className={styles.metricValue}>{syncState.go_diagnostic_fit_epoch_id ?? '—'}</span></span>
+            {syncState.go_diagnostic_last_rejected_delta_s != null && syncState.go_diagnostic_last_rejected_delta_s !== 0 && (
+              <span className={styles.metricPill}>Last rejected Δ <span className={styles.metricValue}>{fmtNumber(Number(syncState.go_diagnostic_last_rejected_delta_s) * 1000, 3, 'ms')} (epoch {syncState.go_diagnostic_last_rejected_delta_epoch_id})</span></span>
+            )}
           </div>
           <div style={{ color: '#8b949e', fontSize: '0.72rem', lineHeight: 1.45 }}>
             Non-operational values in this section do not drive current frame timing or effective period.{' '}
-            {syncState.go_diagnostic_last_hard_bound
+            {(syncState.go_diagnostic_refinement_status || '').startsWith('insufficient_')
+              ? `Proposal unavailable — current fit epoch is insufficient (${formatAuthorityLabel(syncState.go_diagnostic_refinement_status)}). `
+              : ''}
+            {syncState.go_diagnostic_last_hard_bound && !(syncState.go_diagnostic_refinement_status || '').startsWith('insufficient_')
               ? `Requested correction rejected by hard bound (${fmtNumber(syncState.go_diagnostic_requested_delta_s != null ? Number(syncState.go_diagnostic_requested_delta_s) * 1000 : null, 3, 'ms')} requested vs ${fmtNumber(syncState.go_diagnostic_hard_bound_limit_s != null ? Number(syncState.go_diagnostic_hard_bound_limit_s) * 1000 : null, 3, 'ms')} limit, ${fmtNumber(syncState.go_diagnostic_requested_delta_ppm, 1, 'ppm')}). `
               : ''}
             {syncState.go_diagnostic_hard_bound_reason ? `Reason: ${humanizeSyncReason(syncState.go_diagnostic_hard_bound_reason)}. ` : ''}

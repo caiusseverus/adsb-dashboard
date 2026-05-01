@@ -359,12 +359,22 @@ def _build_go_diagnostic_fields(
     if hard_bound_limit_ppm is None:
         hard_bound_limit_ppm = 5000.0 if hard_bound_limit_s is not None else None
 
+    ref_status = go_payload.get("period_refinement_status") or ""
+    fit_insufficient = ref_status.startswith("insufficient_")
+    hard_bound_reason = go_payload.get("hard_bound_reason")
+    if fit_insufficient:
+        hard_bound_reason = (
+            "unavailable_due_to_insufficient_fit"
+            if not (go_payload.get("last_hard_bound"))
+            else go_payload.get("hard_bound_reason")
+        )
+
     return {
         "go_diagnostic_base_period_s": float(base_period_s) if _is_finite_number(base_period_s) else None,
         "go_diagnostic_period_delta_s": float(period_delta_s) if _is_finite_number(period_delta_s) else None,
         "go_diagnostic_effective_period_s": float(effective_period_s) if _is_finite_number(effective_period_s) else None,
         "go_diagnostic_period_source": go_payload.get("period_source") or None,
-        "go_diagnostic_refinement_status": (
+        "go_diagnostic_refinement_status": ref_status or (
             "holdover"
             if go_payload.get("holdover")
             else "stable" if _is_finite_number(effective_period_s)
@@ -379,15 +389,21 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_residual_slope_deg_per_s": go_payload.get("residual_slope_deg_per_s"),
         "go_diagnostic_slope_ema_deg_per_s": go_payload.get("slope_ema_deg_per_s"),
         "go_diagnostic_slope_std_deg_per_s": go_payload.get("slope_std_deg_per_s"),
-        "go_diagnostic_proposed_delta_s": go_payload.get("proposed_delta_s"),
-        "go_diagnostic_applied_delta_s": go_payload.get("applied_delta_s"),
+        "go_diagnostic_proposed_delta_s": (
+            None if fit_insufficient else go_payload.get("proposed_delta_s")
+        ),
+        "go_diagnostic_applied_delta_s": (
+            0 if fit_insufficient else go_payload.get("applied_delta_s")
+        ),
         "go_diagnostic_last_slew_limited": go_payload.get("last_slew_limited"),
-        "go_diagnostic_last_hard_bound": go_payload.get("last_hard_bound"),
+        "go_diagnostic_last_hard_bound": (
+            False if fit_insufficient else go_payload.get("last_hard_bound")
+        ),
         "go_diagnostic_reject_reason": go_payload.get("period_reject_reason"),
         "go_diagnostic_holdover": go_payload.get("holdover"),
         "go_diagnostic_holdover_reason": go_payload.get("holdover_reason"),
         "go_diagnostic_last_updated": go_payload.get("last_updated"),
-        "go_diagnostic_hard_bound_reason": go_payload.get("hard_bound_reason"),
+        "go_diagnostic_hard_bound_reason": hard_bound_reason,
         "go_diagnostic_hard_bound_limit_s": hard_bound_limit_s,
         "go_diagnostic_hard_bound_limit_ppm": hard_bound_limit_ppm,
         "go_diagnostic_requested_delta_s": requested_delta_s,
@@ -407,6 +423,9 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_fit_epoch_span_s": go_payload.get("fit_epoch_span_s"),
         "go_diagnostic_fit_dropped_on_epoch_reset": go_payload.get("fit_dropped_on_epoch_reset"),
         "go_diagnostic_fit_segment_count": go_payload.get("fit_segment_count"),
+        "go_diagnostic_last_rejected_delta_s": go_payload.get("last_rejected_delta_s"),
+        "go_diagnostic_last_rejected_delta_reason": go_payload.get("last_rejected_delta_reason"),
+        "go_diagnostic_last_rejected_delta_epoch_id": go_payload.get("last_rejected_delta_epoch_id"),
     }
 
 

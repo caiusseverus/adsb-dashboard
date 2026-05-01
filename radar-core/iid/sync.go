@@ -94,6 +94,9 @@ type SyncState struct {
 	LastUpdateEpochObservedDeg               float64
 	ConsecutiveHardResidualRejects           uint64
 	ConsecutiveHardBoundRejects              uint64
+	LastRejectedDeltaS                       float64
+	LastRejectedDeltaReason                  string
+	LastRejectedDeltaEpochID                 uint64
 	LastAcceptedEpochUS                      float64
 	LastAcceptedEpochAtUnix                  float64
 	SyncEpochAgeS                            float64
@@ -340,6 +343,12 @@ func (s *SyncState) resetFitEpochLocked(reason string) {
 	s.FitEpochResetReason = reason
 	s.fitEpochFirstEpochUS = 0
 	s.fitEpochLastEpochUS = 0
+	s.ProposedDeltaS = 0
+	s.AppliedDeltaS = 0
+	s.LastSlewLimited = false
+	s.LastHardBound = false
+	s.HardBoundReason = ""
+	s.ResidualSlopeDegPerS = 0
 }
 
 func (s *SyncState) startFitEpochIfNeededLocked(ctx fitEpochContext) {
@@ -665,6 +674,9 @@ func (s *SyncState) resetPeriodRefinement(reason string) {
 	s.LastHardBound = false
 	s.ConsecutiveHardBoundRejects = 0
 	s.HardBoundReason = ""
+	s.LastRejectedDeltaS = 0
+	s.LastRejectedDeltaReason = ""
+	s.LastRejectedDeltaEpochID = 0
 	s.HardBoundLimitS = s.BasePeriodS * refinementAbsBoundFraction
 	s.HardBoundLimitPPM = refinementAbsBoundFraction * 1e6
 	s.RequestedDeltaS = 0
@@ -928,20 +940,32 @@ func (s *SyncState) applyBoundedPeriodRefinement() {
 	}
 	if len(s.residualHistory) < residualFitMinObs {
 		s.ResidualSlopeDegPerS = 0
+		s.ProposedDeltaS = 0
+		s.AppliedDeltaS = 0
 		s.PeriodRefinementStatus = "insufficient_history"
 		s.PeriodRejectReason = ""
+		s.LastHardBound = false
+		s.HardBoundReason = ""
 		return
 	}
 	if s.FitSpanS < residualFitMinSpanS {
 		s.ResidualSlopeDegPerS = 0
+		s.ProposedDeltaS = 0
+		s.AppliedDeltaS = 0
 		s.PeriodRefinementStatus = "insufficient_span"
 		s.PeriodRejectReason = ""
+		s.LastHardBound = false
+		s.HardBoundReason = ""
 		return
 	}
-	if s.FitICAOCount > 0 && s.FitICAOCount < residualFitMinICAOs {
+	if s.FitICAOCount < residualFitMinICAOs {
 		s.ResidualSlopeDegPerS = 0
+		s.ProposedDeltaS = 0
+		s.AppliedDeltaS = 0
 		s.PeriodRefinementStatus = "insufficient_icaos"
 		s.PeriodRejectReason = ""
+		s.LastHardBound = false
+		s.HardBoundReason = ""
 		return
 	}
 
@@ -975,7 +999,11 @@ func (s *SyncState) applyBoundedPeriodRefinement() {
 		s.AppliedDeltaS = 0
 		s.HardBoundReason = "requested_delta_exceeds_hard_bound"
 		s.ConsecutiveHardBoundRejects++
+		s.LastRejectedDeltaS = proposedDelta
+		s.LastRejectedDeltaReason = "requested_delta_exceeds_hard_bound"
+		s.LastRejectedDeltaEpochID = s.FitEpochID
 		s.updateHardBoundDiagnosticsLocked(absBound, s.HardBoundReason)
+		s.ProposedDeltaS = 0
 		if s.Holdover {
 			s.HoldoverReasonCounts["hard_bound_reject"] = s.HoldoverReasonCounts["hard_bound_reject"] + 1
 		}

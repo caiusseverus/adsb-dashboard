@@ -130,6 +130,9 @@ func TestSetBasePeriod_MaterialChangeResetsRefinementDeltaAndHistory(t *testing.
 	// Build a non-zero refinement delta and residual history.
 	for i := 1; i <= 12; i++ {
 		s.UpdateSyncEpoch(float64(i)*4_000_000.0, float64(i)*0.8, 4, 0.5)
+		if s.Sync != nil {
+			s.Sync.AddRefinementResidualObservation(float64(i)*4_000_000.0, float64(i)*0.8, 0xAA+uint32(i%3), true, 4, 0.5, 0xAA, "go_refiner_active")
+		}
 	}
 	if s.Sync.PeriodDeltaS == 0 {
 		t.Fatal("expected non-zero refinement delta before base change")
@@ -169,6 +172,9 @@ func TestSetBasePeriod_SmallChangePreservesRefinementDeltaAndHistory(t *testing.
 
 	for i := 1; i <= 12; i++ {
 		s.UpdateSyncEpoch(float64(i)*4_000_000.0, float64(i)*0.8, 4, 0.5)
+		if s.Sync != nil {
+			s.Sync.AddRefinementResidualObservation(float64(i)*4_000_000.0, float64(i)*0.8, 0xAA+uint32(i%3), true, 4, 0.5, 0xAA, "go_refiner_active")
+		}
 	}
 	if s.Sync.PeriodDeltaS == 0 {
 		t.Fatal("expected non-zero refinement delta before base change")

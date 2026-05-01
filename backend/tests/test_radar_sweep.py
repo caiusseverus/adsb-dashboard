@@ -3666,3 +3666,157 @@ def test_fit_per_aircraft_slope_zero_weight_does_not_set_nonfinite():
     ]
     result = _fit_per_aircraft_slope(scored, period_base_s=4.0)
     assert result["reject_reason"] == "insufficient_icaos"
+
+
+def test_diagnostic_proposed_delta_null_when_fit_insufficient():
+    from radar.sweep import _build_go_diagnostic_fields
+
+    fields = _build_go_diagnostic_fields(
+        LiveSyncState(
+            iid=200,
+            period_s=4.0,
+            phase_epoch_us=0.0,
+            phase_offset_deg=0.0,
+            sync_quality=0.9,
+            sync_jitter_deg=2.0,
+            last_sync_update_ts=1_000.0,
+            source="go_frame_sync",
+            usable=False,
+            period_base_s=4.0,
+        ),
+        go_sync={
+            "base_period_s": 4.0,
+            "period_source": "go_runtime.effective_period_s",
+            "period_refinement_status": "insufficient_history",
+            "fit_observation_count": 1,
+            "fit_span_s": 0.0,
+            "fit_icao_count": 0,
+            "proposed_delta_s": 0.043193,
+            "applied_delta_s": 0.0,
+            "last_hard_bound": False,
+            "hard_bound_reason": "",
+            "last_rejected_delta_s": None,
+            "last_rejected_delta_reason": None,
+            "last_rejected_delta_epoch_id": 0,
+        },
+    )
+    assert fields["go_diagnostic_proposed_delta_s"] is None
+    assert fields["go_diagnostic_applied_delta_s"] == 0
+    assert fields["go_diagnostic_last_hard_bound"] is False
+    assert fields["go_diagnostic_hard_bound_reason"] == "unavailable_due_to_insufficient_fit"
+    assert fields["go_diagnostic_refinement_status"] == "insufficient_history"
+
+
+def test_diagnostic_hard_bound_false_when_fit_insufficient():
+    from radar.sweep import _build_go_diagnostic_fields
+
+    fields = _build_go_diagnostic_fields(
+        LiveSyncState(
+            iid=201,
+            period_s=4.0,
+            phase_epoch_us=0.0,
+            phase_offset_deg=0.0,
+            sync_quality=0.9,
+            sync_jitter_deg=2.0,
+            last_sync_update_ts=1_000.0,
+            source="go_frame_sync",
+            usable=False,
+            period_base_s=4.0,
+        ),
+        go_sync={
+            "base_period_s": 4.0,
+            "period_source": "go_runtime.effective_period_s",
+            "period_refinement_status": "insufficient_icaos",
+            "fit_observation_count": 10,
+            "fit_span_s": 30.0,
+            "fit_icao_count": 0,
+            "proposed_delta_s": 0.01,
+            "applied_delta_s": 0.0,
+            "last_hard_bound": True,
+            "hard_bound_reason": "requested_delta_exceeds_hard_bound",
+            "last_rejected_delta_s": 0.03,
+            "last_rejected_delta_reason": "requested_delta_exceeds_hard_bound",
+            "last_rejected_delta_epoch_id": 5,
+        },
+    )
+    assert fields["go_diagnostic_proposed_delta_s"] is None
+    assert fields["go_diagnostic_last_hard_bound"] is False
+    assert fields["go_diagnostic_hard_bound_reason"] == "requested_delta_exceeds_hard_bound"
+
+
+def test_diagnostic_last_rejected_fields_exposed():
+    from radar.sweep import _build_go_diagnostic_fields
+
+    fields = _build_go_diagnostic_fields(
+        LiveSyncState(
+            iid=202,
+            period_s=4.0,
+            phase_epoch_us=0.0,
+            phase_offset_deg=0.0,
+            sync_quality=0.9,
+            sync_jitter_deg=2.0,
+            last_sync_update_ts=1_000.0,
+            source="go_frame_sync",
+            usable=False,
+            period_base_s=4.0,
+        ),
+        go_sync={
+            "base_period_s": 4.0,
+            "period_source": "go_runtime.effective_period_s",
+            "period_refinement_status": "insufficient_history",
+            "fit_observation_count": 1,
+            "fit_span_s": 0.0,
+            "fit_icao_count": 0,
+            "proposed_delta_s": None,
+            "applied_delta_s": 0.0,
+            "last_hard_bound": False,
+            "hard_bound_reason": "",
+            "last_rejected_delta_s": 0.006,
+            "last_rejected_delta_reason": "requested_delta_exceeds_hard_bound",
+            "last_rejected_delta_epoch_id": 12,
+        },
+    )
+    assert fields["go_diagnostic_last_rejected_delta_s"] == 0.006
+    assert fields["go_diagnostic_last_rejected_delta_reason"] == "requested_delta_exceeds_hard_bound"
+    assert fields["go_diagnostic_last_rejected_delta_epoch_id"] == 12
+    assert fields["go_diagnostic_proposed_delta_s"] is None
+
+
+def test_diagnostic_proposal_resumes_when_fit_sufficient():
+    from radar.sweep import _build_go_diagnostic_fields
+
+    fields = _build_go_diagnostic_fields(
+        LiveSyncState(
+            iid=203,
+            period_s=4.0,
+            phase_epoch_us=0.0,
+            phase_offset_deg=0.0,
+            sync_quality=0.9,
+            sync_jitter_deg=2.0,
+            last_sync_update_ts=1_000.0,
+            source="go_frame_sync",
+            usable=False,
+            period_base_s=4.0,
+        ),
+        go_sync={
+            "base_period_s": 4.0,
+            "period_source": "go_runtime.effective_period_s",
+            "period_refinement_status": "applied_slew_limited",
+            "fit_observation_count": 12,
+            "fit_span_s": 45.0,
+            "fit_icao_count": 3,
+            "proposed_delta_s": 0.001,
+            "applied_delta_s": 0.0005,
+            "last_hard_bound": False,
+            "hard_bound_reason": "",
+            "last_rejected_delta_s": 0.006,
+            "last_rejected_delta_reason": "requested_delta_exceeds_hard_bound",
+            "last_rejected_delta_epoch_id": 12,
+        },
+    )
+    assert fields["go_diagnostic_proposed_delta_s"] == 0.001
+    assert fields["go_diagnostic_applied_delta_s"] == 0.0005
+    assert fields["go_diagnostic_last_hard_bound"] is False
+    assert fields["go_diagnostic_hard_bound_reason"] == ""
+    assert fields["go_diagnostic_refinement_status"] == "applied_slew_limited"
+    assert fields["go_diagnostic_last_rejected_delta_s"] == 0.006
