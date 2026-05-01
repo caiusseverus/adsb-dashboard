@@ -143,6 +143,15 @@ type DebugSnapshot struct {
 	UpdateEpochRejectStaleRefPos    uint64
 	UpdateEpochRejectInsufficientAC uint64
 	UpdateEpochLastStrictGatePass   bool
+	LastUpdateEpochResidualDeg      float64
+	LastUpdateEpochPredictedDeg     float64
+	LastUpdateEpochObservedDeg      float64
+	ConsecutiveHardResidualRejects  uint64
+	LastAcceptedEpochAgeS           float64
+	SyncEpochAgeS                   float64
+	CurrentPhaseEpochUS             float64
+	CandidateEpochUS                float64
+	ReacquiredProvisional           bool
 	ActiveAircraftEstimate          int
 	BurstRecordsTotal               int
 	BurstRecordsDynamicCap          int
@@ -652,6 +661,15 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.UpdateEpochRejectStaleRefPos = s.Sync.UpdateEpochRejectCounts["stale_reference_position"]
 		out.UpdateEpochRejectInsufficientAC = s.Sync.UpdateEpochRejectCounts["insufficient_aircraft"]
 		out.UpdateEpochLastStrictGatePass = s.Sync.LastUpdateEpochStrictGatePass
+		out.LastUpdateEpochResidualDeg = s.Sync.LastUpdateEpochResidualDeg
+		out.LastUpdateEpochPredictedDeg = s.Sync.LastUpdateEpochPredictedDeg
+		out.LastUpdateEpochObservedDeg = s.Sync.LastUpdateEpochObservedDeg
+		out.ConsecutiveHardResidualRejects = s.Sync.ConsecutiveHardResidualRejects
+		out.LastAcceptedEpochAgeS = s.Sync.LastAcceptedEpochAgeS
+		out.SyncEpochAgeS = s.Sync.SyncEpochAgeS
+		out.CurrentPhaseEpochUS = s.Sync.CurrentPhaseEpochUS
+		out.CandidateEpochUS = s.Sync.CandidateEpochUS
+		out.ReacquiredProvisional = s.Sync.ReacquiredProvisional
 		out.PeriodRefinementStatus = s.Sync.PeriodRefinementStatus
 		out.RefinementPlottedCount = s.Sync.RefinementPlottedCount
 		out.RefinementEligibleCount = s.Sync.RefinementEligibleCount

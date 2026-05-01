@@ -119,3 +119,29 @@ Plan confirmation:
   - `cd radar-core && GOCACHE=/tmp/go-build-cache go test ./iid ./protocol` -> passed.
   - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py -q` -> `146 passed`.
   - `cd frontend && npm run build` -> passed.
+
+## 2026-05-01 Stage 4 Follow-up: Go Sync Epoch Reacquisition After Hard Residual Holdover
+
+- [x] Run impact scan for sync epoch update and snapshot symbols.
+- [x] Add hard-residual reject diagnostics (residual/predicted/observed, reject streak, accepted age, epoch age, current/candidate epoch).
+- [x] Implement state-aware hard residual handling (trusted path rejects+holdover; holdover path accumulates reacquisition evidence).
+- [x] Implement controlled epoch reacquisition gates and provisional state transition (no immediate phase authority).
+- [x] Add bounded reset fallback based on conservative reject-count and no-accept-age thresholds.
+- [x] Preserve period refinement history/delta across epoch reacquisition unless base period materially changes.
+- [x] Wire diagnostics through debug/protocol snapshot payloads.
+- [x] Add/extend Go tests for stale epoch rejects, reacquisition, authority non-promotion, period preservation, and trusted single-outlier behavior.
+- [x] Run focused verification (`go test` for iid/protocol paths) and review results.
+
+Plan confirmation:
+- Scope is limited to Stage 4 follow-up reacquisition and diagnostics only.
+- Operational authority gates remain strict; reacquisition cannot grant phase authority by itself.
+
+### Review (Stage 4 follow-up)
+- Added holdover hard-residual diagnostics and epoch-age visibility fields in Go sync state, debug snapshot, protocol IID_STATE, and snapshot payload map.
+- Added holdover-aware hard-residual handling:
+- Trusted/non-holdover path still hard-rejects and enters holdover.
+- Holdover path records consecutive hard rejects and can trigger conservative controlled reacquisition when support/gates pass.
+- Added bounded fallback gates (`consecutive` and `no accepted update age`) and kept thresholds conservative (`N=8`, `M=30s`) within the controlled reacquisition checks.
+- Reacquisition re-anchors epoch/offset and marks provisional (`reacquired_provisional`) while forcing strict-gate flag false so phase authority is not granted by reacquisition alone.
+- Preserved period refinement delta/history through epoch reacquisition; no reset of `PeriodDeltaS` unless existing base-period-change logic triggers elsewhere.
+- Verification: `cd radar-core && GOCACHE=/tmp/go-build-cache go test ./iid ./protocol` -> passed.

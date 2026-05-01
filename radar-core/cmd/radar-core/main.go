@@ -550,6 +550,15 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 			"last_update_epoch_n_aircraft":              snap.LastUpdateEpochNAircraft,
 			"last_update_epoch_ref_pos_age_s":           snap.LastUpdateEpochRefPosAgeS,
 			"last_update_epoch_ref_icao":                snap.LastUpdateEpochRefICAO,
+			"last_update_epoch_residual_deg":            snap.LastUpdateEpochResidualDeg,
+			"last_update_epoch_predicted_deg":           snap.LastUpdateEpochPredictedDeg,
+			"last_update_epoch_observed_deg":            snap.LastUpdateEpochObservedDeg,
+			"consecutive_hard_residual_rejects":         snap.ConsecutiveHardResidualRejects,
+			"last_accepted_epoch_age_s":                 snap.LastAcceptedEpochAgeS,
+			"sync_epoch_age_s":                          snap.SyncEpochAgeS,
+			"current_phase_epoch_us":                    snap.CurrentPhaseEpochUS,
+			"candidate_epoch_us":                        snap.CandidateEpochUS,
+			"sync_reacquired_provisional":               snap.ReacquiredProvisional,
 			"update_epoch_reject_quality_gate":          snap.UpdateEpochRejectQualityGate,
 			"update_epoch_reject_missing_base":          snap.UpdateEpochRejectMissingBase,
 			"update_epoch_reject_hard_residual":         snap.UpdateEpochRejectHardResidual,
@@ -877,6 +886,15 @@ func (e *engine) emitIIDState(iidNum uint8, s *iid.IIDState, nBurstRecords uint1
 		LastUpdateEpochNAircraft:        snapLastUpdateEpochNAircraft(s),
 		LastUpdateEpochRefPosAgeS:       snapLastUpdateEpochRefPosAgeS(s),
 		LastUpdateEpochRefICAO:          snapLastUpdateEpochRefICAO(s),
+		LastUpdateEpochResidualDeg:      snapLastUpdateEpochResidualDeg(s),
+		LastUpdateEpochPredictedDeg:     snapLastUpdateEpochPredictedDeg(s),
+		LastUpdateEpochObservedDeg:      snapLastUpdateEpochObservedDeg(s),
+		ConsecutiveHardResidualRejects:  snapConsecutiveHardResidualRejects(s),
+		LastAcceptedEpochAgeS:           snapLastAcceptedEpochAgeS(s),
+		SyncEpochAgeS:                   snapSyncEpochAgeS(s),
+		CurrentPhaseEpochUS:             snapCurrentPhaseEpochUS(s),
+		CandidateEpochUS:                snapCandidateEpochUS(s),
+		SyncReacquiredProvisional:       snapSyncReacquiredProvisional(s),
 		UpdateEpochRejectQualityGate:    snapUpdateEpochRejectCount(s, "quality_gate_failed"),
 		UpdateEpochRejectMissingBase:    snapUpdateEpochRejectCount(s, "missing_df_base_period"),
 		UpdateEpochRejectHardResidual:   snapUpdateEpochRejectCount(s, "hard_residual_reject"),
@@ -1102,6 +1120,50 @@ func snapLastUpdateEpochRefICAO(s *iid.IIDState) *uint32 {
 		return nil
 	}
 	return &v
+}
+func snapLastUpdateEpochResidualDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastUpdateEpochResidualDeg
+	return &v
+}
+func snapLastUpdateEpochPredictedDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastUpdateEpochPredictedDeg
+	return &v
+}
+func snapLastUpdateEpochObservedDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastUpdateEpochObservedDeg
+	return &v
+}
+func snapConsecutiveHardResidualRejects(s *iid.IIDState) uint32 {
+	v := s.DebugStateSnapshot().ConsecutiveHardResidualRejects
+	if v > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(v)
+}
+func snapLastAcceptedEpochAgeS(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastAcceptedEpochAgeS
+	return &v
+}
+func snapSyncEpochAgeS(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().SyncEpochAgeS
+	return &v
+}
+func snapCurrentPhaseEpochUS(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().CurrentPhaseEpochUS
+	if v <= 0 {
+		return nil
+	}
+	return &v
+}
+func snapCandidateEpochUS(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().CandidateEpochUS
+	if v <= 0 {
+		return nil
+	}
+	return &v
+}
+func snapSyncReacquiredProvisional(s *iid.IIDState) bool {
+	return s.DebugStateSnapshot().ReacquiredProvisional
 }
 func snapUpdateEpochRejectCount(s *iid.IIDState, reason string) uint32 {
 	snap := s.DebugStateSnapshot()

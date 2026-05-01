@@ -191,6 +191,15 @@ type IIDState struct {
 	LastUpdateEpochNAircraft        uint16   `codec:"uen"`
 	LastUpdateEpochRefPosAgeS       *float64 `codec:"uep"`
 	LastUpdateEpochRefICAO          *uint32  `codec:"uei"`
+	LastUpdateEpochResidualDeg      *float64 `codec:"ued"`
+	LastUpdateEpochPredictedDeg     *float64 `codec:"ueg"`
+	LastUpdateEpochObservedDeg      *float64 `codec:"ueo"`
+	ConsecutiveHardResidualRejects  uint32   `codec:"uek"`
+	LastAcceptedEpochAgeS           *float64 `codec:"uea2"`
+	SyncEpochAgeS                   *float64 `codec:"ues2"`
+	CurrentPhaseEpochUS             *float64 `codec:"uec2"`
+	CandidateEpochUS                *float64 `codec:"uen2"`
+	SyncReacquiredProvisional       bool     `codec:"uerp"`
 	UpdateEpochRejectQualityGate    uint32   `codec:"ueq"`
 	UpdateEpochRejectMissingBase    uint32   `codec:"uem"`
 	UpdateEpochRejectHardResidual   uint32   `codec:"ueh"`

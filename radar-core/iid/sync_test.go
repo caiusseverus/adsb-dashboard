@@ -56,6 +56,9 @@ func TestSyncState_HardReject(t *testing.T) {
 	if s.NSyncFrames != 1 {
 		t.Errorf("NSyncFrames = %d, want 1 (unchanged)", s.NSyncFrames)
 	}
+	if s.PhaseEpochUS != 0.0 {
+		t.Errorf("PhaseEpochUS = %.0f, want unchanged 0", s.PhaseEpochUS)
+	}
 }
 
 func TestSyncState_QualityGate(t *testing.T) {
@@ -290,7 +293,7 @@ func TestSyncState_HoldoverReason_QualityGateAndHardResidual(t *testing.T) {
 	if accepted {
 		t.Fatal("expected hard residual reject")
 	}
-	if s.HoldoverReason != "hard_residual_reject" {
+	if s.HoldoverReason != "hard_residual_reject_holdover" {
 		t.Fatalf("holdover reason=%q", s.HoldoverReason)
 	}
 }
@@ -308,6 +311,73 @@ func TestSyncState_MaintenanceUpdateClearsHoldoverWithoutStrictGate(t *testing.T
 	}
 	if s.LastUpdateEpochStrictGatePass {
 		t.Fatal("strict gate should remain false for n_aircraft=2")
+	}
+}
+
+func seedReacquireFitSupport(s *SyncState) {
+	for i := 0; i < 24; i++ {
+		icao := uint32(0xAA + uint32(i%4))
+		s.AddRefinementResidualObservation(float64(i+1)*4_000_000.0, 1.0, icao, true, 4, 0.5)
+	}
+}
+
+func TestSyncState_HardResidualInHoldoverAccumulatesUntilReacquire(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	seedReacquireFitSupport(s)
+	s.Holdover = true
+	s.HoldoverReason = "quality_gate_failed"
+
+	// First two hard rejects while in holdover: track evidence, no re-anchor yet.
+	if s.UpdateEpoch(4_000_000.0, 90.0, 4.0, 1.0, 4, 0.5, 0xAA) {
+		t.Fatal("first holdover hard reject should not reacquire")
+	}
+	if s.UpdateEpoch(8_000_000.0, 90.0, 4.0, 1.0, 4, 0.5, 0xAA) {
+		t.Fatal("second holdover hard reject should not reacquire")
+	}
+	if s.ConsecutiveHardResidualRejects != 2 {
+		t.Fatalf("consecutive rejects=%d, want 2", s.ConsecutiveHardResidualRejects)
+	}
+	if s.HoldoverReason != "hard_residual_reject_holdover" {
+		t.Fatalf("holdover reason=%q, want hard_residual_reject_holdover", s.HoldoverReason)
+	}
+
+	// Third consecutive reject triggers controlled provisional re-anchor.
+	if !s.UpdateEpoch(12_000_000.0, 90.0, 4.0, 1.0, 4, 0.5, 0xAA) {
+		t.Fatal("third holdover hard reject should trigger reacquisition")
+	}
+	if s.PhaseEpochUS != 12_000_000.0 {
+		t.Fatalf("phase epoch=%.0f, want reacquired epoch", s.PhaseEpochUS)
+	}
+	if s.Holdover {
+		t.Fatal("holdover should clear on controlled reacquisition")
+	}
+	if !s.ReacquiredProvisional {
+		t.Fatal("reacquisition should be marked provisional")
+	}
+	if s.LastUpdateEpochStrictGatePass {
+		t.Fatal("reacquisition must not grant strict authority")
+	}
+}
+
+func TestSyncState_ReacquirePreservesPeriodDelta(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	seedReacquireFitSupport(s)
+	s.PeriodDeltaS = 0.001
+	s.EffectivePeriodS = s.BasePeriodS + s.PeriodDeltaS
+	before := s.PeriodDeltaS
+	s.Holdover = true
+	s.HoldoverReason = "hard_residual_reject"
+
+	s.UpdateEpoch(4_000_000.0, 90.0, 4.0, 1.0, 4, 0.5, 0xAA)
+	s.UpdateEpoch(8_000_000.0, 90.0, 4.0, 1.0, 4, 0.5, 0xAA)
+	if !s.UpdateEpoch(12_000_000.0, 90.0, 4.0, 1.0, 4, 0.5, 0xAA) {
+		t.Fatal("expected reacquisition")
+	}
+	if math.Abs(s.PeriodDeltaS-before) > 1e-12 {
+		t.Fatalf("period delta changed across reacquire: got %.12f want %.12f", s.PeriodDeltaS, before)
+	}
+	if math.Abs(s.EffectivePeriodS-(s.BasePeriodS+s.PeriodDeltaS)) > 1e-12 {
+		t.Fatal("effective period invariant broken after reacquire")
 	}
 }
 
