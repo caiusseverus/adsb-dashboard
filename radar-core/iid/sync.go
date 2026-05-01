@@ -138,6 +138,7 @@ type SyncState struct {
 	ReferenceChangeCount                     uint64
 	ReferenceLastChangeUnix                  float64
 	ObservationDropCountsByReason            map[string]uint64
+	LastUpdateEpochRefPosMissingReason       string // "not_in_cache", "stale", or ""
 }
 
 const (
@@ -533,6 +534,14 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 		s.PeriodS = 0
 		s.ResidualSlopeDegPerS = 0
 		return s.rejectUpdateEpoch("missing_df_base_period")
+	}
+
+	// refPosAgeS < 0 is the sentinel for "no entry in Go position cache".
+	// This is distinct from a stale position and must surface as its own reason.
+	// Note: -1.0 would pass the gate checks below (−1 ≤ 8), so intercept here.
+	if refPosAgeS < 0 {
+		s.enterHoldover("missing_reference_position")
+		return s.rejectUpdateEpoch("missing_reference_position")
 	}
 
 	// Strict authority gate.

@@ -792,7 +792,7 @@ func TestSelectReference_BasicSelection(t *testing.T) {
 			FiredAt:    now,
 		})
 	}
-	ref := SelectReference(records, 4.0, 0, 0)
+	ref := SelectReference(records, 4.0, 0, 0, nil)
 	if ref != 0xAA {
 		t.Errorf("reference = 0x%X, want 0xAA", ref)
 	}
@@ -810,7 +810,7 @@ func TestSelectReference_Hysteresis(t *testing.T) {
 		records = append(records, BurstRecord{ICAO: 0xBB, CentroidUS: float64(i) * 4_000_000.0, FiredAt: now})
 	}
 	// 0xBB is current reference — 0xAA is slightly better but within hysteresis.
-	ref := SelectReference(records, 4.0, 0xBB, 0)
+	ref := SelectReference(records, 4.0, 0xBB, 0, nil)
 	if ref != 0xBB {
 		t.Errorf("reference = 0x%X, want 0xBB (hysteresis holds)", ref)
 	}
@@ -996,5 +996,89 @@ func TestSyncState_ProposalResumesAfterSufficientObservations(t *testing.T) {
 	}
 	if s.ProposedDeltaS == 0 {
 		t.Fatalf("proposed_delta_s=0 after %d observations (status=%s), want non-zero", s.FitObservationCount, s.PeriodRefinementStatus)
+	}
+}
+
+func TestSelectReference_PrefersPositionCandidate(t *testing.T) {
+	cache := NewPositionCache()
+	nowUnix := float64(time.Now().Unix())
+	// 0xAA has a fresh position; 0xBB does not.
+	cache.Update(0xAA, 51.5, -0.1, nil, nowUnix)
+
+	var records []BurstRecord
+	now := time.Now()
+	// 0xAA: 5 bursts (fewer = worse countFactor score).
+	for i := 0; i < 5; i++ {
+		records = append(records, BurstRecord{ICAO: 0xAA, CentroidUS: float64(i) * 4_000_000.0, FiredAt: now})
+	}
+	// 0xBB: 10 bursts (more = better countFactor score), but no position.
+	for i := 0; i < 10; i++ {
+		records = append(records, BurstRecord{ICAO: 0xBB, CentroidUS: float64(i) * 4_000_000.0, FiredAt: now})
+	}
+
+	// Without cache, 0xBB wins (lower score).
+	if ref := SelectReference(records, 4.0, 0, 0, nil); ref != 0xBB {
+		t.Errorf("without cache: expected 0xBB to win by score, got 0x%X", ref)
+	}
+	// With cache, 0xAA wins (has position).
+	if ref := SelectReference(records, 4.0, 0, 0, cache); ref != 0xAA {
+		t.Errorf("with cache: expected 0xAA to win (has position), got 0x%X", ref)
+	}
+}
+
+func TestSelectReference_NoPositionCandidates_FallsBackToScore(t *testing.T) {
+	// Empty cache: no positions known. Both candidates compete on burst score.
+	cache := NewPositionCache()
+	var records []BurstRecord
+	now := time.Now()
+	for i := 0; i < 10; i++ {
+		records = append(records, BurstRecord{ICAO: 0xAA, CentroidUS: float64(i) * 4_000_000.0, FiredAt: now})
+	}
+	for i := 0; i < 6; i++ {
+		records = append(records, BurstRecord{ICAO: 0xBB, CentroidUS: float64(i) * 4_500_000.0, FiredAt: now})
+	}
+	// 0xAA has more bursts and matches the period better.
+	ref := SelectReference(records, 4.0, 0, 0, cache)
+	if ref != 0xAA {
+		t.Errorf("fallback: expected 0xAA to win by score, got 0x%X", ref)
+	}
+}
+
+func TestUpdateEpoch_MissingRefPositionSentinel(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	// refPosAgeS=-1 is the "not in Go position cache" sentinel.
+	accepted := s.UpdateEpoch(4_000_000.0, 0.0, 4.0, 1.0, 4, -1.0)
+	if accepted {
+		t.Fatal("expected rejection when refPosAgeS=-1 (not in cache)")
+	}
+	if s.LastUpdateEpochRejectReason != "missing_reference_position" {
+		t.Errorf("reject reason=%q, want missing_reference_position", s.LastUpdateEpochRejectReason)
+	}
+	if !s.Holdover {
+		t.Error("expected holdover after missing_reference_position")
+	}
+	if s.UpdateEpochRejectCounts["missing_reference_position"] != 1 {
+		t.Errorf("reject count=%d, want 1", s.UpdateEpochRejectCounts["missing_reference_position"])
+	}
+}
+
+func TestUpdateEpoch_StaleRefPositionDistinctFromMissing(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	// refPosAgeS=20s — stale but not missing (positive value > 8s threshold).
+	accepted := s.UpdateEpoch(4_000_000.0, 0.0, 4.0, 1.0, 4, 20.0)
+	if accepted {
+		t.Fatal("expected rejection for stale refPosAgeS=20s")
+	}
+	if s.LastUpdateEpochRejectReason != "stale_reference_position" {
+		t.Errorf("reject reason=%q, want stale_reference_position (not missing)", s.LastUpdateEpochRejectReason)
+	}
+}
+
+func TestUpdateEpoch_FreshRefPosition_Accepts(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	// refPosAgeS=1s — fresh position, should accept.
+	accepted := s.UpdateEpoch(4_000_000.0, 0.0, 4.0, 1.0, 4, 1.0)
+	if !accepted {
+		t.Errorf("expected accept for fresh refPosAgeS=1s, reject reason=%q", s.LastUpdateEpochRejectReason)
 	}
 }

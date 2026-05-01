@@ -64,6 +64,10 @@ type IIDState struct {
 	// Stage 3: reference aircraft and compact sync state.
 	RefICAO *uint32 // selected reference aircraft (nil until stable)
 	Sync    *SyncState
+
+	LastRefSelHasPosition  bool    // chosen reference has a fresh position in Go cache
+	LastRefSelPositionAgeS float64 // age in seconds, -1 if not in cache
+	LastRefSelMissingReason string  // "not_in_cache", "stale", or ""
 }
 
 // DebugSnapshot is a point-in-time operational view of one IID.
@@ -210,6 +214,11 @@ type DebugSnapshot struct {
 	ReferenceChangeCount                     uint64
 	ReferenceChurnRate                       float64
 	ObservationDropCountsByReason            map[string]uint64
+	HoldoverMissingReferencePosition         uint64
+	UpdateEpochRejectMissingRefPos           uint64
+	LastRefSelHasPosition                    bool
+	LastRefSelPositionAgeS                   float64
+	LastRefSelMissingReason                  string
 }
 
 const (
@@ -426,7 +435,7 @@ func (s *IIDState) OperationalPeriodSnapshot() *float64 {
 // RefreshReference re-evaluates reference aircraft selection from current records.
 // Called from the rotation analysis ticker after ApplyRotation.
 // Records must be the same snapshot used for rotation analysis.
-func (s *IIDState) RefreshReference(records []BurstRecord, nowUS float64) {
+func (s *IIDState) RefreshReference(records []BurstRecord, nowUS float64, positions *PositionCache) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.EffectivePeriodS == nil {
@@ -453,12 +462,35 @@ func (s *IIDState) RefreshReference(records []BurstRecord, nowUS float64) {
 		}
 	}
 
-	chosen := SelectReference(filtered, *s.EffectivePeriodS, cur, nowUS)
+	chosen := SelectReference(filtered, *s.EffectivePeriodS, cur, nowUS, positions)
 	if chosen != 0 {
 		if s.Sync != nil && cur != 0 && chosen != cur {
 			s.Sync.RecordReferenceChange(chosen)
 		}
 		s.RefICAO = &chosen
+		// Record position diagnostics for the chosen reference.
+		if positions != nil {
+			posRaw, exists := positions.GetRaw(chosen)
+			if !exists {
+				s.LastRefSelHasPosition = false
+				s.LastRefSelPositionAgeS = -1.0
+				s.LastRefSelMissingReason = "not_in_cache"
+			} else {
+				ageS := time.Since(posRaw.TS).Seconds()
+				s.LastRefSelPositionAgeS = ageS
+				if ageS <= refinementStalePositionMaxS {
+					s.LastRefSelHasPosition = true
+					s.LastRefSelMissingReason = ""
+				} else {
+					s.LastRefSelHasPosition = false
+					s.LastRefSelMissingReason = "stale"
+				}
+			}
+		} else {
+			s.LastRefSelHasPosition = false
+			s.LastRefSelPositionAgeS = -1.0
+			s.LastRefSelMissingReason = "not_in_cache"
+		}
 		return
 	}
 	// If no dominant-family candidate is available, clear the reference so
@@ -766,6 +798,8 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.HoldoverInsufficientAircraft = s.Sync.HoldoverReasonCounts["insufficient_aircraft"]
 		out.HoldoverNoDominantFamily = s.Sync.HoldoverReasonCounts["no_dominant_family"]
 		out.HoldoverSyncStateMissing = s.Sync.HoldoverReasonCounts["sync_state_missing"]
+		out.HoldoverMissingReferencePosition = s.Sync.HoldoverReasonCounts["missing_reference_position"]
+		out.UpdateEpochRejectMissingRefPos = s.Sync.UpdateEpochRejectCounts["missing_reference_position"]
 		out.UpdateEpochAttempts = s.Sync.UpdateEpochAttempts
 		out.UpdateEpochAccepts = s.Sync.UpdateEpochAccepts
 		out.UpdateEpochRejects = s.Sync.UpdateEpochRejects
@@ -906,6 +940,9 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		}
 	}
 	out.ReferenceSelectionSparseHistory = out.HasPeriod && !out.HasRefICAO && out.ReferenceEligibleAircraft == 0
+	out.LastRefSelHasPosition = s.LastRefSelHasPosition
+	out.LastRefSelPositionAgeS = s.LastRefSelPositionAgeS
+	out.LastRefSelMissingReason = s.LastRefSelMissingReason
 	return out
 }
 

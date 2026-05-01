@@ -3,6 +3,7 @@ package iid
 import (
 	"math"
 	"testing"
+	"time"
 )
 
 func TestRefreshReference_PrefersDominantFamily(t *testing.T) {
@@ -30,7 +31,7 @@ func TestRefreshReference_PrefersDominantFamily(t *testing.T) {
 		{ICAO: 0xBBBBBB, CentroidUS: 8_200_000},
 		{ICAO: 0xBBBBBB, CentroidUS: 12_300_000},
 	}
-	s.RefreshReference(records, 12_000_000)
+	s.RefreshReference(records, 12_000_000, nil)
 
 	if s.RefICAO == nil {
 		t.Fatal("reference ICAO was cleared, expected dominant-family candidate")
@@ -61,7 +62,7 @@ func TestRefreshReference_ClearsWhenNoDominantCandidates(t *testing.T) {
 		{ICAO: 0xBBBBBB, CentroidUS: 8_000_000},
 		{ICAO: 0xBBBBBB, CentroidUS: 12_000_000},
 	}
-	s.RefreshReference(records, 12_000_000)
+	s.RefreshReference(records, 12_000_000, nil)
 
 	if s.RefICAO != nil {
 		t.Fatalf("reference ICAO not cleared, got 0x%X", *s.RefICAO)
@@ -521,7 +522,7 @@ func TestRefreshReferenceIgnoresDisagreeingGoFamilyGate(t *testing.T) {
 		{ICAO: 0xBBBBBB, CentroidUS: 9_580_000},
 		{ICAO: 0xBBBBBB, CentroidUS: 14_370_000},
 	}
-	s.RefreshReference(records, 14_370_000)
+	s.RefreshReference(records, 14_370_000, nil)
 
 	if s.RefICAO == nil {
 		t.Fatal("reference ICAO was not selected")
@@ -590,5 +591,43 @@ func TestAddBurst_UsesDensityAwareCap(t *testing.T) {
 	}
 	if snap.BurstRecordsCapHitsTotal == 0 {
 		t.Fatal("expected burst_records_cap_hits_total > 0")
+	}
+}
+
+func TestRefreshReference_PrefersPositionHoldingCandidate(t *testing.T) {
+	cache := NewPositionCache()
+	nowUnix := float64(time.Now().Unix())
+	// 0xAA has a fresh position; 0xBB does not.
+	cache.Update(0xAA, 51.5, -0.1, nil, nowUnix)
+
+	s := NewIIDState(7)
+	period := 4.0
+	s.SetBasePeriod(period)
+
+	// 0xBB has more bursts (better countFactor score) but no position.
+	// 0xAA has fewer bursts but a fresh position.
+	var records []BurstRecord
+	now := time.Now()
+	for i := 0; i < 5; i++ {
+		records = append(records, BurstRecord{ICAO: 0xAA, CentroidUS: float64(i) * 4_000_000.0, FiredAt: now})
+	}
+	for i := 0; i < 10; i++ {
+		records = append(records, BurstRecord{ICAO: 0xBB, CentroidUS: float64(i) * 4_000_000.0, FiredAt: now})
+	}
+
+	nowUS := float64(9) * 4_000_000.0
+	s.RefreshReference(records, nowUS, cache)
+
+	if s.RefICAO == nil {
+		t.Fatal("reference ICAO not selected")
+	}
+	if *s.RefICAO != 0xAA {
+		t.Errorf("reference ICAO=0x%X, want 0xAA (has position)", *s.RefICAO)
+	}
+	if !s.LastRefSelHasPosition {
+		t.Error("LastRefSelHasPosition should be true for 0xAA")
+	}
+	if s.LastRefSelMissingReason != "" {
+		t.Errorf("LastRefSelMissingReason=%q, want empty", s.LastRefSelMissingReason)
 	}
 }

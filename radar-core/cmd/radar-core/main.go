@@ -207,10 +207,19 @@ func (e *engine) maybeUpdateSync(s *iid.IIDState, f *burst.FiredBurst) {
 	}
 
 	// Look up the reference aircraft's ADS-B position for age estimate.
-	refPosAgeS := 999.0
-	pos := e.positions.Get(f.ICAO)
-	if pos != nil {
-		refPosAgeS = time.Since(pos.TS).Seconds()
+	// Use GetRaw (no staleness filter) so we can distinguish "not in cache"
+	// (sentinel -1.0) from a genuinely stale position (positive age > 8s).
+	refPosAgeS := -1.0 // sentinel: not in Go position cache
+	refPosMissingReason := "not_in_cache"
+	posRaw, posExists := e.positions.GetRaw(f.ICAO)
+	if posExists {
+		rawAge := time.Since(posRaw.TS).Seconds()
+		refPosAgeS = rawAge
+		if rawAge > 8.0 {
+			refPosMissingReason = "stale"
+		} else {
+			refPosMissingReason = ""
+		}
 	}
 
 	popDiag := e.computeSyncPopulationDiagnostics(s, f.ICAO, f.CentroidUS)
@@ -236,8 +245,11 @@ func (e *engine) maybeUpdateSync(s *iid.IIDState, f *burst.FiredBurst) {
 
 	phaseOffsetDeg := 0.0
 	cfg := rcconfig.Get()
-	if pos != nil && cfg.HasReceiver {
-		phaseOffsetDeg = bearingDeg(cfg.ReceiverLat, cfg.ReceiverLon, pos.Lat, pos.Lon)
+	if posExists && posRaw != nil && cfg.HasReceiver {
+		phaseOffsetDeg = bearingDeg(cfg.ReceiverLat, cfg.ReceiverLon, posRaw.Lat, posRaw.Lon)
+	}
+	if s.Sync != nil {
+		s.Sync.LastUpdateEpochRefPosMissingReason = refPosMissingReason
 	}
 	s.UpdateSyncEpoch(f.CentroidUS, phaseOffsetDeg, nAircraft, refPosAgeS)
 	snap := s.DebugStateSnapshot()
@@ -727,7 +739,12 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 			"previous_reference_icao":                       snap.PreviousReferenceICAO,
 			"reference_change_count":                        snap.ReferenceChangeCount,
 			"reference_churn_rate":                          snap.ReferenceChurnRate,
-			"observation_drop_counts_by_reason":             snap.ObservationDropCountsByReason,
+			"observation_drop_counts_by_reason":              snap.ObservationDropCountsByReason,
+			"holdover_missing_reference_position":            snap.HoldoverMissingReferencePosition,
+			"update_epoch_reject_missing_ref_pos":            snap.UpdateEpochRejectMissingRefPos,
+			"last_ref_sel_has_position":                      snap.LastRefSelHasPosition,
+			"last_ref_sel_position_age_s":                    snap.LastRefSelPositionAgeS,
+			"last_ref_sel_missing_reason":                    snap.LastRefSelMissingReason,
 			"retained_state": map[string]interface{}{
 				"active_aircraft_estimate":           snap.ActiveAircraftEstimate,
 				"burst_records_total":                snap.BurstRecordsTotal,
@@ -1485,7 +1502,7 @@ func (e *engine) analyseAllIIDs() {
 		if len(records) > 0 {
 			nowUS = records[len(records)-1].CentroidUS
 		}
-		s.RefreshReference(records, nowUS)
+		s.RefreshReference(records, nowUS, e.positions)
 
 		e.emitIIDState(iidNum, s, uint16(minInt(len(records), 65535)))
 	}

@@ -49,7 +49,7 @@ func injectRef(s *iid.IIDState, refICAO uint32, periodS float64, count int) {
 	if snap != nil {
 		model := iid.AnalyseBurstRecords(snap)
 		s.ApplyRotation(model)
-		s.RefreshReference(snap, float64(count-1)*periodS*1_000_000.0)
+		s.RefreshReference(snap, float64(count-1)*periodS*1_000_000.0, nil)
 	}
 }
 

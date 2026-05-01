@@ -41,6 +41,16 @@ func (c *PositionCache) Update(icao uint32, lat, lon float64, altFt *int32, ts f
 	c.mu.Unlock()
 }
 
+// GetRaw returns the position entry for icao without staleness filtering.
+// The second return value is true if any entry exists in the cache.
+// Use this to distinguish "not in cache" from "stale" (age > positionMaxAgeS).
+func (c *PositionCache) GetRaw(icao uint32) (*AircraftPosition, bool) {
+	c.mu.RLock()
+	pos := c.positions[icao]
+	c.mu.RUnlock()
+	return pos, pos != nil
+}
+
 // Get returns the position for icao if it exists and is not stale, else nil.
 func (c *PositionCache) Get(icao uint32) *AircraftPosition {
 	c.mu.RLock()

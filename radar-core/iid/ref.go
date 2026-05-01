@@ -3,6 +3,7 @@ package iid
 import (
 	"math"
 	"sort"
+	"time"
 )
 
 // Reference aircraft selection constants (match sweep.py _select_reference_from_live_bursts).
@@ -20,13 +21,16 @@ type RefCandidate struct {
 
 // SelectReference picks the reference aircraft for an IID from its burst records.
 //
-// It groups records by ICAO, computes inter-burst interval regularity, and
-// returns the ICAO with the best (lowest) score. Returns 0 if no candidate
-// has sufficient data.
+// When positions is non-nil, candidates with a fresh ADS-B position (age ≤ 8 s)
+// are preferred over those without. A no-position aircraft is only selected as
+// reference when no fresh-position candidate exists, preventing epoch updates
+// with the missing-position sentinel.
 //
 // currentRef is the current reference ICAO (0 if none); hysteresis prevents
-// unnecessary switches when two candidates are close.
-func SelectReference(records []BurstRecord, periodS float64, currentRef uint32, nowUS float64) uint32 {
+// unnecessary switches when two candidates are close in score. Hysteresis is
+// not applied when the current reference lacks a fresh position but a
+// position-holding challenger exists.
+func SelectReference(records []BurstRecord, periodS float64, currentRef uint32, nowUS float64, positions *PositionCache) uint32 {
 	if periodS <= 0 || len(records) == 0 {
 		return 0
 	}
@@ -79,20 +83,41 @@ func SelectReference(records []BurstRecord, periodS float64, currentRef uint32, 
 		return 0
 	}
 
-	// Find best (lowest score).
+	// Identify which candidates have a fresh ADS-B position in the Go cache.
+	// refinementStalePositionMaxS (8.0s) is defined in sync.go (same package).
+	withFreshPos := map[uint32]bool{}
+	anyWithFreshPos := false
+	if positions != nil {
+		for icao := range candidates {
+			posRaw, exists := positions.GetRaw(icao)
+			if exists && posRaw != nil && time.Since(posRaw.TS).Seconds() <= refinementStalePositionMaxS {
+				withFreshPos[icao] = true
+				anyWithFreshPos = true
+			}
+		}
+	}
+
+	// Find best (lowest) score. When any fresh-position candidate exists, skip
+	// no-position candidates entirely so they cannot be selected as reference.
 	bestICAO := uint32(0)
 	bestScore := math.Inf(1)
 	for icao, score := range candidates {
+		if anyWithFreshPos && !withFreshPos[icao] {
+			continue
+		}
 		if score < bestScore {
 			bestScore = score
 			bestICAO = icao
 		}
 	}
 
-	// Hysteresis: only displace current ref if challenger is meaningfully better.
-	if currentRef != 0 {
+	// Hysteresis: only displace the current reference when the challenger is
+	// meaningfully better. Skip hysteresis protection when the current reference
+	// lacks a fresh position but a position-holding challenger is available.
+	if currentRef != 0 && bestICAO != currentRef {
 		if currentScore, ok := candidates[currentRef]; ok {
-			if bestScore > currentScore*(1.0-hysteresis) {
+			currentHasFreshPos := !anyWithFreshPos || withFreshPos[currentRef]
+			if currentHasFreshPos && bestScore > currentScore*(1.0-hysteresis) {
 				bestICAO = currentRef
 			}
 		}
