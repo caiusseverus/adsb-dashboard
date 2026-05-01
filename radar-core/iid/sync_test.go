@@ -339,11 +339,23 @@ func TestSyncState_RepeatedHardBoundRejectResetsFitEpoch(t *testing.T) {
 	if s.LastRejectedDeltaReason != "requested_delta_exceeds_hard_bound" {
 		t.Fatalf("last_rejected_delta_reason=%q, want requested_delta_exceeds_hard_bound", s.LastRejectedDeltaReason)
 	}
+	if s.LastRejectedDeltaPPM == 0 {
+		t.Fatal("expected last_rejected_delta_ppm to be populated")
+	}
+	if s.ProposedDeltaS != 0 {
+		t.Fatalf("proposed_delta_s=%.9f, want 0 after epoch reset", s.ProposedDeltaS)
+	}
+	if s.RequestedDeltaS != 0 {
+		t.Fatalf("requested_delta_s=%.9f, want 0 after epoch reset", s.RequestedDeltaS)
+	}
+	if s.RequestedDeltaPPM != 0 {
+		t.Fatalf("requested_delta_ppm=%.6f, want 0 after epoch reset", s.RequestedDeltaPPM)
+	}
+	if s.LastHardBound {
+		t.Fatal("last_hard_bound should be false after epoch reset")
+	}
 	if s.HardBoundReason != "" {
 		t.Fatalf("hard_bound_reason=%q, want empty after epoch reset", s.HardBoundReason)
-	}
-	if s.RequestedDeltaPPM == 0 {
-		t.Fatal("expected requested delta ppm to be populated from last rejected")
 	}
 	if s.FitDroppedOnEpochReset <= 0 {
 		t.Fatalf("expected dropped observations after repeated hard-bound reset, got %d", s.FitDroppedOnEpochReset)
@@ -945,8 +957,14 @@ func TestSyncState_LastRejectedDeltaPreserved(t *testing.T) {
 	if s.LastRejectedDeltaEpochID == 0 {
 		t.Fatal("last_rejected_delta_epoch_id should be non-zero")
 	}
+	if s.LastRejectedDeltaPPM == 0 {
+		t.Fatal("expected last_rejected_delta_ppm to be populated")
+	}
 	if s.ProposedDeltaS != 0 {
 		t.Fatalf("proposed_delta_s=%.9f, want 0 after hard-bound rejection (moved to last_rejected)", s.ProposedDeltaS)
+	}
+	if s.RequestedDeltaS != 0 {
+		t.Fatalf("requested_delta_s=%.9f, want 0 — proposal moved to last_rejected", s.RequestedDeltaS)
 	}
 }
 

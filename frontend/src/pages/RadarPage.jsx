@@ -2312,7 +2312,10 @@ function SyncModeStatusPanel({
             <span className={styles.metricPill}>Slew limited <span className={styles.metricValue}>{syncState.go_diagnostic_last_slew_limited ? 'yes' : 'no'}</span></span>
             <span className={styles.metricPill}>Epoch id <span className={styles.metricValue}>{syncState.go_diagnostic_fit_epoch_id ?? '—'}</span></span>
             {syncState.go_diagnostic_last_rejected_delta_s != null && syncState.go_diagnostic_last_rejected_delta_s !== 0 && (
-              <span className={styles.metricPill}>Last rejected Δ <span className={styles.metricValue}>{fmtNumber(Number(syncState.go_diagnostic_last_rejected_delta_s) * 1000, 3, 'ms')} (epoch {syncState.go_diagnostic_last_rejected_delta_epoch_id})</span></span>
+              <span className={styles.metricPill}>Last rejected Δ <span className={styles.metricValue}>{fmtNumber(Number(syncState.go_diagnostic_last_rejected_delta_s) * 1000, 3, 'ms')} / {fmtNumber(syncState.go_diagnostic_last_rejected_delta_ppm, 1, 'ppm')} (epoch {syncState.go_diagnostic_last_rejected_delta_epoch_id})</span></span>
+            )}
+            {syncState.go_diagnostic_consecutive_hard_bound_rejects != null && syncState.go_diagnostic_consecutive_hard_bound_rejects > 0 && (
+              <span className={styles.metricPill}>Consec. hard bounds <span className={styles.metricValue}>{syncState.go_diagnostic_consecutive_hard_bound_rejects}</span></span>
             )}
           </div>
           <div style={{ color: '#8b949e', fontSize: '0.72rem', lineHeight: 1.45 }}>

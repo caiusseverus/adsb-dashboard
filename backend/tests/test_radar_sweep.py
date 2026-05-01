@@ -3772,13 +3772,17 @@ def test_diagnostic_last_rejected_fields_exposed():
             "last_hard_bound": False,
             "hard_bound_reason": "",
             "last_rejected_delta_s": 0.006,
+            "last_rejected_delta_ppm": 1500.0,
             "last_rejected_delta_reason": "requested_delta_exceeds_hard_bound",
             "last_rejected_delta_epoch_id": 12,
+            "consecutive_hard_bound_rejects": 3,
         },
     )
     assert fields["go_diagnostic_last_rejected_delta_s"] == 0.006
+    assert fields["go_diagnostic_last_rejected_delta_ppm"] == 1500.0
     assert fields["go_diagnostic_last_rejected_delta_reason"] == "requested_delta_exceeds_hard_bound"
     assert fields["go_diagnostic_last_rejected_delta_epoch_id"] == 12
+    assert fields["go_diagnostic_consecutive_hard_bound_rejects"] == 3
     assert fields["go_diagnostic_proposed_delta_s"] is None
 
 
@@ -3810,8 +3814,10 @@ def test_diagnostic_proposal_resumes_when_fit_sufficient():
             "last_hard_bound": False,
             "hard_bound_reason": "",
             "last_rejected_delta_s": 0.006,
+            "last_rejected_delta_ppm": 1500.0,
             "last_rejected_delta_reason": "requested_delta_exceeds_hard_bound",
             "last_rejected_delta_epoch_id": 12,
+            "consecutive_hard_bound_rejects": 0,
         },
     )
     assert fields["go_diagnostic_proposed_delta_s"] == 0.001
@@ -3820,3 +3826,5 @@ def test_diagnostic_proposal_resumes_when_fit_sufficient():
     assert fields["go_diagnostic_hard_bound_reason"] == ""
     assert fields["go_diagnostic_refinement_status"] == "applied_slew_limited"
     assert fields["go_diagnostic_last_rejected_delta_s"] == 0.006
+    assert fields["go_diagnostic_last_rejected_delta_ppm"] == 1500.0
+    assert fields["go_diagnostic_consecutive_hard_bound_rejects"] == 0

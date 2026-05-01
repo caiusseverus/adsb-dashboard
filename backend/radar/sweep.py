@@ -424,8 +424,10 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_fit_dropped_on_epoch_reset": go_payload.get("fit_dropped_on_epoch_reset"),
         "go_diagnostic_fit_segment_count": go_payload.get("fit_segment_count"),
         "go_diagnostic_last_rejected_delta_s": go_payload.get("last_rejected_delta_s"),
+        "go_diagnostic_last_rejected_delta_ppm": go_payload.get("last_rejected_delta_ppm"),
         "go_diagnostic_last_rejected_delta_reason": go_payload.get("last_rejected_delta_reason"),
         "go_diagnostic_last_rejected_delta_epoch_id": go_payload.get("last_rejected_delta_epoch_id"),
+        "go_diagnostic_consecutive_hard_bound_rejects": go_payload.get("consecutive_hard_bound_rejects"),
     }
 
 

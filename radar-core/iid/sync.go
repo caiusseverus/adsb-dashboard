@@ -97,6 +97,7 @@ type SyncState struct {
 	LastRejectedDeltaS                       float64
 	LastRejectedDeltaReason                  string
 	LastRejectedDeltaEpochID                 uint64
+	LastRejectedDeltaPPM                     float64
 	LastAcceptedEpochUS                      float64
 	LastAcceptedEpochAtUnix                  float64
 	SyncEpochAgeS                            float64
@@ -349,6 +350,8 @@ func (s *SyncState) resetFitEpochLocked(reason string) {
 	s.LastHardBound = false
 	s.HardBoundReason = ""
 	s.ResidualSlopeDegPerS = 0
+	s.RequestedDeltaS = 0
+	s.RequestedDeltaPPM = 0
 }
 
 func (s *SyncState) startFitEpochIfNeededLocked(ctx fitEpochContext) {
@@ -677,6 +680,7 @@ func (s *SyncState) resetPeriodRefinement(reason string) {
 	s.LastRejectedDeltaS = 0
 	s.LastRejectedDeltaReason = ""
 	s.LastRejectedDeltaEpochID = 0
+	s.LastRejectedDeltaPPM = 0
 	s.HardBoundLimitS = s.BasePeriodS * refinementAbsBoundFraction
 	s.HardBoundLimitPPM = refinementAbsBoundFraction * 1e6
 	s.RequestedDeltaS = 0
@@ -1002,8 +1006,15 @@ func (s *SyncState) applyBoundedPeriodRefinement() {
 		s.LastRejectedDeltaS = proposedDelta
 		s.LastRejectedDeltaReason = "requested_delta_exceeds_hard_bound"
 		s.LastRejectedDeltaEpochID = s.FitEpochID
+		if s.BasePeriodS > 0 {
+			s.LastRejectedDeltaPPM = proposedDelta / s.BasePeriodS * 1e6
+		} else {
+			s.LastRejectedDeltaPPM = 0
+		}
 		s.updateHardBoundDiagnosticsLocked(absBound, s.HardBoundReason)
 		s.ProposedDeltaS = 0
+		s.RequestedDeltaS = 0
+		s.RequestedDeltaPPM = 0
 		if s.Holdover {
 			s.HoldoverReasonCounts["hard_bound_reject"] = s.HoldoverReasonCounts["hard_bound_reject"] + 1
 		}

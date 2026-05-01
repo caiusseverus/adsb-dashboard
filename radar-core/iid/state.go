@@ -124,6 +124,7 @@ type DebugSnapshot struct {
 	LastRejectedDeltaS                       float64
 	LastRejectedDeltaReason                  string
 	LastRejectedDeltaEpochID                 uint64
+	LastRejectedDeltaPPM                     float64
 	RequestedDeltaS                          float64
 	RequestedDeltaPPM                        float64
 	CurrentDeltaS                            float64
@@ -169,6 +170,7 @@ type DebugSnapshot struct {
 	LastUpdateEpochPredictedDeg              float64
 	LastUpdateEpochObservedDeg               float64
 	ConsecutiveHardResidualRejects           uint64
+	ConsecutiveHardBoundRejects              uint64
 	LastAcceptedEpochAgeS                    float64
 	SyncEpochAgeS                            float64
 	CurrentPhaseEpochUS                      float64
@@ -726,6 +728,7 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.LastRejectedDeltaS = s.Sync.LastRejectedDeltaS
 		out.LastRejectedDeltaReason = s.Sync.LastRejectedDeltaReason
 		out.LastRejectedDeltaEpochID = s.Sync.LastRejectedDeltaEpochID
+		out.LastRejectedDeltaPPM = s.Sync.LastRejectedDeltaPPM
 		out.RequestedDeltaS = s.Sync.RequestedDeltaS
 		out.RequestedDeltaPPM = s.Sync.RequestedDeltaPPM
 		out.CurrentDeltaS = s.Sync.CurrentDeltaS
@@ -771,6 +774,7 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.LastUpdateEpochPredictedDeg = s.Sync.LastUpdateEpochPredictedDeg
 		out.LastUpdateEpochObservedDeg = s.Sync.LastUpdateEpochObservedDeg
 		out.ConsecutiveHardResidualRejects = s.Sync.ConsecutiveHardResidualRejects
+		out.ConsecutiveHardBoundRejects = s.Sync.ConsecutiveHardBoundRejects
 		out.LastAcceptedEpochAgeS = s.Sync.LastAcceptedEpochAgeS
 		out.SyncEpochAgeS = s.Sync.SyncEpochAgeS
 		out.CurrentPhaseEpochUS = s.Sync.CurrentPhaseEpochUS
