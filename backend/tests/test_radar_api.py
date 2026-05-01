@@ -774,6 +774,9 @@ def test_get_iid_selected_state_marks_cache_hits(monkeypatch):
     assert second["sequence"] == first["sequence"]
     assert second["revisions"] == first["revisions"]
     assert second["transport"]["source"] in {"selected_iid_state_snapshot_cache", "selected_iid_state_ttl_cache"}
+    assert "source_revisions" in second["transport"]
+    assert "sync_source_revision" in second["transport"]["source_revisions"]
+    assert "sweep_frame_revision" in second["transport"]["source_revisions"]
 
 
 def test_get_iid_selected_state_stays_small_with_large_buffers(monkeypatch):
@@ -924,7 +927,107 @@ def test_get_iid_selected_state_signature_ignores_unrelated_recorded_event_buffe
         radar_api._state = prior_state
         monkeypatch.setattr(radar_api, "_SELECTED_IID_STATE_TTL_S", prior_ttl)
 
-    assert first["revisions"] == second["revisions"]
+    assert first["revisions"]["frame_counts"] == second["revisions"]["frame_counts"]
+    assert first["summary"]["frames"] == second["summary"]["frames"]
+
+
+def test_get_iid_selected_state_uses_sweep_frame_source_for_displayed_counts(monkeypatch):
+    state = RadarState()
+    iid = 120
+    state._models[iid] = RadarIID(iid=iid, status="SINGLE_RADAR", period_s=4.0, last_updated=8_000.0)
+    state._live_sync_states[iid] = LiveSyncState(
+        iid=iid,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=8_000.0,
+        source="go_frame_sync",
+        usable=True,
+        period_authority="go_refined",
+        sync_authority="go_runtime",
+    )
+    state._go_sweep_frames_by_iid[iid] = deque([
+        SweepFrame(
+            frame_index=11,
+            sweep_start_us=12_000_000.0,
+            ref_icao="AAAAAA",
+            ref_lat=51.5,
+            ref_lon=-0.2,
+            ref_arrival_us=12_000_000.0,
+            observations=[
+                SweepFrameObservation("BBBBBB", 51.6, -0.1, 12_200_000.0),
+                SweepFrameObservation("CCCCCC", 51.4, -0.3, 12_400_000.0),
+            ],
+            quality="good",
+            period_s=4.0,
+        )
+    ], maxlen=state._GO_SWEEP_FRAMES_MAX)
+    state._go_sweep_frames_revision[iid] = 3
+    state._iid_latest_arrival_us[iid] = 12_400_000.0
+
+    prior_state = radar_api._state
+    radar_api._state = state
+    try:
+        payload = asyncio.run(radar_api.get_iid_selected_state(iid, window_s=60.0, debug_limit=20))
+    finally:
+        radar_api._state = prior_state
+
+    frames = payload["summary"]["frames"]
+    assert frames["displayed_frame_count"] == 1
+    assert frames["n_frames"] == 1
+    assert frames["go_sweep_frame_count"] == 1
+    assert frames["legacy_live_frame_count"] == 0
+    assert frames["reason"] != "no_frames_for_this_iid"
+    assert frames["reason"] == "frames_available"
+
+
+def test_get_iid_selected_state_authority_matches_sync_snapshot_operational_fields(monkeypatch):
+    state = RadarState()
+    iid = 121
+    state._models[iid] = RadarIID(iid=iid, status="SINGLE_RADAR", period_s=4.0, last_updated=9_000.0)
+    state._live_sync_states[iid] = LiveSyncState(
+        iid=iid,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=9_000.0,
+        source="go_frame_sync",
+        usable=True,
+        period_authority="go_refined",
+        sync_authority="go_runtime",
+        phase_authority="go_runtime",
+        handoff_state="TRUSTED",
+        handoff_reason="go_runtime_ready",
+    )
+    state._go_sync_states_by_iid[iid] = {
+        "period_s": 4.0,
+        "base_period_s": 4.0,
+        "effective_period_s": 4.0,
+        "phase_epoch_us": 0.0,
+        "phase_offset_deg": 0.0,
+        "period_source": "go_runtime.base_period_s",
+        "last_updated": 9_000.0,
+    }
+
+    prior_state = radar_api._state
+    radar_api._state = state
+    try:
+        state_payload = asyncio.run(radar_api.get_iid_selected_state(iid, window_s=60.0, debug_limit=20))
+        sync_snapshot_payload = asyncio.run(radar_api.get_iid_sync_snapshot(iid, window_s=60.0, debug_limit=20))
+    finally:
+        radar_api._state = prior_state
+
+    sync_summary = state_payload["summary"]["sync"]
+    sync_state = sync_snapshot_payload["sync_state"]
+    assert sync_summary["operational_period_authority"] == sync_state["period_authority"]
+    assert sync_summary["operational_sync_authority"] == sync_state["sync_authority"]
+    assert sync_summary["period_authority"] == sync_state["period_authority"]
+    assert sync_summary["sync_authority"] == sync_state["sync_authority"]
+    assert sync_summary["go_runtime_authority"] == "go_runtime"
 
 
 def test_get_iid_sweep_frame_fm_geometry_uses_cache(monkeypatch):

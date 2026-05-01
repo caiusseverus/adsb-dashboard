@@ -131,19 +131,50 @@ async function trackedRadarFetchJson(url, { endpoint, trigger, signal, ...option
       return null
     }
     const payload = await response.json()
-    const schemaMismatch = (
-      endpoint === 'iid_selected_state'
-      && payload?.type !== 'radar_selected_iid_state'
+    let schemaMismatch = false
+    let schemaMismatchReason = null
+    if (endpoint === 'iid_selected_state' && payload?.type !== 'radar_selected_iid_state') {
+      schemaMismatch = true
+      schemaMismatchReason = 'expected_type_radar_selected_iid_state'
+    } else if (endpoint === 'iid_position_accumulation' && !Array.isArray(payload?.frame_positions)) {
+      schemaMismatch = true
+      schemaMismatchReason = 'missing_frame_positions_array'
+    } else if (endpoint === 'iid_timeline' && !Array.isArray(payload?.icaos)) {
+      schemaMismatch = true
+      schemaMismatchReason = 'missing_icaos_array'
+    }
+    if (schemaMismatch) {
+      console.warn('RadarPage schema mismatch', { endpoint, url, schemaMismatchReason, payload })
+    }
+    const payloadCount = (
+      Array.isArray(payload?.frames) ? payload.frames.length
+        : Array.isArray(payload?.observations) ? payload.observations.length
+          : Array.isArray(payload?.icaos) ? payload.icaos.length
+            : Array.isArray(payload?.frame_positions) ? payload.frame_positions.length
+              : (typeof payload?.n_frames === 'number' ? payload.n_frames
+                : (typeof payload?.frame_position_count === 'number' ? payload.frame_position_count : null))
     )
     if (schemaMismatch) {
-      console.warn('RadarPage schema mismatch', { endpoint, url, payload })
+      recordRadarPageRequest(endpoint, trigger, 'failed', startedAt, {
+        httpStatus: response.status,
+        url,
+        schemaMismatch: true,
+        schemaMismatchReason,
+        payloadSequence: payload?.sequence ?? null,
+        payloadTimestamp: payload?.server_ts ?? payload?.last_updated ?? null,
+        payloadCount,
+      })
+      return null
     }
     recordRadarPageRequest(endpoint, trigger, 'completed', startedAt, {
       httpStatus: response.status,
+      url,
       cached: payload?.transport?.cached,
       schemaMismatch,
+      schemaMismatchReason,
       payloadSequence: payload?.sequence ?? null,
       payloadTimestamp: payload?.server_ts ?? payload?.last_updated ?? null,
+      payloadCount,
       payloadEmpty: Array.isArray(payload?.observations) ? payload.observations.length === 0 : null,
     })
     return payload
@@ -676,6 +707,52 @@ function useIidSyncSnapshot(iid, windowS, debugLimit = 120) {
   }, [iid, windowS, debugLimit])
 
   return { data, status }
+}
+
+function useIidTimeline(iid, enabled, windowS = BURST_SYNC_ALIGNMENT_WINDOW_S) {
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    if (iid == null) {
+      setData(null)
+      setLoading(false)
+      return
+    }
+    if (!enabled) {
+      setLoading(false)
+      return
+    }
+    const controller = new AbortController()
+    let firstPoll = true
+    async function poll() {
+      if (firstPoll) setLoading(true)
+      const payload = await trackedRadarFetchJson(
+        `${API_BASE}/api/radar/iids/${iid}/timeline?window_s=${windowS}`,
+        {
+          endpoint: 'iid_timeline',
+          trigger: 'df_alignment_panel_poll',
+          signal: controller.signal,
+        },
+      )
+      firstPoll = false
+      if (!controller.signal.aborted && payload) {
+        startTransition(() => setData(payload))
+      }
+      if (!controller.signal.aborted) {
+        setLoading(false)
+      }
+    }
+
+    poll()
+    const intervalId = setInterval(poll, BURST_SYNC_POLL_MS)
+    return () => {
+      controller.abort()
+      clearInterval(intervalId)
+    }
+  }, [enabled, iid, windowS])
+
+  return { data, loading }
 }
 
 function RadarEndpointDiagnostics({ iid }) {
@@ -1488,6 +1565,12 @@ function EvidenceMapPanel({ iid, controlData = null, evidenceData = null, eviden
   const [outlierResult, setOutlierResult] = useState(null)  // null | {outlierSet, n_outliers, n_inliers, n_total, rejection_counts}
   const [analyseRunning, setAnalyseRunning] = useState(false)
   const [deleteRunning, setDeleteRunning] = useState(false)
+  const [diagTick, setDiagTick] = useState(0)
+
+  useEffect(() => {
+    const id = setInterval(() => setDiagTick(v => v + 1), 1000)
+    return () => clearInterval(id)
+  }, [])
 
   useEffect(() => {
     setOutlierResult(null)
@@ -1578,6 +1661,19 @@ function EvidenceMapPanel({ iid, controlData = null, evidenceData = null, eviden
     ? { source: controlData.display_source, lat: controlData.display_lat, lon: controlData.display_lon, cep_m: controlData.display_cep_m }
     : null
   const frameCount = Number(evidenceData?.frame_position_count ?? scatterPoints.length)
+  const endpointUrl = `${API_BASE}/api/radar/iids/${iid}/position-accumulation`
+  const positionFetchBucket = getRadarPageMetricsStore()?.requests?.iid_position_accumulation ?? null
+  const positionFetchMeta = positionFetchBucket?.lastMeta ?? {}
+  const positionFetchStatus = positionFetchMeta.httpStatus ?? null
+  const positionFetchPayloadCount = Number.isFinite(Number(positionFetchMeta.payloadCount))
+    ? Number(positionFetchMeta.payloadCount)
+    : frameCount
+  const positionSchemaMismatchReason = positionFetchMeta.schemaMismatch
+    ? (positionFetchMeta.schemaMismatchReason ?? 'payload schema mismatch')
+    : null
+  const positionPollingActive = Object.keys(positionFetchBucket?.triggers ?? {}).some(key => key.includes('poll'))
+  const _diagnosticTick = diagTick
+  void _diagnosticTick
 
   const manualPoint = manualEstimate ? [{ lat: manualEstimate.lat, lon: manualEstimate.lon }] : []
   const points = [...scatterPoints, ...solutionPoints, ...ringContextPoints, ...manualPoint]
@@ -1710,7 +1806,21 @@ function EvidenceMapPanel({ iid, controlData = null, evidenceData = null, eviden
         </div>
       )}
       {loading || !bounds ? (
-        <div className={styles.empty}>{loading ? 'Loading…' : 'No frame estimates yet.'}</div>
+        <div className={styles.empty}>
+          <div>{loading ? 'Loading…' : (frameCount > 0 ? 'Frame positions present but map points are not renderable.' : 'No frame estimates yet.')}</div>
+          {!loading && (
+            <div style={{ marginTop: '0.45rem', fontSize: '0.74rem', color: '#8b949e', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>
+              <div>endpoint: {positionFetchMeta.url ?? endpointUrl}</div>
+              <div>http: {positionFetchStatus ?? '—'}</div>
+              <div>payload count: {positionFetchPayloadCount}</div>
+              <div>polling: {positionPollingActive ? 'active' : 'idle'}</div>
+              {positionSchemaMismatchReason && <div>schema mismatch: {positionSchemaMismatchReason}</div>}
+              {!positionSchemaMismatchReason && frameCount > 0 && scatterPoints.length <= 0 && (
+                <div>schema mismatch: frame_positions missing usable lat/lon rows</div>
+              )}
+            </div>
+          )}
+        </div>
       ) : (
         <div className={styles.alignmentWrap} style={{ position: 'relative', overflow: 'hidden', maxWidth: '850px', margin: '0 auto' }}>
           <svg width="100%" viewBox={`0 0 ${width} ${height}`} style={{ display: 'block', aspectRatio: '1 / 1' }}>
@@ -2441,8 +2551,6 @@ function RotationAlignmentPanel({
   const [alignmentMode, setAlignmentMode] = useState(BURST_SYNC_VIEW_MODE_RESIDUALS)
   const [residualChartMode, setResidualChartMode] = useState(RESIDUAL_CHART_MODE_RECORDED)
   const [resetting, setResetting] = useState(false)
-  const [legacyTimeline, setLegacyTimeline] = useState(null)
-  const [legacyLoading, setLegacyLoading] = useState(false)
   const [refOverride, setRefOverride] = useState(null)
   const [refOverrideSent, setRefOverrideSent] = useState(false)
   const [residualBasisMode, setResidualBasisMode] = useState(RESIDUAL_BASIS_RUNTIME_EFFECTIVE)
@@ -2452,7 +2560,11 @@ function RotationAlignmentPanel({
     df11: [],
     lastAppendAtMs: null,
   })
-  const timelineCacheRef = useRef(new Map())
+  const { data: legacyTimeline, loading: legacyLoading } = useIidTimeline(
+    iid,
+    alignmentMode === BURST_SYNC_VIEW_MODE_LEGACY,
+    BURST_SYNC_ALIGNMENT_WINDOW_S,
+  )
   const streamStatus = syncFeedStatus ?? {
     connected: false,
     mode: 'idle',
@@ -2468,48 +2580,10 @@ function RotationAlignmentPanel({
 
   useEffect(() => {
     if (iid == null) {
-      setLegacyTimeline(null)
-      setLegacyLoading(false)
       setRefOverride(null)
       setRefOverrideSent(false)
     }
   }, [iid])
-
-  useEffect(() => {
-    if (iid == null) {
-      setLegacyLoading(false)
-      return
-    }
-    let cancelled = false
-    const cachedTimeline = timelineCacheRef.current.get(iid)
-    setLegacyTimeline(cachedTimeline ?? null)
-    if (alignmentMode !== BURST_SYNC_VIEW_MODE_LEGACY) return
-
-    async function pollTimeline() {
-      const payload = await trackedRadarFetchJson(
-        `${API_BASE}/api/radar/iids/${iid}/timeline?window_s=${BURST_SYNC_ALIGNMENT_WINDOW_S}&_ts=${Date.now()}`,
-        {
-          endpoint: 'iid_timeline',
-          trigger: 'legacy_alignment_mode_poll',
-        },
-      )
-      if (!cancelled && payload) {
-        timelineCacheRef.current.set(iid, payload)
-        startTransition(() => setLegacyTimeline(payload))
-      }
-      if (!cancelled) {
-        if (alignmentMode === BURST_SYNC_VIEW_MODE_LEGACY) setLegacyLoading(false)
-      }
-    }
-
-    setLegacyLoading(true)
-    pollTimeline()
-    const intervalId = setInterval(pollTimeline, BURST_SYNC_POLL_MS)
-    return () => {
-      cancelled = true
-      clearInterval(intervalId)
-    }
-  }, [iid, alignmentMode])
 
   const burstTimeline = syncSnapshot
   const rotation = syncSnapshot?.rotation ?? null
@@ -2730,8 +2804,6 @@ function RotationAlignmentPanel({
     setResetting(true)
     try {
       await resetIid(iid)
-      setLegacyTimeline(null)
-      timelineCacheRef.current.delete(iid)
       onSelectIcao(null)
       setRefOverride(null)
       setRefOverrideSent(false)

@@ -23,6 +23,7 @@ from .sweep import (
     PRIMARY_CONFIDENCE_TARGET,
     SECONDARY_CONFIDENCE_TARGET,
     _confidence_from_support,
+    _live_sync_state_to_dict,
     detect_bursts,
 )
 from .localiser import _bearing_deg, _haversine_m
@@ -2587,6 +2588,14 @@ def build_selected_iid_page_state_payload(
                     "cached": False,
                     "source": "selected_iid_state_unavailable",
                     "cache_ttl_s": _SELECTED_IID_STATE_TTL_S,
+                    "source_revisions": {
+                        "sync_source_revision": None,
+                        "sync_last_update_ts": None,
+                        "go_runtime_last_updated": None,
+                        "go_sync_history_revision": 0,
+                        "go_sweep_frame_revision": 0,
+                        "sweep_frame_revision": 0,
+                    },
                 },
             }
             payload_bytes = _json_size_bytes(payload)
@@ -2601,10 +2610,45 @@ def build_selected_iid_page_state_payload(
             return payload
 
         model = state.get_rotation_model(iid)
-        frame_counts = state.get_live_frame_counts(iid)
+        legacy_frame_counts = state.get_live_frame_counts(iid)
+        sweep_summary_payload = state.get_sweep_frame_summary_payload(iid)
+        sweep_summary_transport = sweep_summary_payload.get("transport") or {}
+        sweep_summary_revision = int(
+            sweep_summary_transport.get("revision")
+            or state.get_sweep_frame_summary_revision(iid)
+            or 0
+        )
+        sweep_summary_cached = bool(state.get_sweep_frame_summary_last_cache_hit(iid))
+        go_runtime_sync = state.get_go_live_sync_state(iid) or {}
+        legacy_python_sync = state.get_stage3_live_sync_state(iid)
+        if legacy_python_sync is None:
+            fallback_sync = state.get_live_sync_state(iid)
+            if fallback_sync is not None and getattr(fallback_sync, "source", None) == "multi_aircraft_burst":
+                legacy_python_sync = fallback_sync
+        operational_sync = state.get_live_sync_state(iid)
+        sync_state = _live_sync_state_to_dict(operational_sync, go_sync=go_runtime_sync) if operational_sync is not None else {}
         with state._lock:
-            sync = state._live_sync_states.get(iid)
             latest_arrival_us = state._iid_latest_arrival_us.get(iid)
+            go_sweep_frame_count = int(len(state._go_sweep_frames_by_iid.get(iid, ())))
+            go_sweep_frame_revision = int(state._go_sweep_frames_revision.get(iid, 0))
+            go_sync_history_revision = int(state._go_sync_diagnostic_history_revision.get(iid, 0))
+
+        sync_last_update_ts = sync_state.get("last_sync_update_ts")
+        go_runtime_last_updated = go_runtime_sync.get("last_updated")
+        sync_source_revision = (
+            f"sync:{sync_last_update_ts}|"
+            f"go:{go_runtime_last_updated}|"
+            f"go_hist:{go_sync_history_revision}|"
+            f"frames:{go_sweep_frame_revision}"
+        )
+
+        displayed_frames = sweep_summary_payload.get("frames")
+        if not isinstance(displayed_frames, list):
+            displayed_frames = []
+        displayed_frame_count = int(sweep_summary_payload.get("n_frames", len(displayed_frames)) or 0)
+        displayed_good_count = sum(1 for frame in displayed_frames if frame.get("quality") == "good")
+        displayed_marginal_count = sum(1 for frame in displayed_frames if frame.get("quality") == "marginal")
+        legacy_live_frame_count = int(legacy_frame_counts.get("n_frames", 0))
 
         selected_payload, selected_revision, selected_cached, selected_meta = _selected_iid_section_entry(
             iid,
@@ -2635,27 +2679,42 @@ def build_selected_iid_page_state_payload(
             iid,
             "sync_summary",
             {
-                "sync_present": bool(sync is not None),
-                "sync_source": getattr(sync, "source", None) if sync is not None else None,
-                "sync_usable": bool(getattr(sync, "usable", False)) if sync is not None else False,
-                "sync_quality": getattr(sync, "sync_quality", None) if sync is not None else None,
-                "sync_ts": getattr(sync, "last_sync_update_ts", None) if sync is not None else None,
-                "period_s": getattr(sync, "period_s", None) if sync is not None else None,
-                "period_authority": getattr(sync, "period_authority", None) if sync is not None else None,
-                "sync_authority": getattr(sync, "sync_authority", None) if sync is not None else None,
+                "sync_source_revision": sync_source_revision,
+                "sync_source": sync_state.get("source"),
+                "sync_usable": bool(sync_state.get("usable")) if sync_state else False,
+                "operational_period_authority": sync_state.get("period_authority"),
+                "operational_sync_authority": sync_state.get("sync_authority"),
+                "effective_period_source": sync_state.get("effective_period_source"),
+                "legacy_python_update_ts": getattr(legacy_python_sync, "last_sync_update_ts", None) if legacy_python_sync is not None else None,
+                "go_runtime_last_updated": go_runtime_last_updated,
             },
             lambda: {
-                "present": sync is not None,
-                "usable": bool(getattr(sync, "usable", False)) if sync is not None else False,
-                "source": getattr(sync, "source", None) if sync is not None else None,
-                "sync_quality": getattr(sync, "sync_quality", None) if sync is not None else None,
-                "period_s": getattr(sync, "period_s", None) if sync is not None else None,
-                "period_authority": getattr(sync, "period_authority", None) if sync is not None else None,
-                "sync_authority": getattr(sync, "sync_authority", None) if sync is not None else None,
-                "phase_authority": getattr(sync, "phase_authority", None) if sync is not None else None,
-                "handoff_state": getattr(sync, "handoff_state", None) if sync is not None else None,
-                "handoff_reason": getattr(sync, "handoff_reason", None) if sync is not None else None,
-                "last_sync_update_ts": getattr(sync, "last_sync_update_ts", None) if sync is not None else None,
+                "present": bool(sync_state),
+                "usable": bool(sync_state.get("usable")) if sync_state else False,
+                "source": sync_state.get("source"),
+                "sync_quality": sync_state.get("sync_quality"),
+                "period_s": sync_state.get("period_s"),
+                "period_authority": sync_state.get("period_authority"),
+                "sync_authority": sync_state.get("sync_authority"),
+                "phase_authority": sync_state.get("phase_authority"),
+                "handoff_state": sync_state.get("handoff_state"),
+                "handoff_reason": sync_state.get("handoff_reason"),
+                "last_sync_update_ts": sync_state.get("last_sync_update_ts"),
+                "operational_period_authority": sync_state.get("period_authority"),
+                "operational_sync_authority": sync_state.get("sync_authority"),
+                "go_runtime_authority": (
+                    "go_runtime"
+                    if bool(go_runtime_sync)
+                    else "unavailable"
+                ),
+                "legacy_python_authority": (
+                    str(getattr(legacy_python_sync, "sync_authority", None) or getattr(legacy_python_sync, "period_authority", None) or "py_bootstrap")
+                    if legacy_python_sync is not None
+                    else "unavailable"
+                ),
+                "go_runtime_state_present": bool(go_runtime_sync),
+                "legacy_python_state_present": bool(legacy_python_sync is not None),
+                "sync_source_revision": sync_source_revision,
             },
         )
         section_timings["sync_authority_summary"] = dict(sync_meta)
@@ -2668,24 +2727,32 @@ def build_selected_iid_page_state_payload(
             "build_ms": sync_meta.get("build_ms"),
             "payload_size_bytes": sync_meta.get("payload_size_bytes"),
             "item_count": sync_meta.get("item_count"),
+            "source_cached": False,
+            "source_revision": sync_source_revision,
+            "source_transport": "live_sync_state",
         }
 
         frame_summary_payload, frames_revision, frames_cached, frames_meta = _selected_iid_section_entry(
             iid,
             "frame_counts",
             {
-                "n_frames": frame_counts.get("n_frames", 0),
-                "n_good": frame_counts.get("n_good", 0),
-                "n_marginal": frame_counts.get("n_marginal", 0),
+                "sweep_summary_revision": sweep_summary_revision,
+                "displayed_frame_count": displayed_frame_count,
+                "go_sweep_frame_count": go_sweep_frame_count,
+                "legacy_live_frame_count": legacy_live_frame_count,
                 "latest_arrival_us": latest_arrival_us,
             },
             lambda: {
-                "n_frames": int(frame_counts.get("n_frames", 0)),
-                "n_good": int(frame_counts.get("n_good", 0)),
-                "n_marginal": int(frame_counts.get("n_marginal", 0)),
+                "n_frames": displayed_frame_count,
+                "n_good": int(displayed_good_count),
+                "n_marginal": int(displayed_marginal_count),
+                "go_sweep_frame_count": int(go_sweep_frame_count),
+                "legacy_live_frame_count": int(legacy_live_frame_count),
+                "displayed_frame_count": int(displayed_frame_count),
+                "frame_source": "go_sweep_frames" if go_sweep_frame_count > 0 else ("legacy_live_frames" if legacy_live_frame_count > 0 else "none"),
                 "reason": (
                     "no_frames_for_this_iid"
-                    if int(frame_counts.get("n_frames", 0)) <= 0
+                    if int(displayed_frame_count) <= 0 and int(go_sweep_frame_count) <= 0
                     else "frames_available"
                 ),
             },
@@ -2700,6 +2767,9 @@ def build_selected_iid_page_state_payload(
             "build_ms": frames_meta.get("build_ms"),
             "payload_size_bytes": frames_meta.get("payload_size_bytes"),
             "item_count": frames_meta.get("item_count"),
+            "source_cached": sweep_summary_cached,
+            "source_revision": sweep_summary_revision,
+            "source_transport": sweep_summary_transport.get("source"),
         }
 
         availability_payload, availability_revision, availability_cached, availability_meta = _selected_iid_section_entry(
@@ -2707,21 +2777,21 @@ def build_selected_iid_page_state_payload(
             "availability",
             {
                 "model_present": bool(model is not None),
-                "sync_present": bool(sync is not None),
-                "n_frames": frame_summary_payload.get("n_frames", 0),
+                "sync_present": bool(sync_state),
+                "displayed_frame_count": frame_summary_payload.get("displayed_frame_count", frame_summary_payload.get("n_frames", 0)),
                 "fm_present": bool(model is not None and model.fm_lat is not None and model.fm_lon is not None),
             },
             lambda: {
                 "burst_sync": {
-                    "available": bool(sync is not None),
+                    "available": bool(sync_state),
                     "reason": "use /api/radar/iids/{iid}/burst_sync_timeline",
                 },
                 "df_alignment": {
-                    "available": bool(sync is not None),
+                    "available": bool(sync_state),
                     "reason": "use /api/radar/iids/{iid}/timeline",
                 },
                 "sweep_frames": {
-                    "available": int(frame_summary_payload.get("n_frames", 0)) > 0,
+                    "available": int(frame_summary_payload.get("displayed_frame_count", frame_summary_payload.get("n_frames", 0))) > 0,
                     "reason": "use /api/radar/iids/{iid}/sweep-frames",
                 },
                 "frame_accumulation": {
@@ -2783,7 +2853,7 @@ def build_selected_iid_page_state_payload(
             max(0.0, now_ts - float(model.last_updated))
             if model is not None and model.last_updated is not None else None
         )
-        sync_update_ts = getattr(sync, "last_sync_update_ts", None) if sync is not None else None
+        sync_update_ts = sync_state.get("last_sync_update_ts")
         sync_update_age_s = (
             max(0.0, now_ts - float(sync_update_ts))
             if sync_update_ts is not None else None
@@ -2804,6 +2874,14 @@ def build_selected_iid_page_state_payload(
             },
             "availability": availability_payload,
             "display_source": _control_payload(model).get("display_source") if model is not None else "none",
+            "source_revisions": {
+                "sync_source_revision": sync_source_revision,
+                "sync_last_update_ts": sync_last_update_ts,
+                "go_runtime_last_updated": go_runtime_last_updated,
+                "go_sync_history_revision": go_sync_history_revision,
+                "go_sweep_frame_revision": go_sweep_frame_revision,
+                "sweep_frame_revision": sweep_summary_revision,
+            },
         }
 
         revisions = {
@@ -2846,6 +2924,18 @@ def build_selected_iid_page_state_payload(
                 "source": "selected_iid_state_summary",
                 "cache_ttl_s": _SELECTED_IID_STATE_TTL_S,
                 "sections": sections_transport,
+                "source_revisions": {
+                    "sync_source_revision": sync_source_revision,
+                    "sync_last_update_ts": sync_last_update_ts,
+                    "go_runtime_last_updated": go_runtime_last_updated,
+                    "go_sync_history_revision": go_sync_history_revision,
+                    "go_sweep_frame_revision": go_sweep_frame_revision,
+                    "sweep_frame_revision": sweep_summary_revision,
+                },
+                "source_cache_status": {
+                    "sync_snapshot_cached": False,
+                    "sweep_summary_cached": sweep_summary_cached,
+                },
             },
         }
         serialization_t0 = time.perf_counter()

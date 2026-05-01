@@ -153,3 +153,28 @@ Verification:
 
 Residual risk:
 - Existing long-running backend on port `8000` appears to still be pre-fix build; live environment validation still requires restart/deploy of patched backend before UI-level acceptance can reflect these changes.
+
+## 2026-05-01 Selected-IID State/Source Consistency + Frontend Gating
+
+- [x] Run GitNexus impact analysis on `/state` and RadarPage symbols and record blast radius/risk.
+- [x] Align `/state` frame summary with `/sweep-frames` source and expose `go_sweep_frame_count`, `legacy_live_frame_count`, `displayed_frame_count`.
+- [x] Align `/state` sync authority summary with `/sync-snapshot`/`burst_sync_timeline` operational authority fields and avoid contradictory collapse.
+- [x] Update `/state` cache signatures and transport diagnostics with source revisions and cache age.
+- [x] Ensure frontend sweep/burst/DF/position panels render from dedicated endpoints and are not gated by `/state` summary counts.
+- [x] Harden DF alignment polling while visible and independent from panel priming.
+- [x] Add position accumulation panel diagnostics for endpoint/status/count/schema mismatch when blank.
+- [x] Add backend/frontend regression tests for summary consistency + dedicated-endpoint panel rendering/polling behavior.
+- [x] Run verification (targeted backend tests + frontend build) and document review.
+
+Review:
+- `/state` now derives sync summary from `get_live_sync_snapshot(...)` and frame summary from `get_sweep_frame_summary_payload(...)`, matching dedicated source paths used by `/sync-snapshot` and `/sweep-frames`.
+- `/state.summary.frames` now exposes `go_sweep_frame_count`, `legacy_live_frame_count`, and `displayed_frame_count`, and will not emit `no_frames_for_this_iid` when Go sweep-frame rows exist.
+- `/state.summary.sync` now exposes separated authority fields: `operational_period_authority`, `operational_sync_authority`, `go_runtime_authority`, and `legacy_python_authority`.
+- `/state.transport` now includes `source_revisions` and source-cache metadata tied to sync snapshot sequence and sweep-frame revision.
+- DF alignment timeline polling now uses dedicated `useIidTimeline(...)` polling while the legacy DF panel mode is visible; polling no longer relies on the prior panel-local cache priming path.
+- Position Accumulation map blank state now surfaces endpoint diagnostics (URL, HTTP status, payload count, polling state, schema mismatch reason).
+
+Verification:
+- `UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_radar_api.py -k "selected_state or position_accumulation" -q`
+- `UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_radar_ui_labels.py -q`
+- `cd frontend && npm run build`

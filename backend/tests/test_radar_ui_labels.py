@@ -64,7 +64,9 @@ def test_radar_page_uses_recorded_event_buffer_and_explicit_empty_reasons():
 def test_radar_page_initialises_legacy_timeline_fetch_without_view_toggle_priming():
     radar_page = Path(__file__).resolve().parents[2] / "frontend" / "src" / "pages" / "RadarPage.jsx"
     text = radar_page.read_text(encoding="utf-8")
-    assert "legacy_alignment_mode_poll" in text
+    assert "useIidTimeline(" in text
+    assert "df_alignment_panel_poll" in text
+    assert "alignmentMode === BURST_SYNC_VIEW_MODE_LEGACY" in text
     assert "if (iid == null) {" in text
 
 
@@ -83,10 +85,20 @@ def test_radar_page_uses_dedicated_endpoints_not_state_bulk_sections():
     assert "/api/radar/iids/${iid}/control" in text
     assert "/api/radar/iids/${iid}/solution-comparison" in text
     assert "/api/radar/iids/${iid}/position-accumulation" in text
+    assert "const sharedSweepFrames = useSweepFrames(selectedIid)" in text
+    assert "frameData={sharedSweepFrames}" in text
     assert "selectedIidState?.frames" not in text
     assert "selectedIidState?.sync" not in text
     assert "selectedIidState?.fm" not in text
     assert "selectedIidState?.evidence" not in text
+
+
+def test_radar_page_position_accumulation_blank_state_shows_endpoint_diagnostics():
+    radar_page = Path(__file__).resolve().parents[2] / "frontend" / "src" / "pages" / "RadarPage.jsx"
+    text = radar_page.read_text(encoding="utf-8")
+    assert "endpoint: {positionFetchMeta.url ?? endpointUrl}" in text
+    assert "payload count: {positionFetchPayloadCount}" in text
+    assert "schema mismatch: frame_positions missing usable lat/lon rows" in text
 
 
 def test_radar_page_all_icaos_chip_uses_distinct_recorded_burst_icaos():

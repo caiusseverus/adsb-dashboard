@@ -2,6 +2,7 @@
 
 ## 2026-05-01
 
+- For selected-IID summary endpoints, do not mix legacy counters/states with canonical panel sources. `/state` must derive frame and authority summaries from the same source paths used by `/sweep-frames` and `/sync-snapshot`, otherwise the UI can show contradictory “no data” and stale authority labels.
 - Do not generate immutable live recorded events from a full-state snapshot replacement path such as `update_go_snapshot()`. Record them only at the true event-ingest hook (for example `update_go_burst_fired()`), otherwise snapshot replay can add expensive per-event work to the control path and starve live frame/alignment generation.
 - In a burst/DF11 hot path, never deduplicate by scanning the entire retained history deque on every append. Use an O(1) guard such as adjacent-event ID comparison or a bounded index, otherwise frame generation can collapse under normal live rates.
 
