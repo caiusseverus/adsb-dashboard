@@ -128,6 +128,16 @@ type SyncState struct {
 	icaoRejectHistory                        map[uint32][]float64
 	icaoSuspiciousUntil                      map[uint32]float64
 	slopeHistory                             []float64
+	FitEpochResetCountByReason               map[string]uint64
+	LastFitEpochResetUnix                    float64
+	FitObservationsAddedSinceReset           int
+	FitObservationsRejectedSinceReset        int
+	LastFitObservationRejectReason           string
+	CurrentReferenceICAO                     uint32
+	PreviousReferenceICAO                    uint32
+	ReferenceChangeCount                     uint64
+	ReferenceLastChangeUnix                  float64
+	ObservationDropCountsByReason            map[string]uint64
 }
 
 const (
@@ -229,12 +239,14 @@ func NewSyncState(iid uint8, periodS, epochUS, phaseOffsetDeg, quality float64) 
 			FitRetentionWindowS:     refinementFitWindowS,
 			SlopeSignConvention:     "observed_minus_predicted",
 			HardBoundLimitPPM:       refinementAbsBoundFraction * 1e6,
-			HoldoverReasonCounts:    make(map[string]uint64),
-		UpdateEpochRejectCounts: make(map[string]uint64),
-		icaoRejectHistory:       make(map[uint32][]float64),
-		icaoSuspiciousUntil:     make(map[uint32]float64),
-		LastAcceptedEpochUS:     epochUS,
-		LastAcceptedEpochAtUnix: float64(time.Now().UnixNano()) / 1e9,
+			HoldoverReasonCounts:        make(map[string]uint64),
+		UpdateEpochRejectCounts:     make(map[string]uint64),
+		icaoRejectHistory:           make(map[uint32][]float64),
+		icaoSuspiciousUntil:         make(map[uint32]float64),
+		FitEpochResetCountByReason:  make(map[string]uint64),
+		ObservationDropCountsByReason: make(map[string]uint64),
+		LastAcceptedEpochUS:         epochUS,
+		LastAcceptedEpochAtUnix:     float64(time.Now().UnixNano()) / 1e9,
 	}
 }
 
@@ -352,6 +364,10 @@ func (s *SyncState) resetFitEpochLocked(reason string) {
 	s.ResidualSlopeDegPerS = 0
 	s.RequestedDeltaS = 0
 	s.RequestedDeltaPPM = 0
+	s.FitObservationsAddedSinceReset = 0
+	s.FitObservationsRejectedSinceReset = 0
+	s.LastFitObservationRejectReason = ""
+	s.ObservationDropCountsByReason = make(map[string]uint64)
 }
 
 func (s *SyncState) startFitEpochIfNeededLocked(ctx fitEpochContext) {
@@ -378,6 +394,8 @@ func (s *SyncState) startFitEpochIfNeededLocked(ctx fitEpochContext) {
 
 func (s *SyncState) rotateFitEpochLocked(reason string, ctx fitEpochContext) {
 	s.resetFitEpochLocked(reason)
+	s.FitEpochResetCountByReason[reason] = s.FitEpochResetCountByReason[reason] + 1
+	s.LastFitEpochResetUnix = float64(time.Now().UnixNano()) / 1e9
 	s.FitEpochID++
 	s.FitEpochStartedUnix = 0
 	s.FitEpochResetReason = reason
@@ -397,10 +415,6 @@ func (s *SyncState) maybeResetFitEpochLocked(ctx fitEpochContext) {
 	}
 	if ctx.residualBasis != s.fitEpochResidualBasis {
 		s.rotateFitEpochLocked("residual_basis_changed", ctx)
-		return
-	}
-	if s.fitEpochReferenceICAO != 0 && ctx.referenceICAO != 0 && ctx.referenceICAO != s.fitEpochReferenceICAO {
-		s.rotateFitEpochLocked("reference_icao_changed", ctx)
 		return
 	}
 	base := ctx.basePeriodS
@@ -836,6 +850,9 @@ func (s *SyncState) AddRefinementResidualObservation(
 		s.PeriodRefinementStatus = "missing_df_base_period"
 		s.RefinementLastRejectReason = "missing_df_base_period"
 		s.FitRejectedObservations++
+		s.FitObservationsRejectedSinceReset++
+		s.LastFitObservationRejectReason = "missing_df_base_period"
+		s.ObservationDropCountsByReason["missing_df_base_period"] = s.ObservationDropCountsByReason["missing_df_base_period"] + 1
 		return
 	}
 	if !dominant {
@@ -845,6 +862,9 @@ func (s *SyncState) AddRefinementResidualObservation(
 		s.RefinementLastRejectReason = "no_dominant_family"
 		s.HoldoverReasonCounts["no_dominant_family"] = s.HoldoverReasonCounts["no_dominant_family"] + 1
 		s.markICAORejectLocked(icao, nowS, "no_dominant_family")
+		s.FitObservationsRejectedSinceReset++
+		s.LastFitObservationRejectReason = "no_dominant_family"
+		s.ObservationDropCountsByReason["no_dominant_family"] = s.ObservationDropCountsByReason["no_dominant_family"] + 1
 		return
 	}
 	if epochUS <= 0 || math.IsNaN(epochUS) || math.IsInf(epochUS, 0) || math.IsNaN(residualDeg) || math.IsInf(residualDeg, 0) {
@@ -853,6 +873,9 @@ func (s *SyncState) AddRefinementResidualObservation(
 		s.PeriodRefinementStatus = "all_rejected"
 		s.RefinementLastRejectReason = "invalid_observation"
 		s.markICAORejectLocked(icao, nowS, "invalid_observation")
+		s.FitObservationsRejectedSinceReset++
+		s.LastFitObservationRejectReason = "invalid_observation"
+		s.ObservationDropCountsByReason["invalid_observation"] = s.ObservationDropCountsByReason["invalid_observation"] + 1
 		return
 	}
 	if refPosAgeS < 0 || math.IsNaN(refPosAgeS) || math.IsInf(refPosAgeS, 0) {
@@ -861,6 +884,9 @@ func (s *SyncState) AddRefinementResidualObservation(
 		s.PeriodRefinementStatus = "all_rejected"
 		s.RefinementLastRejectReason = "invalid_ref_position_age"
 		s.markICAORejectLocked(icao, nowS, "invalid_ref_position_age")
+		s.FitObservationsRejectedSinceReset++
+		s.LastFitObservationRejectReason = "invalid_ref_position_age"
+		s.ObservationDropCountsByReason["invalid_ref_position_age"] = s.ObservationDropCountsByReason["invalid_ref_position_age"] + 1
 		return
 	}
 	if refPosAgeS > refinementStalePositionMaxS {
@@ -869,6 +895,9 @@ func (s *SyncState) AddRefinementResidualObservation(
 		s.PeriodRefinementStatus = "all_rejected"
 		s.RefinementLastRejectReason = "stale_ref_position"
 		s.markICAORejectLocked(icao, nowS, "stale_ref_position")
+		s.FitObservationsRejectedSinceReset++
+		s.LastFitObservationRejectReason = "stale_ref_position"
+		s.ObservationDropCountsByReason["stale_ref_position"] = s.ObservationDropCountsByReason["stale_ref_position"] + 1
 		return
 	}
 	absResidual := math.Abs(residualDeg)
@@ -878,6 +907,9 @@ func (s *SyncState) AddRefinementResidualObservation(
 		s.PeriodRefinementStatus = "all_rejected"
 		s.RefinementLastRejectReason = "hard_outlier"
 		s.markICAORejectLocked(icao, nowS, "hard_outlier")
+		s.FitObservationsRejectedSinceReset++
+		s.LastFitObservationRejectReason = "hard_outlier"
+		s.ObservationDropCountsByReason["hard_outlier"] = s.ObservationDropCountsByReason["hard_outlier"] + 1
 		return
 	}
 	if until, ok := s.icaoSuspiciousUntil[icao]; ok && until > nowS {
@@ -885,6 +917,9 @@ func (s *SyncState) AddRefinementResidualObservation(
 		s.FitRejectedObservations++
 		s.PeriodRefinementStatus = "all_rejected"
 		s.RefinementLastRejectReason = "suspicious_icao_excluded"
+		s.FitObservationsRejectedSinceReset++
+		s.LastFitObservationRejectReason = "suspicious_icao_excluded"
+		s.ObservationDropCountsByReason["suspicious_icao_excluded"] = s.ObservationDropCountsByReason["suspicious_icao_excluded"] + 1
 		return
 	}
 	soft := absResidual > residualSoftDeg
@@ -905,6 +940,8 @@ func (s *SyncState) AddRefinementResidualObservation(
 	})
 	s.appendResidualObservationLocked(epochUS, residualDeg, icao, dominant, soft, weight, nAircraft, refPosAgeS)
 	s.markFitEpochObservationLocked(epochUS, referenceICAO, s.PhaseOffsetDeg, s.BasePeriodS, s.Holdover, authorityBasis)
+	s.FitObservationsAddedSinceReset++
+	s.LastFitObservationRejectReason = ""
 	s.applyBoundedPeriodRefinement()
 	s.EffectivePeriodS = s.BasePeriodS + s.PeriodDeltaS
 	if s.EffectivePeriodS <= 0 {
@@ -931,6 +968,18 @@ func (s *SyncState) AddRefinementResidualValue(
 	authorityBasis string,
 ) {
 	s.AddRefinementResidualObservation(epochUS, residualDeg, icao, dominant, nAircraft, refPosAgeS, referenceICAO, authorityBasis)
+}
+
+func (s *SyncState) RecordReferenceChange(newICAO uint32) {
+	if newICAO == s.CurrentReferenceICAO {
+		return
+	}
+	s.PreviousReferenceICAO = s.CurrentReferenceICAO
+	s.CurrentReferenceICAO = newICAO
+	if s.PreviousReferenceICAO != 0 {
+		s.ReferenceChangeCount++
+	}
+	s.ReferenceLastChangeUnix = float64(time.Now().UnixNano()) / 1e9
 }
 
 func (s *SyncState) applyBoundedPeriodRefinement() {

@@ -200,6 +200,16 @@ type DebugSnapshot struct {
 	ReferenceEligibleAircraft                int
 	DominantFamilyAircraft                   int
 	ReferenceSelectionSparseHistory          bool
+	FitEpochResetCountByReason               map[string]uint64
+	LastFitEpochResetAgeS                    float64
+	FitObservationsAddedSinceReset           int
+	FitObservationsRejectedSinceReset        int
+	LastFitObservationRejectReason           string
+	CurrentReferenceICAO                     uint32
+	PreviousReferenceICAO                    uint32
+	ReferenceChangeCount                     uint64
+	ReferenceChurnRate                       float64
+	ObservationDropCountsByReason            map[string]uint64
 }
 
 const (
@@ -446,7 +456,7 @@ func (s *IIDState) RefreshReference(records []BurstRecord, nowUS float64) {
 	chosen := SelectReference(filtered, *s.EffectivePeriodS, cur, nowUS)
 	if chosen != 0 {
 		if s.Sync != nil && cur != 0 && chosen != cur {
-			s.Sync.ResetFitEpochOnModelChange("reference_icao_changed", chosen, "go_refiner_active")
+			s.Sync.RecordReferenceChange(chosen)
 		}
 		s.RefICAO = &chosen
 		return
@@ -456,7 +466,7 @@ func (s *IIDState) RefreshReference(records []BurstRecord, nowUS float64) {
 	// non-dominant reference that can never open frames.
 	if len(filtered) == 0 {
 		if s.Sync != nil && s.RefICAO != nil {
-			s.Sync.ResetFitEpochOnModelChange("reference_icao_cleared", 0, "go_refiner_active")
+			s.Sync.RecordReferenceChange(0)
 		}
 		s.RefICAO = nil
 	}
@@ -835,6 +845,28 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.SyncNRejectedFrames = s.Sync.NRejectedFrames
 		out.SyncLastUpdatedUnix = float64(s.Sync.LastUpdated.UnixNano()) / 1e9
 		out.SyncUsable = s.Sync.SyncQuality >= 0.3 && !s.Sync.Holdover && s.Sync.PeriodAgreesWithDF && s.Sync.PeriodRejectReason == "" && s.Sync.LastUpdateEpochStrictGatePass
+		out.FitEpochResetCountByReason = s.Sync.FitEpochResetCountByReason
+		if s.Sync.LastFitEpochResetUnix > 0 {
+			ageS := float64(time.Now().UnixNano())/1e9 - s.Sync.LastFitEpochResetUnix
+			if ageS < 0 {
+				ageS = 0
+			}
+			out.LastFitEpochResetAgeS = ageS
+		}
+		out.FitObservationsAddedSinceReset = s.Sync.FitObservationsAddedSinceReset
+		out.FitObservationsRejectedSinceReset = s.Sync.FitObservationsRejectedSinceReset
+		out.LastFitObservationRejectReason = s.Sync.LastFitObservationRejectReason
+		out.CurrentReferenceICAO = s.Sync.CurrentReferenceICAO
+		out.PreviousReferenceICAO = s.Sync.PreviousReferenceICAO
+		out.ReferenceChangeCount = s.Sync.ReferenceChangeCount
+		if s.Sync.ReferenceChangeCount > 0 && s.Sync.FitEpochStartedUnix > 0 {
+			nowS := float64(time.Now().UnixNano()) / 1e9
+			elapsed := nowS - s.Sync.FitEpochStartedUnix
+			if elapsed > 0 {
+				out.ReferenceChurnRate = float64(s.Sync.ReferenceChangeCount) / elapsed * 60.0
+			}
+		}
+		out.ObservationDropCountsByReason = s.Sync.ObservationDropCountsByReason
 	}
 	out.ActiveAircraftEstimate = s.lastActiveAircraft
 	out.BurstRecordsTotal = len(s.records)

@@ -274,24 +274,29 @@ func TestSyncState_FitEpochResetOnReferenceICAOChange(t *testing.T) {
 		t.Fatal("expected seeded residual history")
 	}
 	prevEpochID := s.FitEpochID
-	prevSegmentCount := s.FitSegmentCount
+	prevHistoryLen := len(s.residualHistory)
 
+	s.RecordReferenceChange(0xAA)
+	s.RecordReferenceChange(0xBB)
 	s.AddRefinementResidualObservation(52_000_000.0, -1.2, 0xBB01, true, 4, 0.5, 0xBB, "go_refiner_active")
 
-	if s.FitEpochID <= prevEpochID {
-		t.Fatalf("fit epoch id=%d, want > %d after reference change", s.FitEpochID, prevEpochID)
+	if s.FitEpochID != prevEpochID {
+		t.Fatalf("fit epoch id=%d, want %d (should not reset on reference change)", s.FitEpochID, prevEpochID)
 	}
-	if s.FitSegmentCount != prevSegmentCount+1 {
-		t.Fatalf("fit segment count=%d, want %d", s.FitSegmentCount, prevSegmentCount+1)
+	if len(s.residualHistory) != prevHistoryLen+1 {
+		t.Fatalf("residual history len=%d, want %d (no observations dropped)", len(s.residualHistory), prevHistoryLen+1)
 	}
-	if s.FitEpochResetReason != "reference_icao_changed" {
-		t.Fatalf("fit epoch reset reason=%q, want reference_icao_changed", s.FitEpochResetReason)
+	if s.ReferenceChangeCount != 1 {
+		t.Fatalf("reference change count=%d, want 1", s.ReferenceChangeCount)
 	}
-	if s.FitDroppedOnEpochReset <= 0 {
-		t.Fatalf("expected dropped observations on epoch reset, got %d", s.FitDroppedOnEpochReset)
+	if s.CurrentReferenceICAO != 0xBB {
+		t.Fatalf("current reference icao=%x, want 0xBB", s.CurrentReferenceICAO)
 	}
-	if s.FitEpochObservationCount != 1 {
-		t.Fatalf("fit epoch observation count=%d, want 1 for new epoch", s.FitEpochObservationCount)
+	if s.PreviousReferenceICAO != 0xAA {
+		t.Fatalf("previous reference icao=%x, want 0xAA", s.PreviousReferenceICAO)
+	}
+	if s.FitObservationsAddedSinceReset < 12 {
+		t.Fatalf("fit observations added since reset=%d, want >= 12", s.FitObservationsAddedSinceReset)
 	}
 }
 
@@ -884,7 +889,7 @@ func TestSyncState_ProposedDeltaClearedOnFitEpochReset(t *testing.T) {
 	}
 	prevProposed := s.ProposedDeltaS
 
-	s.AddRefinementResidualObservation(52_000_000.0, -1.2, 0xBB01, true, 4, 0.5, 0xBB, "go_refiner_active")
+	s.AddRefinementResidualObservation(52_000_000.0, -1.2, 0xBB01, true, 4, 0.5, 0xAA, "go_refiner_holdover")
 
 	if s.FitEpochObservationCount != 1 {
 		t.Fatalf("fit epoch observation count=%d, want 1 after reset", s.FitEpochObservationCount)
