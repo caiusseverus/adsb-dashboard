@@ -30,3 +30,21 @@ def test_radar_page_shows_authority_labels_and_separates_diagnostic_delta():
     assert "Handoff reason" in text
     assert "Blocking gates:" in text
     assert "Go Δ (diagnostic)" in text
+
+
+def test_radar_page_labels_recorded_mode_as_immutable_without_recomputed_fallback_wording():
+    radar_page = Path(__file__).resolve().parents[2] / "frontend" / "src" / "pages" / "RadarPage.jsx"
+    text = radar_page.read_text(encoding="utf-8")
+    assert "Recorded immutable event history" in text
+    assert "Recorded warming up (showing recomputed fallback)" not in text
+    assert "Recorded residual data is unavailable or still insufficient for this IID." in text
+
+
+def test_radar_page_labels_recomputed_mode_as_projection_and_uses_explicit_bases():
+    radar_page = Path(__file__).resolve().parents[2] / "frontend" / "src" / "pages" / "RadarPage.jsx"
+    text = radar_page.read_text(encoding="utf-8")
+    assert "Recomputed current projection" in text
+    assert "recorded event basis" in text
+    assert "RESIDUAL_BASIS_COMPACT_BOOTSTRAP" in text
+    assert "RESIDUAL_BASIS_RUNTIME_EFFECTIVE" in text
+    assert "RESIDUAL_BASIS_GO_RUNTIME_DIAGNOSTIC" in text

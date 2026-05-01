@@ -494,7 +494,7 @@ def test_get_burst_sync_timeline_includes_non_sync_driving_observations():
         monkeypatch.setattr("radar.sweep.time.time", lambda: now_ts)
         timeline = state.get_burst_sync_timeline(7, window_s=60.0)
 
-    observations = timeline["observations"]
+    observations = timeline["recomputed_observations"]
     assert len(observations) == 2
     assert observations[0]["icao"] == "AAAAAA"
     assert observations[0]["sync_update_eligible"] is False
@@ -571,6 +571,10 @@ def test_burst_residual_recorded_events_are_immutable_across_period_change(monke
     assert recorded[1]["effective_period_s"] == pytest.approx(5.0)
     assert recorded[0]["residual_deg"] == pytest.approx(first_recorded["residual_deg"])
     assert recorded[0]["classification"] == first_recorded["classification"]
+    assert recorded[0]["display_residual_class"] == first_recorded["display_residual_class"]
+    assert recorded[0]["source_path"] == "python_bootstrap"
+    assert recorded[0]["phase_basis"] == "sweep_epoch_only"
+    assert recorded[0]["phase_is_absolute"] is False
     assert payload["residual_chart_default_mode"] == "recorded"
     assert len(recomputed) == 2
     assert abs(recomputed[0]["residual_deg"] - recorded[0]["residual_deg"]) > 0.01
@@ -599,6 +603,42 @@ def test_burst_residual_recorded_events_prune_by_window_timestamp():
     payload = state.get_burst_sync_timeline(7, window_s=2.0)
 
     assert [row["icao"] for row in payload["recorded_observations"]] == ["NEW"]
+
+
+def test_recorded_mode_does_not_fall_back_to_recomputed_observations():
+    state = RadarState()
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("radar.sweep.time.time", lambda: 1_000.0)
+        state._live_sync_states[7] = LiveSyncState(
+            iid=7,
+            period_s=4.0,
+            phase_epoch_us=0.0,
+            phase_offset_deg=0.0,
+            sync_quality=1.0,
+            sync_jitter_deg=2.0,
+            last_sync_update_ts=999.0,
+            source="multi_aircraft_burst",
+            usable=True,
+            period_base_s=4.0,
+        )
+        state._live_burst_timeline_obs[7] = deque([
+            AlignedBurstSyncObs(
+                burst_centroid_us=4_000_000.0,
+                icao="AAAAAA",
+                bearing_deg=0.0,
+                n_replies=4,
+                signal_dbfs=-12.0,
+                pos_age_s=0.2,
+                range_nm=20.0,
+                ts=999.0,
+                sync_update_eligible=True,
+            )
+        ], maxlen=state._BURST_SYNC_TIMELINE_OBS_MAX)
+        payload = state.get_burst_sync_timeline(7, window_s=300.0)
+
+    assert payload["observations"] == []
+    assert payload["recorded_observations"] == []
+    assert payload["recomputed_observations"]
 
 
 def test_get_burst_sync_timeline_includes_go_evidence_in_diagnostic_timeline(monkeypatch):
@@ -655,7 +695,7 @@ def test_get_burst_sync_timeline_includes_go_evidence_in_diagnostic_timeline(mon
     monkeypatch.setattr("radar.sweep.time.time", lambda: now_ts)
     timeline = state.get_burst_sync_timeline(7, window_s=60.0)
 
-    observations = timeline["observations"]
+    observations = timeline["recomputed_observations"]
     assert len(observations) == 1
     obs = observations[0]
     assert obs["icao"] == "BBBBBB"
@@ -1196,6 +1236,55 @@ def test_go_diagnostic_delta_not_used_as_canonical_when_python_operational():
     assert payload["period_authority"] in {"py_base", "py_refined"}
 
 
+def test_py_base_cannot_expose_go_runtime_operational_sources():
+    sync = LiveSyncState(
+        iid=153,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1_000.0,
+        source="go_frame_sync",
+        usable=True,
+        period_base_s=4.0,
+        period_authority="py_base",
+        sync_authority="py_bootstrap",
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["period_authority"] == "py_base"
+    assert payload["effective_period_source"] == "python_simple_sync.period_base_s"
+    assert payload["period_delta_source"] == "none"
+    assert payload["operational_source_path"] == "python_bootstrap"
+
+
+def test_go_diagnostic_fields_remain_diagnostic_when_go_is_not_authoritative():
+    sync = LiveSyncState(
+        iid=154,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1_000.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=4.0,
+        period_authority="py_base",
+        sync_authority="py_bootstrap",
+    )
+    payload = sweep._live_sync_state_to_dict(sync, go_sync={
+        "base_period_s": 4.0,
+        "period_delta_s": 0.001,
+        "effective_period_s": 4.001,
+        "period_source": "go_runtime.effective_period_s",
+    })
+    assert payload["period_authority"] == "py_base"
+    assert payload["period_delta_source"] == "none"
+    assert payload["go_diagnostic_period_delta_s"] == pytest.approx(0.001)
+    assert payload["go_diagnostic_period_source"] == "go_runtime.effective_period_s"
+
+
 def test_holdover_and_unavailable_states_are_conservative():
     holdover_sync = LiveSyncState(
         iid=54,
@@ -1370,10 +1459,10 @@ def test_go_sync_snapshot_falls_back_to_sweep_frames_when_burst_evidence_aged_ou
 
     snapshot = state.get_live_sync_snapshot(9, window_s=90.0, debug_limit=20)
 
-    assert snapshot["observations"]
-    assert snapshot["observations"][0]["burst_center_method"] == "go_sweep_frame"
-    assert snapshot["df11_residual_observations"]
-    assert snapshot["df11_residual_observations"][0]["residual_source"] == "go_sweep_frame_compact"
+    assert snapshot["recomputed_observations"]
+    assert snapshot["recomputed_observations"][0]["burst_center_method"] == "go_sweep_frame"
+    assert snapshot["recomputed_df11_residual_observations"]
+    assert snapshot["recomputed_df11_residual_observations"][0]["residual_source"] == "go_sweep_frame_compact"
     assert snapshot["alignment_status"]["reason"] == "go_sweep_frames_projected"
 
 
@@ -1472,9 +1561,9 @@ def test_period_fit_rejects_large_residuals_without_hiding_timeline(monkeypatch)
 
     timeline = state.get_burst_sync_timeline(7, window_s=60.0)
 
-    assert len(timeline["observations"]) == 1
-    assert timeline["observations"][0]["fit_eligible"] is False
-    assert timeline["observations"][0]["fit_reject_reason"] == "residual_gate"
+    assert len(timeline["recomputed_observations"]) == 1
+    assert timeline["recomputed_observations"][0]["fit_eligible"] is False
+    assert timeline["recomputed_observations"][0]["fit_reject_reason"] == "residual_gate"
 
 
 def test_update_rotation_models_defers_recently_stable_iids(monkeypatch):

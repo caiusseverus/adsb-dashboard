@@ -33,8 +33,10 @@ const RADAR_FIELD_AXIS_SHRINK_HOLD_MS = 45_000
 const RADAR_FIELD_AXIS_SHRINK_TIME_CONSTANT_MS = 12_000
 const BURST_SYNC_VIEW_MODE_RESIDUALS = 'burst_sync_residuals'
 const BURST_SYNC_VIEW_MODE_LEGACY = 'legacy_live_df_alignment'
-const RESIDUAL_BASIS_ACTIVE = 'active_authority'
-const RESIDUAL_BASIS_ANCHOR = 'anchor_relative'
+const RESIDUAL_BASIS_RECORDED_EVENT = 'recorded_event_basis'
+const RESIDUAL_BASIS_COMPACT_BOOTSTRAP = 'compact_bootstrap'
+const RESIDUAL_BASIS_RUNTIME_EFFECTIVE = 'runtime_effective'
+const RESIDUAL_BASIS_GO_RUNTIME_DIAGNOSTIC = 'go_runtime_diagnostic'
 const RESIDUAL_CHART_MODE_RECORDED = 'recorded'
 const RESIDUAL_CHART_MODE_RECOMPUTED = 'recomputed'
 function getRadarPageMetricsStore() {
@@ -1881,9 +1883,7 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
   const pythonSync = modeDiagnostics.python_sync ?? {}
   const operationalPeriod = getOperationalPeriodTriple(syncState)
   const authoritySummary = authorityModeLabel(syncState)
-  const goDeltaVisible = syncState.period_delta_source === 'go_runtime_delta'
-    && syncState.effective_period_source !== 'go_runtime.effective_period_s'
-    && Number.isFinite(Number(compact.period_delta_s))
+  const goDeltaVisible = Number.isFinite(Number(syncState.go_diagnostic_period_delta_s))
   return (
     <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
@@ -1945,8 +1945,9 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
             <span className={styles.metricPill}>Fit obs <span className={styles.metricValue}>{pythonSync.fit_eligible_observations ?? 0}/{pythonSync.fit_total_observations ?? 0}</span></span>
             <span className={styles.metricPill}>Anchor-relative phase trust <span className={styles.metricValue}>{phaseStatusDisplayLabel(pythonSync.phase_status_display ?? pythonSync.phase_status)}</span></span>
             {goDeltaVisible && (
-              <span className={styles.metricPill}>Go Δ (diagnostic) <span className={styles.metricValue}>{fmtNumber(Number(compact.period_delta_s) * 1000, 2, 'ms')}</span></span>
+              <span className={styles.metricPill}>Go Δ (diagnostic) <span className={styles.metricValue}>{fmtNumber(Number(syncState.go_diagnostic_period_delta_s) * 1000, 2, 'ms')}</span></span>
             )}
+            <span className={styles.metricPill}>Go source (diagnostic) <span className={styles.metricValue}>{formatAuthorityLabel(syncState.go_diagnostic_period_source)}</span></span>
           </div>
           <div style={{ color: '#8b949e', fontSize: '0.72rem', lineHeight: 1.45 }}>
             Non-operational values in this section do not drive current frame timing or effective period.
@@ -2209,7 +2210,7 @@ function RotationAlignmentPanel({
   const [legacyLoading, setLegacyLoading] = useState(false)
   const [refOverride, setRefOverride] = useState(null)
   const [refOverrideSent, setRefOverrideSent] = useState(false)
-  const [residualBasisMode, setResidualBasisMode] = useState(RESIDUAL_BASIS_ACTIVE)
+  const [residualBasisMode, setResidualBasisMode] = useState(RESIDUAL_BASIS_RUNTIME_EFFECTIVE)
   const timelineCacheRef = useRef(new Map())
   const streamStatus = syncFeedStatus ?? {
     connected: false,
@@ -2276,15 +2277,29 @@ function RotationAlignmentPanel({
   const recordedObservations = Array.isArray(burstTimeline?.recorded_observations)
     ? burstTimeline.recorded_observations
     : (Array.isArray(burstTimeline?.observations) ? burstTimeline.observations : [])
-  const recomputedObservations = Array.isArray(burstTimeline?.recomputed_observations)
-    ? burstTimeline.recomputed_observations
+  const recordedDf11ResidualDots = Array.isArray(burstTimeline?.recorded_df11_residual_observations)
+    ? burstTimeline.recorded_df11_residual_observations
+    : (Array.isArray(burstTimeline?.df11_residual_observations) ? burstTimeline.df11_residual_observations : [])
+  const recomputedObservationsByBasis = burstTimeline?.recomputed_observations_by_basis ?? {}
+  const recomputedDf11ByBasis = burstTimeline?.recomputed_df11_residual_observations_by_basis ?? {}
+  const projectionBasisOptions = Array.isArray(burstTimeline?.projection_basis_options)
+    ? burstTimeline.projection_basis_options
     : []
-  const recordedObservationsForDisplay = recordedObservations.length > 0
-    ? recordedObservations
-    : recomputedObservations
+  const availableRecomputedBasisIds = projectionBasisOptions
+    .filter(option => option?.mode === RESIDUAL_CHART_MODE_RECOMPUTED && option?.available)
+    .map(option => option.id)
+  const activeRecomputedBasis = availableRecomputedBasisIds.includes(residualBasisMode)
+    ? residualBasisMode
+    : (availableRecomputedBasisIds[0] ?? RESIDUAL_BASIS_RUNTIME_EFFECTIVE)
+  const recomputedObservations = Array.isArray(recomputedObservationsByBasis?.[activeRecomputedBasis])
+    ? recomputedObservationsByBasis[activeRecomputedBasis]
+    : (Array.isArray(burstTimeline?.recomputed_observations) ? burstTimeline.recomputed_observations : [])
+  const recomputedDf11ResidualDots = Array.isArray(recomputedDf11ByBasis?.[activeRecomputedBasis])
+    ? recomputedDf11ByBasis[activeRecomputedBasis]
+    : []
   const observations = residualChartMode === RESIDUAL_CHART_MODE_RECOMPUTED
     ? recomputedObservations
-    : recordedObservationsForDisplay
+    : recordedObservations
   const alignmentStatus = burstTimeline?.alignment_status ?? null
   const syncModeDiagnostics = burstTimeline?.sync_mode_diagnostics ?? null
   const burstSyncDiagnostic = burstTimeline?.burst_sync_diagnostic ?? null
@@ -2302,12 +2317,12 @@ function RotationAlignmentPanel({
     const value = Number(obs?.beam_center_us ?? 0)
     return Number.isFinite(value) ? Math.max(max, value) : max
   }, 0)
-  const latestDf11ResidualUs = Array.isArray(burstTimeline?.df11_residual_observations)
-    ? burstTimeline.df11_residual_observations.reduce((max, dot) => {
+  const latestDf11ResidualUs = (residualChartMode === RESIDUAL_CHART_MODE_RECOMPUTED
+    ? recomputedDf11ResidualDots
+    : recordedDf11ResidualDots).reduce((max, dot) => {
         const value = Number(dot?.arrival_beast_us ?? 0)
         return Number.isFinite(value) ? Math.max(max, value) : max
       }, 0)
-    : 0
   const timingNowUs = Number(timingView?.nowUs ?? 0)
   const windowSpanUs = Math.max(
     10 * 1_000_000,
@@ -2323,39 +2338,31 @@ function RotationAlignmentPanel({
   // Frontend residual math (predictBearingFromSyncModel / wrapSignedResidualDeg) is
   // no longer used for this chart — residual_deg and timing_class come from the backend.
   const df11ResidualDots = useMemo(() => {
-    const backendDots = Array.isArray(burstTimeline?.df11_residual_observations)
-      ? burstTimeline.df11_residual_observations
-      : []
+    const backendDots = residualChartMode === RESIDUAL_CHART_MODE_RECOMPUTED
+      ? recomputedDf11ResidualDots
+      : recordedDf11ResidualDots
     return backendDots.filter(dot => {
       const sampleUs = Number(dot?.arrival_beast_us ?? 0)
       if (!Number.isFinite(sampleUs) || sampleUs < windowStartUs || sampleUs > windowEndUs) return false
       if (selectedIcao && dot.icao !== selectedIcao) return false
       return true
     })
-  }, [burstTimeline?.df11_residual_observations, selectedIcao, windowEndUs, windowStartUs])
+  }, [recomputedDf11ResidualDots, recordedDf11ResidualDots, residualChartMode, selectedIcao, windowEndUs, windowStartUs])
   const filteredObservations = observations.filter(obs => {
     const sampleUs = Number(obs?.beam_center_us ?? 0)
     if (!Number.isFinite(sampleUs) || sampleUs < windowStartUs || sampleUs > windowEndUs) return false
     if (selectedIcao && obs?.icao !== selectedIcao) return false
     return true
   })
-  const activeAuthorityMode = syncModeDiagnostics?.active_mode ?? syncState?.source ?? 'compact_bootstrap'
-  const candidateAnchorIcao = syncState?.phase_anchor_icao
-  const selectedIcaoIsAnchor = Boolean(selectedIcao && candidateAnchorIcao && selectedIcao === candidateAnchorIcao)
-  const hasAnchorRelativeResiduals = filteredObservations.some(obs => Number.isFinite(Number(obs?.anchor_relative_phase_error_deg)))
-  const anchorRelativeBasisAvailable = Boolean(selectedIcaoIsAnchor && hasAnchorRelativeResiduals)
-  const anchorRelativeResidualFrame = residualBasisMode === RESIDUAL_BASIS_ANCHOR && anchorRelativeBasisAvailable
-  const displayedResidualBasis = anchorRelativeResidualFrame ? 'refined_candidate_anchor' : activeAuthorityMode
-  const burstResidualValue = (obs) => {
-    if (anchorRelativeResidualFrame && Number.isFinite(Number(obs?.anchor_relative_phase_error_deg))) {
-      return Number(obs.anchor_relative_phase_error_deg)
-    }
-    return Number(obs?.residual_deg)
-  }
-  const burstResidualLabel = anchorRelativeResidualFrame
-    ? 'refined candidate-anchor residual'
-    : `${activeAuthorityMode} residual`
-  const visibleDf11ResidualDots = anchorRelativeResidualFrame ? [] : df11ResidualDots
+  const activeProjectionOption = projectionBasisOptions.find(option => option?.id === activeRecomputedBasis)
+  const displayedResidualBasis = residualChartMode === RESIDUAL_CHART_MODE_RECORDED
+    ? 'recorded event basis'
+    : (activeProjectionOption?.label ?? activeRecomputedBasis)
+  const burstResidualValue = (obs) => Number(obs?.residual_deg)
+  const burstResidualLabel = residualChartMode === RESIDUAL_CHART_MODE_RECORDED
+    ? 'recorded event residual'
+    : `${displayedResidualBasis} residual`
+  const visibleDf11ResidualDots = df11ResidualDots
   const inlierCount = filteredObservations.filter(obs => obs.classification === 'inlier').length
   const softCount = filteredObservations.filter(obs => obs.classification === 'soft').length
   const rejectedCount = filteredObservations.filter(obs => obs.classification === 'rejected').length
@@ -2388,10 +2395,14 @@ function RotationAlignmentPanel({
   }, [observations, sortedLegacyIcaos])
 
   useEffect(() => {
-    if (residualBasisMode === RESIDUAL_BASIS_ANCHOR && !anchorRelativeBasisAvailable) {
-      setResidualBasisMode(RESIDUAL_BASIS_ACTIVE)
+    if (residualChartMode === RESIDUAL_CHART_MODE_RECORDED) {
+      setResidualBasisMode(RESIDUAL_BASIS_RECORDED_EVENT)
+      return
     }
-  }, [anchorRelativeBasisAvailable, residualBasisMode])
+    if (!availableRecomputedBasisIds.includes(residualBasisMode)) {
+      setResidualBasisMode(availableRecomputedBasisIds[0] ?? RESIDUAL_BASIS_RUNTIME_EFFECTIVE)
+    }
+  }, [availableRecomputedBasisIds, residualBasisMode, residualChartMode])
 
   async function handleReset() {
     if (iid == null || resetting) return
@@ -2466,9 +2477,7 @@ function RotationAlignmentPanel({
       key: `${obs?.icao ?? 'unknown'}-${Number(obs?.beam_center_us ?? obs?.raw_arrival_us ?? 0)}-${Number(obs?.residual_deg ?? 0).toFixed(3)}`,
       phaseDeg: Number(obs?.bearing_deg),
       residualDeg: burstResidualValue(obs),
-      residualCorrectedDeg: anchorRelativeResidualFrame
-        ? burstResidualValue(obs)
-        : Number(obs?.residual_corrected_deg ?? obs?.residual_deg),
+      residualCorrectedDeg: Number(obs?.residual_corrected_deg ?? obs?.residual_deg),
       classification: obs?.classification,
       icao: obs?.icao,
       bearingDeg: Number(obs?.bearing_deg),
@@ -2563,7 +2572,7 @@ function RotationAlignmentPanel({
           <div className={styles.cardTitle}>Burst Sync Alignment</div>
           <div className={styles.sectionLead}>
             {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS
-              ? `Burst-centre residuals are shown in the selected basis: ${displayedResidualBasis}. DF11 dots are shown only in active-authority mode.`
+              ? `Chart mode: ${residualChartMode === RESIDUAL_CHART_MODE_RECORDED ? 'Recorded immutable event history' : 'Recomputed current projection'}. Residual basis: ${displayedResidualBasis}.`
               : 'Legacy view: per-aircraft live DF alignment across the rolling window for broad multi-aircraft timing context.'}
           </div>
         </div>
@@ -2636,10 +2645,10 @@ function RotationAlignmentPanel({
             </span>
           )}
           {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS && (
-            <span className={styles.metricPill} title="Choose whether residual plots show the operational authority frame or the diagnostic selected-anchor-relative frame.">
+            <span className={styles.metricPill} title="Recorded mode always uses stored event values. Recomputed mode projects retained events against the selected current model basis.">
               Residual basis
               <select
-                value={residualBasisMode}
+                value={residualChartMode === RESIDUAL_CHART_MODE_RECORDED ? RESIDUAL_BASIS_RECORDED_EVENT : activeRecomputedBasis}
                 onChange={e => setResidualBasisMode(e.target.value)}
                 style={{
                   background: 'transparent',
@@ -2651,8 +2660,13 @@ function RotationAlignmentPanel({
                   padding: '1px 3px',
                 }}
               >
-                <option value={RESIDUAL_BASIS_ACTIVE}>{activeAuthorityMode}</option>
-                <option value={RESIDUAL_BASIS_ANCHOR} disabled={!anchorRelativeBasisAvailable}>refined_candidate_anchor</option>
+                {residualChartMode === RESIDUAL_CHART_MODE_RECORDED ? (
+                  <option value={RESIDUAL_BASIS_RECORDED_EVENT}>recorded event basis</option>
+                ) : projectionBasisOptions
+                  .filter(option => option?.mode === RESIDUAL_CHART_MODE_RECOMPUTED)
+                  .map(option => (
+                    <option key={option.id} value={option.id} disabled={!option.available}>{option.label}</option>
+                  ))}
               </select>
             </span>
           )}
@@ -2667,15 +2681,12 @@ function RotationAlignmentPanel({
           </span>
           {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS && residualChartMode === RESIDUAL_CHART_MODE_RECOMPUTED && (
             <span className={styles.metricPill} style={{ color: '#d29922' }}>
-              Recomputed projection
+              Recomputed current projection
             </span>
           )}
-          {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS
-            && residualChartMode === RESIDUAL_CHART_MODE_RECORDED
-            && recordedObservations.length === 0
-            && recomputedObservations.length > 0 && (
-            <span className={styles.metricPill} style={{ color: '#d29922' }}>
-              Recorded warming up (showing recomputed fallback)
+          {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS && residualChartMode === RESIDUAL_CHART_MODE_RECORDED && (
+            <span className={styles.metricPill} style={{ color: '#3fb950' }}>
+              Recorded immutable event history
             </span>
           )}
           <span className={styles.metricPill} title="Short local solver window used for fitting only.">
@@ -2731,7 +2742,7 @@ function RotationAlignmentPanel({
           <span className={styles.metricPill}>Phase absolute? <span className={styles.metricValue}>{syncState?.phase_is_absolute ? 'yes' : 'no'}</span></span>
           <span className={styles.metricPill}>Anchor ICAO <span className={styles.metricValue}>{syncState?.phase_anchor_icao ?? '—'}</span></span>
           <span className={styles.metricPill}>Anchor age <span className={styles.metricValue}>{syncState?.phase_anchor_since_ts ? `${Math.max(0, (Date.now() / 1000) - Number(syncState.phase_anchor_since_ts)).toFixed(0)}s` : '—'}</span></span>
-          <span className={styles.metricPill}>Residual source <span className={styles.metricValue}>{burstTimeline?.residual_chart_default_mode ?? '—'}</span></span>
+          <span className={styles.metricPill}>Chart semantics <span className={styles.metricValue}>{residualChartMode === RESIDUAL_CHART_MODE_RECORDED ? 'immutable' : 'reprojected'}</span></span>
           <span className={styles.metricPill}>Diag: convergence <span className={styles.metricValue}>{syncState?.fit_observation_count != null ? `${syncState.fit_observation_count} obs / ${fmtNumber(syncState.fit_span_s, 1, 's')}` : '—'}</span></span>
           <span className={styles.metricPill}>Diag: fit ICAOs <span className={styles.metricValue}>{syncState?.fit_icao_count ?? '—'}</span></span>
           <span className={styles.metricPill}>Diag: obs/ICAO min|med|max <span className={styles.metricValue}>
@@ -2844,10 +2855,12 @@ function RotationAlignmentPanel({
           {filteredObservations.length === 0 && visibleDf11ResidualDots.length === 0 ? (
             <div className={styles.empty}>
               <div>
-                {alignmentStatus?.detail
-                  ?? (syncState
-                    ? 'No burst-sync or DF11 residual data yet for this IID.'
-                    : 'Waiting for a maintained sync model before backend DF11 residual dots can be computed.')}
+                {residualChartMode === RESIDUAL_CHART_MODE_RECORDED
+                  ? 'Recorded residual data is unavailable or still insufficient for this IID.'
+                  : (alignmentStatus?.detail
+                    ?? (syncState
+                      ? 'No recomputed burst-sync or DF11 residual data yet for this IID.'
+                      : 'Waiting for a maintained sync model before recomputed residual projections can be built.'))}
               </div>
               {burstSyncDiagnostic && (
                 <div style={{ marginTop: '0.5rem', fontSize: '0.74rem', color: '#8b949e', fontFamily: 'SFMono-Regular, Consolas, monospace' }}>
@@ -2999,9 +3012,9 @@ function RotationAlignmentPanel({
                     )
                   })}
                   <text x={padL + plotW / 2} y={18} textAnchor="middle" className={styles.axisLabel}>
-                    {anchorRelativeResidualFrame
-                      ? 'Burst-centre residuals — basis refined_candidate_anchor'
-                      : `Burst-centre and DF11 residuals — basis ${activeAuthorityMode}`}
+                    {residualChartMode === RESIDUAL_CHART_MODE_RECORDED
+                      ? 'Burst-centre and DF11 residuals — recorded event basis'
+                      : `Burst-centre and DF11 residuals — ${displayedResidualBasis}`}
                   </text>
                   <text x={padL + plotW / 2} y={chartH - 4} textAnchor="middle" className={styles.axisLabel}>
                     Elapsed seconds across rolling window
@@ -3022,7 +3035,7 @@ function RotationAlignmentPanel({
                           opacity={0.62}
                         >
                           <title>
-                            {`${dot.icao ?? 'DF11'} ${(dot.timing_class ?? '').replace('_', ' ')} ${activeAuthorityMode} residual ${Number(dot.residual_deg ?? 0).toFixed(2)}° (backend)`}
+                            {`${dot.icao ?? 'DF11'} ${(dot.timing_class ?? '').replace('_', ' ')} ${displayedResidualBasis} residual ${Number(dot.residual_deg ?? 0).toFixed(2)}°`}
                           </title>
                         </circle>
                       ))
@@ -3058,7 +3071,7 @@ function RotationAlignmentPanel({
                 Burst inlier {inlierCount} · Soft {softCount} · Rejected {rejectedCount}
                 {' · '}Sync-driving bursts {syncDrivingCount}
                 {nonSyncDrivingCount > 0 ? ` · Non-sync-driving bursts ${nonSyncDrivingCount}` : ''}
-                {anchorRelativeResidualFrame ? ' · DF11 hidden in anchor-relative frame' : ` · DF11 early ${dfEarlyCount} · on time ${dfOnTimeCount} · late ${dfLateCount}`}
+                {` · DF11 early ${dfEarlyCount} · on time ${dfOnTimeCount} · late ${dfLateCount}`}
                 {syncState?.sync_jitter_deg != null ? ` · Sync jitter ±${syncState.sync_jitter_deg.toFixed(1)}°` : ''}
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))', gap: '12px', marginTop: '0.8rem' }}>
@@ -3107,10 +3120,10 @@ function RotationAlignmentPanel({
                       )
                     })}
                     <text x={phasePadL + phasePlotW / 2} y={18} textAnchor="middle" className={styles.axisLabel}>
-                      {anchorRelativeResidualFrame ? 'Folded residual vs bearing — basis refined_candidate_anchor' : `Folded residual vs bearing — basis ${activeAuthorityMode}`}
+                      {`Folded residual vs bearing — ${displayedResidualBasis}`}
                     </text>
                     <text x={phasePadL + phasePlotW / 2} y={phaseChartH - 4} textAnchor="middle" className={styles.axisLabel}>
-                      {anchorRelativeResidualFrame ? 'Selected candidate-anchor frame' : 'Static 0-360° rotation domain'}
+                      {'Static 0-360° rotation domain'}
                     </text>
                     {phaseResidualRows.map(row => (
                       <circle
@@ -3182,10 +3195,10 @@ function RotationAlignmentPanel({
                       )
                     })}
                     <text x={phasePadL + phasePlotW / 2} y={18} textAnchor="middle" className={styles.axisLabel}>
-                      {anchorRelativeResidualFrame ? 'Residual vs range — basis refined_candidate_anchor' : `Residual vs range — basis ${activeAuthorityMode}`}
+                      {`Residual vs range — ${displayedResidualBasis}`}
                     </text>
                     <text x={phasePadL + phasePlotW / 2} y={auxChartH - 4} textAnchor="middle" className={styles.axisLabel}>
-                      {anchorRelativeResidualFrame ? 'Selected candidate-anchor residual by aircraft range' : 'Corrected residual by aircraft range'}
+                      {'Corrected residual by aircraft range'}
                     </text>
                     {rangeResidualRows.map(row => (
                       <circle

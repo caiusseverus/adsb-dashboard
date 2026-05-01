@@ -260,7 +260,100 @@ def _get_authoritative_radar_position(model: RadarIID) -> dict:
     return get_authoritative_radar_position(model)
 
 
-def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
+def _source_path_from_period_authority(period_authority: str) -> str:
+    if period_authority == "py_base":
+        return "python_bootstrap"
+    if period_authority == "py_refined":
+        return "python_refined"
+    if period_authority == "go_refined":
+        return "go_runtime"
+    if period_authority == "holdover":
+        return "holdover"
+    return "unavailable"
+
+
+def _build_go_diagnostic_fields(
+    sync: "LiveSyncState",
+    go_sync: dict | None = None,
+) -> dict:
+    go_payload = dict(go_sync or {})
+    if not go_payload and str(getattr(sync, "source", "") or "") == "go_frame_sync":
+        go_payload = {
+            "base_period_s": getattr(sync, "period_base_s", None),
+            "period_delta_s": (
+                (float(getattr(sync, "period_s", 0.0) or 0.0) - float(getattr(sync, "period_base_s", 0.0) or 0.0))
+                if _is_finite_number(getattr(sync, "period_s", None)) and _is_finite_number(getattr(sync, "period_base_s", None))
+                else None
+            ),
+            "effective_period_s": getattr(sync, "period_s", None),
+            "period_source": "go_runtime.effective_period_s",
+            "fit_observation_count": getattr(sync, "fit_total_observations", None),
+            "fit_span_s": getattr(sync, "fit_span_s", None),
+            "fit_icao_count": getattr(sync, "fit_icao_count", None),
+            "residual_slope_deg_per_s": getattr(sync, "residual_slope_deg_per_s", None),
+            "holdover": getattr(sync, "holdover", None),
+            "holdover_reason": getattr(sync, "holdover_reason", None),
+            "last_updated": getattr(sync, "last_sync_update_ts", None),
+        }
+    base_period_s = go_payload.get("base_period_s")
+    period_delta_s = go_payload.get("period_delta_s")
+    effective_period_s = go_payload.get("effective_period_s")
+    if effective_period_s is None and _is_finite_number(go_payload.get("period_s")):
+        effective_period_s = go_payload.get("period_s")
+    if (
+        period_delta_s is None
+        and _is_finite_number(base_period_s)
+        and _is_finite_number(effective_period_s)
+    ):
+        period_delta_s = float(effective_period_s) - float(base_period_s)
+    return {
+        "go_diagnostic_base_period_s": float(base_period_s) if _is_finite_number(base_period_s) else None,
+        "go_diagnostic_period_delta_s": float(period_delta_s) if _is_finite_number(period_delta_s) else None,
+        "go_diagnostic_effective_period_s": float(effective_period_s) if _is_finite_number(effective_period_s) else None,
+        "go_diagnostic_period_source": go_payload.get("period_source") or None,
+        "go_diagnostic_refinement_status": (
+            "holdover"
+            if go_payload.get("holdover")
+            else "stable" if _is_finite_number(effective_period_s)
+            else "unavailable"
+        ),
+        "go_diagnostic_fit_observation_count": go_payload.get("fit_observation_count"),
+        "go_diagnostic_fit_span_s": go_payload.get("fit_span_s"),
+        "go_diagnostic_fit_icao_count": go_payload.get("fit_icao_count"),
+        "go_diagnostic_residual_slope_deg_per_s": go_payload.get("residual_slope_deg_per_s"),
+        "go_diagnostic_holdover": go_payload.get("holdover"),
+        "go_diagnostic_holdover_reason": go_payload.get("holdover_reason"),
+        "go_diagnostic_last_updated": go_payload.get("last_updated"),
+    }
+
+
+def _clone_sync_for_projection(
+    sync: "LiveSyncState",
+    *,
+    period_s: float,
+    period_base_s: float,
+    phase_epoch_us: float | None = None,
+    phase_offset_deg: float | None = None,
+    source: str | None = None,
+    usable: bool = True,
+) -> "LiveSyncState":
+    import dataclasses
+
+    return dataclasses.replace(
+        sync,
+        period_s=float(period_s),
+        period_base_s=float(period_base_s),
+        base_period_s=float(period_base_s),
+        period_delta_s=float(period_s) - float(period_base_s),
+        effective_period_s=float(period_s),
+        phase_epoch_us=float(phase_epoch_us) if phase_epoch_us is not None else sync.phase_epoch_us,
+        phase_offset_deg=float(phase_offset_deg) if phase_offset_deg is not None else sync.phase_offset_deg,
+        source=source or sync.source,
+        usable=usable,
+    )
+
+
+def _live_sync_state_to_dict(sync: "LiveSyncState", go_sync: dict | None = None) -> dict:
     """Serialise a LiveSyncState to a plain dict for API/verification payloads.
 
     Exposed phase metadata is anchor-relative/sweep-relative in current stages.
@@ -293,26 +386,7 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
     has_period_delta = period_base_s > 0.0 and abs(period_s - period_base_s) > 1e-12
 
     period_delta_source = "none"
-    if has_period_delta and source == "multi_aircraft_burst":
-        period_delta_source = "python_simple_sync_delta"
-    elif has_period_delta and source == "go_frame_sync":
-        period_delta_source = "go_runtime_delta"
-
     effective_period_source = "none"
-    if source == "multi_aircraft_burst":
-        effective_period_source = (
-            "python_simple_sync.period_s"
-            if has_period_delta else
-            "python_simple_sync.period_base_s"
-        )
-    elif source == "go_frame_sync":
-        effective_period_source = (
-            "go_runtime.effective_period_s"
-            if has_period_delta else
-            "go_runtime.base_period_s"
-        )
-    elif source == "sweep_frame":
-        effective_period_source = "sweep_frame.period_s"
 
     fit_observation_count = int(getattr(sync, "fit_total_observations", 0) or 0)
     fit_span_raw = getattr(sync, "fit_span_s", None)
@@ -398,6 +472,52 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
         effective_period_s = None
         period_delta_s = None
 
+    if period_authority == "py_base":
+        if base_period_s is not None:
+            effective_period_s = base_period_s
+        period_delta_s = 0.0 if base_period_s is not None else None
+        period_delta_source = "none"
+        effective_period_source = "python_simple_sync.period_base_s"
+    elif period_authority == "py_refined":
+        if base_period_s is not None and effective_period_s is not None:
+            period_delta_s = effective_period_s - base_period_s
+        period_delta_source = "python_simple_sync_delta" if period_delta_s is not None and abs(period_delta_s) > _CANONICAL_PERIOD_INVARIANT_TOL_S else "none"
+        effective_period_source = (
+            "python_simple_sync.period_s"
+            if period_delta_source != "none"
+            else "python_simple_sync.period_base_s"
+        )
+    elif period_authority == "go_refined":
+        if base_period_s is not None and effective_period_s is not None and period_delta_s is None:
+            period_delta_s = effective_period_s - base_period_s
+        period_delta_source = "go_runtime_delta" if period_delta_s is not None and abs(period_delta_s) > _CANONICAL_PERIOD_INVARIANT_TOL_S else "none"
+        effective_period_source = (
+            "go_runtime.effective_period_s"
+            if period_delta_source != "none"
+            else "go_runtime.base_period_s"
+        )
+    elif period_authority in {"holdover", "unavailable"}:
+        period_delta_source = "none"
+        effective_period_source = "none"
+
+    consistency_warnings: list[str] = []
+    if period_authority == "py_base" and effective_period_source.startswith("go_runtime"):
+        consistency_warnings.append("operational_effective_period_source_demoted_from_go_runtime_for_py_base")
+        effective_period_source = "python_simple_sync.period_base_s"
+        period_delta_source = "none"
+        period_delta_s = 0.0 if base_period_s is not None else None
+        if base_period_s is not None:
+            effective_period_s = base_period_s
+    elif period_authority == "py_refined" and effective_period_source.startswith("go_runtime"):
+        consistency_warnings.append("operational_effective_period_source_demoted_from_go_runtime_for_py_refined")
+        effective_period_source = "python_simple_sync.period_s"
+        period_delta_source = "python_simple_sync_delta" if period_delta_s is not None and abs(period_delta_s) > _CANONICAL_PERIOD_INVARIANT_TOL_S else "none"
+    elif period_authority != "go_refined" and period_delta_source == "go_runtime_delta":
+        consistency_warnings.append("operational_period_delta_source_demoted_from_go_runtime_delta")
+        period_delta_source = "none" if period_authority == "py_base" else "python_simple_sync_delta" if period_authority == "py_refined" else "none"
+    for warning in consistency_warnings:
+        log.warning("sync source consistency warning for iid=%s: %s", getattr(sync, "iid", None), warning)
+
     if (
         base_period_s is not None
         and effective_period_s is not None
@@ -466,6 +586,8 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
         "fit_span_s": fit_span_s,
         "slope_sign_convention": slope_sign_convention,
         "effective_period_source": effective_period_source,
+        "operational_source_path": _source_path_from_period_authority(period_authority),
+        "consistency_warnings": consistency_warnings,
         "fit_icao_count": getattr(sync, "fit_icao_count", None),
         "fit_observations_per_icao_min": getattr(sync, "fit_observations_per_icao_min", None),
         "fit_observations_per_icao_median": getattr(sync, "fit_observations_per_icao_median", None),
@@ -508,6 +630,7 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
         "update_epoch_reject_insufficient_aircraft": getattr(sync, "update_epoch_reject_insufficient_aircraft", None),
         "update_epoch_last_strict_gate_pass": getattr(sync, "update_epoch_last_strict_gate_pass", None),
     })
+    payload.update(_build_go_diagnostic_fields(sync, go_sync=go_sync))
     return payload
 
 
@@ -889,6 +1012,7 @@ class RadarState:
         self._LIVE_BURST_RESIDUAL_EVENTS_RETENTION_S = 360.0
         self._BURST_SYNC_RESIDUAL_EVENTS_MAX = 12_000
         self._live_burst_residual_events: dict[int, deque] = {}  # {iid: deque[dict]}
+        self._live_df11_recorded_residual_events: dict[int, deque] = {}  # {iid: deque[dict]}
         # Bounded buffer of recent Stage 3-usable live detections.
         # One entry per fired burst; Stage 3 solver queries with max_age_s=30.
         # At Pi density (~50 aircraft, 15 bursts/min each = ~12/s × 30s ≈ 375 entries).
@@ -1031,6 +1155,7 @@ class RadarState:
                 self._flash_seq += 1
                 self._flash_events.append((self._flash_seq, iid, icao_hex, int(arrival_us)))
 
+            self._record_df11_residual_snapshot(iid, icao_hex, arrival_us, signal_dbfs)
             # Live frame building — process each DF11 as it arrives.
             self._on_df11_frame_builder(iid, icao_hex, arrival_us, signal_dbfs)
 
@@ -1060,6 +1185,8 @@ class RadarState:
             self._live_burst_timeline_obs[iid] = deque(maxlen=self._BURST_SYNC_TIMELINE_OBS_MAX)
         if iid not in self._live_burst_residual_events:
             self._live_burst_residual_events[iid] = deque(maxlen=self._BURST_SYNC_RESIDUAL_EVENTS_MAX)
+        if iid not in self._live_df11_recorded_residual_events:
+            self._live_df11_recorded_residual_events[iid] = deque(maxlen=self._BURST_SYNC_RESIDUAL_EVENTS_MAX)
 
     @staticmethod
     def _density_scaled_cap(
@@ -1842,6 +1969,8 @@ class RadarState:
                     self._iid_latest_arrival_us[iid] = arrival_us
                     self._dirty_iids.add(iid)
             append_s = time.perf_counter() - t_append
+            for iid, icao_hex, signal_dbfs, arrival_us in prepared:
+                self._record_df11_residual_snapshot(iid, icao_hex, arrival_us, signal_dbfs)
 
             # In radar-core mode Go owns DF11 burst detection; skip Python's
             # accumulator entirely.  _iid_events and _dirty_iids (above) are
@@ -3645,7 +3774,170 @@ class RadarState:
                 "reference_icao": getattr(getattr(self._models.get(iid), "reference_aircraft", None), "ref_icao", None),
                 "sync_revision": int(self._go_sync_diagnostic_history_revision.get(iid, 0)),
             })
+            sync_snapshot = _live_sync_state_to_dict(sync, go_sync=dict(self._go_sync_states_by_iid.get(iid) or {}))
+            event_buf[-1] = self._build_recorded_residual_event(
+                iid=iid,
+                icao=icao,
+                wall_ts=obs.ts,
+                arrival_beast_us=obs.raw_arrival_us,
+                beam_center_us=obs.burst_centroid_us,
+                centroid_timestamp_us=obs.burst_centroid_us,
+                residual_deg=residual_deg,
+                display_residual_class=f"burst_{residual_class}",
+                sync_snapshot=sync_snapshot,
+                sync_revision=int(self._go_sync_diagnostic_history_revision.get(iid, 0)),
+                reject_reason=fit_reject_reason,
+                predicted_deg=prediction.predicted_bearing_deg,
+                bearing_deg=obs.bearing_deg,
+                range_nm=obs.range_nm,
+                n_replies=obs.n_replies,
+                signal_dbfs=obs.signal_dbfs,
+                sync_update_eligible=bool(sync_update_eligible),
+                fit_eligible=bool(fit_eligible),
+                classification=residual_class,
+                timing_class=timing_class,
+                event_kind="burst",
+            )
             self._prune_burst_residual_event_buffer(event_buf, now_ts=obs.ts)
+
+    def _build_recorded_residual_event(
+        self,
+        *,
+        iid: int,
+        icao: str,
+        wall_ts: float,
+        arrival_beast_us: float,
+        beam_center_us: float,
+        centroid_timestamp_us: float,
+        residual_deg: float,
+        display_residual_class: str,
+        sync_snapshot: dict,
+        sync_revision: int,
+        reject_reason: str | None,
+        predicted_deg: float | None,
+        bearing_deg: float | None,
+        range_nm: float | None,
+        n_replies: int | None,
+        signal_dbfs: float | None,
+        sync_update_eligible: bool,
+        fit_eligible: bool,
+        classification: str | None,
+        timing_class: str | None,
+        event_kind: str,
+    ) -> dict:
+        return {
+            "event_kind": event_kind,
+            "wall_ts": float(wall_ts),
+            "arrival_beast_us": float(arrival_beast_us),
+            "beam_center_us": float(beam_center_us),
+            "iid": int(iid),
+            "icao": str(icao),
+            "centroid_timestamp_us": float(centroid_timestamp_us),
+            "residual_deg": float(residual_deg),
+            "residual_basis": "runtime_effective",
+            "display_residual_class": display_residual_class,
+            "classification": classification,
+            "timing_class": timing_class,
+            "bearing_deg": float(bearing_deg) if bearing_deg is not None else None,
+            "predicted_deg": float(predicted_deg) if predicted_deg is not None else None,
+            "range_nm": float(range_nm) if range_nm is not None else None,
+            "n_replies": int(n_replies) if n_replies is not None else None,
+            "signal_dbfs": float(signal_dbfs) if signal_dbfs is not None else None,
+            "sync_update_eligible": bool(sync_update_eligible),
+            "fit_eligible": bool(fit_eligible),
+            "refinement_status": sync_snapshot.get("period_refinement_status"),
+            "reject_reason": reject_reason,
+            "base_period_s": sync_snapshot.get("base_period_s"),
+            "period_delta_s": sync_snapshot.get("period_delta_s"),
+            "effective_period_s": sync_snapshot.get("effective_period_s"),
+            "period_authority": sync_snapshot.get("period_authority"),
+            "sync_authority": sync_snapshot.get("sync_authority"),
+            "phase_authority": sync_snapshot.get("phase_authority"),
+            "phase_basis": sync_snapshot.get("phase_basis"),
+            "phase_is_absolute": bool(sync_snapshot.get("phase_is_absolute", False)),
+            "phase_epoch_us": float(sync_snapshot.get("phase_epoch_us") or 0.0),
+            "phase_offset_deg": float(sync_snapshot.get("phase_offset_deg") or 0.0),
+            "effective_period_source": sync_snapshot.get("effective_period_source"),
+            "period_delta_source": sync_snapshot.get("period_delta_source"),
+            "source_path": sync_snapshot.get("operational_source_path"),
+            "handoff_state": sync_snapshot.get("handoff_state"),
+            "handoff_reason": sync_snapshot.get("handoff_reason"),
+            "sync_revision": int(sync_revision),
+        }
+
+    def _record_df11_residual_snapshot(
+        self,
+        iid: int,
+        icao: str,
+        arrival_us: float,
+        signal_dbfs: float | None,
+    ) -> None:
+        with self._lock:
+            sync = self._live_sync_states.get(iid)
+            latest_arrival_us = self._iid_latest_arrival_us.get(iid)
+            go_sync = dict(self._go_sync_states_by_iid.get(iid) or {})
+        if sync is None or not getattr(sync, "usable", False):
+            return
+        wall_ts = self._estimate_wall_time_from_arrival_us(arrival_us, latest_arrival_us)
+        if wall_ts is None:
+            return
+        pos = self._adsb_tracker.get_position_at(icao, wall_ts)
+        if pos is None or pos.get("lat") is None or pos.get("lon") is None:
+            return
+        receiver_lat = self._receiver_lat
+        receiver_lon = self._receiver_lon
+        if receiver_lat is None or receiver_lon is None:
+            return
+        truth_lat = pos["lat"]
+        truth_lon = pos["lon"]
+        bearing_deg = _bearing_deg_simple(receiver_lat, receiver_lon, truth_lat, truth_lon)
+        range_nm = _haversine_nm_simple(receiver_lat, receiver_lon, truth_lat, truth_lon)
+        prediction = predict_sync_observation(
+            sync,
+            arrival_us,
+            range_nm=range_nm,
+            bearing_rate_deg_s=None,
+            motion_comp_dt_us=None,
+            motion_comp_block_reason="individual_df11_arrival",
+        )
+        residual_deg = (bearing_deg - prediction.predicted_bearing_deg + 540.0) % 360.0 - 180.0
+        abs_res = abs(residual_deg)
+        if abs_res <= _DF11_RESIDUAL_ON_TIME_THRESHOLD_DEG:
+            timing_class = "on_time"
+        elif residual_deg > 0:
+            timing_class = "early"
+        else:
+            timing_class = "late"
+        sync_snapshot = _live_sync_state_to_dict(sync, go_sync=go_sync)
+        event = self._build_recorded_residual_event(
+            iid=iid,
+            icao=icao,
+            wall_ts=wall_ts,
+            arrival_beast_us=arrival_us,
+            beam_center_us=arrival_us,
+            centroid_timestamp_us=arrival_us,
+            residual_deg=residual_deg,
+            display_residual_class=f"df11_{timing_class}",
+            sync_snapshot=sync_snapshot,
+            sync_revision=int(self._go_sync_diagnostic_history_revision.get(iid, 0)),
+            reject_reason="individual_df11_arrival",
+            predicted_deg=prediction.predicted_bearing_deg,
+            bearing_deg=bearing_deg,
+            range_nm=range_nm,
+            n_replies=1,
+            signal_dbfs=signal_dbfs,
+            sync_update_eligible=False,
+            fit_eligible=False,
+            classification=None,
+            timing_class=timing_class,
+            event_kind="df11",
+        )
+        with self._lock:
+            event_buf = self._live_df11_recorded_residual_events.setdefault(
+                iid, deque(maxlen=self._BURST_SYNC_RESIDUAL_EVENTS_MAX)
+            )
+            event_buf.append(event)
+            self._prune_burst_residual_event_buffer(event_buf, now_ts=wall_ts)
 
     @staticmethod
     def _score_sync_burst_observation(obs: AlignedBurstSyncObs) -> float:
@@ -5119,6 +5411,7 @@ class RadarState:
                                self._live_aligned_burst_obs,
                                self._live_burst_timeline_obs,
                                self._live_burst_residual_events,
+                               self._live_df11_recorded_residual_events,
                                self._live_sync_states,
                                self._last_simple_sync_update_ts,
                                self._live_icao_sync_quality,
@@ -5279,6 +5572,7 @@ class RadarState:
             self._live_aligned_burst_obs.clear()
             self._live_burst_timeline_obs.clear()
             self._live_burst_residual_events.clear()
+            self._live_df11_recorded_residual_events.clear()
             self._live_sync_states.clear()
             self._last_simple_sync_update_ts.clear()
             self._live_icao_sync_quality.clear()
@@ -5711,12 +6005,15 @@ class RadarState:
             model = self._models.get(iid)
             timeline_obs_buf = self._live_burst_timeline_obs.get(iid)
             residual_events_buf = self._live_burst_residual_events.get(iid)
+            df11_recorded_events_buf = self._live_df11_recorded_residual_events.get(iid)
             aligned_obs_buf = self._live_aligned_burst_obs.get(iid)
             go_evidence = [entry for entry in self._go_evidence_events if int(entry.get("iid", -1)) == iid]
+            go_sync = dict(self._go_sync_states_by_iid.get(iid) or {})
             go_frame_revision = self._go_sweep_frames_revision.get(iid, 0)
             has_go_evidence = bool(go_evidence)
             timeline_obs_snapshot = [] if has_go_evidence else (list(timeline_obs_buf) if timeline_obs_buf else [])
             residual_events_snapshot = list(residual_events_buf) if residual_events_buf else []
+            df11_recorded_events_snapshot = list(df11_recorded_events_buf) if df11_recorded_events_buf else []
             aligned_obs_snapshot = list(aligned_obs_buf) if aligned_obs_buf else []
             obs_buf = timeline_obs_buf
             if obs_buf is None:
@@ -5796,6 +6093,21 @@ class RadarState:
             event for event in residual_events_snapshot
             if float(event.get("beam_center_us") or 0.0) >= _df11_cutoff_us
         ]
+        recorded_df11_residual_observations = [
+            event for event in df11_recorded_events_snapshot
+            if float(event.get("arrival_beast_us") or 0.0) >= _df11_cutoff_us
+        ]
+        projection_basis_options = [
+            {
+                "id": "recorded_event_basis",
+                "label": "recorded event basis",
+                "mode": "recorded",
+                "available": bool(residual_events or recorded_df11_residual_observations),
+                "projection_label": "Recorded immutable event history",
+                "authority_label": "Recorded event authority/source",
+                "immutable": True,
+            }
+        ]
 
         evidence_with_position = sum(
             1 for ev in go_evidence
@@ -5827,7 +6139,10 @@ class RadarState:
                 "observations": residual_events,
                 "recorded_observations": residual_events,
                 "recomputed_observations": [],
+                "recorded_df11_residual_observations": recorded_df11_residual_observations,
+                "recomputed_df11_residual_observations": [],
                 "residual_chart_default_mode": "recorded",
+                "projection_basis_options": projection_basis_options,
                 "sync_state": _live_sync_state_to_dict(sync) if sync else None,
                 "window_s": window_s,
                 "per_icao_quality": [],
@@ -5886,6 +6201,92 @@ class RadarState:
                     entries,
                     source=residual_source,
                 )
+            sync_state_payload = _live_sync_state_to_dict(sync, go_sync=go_sync)
+            recomputed_observations_by_basis = {
+                "runtime_effective": entries,
+            }
+            recomputed_df11_by_basis = {
+                "runtime_effective": df11_residual_observations,
+            }
+            projection_basis_options.extend([
+                {
+                    "id": "runtime_effective",
+                    "label": "runtime effective projection",
+                    "mode": "recomputed",
+                    "available": bool(entries or df11_residual_observations),
+                    "projection_label": "Recomputed current projection",
+                    "authority_label": sync_state_payload.get("operational_source_path"),
+                    "immutable": False,
+                }
+            ])
+            base_period_s = sync_state_payload.get("base_period_s")
+            if _is_finite_number(base_period_s) and float(base_period_s) > 0.0:
+                bootstrap_sync = _clone_sync_for_projection(
+                    sync,
+                    period_s=float(base_period_s),
+                    period_base_s=float(base_period_s),
+                    source=sync.source,
+                    usable=True,
+                )
+                bootstrap_entries = self._build_compact_burst_sync_timeline_entries(
+                    sync=bootstrap_sync,
+                    obs_snapshot=obs_snapshot,
+                    window_s=window_s,
+                )
+                bootstrap_df11 = self._build_df11_residual_observations(
+                    sync=bootstrap_sync,
+                    iid_events=iid_events_for_df11,
+                    latest_arrival_us=latest_arrival_us_for_iid,
+                )
+                recomputed_observations_by_basis["compact_bootstrap"] = bootstrap_entries
+                recomputed_df11_by_basis["compact_bootstrap"] = bootstrap_df11
+                projection_basis_options.append({
+                    "id": "compact_bootstrap",
+                    "label": "compact bootstrap projection",
+                    "mode": "recomputed",
+                    "available": bool(bootstrap_entries or bootstrap_df11),
+                    "projection_label": "Recomputed current projection",
+                    "authority_label": "python_bootstrap",
+                    "immutable": False,
+                })
+            go_effective_period_s = go_sync.get("effective_period_s") or go_sync.get("period_s")
+            go_base_period_s = go_sync.get("base_period_s") or go_effective_period_s
+            if (
+                _is_finite_number(go_effective_period_s)
+                and _is_finite_number(go_base_period_s)
+                and _is_finite_number(go_sync.get("phase_epoch_us"))
+                and _is_finite_number(go_sync.get("phase_offset_deg"))
+            ):
+                go_projection_sync = _clone_sync_for_projection(
+                    sync,
+                    period_s=float(go_effective_period_s),
+                    period_base_s=float(go_base_period_s),
+                    phase_epoch_us=float(go_sync["phase_epoch_us"]),
+                    phase_offset_deg=float(go_sync["phase_offset_deg"]),
+                    source="go_frame_sync",
+                    usable=True,
+                )
+                go_projection_entries = self._build_compact_burst_sync_timeline_entries(
+                    sync=go_projection_sync,
+                    obs_snapshot=obs_snapshot,
+                    window_s=window_s,
+                )
+                go_projection_df11 = self._build_df11_residual_observations(
+                    sync=go_projection_sync,
+                    iid_events=iid_events_for_df11,
+                    latest_arrival_us=latest_arrival_us_for_iid,
+                )
+                recomputed_observations_by_basis["go_runtime_diagnostic"] = go_projection_entries
+                recomputed_df11_by_basis["go_runtime_diagnostic"] = go_projection_df11
+                projection_basis_options.append({
+                    "id": "go_runtime_diagnostic",
+                    "label": "Go runtime diagnostic projection",
+                    "mode": "recomputed",
+                    "available": bool(go_projection_entries or go_projection_df11),
+                    "projection_label": "Recomputed current projection",
+                    "authority_label": "go_diagnostic_shadow",
+                    "immutable": False,
+                })
 
             burst_sync_diagnostic = {
                 "last_multisync_ts": float(sync.last_sync_update_ts),
@@ -5902,8 +6303,13 @@ class RadarState:
                 "observations": residual_events if residual_events else entries,
                 "recorded_observations": residual_events,
                 "recomputed_observations": entries,
+                "recorded_df11_residual_observations": recorded_df11_residual_observations,
+                "recomputed_df11_residual_observations": df11_residual_observations,
+                "recomputed_observations_by_basis": recomputed_observations_by_basis,
+                "recomputed_df11_residual_observations_by_basis": recomputed_df11_by_basis,
                 "residual_chart_default_mode": "recorded",
-                "sync_state": _live_sync_state_to_dict(sync),
+                "projection_basis_options": projection_basis_options,
+                "sync_state": sync_state_payload,
                 "window_s": window_s,
                 "per_icao_quality": [],
                 "period_update_history": update_history,
@@ -6128,13 +6534,104 @@ class RadarState:
             iid_events=iid_events_for_df11,
             latest_arrival_us=latest_arrival_us_for_iid,
         )
+        sync_state_payload = _live_sync_state_to_dict(sync, go_sync=go_sync)
+        recomputed_observations_by_basis = {
+            "runtime_effective": entries,
+        }
+        recomputed_df11_by_basis = {
+            "runtime_effective": df11_residual_observations,
+        }
+        projection_basis_options.extend([
+            {
+                "id": "runtime_effective",
+                "label": "runtime effective projection",
+                "mode": "recomputed",
+                "available": bool(entries or df11_residual_observations),
+                "projection_label": "Recomputed current projection",
+                "authority_label": sync_state_payload.get("operational_source_path"),
+                "immutable": False,
+            }
+        ])
+        base_period_s = sync_state_payload.get("base_period_s")
+        if _is_finite_number(base_period_s) and float(base_period_s) > 0.0:
+            bootstrap_sync = _clone_sync_for_projection(
+                sync,
+                period_s=float(base_period_s),
+                period_base_s=float(base_period_s),
+                source=sync.source,
+                usable=True,
+            )
+            bootstrap_entries = self._build_compact_burst_sync_timeline_entries(
+                sync=bootstrap_sync,
+                obs_snapshot=obs_snapshot,
+                window_s=window_s,
+            )
+            bootstrap_df11 = self._build_df11_residual_observations(
+                sync=bootstrap_sync,
+                iid_events=iid_events_for_df11,
+                latest_arrival_us=latest_arrival_us_for_iid,
+            )
+            recomputed_observations_by_basis["compact_bootstrap"] = bootstrap_entries
+            recomputed_df11_by_basis["compact_bootstrap"] = bootstrap_df11
+            projection_basis_options.append({
+                "id": "compact_bootstrap",
+                "label": "compact bootstrap projection",
+                "mode": "recomputed",
+                "available": bool(bootstrap_entries or bootstrap_df11),
+                "projection_label": "Recomputed current projection",
+                "authority_label": "python_bootstrap",
+                "immutable": False,
+            })
+        go_effective_period_s = go_sync.get("effective_period_s") or go_sync.get("period_s")
+        go_base_period_s = go_sync.get("base_period_s") or go_effective_period_s
+        if (
+            _is_finite_number(go_effective_period_s)
+            and _is_finite_number(go_base_period_s)
+            and _is_finite_number(go_sync.get("phase_epoch_us"))
+            and _is_finite_number(go_sync.get("phase_offset_deg"))
+        ):
+            go_projection_sync = _clone_sync_for_projection(
+                sync,
+                period_s=float(go_effective_period_s),
+                period_base_s=float(go_base_period_s),
+                phase_epoch_us=float(go_sync["phase_epoch_us"]),
+                phase_offset_deg=float(go_sync["phase_offset_deg"]),
+                source="go_frame_sync",
+                usable=True,
+            )
+            go_projection_entries = self._build_compact_burst_sync_timeline_entries(
+                sync=go_projection_sync,
+                obs_snapshot=obs_snapshot,
+                window_s=window_s,
+            )
+            go_projection_df11 = self._build_df11_residual_observations(
+                sync=go_projection_sync,
+                iid_events=iid_events_for_df11,
+                latest_arrival_us=latest_arrival_us_for_iid,
+            )
+            recomputed_observations_by_basis["go_runtime_diagnostic"] = go_projection_entries
+            recomputed_df11_by_basis["go_runtime_diagnostic"] = go_projection_df11
+            projection_basis_options.append({
+                "id": "go_runtime_diagnostic",
+                "label": "Go runtime diagnostic projection",
+                "mode": "recomputed",
+                "available": bool(go_projection_entries or go_projection_df11),
+                "projection_label": "Recomputed current projection",
+                "authority_label": "go_diagnostic_shadow",
+                "immutable": False,
+            })
 
         return {
-            "observations": residual_events if residual_events else entries,
+            "observations": residual_events,
             "recorded_observations": residual_events,
             "recomputed_observations": entries,
+            "recorded_df11_residual_observations": recorded_df11_residual_observations,
+            "recomputed_df11_residual_observations": df11_residual_observations,
+            "recomputed_observations_by_basis": recomputed_observations_by_basis,
+            "recomputed_df11_residual_observations_by_basis": recomputed_df11_by_basis,
             "residual_chart_default_mode": "recorded",
-            "sync_state": _live_sync_state_to_dict(sync),
+            "projection_basis_options": projection_basis_options,
+            "sync_state": sync_state_payload,
             "window_s": window_s,
             "per_icao_quality": quality_payload,
             "period_update_history": update_history,
@@ -6186,9 +6683,15 @@ class RadarState:
             go_frame_revision = self._go_sweep_frames_revision.get(iid, 0)
             sync_history_revision = int(self._go_sync_diagnostic_history_revision.get(iid, 0))
             obs_buf = None if go_evidence else (self._live_burst_timeline_obs.get(iid) or self._live_aligned_burst_obs.get(iid))
+            burst_recorded_buf = self._live_burst_residual_events.get(iid)
+            df11_recorded_buf = self._live_df11_recorded_residual_events.get(iid)
             obs_len = len(go_evidence) if go_evidence else (len(obs_buf) if obs_buf else 0)
+            burst_recorded_len = len(burst_recorded_buf) if burst_recorded_buf else 0
+            df11_recorded_len = len(df11_recorded_buf) if df11_recorded_buf else 0
             last_obs_us = None
             last_obs_ts = None
+            last_burst_recorded_us = None
+            last_df11_recorded_us = None
             if go_evidence:
                 last_obs = go_evidence[-1]
                 last_obs_us = last_obs.get("arrival_us")
@@ -6197,6 +6700,10 @@ class RadarState:
                 last_obs = obs_buf[-1]
                 last_obs_us = getattr(last_obs, "burst_centroid_us", None)
                 last_obs_ts = getattr(last_obs, "ts", None)
+            if burst_recorded_buf:
+                last_burst_recorded_us = burst_recorded_buf[-1].get("beam_center_us")
+            if df11_recorded_buf:
+                last_df11_recorded_us = df11_recorded_buf[-1].get("arrival_beast_us")
             signature = (
                 float(window_s),
                 int(debug_limit),
@@ -6208,8 +6715,12 @@ class RadarState:
                 getattr(model, "period_s", None),
                 getattr(model, "status", None),
                 obs_len,
+                burst_recorded_len,
+                df11_recorded_len,
                 last_obs_us,
                 last_obs_ts,
+                last_burst_recorded_us,
+                last_df11_recorded_us,
                 go_admission.get("last_reason"),
                 go_admission.get("last_ts"),
                 tuple(sorted((go_admission.get("counts") or {}).items())),
@@ -6234,9 +6745,9 @@ class RadarState:
         burst_timeline = self.get_burst_sync_timeline(iid, window_s=window_s)
         recorded_observations = burst_timeline.get("recorded_observations", [])
         recomputed_observations = burst_timeline.get("recomputed_observations", [])
+        recorded_df11_residual_observations = burst_timeline.get("recorded_df11_residual_observations", [])
+        recomputed_df11_residual_observations = burst_timeline.get("recomputed_df11_residual_observations", [])
         display_observations = burst_timeline.get("observations", [])
-        if not display_observations and recomputed_observations:
-            display_observations = recomputed_observations
         snapshot = {
             "type": "radar_sync",
             "iid": iid,
@@ -6247,12 +6758,17 @@ class RadarState:
             "observations": display_observations,
             "recorded_observations": recorded_observations,
             "recomputed_observations": recomputed_observations,
+            "recorded_df11_residual_observations": recorded_df11_residual_observations,
+            "recomputed_df11_residual_observations": recomputed_df11_residual_observations,
+            "recomputed_observations_by_basis": burst_timeline.get("recomputed_observations_by_basis", {}),
+            "recomputed_df11_residual_observations_by_basis": burst_timeline.get("recomputed_df11_residual_observations_by_basis", {}),
             "residual_chart_default_mode": burst_timeline.get("residual_chart_default_mode", "recorded"),
+            "projection_basis_options": burst_timeline.get("projection_basis_options", []),
             # Backend-computed DF11 residual observations for the burst-sync chart overlay.
             # Both "observations" (burst) and "df11_residual_observations" are derived from
             # the same authoritative sync snapshot and predict_sync_observation() path.
             # chart_overlay_consistent=True confirms they are directly comparable.
-            "df11_residual_observations": burst_timeline.get("df11_residual_observations", []),
+            "df11_residual_observations": recorded_df11_residual_observations,
             "chart_overlay_consistent": burst_timeline.get("chart_overlay_consistent", False),
             "phase_anchor_candidates": burst_timeline.get("phase_anchor_candidates", []),
             "burst_sync_diagnostic": burst_timeline.get("burst_sync_diagnostic"),
