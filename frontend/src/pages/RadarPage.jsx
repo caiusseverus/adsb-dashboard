@@ -2241,17 +2241,16 @@ function RotationAlignmentPanel({
   }, [iid])
 
   useEffect(() => {
-    // Only poll the legacy timeline when the legacy alignment view is active.
-    // This endpoint is expensive on the backend and the default view
-    // (burst-sync residuals) does not use it.
-    if (iid == null || alignmentMode !== BURST_SYNC_VIEW_MODE_LEGACY) {
+    if (iid == null) {
       setLegacyLoading(false)
       return
     }
     let cancelled = false
     const cachedTimeline = timelineCacheRef.current.get(iid)
     setLegacyTimeline(cachedTimeline ?? null)
-    setLegacyLoading(true)
+    if (alignmentMode === BURST_SYNC_VIEW_MODE_LEGACY) {
+      setLegacyLoading(true)
+    }
 
     async function pollTimeline() {
       const payload = await trackedRadarFetchJson(
@@ -2266,7 +2265,7 @@ function RotationAlignmentPanel({
         startTransition(() => setLegacyTimeline(payload))
       }
       if (!cancelled) {
-        if (!cancelled) setLegacyLoading(false)
+        if (alignmentMode === BURST_SYNC_VIEW_MODE_LEGACY) setLegacyLoading(false)
       }
     }
 
@@ -2584,10 +2583,14 @@ function RotationAlignmentPanel({
     if (recordedBurstEventsInWindow.length === 0) return 'events outside display window'
     if (selectedIcao && filteredObservations.length === 0) return 'all events filtered by ICAO selection'
     if (phaseResidualRows.length === 0) {
+      if (burstSyncDiagnostic?.radar_position_available === false) {
+        return `recorded events missing bearing/range because radar position is unavailable (${recordedEventDiagnostics?.recorded_events_missing_bearing ?? recordedBurstEventsInWindow.length})`
+      }
       return `recorded events missing bearing (${recordedEventDiagnostics?.recorded_events_missing_bearing ?? recordedBurstEventsInWindow.length})`
     }
     return null
   }, [
+    burstSyncDiagnostic?.radar_position_available,
     filteredObservations.length,
     phaseResidualRows.length,
     recordedBurstEventsInWindow.length,
@@ -2603,6 +2606,9 @@ function RotationAlignmentPanel({
     if (recordedObservations.length === 0) return 'no recorded burst events'
     if (recordedBurstEventsInWindow.length === 0) return 'events outside display window'
     if (selectedIcao && filteredObservations.length === 0) return 'all events filtered by ICAO selection'
+    if (burstSyncDiagnostic?.radar_position_available === false && filteredObservations.length > 0) {
+      return `recorded events missing bearing/range because radar position is unavailable (${recordedEventDiagnostics?.recorded_events_missing_range ?? filteredObservations.length})`
+    }
     if (filteredObservations.length > 0 && filteredObservations.every(obs => !Number.isFinite(Number(obs?.range_nm)))) {
       return `recorded events missing range (${recordedEventDiagnostics?.recorded_events_missing_range ?? filteredObservations.length})`
     }
@@ -2614,6 +2620,7 @@ function RotationAlignmentPanel({
     }
     return null
   }, [
+    burstSyncDiagnostic?.radar_position_available,
     filteredObservations,
     rangeResidualRows.length,
     recordedBurstEventsInWindow.length,

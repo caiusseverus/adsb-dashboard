@@ -57,7 +57,15 @@ def test_radar_page_uses_recorded_event_buffer_and_explicit_empty_reasons():
     assert "event?.event_id" in text
     assert "Residual-vs-bearing empty:" in text
     assert "Residual-vs-range empty:" in text
+    assert "recorded events missing bearing/range because radar position is unavailable" in text
     assert "frontend_recorded_buffer_size" in text
+
+
+def test_radar_page_initialises_legacy_timeline_fetch_without_view_toggle_priming():
+    radar_page = Path(__file__).resolve().parents[2] / "frontend" / "src" / "pages" / "RadarPage.jsx"
+    text = radar_page.read_text(encoding="utf-8")
+    assert "legacy_alignment_mode_poll" in text
+    assert "if (iid == null) {" in text
 
 
 def test_radar_page_all_icaos_chip_uses_distinct_recorded_burst_icaos():

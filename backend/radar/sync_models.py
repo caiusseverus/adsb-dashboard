@@ -126,11 +126,11 @@ class AlignedBurstSyncObs:
 
     burst_centroid_us: float
     icao: str
-    bearing_deg: float
+    bearing_deg: float | None
     n_replies: int
     signal_dbfs: float | None
     pos_age_s: float
-    range_nm: float
+    range_nm: float | None
     ts: float
     sync_update_eligible: bool = True
     raw_arrival_us: float = 0.0

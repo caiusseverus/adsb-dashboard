@@ -775,6 +775,83 @@ def test_update_go_burst_fired_records_immutable_burst_event(monkeypatch):
     assert timeline["recorded_event_diagnostics"]["recorded_burst_event_count_in_window"] == 1
 
 
+def test_recorded_go_burst_event_retained_without_radar_position(monkeypatch):
+    state = RadarState()
+    now_ts = 1_000.0
+    monkeypatch.setattr("radar.sweep.time.time", lambda: now_ts)
+    state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=None, lon=None)
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=now_ts,
+        source="multi_aircraft_burst",
+        usable=True,
+    )
+    state.update_go_burst_fired({
+        "i": 7,
+        "c": int("BBBBBB", 16),
+        "cu": 8_200_000.0,
+        "cw": 8_200_000.0,
+        "n": 4,
+        "s": -15.0,
+        "la": 51.1,
+        "lo": 0.2,
+        "pa": 0.3,
+        "df": True,
+    })
+
+    timeline = state.get_burst_sync_timeline(7, window_s=60.0)
+    recorded = timeline["recorded_observations"]
+    assert len(recorded) == 1
+    assert recorded[0]["event_kind"] == "burst"
+    assert recorded[0]["bearing_deg"] is None
+    assert recorded[0]["range_nm"] is None
+    assert recorded[0]["corrected_residual_deg"] is None
+    diag = timeline["recorded_event_diagnostics"]
+    assert diag["recorded_burst_event_count_in_window"] == 1
+    assert diag["backend_recorded_events_omitted_missing_geometry_total"] >= 1
+
+
+def test_go_sweep_frame_timeline_rows_do_not_require_radar_position():
+    state = RadarState()
+    iid = 19
+    state._models[iid] = RadarIID(iid=iid, status="SINGLE_RADAR", period_s=4.0, lat=None, lon=None)
+    state._live_sync_states[iid] = LiveSyncState(
+        iid=iid,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1_000.0,
+        source="go_frame_sync",
+        usable=True,
+    )
+    state._iid_latest_arrival_us[iid] = 5_000_000.0
+    state.update_go_frame_ready({
+        "i": iid,
+        "fi": 3,
+        "p": 4.0,
+        "rc": int("AAAAAA", 16),
+        "rla": 51.0,
+        "rlo": 0.0,
+        "ra": 5_000_000.0,
+        "q": "good",
+        "obs": [
+            {"c": int("BBBBBB", 16), "la": 51.2, "lo": 0.3, "a": 5_001_000.0, "n": 3, "pa": 0.4},
+        ],
+    })
+
+    timeline = state.get_burst_sync_timeline(iid, window_s=60.0)
+    assert timeline["observations"]
+    assert all(obs.get("bearing_deg") is None for obs in timeline["observations"])
+    assert all(obs.get("range_nm") is None for obs in timeline["observations"])
+
+
 def test_recorded_df11_and_burst_events_remain_separate():
     state = RadarState()
     state._live_sync_states[7] = LiveSyncState(
@@ -3015,6 +3092,28 @@ def test_radar_core_frame_injection_populates_fm_mailbox_and_completed_buffer():
     assert stats["radar_core_frames_enabled"] is True
     assert stats["radar_core_frames_injected"] == 1
     assert stats["radar_core_frame_inject_errors"] == 0
+
+
+def test_frame_counts_unchanged_by_recorded_timeline_reads():
+    state = RadarState()
+    state.enable_radar_core_frames(True)
+    state.inject_frame_from_go({
+        "t": 11,
+        "i": 72,
+        "fi": 1,
+        "p": 4.0,
+        "rc": 0xAAAAAA,
+        "rla": 51.0,
+        "rlo": -1.0,
+        "ra": 1_000_000.0,
+        "obs": [{"c": 0xBBBBBB, "la": 51.1, "lo": -1.1, "a": 1_001_000.0, "n": 3, "pa": 0.5}],
+        "q": "good",
+    })
+    before = state.get_live_frame_counts(72)
+    state.get_burst_sync_timeline(72, window_s=60.0)
+    state.get_burst_sync_timeline(72, window_s=300.0)
+    after = state.get_live_frame_counts(72)
+    assert before == after
 
 
 def test_radar_core_frames_enabled_suppresses_python_fm_mailbox_injection():

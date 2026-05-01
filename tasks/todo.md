@@ -49,3 +49,35 @@ Verification:
 
 Residual risk:
 - This is verified by backend tests, not by a live running feed. Runtime confirmation is still needed to prove DF alignment and frame generation recover under live traffic.
+
+## 2026-05-01 Residual/Chart Semantics Regression Recovery
+
+- [x] Review lessons and verify current frame-generation health versus timeline/render regression using counters and pipeline endpoints.
+- [x] Run GitNexus impact analysis for all backend/frontend symbols touched by this fix and record any high-risk blast radius.
+- [x] Fix backend timeline snapshot builders so burst/frame timeline events are emitted without radar-position gating; geometry fields must be optional.
+- [x] Fix backend recorded burst event creation to preserve complete rows even when radar geometry is unavailable.
+- [x] Fix backend sweep/timeline API payloads to avoid empty suppressions tied to missing authoritative radar position.
+- [x] Fix frontend DF Alignment/Burst Sync fetch lifecycle so IID selection initializes data without view-toggle priming.
+- [x] Fix frontend recorded buffer retention semantics: append + dedupe + prune-by-window only; no destructive clears on mode/basis/authority switches.
+- [x] Add/update backend tests covering missing-geometry behavior, recorded burst completeness, event-kind separation, and frame counters independence.
+- [x] Add/update frontend tests for fetch lifecycle and recorded-buffer behavior, including explicit missing-geometry empty reasons.
+- [x] Run focused verification (backend pytest, frontend build/tests, endpoint checks) and document review/results here.
+
+Plan confirmation:
+- Preserve the design constraint that pre-localisation sync diagnostics must not require known radar lat/lon.
+- Keep geometry-derived fields (`bearing_deg`, `range_nm`, `corrected_residual_deg`) as optional enrichments only.
+- Separate "frame generation health" from "chart/timeline display health" in diagnostics and reporting.
+
+Review:
+- Backend Go timeline snapshot builders no longer return `[]` solely because authoritative radar position is unavailable; they now emit rows with timing/sync fields intact and nullable geometry fields.
+- Recorded Go burst event creation no longer drops events on missing radar position. Events are retained with full metadata, `bearing_deg/range_nm/corrected_residual_deg = null`, and missing-geometry counters are incremented.
+- Recorded diagnostics now expose backend created totals by event kind (`backend_recorded_burst_events_created_total`, `backend_recorded_df11_events_created_total`) and omitted-missing-geometry totals.
+- Frontend legacy DF-alignment timeline polling is initialized on IID selection rather than being gated by subview selection, removing view-toggle priming behavior.
+- Recorded residual empty reasons now explicitly state radar-position-unavailable when geometry-dependent secondary plots are empty for that cause.
+
+Verification:
+- `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_ui_labels.py -q` (116 passed).
+- `cd frontend && npm run build` (success).
+
+Residual risk:
+- Live endpoint/runtime checks (`/api/radar/iids/<iid>/pipeline-health`, `/api/radar/iids/<iid>/sweep-frames`, `/api/radar/iids/<iid>/state`) were not executed against a running receiver in this pass; runtime confirmation is still required for final sign-off.

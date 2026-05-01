@@ -1364,6 +1364,8 @@ class RadarState:
             iid,
             {
                 "appended_total": 0,
+                "appended_burst_total": 0,
+                "appended_df11_total": 0,
                 "pruned_total": 0,
                 "dropped_reason_counts": {
                     "age_prune": 0,
@@ -1395,6 +1397,11 @@ class RadarState:
                 return False
         event_buf.append(event)
         counters["appended_total"] += 1
+        event_kind = str(event.get("event_kind") or "")
+        if event_kind == "burst":
+            counters["appended_burst_total"] += 1
+        elif event_kind == "df11":
+            counters["appended_df11_total"] += 1
         cutoff_ts = now_ts - self._LIVE_BURST_RESIDUAL_EVENTS_RETENTION_S
         while event_buf and float(event_buf[0].get("wall_ts") or now_ts) < cutoff_ts:
             event_buf.popleft()
@@ -3891,7 +3898,8 @@ class RadarState:
             "range_nm": float(range_nm) if range_nm is not None else None,
             "corrected_residual_deg": (
                 float(corrected_residual_deg)
-                if corrected_residual_deg is not None else float(residual_deg)
+                if corrected_residual_deg is not None
+                else (float(residual_deg) if bearing_deg is not None else None)
             ),
             "pos_age_s": float(pos_age_s) if pos_age_s is not None else None,
             "aircraft_position_age_s": float(pos_age_s) if pos_age_s is not None else None,
@@ -3978,8 +3986,13 @@ class RadarState:
         prev_appended_total = int(diag_last.get("appended_total") or 0)
         prev_pruned_total = int(diag_last.get("pruned_total") or 0)
         diagnostics = {
+            "backend_recorded_burst_events_created_total": int(counters.get("appended_burst_total") or 0),
+            "backend_recorded_df11_events_created_total": int(counters.get("appended_df11_total") or 0),
+            "backend_recorded_events_omitted_missing_geometry_total": int(dropped_reason_counts.get("missing_geometry") or 0),
             "recorded_event_count_total": burst_total + df11_total,
             "recorded_event_count_in_window": len(window_events),
+            "recorded_burst_event_count_total": burst_total,
+            "recorded_df11_event_count_total": df11_total,
             "recorded_burst_event_count_in_window": len(burst_in_window),
             "recorded_df11_event_count_in_window": len(df11_in_window),
             "oldest_recorded_event_age_s": max(wall_ages) if wall_ages else None,
@@ -4101,9 +4114,9 @@ class RadarState:
         radar_pos = _get_authoritative_radar_position(model) if model is not None else {"lat": None, "lon": None}
         radar_lat = radar_pos.get("lat")
         radar_lon = radar_pos.get("lon")
-        if radar_lat is None or radar_lon is None:
+        geometry_available = radar_lat is not None and radar_lon is not None
+        if not geometry_available:
             self._recorded_event_counters(iid)["dropped_reason_counts"]["missing_geometry"] += 1
-            return
         centroid_us = (
             evidence.get("weighted_centroid_us")
             if evidence.get("weighted_centroid_us") is not None
@@ -4111,8 +4124,14 @@ class RadarState:
         )
         if not _is_finite_number(centroid_us):
             return
-        bearing_deg = _bearing_deg_simple(radar_lat, radar_lon, float(truth_lat), float(truth_lon))
-        range_nm = _haversine_nm_simple(radar_lat, radar_lon, float(truth_lat), float(truth_lon))
+        bearing_deg = (
+            _bearing_deg_simple(radar_lat, radar_lon, float(truth_lat), float(truth_lon))
+            if geometry_available else None
+        )
+        range_nm = (
+            _haversine_nm_simple(radar_lat, radar_lon, float(truth_lat), float(truth_lon))
+            if geometry_available else None
+        )
         prediction = predict_sync_observation(
             sync,
             float(centroid_us),
@@ -4121,20 +4140,25 @@ class RadarState:
             motion_comp_dt_us=None,
             motion_comp_block_reason="go_recorded_burst_alignment",
         )
-        residual_deg = (bearing_deg - prediction.predicted_bearing_deg + 540.0) % 360.0 - 180.0
+        residual_deg = (
+            (bearing_deg - prediction.predicted_bearing_deg + 540.0) % 360.0 - 180.0
+            if bearing_deg is not None else 0.0
+        )
         abs_res = abs(residual_deg)
-        residual_class = self._classify_sync_residual(abs_res)
+        residual_class = self._classify_sync_residual(abs_res) if bearing_deg is not None else "rejected"
         fit_reject_reason = None
         sync_update_eligible = bool(evidence.get("sync_eligible", evidence.get("dominant_family", False)))
         pos_age_s = evidence.get("position_age_seconds")
         if not sync_update_eligible:
             fit_reject_reason = "not_sync_update_eligible"
-        elif abs_res >= 150.0:
+        elif bearing_deg is not None and abs_res >= 150.0:
             fit_reject_reason = "near_wrap_residual"
-        elif abs_res > 35.0:
+        elif bearing_deg is not None and abs_res > 35.0:
             fit_reject_reason = "residual_gate"
         elif _is_finite_number(pos_age_s) and float(pos_age_s) > 8.0:
             fit_reject_reason = "stale_position"
+        elif bearing_deg is None:
+            fit_reject_reason = "missing_geometry"
         fit_eligible = fit_reject_reason is None
         sync_snapshot = _live_sync_state_to_dict(sync, go_sync=go_sync)
         event = self._build_recorded_residual_event(
@@ -4159,7 +4183,7 @@ class RadarState:
             classification=residual_class,
             timing_class=None,
             event_kind="burst",
-            corrected_residual_deg=residual_deg,
+            corrected_residual_deg=residual_deg if bearing_deg is not None else None,
             pos_age_s=pos_age_s,
             dominant_family=bool(evidence.get("dominant_family", False)),
             prefer_go_runtime=True,
@@ -6293,9 +6317,6 @@ class RadarState:
             elif not has_go_evidence and go_frame_revision <= 0:
                 reason = "no_go_evidence_retained"
                 detail = "No retained Go burst evidence or sweep-frame history is available for this IID yet."
-            elif radar_pos.get("lat") is None or radar_pos.get("lon") is None:
-                reason = "radar_position_unavailable"
-                detail = "Go frame/evidence history exists, but radar position is unavailable so alignment rows cannot be projected yet."
             elif sync is None:
                 reason = "sync_state_unavailable"
                 detail = "Go evidence is present, but no live sync state is available yet."
@@ -6372,7 +6393,6 @@ class RadarState:
                     "sync_state_unavailable" if sync is None
                     else "no_go_evidence" if not go_evidence
                     else "no_evidence_with_position" if evidence_with_position == 0
-                    else "radar_position_unavailable" if not radar_pos_available
                     else "unknown"
                 ),
             }
@@ -6597,6 +6617,8 @@ class RadarState:
         entries = []
         for obs in obs_snapshot:
             if obs.ts < cutoff_ts:
+                continue
+            if getattr(obs, "bearing_deg", None) is None:
                 continue
             # Authoritative predictor: same path used by fitting and the live localiser.
             uncorrected_prediction = predict_sync_observation(

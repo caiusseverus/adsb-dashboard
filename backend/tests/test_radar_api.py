@@ -252,8 +252,10 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     assert payload["sync_state"]["effective_period_source"] == "go_runtime.base_period_s"
     assert "handoff_state" in payload["sync_state"]
     assert "handoff_gate_failures" in payload["sync_state"]
-    assert payload["observations"] == []
-    assert payload["alignment_status"]["reason"] == "radar_position_unavailable"
+    assert len(payload["observations"]) == 1
+    assert payload["observations"][0]["bearing_deg"] is None
+    assert payload["observations"][0]["range_nm"] is None
+    assert payload["alignment_status"]["reason"] == "go_evidence_projected"
     assert payload["alignment_status"]["multi_sync_admission"]["last_reason"] == "no_receiver_config"
     assert payload["alignment_status"]["multi_sync_admission"]["counts"]["no_receiver_config"] == 7
 

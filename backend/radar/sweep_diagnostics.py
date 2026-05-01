@@ -115,10 +115,18 @@ def build_compact_burst_sync_timeline_entries(
             motion_comp_dt_us=getattr(obs, "motion_comp_dt_us", None),
             motion_comp_block_reason=getattr(obs, "motion_comp_block_reason", None),
         )
-        residual_deg = (obs.bearing_deg - prediction.predicted_bearing_deg + 540.0) % 360.0 - 180.0
-        classification = state._classify_sync_residual(abs(residual_deg))
+        residual_deg = (
+            (obs.bearing_deg - prediction.predicted_bearing_deg + 540.0) % 360.0 - 180.0
+            if obs.bearing_deg is not None else None
+        )
+        classification = state._classify_sync_residual(abs(residual_deg)) if residual_deg is not None else "rejected"
         weight = state._score_sync_burst_observation(obs)
-        fit_eligible = bool(getattr(obs, "sync_update_eligible", True)) and classification != "rejected" and weight > 0
+        fit_eligible = (
+            bool(getattr(obs, "sync_update_eligible", True))
+            and classification != "rejected"
+            and weight > 0
+            and residual_deg is not None
+        )
         entries.append({
             "beam_center_us": obs.burst_centroid_us,
             "wall_ts": obs.ts,
@@ -158,7 +166,7 @@ def build_compact_burst_sync_timeline_entries(
             "weight": weight,
             "classification": classification,
             "fit_eligible": fit_eligible,
-            "fit_reject_reason": None if fit_eligible else "compact_go_sync",
+            "fit_reject_reason": None if fit_eligible else ("missing_geometry" if residual_deg is None else "compact_go_sync"),
             "n_replies": obs.n_replies,
             "signal_dbfs": obs.signal_dbfs,
             "pos_age_s": obs.pos_age_s,
@@ -408,8 +416,7 @@ def go_burst_sync_timeline_snapshot(state: Any, iid: int, window_s: float) -> li
     radar_pos = get_authoritative_radar_position(model) if model is not None else {"lat": None, "lon": None}
     radar_lat = radar_pos.get("lat")
     radar_lon = radar_pos.get("lon")
-    if radar_lat is None or radar_lon is None:
-        return []
+    geometry_available = radar_lat is not None and radar_lon is not None
     cutoff_ts = time.time() - window_s
     period_s = sync.period_s if sync is not None and sync.period_s > 0 else 0.0
     observations: list[AlignedBurstSyncObs] = []
@@ -423,15 +430,25 @@ def go_burst_sync_timeline_snapshot(state: Any, iid: int, window_s: float) -> li
         truth_lon = entry.get("truth_lon")
         if truth_lat is None or truth_lon is None:
             continue
-        bearing_deg = _bearing_deg_simple(radar_lat, radar_lon, float(truth_lat), float(truth_lon))
-        range_nm = _haversine_nm_simple(radar_lat, radar_lon, float(truth_lat), float(truth_lon))
+        bearing_deg = (
+            _bearing_deg_simple(radar_lat, radar_lon, float(truth_lat), float(truth_lon))
+            if geometry_available else None
+        )
+        range_nm = (
+            _haversine_nm_simple(radar_lat, radar_lon, float(truth_lat), float(truth_lon))
+            if geometry_available else None
+        )
         pos_age_s = float(entry.get("position_age_seconds") or 0.0)
-        motion_estimate = _estimate_aircraft_bearing_rate(
-            icao=str(entry["icao"]),
-            bearing_deg=bearing_deg,
-            burst_centroid_us=float(entry["arrival_us"]),
-            pos_age_s=pos_age_s,
-            history=observations,
+        motion_estimate = (
+            _estimate_aircraft_bearing_rate(
+                icao=str(entry["icao"]),
+                bearing_deg=bearing_deg,
+                burst_centroid_us=float(entry["arrival_us"]),
+                pos_age_s=pos_age_s,
+                history=observations,
+            )
+            if bearing_deg is not None
+            else {"bearing_rate_deg_s": None, "motion_comp_block_reason": "missing_geometry"}
         )
         bearing_rate_deg_s = motion_estimate.get("bearing_rate_deg_s")
         motion_comp_dt_us = _compute_motion_comp_dt_us(period_s, bearing_rate_deg_s) if period_s > 0 else None
@@ -441,7 +458,7 @@ def go_burst_sync_timeline_snapshot(state: Any, iid: int, window_s: float) -> li
             motion_block_reason = "disabled"
         elif motion_comp_dt_us is None and motion_block_reason is None:
             motion_block_reason = "bearing_rate_unavailable"
-        prop_delay_us = _compute_propagation_delay_us(range_nm)
+        prop_delay_us = _compute_propagation_delay_us(range_nm) if range_nm is not None else 0.0
         prop_corrected_us = float(entry["arrival_us"]) - prop_delay_us if RADAR_SYNC_PROP_DELAY_ENABLED else float(entry["arrival_us"])
         effective_us = prop_corrected_us - motion_comp_dt_us if motion_applied else prop_corrected_us
         observations.append(AlignedBurstSyncObs(
@@ -494,8 +511,7 @@ def go_sweep_frame_sync_timeline_snapshot(state: Any, iid: int, window_s: float)
     radar_pos = get_authoritative_radar_position(model) if model is not None else {"lat": None, "lon": None}
     radar_lat = radar_pos.get("lat")
     radar_lon = radar_pos.get("lon")
-    if radar_lat is None or radar_lon is None:
-        return []
+    geometry_available = radar_lat is not None and radar_lon is not None
     cutoff_ts = time.time() - window_s
     observations: list[AlignedBurstSyncObs] = []
     period_s = sync.period_s if sync is not None and sync.period_s > 0 else 0.0
@@ -506,14 +522,24 @@ def go_sweep_frame_sync_timeline_snapshot(state: Any, iid: int, window_s: float)
             wall_ts = state._estimate_wall_time_from_arrival_us(float(arrival_us), latest_arrival_us)
             if wall_ts is None or wall_ts < cutoff_ts:
                 continue
-            bearing_deg = _bearing_deg_simple(radar_lat, radar_lon, float(lat), float(lon))
-            range_nm = _haversine_nm_simple(radar_lat, radar_lon, float(lat), float(lon))
-            motion_estimate = _estimate_aircraft_bearing_rate(
-                icao=str(icao),
-                bearing_deg=bearing_deg,
-                burst_centroid_us=float(arrival_us),
-                pos_age_s=float(pos_age_s or 0.0),
-                history=observations,
+            bearing_deg = (
+                _bearing_deg_simple(radar_lat, radar_lon, float(lat), float(lon))
+                if geometry_available else None
+            )
+            range_nm = (
+                _haversine_nm_simple(radar_lat, radar_lon, float(lat), float(lon))
+                if geometry_available else None
+            )
+            motion_estimate = (
+                _estimate_aircraft_bearing_rate(
+                    icao=str(icao),
+                    bearing_deg=bearing_deg,
+                    burst_centroid_us=float(arrival_us),
+                    pos_age_s=float(pos_age_s or 0.0),
+                    history=observations,
+                )
+                if bearing_deg is not None
+                else {"bearing_rate_deg_s": None, "motion_comp_block_reason": "missing_geometry"}
             )
             bearing_rate_deg_s = motion_estimate.get("bearing_rate_deg_s")
             motion_comp_dt_us = _compute_motion_comp_dt_us(period_s, bearing_rate_deg_s) if period_s > 0 else None
@@ -523,7 +549,7 @@ def go_sweep_frame_sync_timeline_snapshot(state: Any, iid: int, window_s: float)
                 motion_block_reason = "disabled"
             elif motion_comp_dt_us is None and motion_block_reason is None:
                 motion_block_reason = "bearing_rate_unavailable"
-            prop_delay_us = _compute_propagation_delay_us(range_nm)
+            prop_delay_us = _compute_propagation_delay_us(range_nm) if range_nm is not None else 0.0
             prop_corrected_us = float(arrival_us) - prop_delay_us if RADAR_SYNC_PROP_DELAY_ENABLED else float(arrival_us)
             effective_us = prop_corrected_us - motion_comp_dt_us if motion_applied else prop_corrected_us
             observations.append(AlignedBurstSyncObs(
