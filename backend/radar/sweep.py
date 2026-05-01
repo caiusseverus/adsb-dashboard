@@ -326,6 +326,39 @@ def _build_go_diagnostic_fields(
         and _is_finite_number(effective_period_s)
     ):
         period_delta_s = float(effective_period_s) - float(base_period_s)
+    requested_delta_s = go_payload.get("requested_delta_s", go_payload.get("proposed_delta_s"))
+    current_delta_s = go_payload.get("current_delta_s", period_delta_s)
+    delta_to_base_s = go_payload.get("delta_to_base_s", current_delta_s)
+    df_base_period_s = go_payload.get("df_base_period_s", base_period_s)
+    period_disagreement_s = go_payload.get("period_disagreement_s")
+    if period_disagreement_s is None and _is_finite_number(effective_period_s) and _is_finite_number(df_base_period_s):
+        period_disagreement_s = float(effective_period_s) - float(df_base_period_s)
+
+    def _ppm(value: float | None, base: float | None) -> float | None:
+        if not _is_finite_number(value) or not _is_finite_number(base) or float(base) == 0.0:
+            return None
+        return float(value) / float(base) * 1_000_000.0
+
+    requested_delta_ppm = go_payload.get("requested_delta_ppm")
+    if requested_delta_ppm is None:
+        requested_delta_ppm = _ppm(requested_delta_s, base_period_s)
+    current_delta_ppm = go_payload.get("current_delta_ppm")
+    if current_delta_ppm is None:
+        current_delta_ppm = _ppm(current_delta_s, base_period_s)
+    delta_to_base_ppm = go_payload.get("delta_to_base_ppm")
+    if delta_to_base_ppm is None:
+        delta_to_base_ppm = _ppm(delta_to_base_s, df_base_period_s)
+    period_disagreement_ppm = go_payload.get("period_disagreement_ppm")
+    if period_disagreement_ppm is None:
+        period_disagreement_ppm = _ppm(period_disagreement_s, df_base_period_s)
+
+    hard_bound_limit_s = go_payload.get("hard_bound_limit_s")
+    if hard_bound_limit_s is None and _is_finite_number(base_period_s):
+        hard_bound_limit_s = float(base_period_s) * 0.005
+    hard_bound_limit_ppm = go_payload.get("hard_bound_limit_ppm")
+    if hard_bound_limit_ppm is None:
+        hard_bound_limit_ppm = 5000.0 if hard_bound_limit_s is not None else None
+
     return {
         "go_diagnostic_base_period_s": float(base_period_s) if _is_finite_number(base_period_s) else None,
         "go_diagnostic_period_delta_s": float(period_delta_s) if _is_finite_number(period_delta_s) else None,
@@ -340,10 +373,40 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_fit_observation_count": go_payload.get("fit_observation_count"),
         "go_diagnostic_fit_span_s": go_payload.get("fit_span_s"),
         "go_diagnostic_fit_icao_count": go_payload.get("fit_icao_count"),
+        "go_diagnostic_fit_observations_per_icao_min": go_payload.get("fit_observations_per_icao_min"),
+        "go_diagnostic_fit_observations_per_icao_median": go_payload.get("fit_observations_per_icao_median"),
+        "go_diagnostic_fit_observations_per_icao_max": go_payload.get("fit_observations_per_icao_max"),
         "go_diagnostic_residual_slope_deg_per_s": go_payload.get("residual_slope_deg_per_s"),
+        "go_diagnostic_slope_ema_deg_per_s": go_payload.get("slope_ema_deg_per_s"),
+        "go_diagnostic_slope_std_deg_per_s": go_payload.get("slope_std_deg_per_s"),
+        "go_diagnostic_proposed_delta_s": go_payload.get("proposed_delta_s"),
+        "go_diagnostic_applied_delta_s": go_payload.get("applied_delta_s"),
+        "go_diagnostic_last_slew_limited": go_payload.get("last_slew_limited"),
+        "go_diagnostic_last_hard_bound": go_payload.get("last_hard_bound"),
+        "go_diagnostic_reject_reason": go_payload.get("period_reject_reason"),
         "go_diagnostic_holdover": go_payload.get("holdover"),
         "go_diagnostic_holdover_reason": go_payload.get("holdover_reason"),
         "go_diagnostic_last_updated": go_payload.get("last_updated"),
+        "go_diagnostic_hard_bound_reason": go_payload.get("hard_bound_reason"),
+        "go_diagnostic_hard_bound_limit_s": hard_bound_limit_s,
+        "go_diagnostic_hard_bound_limit_ppm": hard_bound_limit_ppm,
+        "go_diagnostic_requested_delta_s": requested_delta_s,
+        "go_diagnostic_requested_delta_ppm": requested_delta_ppm,
+        "go_diagnostic_current_delta_s": current_delta_s,
+        "go_diagnostic_current_delta_ppm": current_delta_ppm,
+        "go_diagnostic_delta_to_base_s": delta_to_base_s,
+        "go_diagnostic_delta_to_base_ppm": delta_to_base_ppm,
+        "go_diagnostic_df_base_period_s": df_base_period_s,
+        "go_diagnostic_period_agrees_with_df": go_payload.get("period_agrees_with_df"),
+        "go_diagnostic_period_disagreement_s": period_disagreement_s,
+        "go_diagnostic_period_disagreement_ppm": period_disagreement_ppm,
+        "go_diagnostic_fit_epoch_id": go_payload.get("fit_epoch_id"),
+        "go_diagnostic_fit_epoch_started_ts": go_payload.get("fit_epoch_started_ts"),
+        "go_diagnostic_fit_epoch_reset_reason": go_payload.get("fit_epoch_reset_reason"),
+        "go_diagnostic_fit_epoch_observation_count": go_payload.get("fit_epoch_observation_count"),
+        "go_diagnostic_fit_epoch_span_s": go_payload.get("fit_epoch_span_s"),
+        "go_diagnostic_fit_dropped_on_epoch_reset": go_payload.get("fit_dropped_on_epoch_reset"),
+        "go_diagnostic_fit_segment_count": go_payload.get("fit_segment_count"),
     }
 
 
@@ -576,6 +639,24 @@ def _live_sync_state_to_dict(sync: "LiveSyncState", go_sync: dict | None = None)
     if explicit_sign:
         slope_sign_convention = explicit_sign
 
+    operational_has_python_fit = source == "multi_aircraft_burst"
+    operational_fit_total_observations = (
+        int(getattr(sync, "fit_total_observations", 0) or 0)
+        if operational_has_python_fit else None
+    )
+    operational_fit_eligible_observations = (
+        int(getattr(sync, "fit_eligible_observations", 0) or 0)
+        if operational_has_python_fit else None
+    )
+    operational_period_refinement_status = period_refinement_status
+    operational_refinement_unavailable_reason = None
+    if operational_period_refinement_status in {"unavailable", "diagnostic_only"}:
+        operational_refinement_unavailable_reason = handoff_reason or "operational_refiner_unavailable"
+    elif operational_period_refinement_status == "holdover":
+        operational_refinement_unavailable_reason = handoff_reason or "holdover"
+    elif not operational_has_python_fit and period_authority in {"py_base", "py_refined"}:
+        operational_refinement_unavailable_reason = "python_fit_state_not_live"
+
     payload.update({
         "base_period_s": base_period_s,
         "period_delta_s": period_delta_s,
@@ -602,6 +683,14 @@ def _live_sync_state_to_dict(sync: "LiveSyncState", go_sync: dict | None = None)
             "unavailable"
         ),
         "period_delta_source": period_delta_source,
+        "operational_fit_total_observations": operational_fit_total_observations,
+        "operational_fit_eligible_observations": operational_fit_eligible_observations,
+        "operational_period_refinement_status": operational_period_refinement_status,
+        "operational_refinement_unavailable_reason": operational_refinement_unavailable_reason,
+        "operational_go_ready": period_authority == "go_refined",
+        "operational_go_ready_reason": (
+            None if period_authority == "go_refined" else (handoff_reason or "go_not_ready")
+        ),
         "fit_observation_count": fit_observation_count,
         "fit_span_s": fit_span_s,
         "slope_sign_convention": slope_sign_convention,
@@ -624,6 +713,18 @@ def _live_sync_state_to_dict(sync: "LiveSyncState", go_sync: dict | None = None)
         "applied_delta_s": getattr(sync, "applied_delta_s", None),
         "last_slew_limited": getattr(sync, "last_slew_limited", None),
         "last_hard_bound": getattr(sync, "last_hard_bound", None),
+        "hard_bound_reason": getattr(sync, "hard_bound_reason", None),
+        "hard_bound_limit_s": getattr(sync, "hard_bound_limit_s", None),
+        "hard_bound_limit_ppm": getattr(sync, "hard_bound_limit_ppm", None),
+        "requested_delta_s": getattr(sync, "requested_delta_s", None),
+        "requested_delta_ppm": getattr(sync, "requested_delta_ppm", None),
+        "current_delta_s": getattr(sync, "current_delta_s", None),
+        "current_delta_ppm": getattr(sync, "current_delta_ppm", None),
+        "delta_to_base_s": getattr(sync, "delta_to_base_s", None),
+        "delta_to_base_ppm": getattr(sync, "delta_to_base_ppm", None),
+        "df_base_period_s": getattr(sync, "df_base_period_s", None),
+        "period_disagreement_s": getattr(sync, "period_disagreement_s", None),
+        "period_disagreement_ppm": getattr(sync, "period_disagreement_ppm", None),
         "holdover_reason": getattr(sync, "holdover_reason", None),
         "last_sync_reject_reason": getattr(sync, "holdover_reason", None),
         "holdover_quality_gate_failed": getattr(sync, "holdover_quality_gate_failed", None),
@@ -649,6 +750,13 @@ def _live_sync_state_to_dict(sync: "LiveSyncState", go_sync: dict | None = None)
         "update_epoch_reject_stale_ref_pos": getattr(sync, "update_epoch_reject_stale_ref_pos", None),
         "update_epoch_reject_insufficient_aircraft": getattr(sync, "update_epoch_reject_insufficient_aircraft", None),
         "update_epoch_last_strict_gate_pass": getattr(sync, "update_epoch_last_strict_gate_pass", None),
+        "fit_epoch_id": getattr(sync, "fit_epoch_id", None),
+        "fit_epoch_started_ts": getattr(sync, "fit_epoch_started_ts", None),
+        "fit_epoch_reset_reason": getattr(sync, "fit_epoch_reset_reason", None),
+        "fit_epoch_observation_count": getattr(sync, "fit_epoch_observation_count", None),
+        "fit_epoch_span_s": getattr(sync, "fit_epoch_span_s", None),
+        "fit_dropped_on_epoch_reset": getattr(sync, "fit_dropped_on_epoch_reset", None),
+        "fit_segment_count": getattr(sync, "fit_segment_count", None),
     })
     payload.update(_build_go_diagnostic_fields(sync, go_sync=go_sync))
     return payload
@@ -2639,6 +2747,51 @@ class RadarState:
                 ),
                 "last_slew_limited": bool(entry.get("last_slew_limited", False)),
                 "last_hard_bound": bool(entry.get("last_hard_bound", False)),
+                "hard_bound_reason": str(entry.get("hard_bound_reason") or ""),
+                "hard_bound_limit_s": (
+                    float(entry["hard_bound_limit_s"]) if entry.get("hard_bound_limit_s") is not None else None
+                ),
+                "hard_bound_limit_ppm": (
+                    float(entry["hard_bound_limit_ppm"]) if entry.get("hard_bound_limit_ppm") is not None else None
+                ),
+                "requested_delta_s": (
+                    float(entry["requested_delta_s"]) if entry.get("requested_delta_s") is not None else None
+                ),
+                "requested_delta_ppm": (
+                    float(entry["requested_delta_ppm"]) if entry.get("requested_delta_ppm") is not None else None
+                ),
+                "current_delta_s": (
+                    float(entry["current_delta_s"]) if entry.get("current_delta_s") is not None else None
+                ),
+                "current_delta_ppm": (
+                    float(entry["current_delta_ppm"]) if entry.get("current_delta_ppm") is not None else None
+                ),
+                "delta_to_base_s": (
+                    float(entry["delta_to_base_s"]) if entry.get("delta_to_base_s") is not None else None
+                ),
+                "delta_to_base_ppm": (
+                    float(entry["delta_to_base_ppm"]) if entry.get("delta_to_base_ppm") is not None else None
+                ),
+                "df_base_period_s": (
+                    float(entry["df_base_period_s"]) if entry.get("df_base_period_s") is not None else None
+                ),
+                "period_disagreement_s": (
+                    float(entry["period_disagreement_s"]) if entry.get("period_disagreement_s") is not None else None
+                ),
+                "period_disagreement_ppm": (
+                    float(entry["period_disagreement_ppm"]) if entry.get("period_disagreement_ppm") is not None else None
+                ),
+                "fit_epoch_id": int(entry.get("fit_epoch_id") or 0),
+                "fit_epoch_started_ts": (
+                    float(entry["fit_epoch_started_ts"]) if entry.get("fit_epoch_started_ts") is not None else None
+                ),
+                "fit_epoch_reset_reason": str(entry.get("fit_epoch_reset_reason") or ""),
+                "fit_epoch_observation_count": int(entry.get("fit_epoch_observation_count") or 0),
+                "fit_epoch_span_s": (
+                    float(entry["fit_epoch_span_s"]) if entry.get("fit_epoch_span_s") is not None else None
+                ),
+                "fit_dropped_on_epoch_reset": int(entry.get("fit_dropped_on_epoch_reset") or 0),
+                "fit_segment_count": int(entry.get("fit_segment_count") or 0),
                 "slope_sign_convention": str(entry.get("slope_sign_convention") or ""),
                 "holdover_reason": str(entry.get("holdover_reason") or ""),
                 "holdover_quality_gate_failed": int(entry.get("holdover_quality_gate_failed") or 0),
@@ -3126,6 +3279,64 @@ class RadarState:
             ),
             last_slew_limited=bool(go_sync.get("last_slew_limited", False)),
             last_hard_bound=bool(go_sync.get("last_hard_bound", False)),
+            hard_bound_reason=str(go_sync.get("hard_bound_reason") or "") or None,
+            hard_bound_limit_s=(
+                float(go_sync["hard_bound_limit_s"])
+                if go_sync.get("hard_bound_limit_s") is not None else None
+            ),
+            hard_bound_limit_ppm=(
+                float(go_sync["hard_bound_limit_ppm"])
+                if go_sync.get("hard_bound_limit_ppm") is not None else None
+            ),
+            requested_delta_s=(
+                float(go_sync["requested_delta_s"])
+                if go_sync.get("requested_delta_s") is not None else None
+            ),
+            requested_delta_ppm=(
+                float(go_sync["requested_delta_ppm"])
+                if go_sync.get("requested_delta_ppm") is not None else None
+            ),
+            current_delta_s=(
+                float(go_sync["current_delta_s"])
+                if go_sync.get("current_delta_s") is not None else None
+            ),
+            current_delta_ppm=(
+                float(go_sync["current_delta_ppm"])
+                if go_sync.get("current_delta_ppm") is not None else None
+            ),
+            delta_to_base_s=(
+                float(go_sync["delta_to_base_s"])
+                if go_sync.get("delta_to_base_s") is not None else None
+            ),
+            delta_to_base_ppm=(
+                float(go_sync["delta_to_base_ppm"])
+                if go_sync.get("delta_to_base_ppm") is not None else None
+            ),
+            df_base_period_s=(
+                float(go_sync["df_base_period_s"])
+                if go_sync.get("df_base_period_s") is not None else None
+            ),
+            period_disagreement_s=(
+                float(go_sync["period_disagreement_s"])
+                if go_sync.get("period_disagreement_s") is not None else None
+            ),
+            period_disagreement_ppm=(
+                float(go_sync["period_disagreement_ppm"])
+                if go_sync.get("period_disagreement_ppm") is not None else None
+            ),
+            fit_epoch_id=int(go_sync.get("fit_epoch_id") or 0),
+            fit_epoch_started_ts=(
+                float(go_sync["fit_epoch_started_ts"])
+                if go_sync.get("fit_epoch_started_ts") is not None else None
+            ),
+            fit_epoch_reset_reason=str(go_sync.get("fit_epoch_reset_reason") or "") or None,
+            fit_epoch_observation_count=int(go_sync.get("fit_epoch_observation_count") or 0),
+            fit_epoch_span_s=(
+                float(go_sync["fit_epoch_span_s"])
+                if go_sync.get("fit_epoch_span_s") is not None else None
+            ),
+            fit_dropped_on_epoch_reset=int(go_sync.get("fit_dropped_on_epoch_reset") or 0),
+            fit_segment_count=int(go_sync.get("fit_segment_count") or 0),
             slope_sign_convention=str(go_sync.get("slope_sign_convention") or "") or None,
             holdover_reason=str(go_sync.get("holdover_reason") or "") or None,
             holdover_quality_gate_failed=int(go_sync.get("holdover_quality_gate_failed") or 0),
@@ -3208,6 +3419,18 @@ class RadarState:
                 "applied_delta_s": iid_state.get("pad"),
                 "last_slew_limited": iid_state.get("lsl"),
                 "last_hard_bound": iid_state.get("lhb"),
+                "hard_bound_reason": iid_state.get("hbr"),
+                "hard_bound_limit_s": iid_state.get("hls"),
+                "hard_bound_limit_ppm": iid_state.get("hlp"),
+                "requested_delta_s": iid_state.get("rds"),
+                "requested_delta_ppm": iid_state.get("rdp"),
+                "current_delta_s": iid_state.get("cds"),
+                "current_delta_ppm": iid_state.get("cdp"),
+                "delta_to_base_s": iid_state.get("dbs"),
+                "delta_to_base_ppm": iid_state.get("dbp"),
+                "df_base_period_s": iid_state.get("dfb"),
+                "period_disagreement_s": iid_state.get("pgs"),
+                "period_disagreement_ppm": iid_state.get("pgp"),
                 "fit_observation_count": iid_state.get("foc"),
                 "fit_span_s": iid_state.get("fsp"),
                 "fit_icao_count": iid_state.get("fic"),
@@ -3219,6 +3442,13 @@ class RadarState:
                 "fit_last_eviction_reason": iid_state.get("fer"),
                 "suspicious_icao_count": iid_state.get("sic"),
                 "suspicious_icao_last_reason": iid_state.get("sir"),
+                "fit_epoch_id": iid_state.get("fei"),
+                "fit_epoch_started_ts": iid_state.get("fes"),
+                "fit_epoch_reset_reason": iid_state.get("frr"),
+                "fit_epoch_observation_count": iid_state.get("feo"),
+                "fit_epoch_span_s": iid_state.get("fep"),
+                "fit_dropped_on_epoch_reset": iid_state.get("fdr"),
+                "fit_segment_count": iid_state.get("fsg"),
                 "slope_sign_convention": iid_state.get("ssc"),
                 "holdover_reason": iid_state.get("shr"),
                 "holdover_quality_gate_failed": iid_state.get("shq"),
@@ -3916,6 +4146,12 @@ class RadarState:
             "period_authority": sync_snapshot.get("period_authority"),
             "sync_authority": sync_snapshot.get("sync_authority"),
             "phase_authority": sync_snapshot.get("phase_authority"),
+            "event_base_period_s": sync_snapshot.get("base_period_s"),
+            "event_period_delta_s": sync_snapshot.get("period_delta_s"),
+            "event_effective_period_s": sync_snapshot.get("effective_period_s"),
+            "event_period_authority": sync_snapshot.get("period_authority"),
+            "event_sync_authority": sync_snapshot.get("sync_authority"),
+            "event_phase_authority": sync_snapshot.get("phase_authority"),
             "phase_basis": sync_snapshot.get("phase_basis"),
             "phase_is_absolute": bool(sync_snapshot.get("phase_is_absolute", False)),
             "phase_epoch_us": float(sync_snapshot.get("phase_epoch_us") or 0.0),
@@ -3932,6 +4168,8 @@ class RadarState:
             ),
             "handoff_state": sync_snapshot.get("handoff_state"),
             "handoff_reason": sync_snapshot.get("handoff_reason"),
+            "event_handoff_state": sync_snapshot.get("handoff_state"),
+            "event_handoff_reason": sync_snapshot.get("handoff_reason"),
             "sync_revision": int(sync_revision),
         }
 
@@ -6473,6 +6711,7 @@ class RadarState:
                 "sync_mode_diagnostics": sync_mode_diagnostics,
                 "burst_sync_diagnostic": burst_sync_diagnostic,
                 "recorded_event_diagnostics": recorded_event_diagnostics,
+                "recorded_event_time_notice": "Chart points use event-time authority snapshots; current authority is shown separately.",
             }
 
         if not _sync_source_has_rich_python_diagnostics(sync):
@@ -6631,6 +6870,7 @@ class RadarState:
                 "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []),
                 "burst_sync_diagnostic": burst_sync_diagnostic,
                 "recorded_event_diagnostics": recorded_event_diagnostics,
+                "recorded_event_time_notice": "Chart points use event-time authority snapshots; current authority is shown separately.",
                 "motion_comp_summary": {
                     "phase_enabled": bool(getattr(sync, "motion_comp_phase_enabled", False)),
                     "fit_enabled": bool(getattr(sync, "motion_comp_fit_enabled", False)),
@@ -6974,6 +7214,7 @@ class RadarState:
             "df11_residual_observations": df11_residual_observations,
             "chart_overlay_consistent": True,
             "recorded_event_diagnostics": recorded_event_diagnostics,
+            "recorded_event_time_notice": "Chart points use event-time authority snapshots; current authority is shown separately.",
             "retention_diagnostics": retention_diagnostics,
             "display_retention_diagnostic": self._build_display_retention_diagnostic(
                 sync, entries, df11_residual_observations, window_s
@@ -7089,6 +7330,7 @@ class RadarState:
             "phase_anchor_candidates": burst_timeline.get("phase_anchor_candidates", []),
             "burst_sync_diagnostic": burst_timeline.get("burst_sync_diagnostic"),
             "recorded_event_diagnostics": burst_timeline.get("recorded_event_diagnostics"),
+            "recorded_event_time_notice": burst_timeline.get("recorded_event_time_notice"),
             "period_update_history": burst_timeline.get("period_update_history", []),
             "slope_history": burst_timeline.get("slope_history", []),
             "period_history": burst_timeline.get("period_history", []),

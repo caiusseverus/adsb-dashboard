@@ -2222,13 +2222,20 @@ function isFiniteValue(value) {
   return value !== null && value !== undefined && Number.isFinite(Number(value))
 }
 
-function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
+function SyncModeStatusPanel({
+  syncState,
+  modeDiagnostics,
+  alignmentStatus,
+  residualChartMode,
+  recordedEventTimeNotice,
+}) {
   if (!syncState || !modeDiagnostics) return null
   const compact = modeDiagnostics.compact ?? {}
   const pythonSync = modeDiagnostics.python_sync ?? {}
   const operationalPeriod = getOperationalPeriodTriple(syncState)
   const authoritySummary = authorityModeLabel(syncState)
   const goDeltaVisible = Number.isFinite(Number(syncState.go_diagnostic_period_delta_s))
+  const recordedMode = residualChartMode === RESIDUAL_CHART_MODE_RECORDED
   return (
     <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
@@ -2249,7 +2256,7 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
           <span className={styles.metricPill}>Phase authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.phase_authority)}</span></span>
           <span className={styles.metricPill}>Handoff state <span className={styles.metricValue}>{formatAuthorityLabel(syncState.handoff_state)}</span></span>
           <span className={styles.metricPill}>Handoff reason <span className={styles.metricValue}>{formatAuthorityLabel(syncState.handoff_reason)}</span></span>
-          <span className={styles.metricPill}>Refinement status <span className={styles.metricValue}>{formatAuthorityLabel(syncState.period_refinement_status)}</span></span>
+          <span className={styles.metricPill}>Refinement status <span className={styles.metricValue}>{formatAuthorityLabel(syncState.operational_period_refinement_status)}</span></span>
           <span className={styles.metricPill}>Effective period source <span className={styles.metricValue}>{formatAuthorityLabel(syncState.effective_period_source)}</span></span>
           <span className={styles.metricPill}>Period Δ source <span className={styles.metricValue}>{formatAuthorityLabel(syncState.period_delta_source)}</span></span>
           <span className={styles.metricPill}>Python sync <span className={styles.metricValue}>{pythonSync.usable ? 'usable' : pythonSync.present ? 'present' : 'absent'}</span></span>
@@ -2257,24 +2264,31 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
         </div>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '10px' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '10px' }}>
         <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '6px 8px' }}>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Operational period triple</div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Current operational state</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px' }}>
-            <span className={styles.metricPill}>Ref ICAO <span className={styles.metricValue}>{compact.reference_icao ?? '—'}</span></span>
+            <span className={styles.metricPill}>Operational mode <span className={styles.metricValue}>{authoritySummary}</span></span>
+            <span className={styles.metricPill}>Period authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.period_authority)}</span></span>
+            <span className={styles.metricPill}>Sync authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.sync_authority)}</span></span>
+            <span className={styles.metricPill}>Phase authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.phase_authority)}</span></span>
             <span className={styles.metricPill}>Base <span className={styles.metricValue}>{fmtNumber(operationalPeriod?.base, 4, 's')}</span></span>
             <span className={styles.metricPill}>Δ <span className={styles.metricValue}>{fmtNumber(operationalPeriod?.delta != null ? operationalPeriod.delta * 1000 : null, 2, 'ms')}</span></span>
             <span className={styles.metricPill}>Effective <span className={styles.metricValue}>{fmtNumber(operationalPeriod?.effective, 4, 's')}</span></span>
-            <span className={styles.metricPill}>DF agreement <span className={styles.metricValue}>{compact.period_agrees_with_df === false ? 'rejected' : compact.period_agrees_with_df === true ? 'yes' : '—'}</span></span>
-            <span className={styles.metricPill}>Prev ref <span className={styles.metricValue}>{compact.last_reference_icao ?? '—'}</span></span>
-            <span className={styles.metricPill}>Ref churn <span className={styles.metricValue}>{compact.reference_changed_recently ? 'recent' : 'stable'}</span></span>
-            <span className={styles.metricPill}>Resets <span className={styles.metricValue}>{compact.sync_reset_count ?? 0}</span></span>
+            <span className={styles.metricPill}>Handoff <span className={styles.metricValue}>{formatAuthorityLabel(syncState.handoff_state)}</span></span>
+            <span className={styles.metricPill}>Handoff reason <span className={styles.metricValue}>{formatAuthorityLabel(syncState.handoff_reason)}</span></span>
+            <span className={styles.metricPill}>Operational fit obs <span className={styles.metricValue}>
+              {syncState.operational_fit_total_observations != null
+                ? `${syncState.operational_fit_eligible_observations ?? 0}/${syncState.operational_fit_total_observations ?? 0}`
+                : 'unavailable'}
+            </span></span>
+            <span className={styles.metricPill}>Operational refinement <span className={styles.metricValue}>{formatAuthorityLabel(syncState.operational_period_refinement_status)}</span></span>
           </div>
           <div style={{ color: '#8b949e', fontSize: '0.72rem', lineHeight: 1.45 }}>
+            {syncState.operational_refinement_unavailable_reason
+              ? `Operational refinement unavailable: ${humanizeSyncReason(syncState.operational_refinement_unavailable_reason)}. `
+              : ''}
             {compact.period_reject_reason ? `Period refinement rejected: ${humanizeSyncReason(compact.period_reject_reason)}. ` : ''}
-            {compact.reference_changed_recently ? `Reference changed recently from ${compact.last_reference_icao ?? '—'} to ${compact.reference_icao ?? '—'}. ` : ''}
-            {compact.phase_epoch_changed_recently ? 'Phase epoch changed recently. ' : ''}
-            {compact.last_holdover_transition ? `Last holdover transition: ${humanizeSyncReason(compact.last_holdover_transition)}. ` : ''}
             {syncState.last_handoff_transition_ts ? `Last handoff transition: ${new Date(Number(syncState.last_handoff_transition_ts) * 1000).toLocaleTimeString()}. ` : ''}
             {collectBlockingHandoffGates(syncState).length ? `Blocking gates: ${collectBlockingHandoffGates(syncState).join(', ')}. ` : ''}
             {compact.last_sync_reset_reason ? `Last reset: ${humanizeSyncReason(compact.last_sync_reset_reason)}.` : (alignmentStatus?.detail ?? '')}
@@ -2282,24 +2296,43 @@ function SyncModeStatusPanel({ syncState, modeDiagnostics, alignmentStatus }) {
         </div>
 
         <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '6px 8px' }}>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Diagnostic / shadow refiner</div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Go diagnostic refiner</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px' }}>
-            <span className={styles.metricPill}>Present <span className={styles.metricValue}>{pythonSync.present ? 'yes' : 'no'}</span></span>
-            <span className={styles.metricPill}>Anchor <span className={styles.metricValue}>{pythonSync.anchor_icao ?? '—'}</span></span>
-            <span className={styles.metricPill}>Candidates <span className={styles.metricValue}>{pythonSync.anchor_candidate_count ?? 0}</span></span>
-            <span className={styles.metricPill}>Fit obs <span className={styles.metricValue}>{pythonSync.fit_eligible_observations ?? 0}/{pythonSync.fit_total_observations ?? 0}</span></span>
-            <span className={styles.metricPill}>Anchor-relative phase trust <span className={styles.metricValue}>{phaseStatusDisplayLabel(pythonSync.phase_status_display ?? pythonSync.phase_status)}</span></span>
+            <span className={styles.metricPill}>Status <span className={styles.metricValue}>{formatAuthorityLabel(syncState.go_diagnostic_refinement_status)}</span></span>
+            <span className={styles.metricPill}>Source <span className={styles.metricValue}>{formatAuthorityLabel(syncState.go_diagnostic_period_source)}</span></span>
+            <span className={styles.metricPill}>Fit obs <span className={styles.metricValue}>{syncState.go_diagnostic_fit_observation_count ?? 0}</span></span>
+            <span className={styles.metricPill}>Fit span <span className={styles.metricValue}>{fmtNumber(syncState.go_diagnostic_fit_span_s, 1, 's')}</span></span>
+            <span className={styles.metricPill}>Fit ICAOs <span className={styles.metricValue}>{syncState.go_diagnostic_fit_icao_count ?? 0}</span></span>
             {goDeltaVisible && (
               <span className={styles.metricPill}>Go Δ (diagnostic) <span className={styles.metricValue}>{fmtNumber(Number(syncState.go_diagnostic_period_delta_s) * 1000, 2, 'ms')}</span></span>
             )}
-            <span className={styles.metricPill}>Go source (diagnostic) <span className={styles.metricValue}>{formatAuthorityLabel(syncState.go_diagnostic_period_source)}</span></span>
+            <span className={styles.metricPill}>Proposed Δ <span className={styles.metricValue}>{fmtNumber(Number(syncState.go_diagnostic_proposed_delta_s) * 1000, 3, 'ms')}</span></span>
+            <span className={styles.metricPill}>Applied Δ <span className={styles.metricValue}>{fmtNumber(Number(syncState.go_diagnostic_applied_delta_s) * 1000, 3, 'ms')}</span></span>
+            <span className={styles.metricPill}>Hard bound <span className={styles.metricValue}>{syncState.go_diagnostic_last_hard_bound ? 'yes' : 'no'}</span></span>
+            <span className={styles.metricPill}>Slew limited <span className={styles.metricValue}>{syncState.go_diagnostic_last_slew_limited ? 'yes' : 'no'}</span></span>
+            <span className={styles.metricPill}>Epoch id <span className={styles.metricValue}>{syncState.go_diagnostic_fit_epoch_id ?? '—'}</span></span>
           </div>
           <div style={{ color: '#8b949e', fontSize: '0.72rem', lineHeight: 1.45 }}>
-            Non-operational values in this section do not drive current frame timing or effective period.
-            {' '}
-            {pythonSync.active
-              ? (pythonSync.no_anchor_reason ? `No anchor selected: ${humanizeSyncReason(pythonSync.no_anchor_reason)}.` : 'Python live sync is active.')
-              : `Python live sync is not active: ${humanizeSyncReason(pythonSync.no_anchor_reason)}.`}
+            Non-operational values in this section do not drive current frame timing or effective period.{' '}
+            {syncState.go_diagnostic_last_hard_bound
+              ? `Requested correction rejected by hard bound (${fmtNumber(syncState.go_diagnostic_requested_delta_s != null ? Number(syncState.go_diagnostic_requested_delta_s) * 1000 : null, 3, 'ms')} requested vs ${fmtNumber(syncState.go_diagnostic_hard_bound_limit_s != null ? Number(syncState.go_diagnostic_hard_bound_limit_s) * 1000 : null, 3, 'ms')} limit, ${fmtNumber(syncState.go_diagnostic_requested_delta_ppm, 1, 'ppm')}). `
+              : ''}
+            {syncState.go_diagnostic_hard_bound_reason ? `Reason: ${humanizeSyncReason(syncState.go_diagnostic_hard_bound_reason)}. ` : ''}
+            {syncState.go_diagnostic_fit_epoch_reset_reason ? `Fit epoch reset: ${humanizeSyncReason(syncState.go_diagnostic_fit_epoch_reset_reason)}.` : ''}
+          </div>
+        </div>
+
+        <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '6px 8px' }}>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Recorded event chart semantics</div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px' }}>
+            <span className={styles.metricPill}>Chart mode <span className={styles.metricValue}>{recordedMode ? 'recorded' : 'recomputed'}</span></span>
+            <span className={styles.metricPill}>Residual basis <span className={styles.metricValue}>{recordedMode ? 'event-time immutable' : 'current projection'}</span></span>
+            <span className={styles.metricPill}>Current authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.period_authority)}</span></span>
+          </div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', lineHeight: 1.45 }}>
+            {recordedMode
+              ? (recordedEventTimeNotice ?? 'Chart points use event-time authority snapshots; current authority is shown separately.')
+              : 'Chart points use current recomputed projection values. Current authority above remains authoritative.'}
           </div>
         </div>
       </div>
@@ -2420,7 +2453,11 @@ function PhaseAnchorPanel({ syncState, observations, candidates }) {
           <span className={styles.metricPill} title="Anchor-relative phase status: trusted = Stage 3 eligible; provisional = display only; untrusted = blocked">Anchor-relative phase trust <span className={styles.metricValue} style={{ color: syncState.phase_status === 'trusted' ? '#3fb950' : syncState.phase_status === 'provisional' ? '#e3b341' : '#8b949e' }}>{phaseStatusDisplayLabel(syncState.phase_status_display ?? syncState.phase_status)}</span></span>
           <span className={styles.metricPill}>Agree/reject <span className={styles.metricValue}>{syncState.phase_validation_contributors ?? 0}/{syncState.phase_validation_reject_count ?? 0}</span></span>
           <span className={styles.metricPill}>Median Δ <span className={styles.metricValue}>{fmtNumber(syncState.phase_validation_median_error_deg, 2, '°')}</span></span>
-          <span className={styles.metricPill}>Fit obs <span className={styles.metricValue}>{syncState.fit_eligible_observations ?? 0}/{syncState.fit_total_observations ?? 0}</span></span>
+          <span className={styles.metricPill}>Operational fit obs <span className={styles.metricValue}>
+            {syncState.operational_fit_total_observations != null
+              ? `${syncState.operational_fit_eligible_observations ?? 0}/${syncState.operational_fit_total_observations ?? 0}`
+              : 'unavailable'}
+          </span></span>
           <span className={styles.metricPill}>Candidates <span className={styles.metricValue}>{syncState.phase_anchor_candidate_count ?? candidateRows.length}</span></span>
         </div>
       </div>
@@ -3137,6 +3174,11 @@ function RotationAlignmentPanel({
               Recorded immutable event history
             </span>
           )}
+          {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS && residualChartMode === RESIDUAL_CHART_MODE_RECORDED && (
+            <span className={styles.metricPill} style={{ color: '#8b949e' }}>
+              Chart points use event-time authority snapshots
+            </span>
+          )}
           <span className={styles.metricPill} title="Short local solver window used for fitting only.">
             Fit window <span className={styles.metricValue}>{syncHorizons?.fit_window_s != null ? `${Number(syncHorizons.fit_window_s).toFixed(0)}s` : '—'}</span>
           </span>
@@ -3191,24 +3233,25 @@ function RotationAlignmentPanel({
           <span className={styles.metricPill}>Anchor ICAO <span className={styles.metricValue}>{syncState?.phase_anchor_icao ?? '—'}</span></span>
           <span className={styles.metricPill}>Anchor age <span className={styles.metricValue}>{syncState?.phase_anchor_since_ts ? `${Math.max(0, (Date.now() / 1000) - Number(syncState.phase_anchor_since_ts)).toFixed(0)}s` : '—'}</span></span>
           <span className={styles.metricPill}>Chart semantics <span className={styles.metricValue}>{residualChartMode === RESIDUAL_CHART_MODE_RECORDED ? 'immutable' : 'reprojected'}</span></span>
-          <span className={styles.metricPill}>Diag: convergence <span className={styles.metricValue}>{syncState?.fit_observation_count != null ? `${syncState.fit_observation_count} obs / ${fmtNumber(syncState.fit_span_s, 1, 's')}` : '—'}</span></span>
-          <span className={styles.metricPill}>Diag: fit ICAOs <span className={styles.metricValue}>{syncState?.fit_icao_count ?? '—'}</span></span>
-          <span className={styles.metricPill}>Diag: obs/ICAO min|med|max <span className={styles.metricValue}>
-            {syncState?.fit_observations_per_icao_median != null
-              ? `${syncState.fit_observations_per_icao_min}|${Number(syncState.fit_observations_per_icao_median).toFixed(1)}|${syncState.fit_observations_per_icao_max}`
+          <span className={styles.metricPill}>Diag: Go convergence <span className={styles.metricValue}>{syncState?.go_diagnostic_fit_observation_count != null ? `${syncState.go_diagnostic_fit_observation_count} obs / ${fmtNumber(syncState.go_diagnostic_fit_span_s, 1, 's')}` : '—'}</span></span>
+          <span className={styles.metricPill}>Diag: Go fit ICAOs <span className={styles.metricValue}>{syncState?.go_diagnostic_fit_icao_count ?? '—'}</span></span>
+          <span className={styles.metricPill}>Diag: Go obs/ICAO min|med|max <span className={styles.metricValue}>
+            {syncState?.go_diagnostic_fit_observations_per_icao_median != null
+              ? `${syncState.go_diagnostic_fit_observations_per_icao_min}|${Number(syncState.go_diagnostic_fit_observations_per_icao_median).toFixed(1)}|${syncState.go_diagnostic_fit_observations_per_icao_max}`
               : '—'}
           </span></span>
           <span className={styles.metricPill}>Diag: slope sign <span className={styles.metricValue}>{syncState?.slope_sign_convention ?? '—'}</span></span>
           <span className={styles.metricPill}>Diag: Go slope/EMA/σ <span className={styles.metricValue}>
-            {syncState?.residual_slope_deg_per_s != null
-              ? `${Number(syncState.residual_slope_deg_per_s).toFixed(3)} / ${fmtNumber(syncState?.slope_ema_deg_per_s, 3)} / ${fmtNumber(syncState?.slope_std_deg_per_s, 3)}`
+            {syncState?.go_diagnostic_residual_slope_deg_per_s != null
+              ? `${Number(syncState.go_diagnostic_residual_slope_deg_per_s).toFixed(3)} / ${fmtNumber(syncState?.go_diagnostic_slope_ema_deg_per_s, 3)} / ${fmtNumber(syncState?.go_diagnostic_slope_std_deg_per_s, 3)}`
               : '—'}
           </span></span>
           <span className={styles.metricPill}>Diag: Go Δ proposed/applied <span className={styles.metricValue}>
-            {syncState?.proposed_delta_s != null
-              ? `${Number(syncState.proposed_delta_s).toExponential(2)} / ${fmtNumber(syncState?.applied_delta_s, 6)}`
+            {syncState?.go_diagnostic_proposed_delta_s != null
+              ? `${Number(syncState.go_diagnostic_proposed_delta_s).toExponential(2)} / ${fmtNumber(syncState?.go_diagnostic_applied_delta_s, 6)}`
               : '—'}
           </span></span>
+          <span className={styles.metricPill}>Diag: hard-bound reason <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.go_diagnostic_hard_bound_reason)}</span></span>
           {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS ? (
             <>
               <span className={styles.metricPill}>
@@ -3313,6 +3356,8 @@ function RotationAlignmentPanel({
         syncState={syncState}
         modeDiagnostics={syncModeDiagnostics}
         alignmentStatus={alignmentStatus}
+        residualChartMode={residualChartMode}
+        recordedEventTimeNotice={burstTimeline?.recorded_event_time_notice}
       />
 
       <PhaseAnchorPanel
@@ -3531,7 +3576,11 @@ function RotationAlignmentPanel({
                         strokeWidth={selectedIcao === obs.icao ? 1.2 : syncEligible ? 0 : 0.8}
                       >
                         <title>
-                          {`${obs.icao} ${burstResidualLabel} ${Number(displayedResidual ?? 0).toFixed(2)}° | predicted ${Number(obs.predicted_deg ?? 0).toFixed(1)}° | replies ${obs.n_replies ?? 0}${syncEligible ? '' : ' | non-sync-driving'}`}
+                          {`${obs.icao} ${burstResidualLabel} ${Number(displayedResidual ?? 0).toFixed(2)}° | predicted ${Number(obs.predicted_deg ?? 0).toFixed(1)}° | replies ${obs.n_replies ?? 0}${syncEligible ? '' : ' | non-sync-driving'}${
+                            residualChartMode === RESIDUAL_CHART_MODE_RECORDED
+                              ? ` | event authority ${formatAuthorityLabel(obs.event_period_authority ?? obs.period_authority)} / ${formatAuthorityLabel(obs.event_sync_authority ?? obs.sync_authority)} | event handoff ${formatAuthorityLabel(obs.event_handoff_state ?? obs.handoff_state)} | event effective ${fmtNumber(obs.event_effective_period_s ?? obs.effective_period_s, 4, 's')} | event Δ ${fmtNumber((obs.event_period_delta_s ?? obs.period_delta_s) != null ? Number(obs.event_period_delta_s ?? obs.period_delta_s) * 1000 : null, 3, 'ms')}`
+                              : ''
+                          }`}
                         </title>
                       </circle>
                     )

@@ -225,6 +225,13 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
         "handoff_reason",
         "handoff_gate_failures",
         "last_handoff_transition_ts",
+        "operational_fit_total_observations",
+        "operational_fit_eligible_observations",
+        "operational_period_refinement_status",
+        "operational_refinement_unavailable_reason",
+        "go_diagnostic_fit_observation_count",
+        "go_diagnostic_proposed_delta_s",
+        "go_diagnostic_applied_delta_s",
     }
 
     assert payload["sync_state"]["source"] == "go_frame_sync"
@@ -250,6 +257,10 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     assert payload["sync_state"]["last_sync_reject_reason"] == "hard_residual_reject"
     assert payload["sync_state"]["holdover_hard_residual_reject"] == 7
     assert payload["sync_state"]["effective_period_source"] == "go_runtime.base_period_s"
+    assert payload["sync_state"]["operational_period_refinement_status"] is not None
+    assert payload["sync_state"]["go_diagnostic_fit_observation_count"] == 14
+    assert payload["sync_state"]["go_diagnostic_proposed_delta_s"] == pytest.approx(0.0005)
+    assert payload["sync_state"]["go_diagnostic_applied_delta_s"] == pytest.approx(0.0001)
     assert "handoff_state" in payload["sync_state"]
     assert "handoff_gate_failures" in payload["sync_state"]
     assert "data_path_diagnostics" in payload

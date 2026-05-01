@@ -277,6 +277,89 @@ func TestSyncState_PeriodRefinement_RejectsExcessiveSlope(t *testing.T) {
 	}
 }
 
+func TestSyncState_FitEpochResetOnReferenceICAOChange(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 12; i++ {
+		residual := -6.0 + float64(i)*0.3
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, residual, 0xAA+uint32(i%4), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	if len(s.residualHistory) == 0 {
+		t.Fatal("expected seeded residual history")
+	}
+	prevEpochID := s.FitEpochID
+	prevSegmentCount := s.FitSegmentCount
+
+	s.AddRefinementResidualObservation(52_000_000.0, -1.2, 0xBB01, true, 4, 0.5, 0xBB, "go_refiner_active")
+
+	if s.FitEpochID <= prevEpochID {
+		t.Fatalf("fit epoch id=%d, want > %d after reference change", s.FitEpochID, prevEpochID)
+	}
+	if s.FitSegmentCount != prevSegmentCount+1 {
+		t.Fatalf("fit segment count=%d, want %d", s.FitSegmentCount, prevSegmentCount+1)
+	}
+	if s.FitEpochResetReason != "reference_icao_changed" {
+		t.Fatalf("fit epoch reset reason=%q, want reference_icao_changed", s.FitEpochResetReason)
+	}
+	if s.FitDroppedOnEpochReset <= 0 {
+		t.Fatalf("expected dropped observations on epoch reset, got %d", s.FitDroppedOnEpochReset)
+	}
+	if s.FitEpochObservationCount != 1 {
+		t.Fatalf("fit epoch observation count=%d, want 1 for new epoch", s.FitEpochObservationCount)
+	}
+}
+
+func TestSyncState_FitEpochResetOnAuthorityBasisChange(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 10; i++ {
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, float64(i)*0.2, 0xCC+uint32(i%3), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	if len(s.residualHistory) == 0 {
+		t.Fatal("expected seeded residual history")
+	}
+	prevEpochID := s.FitEpochID
+
+	s.AddRefinementResidualObservation(44_000_000.0, 1.1, 0xCC, true, 4, 0.5, 0xAA, "go_refiner_holdover")
+
+	if s.FitEpochID <= prevEpochID {
+		t.Fatalf("fit epoch id=%d, want > %d after authority basis change", s.FitEpochID, prevEpochID)
+	}
+	if s.FitEpochResetReason != "period_authority_changed" {
+		t.Fatalf("fit epoch reset reason=%q, want period_authority_changed", s.FitEpochResetReason)
+	}
+	if s.FitDroppedOnEpochReset <= 0 {
+		t.Fatalf("expected dropped observations on epoch reset, got %d", s.FitDroppedOnEpochReset)
+	}
+}
+
+func TestSyncState_RepeatedHardBoundRejectResetsFitEpoch(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+
+	triggeredReset := false
+	for i := 1; i <= 24; i++ {
+		residual := -30.0 + float64(i)*3.0
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, residual, 0xDD+uint32(i%4), true, 4, 0.5, 0xAA, "go_refiner_active")
+		if s.FitEpochResetReason == "repeated_hard_bound_reject" {
+			triggeredReset = true
+			break
+		}
+	}
+	if !triggeredReset {
+		t.Fatal("expected repeated hard-bound rejection to rotate fit epoch")
+	}
+	if !s.LastHardBound {
+		t.Fatal("expected last_hard_bound=true when repeated hard-bound reset triggers")
+	}
+	if s.HardBoundReason != "requested_delta_exceeds_hard_bound" {
+		t.Fatalf("hard bound reason=%q, want requested_delta_exceeds_hard_bound", s.HardBoundReason)
+	}
+	if s.RequestedDeltaPPM == 0 {
+		t.Fatal("expected requested delta ppm to be populated")
+	}
+	if s.FitDroppedOnEpochReset <= 0 {
+		t.Fatalf("expected dropped observations after repeated hard-bound reset, got %d", s.FitDroppedOnEpochReset)
+	}
+}
+
 func TestSyncState_HoldoverReason_QualityGateAndHardResidual(t *testing.T) {
 	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
 	accepted := s.UpdateEpoch(4_000_000.0, 0.0, 4.0, 1.0, 1, 0.5)
@@ -317,7 +400,7 @@ func TestSyncState_MaintenanceUpdateClearsHoldoverWithoutStrictGate(t *testing.T
 func seedReacquireFitSupport(s *SyncState) {
 	for i := 0; i < 24; i++ {
 		icao := uint32(0xAA + uint32(i%4))
-		s.AddRefinementResidualObservation(float64(i+1)*4_000_000.0, 1.0, icao, true, 4, 0.5)
+		s.AddRefinementResidualObservation(float64(i+1)*4_000_000.0, 1.0, icao, true, 4, 0.5, 0, "go_refiner_active")
 	}
 }
 
@@ -387,7 +470,7 @@ func TestSyncState_MaintenanceAllowsNAircraftOneWithStrongResidualSupport(t *tes
 	// Strengthen support to pass maintenance-from-support thresholds.
 	for i := 0; i < 40; i++ {
 		icao := uint32(0xB0 + uint32(i%8))
-		s.AddRefinementResidualObservation(float64(i+1)*2_000_000.0, 0.5, icao, true, 4, 0.4)
+		s.AddRefinementResidualObservation(float64(i+1)*2_000_000.0, 0.5, icao, true, 4, 0.4, 0, "go_refiner_active")
 	}
 	accepted := s.UpdateEpoch(4_000_000.0, 0.0, 4.0, 1.0, 1, 1.0, 0xAA)
 	if !accepted {
@@ -419,7 +502,7 @@ func TestSyncState_UpdateAcceptRejectImprovesWithStrongSupportAtNAircraftOne(t *
 	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
 	for i := 0; i < 48; i++ {
 		icao := uint32(0xC0 + uint32(i%10))
-		s.AddRefinementResidualObservation(float64(i+1)*1_500_000.0, 0.2, icao, true, 4, 0.4)
+		s.AddRefinementResidualObservation(float64(i+1)*1_500_000.0, 0.2, icao, true, 4, 0.4, 0, "go_refiner_active")
 	}
 	for i := 1; i <= 6; i++ {
 		epochUS := float64(i) * 4_000_000.0
@@ -601,7 +684,7 @@ func TestFitResidualSlopeDegPerS_SoftWeightsPreserved(t *testing.T) {
 func TestSyncState_AddRefinementResidualValue_UsesProvidedResidualDirectly(t *testing.T) {
 	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
 	for i := 0; i < 80; i++ {
-		s.AddRefinementResidualValue(float64(i+1)*1_000_000.0, float64(i+1)*0.05, 0xAA+uint32(i%8), true, 4, 0.2)
+		s.AddRefinementResidualValue(float64(i+1)*1_000_000.0, float64(i+1)*0.05, 0xAA+uint32(i%8), true, 4, 0.2, 0, "go_refiner_active")
 	}
 	if s.RefinementEligibleCount == 0 {
 		t.Fatal("expected eligible observations")
@@ -615,7 +698,7 @@ func TestSyncState_ResidualRetentionPerICAOAndGlobalCap(t *testing.T) {
 	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
 	for i := 0; i < 400; i++ {
 		icao := uint32(0xAA + uint32(i%40))
-		s.AddRefinementResidualObservation(float64(i+1)*100_000.0, 2.0, icao, true, 4, 0.2)
+		s.AddRefinementResidualObservation(float64(i+1)*100_000.0, 2.0, icao, true, 4, 0.2, 0, "go_refiner_active")
 	}
 	if len(s.residualHistory) > refinementGlobalCap {
 		t.Fatalf("history len=%d exceeds global cap %d", len(s.residualHistory), refinementGlobalCap)
@@ -636,7 +719,7 @@ func TestSyncState_ResidualRetentionPerICAOAndGlobalCap(t *testing.T) {
 
 func TestSyncState_RejectsStaleRefPositionForRefinement(t *testing.T) {
 	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
-	s.AddRefinementResidualObservation(1_000_000.0, 1.0, 0xAA, true, 4, 9.0)
+	s.AddRefinementResidualObservation(1_000_000.0, 1.0, 0xAA, true, 4, 9.0, 0, "go_refiner_active")
 	if s.RefinementLastRejectReason != "stale_ref_position" {
 		t.Fatalf("reject reason=%q, want stale_ref_position", s.RefinementLastRejectReason)
 	}
@@ -647,12 +730,12 @@ func TestSyncState_SuspiciousICAOExclusion(t *testing.T) {
 	now := float64(time.Now().Unix())
 	for i := 0; i < 5; i++ {
 		s.RefinementLastObservationUnix = now + float64(i)
-		s.AddRefinementResidualObservation(float64(i+1)*1_000_000.0, 90.0, 0xAA, true, 4, 0.2)
+		s.AddRefinementResidualObservation(float64(i+1)*1_000_000.0, 90.0, 0xAA, true, 4, 0.2, 0, "go_refiner_active")
 	}
 	if s.SuspiciousICAOCount == 0 {
 		t.Fatal("expected suspicious ICAO count > 0")
 	}
-	s.AddRefinementResidualObservation(10_000_000.0, 1.0, 0xAA, true, 4, 0.2)
+	s.AddRefinementResidualObservation(10_000_000.0, 1.0, 0xAA, true, 4, 0.2, 0, "go_refiner_active")
 	if s.RefinementLastRejectReason != "suspicious_icao_excluded" {
 		t.Fatalf("reject reason=%q, want suspicious_icao_excluded", s.RefinementLastRejectReason)
 	}
@@ -673,7 +756,7 @@ func TestSyncState_PeriodRefinementSignForPPMDrift(t *testing.T) {
 		truePeriod := 4.0 * (1.0 + 50.0/1e6)
 		for i := 1; i <= 40; i++ {
 			r := makeResidual(i, truePeriod, 4.0)
-			s.AddRefinementResidualObservation(float64(i)*4_000_000.0, r, 0xAB+uint32(i%4), true, 4, 0.2)
+			s.AddRefinementResidualObservation(float64(i)*4_000_000.0, r, 0xAB+uint32(i%4), true, 4, 0.2, 0, "go_refiner_active")
 		}
 		if s.PeriodDeltaS <= 0 {
 			t.Fatalf("+50ppm expected positive delta, got %.9f", s.PeriodDeltaS)
@@ -684,7 +767,7 @@ func TestSyncState_PeriodRefinementSignForPPMDrift(t *testing.T) {
 		truePeriod := 4.0 * (1.0 - 50.0/1e6)
 		for i := 1; i <= 40; i++ {
 			r := makeResidual(i, truePeriod, 4.0)
-			s.AddRefinementResidualObservation(float64(i)*4_000_000.0, r, 0xCD+uint32(i%4), true, 4, 0.2)
+			s.AddRefinementResidualObservation(float64(i)*4_000_000.0, r, 0xCD+uint32(i%4), true, 4, 0.2, 0, "go_refiner_active")
 		}
 		if s.PeriodDeltaS >= 0 {
 			t.Fatalf("-50ppm expected negative delta, got %.9f", s.PeriodDeltaS)

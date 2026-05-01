@@ -619,6 +619,24 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 			"period_delta_s":                                 snap.PeriodDeltaS,
 			"effective_period_s":                             nil,
 			"residual_slope_deg_per_s":                       snap.ResidualSlopeDegPerS,
+			"slope_ema_deg_per_s":                            snap.ResidualSlopeEMADegPerS,
+			"slope_std_deg_per_s":                            snap.ResidualSlopeStdDegPerS,
+			"proposed_delta_s":                               snap.ProposedDeltaS,
+			"applied_delta_s":                                snap.AppliedDeltaS,
+			"last_slew_limited":                              snap.LastSlewLimited,
+			"last_hard_bound":                                snap.LastHardBound,
+			"hard_bound_reason":                              snap.HardBoundReason,
+			"hard_bound_limit_s":                             snap.HardBoundLimitS,
+			"hard_bound_limit_ppm":                           snap.HardBoundLimitPPM,
+			"requested_delta_s":                              snap.RequestedDeltaS,
+			"requested_delta_ppm":                            snap.RequestedDeltaPPM,
+			"current_delta_s":                                snap.CurrentDeltaS,
+			"current_delta_ppm":                              snap.CurrentDeltaPPM,
+			"delta_to_base_s":                                snap.DeltaToBaseS,
+			"delta_to_base_ppm":                              snap.DeltaToBasePPM,
+			"df_base_period_s":                               snap.DFBasePeriodS,
+			"period_disagreement_s":                          snap.PeriodDisagreementS,
+			"period_disagreement_ppm":                        snap.PeriodDisagreementPPM,
 			"period_refinement_status":                       snap.PeriodRefinementStatus,
 			"period_agrees_with_df":                          snap.PeriodAgreesWithDF,
 			"period_reject_reason":                           snap.PeriodRejectReason,
@@ -677,6 +695,24 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 			"refinement_last_reject_reason":                  snap.RefinementLastRejectReason,
 			"refinement_last_observation_age_s":              snap.RefinementLastObservationAgeS,
 			"refinement_history_len":                         snap.RefinementHistoryLen,
+			"fit_observation_count":                          snap.FitObservationCount,
+			"fit_span_s":                                     snap.FitSpanS,
+			"fit_icao_count":                                 snap.FitICAOCount,
+			"fit_observations_per_icao_min":                  snap.FitObservationsPerICAOMin,
+			"fit_observations_per_icao_median":               snap.FitObservationsPerICAOMedian,
+			"fit_observations_per_icao_max":                  snap.FitObservationsPerICAOMax,
+			"fit_retention_window_s":                         snap.FitRetentionWindowS,
+			"fit_global_cap_hit":                             snap.FitGlobalCapHit,
+			"fit_last_eviction_reason":                       snap.FitLastEvictionReason,
+			"suspicious_icao_count":                          snap.SuspiciousICAOCount,
+			"suspicious_icao_last_reason":                    snap.SuspiciousICAOLastReason,
+			"fit_epoch_id":                                   snap.FitEpochID,
+			"fit_epoch_started_ts":                           snap.FitEpochStartedUnix,
+			"fit_epoch_reset_reason":                         snap.FitEpochResetReason,
+			"fit_epoch_observation_count":                    snap.FitEpochObservationCount,
+			"fit_epoch_span_s":                               snap.FitEpochSpanS,
+			"fit_dropped_on_epoch_reset":                     snap.FitDroppedOnEpochReset,
+			"fit_segment_count":                              snap.FitSegmentCount,
 			"retained_state": map[string]interface{}{
 				"active_aircraft_estimate":           snap.ActiveAircraftEstimate,
 				"burst_records_total":                snap.BurstRecordsTotal,
@@ -954,6 +990,18 @@ func (e *engine) emitIIDState(iidNum uint8, s *iid.IIDState, nBurstRecords uint1
 		AppliedDeltaS:                   snapAppliedDelta(s),
 		LastSlewLimited:                 snapLastSlewLimited(s),
 		LastHardBound:                   snapLastHardBound(s),
+		HardBoundReason:                 snapHardBoundReason(s),
+		HardBoundLimitS:                 snapHardBoundLimitS(s),
+		HardBoundLimitPPM:               snapHardBoundLimitPPM(s),
+		RequestedDeltaS:                 snapRequestedDeltaS(s),
+		RequestedDeltaPPM:               snapRequestedDeltaPPM(s),
+		CurrentDeltaS:                   snapCurrentDeltaS(s),
+		CurrentDeltaPPM:                 snapCurrentDeltaPPM(s),
+		DeltaToBaseS:                    snapDeltaToBaseS(s),
+		DeltaToBasePPM:                  snapDeltaToBasePPM(s),
+		DFBasePeriodS:                   snapDFBasePeriodS(s),
+		PeriodDisagreementS:             snapPeriodDisagreementS(s),
+		PeriodDisagreementPPM:           snapPeriodDisagreementPPM(s),
 		PeriodRefineStatus:              snapPeriodRefineStatus(s),
 		PeriodAgreesWithDF:              snapPeriodAgrees(s),
 		PeriodRejectReason:              snapPeriodRejectReason(s),
@@ -968,6 +1016,13 @@ func (e *engine) emitIIDState(iidNum uint8, s *iid.IIDState, nBurstRecords uint1
 		FitLastEvictionReason:           snapFitLastEvictionReason(s),
 		SuspiciousICAOCount:             snapSuspiciousICAOCount(s),
 		SuspiciousICAOLastReason:        snapSuspiciousICAOLastReason(s),
+		FitEpochID:                      snapFitEpochID(s),
+		FitEpochStartedUnix:             snapFitEpochStartedUnix(s),
+		FitEpochResetReason:             snapFitEpochResetReason(s),
+		FitEpochObservationCount:        snapFitEpochObservationCount(s),
+		FitEpochSpanS:                   snapFitEpochSpanS(s),
+		FitDroppedOnEpochReset:          snapFitDroppedOnEpochReset(s),
+		FitSegmentCount:                 snapFitSegmentCount(s),
 		SlopeSignConvention:             snapSlopeSignConvention(s),
 		HoldoverReason:                  snapHoldoverReason(s),
 		HoldoverQualityGateFailed:       snapHoldoverCount(s, "quality_gate_failed"),
@@ -1078,6 +1133,38 @@ func snapProposedDelta(s *iid.IIDState) *float64 {
 func snapAppliedDelta(s *iid.IIDState) *float64 { v := s.DebugStateSnapshot().AppliedDeltaS; return &v }
 func snapLastSlewLimited(s *iid.IIDState) bool  { return s.DebugStateSnapshot().LastSlewLimited }
 func snapLastHardBound(s *iid.IIDState) bool    { return s.DebugStateSnapshot().LastHardBound }
+func snapHardBoundReason(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().HardBoundReason
+}
+func snapHardBoundLimitS(s *iid.IIDState) *float64 { v := s.DebugStateSnapshot().HardBoundLimitS; return &v }
+func snapHardBoundLimitPPM(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().HardBoundLimitPPM
+	return &v
+}
+func snapRequestedDeltaS(s *iid.IIDState) *float64 { v := s.DebugStateSnapshot().RequestedDeltaS; return &v }
+func snapRequestedDeltaPPM(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().RequestedDeltaPPM
+	return &v
+}
+func snapCurrentDeltaS(s *iid.IIDState) *float64 { v := s.DebugStateSnapshot().CurrentDeltaS; return &v }
+func snapCurrentDeltaPPM(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().CurrentDeltaPPM
+	return &v
+}
+func snapDeltaToBaseS(s *iid.IIDState) *float64 { v := s.DebugStateSnapshot().DeltaToBaseS; return &v }
+func snapDeltaToBasePPM(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().DeltaToBasePPM
+	return &v
+}
+func snapDFBasePeriodS(s *iid.IIDState) *float64 { v := s.DebugStateSnapshot().DFBasePeriodS; return &v }
+func snapPeriodDisagreementS(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().PeriodDisagreementS
+	return &v
+}
+func snapPeriodDisagreementPPM(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().PeriodDisagreementPPM
+	return &v
+}
 func snapFitObservationCount(s *iid.IIDState) uint16 {
 	v := s.DebugStateSnapshot().FitObservationCount
 	if v < 0 {
@@ -1143,6 +1230,51 @@ func snapSuspiciousICAOCount(s *iid.IIDState) uint16 {
 }
 func snapSuspiciousICAOLastReason(s *iid.IIDState) string {
 	return s.DebugStateSnapshot().SuspiciousICAOLastReason
+}
+func snapFitEpochID(s *iid.IIDState) uint32 {
+	v := s.DebugStateSnapshot().FitEpochID
+	if v > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(v)
+}
+func snapFitEpochStartedUnix(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().FitEpochStartedUnix
+	return &v
+}
+func snapFitEpochResetReason(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().FitEpochResetReason
+}
+func snapFitEpochObservationCount(s *iid.IIDState) uint16 {
+	v := s.DebugStateSnapshot().FitEpochObservationCount
+	if v < 0 {
+		return 0
+	}
+	if v > math.MaxUint16 {
+		return math.MaxUint16
+	}
+	return uint16(v)
+}
+func snapFitEpochSpanS(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().FitEpochSpanS
+	return &v
+}
+func snapFitDroppedOnEpochReset(s *iid.IIDState) uint32 {
+	v := s.DebugStateSnapshot().FitDroppedOnEpochReset
+	if v < 0 {
+		return 0
+	}
+	if v > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(v)
+}
+func snapFitSegmentCount(s *iid.IIDState) uint32 {
+	v := s.DebugStateSnapshot().FitSegmentCount
+	if v > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(v)
 }
 func snapSlopeSignConvention(s *iid.IIDState) string {
 	return s.DebugStateSnapshot().SlopeSignConvention

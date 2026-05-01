@@ -178,3 +178,35 @@ Verification:
 - `UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_radar_api.py -k "selected_state or position_accumulation" -q`
 - `UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_radar_ui_labels.py -q`
 - `cd frontend && npm run build`
+
+## 2026-05-01 Sync Authority / Diagnostic Semantics + Go Hard-Bound Diagnosis
+
+- [x] Run GitNexus impact checks for backend sync serialization, Go sync-refiner state, and frontend authority panels; record blast radius and risk before edits.
+- [x] Separate current operational authority from recorded event-time authority metadata in backend payloads and frontend rendering.
+- [x] Split operational fit/readiness fields from Go diagnostic fit/refiner fields in `sync_state`; stop frontend use of ambiguous aliases.
+- [x] Add explicit Go hard-bound diagnostics (reason, limits, requested/current/base/effective deltas in s+ppm, DF disagreement fields) and surface them in the UI.
+- [x] Add Go fit-history epoch segmentation/invalidation for incompatible model-state changes (base period shift, phase epoch/reset, phase-offset discontinuity, reference change, residual-basis change, authority-basis changes, holdover basis changes, dominant-family reset).
+- [x] Expose fit-epoch diagnostics (`fit_epoch_id`, reset reason/timestamp, dropped count, segment count, epoch span/count) and wire to sync snapshot payloads.
+- [x] Diagnose hard-bound root cause path using exported observation diagnostics (fit window/span, per-ICAO contributions/rejections, history crossing boundaries) and encode explicit reject-state reporting.
+- [x] Update RadarPage sections so current operational state, Go diagnostic refiner state, and recorded chart/event-time semantics are visually separated and non-contradictory.
+- [x] Add/update backend tests for authority separation, fit-field separation, hard-bound diagnostics, non-operational Go delta behavior, and fit-epoch reset/segmentation rules.
+- [x] Add/update frontend/static tests for authority-pill source, recorded event-time labeling, diagnostic-section isolation, hard-bound reason visibility, and operational-period stability under hard-bound rejection.
+- [x] Run focused verification (`uv run --directory backend pytest ...`, `cd frontend && npm run build`) and document review + outcomes in this file.
+
+Review:
+- Operational authority now stays sourced from current `sync_state` (`period_authority/sync_authority/phase_authority/handoff_*`), while recorded residual rows carry explicit `event_*` authority snapshot metadata and an explicit event-time notice.
+- Frontend Sync Source/authority pills no longer consume ambiguous fit aliases; they now use operational fields (`operational_*`) for current readiness and separate `go_diagnostic_*` fields for Go refiner diagnostics.
+- Go diagnostic hard-bound state now exports reasoned diagnostics in both seconds and ppm (`requested/current/base/disagreement/limit`), plus explicit hard-bound reason/reject status.
+- Fit-history compatibility handling now rotates fit epochs on incompatible model-state shifts and exposes epoch diagnostics (`fit_epoch_id`, reset reason, dropped count, segment count, epoch span/count).
+- Added Go unit coverage for fit-epoch resets on reference change, period-authority-basis change, and repeated hard-bound reject rotation.
+- Hard-bound root-cause determination: oversized proposed correction is consistent with mixed-basis/epoch contamination of residual slope history; segmentation + reset rules now prevent fitting a single slope through incompatible phase/base/authority regimes.
+
+Verification:
+- `GOCACHE=/tmp/go-build-cache go test ./...` (from `radar-core`)  
+- `UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_radar_sweep.py -q`  
+- `UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_radar_api.py -k "selected_state or sync_snapshot or sync_state or data_path_diagnostics or position_accumulation or authority_matches" -q`  
+- `UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_radar_ui_labels.py -q`  
+- `cd frontend && npm run build`
+
+Residual risk:
+- `backend/tests/test_radar_api.py::test_manual_position_controls_persist_and_lock` is currently hanging in this environment and was excluded from the focused sync-semantics verification scope; this appears pre-existing and unrelated to sync authority/refiner semantics.

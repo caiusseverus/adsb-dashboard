@@ -569,6 +569,11 @@ def test_burst_residual_recorded_events_are_immutable_across_period_change(monke
     assert len(recorded) == 2
     assert recorded[0]["effective_period_s"] == pytest.approx(4.0)
     assert recorded[1]["effective_period_s"] == pytest.approx(5.0)
+    assert recorded[0]["event_effective_period_s"] == pytest.approx(4.0)
+    assert recorded[1]["event_effective_period_s"] == pytest.approx(5.0)
+    assert recorded[0]["event_period_authority"] == recorded[0]["period_authority"]
+    assert recorded[0]["event_sync_authority"] == recorded[0]["sync_authority"]
+    assert recorded[0]["event_handoff_state"] == recorded[0]["handoff_state"]
     assert recorded[0]["residual_deg"] == pytest.approx(first_recorded["residual_deg"])
     assert recorded[0]["classification"] == first_recorded["classification"]
     assert recorded[0]["display_residual_class"] == first_recorded["display_residual_class"]
@@ -1435,6 +1440,7 @@ def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monke
     assert first["sync_state"]["fit_span_s"] is None
     assert first["sync_state"]["slope_sign_convention"] == "observed_minus_predicted"
     assert first["sync_state"]["effective_period_source"] == "python_simple_sync.period_base_s"
+    assert "event-time authority snapshots" in first["recorded_event_time_notice"]
 
 
 def test_canonical_period_invariant_for_python_refined_state():
@@ -1536,11 +1542,36 @@ def test_go_diagnostic_fields_remain_diagnostic_when_go_is_not_authoritative():
         "period_delta_s": 0.001,
         "effective_period_s": 4.001,
         "period_source": "go_runtime.effective_period_s",
+        "proposed_delta_s": 0.0015,
+        "applied_delta_s": 0.0,
+        "last_hard_bound": True,
+        "hard_bound_reason": "requested_delta_exceeds_hard_bound",
+        "hard_bound_limit_s": 0.0002,
+        "hard_bound_limit_ppm": 50.0,
+        "requested_delta_s": 0.0015,
+        "requested_delta_ppm": 375.0,
+        "current_delta_s": 0.0,
+        "current_delta_ppm": 0.0,
+        "delta_to_base_s": 0.0,
+        "delta_to_base_ppm": 0.0,
+        "df_base_period_s": 4.0,
+        "period_agrees_with_df": False,
+        "period_disagreement_s": 0.001,
+        "period_disagreement_ppm": 250.0,
+        "fit_epoch_id": 3,
+        "fit_epoch_reset_reason": "phase_epoch_reacquired",
     })
     assert payload["period_authority"] == "py_base"
     assert payload["period_delta_source"] == "none"
     assert payload["go_diagnostic_period_delta_s"] == pytest.approx(0.001)
     assert payload["go_diagnostic_period_source"] == "go_runtime.effective_period_s"
+    assert payload["go_diagnostic_hard_bound_reason"] == "requested_delta_exceeds_hard_bound"
+    assert payload["go_diagnostic_hard_bound_limit_s"] == pytest.approx(0.0002)
+    assert payload["go_diagnostic_requested_delta_ppm"] == pytest.approx(375.0)
+    assert payload["go_diagnostic_period_agrees_with_df"] is False
+    assert payload["go_diagnostic_fit_epoch_id"] == 3
+    assert payload["operational_fit_total_observations"] is not None
+    assert payload["operational_period_refinement_status"] == payload["period_refinement_status"]
 
 
 def test_holdover_and_unavailable_states_are_conservative():

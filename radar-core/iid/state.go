@@ -118,6 +118,25 @@ type DebugSnapshot struct {
 	AppliedDeltaS                            float64
 	LastSlewLimited                          bool
 	LastHardBound                            bool
+	HardBoundReason                          string
+	HardBoundLimitS                          float64
+	HardBoundLimitPPM                        float64
+	RequestedDeltaS                          float64
+	RequestedDeltaPPM                        float64
+	CurrentDeltaS                            float64
+	CurrentDeltaPPM                          float64
+	DeltaToBaseS                             float64
+	DeltaToBasePPM                           float64
+	DFBasePeriodS                            float64
+	PeriodDisagreementS                      float64
+	PeriodDisagreementPPM                    float64
+	FitEpochID                               uint64
+	FitEpochStartedUnix                      float64
+	FitEpochResetReason                      string
+	FitEpochObservationCount                 int
+	FitEpochSpanS                            float64
+	FitDroppedOnEpochReset                   int
+	FitSegmentCount                          uint64
 	SlopeSignConvention                      string
 	HoldoverReason                           string
 	HoldoverQualityGateFailed                uint64
@@ -316,10 +335,15 @@ func (s *IIDState) SetBasePeriod(periodS float64) {
 		s.PeriodAgreesWithDF = false
 		s.PeriodRejectReason = "missing_df_base_period"
 		if s.Sync != nil {
+			refICAO := uint32(0)
+			if s.RefICAO != nil {
+				refICAO = *s.RefICAO
+			}
 			s.Sync.Holdover = true
 			s.Sync.PeriodS = 0
 			s.Sync.PeriodRejectReason = "missing_df_base_period"
 			s.Sync.PeriodAgreesWithDF = false
+			s.Sync.ResetFitEpochOnModelChange("base_period_unavailable", refICAO, "go_refiner_holdover")
 		}
 		return
 	}
@@ -416,6 +440,9 @@ func (s *IIDState) RefreshReference(records []BurstRecord, nowUS float64) {
 
 	chosen := SelectReference(filtered, *s.EffectivePeriodS, cur, nowUS)
 	if chosen != 0 {
+		if s.Sync != nil && cur != 0 && chosen != cur {
+			s.Sync.ResetFitEpochOnModelChange("reference_icao_changed", chosen, "go_refiner_active")
+		}
 		s.RefICAO = &chosen
 		return
 	}
@@ -423,6 +450,9 @@ func (s *IIDState) RefreshReference(records []BurstRecord, nowUS float64) {
 	// downstream gates expose "no_reference" rather than a permanently
 	// non-dominant reference that can never open frames.
 	if len(filtered) == 0 {
+		if s.Sync != nil && s.RefICAO != nil {
+			s.Sync.ResetFitEpochOnModelChange("reference_icao_cleared", 0, "go_refiner_active")
+		}
 		s.RefICAO = nil
 	}
 }
@@ -438,6 +468,11 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 			s.Sync.enterHoldover("missing_df_base_period")
 			s.Sync.PeriodAgreesWithDF = false
 			s.Sync.PeriodRejectReason = "missing_df_base_period"
+			refICAO := uint32(0)
+			if s.RefICAO != nil {
+				refICAO = *s.RefICAO
+			}
+			s.Sync.ResetFitEpochOnModelChange("missing_df_base_period", refICAO, "go_refiner_holdover")
 		}
 		return
 	}
@@ -519,7 +554,15 @@ func (s *IIDState) RecordBurstResidualObservation(
 		return
 	}
 	residual := circularDiff(observedBearingDeg, predicted)
-	s.Sync.AddRefinementResidualValue(epochUS, residual, icao, dominantFamily, nAircraft, refPosAgeS)
+	refICAO := uint32(0)
+	if s.RefICAO != nil {
+		refICAO = *s.RefICAO
+	}
+	authorityBasis := "go_refiner_active"
+	if s.Sync.Holdover {
+		authorityBasis = "go_refiner_holdover"
+	}
+	s.Sync.AddRefinementResidualValue(epochUS, residual, icao, dominantFamily, nAircraft, refPosAgeS, refICAO, authorityBasis)
 	s.PeriodDeltaS = s.Sync.PeriodDeltaS
 	effective := s.Sync.EffectivePeriodS
 	s.EffectivePeriodS = &effective
@@ -548,7 +591,15 @@ func (s *IIDState) RecordBurstResidualValue(
 	// Direct residual-value ingestion path: residualDeg is already computed as
 	// observed-minus-predicted in the producer path, so this path does not require
 	// a selected Go reference aircraft.
-	s.Sync.AddRefinementResidualValue(epochUS, residualDeg, icao, dominantFamily, nAircraft, refPosAgeS)
+	refICAO := uint32(0)
+	if s.RefICAO != nil {
+		refICAO = *s.RefICAO
+	}
+	authorityBasis := "go_refiner_active"
+	if s.Sync.Holdover {
+		authorityBasis = "go_refiner_holdover"
+	}
+	s.Sync.AddRefinementResidualValue(epochUS, residualDeg, icao, dominantFamily, nAircraft, refPosAgeS, refICAO, authorityBasis)
 	s.PeriodDeltaS = s.Sync.PeriodDeltaS
 	effective := s.Sync.EffectivePeriodS
 	s.EffectivePeriodS = &effective
@@ -666,6 +717,25 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.AppliedDeltaS = s.Sync.AppliedDeltaS
 		out.LastSlewLimited = s.Sync.LastSlewLimited
 		out.LastHardBound = s.Sync.LastHardBound
+		out.HardBoundReason = s.Sync.HardBoundReason
+		out.HardBoundLimitS = s.Sync.HardBoundLimitS
+		out.HardBoundLimitPPM = s.Sync.HardBoundLimitPPM
+		out.RequestedDeltaS = s.Sync.RequestedDeltaS
+		out.RequestedDeltaPPM = s.Sync.RequestedDeltaPPM
+		out.CurrentDeltaS = s.Sync.CurrentDeltaS
+		out.CurrentDeltaPPM = s.Sync.CurrentDeltaPPM
+		out.DeltaToBaseS = s.Sync.DeltaToBaseS
+		out.DeltaToBasePPM = s.Sync.DeltaToBasePPM
+		out.DFBasePeriodS = s.Sync.DFBasePeriodS
+		out.PeriodDisagreementS = s.Sync.PeriodDisagreementS
+		out.PeriodDisagreementPPM = s.Sync.PeriodDisagreementPPM
+		out.FitEpochID = s.Sync.FitEpochID
+		out.FitEpochStartedUnix = s.Sync.FitEpochStartedUnix
+		out.FitEpochResetReason = s.Sync.FitEpochResetReason
+		out.FitEpochObservationCount = s.Sync.FitEpochObservationCount
+		out.FitEpochSpanS = s.Sync.FitEpochSpanS
+		out.FitDroppedOnEpochReset = s.Sync.FitDroppedOnEpochReset
+		out.FitSegmentCount = s.Sync.FitSegmentCount
 		out.SlopeSignConvention = s.Sync.SlopeSignConvention
 		out.HoldoverReason = s.Sync.HoldoverReason
 		out.HoldoverQualityGateFailed = s.Sync.HoldoverReasonCounts["quality_gate_failed"]

@@ -159,6 +159,18 @@ type IIDState struct {
 	AppliedDeltaS                   *float64 `codec:"pad"`
 	LastSlewLimited                 bool     `codec:"lsl"`
 	LastHardBound                   bool     `codec:"lhb"`
+	HardBoundReason                 string   `codec:"hbr"`
+	HardBoundLimitS                 *float64 `codec:"hls"`
+	HardBoundLimitPPM               *float64 `codec:"hlp"`
+	RequestedDeltaS                 *float64 `codec:"rds"`
+	RequestedDeltaPPM               *float64 `codec:"rdp"`
+	CurrentDeltaS                   *float64 `codec:"cds"`
+	CurrentDeltaPPM                 *float64 `codec:"cdp"`
+	DeltaToBaseS                    *float64 `codec:"dbs"`
+	DeltaToBasePPM                  *float64 `codec:"dbp"`
+	DFBasePeriodS                   *float64 `codec:"dfb"`
+	PeriodDisagreementS             *float64 `codec:"pgs"`
+	PeriodDisagreementPPM           *float64 `codec:"pgp"`
 	PeriodRefineStatus              string   `codec:"prs"`
 	PeriodAgreesWithDF              bool     `codec:"pag"`
 	PeriodRejectReason              string   `codec:"prr"`
@@ -173,6 +185,13 @@ type IIDState struct {
 	FitLastEvictionReason           string   `codec:"fer"`
 	SuspiciousICAOCount             uint16   `codec:"sic"`
 	SuspiciousICAOLastReason        string   `codec:"sir"`
+	FitEpochID                      uint32   `codec:"fei"`
+	FitEpochStartedUnix             *float64 `codec:"fes"`
+	FitEpochResetReason             string   `codec:"frr"`
+	FitEpochObservationCount        uint16   `codec:"feo"`
+	FitEpochSpanS                   *float64 `codec:"fep"`
+	FitDroppedOnEpochReset          uint32   `codec:"fdr"`
+	FitSegmentCount                 uint32   `codec:"fsg"`
 	SlopeSignConvention             string   `codec:"ssc"`
 	HoldoverReason                  string   `codec:"shr"`
 	HoldoverQualityGateFailed       uint32   `codec:"shq"`
