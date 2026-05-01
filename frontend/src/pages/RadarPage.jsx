@@ -178,6 +178,34 @@ function useRadarLiveStream() {
     let closed = false
     let retryTimeout = null
 
+    async function pollFallback() {
+      const payload = await trackedRadarFetchJson(`${API_BASE}/api/radar/iids?window_s=600`, {
+        endpoint: 'iids',
+        trigger: 'radar_live_fallback_poll',
+      })
+      const iids = Array.isArray(payload?.iids) ? payload.iids : []
+      if (closed || iids.length === 0) return
+      const ts = Date.now() / 1000
+      setIidMap(prev => {
+        const next = { ...prev }
+        for (const entry of iids) {
+          next[entry.iid] = {
+            ...(next[entry.iid] ?? {}),
+            ...entry,
+            localiser: {
+              lat: entry.display_lat ?? entry.fm_lat ?? null,
+              lon: entry.display_lon ?? entry.fm_lon ?? null,
+              cep_m: entry.fm_cep_m ?? null,
+              source: entry.display_source ?? null,
+            },
+            sync: (next[entry.iid] ?? {}).sync ?? null,
+            server_ts: ts,
+          }
+        }
+        return next
+      })
+    }
+
     function connect() {
       if (closed) return
       ws = new WebSocket(`${RADAR_SYNC_WS_BASE}/ws/radar/live`)
@@ -211,9 +239,12 @@ function useRadarLiveStream() {
     }
 
     connect()
+    pollFallback()
+    const fallbackInterval = setInterval(pollFallback, 5000)
     return () => {
       closed = true
       clearTimeout(retryTimeout)
+      clearInterval(fallbackInterval)
       ws?.close()
     }
   }, [])
@@ -1672,6 +1703,11 @@ function useSelectedIidPageState(iid, windowS, debugLimit = 120) {
   const fallbackRef = useRef(null)
   const lastUpdateRef = useRef(0)
   const revisionsRef = useRef(null)
+  const snapshotRef = useRef(null)
+
+  useEffect(() => {
+    snapshotRef.current = snapshot
+  }, [snapshot])
 
   useEffect(() => {
     if (iid == null) {
@@ -1731,6 +1767,18 @@ function useSelectedIidPageState(iid, windowS, debugLimit = 120) {
       })
         .then(payload => {
           if (closed || !payload || payload.type !== 'radar_selected_iid_state') return
+          const currentSnapshot = snapshotRef.current
+          if (
+            currentSnapshot
+            && currentSnapshot.iid === iid
+            && payload.sequence === currentSnapshot.sequence
+            && Array.isArray(payload.frames?.frames)
+            && payload.frames.frames.length === 0
+            && Array.isArray(currentSnapshot.frames?.frames)
+            && currentSnapshot.frames.frames.length > 0
+          ) {
+            return
+          }
           const changedSections = getChangedSections(payload.revisions)
           lastUpdateRef.current = performance.now()
           startTransition(() => setSnapshot(payload))
@@ -1792,9 +1840,9 @@ function useSelectedIidPageState(iid, windowS, debugLimit = 120) {
     connect()
     fallbackRef.current = setInterval(() => {
       if (closed) return
-      if (performance.now() - lastUpdateRef.current > 2500) {
-        pollFallback()
-      }
+      // Safety net: keep a low-rate HTTP poll even when websocket heartbeats are flowing.
+      // This avoids stale UI when websocket snapshots are starved by upstream cache/signature issues.
+      pollFallback()
     }, 1000)
 
     return () => {

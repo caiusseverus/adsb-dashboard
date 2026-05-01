@@ -6141,6 +6141,56 @@ class RadarState:
         with self._lock:
             return self._iid_latest_arrival_us.get(iid)
 
+    def get_data_path_diagnostics(self, iid: int) -> dict:
+        """Compact liveness diagnostics for frame/sync/alignment UI data paths."""
+        now_ts = time.time()
+        with self._lock:
+            go_frames = list(self._go_sweep_frames_by_iid.get(iid, ()))
+            go_evidence = [entry for entry in self._go_evidence_events if int(entry.get("iid", -1)) == iid]
+            burst_timeline = list(self._live_burst_timeline_obs.get(iid, ()))
+            aligned_obs = list(self._live_aligned_burst_obs.get(iid, ()))
+            recorded_burst = list(self._live_burst_residual_events.get(iid, ()))
+            recorded_df11 = list(self._live_df11_recorded_residual_events.get(iid, ()))
+            latest_arrival_us = self._iid_latest_arrival_us.get(iid)
+
+        frame_counts = self.get_live_frame_counts(iid)
+        recomputed_source_count = len(go_evidence) if go_evidence else len(burst_timeline or aligned_obs)
+        df_alignment_source = self.get_iid_timeline(iid, window_s=300.0) or {}
+        df_alignment_source_count = sum(len(arrivals or []) for arrivals in df_alignment_source.values())
+        fm_position_count = len(self.get_go_frame_positions(iid) or [])
+
+        last_frame_arrival_us = None
+        if go_frames:
+            last_frame_arrival_us = float(go_frames[-1].ref_arrival_us or 0.0)
+        elif latest_arrival_us is not None:
+            last_frame_arrival_us = float(latest_arrival_us)
+
+        last_burst_event_ts = None
+        if go_evidence:
+            last_burst_event_ts = float(go_evidence[-1].get("wall_ts") or 0.0) or None
+        elif burst_timeline:
+            last_burst_event_ts = float(getattr(burst_timeline[-1], "ts", 0.0) or 0.0) or None
+
+        return {
+            "iid": iid,
+            "live_frame_count": int(frame_counts.get("n_frames", 0)),
+            "go_sweep_frame_count": len(go_frames),
+            "go_evidence_event_count": len(go_evidence),
+            "burst_sync_recorded_event_count": len(recorded_burst) + len(recorded_df11),
+            "burst_sync_recomputed_source_count": int(recomputed_source_count),
+            "df_alignment_source_count": int(df_alignment_source_count),
+            "fm_position_accumulation_count": int(fm_position_count),
+            "last_frame_ingest_age_s": (
+                max(0.0, (float(latest_arrival_us) - last_frame_arrival_us) / 1_000_000.0)
+                if latest_arrival_us is not None and last_frame_arrival_us is not None else None
+            ),
+            "last_burst_sync_event_age_s": (
+                max(0.0, now_ts - float(last_burst_event_ts))
+                if last_burst_event_ts is not None else None
+            ),
+            "last_df_alignment_update_age_s": 0.0 if df_alignment_source_count > 0 else None,
+        }
+
     def get_iid_timeline(self, iid: int, window_s: float = 30.0) -> dict:
         """Return per-ICAO burst centroid timestamps for a single IID."""
         with self._lock:

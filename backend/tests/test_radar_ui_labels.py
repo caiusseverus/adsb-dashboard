@@ -68,6 +68,13 @@ def test_radar_page_initialises_legacy_timeline_fetch_without_view_toggle_primin
     assert "if (iid == null) {" in text
 
 
+def test_radar_page_has_http_safety_polls_for_live_stream_and_selected_state():
+    radar_page = Path(__file__).resolve().parents[2] / "frontend" / "src" / "pages" / "RadarPage.jsx"
+    text = radar_page.read_text(encoding="utf-8")
+    assert "radar_live_fallback_poll" in text
+    assert "selected_state_stream_fallback" in text
+
+
 def test_radar_page_all_icaos_chip_uses_distinct_recorded_burst_icaos():
     radar_page = Path(__file__).resolve().parents[2] / "frontend" / "src" / "pages" / "RadarPage.jsx"
     text = radar_page.read_text(encoding="utf-8")

@@ -252,12 +252,34 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     assert payload["sync_state"]["effective_period_source"] == "go_runtime.base_period_s"
     assert "handoff_state" in payload["sync_state"]
     assert "handoff_gate_failures" in payload["sync_state"]
+    assert "data_path_diagnostics" in payload
+    assert payload["data_path_diagnostics"]["go_evidence_event_count"] >= 1
     assert len(payload["observations"]) == 1
     assert payload["observations"][0]["bearing_deg"] is None
     assert payload["observations"][0]["range_nm"] is None
     assert payload["alignment_status"]["reason"] == "go_evidence_projected"
     assert payload["alignment_status"]["multi_sync_admission"]["last_reason"] == "no_receiver_config"
     assert payload["alignment_status"]["multi_sync_admission"]["counts"]["no_receiver_config"] == 7
+
+
+def test_get_iid_data_path_diagnostics_endpoint_reports_compact_counters():
+    state = RadarState()
+    state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=51.0, lon=0.0)
+    state._go_evidence_events = deque([
+        {"kind": "burst_fired", "iid": 7, "icao": "AAAAAA", "arrival_us": 4_000_000.0, "wall_ts": 1_000.0},
+    ], maxlen=state._GO_EVIDENCE_EVENTS_MAX)
+    prior_state = radar_api._state
+    radar_api._state = state
+    try:
+        payload = asyncio.run(radar_api.get_iid_data_path_diagnostics(7))
+    finally:
+        radar_api._state = prior_state
+
+    assert payload["available"] is True
+    assert payload["iid"] == 7
+    assert payload["go_evidence_event_count"] == 1
+    assert "live_frame_count" in payload
+    assert "df_alignment_source_count" in payload
 
 
 def test_sync_state_exposes_phase_status_alias_without_removing_legacy_value():

@@ -1192,6 +1192,7 @@ def build_iid_sync_snapshot_payload(
     payload = dict(snapshot)
     payload["rotation"] = build_iid_rotation_payload(state, iid)
     payload["rotation"].update(_control_payload(state.get_rotation_model(iid)))
+    payload["data_path_diagnostics"] = state.get_data_path_diagnostics(iid)
     return payload
 
 
@@ -1424,6 +1425,14 @@ async def get_iid_sync_snapshot(
             t0,
             cache_status="hit" if cache_hit else "miss",
         )
+
+
+@router.get("/iids/{iid}/data-path-diagnostics")
+async def get_iid_data_path_diagnostics(iid: int):
+    """Compact liveness counters for RadarPage data-path triage."""
+    if _state is None:
+        return {"iid": iid, "available": False, "reason": "radar module not initialised"}
+    return {"iid": iid, "available": True, **_state.get_data_path_diagnostics(iid)}
 
 
 @router.get("/iids/{iid}/state")
@@ -2434,6 +2443,7 @@ def build_selected_iid_page_state_payload(
             },
             "selected": {"iid": iid, "available": False, "reason": "radar module not initialised"},
             "sync": build_iid_sync_snapshot_payload(None, iid, window_s=window_s, debug_limit=debug_limit),
+            "data_path_diagnostics": {"iid": iid, "available": False, "reason": "radar module not initialised"},
             "frames": {"iid": iid, "n_frames": 0, "frames": []},
             "reference": {"iid": iid, "status": "NOT_INITIALISED"},
             "pipeline": {
@@ -2486,6 +2496,7 @@ def build_selected_iid_page_state_payload(
         sync_signature,
         lambda: sync_payload,
     )
+    data_path_diag = state.get_data_path_diagnostics(iid)
     frames_payload, frames_revision, frames_cached = _selected_iid_section_entry(
         iid,
         "frames",
@@ -2668,6 +2679,7 @@ def build_selected_iid_page_state_payload(
         "revisions": revisions,
         "selected": selected_payload,
         "sync": sync_section,
+        "data_path_diagnostics": data_path_diag,
         "frames": frames_payload,
         "reference": reference_payload,
         "pipeline": pipeline_payload,

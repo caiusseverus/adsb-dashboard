@@ -81,3 +81,32 @@ Verification:
 
 Residual risk:
 - Live endpoint/runtime checks (`/api/radar/iids/<iid>/pipeline-health`, `/api/radar/iids/<iid>/sweep-frames`, `/api/radar/iids/<iid>/state`) were not executed against a running receiver in this pass; runtime confirmation is still required for final sign-off.
+
+## 2026-05-01 Fundamental Radar UI/Data-Path Regression Recovery
+
+- [x] Verify authoritative backend live streams for one active IID and classify breakage layer: generation vs API vs frontend render.
+- [x] Run GitNexus impact analysis for each backend/frontend symbol to be edited and report blast radius.
+- [x] Decouple frame/sync/radar-location/DF-alignment source-of-truth paths from recorded residual buffers.
+- [x] Restore burst-sync recomputed-mode population independent of recorded immutable-event availability.
+- [x] Fix DF Alignment fetch lifecycle: initial fetch on IID/view activation and continuous polling while visible.
+- [x] Fix frontend state-clearing/caching behavior so empty payloads do not permanently suppress valid data.
+- [x] Ensure missing radar position yields nullable geometry enrichment rather than suppressing frame/sync/alignment rows.
+- [x] Add compact diagnostics for frame/sync/alignment/location pipeline liveness counts and last-update ages.
+- [x] Add backend and frontend regression tests for source independence, fetch lifecycle, and missing-geometry handling.
+- [x] Perform verification and document outcomes; keep period/phase/refiner/localisation maths untouched.
+
+Review:
+- Runtime probe found backend service not running on `127.0.0.1:8000`, so endpoint liveness classification could not be completed against live traffic in this pass.
+- Added backend `data_path_diagnostics` counters/ages to the sync snapshot payload and selected-IID page-state payload, plus a dedicated endpoint: `/api/radar/iids/{iid}/data-path-diagnostics`.
+- Added frontend HTTP safety-net polling for:
+  - IID live table (`/api/radar/iids`) in `useRadarLiveStream`.
+  - selected-IID state (`/api/radar/iids/{iid}/state`) in `useSelectedIidPageState`, even while websocket heartbeat is active.
+- Added guard so empty frame payload with unchanged sequence does not overwrite an already-populated selected-IID snapshot.
+- Kept frame generation/sync/localisation math untouched; no changes to period refinement, Go refiner logic, phase logic, or solver math.
+
+Verification:
+- `uv run --directory backend pytest tests/test_radar_api.py tests/test_radar_sweep.py tests/test_radar_ui_labels.py -q` (167 passed).
+- `cd frontend && npm run build` (success).
+
+Residual risk:
+- Live/manual endpoint validation with an active backend process is still required to conclusively classify generation-vs-API-vs-frontend for your current deployment.
