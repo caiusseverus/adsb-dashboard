@@ -2718,6 +2718,13 @@ function RotationAlignmentPanel({
           <span className={styles.metricPill}>Diag: handoff state <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.handoff_state)}</span></span>
           <span className={styles.metricPill}>Diag: handoff reason <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.handoff_reason)}</span></span>
           <span className={styles.metricPill}>Diag: holdover reason <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.holdover_reason ?? syncState?.last_sync_reject_reason)}</span></span>
+          <span className={styles.metricPill}>Diag: epoch update A/R <span className={styles.metricValue}>{syncState?.update_epoch_accepts ?? 0}/{syncState?.update_epoch_rejects ?? 0}</span></span>
+          <span className={styles.metricPill}>Diag: last epoch reject <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.last_update_epoch_reject_reason)}</span></span>
+          <span className={styles.metricPill}>Diag: last epoch nAircraft/refAge <span className={styles.metricValue}>
+            {syncState?.last_update_epoch_n_aircraft != null
+              ? `${syncState.last_update_epoch_n_aircraft}/${fmtNumber(syncState?.last_update_epoch_ref_pos_age_s, 1, 's')}`
+              : '—'}
+          </span></span>
           <span className={styles.metricPill}>Diag: effective period source <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.effective_period_source)}</span></span>
           <span className={styles.metricPill}>Diag: period Δ source <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.period_delta_source)}</span></span>
           <span className={styles.metricPill}>Phase basis <span className={styles.metricValue}>{syncState?.phase_basis ?? '—'}</span></span>

@@ -61,6 +61,15 @@ type SyncState struct {
 	SlopeSignConvention           string
 	HoldoverReason                string
 	HoldoverReasonCounts          map[string]uint64
+	UpdateEpochAttempts           uint64
+	UpdateEpochAccepts            uint64
+	UpdateEpochRejects            uint64
+	LastUpdateEpochRejectReason   string
+	LastUpdateEpochNAircraft      int
+	LastUpdateEpochRefPosAgeS     float64
+	LastUpdateEpochRefICAO        uint32
+	UpdateEpochRejectCounts       map[string]uint64
+	LastUpdateEpochStrictGatePass bool
 	residualHistory               []residualObservation
 	icaoRejectHistory             map[uint32][]float64
 	icaoSuspiciousUntil           map[uint32]float64
@@ -126,27 +135,28 @@ func syncQuality(status string, hasPeriod bool) float64 {
 // (0.0 when the radar position is unknown — Stage 3 default).
 func NewSyncState(iid uint8, periodS, epochUS, phaseOffsetDeg, quality float64) *SyncState {
 	return &SyncState{
-		IID:                    iid,
-		PeriodS:                periodS,
-		BasePeriodS:            periodS,
-		PeriodDeltaS:           0,
-		EffectivePeriodS:       periodS,
-		PhaseEpochUS:           epochUS,
-		PhaseOffsetDeg:         phaseOffsetDeg,
-		SyncQuality:            quality,
-		SyncJitterDeg:          5.0,
-		ResidualEMA:            5.0,
-		NSyncFrames:            1,
-		Holdover:               false,
-		LastUpdated:            time.Now(),
-		PeriodSource:           "df_alignment",
-		PeriodAgreesWithDF:     true,
-		PeriodRefinementStatus: "base_only",
-		FitRetentionWindowS:    refinementFitWindowS,
-		SlopeSignConvention:    "observed_minus_predicted",
-		HoldoverReasonCounts:   make(map[string]uint64),
-		icaoRejectHistory:      make(map[uint32][]float64),
-		icaoSuspiciousUntil:    make(map[uint32]float64),
+		IID:                     iid,
+		PeriodS:                 periodS,
+		BasePeriodS:             periodS,
+		PeriodDeltaS:            0,
+		EffectivePeriodS:        periodS,
+		PhaseEpochUS:            epochUS,
+		PhaseOffsetDeg:          phaseOffsetDeg,
+		SyncQuality:             quality,
+		SyncJitterDeg:           5.0,
+		ResidualEMA:             5.0,
+		NSyncFrames:             1,
+		Holdover:                false,
+		LastUpdated:             time.Now(),
+		PeriodSource:            "df_alignment",
+		PeriodAgreesWithDF:      true,
+		PeriodRefinementStatus:  "base_only",
+		FitRetentionWindowS:     refinementFitWindowS,
+		SlopeSignConvention:     "observed_minus_predicted",
+		HoldoverReasonCounts:    make(map[string]uint64),
+		UpdateEpochRejectCounts: make(map[string]uint64),
+		icaoRejectHistory:       make(map[uint32][]float64),
+		icaoSuspiciousUntil:     make(map[uint32]float64),
 	}
 }
 
@@ -164,7 +174,25 @@ func (s *SyncState) enterHoldover(reason string) {
 // phaseOffsetDeg is 0.0 until radar position is known.
 //
 // Returns true if the update was accepted.
-func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float64, nAircraft int, refPosAgeS float64) bool {
+func (s *SyncState) rejectUpdateEpoch(reason string) bool {
+	s.UpdateEpochRejects++
+	s.LastUpdateEpochRejectReason = reason
+	if reason != "" {
+		s.UpdateEpochRejectCounts[reason] = s.UpdateEpochRejectCounts[reason] + 1
+	}
+	return false
+}
+
+func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float64, nAircraft int, refPosAgeS float64, refICAOOpt ...uint32) bool {
+	refICAO := uint32(0)
+	if len(refICAOOpt) > 0 {
+		refICAO = refICAOOpt[0]
+	}
+	s.UpdateEpochAttempts++
+	s.LastUpdateEpochNAircraft = nAircraft
+	s.LastUpdateEpochRefPosAgeS = refPosAgeS
+	s.LastUpdateEpochRefICAO = refICAO
+	s.LastUpdateEpochStrictGatePass = false
 	if periodS <= 0 || math.IsNaN(periodS) || math.IsInf(periodS, 0) {
 		s.enterHoldover("missing_df_base_period")
 		s.PeriodRejectReason = "missing_df_base_period"
@@ -173,19 +201,24 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 		s.EffectivePeriodS = 0
 		s.PeriodS = 0
 		s.ResidualSlopeDegPerS = 0
-		return false
+		return s.rejectUpdateEpoch("missing_df_base_period")
 	}
 
-	// Quality gate: frame must have >= 4 aircraft, or >= 3 with fresh ref position.
-	eligible := nAircraft >= 4 || (nAircraft >= 3 && refPosAgeS <= 2.0)
-	if !eligible {
+	// Strict authority gate.
+	strictEligible := nAircraft >= 4 || (nAircraft >= 3 && refPosAgeS <= 2.0)
+	// Maintenance gate: allow epoch tracking to continue with thinner traffic.
+	maintenanceEligible := nAircraft >= 2 && refPosAgeS <= refinementStalePositionMaxS
+	if !maintenanceEligible {
 		s.enterHoldover("quality_gate_failed")
 		if nAircraft < 3 {
 			s.enterHoldover("insufficient_aircraft")
 		} else {
 			s.enterHoldover("stale_reference_position")
 		}
-		return false
+		if nAircraft < 2 {
+			return s.rejectUpdateEpoch("insufficient_aircraft")
+		}
+		return s.rejectUpdateEpoch("stale_reference_position")
 	}
 
 	predictionPeriodS := s.EffectivePeriodS
@@ -208,7 +241,7 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 		s.ResidualEMA = newResidualEMA
 		s.SyncJitterDeg = clamp(newResidualEMA, 2.0, 20.0)
 		s.enterHoldover("hard_residual_reject")
-		return false
+		return s.rejectUpdateEpoch("hard_residual_reject")
 	}
 
 	// Blending alpha: soft-accept for large residuals, normal EMA otherwise.
@@ -249,6 +282,9 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 	s.LastResidualDeg = residual
 	s.Holdover = false
 	s.HoldoverReason = ""
+	s.UpdateEpochAccepts++
+	s.LastUpdateEpochRejectReason = ""
+	s.LastUpdateEpochStrictGatePass = strictEligible
 	s.LastUpdated = time.Now()
 	return true
 }

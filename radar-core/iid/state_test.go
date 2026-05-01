@@ -356,6 +356,49 @@ func TestPeriodRefinement_RecordResidualValueWithoutReferenceAllowed(t *testing.
 	}
 }
 
+func TestUpdateEpochDiagnostics_RecordRejectInputs(t *testing.T) {
+	s := NewIIDState(61)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Sync = NewSyncState(s.IID, base, 0.0, 0.0, 1.0)
+	ref := uint32(0xAAAAAA)
+	s.RefICAO = &ref
+
+	// Force insufficient-aircraft reject.
+	s.UpdateSyncEpoch(4_000_000.0, 0.0, 1, 0.5)
+	snap := s.DebugStateSnapshot()
+	if snap.LastUpdateEpochRejectReason != "insufficient_aircraft" {
+		t.Fatalf("reject reason=%q", snap.LastUpdateEpochRejectReason)
+	}
+	if snap.LastUpdateEpochNAircraft != 1 {
+		t.Fatalf("n_aircraft=%d", snap.LastUpdateEpochNAircraft)
+	}
+}
+
+func TestUpdateEpochMaintenanceGateUpdatesWithoutStrictAuthority(t *testing.T) {
+	s := NewIIDState(62)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Status = "SINGLE_RADAR"
+	s.Sync = NewSyncState(s.IID, base, 0.0, 0.0, 1.0)
+	ref := uint32(0xAAAAAA)
+	s.RefICAO = &ref
+
+	// n=2 passes maintenance gate but fails strict gate.
+	s.UpdateSyncEpoch(4_000_000.0, 0.0, 2, 0.5)
+	snap := s.DebugStateSnapshot()
+	if snap.UpdateEpochAccepts == 0 {
+		t.Fatal("expected maintenance accept")
+	}
+	if snap.SyncHoldover {
+		t.Fatal("maintenance accept should clear holdover")
+	}
+	_, usable, _, _, _, _, _, _, _, _, _ := s.SyncProtocolSnapshot()
+	if usable {
+		t.Fatal("strict authority must remain false under maintenance-only gate")
+	}
+}
+
 func TestPeriodRefinement_NegativeSlopeDrivesPositiveDelta(t *testing.T) {
 	s := NewIIDState(28)
 	base := 4.0

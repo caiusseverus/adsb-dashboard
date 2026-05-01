@@ -129,6 +129,20 @@ type DebugSnapshot struct {
 	HoldoverInsufficientAircraft    uint64
 	HoldoverNoDominantFamily        uint64
 	HoldoverSyncStateMissing        uint64
+	UpdateEpochAttempts             uint64
+	UpdateEpochAccepts              uint64
+	UpdateEpochRejects              uint64
+	LastUpdateEpochRejectReason     string
+	LastUpdateEpochNAircraft        int
+	LastUpdateEpochRefPosAgeS       float64
+	LastUpdateEpochRefICAO          uint32
+	UpdateEpochRejectQualityGate    uint64
+	UpdateEpochRejectMissingBase    uint64
+	UpdateEpochRejectHardResidual   uint64
+	UpdateEpochRejectNoReference    uint64
+	UpdateEpochRejectStaleRefPos    uint64
+	UpdateEpochRejectInsufficientAC uint64
+	UpdateEpochLastStrictGatePass   bool
 	ActiveAircraftEstimate          int
 	BurstRecordsTotal               int
 	BurstRecordsDynamicCap          int
@@ -410,7 +424,7 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 	quality := syncQuality(s.Status, s.BasePeriodS != nil)
 	if s.Sync == nil {
 		// Bootstrap on first reference burst.
-		eligible := nAircraft >= 4 || (nAircraft >= 3 && refPosAgeS <= 2.0)
+		eligible := nAircraft >= 2 && refPosAgeS <= refinementStalePositionMaxS
 		if !eligible {
 			// No live sync state to update yet, but preserve a diagnostic reason bucket.
 			// This is mirrored in DebugStateSnapshot as sync_state_missing-related holdover pressure.
@@ -421,7 +435,11 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 		s.Sync.PeriodRejectReason = s.PeriodRejectReason
 		return
 	}
-	s.Sync.UpdateEpoch(epochUS, phaseOffsetDeg, *s.BasePeriodS, quality, nAircraft, refPosAgeS)
+	refICAO := uint32(0)
+	if s.RefICAO != nil {
+		refICAO = *s.RefICAO
+	}
+	s.Sync.UpdateEpoch(epochUS, phaseOffsetDeg, *s.BasePeriodS, quality, nAircraft, refPosAgeS, refICAO)
 	s.PeriodDeltaS = s.Sync.PeriodDeltaS
 	effective := s.Sync.EffectivePeriodS
 	s.EffectivePeriodS = &effective
@@ -542,7 +560,7 @@ func (s *IIDState) SyncProtocolSnapshot() (
 		return false, false, nil, nil, nil, nil, nil, nil, 0, 0, false
 	}
 	present = true
-	usable = s.Sync.SyncQuality >= 0.3 && !s.Sync.Holdover && s.Sync.PeriodAgreesWithDF && s.Sync.PeriodRejectReason == ""
+	usable = s.Sync.SyncQuality >= 0.3 && !s.Sync.Holdover && s.Sync.PeriodAgreesWithDF && s.Sync.PeriodRejectReason == "" && s.Sync.LastUpdateEpochStrictGatePass
 	holdover = s.Sync.Holdover
 	periodValue := s.Sync.EffectivePeriodS
 	phaseEpochValue := s.Sync.PhaseEpochUS
@@ -620,6 +638,20 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.HoldoverInsufficientAircraft = s.Sync.HoldoverReasonCounts["insufficient_aircraft"]
 		out.HoldoverNoDominantFamily = s.Sync.HoldoverReasonCounts["no_dominant_family"]
 		out.HoldoverSyncStateMissing = s.Sync.HoldoverReasonCounts["sync_state_missing"]
+		out.UpdateEpochAttempts = s.Sync.UpdateEpochAttempts
+		out.UpdateEpochAccepts = s.Sync.UpdateEpochAccepts
+		out.UpdateEpochRejects = s.Sync.UpdateEpochRejects
+		out.LastUpdateEpochRejectReason = s.Sync.LastUpdateEpochRejectReason
+		out.LastUpdateEpochNAircraft = s.Sync.LastUpdateEpochNAircraft
+		out.LastUpdateEpochRefPosAgeS = s.Sync.LastUpdateEpochRefPosAgeS
+		out.LastUpdateEpochRefICAO = s.Sync.LastUpdateEpochRefICAO
+		out.UpdateEpochRejectQualityGate = s.Sync.UpdateEpochRejectCounts["quality_gate_failed"]
+		out.UpdateEpochRejectMissingBase = s.Sync.UpdateEpochRejectCounts["missing_df_base_period"]
+		out.UpdateEpochRejectHardResidual = s.Sync.UpdateEpochRejectCounts["hard_residual_reject"]
+		out.UpdateEpochRejectNoReference = s.Sync.UpdateEpochRejectCounts["no_reference"]
+		out.UpdateEpochRejectStaleRefPos = s.Sync.UpdateEpochRejectCounts["stale_reference_position"]
+		out.UpdateEpochRejectInsufficientAC = s.Sync.UpdateEpochRejectCounts["insufficient_aircraft"]
+		out.UpdateEpochLastStrictGatePass = s.Sync.LastUpdateEpochStrictGatePass
 		out.PeriodRefinementStatus = s.Sync.PeriodRefinementStatus
 		out.RefinementPlottedCount = s.Sync.RefinementPlottedCount
 		out.RefinementEligibleCount = s.Sync.RefinementEligibleCount
@@ -663,7 +695,7 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.SyncNSyncFrames = s.Sync.NSyncFrames
 		out.SyncNRejectedFrames = s.Sync.NRejectedFrames
 		out.SyncLastUpdatedUnix = float64(s.Sync.LastUpdated.UnixNano()) / 1e9
-		out.SyncUsable = s.Sync.SyncQuality >= 0.3 && !s.Sync.Holdover && s.Sync.PeriodAgreesWithDF && s.Sync.PeriodRejectReason == ""
+		out.SyncUsable = s.Sync.SyncQuality >= 0.3 && !s.Sync.Holdover && s.Sync.PeriodAgreesWithDF && s.Sync.PeriodRejectReason == "" && s.Sync.LastUpdateEpochStrictGatePass
 	}
 	out.ActiveAircraftEstimate = s.lastActiveAircraft
 	out.BurstRecordsTotal = len(s.records)

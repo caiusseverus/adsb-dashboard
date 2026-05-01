@@ -61,10 +61,10 @@ func TestSyncState_HardReject(t *testing.T) {
 func TestSyncState_QualityGate(t *testing.T) {
 	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
 
-	// nAircraft=2 — below threshold (need >=4, or >=3 with fresh pos)
-	accepted := s.UpdateEpoch(4_000_000.0, 0.0, 4.0, 1.0, 2, 0.5)
+	// nAircraft=1 — below maintenance threshold
+	accepted := s.UpdateEpoch(4_000_000.0, 0.0, 4.0, 1.0, 1, 0.5)
 	if accepted {
-		t.Error("expected quality-gate rejection for n_aircraft=2")
+		t.Error("expected quality-gate rejection for n_aircraft=1")
 	}
 	if !s.Holdover {
 		t.Error("Holdover should be set after quality-gate rejection")
@@ -276,7 +276,7 @@ func TestSyncState_PeriodRefinement_RejectsExcessiveSlope(t *testing.T) {
 
 func TestSyncState_HoldoverReason_QualityGateAndHardResidual(t *testing.T) {
 	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
-	accepted := s.UpdateEpoch(4_000_000.0, 0.0, 4.0, 1.0, 2, 0.5)
+	accepted := s.UpdateEpoch(4_000_000.0, 0.0, 4.0, 1.0, 1, 0.5)
 	if accepted {
 		t.Fatal("expected reject on insufficient aircraft")
 	}
@@ -292,6 +292,38 @@ func TestSyncState_HoldoverReason_QualityGateAndHardResidual(t *testing.T) {
 	}
 	if s.HoldoverReason != "hard_residual_reject" {
 		t.Fatalf("holdover reason=%q", s.HoldoverReason)
+	}
+}
+
+func TestSyncState_MaintenanceUpdateClearsHoldoverWithoutStrictGate(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	s.Holdover = true
+	s.HoldoverReason = "insufficient_aircraft"
+	accepted := s.UpdateEpoch(4_000_000.0, 0.0, 4.0, 1.0, 2, 0.5)
+	if !accepted {
+		t.Fatal("maintenance update should be accepted")
+	}
+	if s.Holdover {
+		t.Fatal("holdover should clear on accepted maintenance update")
+	}
+	if s.LastUpdateEpochStrictGatePass {
+		t.Fatal("strict gate should remain false for n_aircraft=2")
+	}
+}
+
+func TestSyncState_StrictGatePassFlagAfterRecovery(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	s.Holdover = true
+	accepted := s.UpdateEpoch(4_000_000.0, 0.0, 4.0, 1.0, 2, 0.5)
+	if !accepted || s.LastUpdateEpochStrictGatePass {
+		t.Fatal("first maintenance update should accept with strict gate false")
+	}
+	accepted = s.UpdateEpoch(8_000_000.0, 0.0, 4.0, 1.0, 4, 0.5)
+	if !accepted {
+		t.Fatal("strict update should accept")
+	}
+	if !s.LastUpdateEpochStrictGatePass {
+		t.Fatal("strict gate flag should be true on strict-quality update")
 	}
 }
 

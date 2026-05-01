@@ -493,6 +493,20 @@ def _live_sync_state_to_dict(sync: "LiveSyncState") -> dict:
         "holdover_insufficient_aircraft": getattr(sync, "holdover_insufficient_aircraft", None),
         "holdover_no_dominant_family": getattr(sync, "holdover_no_dominant_family", None),
         "holdover_sync_state_missing": getattr(sync, "holdover_sync_state_missing", None),
+        "update_epoch_attempts": getattr(sync, "update_epoch_attempts", None),
+        "update_epoch_accepts": getattr(sync, "update_epoch_accepts", None),
+        "update_epoch_rejects": getattr(sync, "update_epoch_rejects", None),
+        "last_update_epoch_reject_reason": getattr(sync, "last_update_epoch_reject_reason", None),
+        "last_update_epoch_n_aircraft": getattr(sync, "last_update_epoch_n_aircraft", None),
+        "last_update_epoch_ref_pos_age_s": getattr(sync, "last_update_epoch_ref_pos_age_s", None),
+        "last_update_epoch_ref_icao": getattr(sync, "last_update_epoch_ref_icao", None),
+        "update_epoch_reject_quality_gate": getattr(sync, "update_epoch_reject_quality_gate", None),
+        "update_epoch_reject_missing_base": getattr(sync, "update_epoch_reject_missing_base", None),
+        "update_epoch_reject_hard_residual": getattr(sync, "update_epoch_reject_hard_residual", None),
+        "update_epoch_reject_no_reference": getattr(sync, "update_epoch_reject_no_reference", None),
+        "update_epoch_reject_stale_ref_pos": getattr(sync, "update_epoch_reject_stale_ref_pos", None),
+        "update_epoch_reject_insufficient_aircraft": getattr(sync, "update_epoch_reject_insufficient_aircraft", None),
+        "update_epoch_last_strict_gate_pass": getattr(sync, "update_epoch_last_strict_gate_pass", None),
     })
     return payload
 
@@ -2433,6 +2447,22 @@ class RadarState:
                 "holdover_insufficient_aircraft": int(entry.get("holdover_insufficient_aircraft") or 0),
                 "holdover_no_dominant_family": int(entry.get("holdover_no_dominant_family") or 0),
                 "holdover_sync_state_missing": int(entry.get("holdover_sync_state_missing") or 0),
+                "update_epoch_attempts": int(entry.get("update_epoch_attempts") or 0),
+                "update_epoch_accepts": int(entry.get("update_epoch_accepts") or 0),
+                "update_epoch_rejects": int(entry.get("update_epoch_rejects") or 0),
+                "last_update_epoch_reject_reason": str(entry.get("last_update_epoch_reject_reason") or ""),
+                "last_update_epoch_n_aircraft": int(entry.get("last_update_epoch_n_aircraft") or 0),
+                "last_update_epoch_ref_pos_age_s": (
+                    float(entry["last_update_epoch_ref_pos_age_s"]) if entry.get("last_update_epoch_ref_pos_age_s") is not None else None
+                ),
+                "last_update_epoch_ref_icao": str(entry.get("last_update_epoch_ref_icao") or ""),
+                "update_epoch_reject_quality_gate": int(entry.get("update_epoch_reject_quality_gate") or 0),
+                "update_epoch_reject_missing_base": int(entry.get("update_epoch_reject_missing_base") or 0),
+                "update_epoch_reject_hard_residual": int(entry.get("update_epoch_reject_hard_residual") or 0),
+                "update_epoch_reject_no_reference": int(entry.get("update_epoch_reject_no_reference") or 0),
+                "update_epoch_reject_stale_ref_pos": int(entry.get("update_epoch_reject_stale_ref_pos") or 0),
+                "update_epoch_reject_insufficient_aircraft": int(entry.get("update_epoch_reject_insufficient_aircraft") or 0),
+                "update_epoch_last_strict_gate_pass": bool(entry.get("update_epoch_last_strict_gate_pass", False)),
             }
         except Exception:
             return None
@@ -2902,6 +2932,23 @@ class RadarState:
             holdover_insufficient_aircraft=int(go_sync.get("holdover_insufficient_aircraft") or 0),
             holdover_no_dominant_family=int(go_sync.get("holdover_no_dominant_family") or 0),
             holdover_sync_state_missing=int(go_sync.get("holdover_sync_state_missing") or 0),
+            update_epoch_attempts=int(go_sync.get("update_epoch_attempts") or 0),
+            update_epoch_accepts=int(go_sync.get("update_epoch_accepts") or 0),
+            update_epoch_rejects=int(go_sync.get("update_epoch_rejects") or 0),
+            last_update_epoch_reject_reason=str(go_sync.get("last_update_epoch_reject_reason") or "") or None,
+            last_update_epoch_n_aircraft=int(go_sync.get("last_update_epoch_n_aircraft") or 0),
+            last_update_epoch_ref_pos_age_s=(
+                float(go_sync["last_update_epoch_ref_pos_age_s"])
+                if go_sync.get("last_update_epoch_ref_pos_age_s") is not None else None
+            ),
+            last_update_epoch_ref_icao=str(go_sync.get("last_update_epoch_ref_icao") or "") or None,
+            update_epoch_reject_quality_gate=int(go_sync.get("update_epoch_reject_quality_gate") or 0),
+            update_epoch_reject_missing_base=int(go_sync.get("update_epoch_reject_missing_base") or 0),
+            update_epoch_reject_hard_residual=int(go_sync.get("update_epoch_reject_hard_residual") or 0),
+            update_epoch_reject_no_reference=int(go_sync.get("update_epoch_reject_no_reference") or 0),
+            update_epoch_reject_stale_ref_pos=int(go_sync.get("update_epoch_reject_stale_ref_pos") or 0),
+            update_epoch_reject_insufficient_aircraft=int(go_sync.get("update_epoch_reject_insufficient_aircraft") or 0),
+            update_epoch_last_strict_gate_pass=bool(go_sync.get("update_epoch_last_strict_gate_pass", False)),
             handoff_state=(
                 str(getattr(existing, "handoff_state", "") or "UNTRUSTED")
                 if existing is not None else
@@ -2978,6 +3025,20 @@ class RadarState:
                 "holdover_insufficient_aircraft": iid_state.get("shi"),
                 "holdover_no_dominant_family": iid_state.get("shd"),
                 "holdover_sync_state_missing": iid_state.get("shx"),
+                "update_epoch_attempts": iid_state.get("uea"),
+                "update_epoch_accepts": iid_state.get("uec"),
+                "update_epoch_rejects": iid_state.get("uer"),
+                "last_update_epoch_reject_reason": iid_state.get("uel"),
+                "last_update_epoch_n_aircraft": iid_state.get("uen"),
+                "last_update_epoch_ref_pos_age_s": iid_state.get("uep"),
+                "last_update_epoch_ref_icao": iid_state.get("uei"),
+                "update_epoch_reject_quality_gate": iid_state.get("ueq"),
+                "update_epoch_reject_missing_base": iid_state.get("uem"),
+                "update_epoch_reject_hard_residual": iid_state.get("ueh"),
+                "update_epoch_reject_no_reference": iid_state.get("uenr"),
+                "update_epoch_reject_stale_ref_pos": iid_state.get("ues"),
+                "update_epoch_reject_insufficient_aircraft": iid_state.get("uei2"),
+                "update_epoch_last_strict_gate_pass": iid_state.get("uesp"),
             })
             if go_sync is not None:
                 self._go_sync_states_by_iid[iid] = go_sync

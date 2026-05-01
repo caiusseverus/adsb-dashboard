@@ -104,6 +104,20 @@ class LiveSyncState:
     holdover_insufficient_aircraft: int = 0
     holdover_no_dominant_family: int = 0
     holdover_sync_state_missing: int = 0
+    update_epoch_attempts: int = 0
+    update_epoch_accepts: int = 0
+    update_epoch_rejects: int = 0
+    last_update_epoch_reject_reason: str | None = None
+    last_update_epoch_n_aircraft: int | None = None
+    last_update_epoch_ref_pos_age_s: float | None = None
+    last_update_epoch_ref_icao: str | None = None
+    update_epoch_reject_quality_gate: int = 0
+    update_epoch_reject_missing_base: int = 0
+    update_epoch_reject_hard_residual: int = 0
+    update_epoch_reject_no_reference: int = 0
+    update_epoch_reject_stale_ref_pos: int = 0
+    update_epoch_reject_insufficient_aircraft: int = 0
+    update_epoch_last_strict_gate_pass: bool | None = None
 
 
 @dataclass
