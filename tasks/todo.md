@@ -145,3 +145,19 @@ Plan confirmation:
 - Reacquisition re-anchors epoch/offset and marks provisional (`reacquired_provisional`) while forcing strict-gate flag false so phase authority is not granted by reacquisition alone.
 - Preserved period refinement delta/history through epoch reacquisition; no reset of `PeriodDeltaS` unless existing base-period-change logic triggers elsewhere.
 - Verification: `cd radar-core && GOCACHE=/tmp/go-build-cache go test ./iid ./protocol` -> passed.
+
+## 2026-05-01 Stage 4 Follow-up 2: nAircraft Source and Maintenance Gate Split
+
+- [x] Trace `IIDState.UpdateSyncEpoch` call site and identify existing `nAircraft` semantics.
+- [x] Add call-site diagnostics for raw/positioned/dominant/frame-observation counts and exclusion reasons.
+- [x] Replace `nAircraft` source from pending-burst `ActiveICAOs()` to burst-neighborhood positioned population count.
+- [x] Keep strict authority gate unchanged; add maintenance-only support path using residual fit diagnostics.
+- [x] Add tests for maintenance update behavior with frame-local `nAircraft=1`, non-authoritative single-aircraft traffic, corrected population counting, and improved A/R under synthetic support.
+- [x] Run focused Go verification.
+
+### Review (Stage 4 follow-up 2)
+- Root cause: `maybeUpdateSync` passed `builder.ActiveICAOs()`, which counts ICAOs with pending *unfired* replies, not the multi-aircraft burst neighborhood used by residual refinement support.
+- Fix: `maybeUpdateSync` now computes a reference-burst neighborhood population (`BurstRecordsWindow`) and passes the positioned population count into `UpdateSyncEpoch`.
+- Added diagnostics include raw candidates, positioned candidates, dominant-family candidates, frame observation count, reference ICAO/burst/age, and exclusion counts (`missing_position`, `stale_position`, `not_dominant`, `outside_window`).
+- Maintenance gate split: `UpdateEpoch` can maintain sync at `nAircraft=1` only when residual support is strong (`fit_observation_count`, `fit_icao_count`, `fit_span_s` thresholds). Strict authority gate logic remains unchanged.
+- Verification: `cd radar-core && GOCACHE=/tmp/go-build-cache go test ./iid ./cmd/radar-core ./protocol` -> passed.

@@ -68,103 +68,114 @@ type IIDState struct {
 
 // DebugSnapshot is a point-in-time operational view of one IID.
 type DebugSnapshot struct {
-	Status                          string
-	HasPeriod                       bool
-	PeriodS                         float64
-	HasRefICAO                      bool
-	RefICAO                         uint32
-	SyncPresent                     bool
-	SyncQuality                     float64
-	SyncUsable                      bool
-	SyncPeriodS                     float64
-	SyncPhaseEpochUS                float64
-	SyncPhaseOffsetDeg              float64
-	SyncJitterDeg                   float64
-	SyncResidualEMA                 float64
-	SyncLastResidualDeg             float64
-	SyncHoldover                    bool
-	SyncNSyncFrames                 int
-	SyncNRejectedFrames             int
-	SyncLastUpdatedUnix             float64
-	BasePeriodS                     float64
-	PeriodDeltaS                    float64
-	EffectivePeriodS                float64
-	PeriodSource                    string
-	PeriodAgreesWithDF              bool
-	PeriodRejectReason              string
-	ResidualSlopeDegPerS            float64
-	PeriodRefinementStatus          string
-	RefinementPlottedCount          uint64
-	RefinementEligibleCount         uint64
-	RefinementRejectedCount         uint64
-	RefinementReferenceUpdates      uint64
-	RefinementLastRejectReason      string
-	RefinementLastObservationAgeS   float64
-	RefinementHistoryLen            int
-	FitObservationCount             int
-	FitSpanS                        float64
-	FitICAOCount                    int
-	FitObservationsPerICAOMin       int
-	FitObservationsPerICAOMedian    float64
-	FitObservationsPerICAOMax       int
-	FitRetentionWindowS             float64
-	FitGlobalCapHit                 bool
-	FitLastEvictionReason           string
-	SuspiciousICAOCount             int
-	SuspiciousICAOLastReason        string
-	ResidualSlopeEMADegPerS         float64
-	ResidualSlopeStdDegPerS         float64
-	ProposedDeltaS                  float64
-	AppliedDeltaS                   float64
-	LastSlewLimited                 bool
-	LastHardBound                   bool
-	SlopeSignConvention             string
-	HoldoverReason                  string
-	HoldoverQualityGateFailed       uint64
-	HoldoverMissingDFBasePeriod     uint64
-	HoldoverHardResidualReject      uint64
-	HoldoverNoReference             uint64
-	HoldoverStaleReferencePosition  uint64
-	HoldoverPeriodDisagreement      uint64
-	HoldoverInsufficientAircraft    uint64
-	HoldoverNoDominantFamily        uint64
-	HoldoverSyncStateMissing        uint64
-	UpdateEpochAttempts             uint64
-	UpdateEpochAccepts              uint64
-	UpdateEpochRejects              uint64
-	LastUpdateEpochRejectReason     string
-	LastUpdateEpochNAircraft        int
-	LastUpdateEpochRefPosAgeS       float64
-	LastUpdateEpochRefICAO          uint32
-	UpdateEpochRejectQualityGate    uint64
-	UpdateEpochRejectMissingBase    uint64
-	UpdateEpochRejectHardResidual   uint64
-	UpdateEpochRejectNoReference    uint64
-	UpdateEpochRejectStaleRefPos    uint64
-	UpdateEpochRejectInsufficientAC uint64
-	UpdateEpochLastStrictGatePass   bool
-	LastUpdateEpochResidualDeg      float64
-	LastUpdateEpochPredictedDeg     float64
-	LastUpdateEpochObservedDeg      float64
-	ConsecutiveHardResidualRejects  uint64
-	LastAcceptedEpochAgeS           float64
-	SyncEpochAgeS                   float64
-	CurrentPhaseEpochUS             float64
-	CandidateEpochUS                float64
-	ReacquiredProvisional           bool
-	ActiveAircraftEstimate          int
-	BurstRecordsTotal               int
-	BurstRecordsDynamicCap          int
-	BurstRecordsCapHit              bool
-	BurstRecordsCapHitsTotal        uint64
-	BurstRecordsRetainedSpanS       float64
-	BurstRecordsICAOs               int
-	BurstRecordsPerICAOMin          int
-	BurstRecordsPerICAOMedian       float64
-	BurstRecordsPerICAOMax          int
-	ReferenceEligibleAircraft       int
-	DominantFamilyAircraft          int
-	ReferenceSelectionSparseHistory bool
+	Status                                   string
+	HasPeriod                                bool
+	PeriodS                                  float64
+	HasRefICAO                               bool
+	RefICAO                                  uint32
+	SyncPresent                              bool
+	SyncQuality                              float64
+	SyncUsable                               bool
+	SyncPeriodS                              float64
+	SyncPhaseEpochUS                         float64
+	SyncPhaseOffsetDeg                       float64
+	SyncJitterDeg                            float64
+	SyncResidualEMA                          float64
+	SyncLastResidualDeg                      float64
+	SyncHoldover                             bool
+	SyncNSyncFrames                          int
+	SyncNRejectedFrames                      int
+	SyncLastUpdatedUnix                      float64
+	BasePeriodS                              float64
+	PeriodDeltaS                             float64
+	EffectivePeriodS                         float64
+	PeriodSource                             string
+	PeriodAgreesWithDF                       bool
+	PeriodRejectReason                       string
+	ResidualSlopeDegPerS                     float64
+	PeriodRefinementStatus                   string
+	RefinementPlottedCount                   uint64
+	RefinementEligibleCount                  uint64
+	RefinementRejectedCount                  uint64
+	RefinementReferenceUpdates               uint64
+	RefinementLastRejectReason               string
+	RefinementLastObservationAgeS            float64
+	RefinementHistoryLen                     int
+	FitObservationCount                      int
+	FitSpanS                                 float64
+	FitICAOCount                             int
+	FitObservationsPerICAOMin                int
+	FitObservationsPerICAOMedian             float64
+	FitObservationsPerICAOMax                int
+	FitRetentionWindowS                      float64
+	FitGlobalCapHit                          bool
+	FitLastEvictionReason                    string
+	SuspiciousICAOCount                      int
+	SuspiciousICAOLastReason                 string
+	ResidualSlopeEMADegPerS                  float64
+	ResidualSlopeStdDegPerS                  float64
+	ProposedDeltaS                           float64
+	AppliedDeltaS                            float64
+	LastSlewLimited                          bool
+	LastHardBound                            bool
+	SlopeSignConvention                      string
+	HoldoverReason                           string
+	HoldoverQualityGateFailed                uint64
+	HoldoverMissingDFBasePeriod              uint64
+	HoldoverHardResidualReject               uint64
+	HoldoverNoReference                      uint64
+	HoldoverStaleReferencePosition           uint64
+	HoldoverPeriodDisagreement               uint64
+	HoldoverInsufficientAircraft             uint64
+	HoldoverNoDominantFamily                 uint64
+	HoldoverSyncStateMissing                 uint64
+	UpdateEpochAttempts                      uint64
+	UpdateEpochAccepts                       uint64
+	UpdateEpochRejects                       uint64
+	LastUpdateEpochRejectReason              string
+	LastUpdateEpochNAircraft                 int
+	LastUpdateEpochRefPosAgeS                float64
+	LastUpdateEpochRefICAO                   uint32
+	UpdateEpochRejectQualityGate             uint64
+	UpdateEpochRejectMissingBase             uint64
+	UpdateEpochRejectHardResidual            uint64
+	UpdateEpochRejectNoReference             uint64
+	UpdateEpochRejectStaleRefPos             uint64
+	UpdateEpochRejectInsufficientAC          uint64
+	UpdateEpochLastStrictGatePass            bool
+	LastUpdateEpochResidualDeg               float64
+	LastUpdateEpochPredictedDeg              float64
+	LastUpdateEpochObservedDeg               float64
+	ConsecutiveHardResidualRejects           uint64
+	LastAcceptedEpochAgeS                    float64
+	SyncEpochAgeS                            float64
+	CurrentPhaseEpochUS                      float64
+	CandidateEpochUS                         float64
+	ReacquiredProvisional                    bool
+	LastUpdateEpochRawCandidateAircraftCount int
+	LastUpdateEpochPositionedAircraftCount   int
+	LastUpdateEpochDominantAircraftCount     int
+	LastUpdateEpochFrameObservationCount     int
+	LastUpdateEpochInputReferenceICAO        uint32
+	LastUpdateEpochInputReferenceBurstUS     float64
+	LastUpdateEpochInputReferencePosAgeS     float64
+	LastUpdateEpochExcludedMissingPosition   int
+	LastUpdateEpochExcludedStalePosition     int
+	LastUpdateEpochExcludedNotDominant       int
+	LastUpdateEpochExcludedOutsideWindow     int
+	ActiveAircraftEstimate                   int
+	BurstRecordsTotal                        int
+	BurstRecordsDynamicCap                   int
+	BurstRecordsCapHit                       bool
+	BurstRecordsCapHitsTotal                 uint64
+	BurstRecordsRetainedSpanS                float64
+	BurstRecordsICAOs                        int
+	BurstRecordsPerICAOMin                   int
+	BurstRecordsPerICAOMedian                float64
+	BurstRecordsPerICAOMax                   int
+	ReferenceEligibleAircraft                int
+	DominantFamilyAircraft                   int
+	ReferenceSelectionSparseHistory          bool
 }
 
 const (
@@ -460,6 +471,25 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 	}
 }
 
+// BurstRecordsWindow returns a copy of burst records within +/-halfWindowUS around centerEpochUS.
+func (s *IIDState) BurstRecordsWindow(centerEpochUS, halfWindowUS float64) []BurstRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if halfWindowUS <= 0 {
+		return nil
+	}
+	start := centerEpochUS - halfWindowUS
+	end := centerEpochUS + halfWindowUS
+	out := make([]BurstRecord, 0, len(s.records))
+	for _, rec := range s.records {
+		if rec.CentroidUS < start || rec.CentroidUS > end {
+			continue
+		}
+		out = append(out, rec)
+	}
+	return out
+}
+
 func (s *IIDState) RecordBurstResidualObservation(
 	epochUS float64,
 	icao uint32,
@@ -670,6 +700,17 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.CurrentPhaseEpochUS = s.Sync.CurrentPhaseEpochUS
 		out.CandidateEpochUS = s.Sync.CandidateEpochUS
 		out.ReacquiredProvisional = s.Sync.ReacquiredProvisional
+		out.LastUpdateEpochRawCandidateAircraftCount = s.Sync.LastUpdateEpochRawCandidateAircraftCount
+		out.LastUpdateEpochPositionedAircraftCount = s.Sync.LastUpdateEpochPositionedAircraftCount
+		out.LastUpdateEpochDominantAircraftCount = s.Sync.LastUpdateEpochDominantAircraftCount
+		out.LastUpdateEpochFrameObservationCount = s.Sync.LastUpdateEpochFrameObservationCount
+		out.LastUpdateEpochInputReferenceICAO = s.Sync.LastUpdateEpochInputReferenceICAO
+		out.LastUpdateEpochInputReferenceBurstUS = s.Sync.LastUpdateEpochInputReferenceBurstUS
+		out.LastUpdateEpochInputReferencePosAgeS = s.Sync.LastUpdateEpochInputReferencePosAgeS
+		out.LastUpdateEpochExcludedMissingPosition = s.Sync.LastUpdateEpochExcludedMissingPosition
+		out.LastUpdateEpochExcludedStalePosition = s.Sync.LastUpdateEpochExcludedStalePosition
+		out.LastUpdateEpochExcludedNotDominant = s.Sync.LastUpdateEpochExcludedNotDominant
+		out.LastUpdateEpochExcludedOutsideWindow = s.Sync.LastUpdateEpochExcludedOutsideWindow
 		out.PeriodRefinementStatus = s.Sync.PeriodRefinementStatus
 		out.RefinementPlottedCount = s.Sync.RefinementPlottedCount
 		out.RefinementEligibleCount = s.Sync.RefinementEligibleCount

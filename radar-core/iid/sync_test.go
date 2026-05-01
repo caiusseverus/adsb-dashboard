@@ -381,6 +381,59 @@ func TestSyncState_ReacquirePreservesPeriodDelta(t *testing.T) {
 	}
 }
 
+func TestSyncState_MaintenanceAllowsNAircraftOneWithStrongResidualSupport(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	seedReacquireFitSupport(s)
+	// Strengthen support to pass maintenance-from-support thresholds.
+	for i := 0; i < 40; i++ {
+		icao := uint32(0xB0 + uint32(i%8))
+		s.AddRefinementResidualObservation(float64(i+1)*2_000_000.0, 0.5, icao, true, 4, 0.4)
+	}
+	accepted := s.UpdateEpoch(4_000_000.0, 0.0, 4.0, 1.0, 1, 1.0, 0xAA)
+	if !accepted {
+		t.Fatal("expected maintenance accept with strong residual support and nAircraft=1")
+	}
+	if s.LastUpdateEpochStrictGatePass {
+		t.Fatal("strict authority gate must remain false for nAircraft=1")
+	}
+}
+
+func TestSyncState_MaintenanceRejectsTrueSingleAircraftWithoutSupport(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	accepted := s.UpdateEpoch(4_000_000.0, 0.0, 4.0, 1.0, 1, 1.0, 0xAA)
+	if accepted {
+		t.Fatal("expected reject for nAircraft=1 without residual support")
+	}
+	if s.LastUpdateEpochStrictGatePass {
+		t.Fatal("strict authority gate should be false")
+	}
+}
+
+func TestSyncState_UpdateAcceptRejectImprovesWithStrongSupportAtNAircraftOne(t *testing.T) {
+	baseline := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 6; i++ {
+		epochUS := float64(i) * 4_000_000.0
+		baseline.UpdateEpoch(epochUS, baseline.PredictBearing(epochUS), 4.0, 1.0, 1, 1.2, 0xAA)
+	}
+
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 0; i < 48; i++ {
+		icao := uint32(0xC0 + uint32(i%10))
+		s.AddRefinementResidualObservation(float64(i+1)*1_500_000.0, 0.2, icao, true, 4, 0.4)
+	}
+	for i := 1; i <= 6; i++ {
+		epochUS := float64(i) * 4_000_000.0
+		observed := s.PredictBearing(epochUS)
+		s.UpdateEpoch(epochUS, observed, 4.0, 1.0, 1, 1.2, 0xAA)
+	}
+	if s.UpdateEpochAccepts <= baseline.UpdateEpochAccepts {
+		t.Fatalf("expected improved accepts: baseline=%d supported=%d", baseline.UpdateEpochAccepts, s.UpdateEpochAccepts)
+	}
+	if s.UpdateEpochRejects >= baseline.UpdateEpochRejects {
+		t.Fatalf("expected fewer rejects: baseline=%d supported=%d", baseline.UpdateEpochRejects, s.UpdateEpochRejects)
+	}
+}
+
 func TestSyncState_StrictGatePassFlagAfterRecovery(t *testing.T) {
 	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
 	s.Holdover = true
