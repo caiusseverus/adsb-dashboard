@@ -131,8 +131,20 @@ async function trackedRadarFetchJson(url, { endpoint, trigger, signal, ...option
       return null
     }
     const payload = await response.json()
+    const schemaMismatch = (
+      endpoint === 'iid_selected_state'
+      && payload?.type !== 'radar_selected_iid_state'
+    )
+    if (schemaMismatch) {
+      console.warn('RadarPage schema mismatch', { endpoint, url, payload })
+    }
     recordRadarPageRequest(endpoint, trigger, 'completed', startedAt, {
+      httpStatus: response.status,
       cached: payload?.transport?.cached,
+      schemaMismatch,
+      payloadSequence: payload?.sequence ?? null,
+      payloadTimestamp: payload?.server_ts ?? payload?.last_updated ?? null,
+      payloadEmpty: Array.isArray(payload?.observations) ? payload.observations.length === 0 : null,
     })
     return payload
   } catch (error) {
@@ -561,6 +573,57 @@ function useTdoaDiagnostics(iid, refreshKey = 0) {
   }, [iid, refreshKey])
 
   return data
+}
+
+function RadarEndpointDiagnostics({ iid }) {
+  const [tick, setTick] = useState(0)
+  useEffect(() => {
+    const id = setInterval(() => setTick(v => v + 1), 1000)
+    return () => clearInterval(id)
+  }, [])
+  const _ = tick
+  const store = getRadarPageMetricsStore()
+  const requests = store?.requests ?? {}
+  const rows = Object.entries(requests)
+    .filter(([endpoint]) => endpoint.startsWith('iid_') || endpoint === 'iid_selected_state')
+    .sort(([a], [b]) => a.localeCompare(b))
+  if (iid == null) return null
+  return (
+    <section className={styles.card}>
+      <div className={styles.cardHeader}>
+        <div><div className={styles.cardTitle}>Selected-IID Fetch Diagnostics</div></div>
+      </div>
+      <div className={styles.tableWrap}>
+        <table className={styles.table}>
+          <thead>
+            <tr>
+              <th>Endpoint</th><th>Status</th><th>Age</th><th>Seq/TS</th><th>Empty</th><th>Schema</th><th>Polling</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(([endpoint, bucket]) => {
+              const meta = bucket.lastMeta ?? {}
+              const recentTrigger = Object.keys(bucket.triggers ?? {}).some(key => key.includes('poll'))
+              return (
+                <tr key={endpoint}>
+                  <td className={styles.monoCell}>{endpoint}</td>
+                  <td className={styles.monoCell}>{meta.httpStatus ?? '—'}</td>
+                  <td className={styles.monoCell}>{bucket.lastDurationMs != null ? `${bucket.lastDurationMs}ms` : '—'}</td>
+                  <td className={styles.monoCell}>{meta.payloadSequence ?? meta.payloadTimestamp ?? '—'}</td>
+                  <td className={styles.monoCell}>{meta.payloadEmpty === true ? 'yes' : meta.payloadEmpty === false ? 'no' : '—'}</td>
+                  <td className={styles.monoCell}>{meta.schemaMismatch ? 'rejected' : 'ok'}</td>
+                  <td className={styles.monoCell}>{recentTrigger ? 'active' : 'idle'}</td>
+                </tr>
+              )
+            })}
+            {rows.length === 0 && (
+              <tr><td colSpan={7} className={styles.monoCell}>No selected-IID fetch activity yet.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  )
 }
 
 async function resetIid(iid) {
@@ -1701,6 +1764,7 @@ function useSelectedIidPageState(iid, windowS, debugLimit = 120) {
   })
   const retryRef = useRef(null)
   const fallbackRef = useRef(null)
+  const fallbackInFlightRef = useRef(false)
   const lastUpdateRef = useRef(0)
   const revisionsRef = useRef(null)
   const snapshotRef = useRef(null)
@@ -1739,7 +1803,15 @@ function useSelectedIidPageState(iid, windowS, debugLimit = 120) {
     }
 
     const ingestSnapshot = payload => {
-      if (!payload || payload.type !== 'radar_selected_iid_state') return
+      if (!payload || payload.type !== 'radar_selected_iid_state') {
+        setStatus(prev => ({
+          ...prev,
+          connected: prev.connected,
+          mode: 'schema_mismatch',
+          fallback: true,
+        }))
+        return
+      }
       const changedSections = getChangedSections(payload.revisions)
       recordRadarPageStream('ws_selected_iid_state', 'message', {
         iid,
@@ -1761,12 +1833,21 @@ function useSelectedIidPageState(iid, windowS, debugLimit = 120) {
 
     const pollFallback = () => {
       if (closed) return
+      if (fallbackInFlightRef.current) return
+      const nowPerf = performance.now()
+      const staleForMs = lastUpdateRef.current > 0 ? nowPerf - lastUpdateRef.current : Number.POSITIVE_INFINITY
+      if (staleForMs < 2500) return
+      fallbackInFlightRef.current = true
       trackedRadarFetchJson(`${API_BASE}/api/radar/iids/${iid}/state?window_s=${windowS}&debug_limit=${debugLimit}`, {
         endpoint: 'iid_selected_state',
         trigger: 'selected_state_stream_fallback',
       })
         .then(payload => {
-          if (closed || !payload || payload.type !== 'radar_selected_iid_state') return
+          if (closed || !payload) return
+          if (payload.type !== 'radar_selected_iid_state') {
+            setStatus(prev => ({ ...prev, connected: false, mode: 'schema_mismatch', fallback: true }))
+            return
+          }
           const currentSnapshot = snapshotRef.current
           if (
             currentSnapshot
@@ -1795,6 +1876,9 @@ function useSelectedIidPageState(iid, windowS, debugLimit = 120) {
           if (!closed) {
             setStatus(prev => ({ ...prev, connected: false, mode: 'disconnected', fallback: true }))
           }
+        })
+        .finally(() => {
+          fallbackInFlightRef.current = false
         })
     }
 
@@ -1843,7 +1927,7 @@ function useSelectedIidPageState(iid, windowS, debugLimit = 120) {
       // Safety net: keep a low-rate HTTP poll even when websocket heartbeats are flowing.
       // This avoids stale UI when websocket snapshots are starved by upstream cache/signature issues.
       pollFallback()
-    }, 1000)
+    }, 5000)
 
     return () => {
       closed = true
@@ -2296,13 +2380,11 @@ function RotationAlignmentPanel({
     let cancelled = false
     const cachedTimeline = timelineCacheRef.current.get(iid)
     setLegacyTimeline(cachedTimeline ?? null)
-    if (alignmentMode === BURST_SYNC_VIEW_MODE_LEGACY) {
-      setLegacyLoading(true)
-    }
+    if (alignmentMode !== BURST_SYNC_VIEW_MODE_LEGACY) return
 
     async function pollTimeline() {
       const payload = await trackedRadarFetchJson(
-        `${API_BASE}/api/radar/iids/${iid}/timeline?window_s=${BURST_SYNC_ALIGNMENT_WINDOW_S}`,
+        `${API_BASE}/api/radar/iids/${iid}/timeline?window_s=${BURST_SYNC_ALIGNMENT_WINDOW_S}&_ts=${Date.now()}`,
         {
           endpoint: 'iid_timeline',
           trigger: 'legacy_alignment_mode_poll',
@@ -2317,6 +2399,7 @@ function RotationAlignmentPanel({
       }
     }
 
+    setLegacyLoading(true)
     pollTimeline()
     const intervalId = setInterval(pollTimeline, BURST_SYNC_POLL_MS)
     return () => {
@@ -2329,10 +2412,10 @@ function RotationAlignmentPanel({
   const rotation = syncSnapshot?.rotation ?? null
   const rawRecordedObservations = Array.isArray(burstTimeline?.recorded_observations)
     ? burstTimeline.recorded_observations
-    : (Array.isArray(burstTimeline?.observations) ? burstTimeline.observations : [])
+    : []
   const rawRecordedDf11ResidualDots = Array.isArray(burstTimeline?.recorded_df11_residual_observations)
     ? burstTimeline.recorded_df11_residual_observations
-    : (Array.isArray(burstTimeline?.df11_residual_observations) ? burstTimeline.df11_residual_observations : [])
+    : []
   const recomputedObservationsByBasis = burstTimeline?.recomputed_observations_by_basis ?? {}
   const recomputedDf11ByBasis = burstTimeline?.recomputed_df11_residual_observations_by_basis ?? {}
   const backendRecordedEventDiagnostics = burstTimeline?.recorded_event_diagnostics ?? null
@@ -5411,6 +5494,7 @@ return (
           timingPacket={sharedTimingPacket}
         />
       </div>
+      <RadarEndpointDiagnostics iid={selectedIid} />
     </div>
   </main>
 )

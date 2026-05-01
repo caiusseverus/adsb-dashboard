@@ -110,3 +110,17 @@ Verification:
 
 Residual risk:
 - Live/manual endpoint validation with an active backend process is still required to conclusively classify generation-vs-API-vs-frontend for your current deployment.
+
+## 2026-05-01 Selected-IID Data-Path Regression Audit (In Progress)
+
+- [x] Capture live endpoint snapshots for one active selected IID and classify each endpoint (live, valid-empty, stale, error, frontend-only).
+- [x] Verify frame-generation chain (Go FrameReady -> Python ingest -> backend frame state -> sweep API -> pipeline health) with direct counters and classify first failing hop.
+- [ ] Run GitNexus impact analysis for each symbol to be edited and report blast radius/risk before edits.
+- [x] Audit `frontend/src/pages/RadarPage.jsx` selected-IID fetch/poll lifecycle for sync snapshot, burst timeline, DF alignment, sweep frames, accumulation, FM location/diagnostics, and position accumulation.
+- [ ] Audit frontend response-shape mapping against live backend JSON; add explicit schema-mismatch diagnostics (no silent empty success).
+- [x] Restore source-of-truth separation so sweep/frame/position/DF/pipeline panels do not depend on recorded residual-event buffers.
+- [ ] Fix Burst Sync modes: recorded uses immutable recorded events only; recomputed uses live/recomputed observations independent of recorded buffers.
+- [x] Fix DF alignment lifecycle so first view selection fetches immediately and polling continues while visible.
+- [x] Add temporary frontend diagnostics (URL/status/age/seq-or-ts/count/empty/schema-rejected/polling-active) per selected-IID data source.
+- [ ] Add backend/frontend regression tests for source independence, lifecycle polling, empty recorded behavior, and schema-mismatch handling.
+- [ ] Run verification (backend pytest + frontend tests/build + manual acceptance flow) and document review results.
