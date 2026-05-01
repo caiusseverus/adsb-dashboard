@@ -48,3 +48,20 @@ def test_radar_page_labels_recomputed_mode_as_projection_and_uses_explicit_bases
     assert "RESIDUAL_BASIS_COMPACT_BOOTSTRAP" in text
     assert "RESIDUAL_BASIS_RUNTIME_EFFECTIVE" in text
     assert "RESIDUAL_BASIS_GO_RUNTIME_DIAGNOSTIC" in text
+
+
+def test_radar_page_uses_recorded_event_buffer_and_explicit_empty_reasons():
+    radar_page = Path(__file__).resolve().parents[2] / "frontend" / "src" / "pages" / "RadarPage.jsx"
+    text = radar_page.read_text(encoding="utf-8")
+    assert "setRecordedEventBuffer" in text
+    assert "event?.event_id" in text
+    assert "Residual-vs-bearing empty:" in text
+    assert "Residual-vs-range empty:" in text
+    assert "frontend_recorded_buffer_size" in text
+
+
+def test_radar_page_all_icaos_chip_uses_distinct_recorded_burst_icaos():
+    radar_page = Path(__file__).resolve().parents[2] / "frontend" / "src" / "pages" / "RadarPage.jsx"
+    text = radar_page.read_text(encoding="utf-8")
+    assert "All ICAOs ({sortedIcaos.length})" in text
+    assert "recorded_event_count_in_window" in text

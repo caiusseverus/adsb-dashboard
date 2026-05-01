@@ -572,7 +572,7 @@ def test_burst_residual_recorded_events_are_immutable_across_period_change(monke
     assert recorded[0]["residual_deg"] == pytest.approx(first_recorded["residual_deg"])
     assert recorded[0]["classification"] == first_recorded["classification"]
     assert recorded[0]["display_residual_class"] == first_recorded["display_residual_class"]
-    assert recorded[0]["source_path"] == "python_bootstrap"
+    assert recorded[0]["source_path"] == "recorded_python_bootstrap"
     assert recorded[0]["phase_basis"] == "sweep_epoch_only"
     assert recorded[0]["phase_is_absolute"] is False
     assert payload["residual_chart_default_mode"] == "recorded"
@@ -704,9 +704,190 @@ def test_get_burst_sync_timeline_includes_go_evidence_in_diagnostic_timeline(mon
     assert obs["burst_center_simple_us"] == pytest.approx(8_198_000.0)
     assert obs["burst_center_weighted_us"] == pytest.approx(8_200_000.0)
     assert obs["burst_center_delta_us"] == pytest.approx(2_000.0)
+    recorded = timeline["recorded_observations"]
+    assert recorded == []
+    assert timeline["recorded_df11_residual_observations"] == []
+    assert timeline["recorded_event_diagnostics"]["recorded_burst_event_count_in_window"] == 0
+    assert timeline["recorded_event_diagnostics"]["recorded_df11_event_count_in_window"] == 0
     retention = timeline["retention_diagnostics"]
     assert retention["timeline"]["count"] == 1
     assert retention["timeline"]["newest_burst_centroid_us"] == pytest.approx(8_200_000.0)
+
+
+def test_update_go_burst_fired_records_immutable_burst_event(monkeypatch):
+    state = RadarState()
+    now_ts = 1_000.0
+    monkeypatch.setattr("radar.sweep.time.time", lambda: now_ts)
+    state._models[7] = RadarIID(
+        iid=7,
+        status="SINGLE_RADAR",
+        period_s=4.0,
+        lat=51.0,
+        lon=0.0,
+    )
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=now_ts,
+        source="multi_aircraft_burst",
+        usable=True,
+    )
+
+    state.update_go_burst_fired({
+        "i": 7,
+        "c": int("BBBBBB", 16),
+        "cu": 8_200_000.0,
+        "cs": 8_198_000.0,
+        "cw": 8_200_000.0,
+        "cd": 2_000.0,
+        "cf": 8_190_000.0,
+        "ct": 8_200_000.0,
+        "cm": 8_200_000.0,
+        "cl": 8_206_000.0,
+        "cp": 16_000.0,
+        "pk": -12.0,
+        "n": 4,
+        "s": -15.0,
+        "la": 51.1,
+        "lo": 0.2,
+        "pa": 0.3,
+        "df": True,
+        "se": False,
+        "ce": False,
+        "rp": True,
+        "ru": False,
+    })
+
+    timeline = state.get_burst_sync_timeline(7, window_s=60.0)
+    recorded = timeline["recorded_observations"]
+
+    assert len(recorded) == 1
+    assert recorded[0]["event_kind"] == "burst"
+    assert recorded[0]["source_path"] == "recorded_go_runtime"
+    assert recorded[0]["bearing_deg"] is not None
+    assert recorded[0]["range_nm"] is not None
+    assert recorded[0]["corrected_residual_deg"] is not None
+    assert recorded[0]["aircraft_position_age_s"] == pytest.approx(0.3)
+    assert timeline["recorded_event_diagnostics"]["recorded_burst_event_count_in_window"] == 1
+
+
+def test_recorded_df11_and_burst_events_remain_separate():
+    state = RadarState()
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=4.0,
+    )
+    state._live_burst_residual_events[7] = deque([
+        {
+            "event_id": "7:burst:AAAAAA:4000000.000",
+            "event_kind": "burst",
+            "beam_center_us": 4_000_000.0,
+            "wall_ts": 999.0,
+            "icao": "AAAAAA",
+            "residual_deg": 1.0,
+            "bearing_deg": 90.0,
+            "range_nm": 12.0,
+            "corrected_residual_deg": 1.0,
+        }
+    ])
+    state._live_df11_recorded_residual_events[7] = deque([
+        {
+            "event_id": "7:df11:BBBBBB:4500000.000",
+            "event_kind": "df11",
+            "arrival_beast_us": 4_500_000.0,
+            "beam_center_us": 4_500_000.0,
+            "wall_ts": 999.2,
+            "icao": "BBBBBB",
+            "residual_deg": -2.0,
+            "timing_class": "late",
+        }
+    ])
+    state._iid_latest_arrival_us[7] = 4_500_000.0
+
+    payload = state.get_burst_sync_timeline(7, window_s=300.0)
+
+    assert [event["event_kind"] for event in payload["recorded_observations"]] == ["burst"]
+    assert [event["event_kind"] for event in payload["recorded_df11_residual_observations"]] == ["df11"]
+    assert payload["recorded_event_diagnostics"]["recorded_event_count_total"] == 2
+
+
+def test_append_recorded_event_rejects_adjacent_duplicate_without_rescanning_buffer():
+    state = RadarState()
+    event_buf = deque([
+        {"event_id": "7:burst:AAAAAA:1.000", "wall_ts": 1.0},
+        {"event_id": "7:burst:BBBBBB:2.000", "wall_ts": 2.0},
+    ])
+
+    first = state._append_recorded_event(
+        iid=7,
+        event={"event_id": "7:burst:CCCCCC:3.000", "wall_ts": 3.0},
+        event_buf=event_buf,
+        now_ts=3.0,
+    )
+    second = state._append_recorded_event(
+        iid=7,
+        event={"event_id": "7:burst:CCCCCC:3.000", "wall_ts": 3.0},
+        event_buf=event_buf,
+        now_ts=3.0,
+    )
+
+    assert first is True
+    assert second is False
+    assert [event["event_id"] for event in event_buf] == [
+        "7:burst:AAAAAA:1.000",
+        "7:burst:BBBBBB:2.000",
+        "7:burst:CCCCCC:3.000",
+    ]
+    assert state._recorded_event_counters(7)["dropped_reason_counts"]["duplicate_event_id"] == 1
+
+
+def test_recorded_event_diagnostics_count_missing_geometry_without_crashing():
+    state = RadarState()
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=4.0,
+    )
+    state._live_burst_residual_events[7] = deque([
+        {
+            "event_id": "7:burst:AAAAAA:4000000.000",
+            "event_kind": "burst",
+            "beam_center_us": 4_000_000.0,
+            "wall_ts": 999.0,
+            "icao": "AAAAAA",
+            "residual_deg": 1.0,
+            "bearing_deg": None,
+            "range_nm": None,
+            "corrected_residual_deg": None,
+        }
+    ])
+    state._iid_latest_arrival_us[7] = 4_000_000.0
+
+    payload = state.get_burst_sync_timeline(7, window_s=300.0)
+
+    diag = payload["recorded_event_diagnostics"]
+    assert diag["recorded_events_missing_bearing"] == 1
+    assert diag["recorded_events_missing_range"] == 1
+    assert diag["recorded_events_missing_corrected_residual"] == 1
 
 
 def test_go_evidence_stored_diagnostically_not_as_sync_input(monkeypatch):

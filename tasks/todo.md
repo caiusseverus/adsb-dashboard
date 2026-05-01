@@ -1,34 +1,51 @@
-## 2026-05-01 Burst Sync Residuals Recorder Semantics and Authority Consistency
+## 2026-05-01 Recorded Residual Event Completeness and Retention
 
-- [x] Review current backend/frontend residual chart pipeline and identify where recorded events, recomputed projections, and authority/source fields are assembled.
-- [x] Run best-effort impact scan for touched symbols/files and document blast radius before edits.
-- [x] Update backend recorded residual event snapshots to store immutable scalar render/model metadata at event creation time, with operational vs diagnostic source separation and consistency checks.
-- [x] Remove silent recomputed fallback from recorded mode and expose explicit recorded empty/unavailable state plus explicit recomputed projection modes/bases.
-- [x] Update frontend chart semantics, controls, and labels to distinguish immutable recorded history from current-state projections and to consume canonical operational fields only.
-- [x] Add backend tests for immutable recorded snapshots, authority/source consistency, and explicit projection metadata.
-- [x] Add frontend/static tests for mode wording, basis labeling, and operational/diagnostic field separation.
-- [x] Run focused verification (backend pytest, frontend tests/build) and add a review section with outcomes and remaining risks.
+- [x] Trace current recorded burst-event, recorded DF11-event, timeline API, and frontend recorded-buffer/render derivation paths.
+- [x] Run impact checks for touched backend/frontend symbols and confirm expected blast radius.
+- [x] Fix backend recorded burst event generation so every eligible burst alignment observation emits a complete immutable scalar event with geometry and source-path metadata.
+- [x] Fix backend recorded event retention/diagnostics so append/prune behaviour is stable and distinguishable from missing new events.
+- [x] Fix timeline/live snapshot payload separation so recorded burst rows and recorded DF11 rows remain distinct and complete across the display window.
+- [x] Fix frontend recorded-mode consumption so main chart, ICAO chips, burst counts, residual-vs-bearing, and residual-vs-range use recorded fields only.
+- [x] Add explicit recorded empty-state / missing-geometry reasons and recorded buffer diagnostics in the UI.
+- [x] Add/update backend tests for recorded completeness, event separation, immutability, timestamp pruning, and full-window inclusion.
+- [x] Add/update frontend/static tests for recorded-only derivation, no fallback, stable append/prune semantics, and explicit empty reasons.
+- [x] Run focused verification and document the review/results in this file.
 
 Plan confirmation:
-- Scope limited to chart/data semantics and diagnostic consistency.
-- No changes to period refinement math, Go refiner logic, phase math, readiness gates, or localisation logic.
+- Scope limited to recorded residual event generation, schema, retention, API payloads, and frontend recorded rendering/buffering.
+- No changes to period refinement maths, phase maths, handoff gates, Go refiner logic, or localisation solving.
 
-### Review
-- Backend:
-  - Recorded burst residual events now snapshot scalar render/model metadata at creation time, including authority/source/phase/handoff fields and immutable display class labels.
-  - Added recorded DF11 residual snapshots so recorded mode no longer depends on current-state DF11 recomputation.
-  - Live snapshot/timeline payloads no longer silently substitute recomputed observations into recorded mode.
-  - Added explicit recomputed projection datasets keyed by basis (`runtime_effective`, `compact_bootstrap`, `go_runtime_diagnostic`) while keeping recorded history separate.
-  - Operational sync payload fields are now authority-driven; Go-only period values are exported under `go_diagnostic_*` fields instead of masquerading as operational sources.
-  - Added consistency warnings/demotion for contradictory operational source combinations.
-- Frontend:
-  - Recorded mode is labelled `Recorded immutable event history` and shows an explicit unavailable/insufficient-recorded-data state instead of fallback wording.
-  - Recomputed mode is labelled `Recomputed current projection` and consumes explicit basis options from the payload.
-  - Burst/DF11 chart data now switches between recorded and recomputed datasets without reprojecting recorded history.
-  - Diagnostic Go delta/source display now reads `go_diagnostic_*` fields only.
-- Verification:
-  - `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_api.py tests/test_radar_ui_labels.py -q` -> `155 passed`.
-  - `cd frontend && npm run build` -> passed.
-- Remaining risks:
-  - Manual live validation against a running feed is still needed to confirm the visual step-change behavior when refinement state changes mid-stream.
-  - Recomputed `compact_bootstrap` / `go_runtime_diagnostic` views reuse the existing predictor with alternate period/phase snapshots; labels are explicit, but live operator validation should confirm those views match the intended diagnostic interpretation.
+Review:
+- Go evidence events now emit immutable recorded burst residual events instead of only feeding recomputed diagnostic projections.
+- Recorded event payloads now include stable `event_id`, geometry fields, corrected residual, source path, and aircraft position age.
+- Recorded event diagnostics now distinguish retained totals, in-window counts, appended/pruned deltas, missing geometry counts, and normal window pruning.
+- Frontend recorded mode now maintains a rolling `event_id`-keyed buffer, dedupes partial snapshots, and avoids clearing on mode/basis changes or empty polls.
+- Recorded per-ICAO chips, burst counts, residual-vs-bearing, and residual-vs-range all derive from recorded burst events only.
+- Empty secondary plots now report explicit reasons instead of silently showing blank charts.
+
+Verification:
+- `uv run --directory backend pytest tests/test_radar_sweep.py tests/test_radar_ui_labels.py -q`
+- `cd frontend && npm run build`
+
+Residual risk:
+- Manual live-feed validation is still needed to confirm the recorded buffer keeps filling correctly for more than one 300s window under real traffic.
+
+## 2026-05-01 Recorded Event Regression Triage
+
+- [x] Review lessons and inspect the Go snapshot / burst-fired recorded-event paths touched by the prior change.
+- [x] Verify the likely regression mechanism and blast radius before editing.
+- [x] Move immutable Go recorded-event creation off the snapshot replacement path and back onto the live burst-fired ingest hook.
+- [x] Update backend tests to reflect event-time recording semantics and verify snapshot ingestion no longer manufactures recorded events.
+- [x] Run backend verification for the regression fix.
+
+Review:
+- The regression came from generating immutable Go recorded burst events inside `update_go_snapshot()`, which replays whole retained evidence snapshots rather than only new live events.
+- That put expensive per-evidence prediction and dedupe work on the snapshot ingest path, which is the wrong control path for event-time recording and is consistent with live frame/alignment starvation.
+- The fix removes recorded-event generation from `update_go_snapshot()` and records Go burst residual events only from `update_go_burst_fired()`, where the event is actually created.
+- A second hot-path regression remained in `_append_recorded_event()`: deduplicating by scanning the whole retained deque on every append made live burst ingestion O(n) per event. The fix reduces this to an adjacent-duplicate O(1) guard.
+
+Verification:
+- `uv run --directory backend pytest tests/test_radar_sweep.py -q`
+
+Residual risk:
+- This is verified by backend tests, not by a live running feed. Runtime confirmation is still needed to prove DF alignment and frame generation recover under live traffic.

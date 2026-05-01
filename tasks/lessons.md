@@ -1,5 +1,10 @@
 # Lessons
 
+## 2026-05-01
+
+- Do not generate immutable live recorded events from a full-state snapshot replacement path such as `update_go_snapshot()`. Record them only at the true event-ingest hook (for example `update_go_burst_fired()`), otherwise snapshot replay can add expensive per-event work to the control path and starve live frame/alignment generation.
+- In a burst/DF11 hot path, never deduplicate by scanning the entire retained history deque on every append. Use an O(1) guard such as adjacent-event ID comparison or a bounded index, otherwise frame generation can collapse under normal live rates.
+
 ## 2026-04-29
 
 - When demoting a Go-derived model from authority to diagnostics, gate every operational export of that model, not just the first selector. If `RefreshReference()` ignores an unvalidated family but `FamilySnapshot()` still exposes it to frame admission, frames can stop while the period path looks fixed.

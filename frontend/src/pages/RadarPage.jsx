@@ -2211,6 +2211,12 @@ function RotationAlignmentPanel({
   const [refOverride, setRefOverride] = useState(null)
   const [refOverrideSent, setRefOverrideSent] = useState(false)
   const [residualBasisMode, setResidualBasisMode] = useState(RESIDUAL_BASIS_RUNTIME_EFFECTIVE)
+  const [recordedEventBuffer, setRecordedEventBuffer] = useState({
+    iid: null,
+    bursts: [],
+    df11: [],
+    lastAppendAtMs: null,
+  })
   const timelineCacheRef = useRef(new Map())
   const streamStatus = syncFeedStatus ?? {
     connected: false,
@@ -2274,14 +2280,15 @@ function RotationAlignmentPanel({
 
   const burstTimeline = syncSnapshot
   const rotation = syncSnapshot?.rotation ?? null
-  const recordedObservations = Array.isArray(burstTimeline?.recorded_observations)
+  const rawRecordedObservations = Array.isArray(burstTimeline?.recorded_observations)
     ? burstTimeline.recorded_observations
     : (Array.isArray(burstTimeline?.observations) ? burstTimeline.observations : [])
-  const recordedDf11ResidualDots = Array.isArray(burstTimeline?.recorded_df11_residual_observations)
+  const rawRecordedDf11ResidualDots = Array.isArray(burstTimeline?.recorded_df11_residual_observations)
     ? burstTimeline.recorded_df11_residual_observations
     : (Array.isArray(burstTimeline?.df11_residual_observations) ? burstTimeline.df11_residual_observations : [])
   const recomputedObservationsByBasis = burstTimeline?.recomputed_observations_by_basis ?? {}
   const recomputedDf11ByBasis = burstTimeline?.recomputed_df11_residual_observations_by_basis ?? {}
+  const backendRecordedEventDiagnostics = burstTimeline?.recorded_event_diagnostics ?? null
   const projectionBasisOptions = Array.isArray(burstTimeline?.projection_basis_options)
     ? burstTimeline.projection_basis_options
     : []
@@ -2297,9 +2304,6 @@ function RotationAlignmentPanel({
   const recomputedDf11ResidualDots = Array.isArray(recomputedDf11ByBasis?.[activeRecomputedBasis])
     ? recomputedDf11ByBasis[activeRecomputedBasis]
     : []
-  const observations = residualChartMode === RESIDUAL_CHART_MODE_RECOMPUTED
-    ? recomputedObservations
-    : recordedObservations
   const alignmentStatus = burstTimeline?.alignment_status ?? null
   const syncModeDiagnostics = burstTimeline?.sync_mode_diagnostics ?? null
   const burstSyncDiagnostic = burstTimeline?.burst_sync_diagnostic ?? null
@@ -2313,6 +2317,89 @@ function RotationAlignmentPanel({
     : (rotation?.period_s ?? selectedRow?.period_s ?? null)
   const legacyPeriodS = legacyTimeline?.dominant_period_s ?? rotation?.period_s ?? selectedRow?.period_s ?? null
   const legacyPeriodUs = legacyPeriodS != null ? legacyPeriodS * 1_000_000 : null
+  const bufferWindowUs = Math.max(
+    10 * 1_000_000,
+    Number(burstTimeline?.window_s ?? BURST_SYNC_ALIGNMENT_WINDOW_S) * 1_000_000,
+  )
+
+  useEffect(() => {
+    if (iid == null) {
+      setRecordedEventBuffer({
+        iid: null,
+        bursts: [],
+        df11: [],
+        lastAppendAtMs: null,
+      })
+      return
+    }
+    setRecordedEventBuffer(prev => {
+      const prevForIid = prev?.iid === iid
+        ? prev
+        : { iid, bursts: [], df11: [], lastAppendAtMs: null }
+      const burstTimestampUs = event => Number(event?.beam_center_us ?? 0)
+      const df11TimestampUs = event => Number(event?.arrival_beast_us ?? 0)
+      const maxEventTimestampUs = events => events.reduce((max, event) => {
+        const burstUs = burstTimestampUs(event)
+        const df11Us = df11TimestampUs(event)
+        const eventUs = Number.isFinite(burstUs) && burstUs > 0 ? burstUs : df11Us
+        return Number.isFinite(eventUs) ? Math.max(max, eventUs) : max
+      }, 0)
+      const horizonUs = Math.max(
+        Number(timingView?.nowUs ?? 0),
+        maxEventTimestampUs(prevForIid.bursts),
+        maxEventTimestampUs(prevForIid.df11),
+        maxEventTimestampUs(rawRecordedObservations),
+        maxEventTimestampUs(rawRecordedDf11ResidualDots),
+      )
+      const cutoffUs = horizonUs > 0 ? horizonUs - bufferWindowUs : 0
+      let appended = 0
+      const mergeEvents = (existingEvents, incomingEvents, timestampGetter, eventKind) => {
+        const merged = new Map()
+        for (const event of existingEvents) {
+          const eventUs = timestampGetter(event)
+          if (Number.isFinite(eventUs) && eventUs >= cutoffUs) {
+            const key = String(event?.event_id ?? `${eventKind}:${event?.icao ?? 'unknown'}:${eventUs}`)
+            merged.set(key, event)
+          }
+        }
+        for (const event of incomingEvents) {
+          const eventUs = timestampGetter(event)
+          if (!Number.isFinite(eventUs) || eventUs < cutoffUs) continue
+          const key = String(event?.event_id ?? `${eventKind}:${event?.icao ?? 'unknown'}:${eventUs}`)
+          if (!merged.has(key)) appended += 1
+          merged.set(key, event)
+        }
+        return [...merged.values()].sort((a, b) => timestampGetter(a) - timestampGetter(b))
+      }
+      const nextBursts = mergeEvents(prevForIid.bursts, rawRecordedObservations, burstTimestampUs, 'burst')
+      const nextDf11 = mergeEvents(prevForIid.df11, rawRecordedDf11ResidualDots, df11TimestampUs, 'df11')
+      const nextState = {
+        iid,
+        bursts: nextBursts,
+        df11: nextDf11,
+        lastAppendAtMs: appended > 0 ? Date.now() : prevForIid.lastAppendAtMs,
+      }
+      return nextState
+    })
+  }, [iid, rawRecordedDf11ResidualDots, rawRecordedObservations, bufferWindowUs, timingView?.nowUs])
+
+  const bufferedRecordedEvents = recordedEventBuffer?.iid === iid
+    ? recordedEventBuffer
+    : { iid, bursts: [], df11: [], lastAppendAtMs: null }
+  const recordedObservations = bufferedRecordedEvents.bursts
+  const recordedDf11ResidualDots = bufferedRecordedEvents.df11
+  const frontendRecordedBufferSize = recordedObservations.length + recordedDf11ResidualDots.length
+  const frontendRecordedBufferLastAppendAgeS = bufferedRecordedEvents.lastAppendAtMs != null
+    ? Math.max(0, (Date.now() - bufferedRecordedEvents.lastAppendAtMs) / 1000)
+    : null
+  const recordedEventDiagnostics = {
+    ...(backendRecordedEventDiagnostics ?? {}),
+    frontend_recorded_buffer_size: frontendRecordedBufferSize,
+    frontend_recorded_buffer_last_append_age_s: frontendRecordedBufferLastAppendAgeS,
+  }
+  const observations = residualChartMode === RESIDUAL_CHART_MODE_RECOMPUTED
+    ? recomputedObservations
+    : recordedObservations
   const latestBurstUs = observations.reduce((max, obs) => {
     const value = Number(obs?.beam_center_us ?? 0)
     return Number.isFinite(value) ? Math.max(max, value) : max
@@ -2324,10 +2411,7 @@ function RotationAlignmentPanel({
         return Number.isFinite(value) ? Math.max(max, value) : max
       }, 0)
   const timingNowUs = Number(timingView?.nowUs ?? 0)
-  const windowSpanUs = Math.max(
-    10 * 1_000_000,
-    Number(burstTimeline?.window_s ?? BURST_SYNC_ALIGNMENT_WINDOW_S) * 1_000_000,
-  )
+  const windowSpanUs = bufferWindowUs
   const latestResidualUs = Math.max(latestBurstUs, latestDf11ResidualUs)
   const windowEndUs = latestResidualUs > 0 ? latestResidualUs : timingNowUs
   const windowStartUs = Math.max(0, windowEndUs - windowSpanUs)
@@ -2393,6 +2477,10 @@ function RotationAlignmentPanel({
       .map(([icao, count]) => ({ icao, count }))
       .sort((a, b) => (b.count - a.count) || a.icao.localeCompare(b.icao))
   }, [observations, sortedLegacyIcaos])
+  const recordedBurstEventsInWindow = recordedObservations.filter(obs => {
+    const sampleUs = Number(obs?.beam_center_us ?? 0)
+    return Number.isFinite(sampleUs) && sampleUs >= windowStartUs && sampleUs <= windowEndUs
+  })
 
   useEffect(() => {
     if (residualChartMode === RESIDUAL_CHART_MODE_RECORDED) {
@@ -2488,6 +2576,53 @@ function RotationAlignmentPanel({
   const rangeResidualRows = phaseResidualRows
     .filter(row => Number.isFinite(row.rangeNm) && Number.isFinite(row.residualCorrectedDeg))
     .sort((a, b) => (a.rangeNm - b.rangeNm) || a.key.localeCompare(b.key))
+  const recordedPhaseEmptyReason = useMemo(() => {
+    if (residualChartMode !== RESIDUAL_CHART_MODE_RECORDED) {
+      return phaseResidualRows.length === 0 ? 'No projected residual-vs-bearing rows for this view.' : null
+    }
+    if (recordedObservations.length === 0) return 'no recorded burst events'
+    if (recordedBurstEventsInWindow.length === 0) return 'events outside display window'
+    if (selectedIcao && filteredObservations.length === 0) return 'all events filtered by ICAO selection'
+    if (phaseResidualRows.length === 0) {
+      return `recorded events missing bearing (${recordedEventDiagnostics?.recorded_events_missing_bearing ?? recordedBurstEventsInWindow.length})`
+    }
+    return null
+  }, [
+    filteredObservations.length,
+    phaseResidualRows.length,
+    recordedBurstEventsInWindow.length,
+    recordedEventDiagnostics?.recorded_events_missing_bearing,
+    recordedObservations.length,
+    residualChartMode,
+    selectedIcao,
+  ])
+  const recordedRangeEmptyReason = useMemo(() => {
+    if (residualChartMode !== RESIDUAL_CHART_MODE_RECORDED) {
+      return rangeResidualRows.length === 0 ? 'No projected residual-vs-range rows for this view.' : null
+    }
+    if (recordedObservations.length === 0) return 'no recorded burst events'
+    if (recordedBurstEventsInWindow.length === 0) return 'events outside display window'
+    if (selectedIcao && filteredObservations.length === 0) return 'all events filtered by ICAO selection'
+    if (filteredObservations.length > 0 && filteredObservations.every(obs => !Number.isFinite(Number(obs?.range_nm)))) {
+      return `recorded events missing range (${recordedEventDiagnostics?.recorded_events_missing_range ?? filteredObservations.length})`
+    }
+    if (filteredObservations.length > 0 && filteredObservations.every(obs => !Number.isFinite(Number(obs?.corrected_residual_deg)))) {
+      return `recorded events missing corrected residual (${recordedEventDiagnostics?.recorded_events_missing_corrected_residual ?? filteredObservations.length})`
+    }
+    if (rangeResidualRows.length === 0) {
+      return 'all events filtered by classification'
+    }
+    return null
+  }, [
+    filteredObservations,
+    rangeResidualRows.length,
+    recordedBurstEventsInWindow.length,
+    recordedEventDiagnostics?.recorded_events_missing_corrected_residual,
+    recordedEventDiagnostics?.recorded_events_missing_range,
+    recordedObservations.length,
+    residualChartMode,
+    selectedIcao,
+  ])
   const foldedPhaseCurve = (() => {
     const bins = Array.from({ length: 24 }, (_, idx) => ({
       phaseCenterDeg: (idx + 0.5) * (360 / 24),
@@ -2769,6 +2904,29 @@ function RotationAlignmentPanel({
               <span className={styles.metricPill}>
                 DF11 residual dots <span className={styles.metricValue}>{visibleDf11ResidualDots.length}</span>
               </span>
+              {residualChartMode === RESIDUAL_CHART_MODE_RECORDED && (
+                <>
+                  <span className={styles.metricPill}>
+                    Recorded in window <span className={styles.metricValue}>{recordedEventDiagnostics?.recorded_event_count_in_window ?? frontendRecordedBufferSize}</span>
+                  </span>
+                  <span className={styles.metricPill}>
+                    Pruning <span className={styles.metricValue}>{recordedEventDiagnostics?.window_pruning_status ?? '—'}</span>
+                  </span>
+                  <span className={styles.metricPill}>
+                    Appended/pruned <span className={styles.metricValue}>
+                      {(recordedEventDiagnostics?.recorded_events_appended_last_poll ?? 0)}/{(recordedEventDiagnostics?.recorded_events_pruned_last_poll ?? 0)}
+                    </span>
+                  </span>
+                  <span className={styles.metricPill}>
+                    Frontend buffer <span className={styles.metricValue}>
+                      {recordedEventDiagnostics?.frontend_recorded_buffer_size ?? frontendRecordedBufferSize}
+                      {recordedEventDiagnostics?.frontend_recorded_buffer_last_append_age_s != null
+                        ? ` · ${Number(recordedEventDiagnostics.frontend_recorded_buffer_last_append_age_s).toFixed(1)}s`
+                        : ''}
+                    </span>
+                  </span>
+                </>
+              )}
               <span className={styles.metricPill}>
                 Residual basis <span className={styles.metricValue}>{displayedResidualBasis}</span>
               </span>
@@ -2900,7 +3058,7 @@ function RotationAlignmentPanel({
                   color: selectedIcao == null ? '#d2e4ff' : '#8b949e',
                 }}
               >
-                All ICAOs ({observations.length})
+                All ICAOs ({sortedIcaos.length})
               </button>
               {sortedIcaos.slice(0, 12).map(entry => (
                 <button
@@ -3073,6 +3231,9 @@ function RotationAlignmentPanel({
                 {nonSyncDrivingCount > 0 ? ` · Non-sync-driving bursts ${nonSyncDrivingCount}` : ''}
                 {` · DF11 early ${dfEarlyCount} · on time ${dfOnTimeCount} · late ${dfLateCount}`}
                 {syncState?.sync_jitter_deg != null ? ` · Sync jitter ±${syncState.sync_jitter_deg.toFixed(1)}°` : ''}
+                {residualChartMode === RESIDUAL_CHART_MODE_RECORDED && recordedEventDiagnostics?.recorded_event_count_total != null
+                  ? ` · total retained ${recordedEventDiagnostics.recorded_event_count_total} · oldest age ${recordedEventDiagnostics.oldest_recorded_event_age_s != null ? `${Number(recordedEventDiagnostics.oldest_recorded_event_age_s).toFixed(0)}s` : '—'}`
+                  : ''}
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))', gap: '12px', marginTop: '0.8rem' }}>
                 <div className={styles.alignmentWrap}>
@@ -3148,6 +3309,11 @@ function RotationAlignmentPanel({
                       />
                     )}
                   </svg>
+                  {recordedPhaseEmptyReason && (
+                    <div style={{ marginTop: '0.45rem', fontSize: '0.72rem', color: '#8b949e', textAlign: 'center' }}>
+                      {`Residual-vs-bearing empty: ${recordedPhaseEmptyReason}.`}
+                    </div>
+                  )}
                 </div>
                 <div className={styles.alignmentWrap}>
                   <svg
@@ -3213,6 +3379,11 @@ function RotationAlignmentPanel({
                       </circle>
                     ))}
                   </svg>
+                  {recordedRangeEmptyReason && (
+                    <div style={{ marginTop: '0.45rem', fontSize: '0.72rem', color: '#8b949e', textAlign: 'center' }}>
+                      {`Residual-vs-range empty: ${recordedRangeEmptyReason}.`}
+                    </div>
+                  )}
                 </div>
               </div>
             </>

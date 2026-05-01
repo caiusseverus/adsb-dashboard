@@ -272,6 +272,26 @@ def _source_path_from_period_authority(period_authority: str) -> str:
     return "unavailable"
 
 
+def _recorded_source_path(
+    *,
+    event_kind: str,
+    sync_snapshot: dict,
+    prefer_go_runtime: bool = False,
+) -> str:
+    if event_kind == "df11":
+        return "recorded_df11_timing"
+    if prefer_go_runtime:
+        return "recorded_go_runtime"
+    period_authority = str(sync_snapshot.get("period_authority") or "")
+    if period_authority == "py_base":
+        return "recorded_python_bootstrap"
+    if period_authority == "py_refined":
+        return "recorded_python_refined"
+    if period_authority == "go_refined":
+        return "recorded_go_runtime"
+    return "recorded_burst_alignment"
+
+
 def _build_go_diagnostic_fields(
     sync: "LiveSyncState",
     go_sync: dict | None = None,
@@ -1013,6 +1033,8 @@ class RadarState:
         self._BURST_SYNC_RESIDUAL_EVENTS_MAX = 12_000
         self._live_burst_residual_events: dict[int, deque] = {}  # {iid: deque[dict]}
         self._live_df11_recorded_residual_events: dict[int, deque] = {}  # {iid: deque[dict]}
+        self._recorded_event_counters_by_iid: dict[int, dict] = {}
+        self._recorded_event_diag_last_by_iid: dict[int, dict] = {}
         # Bounded buffer of recent Stage 3-usable live detections.
         # One entry per fired burst; Stage 3 solver queries with max_age_s=30.
         # At Pi density (~50 aircraft, 15 bursts/min each = ~12/s × 30s ≈ 375 entries).
@@ -1184,9 +1206,9 @@ class RadarState:
         if iid not in self._live_burst_timeline_obs:
             self._live_burst_timeline_obs[iid] = deque(maxlen=self._BURST_SYNC_TIMELINE_OBS_MAX)
         if iid not in self._live_burst_residual_events:
-            self._live_burst_residual_events[iid] = deque(maxlen=self._BURST_SYNC_RESIDUAL_EVENTS_MAX)
+            self._live_burst_residual_events[iid] = deque()
         if iid not in self._live_df11_recorded_residual_events:
-            self._live_df11_recorded_residual_events[iid] = deque(maxlen=self._BURST_SYNC_RESIDUAL_EVENTS_MAX)
+            self._live_df11_recorded_residual_events[iid] = deque()
 
     @staticmethod
     def _density_scaled_cap(
@@ -1334,10 +1356,55 @@ class RadarState:
         cutoff_ts = now_ts - self._LIVE_BURST_RESIDUAL_EVENTS_RETENTION_S
         while event_buf and float(event_buf[0].get("wall_ts") or now_ts) < cutoff_ts:
             event_buf.popleft()
-        max_entries = event_buf.maxlen
-        if max_entries is not None and max_entries > 0:
-            while len(event_buf) > max_entries:
-                event_buf.popleft()
+        while len(event_buf) > self._BURST_SYNC_RESIDUAL_EVENTS_MAX:
+            event_buf.popleft()
+
+    def _recorded_event_counters(self, iid: int) -> dict:
+        return self._recorded_event_counters_by_iid.setdefault(
+            iid,
+            {
+                "appended_total": 0,
+                "pruned_total": 0,
+                "dropped_reason_counts": {
+                    "age_prune": 0,
+                    "cap_prune": 0,
+                    "duplicate_event_id": 0,
+                    "missing_geometry": 0,
+                },
+            },
+        )
+
+    def _append_recorded_event(
+        self,
+        *,
+        iid: int,
+        event: dict,
+        event_buf: deque,
+        now_ts: float,
+    ) -> bool:
+        event_id = str(event.get("event_id") or "")
+        counters = self._recorded_event_counters(iid)
+        if event_id and event_buf:
+            last_event_id = str(event_buf[-1].get("event_id") or "")
+            # Recorded events arrive in chronological order from the live ingest
+            # path. Guard only against adjacent duplicate replays so the hot path
+            # stays O(1) instead of rescanning the whole retained deque for every
+            # burst/DF11 event.
+            if last_event_id == event_id:
+                counters["dropped_reason_counts"]["duplicate_event_id"] += 1
+                return False
+        event_buf.append(event)
+        counters["appended_total"] += 1
+        cutoff_ts = now_ts - self._LIVE_BURST_RESIDUAL_EVENTS_RETENTION_S
+        while event_buf and float(event_buf[0].get("wall_ts") or now_ts) < cutoff_ts:
+            event_buf.popleft()
+            counters["pruned_total"] += 1
+            counters["dropped_reason_counts"]["age_prune"] += 1
+        while len(event_buf) > self._BURST_SYNC_RESIDUAL_EVENTS_MAX:
+            event_buf.popleft()
+            counters["pruned_total"] += 1
+            counters["dropped_reason_counts"]["cap_prune"] += 1
+        return True
 
     @staticmethod
     def _summarise_live_sync_observation_buffer(obs_snapshot: list[AlignedBurstSyncObs], max_entries: int) -> dict:
@@ -2977,6 +3044,8 @@ class RadarState:
             self._go_track_observations.append(entry)
             if evidence is not None:
                 self._go_evidence_events.append(evidence)
+        if evidence is not None:
+            self._record_go_burst_residual_snapshot(evidence)
 
     def _go_track_observation_snapshot(self) -> list[dict]:
         return _go_track_observation_snapshot_helper(self)
@@ -3741,41 +3810,10 @@ class RadarState:
                 fit_reject_reason = "zero_weight"
             fit_eligible = fit_reject_reason is None
             event_buf = self._live_burst_residual_events.setdefault(
-                iid, deque(maxlen=self._BURST_SYNC_RESIDUAL_EVENTS_MAX)
+                iid, deque()
             )
-            event_buf.append({
-                "wall_ts": obs.ts,
-                "arrival_beast_us": obs.raw_arrival_us,
-                "beam_center_us": obs.burst_centroid_us,
-                "iid": iid,
-                "icao": icao,
-                "centroid_timestamp_us": obs.burst_centroid_us,
-                "bearing_deg": obs.bearing_deg,
-                "range_nm": obs.range_nm,
-                "n_replies": obs.n_replies,
-                "signal_dbfs": obs.signal_dbfs,
-                "sync_update_eligible": bool(sync_update_eligible),
-                "predicted_deg": prediction.predicted_bearing_deg,
-                "residual_deg": residual_deg,
-                "residual_basis": "active_authority",
-                "sync_source": getattr(sync, "source", None),
-                "base_period_s": float(getattr(sync, "period_base_s", 0.0) or 0.0),
-                "period_delta_s": float((sync.period_s or 0.0) - (getattr(sync, "period_base_s", sync.period_s) or 0.0)),
-                "effective_period_s": float(sync.period_s),
-                "phase_epoch_us": float(sync.phase_epoch_us),
-                "phase_offset_deg": float(sync.phase_offset_deg),
-                "classification": residual_class,
-                "timing_class": timing_class,
-                "dominant_family": bool(sync_update_eligible),
-                "refinement_eligible": bool(fit_eligible),
-                "fit_eligible": bool(fit_eligible),
-                "reject_reason": fit_reject_reason,
-                "fit_reject_reason": fit_reject_reason,
-                "reference_icao": getattr(getattr(self._models.get(iid), "reference_aircraft", None), "ref_icao", None),
-                "sync_revision": int(self._go_sync_diagnostic_history_revision.get(iid, 0)),
-            })
             sync_snapshot = _live_sync_state_to_dict(sync, go_sync=dict(self._go_sync_states_by_iid.get(iid) or {}))
-            event_buf[-1] = self._build_recorded_residual_event(
+            event = self._build_recorded_residual_event(
                 iid=iid,
                 icao=icao,
                 wall_ts=obs.ts,
@@ -3797,8 +3835,11 @@ class RadarState:
                 classification=residual_class,
                 timing_class=timing_class,
                 event_kind="burst",
+                corrected_residual_deg=residual_deg,
+                pos_age_s=obs.pos_age_s,
+                dominant_family=bool(sync_update_eligible),
             )
-            self._prune_burst_residual_event_buffer(event_buf, now_ts=obs.ts)
+            self._append_recorded_event(iid=iid, event=event, event_buf=event_buf, now_ts=obs.ts)
 
     def _build_recorded_residual_event(
         self,
@@ -3824,8 +3865,15 @@ class RadarState:
         classification: str | None,
         timing_class: str | None,
         event_kind: str,
+        corrected_residual_deg: float | None = None,
+        pos_age_s: float | None = None,
+        dominant_family: bool | None = None,
+        prefer_go_runtime: bool = False,
     ) -> dict:
+        timestamp_component = f"{float(centroid_timestamp_us):.3f}"
+        event_id = f"{int(iid)}:{event_kind}:{str(icao)}:{timestamp_component}"
         return {
+            "event_id": event_id,
             "event_kind": event_kind,
             "wall_ts": float(wall_ts),
             "arrival_beast_us": float(arrival_beast_us),
@@ -3841,10 +3889,17 @@ class RadarState:
             "bearing_deg": float(bearing_deg) if bearing_deg is not None else None,
             "predicted_deg": float(predicted_deg) if predicted_deg is not None else None,
             "range_nm": float(range_nm) if range_nm is not None else None,
+            "corrected_residual_deg": (
+                float(corrected_residual_deg)
+                if corrected_residual_deg is not None else float(residual_deg)
+            ),
+            "pos_age_s": float(pos_age_s) if pos_age_s is not None else None,
+            "aircraft_position_age_s": float(pos_age_s) if pos_age_s is not None else None,
             "n_replies": int(n_replies) if n_replies is not None else None,
             "signal_dbfs": float(signal_dbfs) if signal_dbfs is not None else None,
             "sync_update_eligible": bool(sync_update_eligible),
             "fit_eligible": bool(fit_eligible),
+            "dominant_family": bool(dominant_family) if dominant_family is not None else bool(sync_update_eligible),
             "refinement_status": sync_snapshot.get("period_refinement_status"),
             "reject_reason": reject_reason,
             "base_period_s": sync_snapshot.get("base_period_s"),
@@ -3859,11 +3914,98 @@ class RadarState:
             "phase_offset_deg": float(sync_snapshot.get("phase_offset_deg") or 0.0),
             "effective_period_source": sync_snapshot.get("effective_period_source"),
             "period_delta_source": sync_snapshot.get("period_delta_source"),
-            "source_path": sync_snapshot.get("operational_source_path"),
+            "source_path": _recorded_source_path(
+                event_kind=event_kind,
+                sync_snapshot=sync_snapshot,
+                prefer_go_runtime=prefer_go_runtime,
+            ),
+            "recording_path_kind": (
+                "recorded_df11_timing" if event_kind == "df11" else "recorded_burst_alignment"
+            ),
             "handoff_state": sync_snapshot.get("handoff_state"),
             "handoff_reason": sync_snapshot.get("handoff_reason"),
             "sync_revision": int(sync_revision),
         }
+
+    def _build_recorded_event_diagnostics(
+        self,
+        *,
+        iid: int,
+        recorded_burst_events: list[dict],
+        recorded_df11_events: list[dict],
+        latest_arrival_us: float | None,
+        window_s: float,
+    ) -> dict:
+        with self._lock:
+            counters = dict(self._recorded_event_counters(iid))
+            dropped_reason_counts = dict(counters.get("dropped_reason_counts") or {})
+            diag_last = dict(self._recorded_event_diag_last_by_iid.get(iid) or {})
+        burst_total = len(recorded_burst_events)
+        df11_total = len(recorded_df11_events)
+        all_events = list(recorded_burst_events) + list(recorded_df11_events)
+        newest_event_us = max(
+            [
+                float(latest_arrival_us)
+                if _is_finite_number(latest_arrival_us) else 0.0,
+                *[
+                    float(ev.get("beam_center_us") or 0.0)
+                    for ev in recorded_burst_events
+                ],
+                *[
+                    float(ev.get("arrival_beast_us") or 0.0)
+                    for ev in recorded_df11_events
+                ],
+            ]
+        )
+        cutoff_us = newest_event_us - float(window_s) * 1_000_000.0 if newest_event_us > 0.0 else None
+        burst_in_window = [
+            event for event in recorded_burst_events
+            if cutoff_us is None or float(event.get("beam_center_us") or 0.0) >= cutoff_us
+        ]
+        df11_in_window = [
+            event for event in recorded_df11_events
+            if cutoff_us is None or float(event.get("arrival_beast_us") or 0.0) >= cutoff_us
+        ]
+        window_events = burst_in_window + df11_in_window
+        now_ts = time.time()
+        wall_ages = [
+            max(0.0, now_ts - float(event.get("wall_ts") or now_ts))
+            for event in all_events
+            if event.get("wall_ts") is not None
+        ]
+        appended_total = int(counters.get("appended_total") or 0)
+        pruned_total = int(counters.get("pruned_total") or 0)
+        prev_appended_total = int(diag_last.get("appended_total") or 0)
+        prev_pruned_total = int(diag_last.get("pruned_total") or 0)
+        diagnostics = {
+            "recorded_event_count_total": burst_total + df11_total,
+            "recorded_event_count_in_window": len(window_events),
+            "recorded_burst_event_count_in_window": len(burst_in_window),
+            "recorded_df11_event_count_in_window": len(df11_in_window),
+            "oldest_recorded_event_age_s": max(wall_ages) if wall_ages else None,
+            "newest_recorded_event_age_s": min(wall_ages) if wall_ages else None,
+            "last_recorded_event_age_s": min(wall_ages) if wall_ages else None,
+            "recorded_events_appended_last_poll": max(0, appended_total - prev_appended_total),
+            "recorded_events_pruned_last_poll": max(0, pruned_total - prev_pruned_total),
+            "recorded_events_dropped_reason_counts": dropped_reason_counts,
+            "recorded_events_missing_bearing": sum(1 for event in burst_in_window if event.get("bearing_deg") is None),
+            "recorded_events_missing_range": sum(1 for event in burst_in_window if event.get("range_nm") is None),
+            "recorded_events_missing_corrected_residual": sum(
+                1 for event in burst_in_window if event.get("corrected_residual_deg") is None
+            ),
+            "window_pruning_status": (
+                "normal_pruning"
+                if window_events and len(window_events) < len(all_events)
+                else "awaiting_new_events" if not window_events and all_events
+                else "active"
+            ),
+        }
+        with self._lock:
+            self._recorded_event_diag_last_by_iid[iid] = {
+                "appended_total": appended_total,
+                "pruned_total": pruned_total,
+            }
+        return diagnostics
 
     def _record_df11_residual_snapshot(
         self,
@@ -3931,13 +4073,105 @@ class RadarState:
             classification=None,
             timing_class=timing_class,
             event_kind="df11",
+            corrected_residual_deg=residual_deg,
+            pos_age_s=pos.get("position_age_seconds"),
+            dominant_family=False,
         )
         with self._lock:
             event_buf = self._live_df11_recorded_residual_events.setdefault(
-                iid, deque(maxlen=self._BURST_SYNC_RESIDUAL_EVENTS_MAX)
+                iid, deque()
             )
-            event_buf.append(event)
-            self._prune_burst_residual_event_buffer(event_buf, now_ts=wall_ts)
+            self._append_recorded_event(iid=iid, event=event, event_buf=event_buf, now_ts=wall_ts)
+
+    def _record_go_burst_residual_snapshot(self, evidence: dict) -> None:
+        iid = int(evidence.get("iid") or 0)
+        if iid <= 0:
+            return
+        with self._lock:
+            sync = self._live_sync_states.get(iid)
+            go_sync = dict(self._go_sync_states_by_iid.get(iid) or {})
+            model = self._models.get(iid)
+        if sync is None or not getattr(sync, "usable", False):
+            return
+        truth_lat = evidence.get("truth_lat")
+        truth_lon = evidence.get("truth_lon")
+        if truth_lat is None or truth_lon is None:
+            self._recorded_event_counters(iid)["dropped_reason_counts"]["missing_geometry"] += 1
+            return
+        radar_pos = _get_authoritative_radar_position(model) if model is not None else {"lat": None, "lon": None}
+        radar_lat = radar_pos.get("lat")
+        radar_lon = radar_pos.get("lon")
+        if radar_lat is None or radar_lon is None:
+            self._recorded_event_counters(iid)["dropped_reason_counts"]["missing_geometry"] += 1
+            return
+        centroid_us = (
+            evidence.get("weighted_centroid_us")
+            if evidence.get("weighted_centroid_us") is not None
+            else evidence.get("arrival_us")
+        )
+        if not _is_finite_number(centroid_us):
+            return
+        bearing_deg = _bearing_deg_simple(radar_lat, radar_lon, float(truth_lat), float(truth_lon))
+        range_nm = _haversine_nm_simple(radar_lat, radar_lon, float(truth_lat), float(truth_lon))
+        prediction = predict_sync_observation(
+            sync,
+            float(centroid_us),
+            range_nm=range_nm,
+            bearing_rate_deg_s=None,
+            motion_comp_dt_us=None,
+            motion_comp_block_reason="go_recorded_burst_alignment",
+        )
+        residual_deg = (bearing_deg - prediction.predicted_bearing_deg + 540.0) % 360.0 - 180.0
+        abs_res = abs(residual_deg)
+        residual_class = self._classify_sync_residual(abs_res)
+        fit_reject_reason = None
+        sync_update_eligible = bool(evidence.get("sync_eligible", evidence.get("dominant_family", False)))
+        pos_age_s = evidence.get("position_age_seconds")
+        if not sync_update_eligible:
+            fit_reject_reason = "not_sync_update_eligible"
+        elif abs_res >= 150.0:
+            fit_reject_reason = "near_wrap_residual"
+        elif abs_res > 35.0:
+            fit_reject_reason = "residual_gate"
+        elif _is_finite_number(pos_age_s) and float(pos_age_s) > 8.0:
+            fit_reject_reason = "stale_position"
+        fit_eligible = fit_reject_reason is None
+        sync_snapshot = _live_sync_state_to_dict(sync, go_sync=go_sync)
+        event = self._build_recorded_residual_event(
+            iid=iid,
+            icao=str(evidence.get("icao") or ""),
+            wall_ts=float(evidence.get("wall_ts") or time.time()),
+            arrival_beast_us=float(evidence.get("arrival_us") or centroid_us),
+            beam_center_us=float(centroid_us),
+            centroid_timestamp_us=float(centroid_us),
+            residual_deg=residual_deg,
+            display_residual_class=f"burst_{residual_class}",
+            sync_snapshot=sync_snapshot,
+            sync_revision=int(self._go_sync_diagnostic_history_revision.get(iid, 0)),
+            reject_reason=fit_reject_reason,
+            predicted_deg=prediction.predicted_bearing_deg,
+            bearing_deg=bearing_deg,
+            range_nm=range_nm,
+            n_replies=int(evidence.get("n_replies") or 0),
+            signal_dbfs=evidence.get("signal_dbfs"),
+            sync_update_eligible=sync_update_eligible,
+            fit_eligible=fit_eligible,
+            classification=residual_class,
+            timing_class=None,
+            event_kind="burst",
+            corrected_residual_deg=residual_deg,
+            pos_age_s=pos_age_s,
+            dominant_family=bool(evidence.get("dominant_family", False)),
+            prefer_go_runtime=True,
+        )
+        with self._lock:
+            event_buf = self._live_burst_residual_events.setdefault(iid, deque())
+            self._append_recorded_event(
+                iid=iid,
+                event=event,
+                event_buf=event_buf,
+                now_ts=float(evidence.get("wall_ts") or time.time()),
+            )
 
     @staticmethod
     def _score_sync_burst_observation(obs: AlignedBurstSyncObs) -> float:
@@ -6097,6 +6331,13 @@ class RadarState:
             event for event in df11_recorded_events_snapshot
             if float(event.get("arrival_beast_us") or 0.0) >= _df11_cutoff_us
         ]
+        recorded_event_diagnostics = self._build_recorded_event_diagnostics(
+            iid=iid,
+            recorded_burst_events=residual_events_snapshot,
+            recorded_df11_events=df11_recorded_events_snapshot,
+            latest_arrival_us=latest_arrival_us_for_iid,
+            window_s=window_s,
+        )
         projection_basis_options = [
             {
                 "id": "recorded_event_basis",
@@ -6161,6 +6402,7 @@ class RadarState:
                 "alignment_status": alignment_status,
                 "sync_mode_diagnostics": sync_mode_diagnostics,
                 "burst_sync_diagnostic": burst_sync_diagnostic,
+                "recorded_event_diagnostics": recorded_event_diagnostics,
             }
 
         if not _sync_source_has_rich_python_diagnostics(sync):
@@ -6318,6 +6560,7 @@ class RadarState:
                 "sync_horizons": self._sync_horizons_payload(sync, display_window_s=window_s),
                 "phase_anchor_candidates": getattr(sync, "phase_anchor_candidates", []),
                 "burst_sync_diagnostic": burst_sync_diagnostic,
+                "recorded_event_diagnostics": recorded_event_diagnostics,
                 "motion_comp_summary": {
                     "phase_enabled": bool(getattr(sync, "motion_comp_phase_enabled", False)),
                     "fit_enabled": bool(getattr(sync, "motion_comp_fit_enabled", False)),
@@ -6658,6 +6901,7 @@ class RadarState:
             # They are directly comparable on the residual chart.
             "df11_residual_observations": df11_residual_observations,
             "chart_overlay_consistent": True,
+            "recorded_event_diagnostics": recorded_event_diagnostics,
             "retention_diagnostics": retention_diagnostics,
             "display_retention_diagnostic": self._build_display_retention_diagnostic(
                 sync, entries, df11_residual_observations, window_s
@@ -6772,6 +7016,7 @@ class RadarState:
             "chart_overlay_consistent": burst_timeline.get("chart_overlay_consistent", False),
             "phase_anchor_candidates": burst_timeline.get("phase_anchor_candidates", []),
             "burst_sync_diagnostic": burst_timeline.get("burst_sync_diagnostic"),
+            "recorded_event_diagnostics": burst_timeline.get("recorded_event_diagnostics"),
             "period_update_history": burst_timeline.get("period_update_history", []),
             "slope_history": burst_timeline.get("slope_history", []),
             "period_history": burst_timeline.get("period_history", []),
