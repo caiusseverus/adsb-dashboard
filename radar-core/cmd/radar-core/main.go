@@ -1093,7 +1093,6 @@ func (e *engine) emitIIDState(iidNum uint8, s *iid.IIDState, nBurstRecords uint1
 		UpdateEpochLastStrictGatePass:   snapUpdateEpochLastStrictGatePass(s),
 		ReacquireSupportObsCount:       snapReacquireSupportObsCount(s),
 		ReacquireSupportICAOCount:      snapReacquireSupportICAOCount(s),
-		FitEpochResetHoldoverChurn:     snapFitEpochResetHoldoverChurn(s),
 		NBurstRecords:                   nBurstRecords,
 		LastUpdated:                     float64(time.Now().UnixMicro()) / 1e6,
 		Revision:                        rev,
@@ -1473,10 +1472,6 @@ func snapReacquireSupportObsCount(s *iid.IIDState) uint16 {
 
 func snapReacquireSupportICAOCount(s *iid.IIDState) uint16 {
 	return uint16(s.DebugStateSnapshot().ReacquireSupportICAOCount)
-}
-
-func snapFitEpochResetHoldoverChurn(s *iid.IIDState) bool {
-	return s.DebugStateSnapshot().FitEpochResetHoldoverChurn
 }
 
 func (e *engine) runFMWorker(stop <-chan struct{}) {

@@ -1440,3 +1440,110 @@ func TestNonHoldoverAuthorityChangeStillResetsFitEpoch(t *testing.T) {
 		t.Fatalf("reset reason=%q, want period_authority_changed", s.FitEpochResetReason)
 	}
 }
+
+func TestReacquireSupportClearedOnTrueBasisReset(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	seedReacquireFitSupport(s)
+
+	s.Holdover = true
+	s.HoldoverReason = "hard_residual_reject"
+	for i := 0; i < 3; i++ {
+		s.UpdateEpoch(float64(i+1)*4_000_000.0, 90.0, 4.0, 1.0, 4, 0.5, 0xAA)
+	}
+
+	if s.ReacquireSupportObservationCount == 0 {
+		t.Fatal("reacquire support should be preserved after provisional reacquire")
+	}
+
+	s.rotateFitEpochLocked("base_period_changed_material", fitEpochContext{
+		epochUS:        40_000_000.0,
+		residualBasis:  "observed_minus_predicted",
+		referenceICAO:  0xAA,
+		phaseOffsetDeg: 0,
+		holdover:       false,
+		basePeriodS:    4.005,
+		authorityBasis: "go_refiner_active",
+	})
+
+	if s.ReacquireSupportObservationCount != 0 {
+		t.Fatalf("reacquire support observation count=%d, want 0 after true basis reset", s.ReacquireSupportObservationCount)
+	}
+	if s.ReacquireSupportICAOCount != 0 {
+		t.Fatalf("reacquire support icao count=%d, want 0 after true basis reset", s.ReacquireSupportICAOCount)
+	}
+}
+
+func TestReacquireSupportNotClearedOnReacquire(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	seedReacquireFitSupport(s)
+	beforeObs := s.FitObservationCount
+	beforeICAO := s.FitICAOCount
+
+	s.Holdover = true
+	s.HoldoverReason = "hard_residual_reject"
+	for i := 0; i < 3; i++ {
+		s.UpdateEpoch(float64(i+1)*4_000_000.0, 90.0, 4.0, 1.0, 4, 0.5, 0xAA)
+	}
+
+	if s.ReacquireSupportObservationCount < beforeObs {
+		t.Fatalf("reacquire support observation count=%d, want >= %d (preserved from before reacquire)", s.ReacquireSupportObservationCount, beforeObs)
+	}
+	if s.ReacquireSupportICAOCount < beforeICAO {
+		t.Fatalf("reacquire support icao count=%d, want >= %d (preserved from before reacquire)", s.ReacquireSupportICAOCount, beforeICAO)
+	}
+}
+
+func TestReacquireSupportClearedOnModelChangeReset(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	seedReacquireFitSupport(s)
+
+	s.Holdover = true
+	s.HoldoverReason = "hard_residual_reject"
+	for i := 0; i < 3; i++ {
+		s.UpdateEpoch(float64(i+1)*4_000_000.0, 90.0, 4.0, 1.0, 4, 0.5, 0xAA)
+	}
+
+	if s.ReacquireSupportObservationCount == 0 {
+		t.Fatal("reacquire support should be preserved after reacquire")
+	}
+
+	s.ResetFitEpochOnModelChange("base_period_unavailable", 0xAA, "go_refiner_holdover")
+
+	if s.ReacquireSupportObservationCount != 0 {
+		t.Fatalf("reacquire support observation count=%d, want 0 after model-change reset", s.ReacquireSupportObservationCount)
+	}
+}
+
+func TestReacquireSupportClearedOnResidualBasisChange(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	seedReacquireFitSupport(s)
+
+	s.Holdover = true
+	s.HoldoverReason = "hard_residual_reject"
+	for i := 0; i < 3; i++ {
+		s.UpdateEpoch(float64(i+1)*4_000_000.0, 90.0, 4.0, 1.0, 4, 0.5, 0xAA)
+	}
+
+	if s.ReacquireSupportObservationCount == 0 {
+		t.Fatal("reacquire support should be preserved after reacquire")
+	}
+
+	// Add an observation so residualHistory is non-empty (maybeResetFitEpochLocked
+	// skips checks when history is empty).
+	s.AddRefinementResidualObservation(40_000_000.0, 2.0, 0xAA, true, 4, 0.5, 0xAA, "go_refiner_active")
+
+	s.fitEpochResidualBasis = "recorded_event_basis"
+	s.maybeResetFitEpochLocked(fitEpochContext{
+		epochUS:        44_000_000.0,
+		residualBasis:  "observed_minus_predicted",
+		referenceICAO:  0xAA,
+		phaseOffsetDeg: 0,
+		holdover:       false,
+		basePeriodS:    4.0,
+		authorityBasis: "go_refiner_active",
+	})
+
+	if s.ReacquireSupportObservationCount != 0 {
+		t.Fatalf("reacquire support observation count=%d, want 0 after residual-basis-change reset", s.ReacquireSupportObservationCount)
+	}
+}

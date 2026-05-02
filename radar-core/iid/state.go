@@ -222,7 +222,6 @@ type DebugSnapshot struct {
 	LastRefSelMissingReason                  string
 	ReacquireSupportObservationCount         int
 	ReacquireSupportICAOCount                int
-	FitEpochResetHoldoverChurn               bool
 }
 
 const (
@@ -908,7 +907,6 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.ObservationDropCountsByReason = s.Sync.ObservationDropCountsByReason
 		out.ReacquireSupportObservationCount = s.Sync.ReacquireSupportObservationCount
 		out.ReacquireSupportICAOCount = s.Sync.ReacquireSupportICAOCount
-		out.FitEpochResetHoldoverChurn = s.Sync.FitEpochResetHoldoverChurn
 	}
 	out.ActiveAircraftEstimate = s.lastActiveAircraft
 	out.BurstRecordsTotal = len(s.records)

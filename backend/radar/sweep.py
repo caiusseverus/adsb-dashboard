@@ -455,7 +455,6 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_consecutive_hard_bound_rejects": go_payload.get("consecutive_hard_bound_rejects"),
         "go_diagnostic_reacquire_support_obs_count": go_payload.get("reacquire_support_obs_count"),
         "go_diagnostic_reacquire_support_icao_count": go_payload.get("reacquire_support_icao_count"),
-        "go_diagnostic_fit_epoch_reset_holdover_churn": go_payload.get("fit_epoch_reset_holdover_churn"),
     }
 
 
@@ -3230,7 +3229,6 @@ class RadarState:
                 "update_epoch_last_strict_gate_pass": bool(entry.get("update_epoch_last_strict_gate_pass", False)),
                 "reacquire_support_obs_count": int(entry.get("reacquire_support_obs_count") or 0),
                 "reacquire_support_icao_count": int(entry.get("reacquire_support_icao_count") or 0),
-                "fit_epoch_reset_holdover_churn": bool(entry.get("fit_epoch_reset_holdover_churn", False)),
             }
         except Exception:
             return None
@@ -4432,7 +4430,6 @@ class RadarState:
                 "update_epoch_last_strict_gate_pass": iid_state.get("uesp"),
                 "reacquire_support_obs_count": iid_state.get("rso"),
                 "reacquire_support_icao_count": iid_state.get("rsi"),
-                "fit_epoch_reset_holdover_churn": iid_state.get("frh"),
             })
             if go_sync is not None:
                 self._go_sync_states_by_iid[iid] = go_sync

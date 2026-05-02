@@ -229,7 +229,6 @@ type IIDState struct {
 	UpdateEpochLastStrictGatePass   bool     `codec:"uesp"`
 	ReacquireSupportObsCount       uint16   `codec:"rso"`
 	ReacquireSupportICAOCount      uint16   `codec:"rsi"`
-	FitEpochResetHoldoverChurn     bool     `codec:"frh"`
 	NBurstRecords                   uint16   `codec:"nb"`
 	LastUpdated                     float64  `codec:"lu"`
 	Revision                        uint32   `codec:"rv"`

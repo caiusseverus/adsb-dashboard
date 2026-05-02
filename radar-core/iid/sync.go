@@ -142,7 +142,6 @@ type SyncState struct {
 	LastUpdateEpochRefPosMissingReason       string // "not_in_cache", "stale", or ""
 	ReacquireSupportObservationCount         int     // preserved across reacquire for canReacquireInHoldover
 	ReacquireSupportICAOCount                int     // preserved across reacquire for canReacquireInHoldover
-	FitEpochResetHoldoverChurn               bool    // true when last reset was caused by holdover/authority churn (not true basis change)
 }
 
 const (
@@ -394,6 +393,8 @@ func (s *SyncState) resetFitEpochLocked(reason string) {
 	s.FitObservationsRejectedSinceReset = 0
 	s.LastFitObservationRejectReason = ""
 	s.ObservationDropCountsByReason = make(map[string]uint64)
+	s.ReacquireSupportObservationCount = 0
+	s.ReacquireSupportICAOCount = 0
 }
 
 func (s *SyncState) startFitEpochIfNeededLocked(ctx fitEpochContext) {
