@@ -121,7 +121,12 @@ _CANONICAL_PERIOD_INVARIANT_TOL_S = 1e-9
 _canonical_period_invariant_mismatch_count = 0
 _GO_BASE_AGREE_TOL_S = 0.15
 _GO_EFFECTIVE_AGREE_TOL_S = 0.15
-_PHASE_FRESH_MAX_AGE_S = 15.0
+_PHASE_FRESH_MAX_AGE_S = 8.0
+_SLOPE_TREND_NEAR_ZERO_THRESHOLD_DEG_S = 0.5
+_SLOPE_TREND_NEAR_ZERO_MIN_S = 10.0
+_SLOPE_TREND_REGRESSION_WINDOW_S = 30.0
+_SLOPE_TREND_REGRESSION_R2_MIN = 0.5
+_PERIOD_STABILITY_MIN_SAMPLES = 3
 
 _perf_lock = threading.Lock()
 df11_event_timings: deque[float] = deque(maxlen=4000)
@@ -910,7 +915,42 @@ def _live_sync_state_to_dict(
         "fit_epoch_span_s": getattr(sync, "fit_epoch_span_s", None),
         "fit_dropped_on_epoch_reset": getattr(sync, "fit_dropped_on_epoch_reset", None),
         "fit_segment_count": getattr(sync, "fit_segment_count", None),
+        "population_validation_state": getattr(sync, "population_validation_state", None),
+        "population_validation_reason": getattr(sync, "population_validation_reason", None),
     })
+
+    # --- Stage 3R diagnostic summaries derived from handoff gate results ---
+    _hgf = handoff_gate_failures  # shorthand
+    _py_gates = _hgf.get("python_base", {})
+    _go_gates = _hgf.get("go_readiness", {})
+    _phase_gates = _hgf.get("phase_readiness", {})
+    _period_stable_gate = _py_gates.get("period_stable", {}) if _py_gates else {}
+    payload.update({
+        "period_stability_state": (
+            "pass"
+            if _period_stable_gate.get("passed") is True
+            else (_period_stable_gate.get("reason") or None)
+        ) if _py_gates else None,
+        "contamination_state": (
+            _go_gates.get("go_contamination_state", {}).get("reason") or "not_evaluated"
+        ) if _go_gates else "not_evaluated",
+        "slope_trend_state": (
+            (
+                (_go_gates.get("go_slope_converged", {}).get("reason") or "converged")
+                if _go_gates.get("go_slope_converged", {}).get("passed") is True
+                else (_go_gates.get("go_slope_converged", {}).get("reason") or "not_evaluated")
+            )
+        ) if _go_gates else None,
+        "phase_authority_reason": next(
+            (
+                str(v.get("reason") or k)
+                for k, v in (_hgf.get("phase_readiness") or {}).items()
+                if v.get("passed") is False
+            ),
+            None,
+        ),
+    })
+
     payload.update(_build_go_diagnostic_fields(sync, go_sync=go_sync))
 
     # --- Python shadow refinement fields (present when Python runs as shadow) ---
@@ -3231,6 +3271,86 @@ class RadarState:
         self._compact_sync_debug_by_iid[iid] = entry
         return dict(entry)
 
+    def _evaluate_period_stability_gate_locked(self, iid: int) -> dict:
+        """Gate: period_base_s values in _live_period_history must be stable.
+
+        Passes when stdev < 1% of mean across at least _PERIOD_STABILITY_MIN_SAMPLES
+        finite positive samples.  Returns insufficient_history (non-blocking) when
+        fewer than the minimum samples are available.
+        """
+        history = self._live_period_history.get(iid)
+        if not history:
+            return _gate_value(None, "insufficient_history")
+        values = [
+            float(e["period_base_s"])
+            for e in history
+            if _finite_positive(e.get("period_base_s"))
+        ]
+        if len(values) < _PERIOD_STABILITY_MIN_SAMPLES:
+            return _gate_value(None, "insufficient_history")
+        n = len(values)
+        mean = sum(values) / n
+        if mean <= 0.0:
+            return _gate_value(None, "insufficient_history")
+        variance = sum((v - mean) ** 2 for v in values) / n
+        stdev = variance ** 0.5
+        if stdev < 0.01 * mean:
+            return _gate_value(True, None)
+        return _gate_value(False, "stdev_too_high")
+
+    def _evaluate_slope_trend_gate_locked(self, iid: int) -> dict:
+        """Gate: residual slope is converging toward zero.
+
+        Non-blocking when there is insufficient history (returns None, not False).
+        Returns False only when there is enough history but no convergence signal.
+
+        Two acceptance conditions:
+        1. All entries in the last 10 s have |slope| < 0.5 deg/s and the window
+           spans at least 9.5 s (slack for timer jitter).
+        2. Linear regression over the last 30 s shows decreasing |slope| magnitude
+           with R² >= 0.5.
+        """
+        history = self._live_slope_history.get(iid)
+        if not history:
+            return _gate_value(None, "insufficient_slope_history")
+
+        now_ts = time.time()
+
+        # Condition 1: near-zero sustained for >= 10 seconds.
+        recent_10s = [e for e in history if (now_ts - float(e.get("ts") or 0.0)) <= 10.0]
+        if len(recent_10s) >= 2:
+            oldest_ts_in_window = min(float(e.get("ts") or 0.0) for e in recent_10s)
+            if (now_ts - oldest_ts_in_window) >= 9.5:
+                all_near_zero = all(
+                    abs(float(e.get("residual_slope_deg_per_s") or 0.0)) < _SLOPE_TREND_NEAR_ZERO_THRESHOLD_DEG_S
+                    for e in recent_10s
+                )
+                if all_near_zero:
+                    return _gate_value(True, "near_zero_sustained")
+
+        # Condition 2: regression over last 30s shows decreasing magnitude with R² >= 0.5.
+        recent_30s = [e for e in history if (now_ts - float(e.get("ts") or 0.0)) <= 30.0]
+        if len(recent_30s) >= 3:
+            xs = [float(e.get("ts") or 0.0) for e in recent_30s]
+            ys = [abs(float(e.get("residual_slope_deg_per_s") or 0.0)) for e in recent_30s]
+            n = len(xs)
+            mean_x = sum(xs) / n
+            mean_y = sum(ys) / n
+            ss_xy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+            ss_xx = sum((x - mean_x) ** 2 for x in xs)
+            ss_yy = sum((y - mean_y) ** 2 for y in ys)
+            if ss_xx > 0 and ss_yy > 0:
+                r_sq = (ss_xy ** 2) / (ss_xx * ss_yy)
+                slope_regression = ss_xy / ss_xx  # negative = decreasing over time
+                if slope_regression < 0 and r_sq >= _SLOPE_TREND_REGRESSION_R2_MIN:
+                    return _gate_value(True, "slope_magnitude_decreasing")
+
+        # Insufficient history: non-blocking.
+        if len(history) < 2:
+            return _gate_value(None, "insufficient_slope_history")
+
+        return _gate_value(False, "slope_not_converged")
+
     def _evaluate_python_base_validity_gates_locked(self, iid: int) -> dict:
         sync = self._live_sync_states.get(iid)
         model = self._models.get(iid)
@@ -3247,7 +3367,7 @@ class RadarState:
         if model is not None and _is_finite_number(getattr(model, "primary_confidence", None)):
             confidence_ok = float(model.primary_confidence) >= 0.35
         gates["dominant_confidence"] = _gate_value(confidence_ok, None if confidence_ok is not False else "dominant_period_confidence_low")
-        gates["period_stable"] = _gate_value(None, "not_evaluated")
+        gates["period_stable"] = self._evaluate_period_stability_gate_locked(iid)
         fresh_data = None
         if sync_is_python and _is_finite_number(getattr(sync, "last_sync_update_ts", None)):
             fresh_data = (now_ts - float(sync.last_sync_update_ts)) <= self._LIVE_SYNC_OBS_RETENTION_S
@@ -3295,7 +3415,11 @@ class RadarState:
         gates["go_refinement_history_sufficient"] = _gate_value(history_sufficient, None if history_sufficient is not False else "go_refinement_history_insufficient")
         holdover = bool(go_sync.get("holdover", False)) if present else False
         gates["go_not_holdover"] = _gate_value((not holdover) if present else None, None if not holdover else "go_holdover")
-        gates["go_contamination_state"] = _gate_value(None, "not_evaluated")
+        # Pre-Stage-8 stub: no family detection yet; emit typed non-blocking state.
+        # This will be replaced by real Go contamination detection in Stage 8.
+        contamination_stub = "single_family" if present else "insufficient_data"
+        gates["go_contamination_state"] = _gate_value(True, contamination_stub)
+        gates["go_slope_converged"] = self._evaluate_slope_trend_gate_locked(iid)
         effective = float(go_sync["effective_period_s"]) if present and _finite_positive(go_sync.get("effective_period_s")) else None
         gates["go_effective_period_finite_positive"] = _gate_value(
             _finite_positive(effective),
@@ -3315,23 +3439,65 @@ class RadarState:
         gates: dict[str, dict] = {}
         if sync is None:
             gates["phase_basis_supported"] = _gate_value(False, "sync_state_absent")
-            gates["phase_anchor_fresh_if_anchor_relative"] = _gate_value(None, "not_evaluated")
+            gates["phase_anchor_age_fresh"] = _gate_value(None, "not_evaluated")
+            gates["population_validated"] = _gate_value(None, "not_evaluated")
             gates["phase_state_trusted"] = _gate_value(False, "phase_state_unavailable")
             return {"phase_ready": False, "gates": gates, "phase_basis": "sweep_epoch_only"}
-        phase_basis = "sweep_epoch_only"
-        if getattr(sync, "phase_anchor_icao", None) and str(getattr(sync, "phase_anchor_status", "") or "") in {"selected", "anchor_only"}:
+
+        # Derive phase_basis from typed field or anchor state.
+        typed_phase_basis = str(getattr(sync, "phase_basis", "") or "")
+        if typed_phase_basis in {"sweep_epoch_only", "anchor_relative", "geographic"}:
+            phase_basis = typed_phase_basis
+        elif getattr(sync, "phase_anchor_icao", None) and str(getattr(sync, "phase_anchor_status", "") or "") in {"selected", "anchor_only"}:
             phase_basis = "anchor_relative"
+        else:
+            phase_basis = "sweep_epoch_only"
+
         gates["phase_basis_supported"] = _gate_value(
             phase_basis in {"anchor_relative", "geographic"},
             None if phase_basis in {"anchor_relative", "geographic"} else "phase_basis_not_supported",
         )
-        anchor_fresh = None
-        if phase_basis == "anchor_relative":
-            updated = float(getattr(sync, "last_sync_update_ts", 0.0) or 0.0)
-            anchor_fresh = (time.time() - updated) <= _PHASE_FRESH_MAX_AGE_S
-        gates["phase_anchor_fresh_if_anchor_relative"] = _gate_value(anchor_fresh, None if anchor_fresh is not False else "anchor_stale")
+
+        # Freshness gate: use typed phase_anchor_age_s directly.
+        if phase_basis in {"anchor_relative", "geographic"}:
+            phase_anchor_age_s = getattr(sync, "phase_anchor_age_s", None)
+            if phase_anchor_age_s is not None:
+                anchor_fresh = float(phase_anchor_age_s) < _PHASE_FRESH_MAX_AGE_S
+            else:
+                anchor_fresh = False  # missing age blocks phase authority
+        else:
+            anchor_fresh = None  # not applicable
+        gates["phase_anchor_age_fresh"] = _gate_value(
+            anchor_fresh,
+            None if anchor_fresh is not False else "anchor_age_stale_or_missing",
+        )
+
+        # Population validation gate.
+        pop_state = str(getattr(sync, "population_validation_state", "") or "")
+        if pop_state == "pass":
+            pop_gate = _gate_value(True, None)
+        elif pop_state == "fail":
+            pop_gate = _gate_value(False, "population_validation_failed")
+        elif pop_state == "disabled":
+            pop_gate = _gate_value(None, "population_monitor_disabled")  # non-blocking
+        else:
+            pop_gate = _gate_value(None, "population_validation_unavailable")  # insufficient_data, empty, None
+        gates["population_validated"] = pop_gate
+
+        # Anchor status gate — only for anchor-based phase.
+        if phase_basis in {"anchor_relative", "geographic"}:
+            anchor_status = str(getattr(sync, "phase_anchor_status", "") or "")
+            blocked_statuses = {"population_demoted", "stale_anchor", "no_anchor"}
+            if anchor_status in blocked_statuses:
+                gates["phase_anchor_status_ok"] = _gate_value(False, f"anchor_status_{anchor_status}")
+            elif anchor_status:
+                gates["phase_anchor_status_ok"] = _gate_value(True, None)
+            else:
+                gates["phase_anchor_status_ok"] = _gate_value(None, "anchor_status_unknown")
+
         trusted = str(getattr(sync, "phase_status", "") or "") == "trusted"
         gates["phase_state_trusted"] = _gate_value(trusted, None if trusted else "phase_untrusted")
+
         ready = all(v["passed"] is not False for v in gates.values())
         return {"phase_ready": bool(ready), "gates": gates, "phase_basis": phase_basis}
 
@@ -3397,6 +3563,8 @@ class RadarState:
         }
         import config as _cfg
         _go_operational_enabled = bool(getattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False))
+
+        # Step 1: Python must have a valid base period.
         if not py_gates["base_period_valid"]:
             reason = "missing_python_base_period"
             for gate_name, gate_state in py_gates["gates"].items():
@@ -3406,8 +3574,7 @@ class RadarState:
             sync.usable = False
             self._go_operational_by_iid[iid] = False
             self._set_handoff_state_locked(
-                iid,
-                sync,
+                iid, sync,
                 handoff_state="BOOTSTRAPPING_PY",
                 handoff_reason=reason,
                 handoff_gate_failures=failures,
@@ -3416,16 +3583,58 @@ class RadarState:
                 phase_authority="py_bootstrap",
             )
             return
-        if not go_gates["go_ready"]:
+
+        go_sync = self._go_sync_states_by_iid.get(iid)
+        go_present = go_sync is not None
+        go_holdover = bool((go_sync or {}).get("holdover", False))
+
+        # Step 2: Go sync not yet present.
+        if not go_present:
             sync.usable = False
-            reason = "go_not_ready"
-            if bool((self._go_sync_states_by_iid.get(iid) or {}).get("holdover", False)):
-                reason = "go_holdover"
             self._go_operational_by_iid[iid] = False
             self._set_handoff_state_locked(
-                iid,
-                sync,
+                iid, sync,
                 handoff_state="BASE_PERIOD_READY",
+                handoff_reason="go_sync_absent",
+                handoff_gate_failures=failures,
+                period_authority="py_base",
+                sync_authority="py_bootstrap",
+                phase_authority="py_bootstrap",
+            )
+            return
+
+        # Step 3: Go is in holdover — previously valid operational state temporarily lost.
+        if go_holdover:
+            sync.usable = False
+            self._go_operational_by_iid[iid] = False
+            self._set_handoff_state_locked(
+                iid, sync,
+                handoff_state="HOLDOVER",
+                handoff_reason="go_holdover",
+                handoff_gate_failures=failures,
+                period_authority="holdover",
+                sync_authority="holdover",
+                phase_authority="holdover",
+            )
+            return
+
+        # Step 4: Check whether Go base agrees with Python base.
+        # UNTRUSTED only when Go has a *valid* base that *disagrees* with Python — this
+        # implies Go is producing incorrect period estimates.  If Go has no valid base yet
+        # (hasn't accepted Python's base), that is a "not yet ready" situation → Step 5.
+        go_base_valid = go_gates["gates"].get("go_mirrored_base_period_valid", {}).get("passed")
+        go_base_agrees = go_gates["gates"].get("go_base_agrees_with_python_base", {}).get("passed")
+        if go_base_valid is True and go_base_agrees is False:
+            reason = "go_base_disagrees_with_python_base"
+            for gate_name, gate_state in go_gates["gates"].items():
+                if gate_state.get("passed") is False:
+                    reason = str(gate_state.get("reason") or gate_name)
+                    break
+            sync.usable = False
+            self._go_operational_by_iid[iid] = False
+            self._set_handoff_state_locked(
+                iid, sync,
+                handoff_state="UNTRUSTED",
                 handoff_reason=reason,
                 handoff_gate_failures=failures,
                 period_authority="py_base",
@@ -3433,12 +3642,54 @@ class RadarState:
                 phase_authority="py_bootstrap",
             )
             return
+
+        # Step 5: Go base accepted (valid + agrees) but refinement gates not yet
+        # satisfied → GO_REFINING.  If Go has no valid base yet → BASE_PERIOD_READY.
+        go_base_accepted = go_base_valid is True and go_base_agrees is True
+        if not go_gates["go_ready"]:
+            if go_base_accepted:
+                reason = "go_refining"
+                for gate_name, gate_state in go_gates["gates"].items():
+                    if gate_state.get("passed") is False:
+                        reason = str(gate_state.get("reason") or gate_name)
+                        break
+                sync.usable = False
+                self._go_operational_by_iid[iid] = False
+                self._set_handoff_state_locked(
+                    iid, sync,
+                    handoff_state="GO_REFINING",
+                    handoff_reason=reason,
+                    handoff_gate_failures=failures,
+                    period_authority="py_base",
+                    sync_authority="py_bootstrap",
+                    phase_authority="py_bootstrap",
+                )
+            else:
+                # Go present but hasn't yet accepted Python base → BASE_PERIOD_READY.
+                reason = "go_not_ready"
+                for gate_name, gate_state in go_gates["gates"].items():
+                    if gate_state.get("passed") is False:
+                        reason = str(gate_state.get("reason") or gate_name)
+                        break
+                sync.usable = False
+                self._go_operational_by_iid[iid] = False
+                self._set_handoff_state_locked(
+                    iid, sync,
+                    handoff_state="BASE_PERIOD_READY",
+                    handoff_reason=reason,
+                    handoff_gate_failures=failures,
+                    period_authority="py_base",
+                    sync_authority="py_bootstrap",
+                    phase_authority="py_bootstrap",
+                )
+            return
+
+        # Step 6: All Go gates pass. Operational flag determines whether Go is used.
         if not _go_operational_enabled:
             sync.usable = False
             self._go_operational_by_iid[iid] = False
             self._set_handoff_state_locked(
-                iid,
-                sync,
+                iid, sync,
                 handoff_state="GO_REFINED_READY",
                 handoff_reason="go_ready_flag_disabled",
                 handoff_gate_failures=failures,
@@ -3447,12 +3698,13 @@ class RadarState:
                 phase_authority="py_bootstrap",
             )
             return
+
+        # Operational: Go is period authority. Phase authority is separate.
         sync.usable = True
         self._go_operational_by_iid[iid] = True
         phase_authority = "go_runtime" if phase_eval["phase_ready"] else "py_anchor_relative"
         self._set_handoff_state_locked(
-            iid,
-            sync,
+            iid, sync,
             handoff_state="GO_REFINED_READY",
             handoff_reason="go_ready",
             handoff_gate_failures=failures,

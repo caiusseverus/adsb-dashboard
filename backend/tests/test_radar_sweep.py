@@ -3242,12 +3242,14 @@ def test_go_iid_state_does_not_override_multi_aircraft_sync_state():
     assert sync is not None
     assert sync.source == "go_frame_sync"
     assert sync.handoff_state == "BASE_PERIOD_READY"
-    assert sync.handoff_reason == "go_not_ready"
+    # Go has no valid base_period_s (bps key absent) → first failing gate drives reason.
+    assert sync.handoff_reason == "go_mirrored_base_period_invalid"
     assert sync.usable is False
     assert state.get_go_live_sync_state(77)["phase_epoch_us"] == pytest.approx(999_000.0)
 
 
 def test_go_handoff_rejects_holdover_when_python_base_valid():
+    # Stage 3R: holdover now emits HOLDOVER state (not BASE_PERIOD_READY).
     state = RadarState()
     state._models[31] = RadarIID(iid=31, status="SINGLE_RADAR", period_s=4.0, primary_support_count=6)
     state.update_go_iid_state({
@@ -3255,7 +3257,7 @@ def test_go_handoff_rejects_holdover_when_python_base_valid():
         "sq": 0.9, "sj": 1.0, "snf": 10, "sh": True, "lu": 2000.0, "rv": 1, "bps": 4.0, "eps": 4.0, "pag": True,
     })
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(31))
-    assert payload["handoff_state"] == "BASE_PERIOD_READY"
+    assert payload["handoff_state"] == "HOLDOVER"
     assert payload["handoff_reason"] == "go_holdover"
     assert payload["period_authority"] == "holdover"
 
@@ -3276,6 +3278,7 @@ def test_go_sync_snapshot_exposes_holdover_reason_counters():
 
 
 def test_go_handoff_rejects_period_disagreement():
+    # Stage 3R: base period disagreement now emits UNTRUSTED (not BASE_PERIOD_READY).
     state = RadarState()
     state._models[32] = RadarIID(iid=32, status="SINGLE_RADAR", period_s=4.0, primary_support_count=6)
     state.update_go_iid_state({
@@ -3284,8 +3287,8 @@ def test_go_handoff_rejects_period_disagreement():
     })
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(32))
     assert payload["period_authority"] == "py_base"
-    assert payload["handoff_state"] == "BASE_PERIOD_READY"
-    assert payload["handoff_reason"] == "go_not_ready"
+    assert payload["handoff_state"] == "UNTRUSTED"
+    assert payload["sync_authority"] != "go_runtime"
 
 
 def test_go_handoff_allows_period_authority_when_gates_pass():
@@ -4070,13 +4073,13 @@ def test_stage5_flag_enabled_go_ready_effective_period_source_is_go(monkeypatch)
 
 
 def test_stage5_flag_enabled_go_not_ready_falls_back_to_python(monkeypatch):
-    """When the flag is enabled but Go readiness gates fail, fall back
-    to Python safe path and expose failure reason."""
+    """When the flag is enabled but Go base disagrees, emit UNTRUSTED and
+    fall back to Python safe path (Stage 3R: period disagreement → UNTRUSTED)."""
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
     state = RadarState()
     state._models[210] = RadarIID(iid=210, status="SINGLE_RADAR", period_s=4.0, primary_support_count=6)
-    # Go period disagrees with Python base → not_ready
+    # Go period disagrees with Python base → UNTRUSTED (Stage 3R)
     state.update_go_iid_state({
         "i": 210, "sp": True, "su": True, "sps": 4.8, "sep": 1000.0, "sod": 10.0,
         "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1,
@@ -4084,8 +4087,8 @@ def test_stage5_flag_enabled_go_not_ready_falls_back_to_python(monkeypatch):
     })
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(210))
     assert payload["period_authority"] == "py_base"
-    assert payload["handoff_state"] == "BASE_PERIOD_READY"
-    assert payload["handoff_reason"] == "go_not_ready"
+    assert payload["handoff_state"] == "UNTRUSTED"
+    assert payload["sync_authority"] != "go_runtime"
     assert not state._go_operational_by_iid.get(210, False)
     assert payload["go_refiner_operational_enabled"] is True
 
