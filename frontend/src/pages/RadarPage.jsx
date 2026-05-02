@@ -2405,141 +2405,181 @@ function PhaseAnchorPanel({ syncState, observations, candidates }) {
   const tdRight = { textAlign: 'right', padding: '2px 5px', fontFamily: 'SFMono-Regular, Consolas, monospace', borderTop: '1px solid #21262d' }
   const tdLeft = { textAlign: 'left', padding: '2px 5px', borderTop: '1px solid #21262d' }
 
+  const phaseBasis = syncState.phase_basis ?? 'sweep_epoch_only'
+  const phaseLabel = phaseBasis === 'sweep_epoch_only' ? 'Sweep-relative phase'
+    : phaseBasis === 'anchor_relative' ? 'Anchor-relative phase'
+    : phaseBasis === 'geographic' ? 'Geographic phase'
+    : 'Phase unavailable'
+  const phaseDescription = phaseBasis === 'sweep_epoch_only'
+    ? 'Geographic radar beam direction is not known'
+    : phaseBasis === 'anchor_relative'
+    ? 'Referenced to selected anchor aircraft; not geographic'
+    : phaseBasis === 'geographic'
+    ? 'Radar beam direction known'
+    : 'Phase is unavailable'
+
   return (
     <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
         <div>
-          <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Anchor-relative phase</div>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>
-            Phase is referenced to the selected anchor aircraft. Geographic radar beam direction is not yet known.
-          </div>
+          <div style={{ color: '#c9d1d9', fontWeight: 600 }}>{phaseLabel}</div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>{phaseDescription}</div>
         </div>
         <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: '4px', fontSize: '0.72rem' }}>
-          <span className={styles.metricPill}>Anchor <span className={styles.metricValue}>{anchorIcao || '—'}</span></span>
-          <span className={styles.metricPill}>Status <span className={styles.metricValue}>{syncState.phase_anchor_status || '—'}</span></span>
-          <span className={styles.metricPill}>Score <span className={styles.metricValue}>{fmtNumber(syncState.phase_anchor_score, 1)}</span></span>
-          <span className={styles.metricPill}>Spread <span className={styles.metricValue}>{fmtNumber(syncState.phase_anchor_spread_deg, 2, '°')}</span></span>
-          <span className={styles.metricPill}>Obs <span className={styles.metricValue}>{syncState.phase_anchor_obs_count ?? anchorObs.length ?? '—'}</span></span>
-          <span className={styles.metricPill}>Since <span className={styles.metricValue}>{Number.isFinite(sinceAgeS) ? `${Math.max(0, sinceAgeS).toFixed(0)}s` : '—'}</span></span>
-          <span className={styles.metricPill}>Validation <span className={styles.metricValue}>{syncState.phase_validation_status || '—'}</span></span>
-          <span className={styles.metricPill} title="Phase is anchor-relative only. Geographic radar beam direction is unavailable in Stage 1.">Phase basis <span className={styles.metricValue}>{syncState.phase_basis ?? '—'}</span></span>
-          <span className={styles.metricPill}>Phase absolute? <span className={styles.metricValue}>{syncState.phase_is_absolute ? 'yes' : 'no'}</span></span>
-          <span className={styles.metricPill}>Anchor age <span className={styles.metricValue}>{Number.isFinite(sinceAgeS) ? `${Math.max(0, sinceAgeS).toFixed(0)}s` : '—'}</span></span>
-          <span className={styles.metricPill} title="Anchor-relative phase status: trusted = Stage 3 eligible; provisional = display only; untrusted = blocked">Anchor-relative phase trust <span className={styles.metricValue} style={{ color: syncState.phase_status === 'trusted' ? '#3fb950' : syncState.phase_status === 'provisional' ? '#e3b341' : '#8b949e' }}>{phaseStatusDisplayLabel(syncState.phase_status_display ?? syncState.phase_status)}</span></span>
-          <span className={styles.metricPill}>Agree/reject <span className={styles.metricValue}>{syncState.phase_validation_contributors ?? 0}/{syncState.phase_validation_reject_count ?? 0}</span></span>
-          <span className={styles.metricPill}>Median Δ <span className={styles.metricValue}>{fmtNumber(syncState.phase_validation_median_error_deg, 2, '°')}</span></span>
-          <span className={styles.metricPill}>Operational fit obs <span className={styles.metricValue}>
-            {syncState.operational_fit_total_observations != null
-              ? `${syncState.operational_fit_eligible_observations ?? 0}/${syncState.operational_fit_total_observations ?? 0}`
-              : 'unavailable'}
-          </span></span>
-          <span className={styles.metricPill}>Candidates <span className={styles.metricValue}>{syncState.phase_anchor_candidate_count ?? candidateRows.length}</span></span>
+          {phaseBasis === 'sweep_epoch_only' && (
+            <>
+              <span className={styles.metricPill}>Current phase basis: sweep epoch only</span>
+              <span className={styles.metricPill}>No anchor selected</span>
+              <span className={styles.metricPill}>Geographic beam direction is not known</span>
+            </>
+          )}
+          {phaseBasis === 'anchor_relative' && (
+            <>
+              <span className={styles.metricPill}>Anchor <span className={styles.metricValue}>{anchorIcao || '—'}</span></span>
+              <span className={styles.metricPill}>Status <span className={styles.metricValue}>{syncState.phase_anchor_status || '—'}</span></span>
+              <span className={styles.metricPill}>Score <span className={styles.metricValue}>{fmtNumber(syncState.phase_anchor_score, 1)}</span></span>
+              <span className={styles.metricPill}>Spread <span className={styles.metricValue}>{fmtNumber(syncState.phase_anchor_spread_deg, 2, '°')}</span></span>
+              <span className={styles.metricPill}>Obs <span className={styles.metricValue}>{syncState.phase_anchor_obs_count ?? anchorObs.length ?? '—'}</span></span>
+              <span className={styles.metricPill}>Since <span className={styles.metricValue}>{Number.isFinite(sinceAgeS) ? `${Math.max(0, sinceAgeS).toFixed(0)}s` : '—'}</span></span>
+              <span className={styles.metricPill}>Validation <span className={styles.metricValue}>{syncState.phase_validation_status || '—'}</span></span>
+              <span className={styles.metricPill} title="Phase is anchor-relative only. Geographic radar beam direction is unavailable.">Phase basis <span className={styles.metricValue}>{phaseBasis}</span></span>
+              <span className={styles.metricPill}>Not geographic</span>
+              <span className={styles.metricPill}>Anchor age <span className={styles.metricValue}>{Number.isFinite(sinceAgeS) ? `${Math.max(0, sinceAgeS).toFixed(0)}s` : '—'}</span></span>
+              <span className={styles.metricPill} title="Anchor-relative phase status: trusted = Stage 3 eligible; provisional = display only; untrusted = blocked">Anchor-relative phase trust <span className={styles.metricValue} style={{ color: syncState.phase_status === 'trusted' ? '#3fb950' : syncState.phase_status === 'provisional' ? '#e3b341' : '#8b949e' }}>{phaseStatusDisplayLabel(syncState.phase_status_display ?? syncState.phase_status)}</span></span>
+              <span className={styles.metricPill}>Agree/reject <span className={styles.metricValue}>{syncState.phase_validation_contributors ?? 0}/{syncState.phase_validation_reject_count ?? 0}</span></span>
+              <span className={styles.metricPill}>Median Δ <span className={styles.metricValue}>{fmtNumber(syncState.phase_validation_median_error_deg, 2, '°')}</span></span>
+              <span className={styles.metricPill}>Candidates <span className={styles.metricValue}>{syncState.phase_anchor_candidate_count ?? candidateRows.length}</span></span>
+            </>
+          )}
+          {phaseBasis === 'geographic' && (
+            <>
+              <span className={styles.metricPill} style={{ color: '#3fb950' }}>Geographic phase</span>
+              <span className={styles.metricPill}>Phase absolute? <span className={styles.metricValue} style={{ color: '#3fb950' }}>yes</span></span>
+              <span className={styles.metricPill}>Radar beam direction known</span>
+              <span className={styles.metricPill}>Offset <span className={styles.metricValue}>{fmtNumber(syncState.phase_offset_geographic_deg, 2, '°')}</span></span>
+              <span className={styles.metricPill}>Validation <span className={styles.metricValue}>{syncState.phase_validation_status || '—'}</span></span>
+            </>
+          )}
+          {phaseBasis === 'unavailable' && (
+            <>
+              <span className={styles.metricPill}>Phase unavailable</span>
+              <span className={styles.metricPill}>No usable phase basis</span>
+              <span className={styles.metricPill}>Geographic beam direction is not known</span>
+            </>
+          )}
         </div>
       </div>
 
-      {syncState.phase_anchor_replacement_reason && (
+      {phaseBasis === 'anchor_relative' && syncState.phase_anchor_replacement_reason && (
         <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '0.35rem' }}>
           Replacement reason <span className={styles.metricValue}>{syncState.phase_anchor_replacement_reason}</span>
         </div>
       )}
-      {!anchorIcao && (
+      {phaseBasis === 'anchor_relative' && !anchorIcao && (
         <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '0.35rem' }}>
           No anchor selected: <span className={styles.metricValue}>{humanizeSyncReason(syncState.phase_anchor_no_candidate_reason)}</span>
         </div>
       )}
+      {phaseBasis !== 'anchor_relative' && phaseBasis !== 'geographic' && (
+        <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '0.35rem' }}>
+          Geographic radar beam direction is not known — phase is {phaseBasis === 'sweep_epoch_only' ? 'sweep-relative' : 'unavailable'}
+        </div>
+      )}
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '10px' }}>
-        <div style={{ overflow: 'auto', border: '1px solid #30363d', background: '#0f141b', minWidth: 0 }}>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>Anchor candidates</div>
-          <table style={tableStyle}>
-            <thead>
-              <tr>
-                <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
-                <th style={thStyle}>score</th>
-                <th style={thStyle}>spread</th>
-                <th style={thStyle}>count</th>
-                <th style={thStyle}>fit</th>
-                <th style={{ ...thStyle, textAlign: 'left' }}>status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {candidateRows.slice(0, 12).map(row => (
-                <tr key={row.icao} style={{ background: row.icao === anchorIcao ? '#388bfd18' : 'transparent' }}>
-                  <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{row.icao}</td>
-                  <td style={tdRight}>{fmtNumber(row.score, 1)}</td>
-                  <td style={tdRight}>{fmtNumber(row.spread_deg, 2, '°')}</td>
-                  <td style={tdRight}>{row.obs_count ?? '—'}</td>
-                  <td style={tdRight}>{fmtNumber(Number(row.fit_eligible_fraction) * 100, 0, '%')}</td>
-                  <td style={tdLeft}>{row.status === 'rejected' ? humanizeSyncReason(row.reject_reasons?.join(', ') || 'rejected') : humanizeSyncReason(row.status || 'candidate')}</td>
+      {phaseBasis === 'anchor_relative' && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '10px' }}>
+          <div style={{ overflow: 'auto', border: '1px solid #30363d', background: '#0f141b', minWidth: 0 }}>
+            <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>Anchor candidates</div>
+            <table style={tableStyle}>
+              <thead>
+                <tr>
+                  <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
+                  <th style={thStyle}>score</th>
+                  <th style={thStyle}>spread</th>
+                  <th style={thStyle}>count</th>
+                  <th style={thStyle}>fit</th>
+                  <th style={{ ...thStyle, textAlign: 'left' }}>status</th>
                 </tr>
-              ))}
-              {candidateRows.length === 0 && (
-                <tr><td colSpan={6} style={{ ...tdLeft, color: '#8b949e' }}>No candidate ranking yet. {humanizeSyncReason(syncState.phase_anchor_no_candidate_reason)}</td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {candidateRows.slice(0, 12).map(row => (
+                  <tr key={row.icao} style={{ background: row.icao === anchorIcao ? '#388bfd18' : 'transparent' }}>
+                    <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{row.icao}</td>
+                    <td style={tdRight}>{fmtNumber(row.score, 1)}</td>
+                    <td style={tdRight}>{fmtNumber(row.spread_deg, 2, '°')}</td>
+                    <td style={tdRight}>{row.obs_count ?? '—'}</td>
+                    <td style={tdRight}>{fmtNumber(Number(row.fit_eligible_fraction) * 100, 0, '%')}</td>
+                    <td style={tdLeft}>{row.status === 'rejected' ? humanizeSyncReason(row.reject_reasons?.join(', ') || 'rejected') : humanizeSyncReason(row.status || 'candidate')}</td>
+                  </tr>
+                ))}
+                {candidateRows.length === 0 && (
+                  <tr><td colSpan={6} style={{ ...tdLeft, color: '#8b949e' }}>No candidate ranking yet. {humanizeSyncReason(syncState.phase_anchor_no_candidate_reason)}</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
 
-        <div style={{ minWidth: 0 }}>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>Implied phase offset by observation</div>
-          <svg width="100%" height={scatterH} viewBox={`0 0 ${scatterW} ${scatterH}`} style={{ background: '#0f141b', border: '1px solid #30363d', display: 'block' }}>
-            {[0, 90, 180, 270, 360].map(v => {
-              const y = scatterH - (v / 360) * scatterH
-              return <line key={v} x1={0} y1={y} x2={scatterW} y2={y} stroke={v === 0 || v === 360 ? '#30363d' : '#21262d'} />
-            })}
-            {impliedRows.map((obs, idx) => {
-              const t = Number(obs.beam_center_us ?? obs.raw_arrival_us)
-              const off = Number(obs.implied_phase_offset_deg)
-              const anchorDelta = anchorRelativeDelta(obs)
-              const x = Number.isFinite(t) ? ((t - tMin) / tSpan) * scatterW : 0
-              const y = scatterH - (((off % 360) + 360) % 360 / 360) * scatterH
-              const isAnchor = obs.icao === anchorIcao
-              const rejected = Boolean(obs.phase_anchor_reject_reason)
-              return (
-                <circle
-                  key={`${obs.icao}-${t}-${idx}`}
-                  cx={x}
-                  cy={y}
-                  r={isAnchor ? 2.6 : 1.8}
-                  fill={isAnchor ? '#ffd166' : rejected ? '#ff7b72' : '#58a6ff'}
-                  fillOpacity={isAnchor ? 0.95 : 0.65}
-                >
-                  <title>{`${obs.icao || '—'} implied ${off.toFixed(2)}°${Number.isFinite(Number(anchorDelta)) ? ` | anchor Δ ${Number(anchorDelta).toFixed(2)}°` : ''}`}</title>
-                </circle>
-              )
-            })}
-            <text x={2} y={10} fontSize="9" fill="#8b949e">360°</text>
-            <text x={2} y={scatterH - 2} fontSize="9" fill="#8b949e">0°</text>
-          </svg>
-        </div>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '2px' }}>Implied phase offset by observation</div>
+            <svg width="100%" height={scatterH} viewBox={`0 0 ${scatterW} ${scatterH}`} style={{ background: '#0f141b', border: '1px solid #30363d', display: 'block' }}>
+              {[0, 90, 180, 270, 360].map(v => {
+                const y = scatterH - (v / 360) * scatterH
+                return <line key={v} x1={0} y1={y} x2={scatterW} y2={y} stroke={v === 0 || v === 360 ? '#30363d' : '#21262d'} />
+              })}
+              {impliedRows.map((obs, idx) => {
+                const t = Number(obs.beam_center_us ?? obs.raw_arrival_us)
+                const off = Number(obs.implied_phase_offset_deg)
+                const anchorDelta = anchorRelativeDelta(obs)
+                const x = Number.isFinite(t) ? ((t - tMin) / tSpan) * scatterW : 0
+                const y = scatterH - (((off % 360) + 360) % 360 / 360) * scatterH
+                const isAnchor = obs.icao === anchorIcao
+                const rejected = Boolean(obs.phase_anchor_reject_reason)
+                return (
+                  <circle
+                    key={`${obs.icao}-${t}-${idx}`}
+                    cx={x}
+                    cy={y}
+                    r={isAnchor ? 2.6 : 1.8}
+                    fill={isAnchor ? '#ffd166' : rejected ? '#ff7b72' : '#58a6ff'}
+                    fillOpacity={isAnchor ? 0.95 : 0.65}
+                  >
+                    <title>{`${obs.icao || '—'} implied ${off.toFixed(2)}°${Number.isFinite(Number(anchorDelta)) ? ` | anchor Δ ${Number(anchorDelta).toFixed(2)}°` : ''}`}</title>
+                  </circle>
+                )
+              })}
+              <text x={2} y={10} fontSize="9" fill="#8b949e">360°</text>
+              <text x={2} y={scatterH - 2} fontSize="9" fill="#8b949e">0°</text>
+            </svg>
+          </div>
 
-        <div style={{ overflow: 'auto', border: '1px solid #30363d', background: '#0f141b', minWidth: 0 }}>
-          <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>Per-aircraft implied offsets</div>
-          <table style={tableStyle}>
-            <thead>
-              <tr>
-                <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
-                <th style={thStyle}>latest offset</th>
-                <th style={thStyle}>anchor Δ</th>
-                <th style={{ ...thStyle, textAlign: 'left' }}>role</th>
-              </tr>
-            </thead>
-            <tbody>
-              {latestImpliedRows.slice(0, 20).map((obs, idx) => (
-                <tr key={`${obs.icao}-${obs.beam_center_us}-${idx}`}>
-                  <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</td>
-                  <td style={tdRight}>{isFiniteValue(obs.implied_phase_offset_deg) ? fmtNumber(obs.implied_phase_offset_deg, 2, '°') : '—'}</td>
-                  <td style={tdRight}>{isFiniteValue(anchorRelativeDelta(obs)) ? fmtNumber(anchorRelativeDelta(obs), 2, '°') : '—'}</td>
-                  <td style={tdLeft}>{obs.phase_anchor_contributor ? 'anchor contributor' : (obs.phase_anchor_reject_reason || 'validator')}</td>
+          <div style={{ overflow: 'auto', border: '1px solid #30363d', background: '#0f141b', minWidth: 0 }}>
+            <div style={{ color: '#8b949e', fontSize: '0.72rem', padding: '4px 6px' }}>Per-aircraft implied offsets</div>
+            <table style={tableStyle}>
+              <thead>
+                <tr>
+                  <th style={{ ...thStyle, textAlign: 'left' }}>ICAO</th>
+                  <th style={thStyle}>latest offset</th>
+                  <th style={thStyle}>anchor Δ</th>
+                  <th style={{ ...thStyle, textAlign: 'left' }}>role</th>
                 </tr>
-              ))}
-              {latestImpliedRows.length === 0 && (
-                <tr><td colSpan={4} style={{ ...tdLeft, color: '#8b949e' }}>No implied-offset observations yet.</td></tr>
-              )}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {latestImpliedRows.slice(0, 20).map((obs, idx) => (
+                  <tr key={`${obs.icao}-${obs.beam_center_us}-${idx}`}>
+                    <td style={{ ...tdLeft, fontFamily: 'SFMono-Regular, Consolas, monospace' }}>{obs.icao}</td>
+                    <td style={tdRight}>{isFiniteValue(obs.implied_phase_offset_deg) ? fmtNumber(obs.implied_phase_offset_deg, 2, '°') : '—'}</td>
+                    <td style={tdRight}>{isFiniteValue(anchorRelativeDelta(obs)) ? fmtNumber(anchorRelativeDelta(obs), 2, '°') : '—'}</td>
+                    <td style={tdLeft}>{obs.phase_anchor_contributor ? 'anchor contributor' : (obs.phase_anchor_reject_reason || 'validator')}</td>
+                  </tr>
+                ))}
+                {latestImpliedRows.length === 0 && (
+                  <tr><td colSpan={4} style={{ ...tdLeft, color: '#8b949e' }}>No implied-offset observations yet.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   )
 }

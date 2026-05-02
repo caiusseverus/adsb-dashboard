@@ -773,6 +773,17 @@ def _live_sync_state_to_dict(
             "anchor_untrusted" if str(getattr(sync, "phase_status", "") or "") == "untrusted" else
             "unavailable"
         ),
+        "phase_offset_deg": float(getattr(sync, "phase_offset_deg") or 0.0),
+        "phase_offset_geographic_deg": None,
+        "phase_anchor_icao": phase_anchor_icao,
+        "phase_anchor_status": phase_anchor_status,
+        "phase_anchor_score": float(getattr(sync, "phase_anchor_score") or 0.0),
+        "phase_anchor_obs_count": int(getattr(sync, "phase_anchor_obs_count") or 0),
+        "phase_validation_status": str(getattr(sync, "phase_validation_status") or "unavailable"),
+        "phase_validation_contributors": int(getattr(sync, "phase_validation_contributors") or 0),
+        "phase_validation_reject_count": int(getattr(sync, "phase_validation_reject_count") or 0),
+        "phase_validation_median_error_deg": float(getattr(sync, "phase_validation_median_error_deg"))
+            if getattr(sync, "phase_validation_median_error_deg", None) is not None else None,
         "period_delta_source": period_delta_source,
         "operational_fit_total_observations": operational_fit_total_observations,
         "operational_fit_eligible_observations": operational_fit_eligible_observations,
@@ -913,6 +924,9 @@ def _live_sync_state_to_dict(
     # --- Feature flag exposure ---
     payload["go_refiner_operational_enabled"] = go_refiner_operational_enabled
 
+    # --- Enforce phase semantics invariants before serialisation ---
+    payload = _normalise_phase_fields(payload)
+
     return payload
 
 
@@ -927,6 +941,77 @@ def _gate_value(passed: bool | None, reason: str | None = None) -> dict:
 
 def _finite_positive(value: float | None) -> bool:
     return _is_finite_number(value) and float(value) > 0.0
+
+
+def _normalise_phase_fields(payload: dict) -> dict:
+    """Enforce phase semantics invariants before serialisation.
+
+    Canonical phase basis values and their constraints:
+
+    sweep_epoch_only:
+        A sweep epoch/rotation phase exists for timing prediction only.
+        It is NOT a known geographic beam direction.
+        phase_is_absolute must be False.
+        phase_offset_geographic_deg must be None.
+
+    anchor_relative:
+        Phase is relative to a selected anchor aircraft or anchor-derived frame.
+        It is NOT a known geographic beam direction.
+        phase_is_absolute must be False.
+        phase_offset_geographic_deg must be None.
+
+    geographic:
+        Phase is a validated geographic beam direction.
+        This is the ONLY basis where phase_is_absolute may be True.
+        phase_offset_geographic_deg must be finite when phase_is_absolute is True.
+
+    unavailable:
+        No usable phase basis exists.
+        phase_is_absolute must be False.
+        phase_offset_geographic_deg must be None.
+
+    phase_offset_basis must be one of: sweep_epoch | anchor_relative | geographic | unavailable
+
+    If contradictory inputs are detected, normalise to the conservative state
+    and append a diagnostic warning.
+    """
+    phase_basis = str(payload.get("phase_basis") or "sweep_epoch_only")
+    phase_is_absolute = bool(payload.get("phase_is_absolute", False))
+    phase_offset_geographic_deg = payload.get("phase_offset_geographic_deg")
+    phase_authority = str(payload.get("phase_authority") or "")
+    warnings = list(payload.get("consistency_warnings") or [])
+
+    if phase_basis == "sweep_epoch_only":
+        phase_offset_basis = "sweep_epoch"
+    elif phase_basis == "anchor_relative":
+        phase_offset_basis = "anchor_relative"
+    elif phase_basis == "geographic":
+        phase_offset_basis = "geographic"
+    else:
+        phase_offset_basis = "unavailable"
+
+    if phase_is_absolute and phase_basis != "geographic":
+        phase_is_absolute = False
+        warnings.append("phase_is_absolute_normalised_to_false_not_geographic")
+
+    if phase_basis != "geographic" or not phase_is_absolute:
+        phase_offset_geographic_deg = None
+
+    if phase_basis == "unavailable":
+        phase_is_absolute = False
+
+    absolute_authority_keywords = ("go_runtime", "geographic", "trusted")
+    if phase_is_absolute and not any(kw in phase_authority.lower() for kw in absolute_authority_keywords):
+        if phase_basis != "geographic":
+            warnings.append("phase_authority_phase_basis_mismatch")
+
+    return {
+        **payload,
+        "phase_offset_basis": phase_offset_basis,
+        "phase_offset_geographic_deg": phase_offset_geographic_deg,
+        "phase_is_absolute": phase_is_absolute,
+        "consistency_warnings": warnings,
+    }
 
 
 class AircraftPositionTracker:
@@ -4347,9 +4432,20 @@ class RadarState:
             "event_sync_authority": sync_snapshot.get("sync_authority"),
             "event_phase_authority": sync_snapshot.get("phase_authority"),
             "phase_basis": sync_snapshot.get("phase_basis"),
+            "event_phase_basis": sync_snapshot.get("phase_basis"),
             "phase_is_absolute": bool(sync_snapshot.get("phase_is_absolute", False)),
-            "phase_epoch_us": float(sync_snapshot.get("phase_epoch_us") or 0.0),
+            "event_phase_is_absolute": bool(sync_snapshot.get("phase_is_absolute", False)),
             "phase_offset_deg": float(sync_snapshot.get("phase_offset_deg") or 0.0),
+            "event_phase_offset_deg": float(sync_snapshot.get("phase_offset_deg") or 0.0),
+            "phase_offset_basis": sync_snapshot.get("phase_offset_basis"),
+            "event_phase_offset_basis": sync_snapshot.get("phase_offset_basis"),
+            "phase_offset_geographic_deg": sync_snapshot.get("phase_offset_geographic_deg"),
+            "event_phase_offset_geographic_deg": sync_snapshot.get("phase_offset_geographic_deg"),
+            "phase_anchor_icao": sync_snapshot.get("phase_anchor_icao"),
+            "event_phase_anchor_icao": sync_snapshot.get("phase_anchor_icao"),
+            "phase_anchor_status": sync_snapshot.get("phase_anchor_status"),
+            "event_phase_anchor_status": sync_snapshot.get("phase_anchor_status"),
+            "phase_epoch_us": float(sync_snapshot.get("phase_epoch_us") or 0.0),
             "effective_period_source": sync_snapshot.get("effective_period_source"),
             "period_delta_source": sync_snapshot.get("period_delta_source"),
             "source_path": _recorded_source_path(
