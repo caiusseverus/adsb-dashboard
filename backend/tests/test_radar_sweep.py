@@ -5061,3 +5061,124 @@ def test_contamination_detection_evaluates_from_go_path_residual_events(monkeypa
     # even when usable=False)
     recorded = list(state._live_burst_residual_events.get(99) or [])
     assert len(recorded) >= 1
+
+
+# ===========================================================================
+# Consistency-warning throttle and log-spam prevention tests
+# ===========================================================================
+
+
+def test_expected_default_off_fallback_not_logged_as_warning(monkeypatch, caplog):
+    """When RADAR_SYNC_GO_REFINER_OPERATIONAL=False, the go_frame_sync
+    fallback is expected diagnostic/shadow behaviour and must not emit
+    a WARNING log."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
+    caplog.set_level("WARNING")
+
+    sync = LiveSyncState(
+        iid=99,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=2000.0,
+        source="go_frame_sync",
+        usable=True,
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["period_authority"] == "py_base"
+    assert payload["sync_authority"] == "py_bootstrap"
+
+    consistency_warnings = [
+        rec.message for rec in caplog.records
+        if "sync source consistency" in rec.message
+    ]
+    assert len(consistency_warnings) == 0
+
+
+def test_expected_default_off_fallback_logged_as_debug(caplog):
+    """Expected default-off fallback is logged at DEBUG level."""
+    caplog.set_level("DEBUG")
+    sync = LiveSyncState(
+        iid=99,
+        period_s=4.0, period_base_s=4.0,
+        phase_epoch_us=1000.0, phase_offset_deg=10.0,
+        sync_quality=0.9, sync_jitter_deg=1.0,
+        last_sync_update_ts=2000.0,
+        source="go_frame_sync", usable=True,
+    )
+    sweep._live_sync_state_to_dict(sync)
+    debug_records = [
+        rec.message for rec in caplog.records
+        if "sync source consistency note" in rec.message
+    ]
+    assert len(debug_records) >= 1
+
+
+def test_suppress_consistency_logging_prevents_all_logs(caplog):
+    """With suppress_consistency_logging=True, no consistency logs are emitted
+    at any level."""
+    caplog.set_level("DEBUG")
+    sync = LiveSyncState(
+        iid=99,
+        period_s=4.0, period_base_s=4.0,
+        phase_epoch_us=1000.0, phase_offset_deg=10.0,
+        sync_quality=0.9, sync_jitter_deg=1.0,
+        last_sync_update_ts=2000.0,
+        source="go_frame_sync", usable=True,
+    )
+    sweep._live_sync_state_to_dict(sync, suppress_consistency_logging=True)
+    consistency_records = [
+        rec for rec in caplog.records
+        if "sync source consistency" in rec.message or "sync canonical" in rec.message
+    ]
+    assert len(consistency_records) == 0
+
+
+def test_emit_consistency_warning_throttles_real_warnings(caplog, monkeypatch):
+    """Real consistency warnings are throttled: only one is emitted per
+    (iid, reason) within the throttle interval."""
+    caplog.set_level("WARNING")
+    fake_now = [1000.0]
+    monkeypatch.setattr("radar.sweep.time.time", lambda: fake_now[0])
+
+    reason = "operational_effective_period_source_demoted_from_go_runtime_for_py_base"
+    sweep._emit_consistency_warning(42, reason, suppress=False)
+    sweep._emit_consistency_warning(42, reason, suppress=False)
+    sweep._emit_consistency_warning(42, reason, suppress=False)
+
+    warnings = [rec for rec in caplog.records if rec.levelname == "WARNING"
+                and reason in rec.message]
+    assert len(warnings) == 1
+
+    # After throttle window passes, a new warning is emitted
+    fake_now[0] += 61.0
+    sweep._emit_consistency_warning(42, reason, suppress=False)
+    warnings = [rec for rec in caplog.records if rec.levelname == "WARNING"
+                and reason in rec.message]
+    assert len(warnings) == 2
+
+    # Different IID → not throttled by same bucket
+    sweep._emit_consistency_warning(43, reason, suppress=False)
+    warnings = [rec for rec in caplog.records if rec.levelname == "WARNING"
+                and reason in rec.message]
+    assert len(warnings) == 3
+    sweep._consistency_warning_last_emitted.clear()
+
+
+def test_emit_consistency_warning_suppress_prevents_all_logs(caplog):
+    """With suppress=True, no log is emitted regardless of warning type."""
+    caplog.set_level("DEBUG")
+    sweep._emit_consistency_warning(99, "go_frame_sync_unavailable_authority_fallback_py_base_flag_disabled", suppress=True)
+    sweep._emit_consistency_warning(99, "operational_period_delta_source_demoted_from_go_runtime_delta", suppress=True)
+    sweep._emit_consistency_warning(99, "canonical_period_invariant_mismatch_test", suppress=True)
+
+    consistency_records = [
+        rec for rec in caplog.records
+        if "sync source consistency" in rec.message or "sync canonical" in rec.message
+    ]
+    assert len(consistency_records) == 0
+    sweep._consistency_warning_last_emitted.clear()

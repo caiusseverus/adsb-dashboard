@@ -117,6 +117,15 @@ if TYPE_CHECKING:
     from aircraft_state import AircraftState
 
 log = logging.getLogger(__name__)
+_CONSISTENCY_WARNING_THROTTLE_S = 60.0
+_consistency_warning_last_emitted: dict[tuple[int | str, str], float] = {}
+
+# Warning reasons that are expected behaviour when RADAR_SYNC_GO_REFINER_OPERATIONAL
+# is disabled (default) — Go operates as a diagnostic shadow.
+_EXPECTED_SHADOW_WARNINGS = frozenset({
+    "go_frame_sync_unavailable_authority_fallback_py_base_flag_disabled",
+    "go_frame_sync_unavailable_authority_fallback_blocked",
+})
 _CANONICAL_PERIOD_INVARIANT_TOL_S = 1e-9
 _canonical_period_invariant_mismatch_count = 0
 _GO_BASE_AGREE_TOL_S = 0.15
@@ -473,12 +482,29 @@ def _clone_sync_for_projection(
     )
 
 
+def _emit_consistency_warning(iid: int | str | None, reason: str, suppress: bool = False) -> None:
+    if suppress:
+        return
+    if reason in _EXPECTED_SHADOW_WARNINGS:
+        log.debug("sync source consistency note for iid=%s: %s", iid, reason)
+        return
+    now = time.time()
+    key = (iid or 0, reason)
+    last = _consistency_warning_last_emitted.get(key, 0.0)
+    if now - last < _CONSISTENCY_WARNING_THROTTLE_S:
+        return
+    _consistency_warning_last_emitted[key] = now
+    log.warning("sync source consistency warning for iid=%s: %s", iid, reason)
+
+
 def _live_sync_state_to_dict(
     sync: "LiveSyncState",
     go_sync: dict | None = None,
     py_shadow: dict | None = None,
     authority_transitions: list[dict] | None = None,
     go_refiner_operational_enabled: bool | None = None,
+    *,
+    suppress_consistency_logging: bool = False,
 ) -> dict:
     """Serialise a LiveSyncState to a plain dict for API/verification payloads.
 
@@ -736,7 +762,7 @@ def _live_sync_state_to_dict(
         consistency_warnings.append("operational_period_delta_source_demoted_from_go_runtime_delta")
         period_delta_source = "none" if period_authority == "py_base" else "python_simple_sync_delta" if period_authority == "py_refined" else "none"
     for warning in consistency_warnings:
-        log.warning("sync source consistency warning for iid=%s: %s", getattr(sync, "iid", None), warning)
+        _emit_consistency_warning(getattr(sync, "iid", None), warning, suppress=suppress_consistency_logging)
 
     if (
         base_period_s is not None
@@ -747,14 +773,10 @@ def _live_sync_state_to_dict(
         if abs(delta_mismatch_s) > _CANONICAL_PERIOD_INVARIANT_TOL_S:
             global _canonical_period_invariant_mismatch_count
             _canonical_period_invariant_mismatch_count += 1
-            log.warning(
-                "sync canonical period invariant mismatch for iid=%s; recomputing delta (base=%s delta=%s effective=%s mismatch=%s count=%s)",
+            _emit_consistency_warning(
                 getattr(sync, "iid", None),
-                base_period_s,
-                period_delta_s,
-                effective_period_s,
-                delta_mismatch_s,
-                _canonical_period_invariant_mismatch_count,
+                f"canonical_period_invariant_mismatch_base={base_period_s}_delta={period_delta_s}_effective={effective_period_s}_mismatch={delta_mismatch_s}_count={_canonical_period_invariant_mismatch_count}",
+                suppress=suppress_consistency_logging,
             )
             period_delta_s = effective_period_s - base_period_s
 
@@ -4960,7 +4982,7 @@ class RadarState:
             event_buf = self._live_burst_residual_events.setdefault(
                 iid, deque()
             )
-            sync_snapshot = _live_sync_state_to_dict(sync, go_sync=dict(self._go_sync_states_by_iid.get(iid) or {}))
+            sync_snapshot = _live_sync_state_to_dict(sync, go_sync=dict(self._go_sync_states_by_iid.get(iid) or {}), suppress_consistency_logging=True)
             event = self._build_recorded_residual_event(
                 iid=iid,
                 icao=icao,
@@ -5223,7 +5245,7 @@ class RadarState:
             timing_class = "early"
         else:
             timing_class = "late"
-        sync_snapshot = _live_sync_state_to_dict(sync, go_sync=go_sync)
+        sync_snapshot = _live_sync_state_to_dict(sync, go_sync=go_sync, suppress_consistency_logging=True)
         event = self._build_recorded_residual_event(
             iid=iid,
             icao=icao,
@@ -5320,7 +5342,7 @@ class RadarState:
         elif bearing_deg is None:
             fit_reject_reason = "missing_geometry"
         fit_eligible = fit_reject_reason is None
-        sync_snapshot = _live_sync_state_to_dict(sync, go_sync=go_sync)
+        sync_snapshot = _live_sync_state_to_dict(sync, go_sync=go_sync, suppress_consistency_logging=True)
         event = self._build_recorded_residual_event(
             iid=iid,
             icao=str(evidence.get("icao") or ""),
