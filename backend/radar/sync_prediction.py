@@ -31,6 +31,7 @@ class SyncPrediction:
     predicted_bearing_deg: float
     predictor_version: str = "authoritative_sync_v3_motion"
     phase_status: str | None = None
+    phase_basis: str = "sweep_epoch_only"
 
 
 def predict_sync_observation(
@@ -52,6 +53,7 @@ def predict_sync_observation(
       3. compute phase with the current period.
     """
     period_us = sync.period_s * 1e6
+    phase_basis = _derive_prediction_phase_basis(sync)
     if period_us <= 0:
         predicted = sync.phase_offset_deg % 360.0
         return SyncPrediction(
@@ -68,6 +70,7 @@ def predict_sync_observation(
             phase_in_rot_deg=0.0,
             predicted_bearing_raw_deg=predicted,
             predicted_bearing_deg=predicted,
+            phase_basis=phase_basis,
         )
     effective_us = arrival_us
     prop_delay_us = 0.0
@@ -111,6 +114,7 @@ def predict_sync_observation(
         predicted_bearing_raw_deg=predicted_raw,
         predicted_bearing_deg=predicted_raw,
         phase_status=getattr(sync, "phase_status", "untrusted"),
+        phase_basis=phase_basis,
     )
 
 
@@ -123,6 +127,22 @@ def _predict_bearing_from_sync(
     """Compatibility wrapper around the authoritative predictor."""
     prediction = predict_sync_observation(sync, arrival_us, range_nm=range_nm)
     return prediction.predicted_bearing_deg, prediction.phase_in_rot_deg
+
+
+def _derive_prediction_phase_basis(sync: "LiveSyncState") -> str:
+    """Derive the phase basis for a prediction from the live sync state.
+
+    Mirrors the logic in _live_sync_state_to_dict() so consumers can
+    distinguish sweep_epoch_only, anchor_relative, and geographic predictions.
+    """
+    typed_basis = getattr(sync, "phase_basis", None)
+    if typed_basis in {"sweep_epoch_only", "anchor_relative", "geographic"}:
+        return typed_basis
+    phase_anchor_icao = getattr(sync, "phase_anchor_icao", None)
+    phase_anchor_status = str(getattr(sync, "phase_anchor_status", "") or "")
+    if phase_anchor_icao and phase_anchor_status in {"selected", "anchor_only"}:
+        return "anchor_relative"
+    return "sweep_epoch_only"
 
 
 _US_PER_NM_LIGHT = 1852.0 / 299792458.0 * 1e6

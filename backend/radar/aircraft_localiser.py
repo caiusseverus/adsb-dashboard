@@ -1113,15 +1113,20 @@ class AircraftLocaliser:
 
     @staticmethod
     def _sync_state_has_trusted_absolute_phase(sync_state) -> bool:
-        """Return True iff sync_state carries a trustworthy absolute phase anchor.
+        """Return True iff the sync state carries a trusted anchor-relative phase.
+
+        NOTE: This method checks anchor-relative phase trust, NOT geographic/
+        absolute phase. The name is historical; use _sync_state_has_geographic_phase()
+        when you need to gate on true geographic beam direction.
 
         Only the Python simple sync model (source == "multi_aircraft_burst") can
-        supply a trusted phase.  Trust is determined solely by phase_status;
-        heuristic fallbacks and Go-sourced sync are not accepted.
+        supply a trusted anchor-relative phase. Trust is determined solely by
+        phase_status; heuristic fallbacks and Go-sourced sync are not accepted.
 
-        Deprecated in Stage 6: use _sync_state_has_geographic_phase() for
+        Deprecated in Stage 6R: use _sync_state_has_geographic_phase() for
         geographic/localisation consumers. This method remains for backward
-        compatibility with anchor-relative diagnostics.
+        compatibility with anchor-relative diagnostics and the localiser's
+        pre-geographic-phase trust gate.
         """
         if getattr(sync_state, "source", None) != "multi_aircraft_burst":
             return False
@@ -1131,9 +1136,12 @@ class AircraftLocaliser:
     def _derive_phase_basis(sync_state) -> str:
         """Derive the canonical phase basis from a LiveSyncState.
 
-        Mirrors the logic in _live_sync_state_to_dict() to ensure consistency
-        between serialisation and downstream gating.
+        Prefers the typed phase_basis field when available; falls back to
+        deriving from anchor state for backward compatibility.
         """
+        typed_basis = getattr(sync_state, "phase_basis", None)
+        if typed_basis in {"sweep_epoch_only", "anchor_relative", "geographic"}:
+            return typed_basis
         phase_anchor_icao = getattr(sync_state, "phase_anchor_icao", None)
         phase_anchor_status = str(getattr(sync_state, "phase_anchor_status", "") or "")
         if phase_anchor_icao and phase_anchor_status in {"selected", "anchor_only"}:
@@ -1142,8 +1150,11 @@ class AircraftLocaliser:
 
     @staticmethod
     def _sync_state_has_geographic_phase(sync_state, sync_state_dict: dict | None = None) -> tuple[bool, str | None]:
-        """Return (True, None) if sync state carries a geographic phase suitable
-        for bearing-ray / localisation consumption.
+        """Return (True, None) if sync state carries a true geographic phase.
+
+        This is the authoritative gate for geographic/absolute beam direction.
+        It checks phase_basis == "geographic", phase_is_absolute == True, and
+        that phase_offset_geographic_deg is a finite number.
 
         Accepts an optional pre-serialised sync_state_dict to check
         phase_is_absolute without requiring the field on the dataclass.

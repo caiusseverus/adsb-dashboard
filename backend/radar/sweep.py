@@ -498,10 +498,49 @@ def _live_sync_state_to_dict(
     source = str(getattr(sync, "source", "") or "")
     phase_anchor_status = str(getattr(sync, "phase_anchor_status", "") or "")
     phase_anchor_icao = getattr(sync, "phase_anchor_icao", None)
+    phase_anchor_since_ts = getattr(sync, "phase_anchor_since_ts", None)
 
-    phase_basis = "sweep_epoch_only"
-    if phase_anchor_icao and phase_anchor_status in {"selected", "anchor_only"}:
+    # Use the typed phase_basis from LiveSyncState if populated; fall back to
+    # deriving from anchor state for backward compatibility with states built
+    # before the field was added.
+    typed_phase_basis = str(getattr(sync, "phase_basis", "") or "")
+    if typed_phase_basis in {"sweep_epoch_only", "anchor_relative", "geographic"}:
+        phase_basis = typed_phase_basis
+    elif phase_anchor_icao and phase_anchor_status in {"selected", "anchor_only"}:
         phase_basis = "anchor_relative"
+    else:
+        phase_basis = "sweep_epoch_only"
+
+    # Compute anchor age from the wall clock: if an anchor exists and we have
+    # its selection timestamp, age is the wall-clock delta.  If no anchor
+    # exists or the timestamp is missing, age is None so downstream gates
+    # fail clearly.
+    phase_anchor_age_s: float | None = None
+    if phase_anchor_icao and phase_anchor_status in {"selected", "anchor_only"} and phase_anchor_since_ts is not None:
+        try:
+            phase_anchor_age_s = max(0.0, time.time() - float(phase_anchor_since_ts))
+        except (TypeError, ValueError):
+            phase_anchor_age_s = None
+
+    # --- typed phase fields from the dataclass (populated by the updater) ---
+    typed_phase_is_absolute = bool(getattr(sync, "phase_is_absolute", False))
+    typed_phase_offset_geographic = getattr(sync, "phase_offset_geographic_deg", None)
+    typed_phase_absolute_available = bool(getattr(sync, "phase_absolute_available", False))
+    typed_phase_trust_reason = getattr(sync, "phase_trust_reason", None)
+
+    # Compute phase_absolute_available from phase_offset_geographic_deg when
+    # the typed field is not yet populated (backward compat).
+    if typed_phase_absolute_available:
+        phase_absolute_available = True
+    elif _is_finite_number(typed_phase_offset_geographic):
+        phase_absolute_available = True
+    else:
+        phase_absolute_available = False
+
+    # phase_is_absolute mirrors phase_absolute_available by default.
+    # A deliberately separate trust gate could be added later via a distinct
+    # field (e.g. phase_geographic_trusted), but for now the two are coupled.
+    phase_is_absolute = typed_phase_is_absolute or phase_absolute_available
 
     holdover = bool(getattr(sync, "holdover", False))
     period_s = float(getattr(sync, "period_s", 0.0) or 0.0)
@@ -773,7 +812,11 @@ def _live_sync_state_to_dict(
         "last_handoff_transition_ts": last_handoff_transition_ts,
         "handoff_gate_failures": handoff_gate_failures,
         "phase_basis": phase_basis,
-        "phase_is_absolute": False,
+        "phase_basis": phase_basis,
+        "phase_is_absolute": phase_is_absolute,
+        "phase_absolute_available": phase_absolute_available,
+        "phase_trust_reason": typed_phase_trust_reason,
+        "phase_anchor_age_s": phase_anchor_age_s,
         "phase_status_display": (
             "anchor_trusted" if str(getattr(sync, "phase_status", "") or "") == "trusted" else
             "anchor_provisional" if str(getattr(sync, "phase_status", "") or "") == "provisional" else
@@ -782,7 +825,7 @@ def _live_sync_state_to_dict(
         ),
         "phase_offset_deg": float(getattr(sync, "phase_offset_deg") or 0.0),
         "phase_offset_basis": phase_offset_basis,
-        "phase_offset_geographic_deg": None,
+        "phase_offset_geographic_deg": typed_phase_offset_geographic,
         "phase_anchor_icao": phase_anchor_icao,
         "phase_anchor_status": phase_anchor_status,
         "phase_anchor_score": float(getattr(sync, "phase_anchor_score") or 0.0),
@@ -986,6 +1029,7 @@ def _normalise_phase_fields(payload: dict) -> dict:
     phase_basis = str(payload.get("phase_basis") or "sweep_epoch_only")
     phase_is_absolute = bool(payload.get("phase_is_absolute", False))
     phase_offset_geographic_deg = payload.get("phase_offset_geographic_deg")
+    phase_absolute_available = bool(payload.get("phase_absolute_available", False))
     phase_authority = str(payload.get("phase_authority") or "")
     provided_offset_basis = payload.get("phase_offset_basis")
     warnings = list(payload.get("consistency_warnings") or [])
@@ -1034,11 +1078,25 @@ def _normalise_phase_fields(payload: dict) -> dict:
     if not phase_is_absolute and phase_basis == "geographic" and phase_authority and any(kw in phase_authority.lower() for kw in absolute_authority_keywords):
         pass
 
+    # Enforce phase_absolute_available consistency:
+    # must be True when phase_offset_geographic_deg is finite, False otherwise.
+    geographic_offset_finite = (
+        phase_offset_geographic_deg is not None
+        and _is_finite_number(phase_offset_geographic_deg)
+    )
+    if geographic_offset_finite and not phase_absolute_available:
+        warnings.append("phase_absolute_available_normalised_to_true_geographic_offset_present")
+        phase_absolute_available = True
+    if not geographic_offset_finite and phase_absolute_available:
+        warnings.append("phase_absolute_available_normalised_to_false_no_geographic_offset")
+        phase_absolute_available = False
+
     return {
         **payload,
         "phase_offset_basis": phase_offset_basis,
         "phase_offset_geographic_deg": phase_offset_geographic_deg,
         "phase_is_absolute": phase_is_absolute,
+        "phase_absolute_available": phase_absolute_available,
         "consistency_warnings": warnings,
     }
 

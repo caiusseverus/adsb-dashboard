@@ -175,13 +175,22 @@ def _circular_spread_deg(values: list[float]) -> float | None:
 
 
 def _derive_phase_basis_and_anchor(sync) -> tuple[str, str | None, str]:
-    """Return (phase_basis, phase_anchor_icao, phase_anchor_status) from sync state."""
+    """Return (phase_basis, phase_anchor_icao, phase_anchor_status) from sync state.
+
+    Prefers the typed phase_basis field when available.
+    """
+    typed_basis = getattr(sync, "phase_basis", None)
+    if typed_basis in {"sweep_epoch_only", "anchor_relative", "geographic"}:
+        phase_basis = typed_basis
+    else:
+        phase_anchor_icao: str | None = getattr(sync, "phase_anchor_icao", None)
+        phase_anchor_status: str = str(getattr(sync, "phase_anchor_status", "") or "")
+        if phase_anchor_icao and phase_anchor_status in {"selected", "anchor_only"}:
+            phase_basis = "anchor_relative"
+        else:
+            phase_basis = "sweep_epoch_only"
     phase_anchor_icao: str | None = getattr(sync, "phase_anchor_icao", None)
     phase_anchor_status: str = str(getattr(sync, "phase_anchor_status", "") or "")
-    if phase_anchor_icao and phase_anchor_status in {"selected", "anchor_only"}:
-        phase_basis = "anchor_relative"
-    else:
-        phase_basis = "sweep_epoch_only"
     return phase_basis, phase_anchor_icao, phase_anchor_status
 
 

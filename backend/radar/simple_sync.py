@@ -32,6 +32,44 @@ _SIMPLE_SYNC_FIT_WINDOW_ROTATIONS = 6.0
 _SIMPLE_SYNC_FIT_WINDOW_MIN_S = 30.0
 
 
+def _derive_phase_trust_reason(
+    *,
+    phase_anchor_icao: str | None,
+    phase_anchor_status: str,
+    validation: dict,
+    anchor_selection: dict,
+    phase_status: str,
+) -> str | None:
+    """Derive a compact machine-readable phase_trust_reason string.
+
+    Returns one of:
+      anchor_consistent_with_population
+      anchor_sole_candidate
+      population_demoted
+      stale_anchor
+      no_anchor
+      geographic_solver
+    """
+    if not phase_anchor_icao:
+        return "no_anchor"
+
+    v_status = str(validation.get("status", ""))
+    if v_status in {"population_disagrees", "population_veto"}:
+        return "population_demoted"
+
+    if phase_anchor_status not in {"selected", "anchor_only"}:
+        return "stale_anchor" if phase_anchor_icao else "no_anchor"
+
+    candidate_count = len(anchor_selection.get("candidates") or [])
+    if candidate_count <= 1:
+        return "anchor_sole_candidate"
+
+    if phase_status == "trusted":
+        return "anchor_consistent_with_population"
+
+    return "anchor_sole_candidate"
+
+
 def _fit_weighted_slope(xs: list[float], ys: list[float], ws: list[float]) -> tuple[float, float]:
     """Weighted least-squares linear fit y = a + b*x."""
     n = len(xs)
@@ -585,6 +623,21 @@ def update_simple_live_sync_state(
         prop_delay_enabled=bool(RADAR_SYNC_PROP_DELAY_ENABLED),
         motion_comp_phase_enabled=bool(RADAR_SYNC_MOTION_COMP_PHASE_ENABLED),
         motion_comp_fit_enabled=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
+        phase_basis=(
+            "anchor_relative"
+            if phase_anchor_icao and phase_anchor_status in {"selected", "anchor_only"}
+            else "sweep_epoch_only"
+        ),
+        phase_is_absolute=False,
+        phase_absolute_available=False,
+        phase_offset_geographic_deg=None,
+        phase_trust_reason=_derive_phase_trust_reason(
+            phase_anchor_icao=phase_anchor_icao,
+            phase_anchor_status=phase_anchor_status,
+            validation=validation,
+            anchor_selection=anchor_selection,
+            phase_status=phase_status,
+        ),
     )
     if go_is_operational:
         new_state.period_authority = "go_refined"

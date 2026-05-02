@@ -67,6 +67,12 @@ class LiveSyncState:
     phase_validation_median_error_deg: float | None = None
     phase_validation_status: str = "unavailable"
     phase_anchor_candidates: list[dict] = field(default_factory=list)
+    phase_basis: str | None = None
+    phase_anchor_age_s: float | None = None
+    phase_is_absolute: bool = False
+    phase_absolute_available: bool = False
+    phase_trust_reason: str | None = None
+    phase_offset_geographic_deg: float | None = None
     base_period_s: float | None = None
     period_delta_s: float | None = None
     effective_period_s: float | None = None
