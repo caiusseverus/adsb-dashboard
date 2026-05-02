@@ -4297,3 +4297,96 @@ def test_stage5_only_one_operational_delta_exposed(monkeypatch):
     assert payload["period_authority"] == "go_refined"
     assert payload["period_delta_source"] == "none" or payload["period_delta_source"] == "go_runtime_delta"
     assert payload["py_shadow_period_delta_s"] != payload["period_delta_s"]
+
+
+def test_stage5_serializer_cannot_promote_go_frame_sync_when_flag_false(monkeypatch):
+    """Serializer must NOT auto-promote go_frame_sync to go_refined when
+    RADAR_SYNC_GO_REFINER_OPERATIONAL is False, even if usable=True."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
+    from radar.sync_models import LiveSyncState
+    # Simulate a go_frame_sync state with usable=True but no explicit
+    # period_authority set (the fallback path in the serializer).
+    sync = LiveSyncState(
+        iid=700,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=2000.0,
+        source="go_frame_sync",
+        usable=True,
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["period_authority"] == "py_base"
+    assert payload["sync_authority"] == "py_bootstrap"
+    assert payload["go_refiner_operational_enabled"] is False
+
+
+def test_stage5_serializer_promotes_go_frame_sync_when_flag_true(monkeypatch):
+    """When RADAR_SYNC_GO_REFINER_OPERATIONAL is True, the serializer
+    MAY auto-promote go_frame_sync with usable=True to go_refined."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    from radar.sync_models import LiveSyncState
+    sync = LiveSyncState(
+        iid=701,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=2000.0,
+        source="go_frame_sync",
+        usable=True,
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["period_authority"] == "go_refined"
+    assert payload["sync_authority"] == "go_runtime"
+    assert payload["go_refiner_operational_enabled"] is True
+
+
+def test_stage5_flag_disabled_go_ready_diagnostic_not_operational(monkeypatch):
+    """Full integration: flag false, Go ready - Go stays diagnostic, Python
+    remains operational. Go diagnostic delta does not leak into operational."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
+    state = RadarState()
+    state._models[800] = RadarIID(iid=800, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state.update_go_iid_state(_go_sync_for_gates(800, 4.0))
+    payload = sweep._live_sync_state_to_dict(
+        state.get_live_sync_state(800),
+        go_sync=state.get_go_live_sync_state(800) or {},
+        py_shadow=state.get_py_shadow_sync_state(800),
+        authority_transitions=state.get_period_authority_transitions(800),
+    )
+    assert payload["period_authority"] == "py_base"
+    assert payload["sync_authority"] == "py_bootstrap"
+    assert payload["operational_go_ready"] is False
+    assert payload["go_diagnostic_period_delta_s"] is not None
+    assert payload["period_delta_source"] != "go_runtime_delta"
+    assert payload["effective_period_source"] == "python_simple_sync.period_base_s"
+
+
+def test_stage5_flag_enabled_go_ready_operational_full(monkeypatch):
+    """Full integration: flag true, Go ready - Go is operational authority."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    state._models[801] = RadarIID(iid=801, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state.update_go_iid_state(_go_sync_for_gates(801, 4.0))
+    payload = sweep._live_sync_state_to_dict(
+        state.get_live_sync_state(801),
+        go_sync=state.get_go_live_sync_state(801) or {},
+        py_shadow=state.get_py_shadow_sync_state(801),
+        authority_transitions=state.get_period_authority_transitions(801),
+    )
+    assert payload["period_authority"] == "go_refined"
+    assert payload["sync_authority"] == "go_runtime"
+    assert payload["operational_go_ready"] is True
+    assert payload["handoff_state"] == "GO_REFINED_READY"
+    assert payload["handoff_reason"] == "go_ready"
+    assert payload["go_refiner_operational_enabled"] is True

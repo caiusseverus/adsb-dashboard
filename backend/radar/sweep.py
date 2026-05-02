@@ -551,8 +551,12 @@ def _live_sync_state_to_dict(
 
     if usable:
         if source == "go_frame_sync" and period_authority == "unavailable":
-            period_authority = "go_refined" if effective_period_s is not None else "unavailable"
-            sync_authority = "go_runtime" if effective_period_s is not None else "unavailable"
+            if go_refiner_operational_enabled:
+                period_authority = "go_refined" if effective_period_s is not None else "unavailable"
+                sync_authority = "go_runtime" if effective_period_s is not None else "unavailable"
+            else:
+                period_authority = "py_base" if effective_period_s is not None else "unavailable"
+                sync_authority = "py_bootstrap" if effective_period_s is not None else "unavailable"
             if period_refinement_status is None:
                 period_refinement_status = "stable" if effective_period_s is not None else "unavailable"
         elif source == "multi_aircraft_burst" and period_authority == "unavailable":
@@ -6845,7 +6849,12 @@ class RadarState:
                 "recomputed_df11_residual_observations": [],
                 "residual_chart_default_mode": "recorded",
                 "projection_basis_options": projection_basis_options,
-                "sync_state": _live_sync_state_to_dict(sync) if sync else None,
+                "sync_state": _live_sync_state_to_dict(
+                    sync,
+                    go_sync=go_sync,
+                    py_shadow=self._py_shadow_sync_states.get(iid),
+                    authority_transitions=self._period_authority_transitions.get(iid),
+                ) if sync else None,
                 "window_s": window_s,
                 "per_icao_quality": [],
                 "period_update_history": update_history,
@@ -6905,7 +6914,12 @@ class RadarState:
                     entries,
                     source=residual_source,
                 )
-            sync_state_payload = _live_sync_state_to_dict(sync, go_sync=go_sync)
+            sync_state_payload = _live_sync_state_to_dict(
+                sync,
+                go_sync=go_sync,
+                py_shadow=self._py_shadow_sync_states.get(iid),
+                authority_transitions=self._period_authority_transitions.get(iid),
+            )
             recomputed_observations_by_basis = {
                 "runtime_effective": entries,
             }
@@ -7242,7 +7256,12 @@ class RadarState:
             iid_events=iid_events_for_df11,
             latest_arrival_us=latest_arrival_us_for_iid,
         )
-        sync_state_payload = _live_sync_state_to_dict(sync, go_sync=go_sync)
+        sync_state_payload = _live_sync_state_to_dict(
+            sync,
+            go_sync=go_sync,
+            py_shadow=self._py_shadow_sync_states.get(iid),
+            authority_transitions=self._period_authority_transitions.get(iid),
+        )
         recomputed_observations_by_basis = {
             "runtime_effective": entries,
         }
