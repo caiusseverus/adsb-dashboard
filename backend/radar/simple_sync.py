@@ -584,6 +584,7 @@ def update_simple_live_sync_state(
 
     _update_icao_sync_quality_memory(icao_quality, scored)
 
+    existing_source = getattr(existing, "source", "multi_aircraft_burst") or "multi_aircraft_burst"
     new_state = LiveSyncState(
         iid=iid,
         period_s=refined_period_s,
@@ -592,7 +593,7 @@ def update_simple_live_sync_state(
         sync_quality=q,
         sync_jitter_deg=new_jitter,
         last_sync_update_ts=now_ts,
-        source="multi_aircraft_burst",
+        source=existing_source if existing_source == "go_frame_sync" else "multi_aircraft_burst",
         usable=new_usable,
         residual_ema_deg=new_ema,
         n_sync_frames=existing.n_sync_frames + 1,

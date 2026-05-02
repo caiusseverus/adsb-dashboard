@@ -4271,6 +4271,24 @@ class RadarState:
             last_handoff_transition_ts=getattr(existing, "last_handoff_transition_ts", None) if existing is not None else None,
             handoff_gate_failures=dict(getattr(existing, "handoff_gate_failures", {}) or {}) if existing is not None else {},
         )
+        fit_total = int(go_sync.get("fit_observation_count") or 0)
+        fit_span = float(go_sync.get("fit_span_s") or 0.0)
+        fit_icao = int(go_sync.get("fit_icao_count") or 0)
+        fit_window = self._fit_window_s_for_period(float(effective_period_s))
+        self._append_go_sync_diagnostic_history_locked(
+            iid,
+            msg={
+                "ts": last_updated,
+                "fw": fit_window,
+                "dw": _SYNC_DISPLAY_HISTORY_WINDOW_S,
+                "fs": fit_span,
+                "ft": fit_total,
+                "fe": fit_total,
+                "fc": fit_icao,
+                "rs": float(go_sync.get("residual_slope_deg_per_s") or 0.0),
+            },
+            sync=self._live_sync_states[iid],
+        )
         self._apply_go_handoff_state_locked(iid)
 
     def update_go_iid_state(self, iid_state: dict) -> None:
@@ -5173,7 +5191,7 @@ class RadarState:
             sync = self._live_sync_states.get(iid)
             latest_arrival_us = self._iid_latest_arrival_us.get(iid)
             go_sync = dict(self._go_sync_states_by_iid.get(iid) or {})
-        if sync is None or not getattr(sync, "usable", False):
+        if sync is None or not _finite_positive(getattr(sync, "period_s", None)):
             return
         wall_ts = self._estimate_wall_time_from_arrival_us(arrival_us, latest_arrival_us)
         if wall_ts is None:
@@ -5246,7 +5264,7 @@ class RadarState:
             sync = self._live_sync_states.get(iid)
             go_sync = dict(self._go_sync_states_by_iid.get(iid) or {})
             model = self._models.get(iid)
-        if sync is None or not getattr(sync, "usable", False):
+        if sync is None or not _finite_positive(getattr(sync, "period_s", None)):
             return
         truth_lat = evidence.get("truth_lat")
         truth_lon = evidence.get("truth_lon")
@@ -5330,6 +5348,14 @@ class RadarState:
             dominant_family=bool(evidence.get("dominant_family", False)),
             prefer_go_runtime=True,
         )
+        _obs_geometry_ok = geometry_available and bearing_deg is not None
+        _obs_period_ok = sync is not None and _finite_positive(getattr(sync, "period_s", None))
+        _obs_dominant = bool(evidence.get("sync_eligible", evidence.get("dominant_family", False)))
+        _bridge_aligned = _obs_geometry_ok and _obs_period_ok and _obs_dominant
+        if _bridge_aligned:
+            _aligned_period_s = float(getattr(sync, "period_s", 0.0))
+        else:
+            _aligned_period_s = 0.0
         with self._lock:
             event_buf = self._live_burst_residual_events.setdefault(iid, deque())
             self._append_recorded_event(
@@ -5338,6 +5364,34 @@ class RadarState:
                 event_buf=event_buf,
                 now_ts=float(evidence.get("wall_ts") or time.time()),
             )
+            if _bridge_aligned:
+                self._record_aligned_burst_sync_obs(
+                    iid=iid,
+                    icao=str(evidence.get("icao") or ""),
+                    burst_centroid_us=float(centroid_us),
+                    radar_lat=float(radar_lat),
+                    radar_lon=float(radar_lon),
+                    aircraft_lat=float(truth_lat),
+                    aircraft_lon=float(truth_lon),
+                    n_replies=int(evidence.get("n_replies") or 0),
+                    signal_dbfs=evidence.get("signal_dbfs"),
+                    pos_age_s=float(pos_age_s or 0.0),
+                    period_s=_aligned_period_s,
+                )
+            if _obs_geometry_ok and _obs_period_ok:
+                self._record_aligned_burst_sync_obs(
+                    iid=iid,
+                    icao=str(evidence.get("icao") or ""),
+                    burst_centroid_us=float(centroid_us),
+                    radar_lat=float(radar_lat),
+                    radar_lon=float(radar_lon),
+                    aircraft_lat=float(truth_lat),
+                    aircraft_lon=float(truth_lon),
+                    n_replies=int(evidence.get("n_replies") or 0),
+                    signal_dbfs=evidence.get("signal_dbfs"),
+                    pos_age_s=float(pos_age_s or 0.0),
+                    period_s=_aligned_period_s,
+                )
 
     @staticmethod
     def _score_sync_burst_observation(obs: AlignedBurstSyncObs) -> float:

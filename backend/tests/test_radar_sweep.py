@@ -1005,9 +1005,10 @@ def test_go_evidence_stored_diagnostically_not_as_sync_input(monkeypatch):
     assert list(state._live_aligned_burst_obs.get(7, [])) == []
 
 
-def test_go_burst_fired_does_not_trigger_simple_sync_update(monkeypatch):
-    """Go burst events are diagnostic-only: update_go_burst_fired must never
-    call _update_simple_live_sync_state."""
+def test_go_burst_fired_bridges_into_aligned_obs_and_triggers_solver(monkeypatch):
+    """Go burst events bridge into _live_aligned_burst_obs and trigger
+    _update_simple_live_sync_state when geometry and period are available
+    and the burst is dominant-family."""
     state = RadarState()
     state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=51.0, lon=0.0)
     state._live_sync_states[7] = LiveSyncState(
@@ -1025,8 +1026,8 @@ def test_go_burst_fired_does_not_trigger_simple_sync_update(monkeypatch):
         "df": True, "se": True, "ce": True, "rp": True, "ru": False,
     })
 
-    assert calls == [], "_update_simple_live_sync_state must not be called from Go burst path"
-    assert list(state._live_aligned_burst_obs.get(7, [])) == []
+    assert len(calls) == 1
+    assert len(list(state._live_aligned_burst_obs.get(7, []))) >= 1
 
 
 def test_update_go_burst_fired_stores_go_timing_candidate_flags():
@@ -3323,11 +3324,60 @@ def test_handoff_transition_log_only_on_state_change(caplog):
     assert second_count == 1
 
 
-def test_update_go_burst_fired_does_not_call_python_solver(monkeypatch):
-    """Go burst events are diagnostic-only: the Python sync solver must not be
-    invoked from the Go burst-fired path regardless of sync_eligible flags."""
+def test_update_go_burst_fired_bridges_aligned_obs_and_calls_solver(monkeypatch):
+    """Go burst events bridge into _live_aligned_burst_obs and trigger the
+    Python sync solver when geometry and period are available and the burst is
+    dominant-family."""
     state = RadarState()
     state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=51.0, lon=0.0)
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=0.0,
+        sync_quality=1.0, sync_jitter_deg=3.0, last_sync_update_ts=1_000.0,
+        source="go_frame_sync", usable=True,
+    )
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(state, "_update_simple_live_sync_state",
+                        lambda *a, **kw: calls.append((a, kw)))
+
+    state.update_go_burst_fired({
+        "i": 7, "c": int("AAAAAA", 16), "cu": 4_000_000.0,
+        "n": 4, "s": -15.0, "la": 51.1, "lo": 0.1, "pa": 0.2,
+        "df": True, "se": True,
+    })
+
+    assert len(calls) == 1
+
+
+def test_update_go_burst_fired_does_not_call_solver_for_non_dominant_burst(monkeypatch):
+    """Go burst events: the Python sync solver is not invoked for
+    non-dominant-family bursts."""
+    state = RadarState()
+    state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=51.0, lon=0.0)
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=0.0,
+        sync_quality=1.0, sync_jitter_deg=3.0, last_sync_update_ts=1_000.0,
+        source="go_frame_sync", usable=True,
+    )
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(state, "_update_simple_live_sync_state",
+                        lambda *a, **kw: calls.append((a, kw)))
+
+    state.update_go_burst_fired({
+        "i": 7, "c": int("AAAAAA", 16), "cu": 4_000_000.0,
+        "n": 4, "s": -15.0, "la": 51.1, "lo": 0.1, "pa": 0.2,
+        "df": False, "se": False,
+    })
+
+    assert calls == []
+
+
+def test_update_go_burst_fired_does_not_call_solver_when_geometry_missing(monkeypatch):
+    """Go burst events: the Python sync solver is not invoked when geometry
+    is missing (no radar position or no truth lat/lon)."""
+    state = RadarState()
+    state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=None, lon=None)
     state._live_sync_states[7] = LiveSyncState(
         iid=7, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=0.0,
         sync_quality=1.0, sync_jitter_deg=3.0, last_sync_update_ts=1_000.0,
@@ -4696,3 +4746,318 @@ def test_fit_inlier_ratio_never_outside_zero_one_in_payload():
             assert payload["fit_inlier_ratio"] is None, f"expected None, got {payload['fit_inlier_ratio']}"
         else:
             assert 0.0 <= payload["fit_inlier_ratio"] <= 1.0, f"value {payload['fit_inlier_ratio']} outside [0,1]"
+
+
+# ===========================================================================
+# Go/residual recording and handoff-history bridge tests
+# ===========================================================================
+
+
+def test_go_residual_recording_works_with_usable_false_when_period_valid(monkeypatch):
+    """Go burst-fired residuals are recorded even when sync.usable=False,
+    as long as period_s is finite positive. This enables diagnostic residual
+    chart population before Go becomes operational."""
+    state = RadarState()
+    now_ts = 1_000.0
+    monkeypatch.setattr("radar.sweep.time.time", lambda: now_ts)
+    state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=51.0, lon=0.0)
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=now_ts,
+        source="go_frame_sync",
+        usable=False,
+    )
+
+    state.update_go_burst_fired({
+        "i": 7, "c": int("BBBBBB", 16), "cu": 8_200_000.0,
+        "cw": 8_200_000.0, "n": 4, "s": -15.0,
+        "la": 51.1, "lo": 0.2, "pa": 0.3, "df": True,
+    })
+
+    timeline = state.get_burst_sync_timeline(7, window_s=60.0)
+    recorded = timeline["recorded_observations"]
+    assert len(recorded) == 1
+    assert recorded[0]["event_kind"] == "burst"
+    assert recorded[0]["bearing_deg"] is not None
+    diag = timeline["recorded_event_diagnostics"]
+    assert diag["recorded_burst_event_count_in_window"] == 1
+
+
+def test_go_residual_recording_refuses_when_period_invalid():
+    """Go burst-fired residuals are NOT recorded when sync.period_s is
+    zero or missing, because a period is needed to compute residuals."""
+    state = RadarState()
+    state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=51.0, lon=0.0)
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=0.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=1_000.0,
+        source="go_frame_sync",
+        usable=False,
+    )
+
+    state.update_go_burst_fired({
+        "i": 7, "c": int("BBBBBB", 16), "cu": 8_200_000.0,
+        "cw": 8_200_000.0, "n": 4, "s": -15.0,
+        "la": 51.1, "lo": 0.2, "pa": 0.3, "df": True,
+    })
+
+    timeline = state.get_burst_sync_timeline(7, window_s=60.0)
+    recorded = timeline["recorded_observations"]
+    assert len(recorded) == 0
+
+
+def test_go_iid_state_populates_diagnostic_histories():
+    """update_go_iid_state populates _live_period_history and
+    _live_slope_history via the diagnostic history bridge, so that
+    handoff gates have data to evaluate."""
+    state = RadarState()
+    state._models[77] = RadarIID(iid=77, status="SINGLE_RADAR", period_s=4.0, primary_support_count=6)
+
+    state.update_go_iid_state({
+        "i": 77, "sp": True, "su": True, "sps": 4.0, "sep": 500_000.0, "sod": 12.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2_000.0, "rv": 1,
+        "bps": 4.0, "eps": 4.0, "pag": True,
+        "foc": 92, "fsp": 25.0, "fic": 22, "rsps": 0.02,
+    })
+
+    period_history = list(state._live_period_history.get(77) or [])
+    slope_history = list(state._live_slope_history.get(77) or [])
+
+    assert len(period_history) >= 1
+    assert period_history[-1]["period_base_s"] == pytest.approx(4.0)
+    assert period_history[-1]["source"] == "go_frame_sync"
+
+    assert len(slope_history) >= 1
+    assert slope_history[-1]["residual_slope_deg_per_s"] == pytest.approx(0.02)
+    assert slope_history[-1]["source"] == "go_frame_sync"
+
+
+def test_period_stability_gate_can_pass_after_go_history_bridged():
+    """After Go IID state with fit data bridges diagnostic histories,
+    _evaluate_period_stability_gate_locked can evaluate (pass or fail on
+    stdev) rather than returning insufficient_history.  The gate requires
+    at least _PERIOD_STABILITY_MIN_SAMPLES (3) entries."""
+    state = RadarState()
+    state._models[77] = RadarIID(iid=77, status="SINGLE_RADAR", period_s=4.0, primary_support_count=6)
+
+    base_msg = {
+        "i": 77, "sp": True, "su": True, "sps": 4.0, "sep": 500_000.0, "sod": 12.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2_000.0,
+        "bps": 4.0, "eps": 4.0, "pag": True,
+        "foc": 92, "fsp": 25.0, "fic": 22, "rsps": 0.02,
+    }
+    for rev in (1, 2, 3):
+        state.update_go_iid_state({**base_msg, "rv": rev, "lu": 2_000.0 + rev * 10})
+
+    result = state._evaluate_period_stability_gate_locked(77)
+    assert result["reason"] != "insufficient_history"
+    assert result["passed"] is not None
+
+
+def test_handoff_gate_failures_exposed_in_payload():
+    """When handoff is evaluated, the payload exposes individual gate states
+    with their pass/fail status (not just the aggregate reason)."""
+    state = _make_state_with_stable_history(91)
+    state.update_go_iid_state({
+        "i": 91, "sp": True, "su": True, "sps": 4.0, "sep": 1000.0, "sod": 10.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1,
+        "bps": 4.0, "eps": 4.0, "pag": True,
+    })
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(91))
+    failures = payload.get("handoff_gate_failures") or {}
+
+    assert "go_readiness" in failures
+    go_gates = failures["go_readiness"] or {}
+    assert "go_period_stable" in go_gates
+    assert "go_slope_converged" in go_gates
+
+    period_stable = go_gates.get("go_period_stable", {}) or {}
+    assert period_stable.get("passed") is not None
+    slope_converged = go_gates.get("go_slope_converged", {}) or {}
+    assert slope_converged.get("passed") is not None
+
+    assert "period_stability_state" in payload
+    assert "slope_trend_state" in payload
+    assert "contamination_state" in payload
+
+
+def test_go_burst_aligned_obs_bridge_preserves_source_field(monkeypatch):
+    """When update_simple_live_sync_state runs from Go-bridged observations,
+    the LiveSyncState.source must remain go_frame_sync so that
+    _apply_go_handoff_state_locked continues to evaluate."""
+    state = RadarState()
+    now_ts = 1_000.0
+    monkeypatch.setattr("radar.sweep.time.time", lambda: now_ts)
+    state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=51.0, lon=0.0)
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=now_ts,
+        source="go_frame_sync",
+        usable=True,
+    )
+
+    state.update_go_burst_fired({
+        "i": 7, "c": int("BBBBBB", 16), "cu": 8_200_000.0,
+        "cw": 8_200_000.0, "n": 4, "s": -15.0,
+        "la": 51.1, "lo": 0.2, "pa": 0.3, "df": True,
+    })
+
+    sync = state.get_live_sync_state(7)
+    assert sync is not None
+    assert sync.source == "go_frame_sync"
+
+
+def test_go_path_burst_residual_chart_has_points():
+    """After Go bursts with geometry arrive, the burst residual chart must
+    have non-zero recorded observations."""
+    state = RadarState()
+    state._models[7] = RadarIID(iid=7, status="SINGLE_RADAR", period_s=4.0, lat=51.0, lon=0.0)
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=1_000.0,
+        source="go_frame_sync",
+        usable=False,
+    )
+
+    state.update_go_burst_fired({
+        "i": 7, "c": int("BBBBBB", 16), "cu": 8_200_000.0,
+        "cw": 8_200_000.0, "n": 4, "s": -15.0,
+        "la": 51.1, "lo": 0.2, "pa": 0.3, "df": True,
+    })
+
+    timeline = state.get_burst_sync_timeline(7, window_s=60.0)
+    recorded = timeline["recorded_observations"]
+    assert len(recorded) >= 1
+    assert recorded[0]["residual_deg"] is not None
+    assert abs(float(recorded[0]["residual_deg"])) <= 180.0
+
+
+def test_df11_residual_recording_works_with_usable_false_when_period_valid(monkeypatch):
+    """DF11 individual-event residual recording works even when sync.usable=False,
+    as long as period_s is finite positive and geometry is available."""
+    state = RadarState()
+    state._receiver_lat = 51.0
+    state._receiver_lon = 0.0
+
+    now_ts = 1_000.0
+    monkeypatch.setattr("radar.sweep.time.time", lambda: now_ts)
+
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=now_ts,
+        source="go_frame_sync",
+        usable=False,
+    )
+    state._iid_latest_arrival_us[7] = 4_000_000.0
+
+    state._adsb_tracker.update("AAAAAA", 51.1, 0.1, ts=now_ts - 0.5)
+
+    state._record_df11_residual_snapshot(7, "AAAAAA", 4_000_000.0, -15.0)
+
+    recorded = list(state._live_df11_recorded_residual_events.get(7) or [])
+    assert len(recorded) == 1
+    assert recorded[0]["event_kind"] == "df11"
+    assert recorded[0]["icao"] == "AAAAAA"
+    assert recorded[0]["residual_deg"] is not None
+    assert abs(float(recorded[0]["residual_deg"])) <= 180.0
+
+
+def test_df11_residual_recording_refuses_when_period_invalid(monkeypatch):
+    """DF11 individual-event residual recording refuses when sync.period_s
+    is zero or missing."""
+    state = RadarState()
+    state._receiver_lat = 51.0
+    state._receiver_lon = 0.0
+
+    now_ts = 1_000.0
+    monkeypatch.setattr("radar.sweep.time.time", lambda: now_ts)
+
+    state._live_sync_states[7] = LiveSyncState(
+        iid=7,
+        period_s=0.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=now_ts,
+        source="go_frame_sync",
+        usable=False,
+    )
+    state._adsb_tracker.update("AAAAAA", 51.1, 0.1, ts=now_ts - 0.5)
+
+    state._record_df11_residual_snapshot(7, "AAAAAA", 4_000_000.0, -15.0)
+
+    recorded = list(state._live_df11_recorded_residual_events.get(7) or [])
+    assert len(recorded) == 0
+
+
+def test_contamination_detection_evaluates_from_go_path_residual_events(monkeypatch):
+    """Contamination detection can evaluate from residual events produced by
+    the Go burst path (not blocked by marker=no_recorded_burst_residual_events)."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED", True)
+
+    state = RadarState()
+    now_ts = 1_000.0
+    monkeypatch.setattr("radar.sweep.time.time", lambda: now_ts)
+    state._models[99] = RadarIID(iid=99, status="SINGLE_RADAR", period_s=4.0, lat=51.0, lon=0.0)
+    state._live_sync_states[99] = LiveSyncState(
+        iid=99,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=3.0,
+        last_sync_update_ts=now_ts,
+        source="go_frame_sync",
+        usable=False,
+    )
+
+    burst = {
+        "i": 99, "cu": 8_200_000.0, "cw": 8_200_000.0,
+        "n": 5, "s": -12.0, "la": 51.1, "lo": 0.2, "pa": 0.3, "df": True,
+    }
+    for icao_int, lat_delta in enumerate((0.0, 1.0, 2.0), start=int("AAAAAA", 16)):
+        state.update_go_burst_fired({
+            **burst,
+            "c": icao_int,
+            "la": 51.1 + lat_delta * 0.01,
+            "lo": 0.2 + lat_delta * 0.01,
+        })
+
+    result = state._detect_contamination_locked(99)
+    assert result["state"] != "insufficient_data" or (
+        "no_recorded_burst_residual_events" not in str(result.get("reason") or "")
+    )
+    assert result["total_observations"] >= 1
+
+    # Verify recorded residual events exist (the fix ensures they're populated
+    # even when usable=False)
+    recorded = list(state._live_burst_residual_events.get(99) or [])
+    assert len(recorded) >= 1
