@@ -39,11 +39,11 @@ def _inject_stable_slope_history(state: RadarState, iid: int, near_zero: bool = 
     """Inject slope history so the slope trend gate evaluates rather than returning None."""
     now = time.time()
     if near_zero:
-        # 13 entries spanning 12 s, all |slope| < 0.5
+        # 20 entries spanning ~11 s (tight spacing ensures 9.5 s span in 10 s window)
         entries = [
-            {"ts": now - (12 - i), "residual_slope_deg_per_s": 0.05 * (i % 3 - 1),
+            {"ts": now - 11.0 + i * 0.58, "residual_slope_deg_per_s": 0.05 * (i % 3 - 1),
              "raw_slope_deg_per_s": 0.0, "slope_source": "per_aircraft_consensus"}
-            for i in range(13)
+            for i in range(20)
         ]
     else:
         # 30 entries with flat high-error slope (no convergence)
@@ -53,6 +53,16 @@ def _inject_stable_slope_history(state: RadarState, iid: int, near_zero: bool = 
             for i in range(30)
         ]
     state._live_slope_history[iid] = deque(entries, maxlen=80)
+
+
+def _inject_stable_period_history(state: RadarState, iid: int, period_s: float = 4.0) -> None:
+    """Inject period history so the period stability gate evaluates as pass."""
+    stable_values = [period_s + 0.0001 * (i % 3 - 1) for i in range(10)]
+    state._live_period_history[iid] = deque(
+        [{"ts": float(i), "period_base_s": v, "period_s": v, "period_correction_ppm": 0.0}
+         for i, v in enumerate(stable_values)],
+        maxlen=80,
+    )
 
 
 # ===========================================================================
@@ -80,8 +90,9 @@ def test_go_runtime_becomes_authority_when_all_gates_pass(monkeypatch):
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
     state = _make_state_with_python_model(1002)
-    state.update_go_iid_state(_go_sync_for_gates(1002, 4.0))
+    _inject_stable_period_history(state, 1002, 4.0)
     _inject_stable_slope_history(state, 1002, near_zero=True)
+    state.update_go_iid_state(_go_sync_for_gates(1002, 4.0))
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(1002))
     assert payload["period_authority"] == "go_refined"
     assert payload["sync_authority"] == "go_runtime"
@@ -97,8 +108,9 @@ def test_go_period_authority_without_phase_authority(monkeypatch):
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
     state = _make_state_with_python_model(1010)
-    state.update_go_iid_state(_go_sync_for_gates(1010, 4.0))
+    _inject_stable_period_history(state, 1010, 4.0)
     _inject_stable_slope_history(state, 1010, near_zero=True)
+    state.update_go_iid_state(_go_sync_for_gates(1010, 4.0))
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(1010))
     # Period authority should be Go, but no phase anchor → phase authority not go_runtime.
     assert payload["period_authority"] == "go_refined"
@@ -130,8 +142,9 @@ def _make_go_sync_with_phase(iid: int, period_s: float, anchor_age_s, anchor_sta
 
 def _setup_go_state_for_phase_test(state: RadarState, iid: int, period_s: float,
                                     sync: LiveSyncState) -> None:
-    state.update_go_iid_state(_go_sync_for_gates(iid, period_s))
+    _inject_stable_period_history(state, iid, period_s)
     _inject_stable_slope_history(state, iid, near_zero=True)
+    state.update_go_iid_state(_go_sync_for_gates(iid, period_s))
     with state._lock:
         state._live_sync_states[iid] = sync
     state._apply_go_handoff_state_locked(iid)
@@ -245,8 +258,8 @@ def test_period_stability_gate_fails_with_high_variance():
     assert result["reason"] == "stdev_too_high"
 
 
-def test_period_stability_gate_emits_insufficient_history_not_not_evaluated():
-    """With fewer than 3 samples, gate returns insufficient_history, not not_evaluated."""
+def test_period_stability_gate_emits_insufficient_history_blocking():
+    """With fewer than 3 samples, gate returns insufficient_history with passed=False (blocking)."""
     state = RadarState()
     iid = 2003
     state._live_period_history[iid] = deque(
@@ -254,17 +267,16 @@ def test_period_stability_gate_emits_insufficient_history_not_not_evaluated():
         maxlen=80,
     )
     result = state._evaluate_period_stability_gate_locked(iid)
-    assert result["reason"] != "not_evaluated"
     assert result["reason"] == "insufficient_history"
-    assert result["passed"] is not False  # non-blocking
+    assert result["passed"] is False  # blocking
 
 
 def test_period_stability_gate_insufficient_when_no_history():
-    """Empty history → insufficient_history (non-blocking)."""
+    """Empty history → insufficient_history with passed=False (blocking)."""
     state = RadarState()
     result = state._evaluate_period_stability_gate_locked(9999)
     assert result["reason"] == "insufficient_history"
-    assert result["passed"] is not False
+    assert result["passed"] is False  # blocking
 
 
 # ===========================================================================
@@ -307,13 +319,11 @@ def test_slope_ema_near_zero_sustained_passes():
     state = RadarState()
     iid = 4001
     now = time.time()
-    # 11 entries from now-9.7 to now-0.7 (step ~0.9 s), all near-zero.
-    # Oldest entry is at now-9.7, which is clearly inside the 10 s window and
-    # satisfies the >= 9.5 s span check regardless of sub-millisecond timing drift.
+    # 20 entries spanning ~11 s, all near-zero. Robust against sub-second timing drift.
     entries = [
-        {"ts": now - 9.7 + i * 0.9, "residual_slope_deg_per_s": 0.05 * (i % 3 - 1),
+        {"ts": now - 11.0 + i * 0.58, "residual_slope_deg_per_s": 0.05 * (i % 3 - 1),
          "raw_slope_deg_per_s": 0.0, "slope_source": "per_aircraft_consensus"}
-        for i in range(11)
+        for i in range(20)
     ]
     state._live_slope_history[iid] = deque(entries, maxlen=80)
     result = state._evaluate_slope_trend_gate_locked(iid)
@@ -355,11 +365,11 @@ def test_slope_ema_flat_high_error_fails():
     assert result["reason"] == "slope_not_converged"
 
 
-def test_slope_trend_gate_nonblocking_when_no_history():
-    """Empty slope history returns non-blocking None (not False)."""
+def test_slope_trend_gate_blocking_when_no_history():
+    """Empty slope history returns insufficient_slope_history with passed=False (blocking)."""
     state = RadarState()
     result = state._evaluate_slope_trend_gate_locked(9999)
-    assert result["passed"] is not False
+    assert result["passed"] is False  # blocking
     assert result["reason"] == "insufficient_slope_history"
 
 
@@ -455,6 +465,8 @@ def test_handoff_state_go_refined_ready_flag_disabled(monkeypatch):
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
     state = _make_state_with_python_model(5006)
+    _inject_stable_period_history(state, 5006, 4.0)
+    _inject_stable_slope_history(state, 5006, near_zero=True)
     state.update_go_iid_state(_go_sync_for_gates(5006, 4.0))
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(5006))
     assert payload["handoff_state"] == "GO_REFINED_READY"
@@ -467,8 +479,9 @@ def test_handoff_state_go_refined_ready_operational(monkeypatch):
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
     state = _make_state_with_python_model(5007)
-    state.update_go_iid_state(_go_sync_for_gates(5007, 4.0))
+    _inject_stable_period_history(state, 5007, 4.0)
     _inject_stable_slope_history(state, 5007, near_zero=True)
+    state.update_go_iid_state(_go_sync_for_gates(5007, 4.0))
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(5007))
     assert payload["handoff_state"] == "GO_REFINED_READY"
     assert payload["period_authority"] == "go_refined"
@@ -574,3 +587,134 @@ def test_go_refiner_operational_default_off():
     """RADAR_SYNC_GO_REFINER_OPERATIONAL must default to False."""
     import config as _cfg
     assert getattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False) is False
+
+
+# ===========================================================================
+# 11. Period stability blocks operational Go authority
+# ===========================================================================
+
+def test_insufficient_period_history_blocks_go_runtime(monkeypatch):
+    """RADAR_SYNC_GO_REFINER_OPERATIONAL=True + insufficient period history → sync_authority != go_runtime."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = _make_state_with_python_model(8001)
+    _inject_stable_slope_history(state, 8001, near_zero=True)
+    # No period history injected — go_period_stable gate will fail.
+    state.update_go_iid_state(_go_sync_for_gates(8001, 4.0))
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(8001))
+    assert payload["sync_authority"] != "go_runtime"
+    assert payload["period_authority"] != "go_refined"
+
+
+def test_high_period_variance_blocks_go_runtime(monkeypatch):
+    """RADAR_SYNC_GO_REFINER_OPERATIONAL=True + high period variance → sync_authority != go_runtime."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = _make_state_with_python_model(8002)
+    _inject_stable_slope_history(state, 8002, near_zero=True)
+    # High-variance period history: alternating 3.0 / 5.0 — stdev >> 1% of mean
+    noisy_values = [3.0, 5.0, 3.0, 5.0, 3.0]
+    state._live_period_history[8002] = deque(
+        [{"ts": float(i), "period_base_s": v, "period_s": v, "period_correction_ppm": 0.0}
+         for i, v in enumerate(noisy_values)],
+        maxlen=80,
+    )
+    state.update_go_iid_state(_go_sync_for_gates(8002, 4.0))
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(8002))
+    assert payload["sync_authority"] != "go_runtime"
+    assert payload["period_authority"] != "go_refined"
+
+
+def test_insufficient_slope_history_blocks_go_runtime(monkeypatch):
+    """RADAR_SYNC_GO_REFINER_OPERATIONAL=True + insufficient slope history → sync_authority != go_runtime."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = _make_state_with_python_model(8003)
+    _inject_stable_period_history(state, 8003, 4.0)
+    # No slope history injected — go_slope_converged gate will fail.
+    state.update_go_iid_state(_go_sync_for_gates(8003, 4.0))
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(8003))
+    assert payload["sync_authority"] != "go_runtime"
+    assert payload["period_authority"] != "go_refined"
+
+
+def test_flat_high_error_slope_blocks_go_runtime(monkeypatch):
+    """RADAR_SYNC_GO_REFINER_OPERATIONAL=True + flat high-error slope → sync_authority != go_runtime."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = _make_state_with_python_model(8004)
+    _inject_stable_period_history(state, 8004, 4.0)
+    _inject_stable_slope_history(state, 8004, near_zero=False)  # flat high error
+    state.update_go_iid_state(_go_sync_for_gates(8004, 4.0))
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(8004))
+    assert payload["sync_authority"] != "go_runtime"
+    assert payload["period_authority"] != "go_refined"
+
+
+def test_stable_period_and_converged_slope_enables_go_operational(monkeypatch):
+    """RADAR_SYNC_GO_REFINER_OPERATIONAL=True + stable period + converged slope → go_runtime."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = _make_state_with_python_model(8005)
+    _inject_stable_period_history(state, 8005, 4.0)
+    _inject_stable_slope_history(state, 8005, near_zero=True)
+    state.update_go_iid_state(_go_sync_for_gates(8005, 4.0))
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(8005))
+    assert payload["sync_authority"] == "go_runtime"
+    assert payload["period_authority"] == "go_refined"
+    assert payload["handoff_state"] == "GO_REFINED_READY"
+
+
+def test_gates_reported_diagnostically_when_flag_disabled(monkeypatch):
+    """RADAR_SYNC_GO_REFINER_OPERATIONAL=False: gates reported without changing operational authority."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
+    state = _make_state_with_python_model(8006)
+    _inject_stable_period_history(state, 8006, 4.0)
+    _inject_stable_slope_history(state, 8006, near_zero=True)
+    state.update_go_iid_state(_go_sync_for_gates(8006, 4.0))
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(8006))
+    # Gates are reported diagnostically
+    assert "period_stability_state" in payload
+    assert "slope_trend_state" in payload
+    assert "contamination_state" in payload
+    # Operational authority is NOT changed — stays py
+    assert payload["sync_authority"] != "go_runtime"
+    assert payload["period_authority"] == "py_base"
+    assert payload["handoff_state"] == "GO_REFINED_READY"  # diagnostic, not operational
+
+
+# ===========================================================================
+# 12. population_validation_state=disabled is intentionally non-blocking
+# ===========================================================================
+
+def test_population_validation_disabled_allows_phase_authority(monkeypatch):
+    """population_validation_state=disabled is intentional rollback/degraded mode.
+
+    When RADAR_SYNC_POPULATION_MONITOR_ENABLED=False is set as an explicit
+    operator choice, phase authority is allowed to proceed without population
+    validation.  This is documented in the Phase 2 plan as a conscious
+    rollback/degraded mode, not a missing implementation.
+    """
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = _make_state_with_python_model(9001)
+    sync = LiveSyncState(
+        iid=9001,
+        period_s=4.0, period_base_s=4.0,
+        phase_epoch_us=1000.0, phase_offset_deg=10.0,
+        sync_quality=0.9, sync_jitter_deg=1.0,
+        last_sync_update_ts=time.time(),
+        source="go_frame_sync", usable=True,
+        phase_basis="anchor_relative",
+        phase_anchor_icao="ABCDEF",
+        phase_anchor_status="selected",
+        phase_anchor_age_s=2.0,
+        phase_status="trusted",
+        population_validation_state="disabled",
+    )
+    _setup_go_state_for_phase_test(state, 9001, 4.0, sync)
+    updated = state.get_live_sync_state(9001)
+    # Phase authority proceeds when population monitor is intentionally disabled.
+    assert updated.phase_authority == "go_runtime"
+    assert updated.handoff_state == "GO_REFINED_READY"

@@ -924,7 +924,7 @@ def _live_sync_state_to_dict(
     _py_gates = _hgf.get("python_base", {})
     _go_gates = _hgf.get("go_readiness", {})
     _phase_gates = _hgf.get("phase_readiness", {})
-    _period_stable_gate = _py_gates.get("period_stable", {}) if _py_gates else {}
+    _period_stable_gate = _go_gates.get("go_period_stable", {}) if _go_gates else {}
     payload.update({
         "period_stability_state": (
             "pass"
@@ -3274,24 +3274,27 @@ class RadarState:
     def _evaluate_period_stability_gate_locked(self, iid: int) -> dict:
         """Gate: period_base_s values in _live_period_history must be stable.
 
-        Passes when stdev < 1% of mean across at least _PERIOD_STABILITY_MIN_SAMPLES
-        finite positive samples.  Returns insufficient_history (non-blocking) when
-        fewer than the minimum samples are available.
+        Passes only when rolling_stdev(period_candidates) < 0.01 * mean_period
+        across at least _PERIOD_STABILITY_MIN_SAMPLES finite positive samples.
+        All non-pass states (insufficient_history, stdev_too_high,
+        invalid_period_history) block GO_REFINED_READY and sync_authority=go_runtime.
+
+        This does not prevent frame accumulation or diagnostic Go shadow operation.
         """
         history = self._live_period_history.get(iid)
         if not history:
-            return _gate_value(None, "insufficient_history")
+            return _gate_value(False, "insufficient_history")
         values = [
             float(e["period_base_s"])
             for e in history
             if _finite_positive(e.get("period_base_s"))
         ]
         if len(values) < _PERIOD_STABILITY_MIN_SAMPLES:
-            return _gate_value(None, "insufficient_history")
+            return _gate_value(False, "insufficient_history")
         n = len(values)
         mean = sum(values) / n
         if mean <= 0.0:
-            return _gate_value(None, "insufficient_history")
+            return _gate_value(False, "invalid_period_history")
         variance = sum((v - mean) ** 2 for v in values) / n
         stdev = variance ** 0.5
         if stdev < 0.01 * mean:
@@ -3299,10 +3302,12 @@ class RadarState:
         return _gate_value(False, "stdev_too_high")
 
     def _evaluate_slope_trend_gate_locked(self, iid: int) -> dict:
-        """Gate: residual slope is converging toward zero.
+        """Gate: residual slope EMA is converging toward zero.
 
-        Non-blocking when there is insufficient history (returns None, not False).
-        Returns False only when there is enough history but no convergence signal.
+        All non-pass states (insufficient_slope_history, slope_not_converged,
+        invalid_slope_history) block GO_REFINED_READY and sync_authority=go_runtime.
+
+        This does not prevent frame accumulation or diagnostic Go shadow operation.
 
         Two acceptance conditions:
         1. All entries in the last 10 s have |slope| < 0.5 deg/s and the window
@@ -3312,7 +3317,7 @@ class RadarState:
         """
         history = self._live_slope_history.get(iid)
         if not history:
-            return _gate_value(None, "insufficient_slope_history")
+            return _gate_value(False, "insufficient_slope_history")
 
         now_ts = time.time()
 
@@ -3345,9 +3350,9 @@ class RadarState:
                 if slope_regression < 0 and r_sq >= _SLOPE_TREND_REGRESSION_R2_MIN:
                     return _gate_value(True, "slope_magnitude_decreasing")
 
-        # Insufficient history: non-blocking.
+        # Insufficient history: blocking.
         if len(history) < 2:
-            return _gate_value(None, "insufficient_slope_history")
+            return _gate_value(False, "insufficient_slope_history")
 
         return _gate_value(False, "slope_not_converged")
 
@@ -3367,7 +3372,6 @@ class RadarState:
         if model is not None and _is_finite_number(getattr(model, "primary_confidence", None)):
             confidence_ok = float(model.primary_confidence) >= 0.35
         gates["dominant_confidence"] = _gate_value(confidence_ok, None if confidence_ok is not False else "dominant_period_confidence_low")
-        gates["period_stable"] = self._evaluate_period_stability_gate_locked(iid)
         fresh_data = None
         if sync_is_python and _is_finite_number(getattr(sync, "last_sync_update_ts", None)):
             fresh_data = (now_ts - float(sync.last_sync_update_ts)) <= self._LIVE_SYNC_OBS_RETENTION_S
@@ -3419,6 +3423,7 @@ class RadarState:
         # This will be replaced by real Go contamination detection in Stage 8.
         contamination_stub = "single_family" if present else "insufficient_data"
         gates["go_contamination_state"] = _gate_value(True, contamination_stub)
+        gates["go_period_stable"] = self._evaluate_period_stability_gate_locked(iid)
         gates["go_slope_converged"] = self._evaluate_slope_trend_gate_locked(iid)
         effective = float(go_sync["effective_period_s"]) if present and _finite_positive(go_sync.get("effective_period_s")) else None
         gates["go_effective_period_finite_positive"] = _gate_value(
@@ -3479,6 +3484,12 @@ class RadarState:
         elif pop_state == "fail":
             pop_gate = _gate_value(False, "population_validation_failed")
         elif pop_state == "disabled":
+            # Intentionally non-blocking: RADAR_SYNC_POPULATION_MONITOR_ENABLED=False
+            # is an explicit rollback / degraded-mode setting where phase authority
+            # is allowed to proceed without population validation.  This is a
+            # conscious operator choice, not a missing implementation.  See test
+            # test_population_validation_disabled_allows_phase_authority in
+            # test_stage3r_handoff.py for the contract.
             pop_gate = _gate_value(None, "population_monitor_disabled")  # non-blocking
         else:
             pop_gate = _gate_value(None, "population_validation_unavailable")  # insufficient_data, empty, None

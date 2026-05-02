@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -3292,8 +3293,7 @@ def test_go_handoff_rejects_period_disagreement():
 
 
 def test_go_handoff_allows_period_authority_when_gates_pass():
-    state = RadarState()
-    state._models[33] = RadarIID(iid=33, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state = _make_state_with_stable_history(33)
     state.update_go_iid_state({
         "i": 33, "sp": True, "su": True, "sps": 4.0, "sep": 1000.0, "sod": 10.0,
         "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1, "bps": 4.0, "eps": 4.0, "pag": True,
@@ -3986,13 +3986,49 @@ def _go_sync_for_gates(iid=100, period_s=4.0) -> dict:
     }
 
 
+def _inject_stable_period_history(state: RadarState, iid: int, period_s: float = 4.0) -> None:
+    """Inject period history so the period stability gate evaluates as pass."""
+    stable_values = [period_s + 0.0001 * (i % 3 - 1) for i in range(10)]
+    state._live_period_history[iid] = deque(
+        [{"ts": float(i), "period_base_s": v, "period_s": v, "period_correction_ppm": 0.0}
+         for i, v in enumerate(stable_values)],
+        maxlen=80,
+    )
+
+
+def _inject_stable_slope_history(state: RadarState, iid: int, near_zero: bool = True) -> None:
+    """Inject slope history so the slope trend gate evaluates as pass."""
+    now = time.time()
+    if near_zero:
+        entries = [
+            {"ts": now - 11.0 + i * 0.58, "residual_slope_deg_per_s": 0.05 * (i % 3 - 1),
+             "raw_slope_deg_per_s": 0.0, "slope_source": "per_aircraft_consensus"}
+            for i in range(20)
+        ]
+    else:
+        entries = [
+            {"ts": now - (30 - i), "residual_slope_deg_per_s": 1.5 + 0.05 * (i % 3 - 1),
+             "raw_slope_deg_per_s": 1.5, "slope_source": "per_aircraft_consensus"}
+            for i in range(30)
+        ]
+    state._live_slope_history[iid] = deque(entries, maxlen=80)
+
+
+def _make_state_with_stable_history(iid: int, period_s: float = 4.0) -> RadarState:
+    """Create a state with python model, stable period history, and stable slope history."""
+    state = RadarState()
+    state._models[iid] = RadarIID(iid=iid, status="SINGLE_RADAR", period_s=period_s, primary_support_count=8)
+    _inject_stable_period_history(state, iid, period_s)
+    _inject_stable_slope_history(state, iid, near_zero=True)
+    return state
+
+
 def test_stage5_flag_disabled_go_stays_diagnostic(monkeypatch):
     """With RADAR_SYNC_GO_REFINER_OPERATIONAL=False (default), Go refiner
     remains diagnostic even when readiness gates pass."""
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
-    state = RadarState()
-    state._models[111] = RadarIID(iid=111, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state = _make_state_with_stable_history(111)
     state.update_go_iid_state(_go_sync_for_gates(111, 4.0))
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(111))
     assert payload["period_authority"] == "py_base"
@@ -4008,8 +4044,7 @@ def test_stage5_flag_disabled_go_diagnostic_delta_not_operational(monkeypatch):
     the operational period delta."""
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
-    state = RadarState()
-    state._models[112] = RadarIID(iid=112, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state = _make_state_with_stable_history(112)
     state.update_go_iid_state(_go_sync_for_gates(112, 4.0))
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(112))
     assert payload["period_authority"] == "py_base"
@@ -4024,8 +4059,7 @@ def test_stage5_flag_enabled_go_ready_becomes_operational(monkeypatch):
     GO_REFINED_READY, Go becomes the sole operational period refiner."""
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
-    state = RadarState()
-    state._models[200] = RadarIID(iid=200, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state = _make_state_with_stable_history(200)
     state.update_go_iid_state(_go_sync_for_gates(200, 4.0))
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(200))
     assert payload["period_authority"] == "go_refined"
@@ -4041,8 +4075,7 @@ def test_stage5_flag_enabled_go_ready_effective_equals_base_plus_delta(monkeypat
     Effective = Base + Delta."""
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
-    state = RadarState()
-    state._models[201] = RadarIID(iid=201, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state = _make_state_with_stable_history(201, period_s=4.0)
     state.update_go_iid_state({
         "i": 201, "sp": True, "su": True, "sps": 4.001, "sep": 1000.0, "sod": 10.0,
         "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1,
@@ -4064,8 +4097,7 @@ def test_stage5_flag_enabled_go_ready_effective_period_source_is_go(monkeypatch)
     go_runtime.effective_period_s."""
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
-    state = RadarState()
-    state._models[202] = RadarIID(iid=202, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state = _make_state_with_stable_history(202)
     state.update_go_iid_state(_go_sync_for_gates(202, 4.0))
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(202))
     assert payload["period_authority"] == "go_refined"
@@ -4127,15 +4159,17 @@ def test_stage5_transition_recorded_when_go_becomes_operational(monkeypatch):
     recorded with from/to/reason metadata."""
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
-    state = RadarState()
     # First set up Go not-ready to establish a baseline
+    state = RadarState()
     state._models[400] = RadarIID(iid=400, status="SINGLE_RADAR", period_s=4.0, primary_support_count=6)
     state.update_go_iid_state({
         "i": 400, "sp": True, "su": True, "sps": 4.8, "sep": 1000.0, "sod": 10.0,
         "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1,
         "bps": 4.8, "eps": 4.8, "pag": True,
     })
-    # Now make Go ready
+    # Now make Go ready with stable history
+    _inject_stable_period_history(state, 400, 4.0)
+    _inject_stable_slope_history(state, 400, near_zero=True)
     state.update_go_iid_state(_go_sync_for_gates(400, 4.0))
     payload = sweep._live_sync_state_to_dict(
         state.get_live_sync_state(400),
@@ -4152,8 +4186,7 @@ def test_stage5_transition_recorded_when_go_loses_operational(monkeypatch):
     """When Go loses readiness, the fallback transition is recorded."""
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
-    state = RadarState()
-    state._models[401] = RadarIID(iid=401, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state = _make_state_with_stable_history(401)
     # Make Go operational first
     state.update_go_iid_state(_go_sync_for_gates(401, 4.0))
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(401))
@@ -4178,8 +4211,7 @@ def test_stage5_py_shadow_fields_present_when_go_operational(monkeypatch):
     and Python simple_sync runs."""
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
-    state = RadarState()
-    state._models[500] = RadarIID(iid=500, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state = _make_state_with_stable_history(500)
     state.update_go_iid_state(_go_sync_for_gates(500, 4.0))
     assert state._go_operational_by_iid.get(500, False) is True
     # Simulate Python running and writing shadow data
@@ -4210,8 +4242,7 @@ def test_stage5_shadow_vs_go_comparison_field(monkeypatch):
     is populated when both shadow and Go diagnostic deltas are available."""
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
-    state = RadarState()
-    state._models[501] = RadarIID(iid=501, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state = _make_state_with_stable_history(501)
     state.update_go_iid_state({
         "i": 501, "sp": True, "su": True, "sps": 4.002, "sep": 1000.0, "sod": 10.0,
         "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1,
@@ -4283,8 +4314,7 @@ def test_stage5_only_one_operational_delta_exposed(monkeypatch):
     The Python shadow delta must not appear in the operational triple."""
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
-    state = RadarState()
-    state._models[601] = RadarIID(iid=601, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state = _make_state_with_stable_history(601)
     state.update_go_iid_state(_go_sync_for_gates(601, 4.0))
     state._py_shadow_sync_states[601] = {
         "py_shadow_period_delta_s": 0.001,
@@ -4362,8 +4392,7 @@ def test_stage5_flag_disabled_go_ready_diagnostic_not_operational(monkeypatch):
     remains operational. Go diagnostic delta does not leak into operational."""
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
-    state = RadarState()
-    state._models[800] = RadarIID(iid=800, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state = _make_state_with_stable_history(800)
     state.update_go_iid_state(_go_sync_for_gates(800, 4.0))
     payload = sweep._live_sync_state_to_dict(
         state.get_live_sync_state(800),
@@ -4383,8 +4412,7 @@ def test_stage5_flag_enabled_go_ready_operational_full(monkeypatch):
     """Full integration: flag true, Go ready - Go is operational authority."""
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
-    state = RadarState()
-    state._models[801] = RadarIID(iid=801, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state = _make_state_with_stable_history(801)
     state.update_go_iid_state(_go_sync_for_gates(801, 4.0))
     payload = sweep._live_sync_state_to_dict(
         state.get_live_sync_state(801),
