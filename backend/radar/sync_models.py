@@ -91,6 +91,7 @@ class LiveSyncState:
     fit_retention_window_s: float | None = None
     fit_global_cap_hit: bool = False
     fit_last_eviction_reason: str | None = None
+    fit_inlier_ratio: float | None = None
     suspicious_icao_count: int = 0
     suspicious_icao_last_reason: str | None = None
     slope_ema_deg_per_s: float | None = None

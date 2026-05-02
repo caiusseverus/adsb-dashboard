@@ -397,6 +397,7 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_fit_observation_count": go_payload.get("fit_observation_count"),
         "go_diagnostic_fit_span_s": go_payload.get("fit_span_s"),
         "go_diagnostic_fit_icao_count": go_payload.get("fit_icao_count"),
+        "go_diagnostic_fit_inlier_ratio": go_payload.get("fit_inlier_ratio"),
         "go_diagnostic_fit_observations_per_icao_min": go_payload.get("fit_observations_per_icao_min"),
         "go_diagnostic_fit_observations_per_icao_median": go_payload.get("fit_observations_per_icao_median"),
         "go_diagnostic_fit_observations_per_icao_max": go_payload.get("fit_observations_per_icao_max"),
@@ -3099,6 +3100,10 @@ class RadarState:
                 ),
                 "fit_global_cap_hit": bool(entry.get("fit_global_cap_hit", False)),
                 "fit_last_eviction_reason": str(entry.get("fit_last_eviction_reason") or ""),
+                "fit_inlier_ratio": (
+                    float(entry["fit_inlier_ratio"])
+                    if entry.get("fit_inlier_ratio") is not None else None
+                ),
                 "suspicious_icao_count": int(entry.get("suspicious_icao_count") or 0),
                 "suspicious_icao_last_reason": str(entry.get("suspicious_icao_last_reason") or ""),
                 "residual_slope_deg_per_s": (
@@ -3892,6 +3897,10 @@ class RadarState:
             ),
             fit_global_cap_hit=bool(go_sync.get("fit_global_cap_hit", False)),
             fit_last_eviction_reason=str(go_sync.get("fit_last_eviction_reason") or ""),
+            fit_inlier_ratio=(
+                float(go_sync["fit_inlier_ratio"])
+                if go_sync.get("fit_inlier_ratio") is not None else None
+            ),
             suspicious_icao_count=int(go_sync.get("suspicious_icao_count") or 0),
             suspicious_icao_last_reason=str(go_sync.get("suspicious_icao_last_reason") or ""),
             residual_slope_deg_per_s=float(go_sync.get("residual_slope_deg_per_s") or 0.0),

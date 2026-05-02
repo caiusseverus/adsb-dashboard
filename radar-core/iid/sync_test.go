@@ -1082,3 +1082,112 @@ func TestUpdateEpoch_FreshRefPosition_Accepts(t *testing.T) {
 		t.Errorf("expected accept for fresh refPosAgeS=1s, reject reason=%q", s.LastUpdateEpochRejectReason)
 	}
 }
+
+func TestFitInlierRatio_EmptyFitSet_Sentinel(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	// No observations added yet — FitInlierRatio should be the -1.0 sentinel.
+	if s.FitInlierRatio >= 0.0 {
+		t.Errorf("FitInlierRatio = %.2f after bootstrap, want < 0 (sentinel for no data)", s.FitInlierRatio)
+	}
+}
+
+func TestFitInlierRatio_AllInliers_ReturnsOne(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	// Add 12 hard-inlier observations: |residual| <= 20°, all dominant, fresh positions.
+	for i := 1; i <= 12; i++ {
+		residual := float64(i-6) * 1.5 // range [-7.5, +9.0] — well within 20°
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, residual, 0xAA+uint32(i%4), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	if s.FitInlierRatio <= 0.0 || s.FitInlierRatio > 1.0 {
+		t.Fatalf("FitInlierRatio = %.4f, want > 0 and <= 1", s.FitInlierRatio)
+	}
+	if s.FitInlierRatio < 0.999 {
+		t.Errorf("FitInlierRatio = %.4f with all inliers, want 1.0", s.FitInlierRatio)
+	}
+}
+
+func TestFitInlierRatio_MixedInliersOutliers_Fractional(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	// Use balanced residuals that don't trigger out-of-bounds slope reset.
+	// Hard inliers: |residual| <= 20° (Soft=false).
+	// Soft outliers: 20° < |residual| <= 50° (Soft=true, weight=0.25).
+	// Alternating positive/negative residuals keeps slope near zero.
+	for i := 1; i <= 5; i++ {
+		residual := 5.0 * float64(i%2*2-1) // alternates +5, -5
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, residual, 0xAA+uint32(i), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	for i := 6; i <= 10; i++ {
+		residual := 25.0 * float64(i%2*2-1) // alternates +25, -25
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, residual, 0xAA+uint32(i), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	// expected: 5 inliers / 10 eligible = 0.5
+	expected := 0.5
+	if math.Abs(s.FitInlierRatio-expected) > 0.01 {
+		t.Errorf("FitInlierRatio = %.4f, want %.4f (5 inliers / 10 eligible)", s.FitInlierRatio, expected)
+	}
+}
+
+func TestFitInlierRatio_RejectsExcluded_DenominatorCountsRejects(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	// Add balanced inliers to avoid slope out-of-bounds
+	for i := 1; i <= 4; i++ {
+		residual := 5.0 * float64(i%2*2-1)
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, residual, 0xAA+uint32(i), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	// Add 4 hard-reject observations (|residual| > 50°) — these count toward denominator
+	for i := 5; i <= 8; i++ {
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, 60.0, 0xAA+uint32(i), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	// Expected: 4 inliers / (4 eligible + 4 rejected) = 4/8 = 0.5
+	expected := 0.5
+	if math.Abs(s.FitInlierRatio-expected) > 0.01 {
+		t.Errorf("FitInlierRatio = %.4f, want %.4f (4 inliers / (4+4) total)", s.FitInlierRatio, expected)
+	}
+}
+
+func TestFitInlierRatio_RatioNeverOutsideZeroOne(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	// Add all hard rejects only — no eligible observations
+	for i := 1; i <= 5; i++ {
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, 60.0, 0xAA+uint32(i), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	// With only rejects, eligible = 0 + 5 = 5, inliers = 0, ratio = 0/5 = 0.0
+	if math.Abs(s.FitInlierRatio-0.0) > 0.01 {
+		t.Errorf("FitInlierRatio = %.4f with only rejects, want 0.0", s.FitInlierRatio)
+	}
+	if s.FitInlierRatio < 0.0 || s.FitInlierRatio > 1.0 {
+		t.Errorf("FitInlierRatio = %.4f outside [0.0, 1.0]", s.FitInlierRatio)
+	}
+}
+
+func TestFitInlierRatio_ResetsOnEpochReset(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 10; i++ {
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, 5.0, 0xAA+uint32(i%4), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	if s.FitInlierRatio < 0.0 {
+		t.Fatalf("FitInlierRatio = %.2f after adding observations, want >= 0", s.FitInlierRatio)
+	}
+	s.resetFitEpochLocked("test_reset")
+	if s.FitInlierRatio >= 0.0 {
+		t.Errorf("FitInlierRatio = %.2f after reset, want < 0 (sentinel for no data)", s.FitInlierRatio)
+	}
+}
+
+func TestFitInlierRatio_DebugSnapshotPropagation(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 8; i++ {
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, 5.0, 0xAA+uint32(i%3), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	ratio := s.FitInlierRatio
+	if ratio <= 0.0 || ratio > 1.0 {
+		t.Fatalf("FitInlierRatio = %.4f in SyncState, invalid", ratio)
+	}
+
+	// Verify ratio is accessible via DebugSnapshot (mirrors what Python receives)
+	iid := &IIDState{IID: 3, Sync: s}
+	snap := iid.DebugStateSnapshot()
+	if math.Abs(snap.FitInlierRatio-ratio) > 0.001 {
+		t.Errorf("DebugSnapshot.FitInlierRatio = %.4f, want %.4f (from SyncState)", snap.FitInlierRatio, ratio)
+	}
+}

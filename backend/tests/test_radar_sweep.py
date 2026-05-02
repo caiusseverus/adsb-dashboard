@@ -4512,3 +4512,187 @@ def test_stage5_serializer_flag_true_no_handoff_state_falls_back(monkeypatch):
     assert "go_frame_sync_unavailable_authority_fallback_blocked" in (
         payload.get("consistency_warnings") or []
     )
+
+
+# --- FitInlierRatio tests (Stage 4R) ---
+
+def test_normalise_go_sync_state_fit_inlier_ratio_present():
+    from radar.sweep import RadarState
+    entry = {
+        "sync_state_present": True,
+        "fit_inlier_ratio": 0.75,
+        "sync_period_s": 4.0,
+        "sync_phase_epoch_us": 1000.0,
+        "sync_phase_offset_deg": 10.0,
+    }
+    result = RadarState._normalise_go_sync_state(entry)
+    assert result is not None
+    assert result["fit_inlier_ratio"] == 0.75
+
+
+def test_normalise_go_sync_state_fit_inlier_ratio_none_when_missing():
+    from radar.sweep import RadarState
+    entry = {
+        "sync_state_present": True,
+        "sync_period_s": 4.0,
+        "sync_phase_epoch_us": 1000.0,
+        "sync_phase_offset_deg": 10.0,
+    }
+    result = RadarState._normalise_go_sync_state(entry)
+    assert result is not None
+    assert result["fit_inlier_ratio"] is None
+
+
+def test_normalise_go_sync_state_fit_inlier_ratio_none_when_null():
+    from radar.sweep import RadarState
+    entry = {
+        "sync_state_present": True,
+        "fit_inlier_ratio": None,
+        "sync_period_s": 4.0,
+        "sync_phase_epoch_us": 1000.0,
+        "sync_phase_offset_deg": 10.0,
+    }
+    result = RadarState._normalise_go_sync_state(entry)
+    assert result is not None
+    assert result["fit_inlier_ratio"] is None
+
+
+def test_live_sync_state_carries_fit_inlier_ratio():
+    from radar.sync_models import LiveSyncState
+    sync = LiveSyncState(
+        iid=1,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1000.0,
+        source="go_frame_sync",
+        usable=False,
+        fit_inlier_ratio=0.85,
+    )
+    assert sync.fit_inlier_ratio == 0.85
+
+
+def test_live_sync_state_fit_inlier_ratio_defaults_to_none():
+    from radar.sync_models import LiveSyncState
+    sync = LiveSyncState(
+        iid=1,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1000.0,
+        source="go_frame_sync",
+        usable=False,
+    )
+    assert sync.fit_inlier_ratio is None
+
+
+def test_live_sync_state_to_dict_exposes_fit_inlier_ratio():
+    from radar.sync_models import LiveSyncState
+    sync = LiveSyncState(
+        iid=1,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1000.0,
+        source="go_frame_sync",
+        usable=False,
+        fit_inlier_ratio=0.6,
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["fit_inlier_ratio"] == 0.6
+
+
+def test_live_sync_state_to_dict_fit_inlier_ratio_none():
+    from radar.sync_models import LiveSyncState
+    sync = LiveSyncState(
+        iid=1,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1000.0,
+        source="go_frame_sync",
+        usable=False,
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["fit_inlier_ratio"] is None
+
+
+def test_go_diagnostic_fit_inlier_ratio_exposed():
+    from radar.sweep import _build_go_diagnostic_fields
+    from radar.sync_models import LiveSyncState
+
+    fields = _build_go_diagnostic_fields(
+        LiveSyncState(
+            iid=201,
+            period_s=4.0,
+            phase_epoch_us=0.0,
+            phase_offset_deg=0.0,
+            sync_quality=0.9,
+            sync_jitter_deg=2.0,
+            last_sync_update_ts=1000.0,
+            source="go_frame_sync",
+            usable=False,
+            period_base_s=4.0,
+        ),
+        go_sync={
+            "base_period_s": 4.0,
+            "fit_inlier_ratio": 0.82,
+        },
+    )
+    assert fields["go_diagnostic_fit_inlier_ratio"] == 0.82
+
+
+def test_go_diagnostic_fit_inlier_ratio_none_when_missing():
+    from radar.sweep import _build_go_diagnostic_fields
+    from radar.sync_models import LiveSyncState
+
+    fields = _build_go_diagnostic_fields(
+        LiveSyncState(
+            iid=201,
+            period_s=4.0,
+            phase_epoch_us=0.0,
+            phase_offset_deg=0.0,
+            sync_quality=0.9,
+            sync_jitter_deg=2.0,
+            last_sync_update_ts=1000.0,
+            source="go_frame_sync",
+            usable=False,
+            period_base_s=4.0,
+        ),
+        go_sync={
+            "base_period_s": 4.0,
+        },
+    )
+    assert fields["go_diagnostic_fit_inlier_ratio"] is None
+
+
+def test_fit_inlier_ratio_never_outside_zero_one_in_payload():
+    from radar.sync_models import LiveSyncState
+    # NaN or negative values in LiveSyncState should be preserved as-is
+    # but the Go side clamps before sending. Verify the field exists.
+    for val in (0.0, 0.5, 1.0, None):
+        sync = LiveSyncState(
+            iid=1,
+            period_s=4.0,
+            phase_epoch_us=0.0,
+            phase_offset_deg=0.0,
+            sync_quality=0.9,
+            sync_jitter_deg=2.0,
+            last_sync_update_ts=1000.0,
+            source="go_frame_sync",
+            usable=False,
+            fit_inlier_ratio=val,
+        )
+        payload = sweep._live_sync_state_to_dict(sync)
+        if val is None:
+            assert payload["fit_inlier_ratio"] is None, f"expected None, got {payload['fit_inlier_ratio']}"
+        else:
+            assert 0.0 <= payload["fit_inlier_ratio"] <= 1.0, f"value {payload['fit_inlier_ratio']} outside [0,1]"

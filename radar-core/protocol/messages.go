@@ -183,6 +183,7 @@ type IIDState struct {
 	FitRetentionWindowS             *float64 `codec:"frw"`
 	FitGlobalCapHit                 bool     `codec:"fgh"`
 	FitLastEvictionReason           string   `codec:"fer"`
+	FitInlierRatio                  *float64 `codec:"fir"`
 	SuspiciousICAOCount             uint16   `codec:"sic"`
 	SuspiciousICAOLastReason        string   `codec:"sir"`
 	FitEpochID                      uint32   `codec:"fei"`

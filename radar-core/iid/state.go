@@ -114,6 +114,7 @@ type DebugSnapshot struct {
 	FitRetentionWindowS                      float64
 	FitGlobalCapHit                          bool
 	FitLastEvictionReason                    string
+	FitInlierRatio                           float64
 	SuspiciousICAOCount                      int
 	SuspiciousICAOLastReason                 string
 	ResidualSlopeEMADegPerS                  float64
@@ -851,6 +852,7 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.FitRetentionWindowS = s.Sync.FitRetentionWindowS
 		out.FitGlobalCapHit = s.Sync.FitGlobalCapHit
 		out.FitLastEvictionReason = s.Sync.FitLastEvictionReason
+		out.FitInlierRatio = s.Sync.FitInlierRatio
 		out.SuspiciousICAOCount = s.Sync.SuspiciousICAOCount
 		out.SuspiciousICAOLastReason = s.Sync.SuspiciousICAOLastReason
 		if s.Sync.RefinementLastObservationUnix > 0 {

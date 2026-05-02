@@ -721,6 +721,7 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 			"fit_retention_window_s":                         snap.FitRetentionWindowS,
 			"fit_global_cap_hit":                             snap.FitGlobalCapHit,
 			"fit_last_eviction_reason":                       snap.FitLastEvictionReason,
+			"fit_inlier_ratio":                               snap.FitInlierRatio,
 			"suspicious_icao_count":                          snap.SuspiciousICAOCount,
 			"suspicious_icao_last_reason":                    snap.SuspiciousICAOLastReason,
 			"fit_epoch_id":                                   snap.FitEpochID,
@@ -1046,6 +1047,7 @@ func (e *engine) emitIIDState(iidNum uint8, s *iid.IIDState, nBurstRecords uint1
 		FitRetentionWindowS:             snapFitRetentionWindowS(s),
 		FitGlobalCapHit:                 snapFitGlobalCapHit(s),
 		FitLastEvictionReason:           snapFitLastEvictionReason(s),
+		FitInlierRatio:                  snapFitInlierRatio(s),
 		SuspiciousICAOCount:             snapSuspiciousICAOCount(s),
 		SuspiciousICAOLastReason:        snapSuspiciousICAOLastReason(s),
 		FitEpochID:                      snapFitEpochID(s),
@@ -1249,6 +1251,13 @@ func snapFitRetentionWindowS(s *iid.IIDState) *float64 {
 func snapFitGlobalCapHit(s *iid.IIDState) bool { return s.DebugStateSnapshot().FitGlobalCapHit }
 func snapFitLastEvictionReason(s *iid.IIDState) string {
 	return s.DebugStateSnapshot().FitLastEvictionReason
+}
+func snapFitInlierRatio(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().FitInlierRatio
+	if v < 0.0 {
+		return nil // sentinel for "no data" — Python maps to None
+	}
+	return &v
 }
 func snapSuspiciousICAOCount(s *iid.IIDState) uint16 {
 	v := s.DebugStateSnapshot().SuspiciousICAOCount

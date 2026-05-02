@@ -50,6 +50,7 @@ type SyncState struct {
 	FitLastEvictionReason                    string
 	FitEligibleObservations                  int
 	FitRejectedObservations                  int
+	FitInlierRatio                           float64
 	SuspiciousICAOCount                      int
 	SuspiciousICAOLastReason                 string
 	ResidualSlopeEMADegPerS                  float64
@@ -237,10 +238,11 @@ func NewSyncState(iid uint8, periodS, epochUS, phaseOffsetDeg, quality float64) 
 		PeriodSource:            "df_alignment",
 		PeriodAgreesWithDF:      true,
 		PeriodRefinementStatus:  "base_only",
-			FitRetentionWindowS:     refinementFitWindowS,
-			SlopeSignConvention:     "observed_minus_predicted",
-			HardBoundLimitPPM:       refinementAbsBoundFraction * 1e6,
-			HoldoverReasonCounts:        make(map[string]uint64),
+		FitRetentionWindowS:     refinementFitWindowS,
+		SlopeSignConvention:     "observed_minus_predicted",
+		HardBoundLimitPPM:       refinementAbsBoundFraction * 1e6,
+		FitInlierRatio:          -1.0,
+		HoldoverReasonCounts:        make(map[string]uint64),
 		UpdateEpochRejectCounts:     make(map[string]uint64),
 		icaoRejectHistory:           make(map[uint32][]float64),
 		icaoSuspiciousUntil:         make(map[uint32]float64),
@@ -355,6 +357,7 @@ func (s *SyncState) resetFitEpochLocked(reason string) {
 	s.FitGlobalCapHit = false
 	s.FitLastEvictionReason = ""
 	s.FitEpochResetReason = reason
+	s.FitInlierRatio = -1.0
 	s.fitEpochFirstEpochUS = 0
 	s.fitEpochLastEpochUS = 0
 	s.ProposedDeltaS = 0
@@ -808,6 +811,31 @@ func (s *SyncState) computeFitDistributionLocked() {
 	}
 }
 
+func (s *SyncState) computeFitInlierRatio() {
+	// Hard inliers = observations in residualHistory with Soft=false (|residual| <= 20°)
+	// Soft outliers = observations with Soft=true (20° < |residual| <= 50°)
+	// Hard rejects = observations rejected before entering residualHistory, counted by FitRejectedObservations.
+	// eligible = len(residualHistory) + FitRejectedObservations
+	// fit_inlier_ratio = inlier_count / eligible
+	eligible := len(s.residualHistory) + s.FitRejectedObservations
+	if eligible <= 0 {
+		s.FitInlierRatio = -1.0 // sentinel for "no data" — Python maps this to None
+		return
+	}
+	inlierCount := 0
+	for _, o := range s.residualHistory {
+		if !o.Soft {
+			inlierCount++
+		}
+	}
+	s.FitInlierRatio = float64(inlierCount) / float64(eligible)
+	if s.FitInlierRatio < 0.0 {
+		s.FitInlierRatio = 0.0
+	} else if s.FitInlierRatio > 1.0 {
+		s.FitInlierRatio = 1.0
+	}
+}
+
 func (s *SyncState) markICAORejectLocked(icao uint32, nowS float64, reason string) {
 	if icao == 0 {
 		return
@@ -853,6 +881,7 @@ func (s *SyncState) AddRefinementResidualObservation(
 ) {
 	s.RefinementPlottedCount++
 	s.RefinementLastObservationUnix = float64(time.Now().UnixNano()) / 1e9
+	defer s.computeFitInlierRatio()
 	nowS := s.RefinementLastObservationUnix
 	s.updateSuspiciousCountLocked(nowS)
 	if s.BasePeriodS <= 0 {
