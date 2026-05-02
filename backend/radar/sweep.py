@@ -549,14 +549,52 @@ def _live_sync_state_to_dict(
     elif base_period_s is not None and effective_period_s is not None:
         period_delta_s = effective_period_s - base_period_s
 
+    # Accumulate consistency warnings across the serialisation pass; must
+    # be defined before the if usable: block since the go_frame_sync fallback
+    # path may append to it.
+    consistency_warnings: list[str] = []
+
     if usable:
         if source == "go_frame_sync" and period_authority == "unavailable":
-            if go_refiner_operational_enabled:
-                period_authority = "go_refined" if effective_period_s is not None else "unavailable"
-                sync_authority = "go_runtime" if effective_period_s is not None else "unavailable"
-            else:
+            # No explicit authority was set by _apply_go_handoff_state_locked.
+            # This is a raw/uninitialised Go state; we must decide authority
+            # explicitly rather than silently auto-promoting.
+            if not go_refiner_operational_enabled:
+                # Flag off: Go is diagnostic/shadow only.
                 period_authority = "py_base" if effective_period_s is not None else "unavailable"
                 sync_authority = "py_bootstrap" if effective_period_s is not None else "unavailable"
+                if effective_period_s is not None:
+                    consistency_warnings.append(
+                        "go_frame_sync_unavailable_authority_fallback_py_base_flag_disabled"
+                    )
+            else:
+                # Flag on: evaluate whether Go can become operational even
+                # without an explicit handoff call. This path exists for
+                # states produced outside the normal _ingest → _apply flow.
+                go_effective_finite = (
+                    go_sync is not None
+                    and _finite_positive(go_sync.get("effective_period_s"))
+                ) if go_sync else _finite_positive(effective_period_s)
+                python_base_ok = _finite_positive(base_period_s)
+                not_holdover = not holdover
+                handoff_ready = (
+                    str(getattr(sync, "handoff_state", "") or "") == "GO_REFINED_READY"
+                )
+                gates_ok = (
+                    python_base_ok
+                    and not_holdover
+                    and handoff_ready
+                    and go_effective_finite
+                )
+                if gates_ok:
+                    period_authority = "go_refined"
+                    sync_authority = "go_runtime"
+                else:
+                    period_authority = "py_base" if python_base_ok else "py_bootstrap"
+                    sync_authority = "py_bootstrap"
+                    consistency_warnings.append(
+                        "go_frame_sync_unavailable_authority_fallback_blocked"
+                    )
             if period_refinement_status is None:
                 period_refinement_status = "stable" if effective_period_s is not None else "unavailable"
         elif source == "multi_aircraft_burst" and period_authority == "unavailable":
@@ -637,7 +675,6 @@ def _live_sync_state_to_dict(
         if _is_finite_number(go_effective) and float(go_effective) > 0.0:
             effective_period_s = float(go_effective)
 
-    consistency_warnings: list[str] = []
     if period_authority == "py_base" and effective_period_source.startswith("go_runtime"):
         consistency_warnings.append("operational_effective_period_source_demoted_from_go_runtime_for_py_base")
         effective_period_source = "python_simple_sync.period_base_s"

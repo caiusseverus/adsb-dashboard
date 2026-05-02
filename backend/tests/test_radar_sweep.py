@@ -4326,8 +4326,9 @@ def test_stage5_serializer_cannot_promote_go_frame_sync_when_flag_false(monkeypa
 
 
 def test_stage5_serializer_promotes_go_frame_sync_when_flag_true(monkeypatch):
-    """When RADAR_SYNC_GO_REFINER_OPERATIONAL is True, the serializer
-    MAY auto-promote go_frame_sync with usable=True to go_refined."""
+    """When RADAR_SYNC_GO_REFINER_OPERATIONAL is True AND explicit gates
+    pass (valid base, not holdover, handoff_state=GO_REFINED_READY, finite
+    effective), the serializer MAY promote go_frame_sync to go_refined."""
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
     from radar.sync_models import LiveSyncState
@@ -4342,6 +4343,8 @@ def test_stage5_serializer_promotes_go_frame_sync_when_flag_true(monkeypatch):
         last_sync_update_ts=2000.0,
         source="go_frame_sync",
         usable=True,
+        handoff_state="GO_REFINED_READY",
+        holdover=False,
     )
     payload = sweep._live_sync_state_to_dict(sync)
     assert payload["period_authority"] == "go_refined"
@@ -4390,3 +4393,89 @@ def test_stage5_flag_enabled_go_ready_operational_full(monkeypatch):
     assert payload["handoff_state"] == "GO_REFINED_READY"
     assert payload["handoff_reason"] == "go_ready"
     assert payload["go_refiner_operational_enabled"] is True
+
+
+def test_stage5_serializer_old_bad_path_fully_blocked(monkeypatch):
+    """Directly exercise the old bad path: flag=False, source=go_frame_sync,
+    usable=True, period_authority unset.  Verify period_authority never becomes
+    go_refined, sync_authority never becomes go_runtime, and
+    effective_period_source never becomes go_runtime.effective_period_s."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
+    from radar.sync_models import LiveSyncState
+    sync = LiveSyncState(
+        iid=900,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=2000.0,
+        source="go_frame_sync",
+        usable=True,
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["period_authority"] != "go_refined"
+    assert payload["sync_authority"] != "go_runtime"
+    assert payload["effective_period_source"] != "go_runtime.effective_period_s"
+    assert payload["period_delta_source"] != "go_runtime_delta"
+    assert payload["go_refiner_operational_enabled"] is False
+    assert "go_frame_sync_unavailable_authority_fallback_py_base_flag_disabled" in (
+        payload.get("consistency_warnings") or []
+    )
+
+
+def test_stage5_serializer_flag_true_gates_fail_falls_back(monkeypatch):
+    """Flag=True but gates fail (holdover prevents promotion).
+    Verify the fallback does not leave Go as operational authority."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    from radar.sync_models import LiveSyncState
+    sync = LiveSyncState(
+        iid=901,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=2000.0,
+        source="go_frame_sync",
+        usable=True,
+        holdover=True,
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["period_authority"] != "go_refined"
+    assert payload["sync_authority"] != "go_runtime"
+    assert payload["effective_period_source"] != "go_runtime.effective_period_s"
+    assert "go_frame_sync_unavailable_authority_fallback_blocked" in (
+        payload.get("consistency_warnings") or []
+    )
+
+
+def test_stage5_serializer_flag_true_no_handoff_state_falls_back(monkeypatch):
+    """Flag=True but handoff_state is not GO_REFINED_READY.
+    The raw Go state must not be promoted to go_refined."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    from radar.sync_models import LiveSyncState
+    sync = LiveSyncState(
+        iid=902,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=2000.0,
+        source="go_frame_sync",
+        usable=True,
+        holdover=False,
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["period_authority"] != "go_refined"
+    assert payload["sync_authority"] != "go_runtime"
+    assert "go_frame_sync_unavailable_authority_fallback_blocked" in (
+        payload.get("consistency_warnings") or []
+    )
