@@ -17,6 +17,15 @@ import {
   MESSAGE_FIELD_RENDER_HOLDBACK_US,
   selectMessageFieldEvents,
 } from '../utils/messageField'
+import {
+  humanizeSyncReason,
+  formatAuthorityLabel,
+  collectBlockingHandoffGates,
+  authorityModeLabel,
+  getOperationalPeriodTriple,
+  isFiniteValue,
+  fmtNumber,
+} from '../utils/radarSync'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
 const RADAR_SYNC_WS_BASE = import.meta.env.PROD
@@ -2160,32 +2169,6 @@ const legendDotStyle = {
   display: 'inline-block',
 }
 
-function humanizeSyncReason(value) {
-  if (!value) return '—'
-  return String(value).replaceAll('_', ' ')
-}
-
-function formatAuthorityLabel(value) {
-  if (!value) return 'unavailable'
-  return String(value).replaceAll('_', ' ')
-}
-
-function collectBlockingHandoffGates(syncState) {
-  const failures = syncState?.handoff_gate_failures
-  if (!failures || typeof failures !== 'object') return []
-  const blocking = []
-  Object.entries(failures).forEach(([groupName, groupValue]) => {
-    if (!groupValue || typeof groupValue !== 'object') return
-    Object.entries(groupValue).forEach(([gateName, gateState]) => {
-      if (!gateState || typeof gateState !== 'object') return
-      if (gateState.passed === false) {
-        blocking.push(`${groupName}.${gateName}`)
-      }
-    })
-  })
-  return blocking
-}
-
 function phaseStatusDisplayLabel(value) {
   switch (value) {
     case 'trusted': return 'anchor_trusted'
@@ -2193,33 +2176,6 @@ function phaseStatusDisplayLabel(value) {
     case 'untrusted': return 'anchor_untrusted'
     default: return 'unavailable'
   }
-}
-
-function authorityModeLabel(syncState) {
-  if (!syncState) return 'unavailable'
-  const periodAuthority = String(syncState.period_authority ?? '').toLowerCase()
-  if (periodAuthority === 'holdover') return 'holdover'
-  if (periodAuthority === 'py_base') return 'Python base/bootstrap'
-  if (periodAuthority === 'py_refined') return 'Python refined'
-  if (periodAuthority === 'go_refined') return 'Go refined/runtime'
-  return 'unavailable'
-}
-
-function getOperationalPeriodTriple(syncState) {
-  if (!syncState) return null
-  const baseRaw = syncState.base_period_s
-  const deltaRaw = syncState.period_delta_s
-  const effectiveRaw = syncState.effective_period_s
-  if (![baseRaw, deltaRaw, effectiveRaw].every(isFiniteValue)) return null
-  const base = Number(baseRaw)
-  const delta = Number(deltaRaw)
-  const effective = Number(effectiveRaw)
-  if ([base, delta, effective].every(Number.isFinite)) return { base, delta, effective }
-  return null
-}
-
-function isFiniteValue(value) {
-  return value !== null && value !== undefined && Number.isFinite(Number(value))
 }
 
 function SyncModeStatusPanel({
@@ -2284,6 +2240,16 @@ function SyncModeStatusPanel({
             </span></span>
             <span className={styles.metricPill}>Operational refinement <span className={styles.metricValue}>{formatAuthorityLabel(syncState.operational_period_refinement_status)}</span></span>
           </div>
+          {!operationalPeriod && (isFiniteValue(syncState.base_period_s) || isFiniteValue(syncState.period_delta_s) || isFiniteValue(syncState.effective_period_s)) && (
+            <div style={{ marginTop: '6px', paddingTop: '6px', borderTop: '1px solid #30363d' }}>
+              <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Retained diagnostic values</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+                <span className={styles.metricPill}>Retained base <span className={styles.metricValue}>{fmtNumber(syncState.base_period_s, 4, 's')}</span></span>
+                <span className={styles.metricPill}>Retained Δ <span className={styles.metricValue}>{fmtNumber(isFiniteValue(syncState.period_delta_s) ? Number(syncState.period_delta_s) * 1000 : null, 2, 'ms')}</span></span>
+                <span className={styles.metricPill}>Retained effective <span className={styles.metricValue}>{fmtNumber(syncState.effective_period_s, 4, 's')}</span></span>
+              </div>
+            </div>
+          )}
           <div style={{ color: '#8b949e', fontSize: '0.72rem', lineHeight: 1.45 }}>
             {syncState.operational_refinement_unavailable_reason
               ? `Operational refinement unavailable: ${humanizeSyncReason(syncState.operational_refinement_unavailable_reason)}. `
@@ -2576,11 +2542,6 @@ function PhaseAnchorPanel({ syncState, observations, candidates }) {
       </div>
     </div>
   )
-}
-
-function fmtNumber(value, digits = 2, suffix = '') {
-  const n = Number(value)
-  return Number.isFinite(n) ? `${n.toFixed(digits)}${suffix}` : '-'
 }
 
 function RotationAlignmentPanel({

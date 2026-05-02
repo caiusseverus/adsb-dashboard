@@ -210,3 +210,31 @@ Verification:
 
 Residual risk:
 - `backend/tests/test_radar_api.py::test_manual_position_controls_persist_and_lock` is currently hanging in this environment and was excluded from the focused sync-semantics verification scope; this appears pre-existing and unrelated to sync authority/refiner semantics.
+
+## 2026-05-02 Sync Source Operational State Card — Retained Value Isolation
+
+- [x] Extract pure sync helper functions from RadarPage.jsx into testable utility module.
+- [x] Modify `getOperationalPeriodTriple` to return null when `period_authority` is not operational (`holdover`, `unavailable`, etc.).
+- [x] Update Current operational state card to show Base/Δ/Effective as unavailable when authority is not operational.
+- [x] Add a separately labelled retained-diagnostic subsection inside Current operational state card for last-known raw values (only when authority is not operational but raw values exist).
+- [x] Ensure Go diagnostic refiner card continues to show retained/proposed/applied Go deltas unchanged.
+- [x] Add frontend/static test using Node built-in test runner covering operational triple authority gating and retained Go delta visibility.
+- [x] Run frontend build and static test verification.
+
+Plan confirmation:
+- Scope is limited to frontend rendering logic and helper functions; no backend or Go core changes.
+- Operational period triple must gate on `py_base` / `py_refined` / `go_refined` only.
+- Retained values may be shown in a diagnostic subsection, never as operational.
+
+Review:
+- Extracted `humanizeSyncReason`, `formatAuthorityLabel`, `collectBlockingHandoffGates`, `authorityModeLabel`, `getOperationalPeriodTriple`, `isFiniteValue`, and `fmtNumber` into `frontend/src/utils/radarSync.js`.
+- `getOperationalPeriodTriple` now gates on `period_authority` being `py_base`, `py_refined`, or `go_refined`; returns `null` for `holdover`, `unavailable`, or any other non-operational authority.
+- Fixed latent `fmtNumber` bug where `null` was coerced to `0` via `Number(null)`; now explicitly returns `'-'` for `null`/`undefined`.
+- Current operational state card renders Base/Δ/Effective as `'-'` when authority is not operational.
+- Added a "Retained diagnostic values" subsection inside Current operational state card that conditionally shows last-known base/Δ/effective when authority is non-operational but raw values are still finite.
+- Go diagnostic refiner card is untouched and continues to show retained/proposed/applied Go deltas.
+
+Verification:
+- `cd frontend && npm run test:static` — 5 tests pass
+- `cd frontend && npm run build` — builds cleanly
+- `uv run --directory backend pytest tests/test_radar_ui_labels.py -q` — 11 passed
