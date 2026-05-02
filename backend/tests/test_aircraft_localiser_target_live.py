@@ -28,6 +28,9 @@ from radar.aircraft_localiser import (
     REASON_NO_FORWARD_INTERSECTIONS,
     REASON_NO_ELIGIBLE_RADARS,
     REASON_NO_SYNC,
+    REASON_PHASE_BASIS_ANCHOR_RELATIVE,
+    REASON_PHASE_BASIS_SWEEP_EPOCH_ONLY,
+    REASON_PHASE_NOT_GEOGRAPHIC,
     REASON_STALE_OBSERVATION,
     REASON_SYNC_QUALITY_LOW,
     _ray_intersection_enu,
@@ -249,11 +252,12 @@ def test_one_observation_per_radar_newest_wins():
 
     sel = loc.select_authoritative_observations("ABC", None, now)
     accepted = sel["accepted"]
-    assert len(accepted) == 2
-    by_iid = {o.iid: o for o in accepted}
-    assert by_iid[1].arrival_us == 999_999_999.0
-    assert by_iid[2].arrival_us == 888_888_888.0
-    assert sel["per_radar_reasons"] == {}
+    # Both radars have anchor_relative phase → rejected by geographic phase gate
+    assert len(accepted) == 0
+    assert sel["per_radar_reasons"] == {
+        1: REASON_PHASE_BASIS_ANCHOR_RELATIVE,
+        2: REASON_PHASE_BASIS_ANCHOR_RELATIVE,
+    }
 
 
 def test_stage3_selection_ignores_go_frame_sync_states():
@@ -292,10 +296,12 @@ def test_stale_observation_produces_rejected_ray_not_accepted():
     loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
 
     sel = loc.select_authoritative_observations("ABC", None, now)
-    assert {o.iid for o in sel["accepted"]} == {2}
-    assert sel["per_radar_reasons"].get(1) == REASON_STALE_OBSERVATION
-    assert len(sel["rejected_rays"]) == 1
-    assert sel["rejected_rays"][0].rejection_reason == REASON_STALE_OBSERVATION
+    # Both radars have anchor_relative phase → rejected by geographic phase gate.
+    # Phase gate rejects before per-observation logic (stale gating, ray construction).
+    assert sel["accepted"] == []
+    assert sel["per_radar_reasons"][1] == REASON_PHASE_BASIS_ANCHOR_RELATIVE
+    assert sel["per_radar_reasons"][2] == REASON_PHASE_BASIS_ANCHOR_RELATIVE
+    assert len(sel["rejected_rays"]) == 0
 
 
 def test_display_set_matches_solver_input_set():
@@ -316,11 +322,13 @@ def test_display_set_matches_solver_input_set():
     loc._solve_for_icao("ABC")
 
     current_rays = loc._current_rays_by_icao.get("ABC", [])
-    # Display layer: exactly one ray per radar.
-    assert len({r.iid for r in current_rays}) == len(current_rays)
-    # And arrival_us for IID 1 must be the newest (wall_ts=now-0.2 → arrival_us match).
-    by_iid = {r.iid: r for r in current_rays}
-    assert by_iid[1].arrival_us == pytest.approx((now - 0.2) * 1e6)
+    # All radars have anchor_relative phase → geographic phase gate rejects
+    # before any ray construction, so no display rays are produced.
+    assert current_rays == []
+    rejected = loc._current_rejected_rays_by_icao.get("ABC", [])
+    assert rejected == []
+    reasons = loc._last_rejection_reasons_by_icao["ABC"]
+    assert reasons["global"] == REASON_PHASE_BASIS_ANCHOR_RELATIVE
 
 
 def test_no_mutation_of_shared_sync_jitter():
@@ -366,10 +374,10 @@ def test_rejected_ray_buffer_populated_when_only_stale():
     assert fix is None
     assert len(loc._current_rays_by_icao.get("ABC", [])) == 0
     rejected = loc._current_rejected_rays_by_icao.get("ABC", [])
-    assert len(rejected) == 2
-    assert all(r.rejection_reason == REASON_STALE_OBSERVATION for r in rejected)
+    # Geographic phase gate rejects anchor_relative before ray construction.
+    assert len(rejected) == 0
     reasons = loc._last_rejection_reasons_by_icao["ABC"]
-    assert reasons["global"] is not None
+    assert reasons["global"] == REASON_PHASE_BASIS_ANCHOR_RELATIVE
 
 
 def test_fix_history_exposed_in_evidence():
@@ -542,11 +550,10 @@ def test_bearing_truth_mismatch_rejected():
     loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
 
     sel = loc.select_authoritative_observations("XYZ", None, now)
+    # Anchor_relative phase → geographic phase gate rejects before bearing-truth gate.
     assert sel["accepted"] == []
-    assert sel["per_radar_reasons"].get(1) == REASON_BEARING_TRUTH_MISMATCH
-    assert len(sel["rejected_rays"]) == 1
-    assert sel["rejected_rays"][0].rejection_reason == REASON_BEARING_TRUTH_MISMATCH
-    assert sel["rejected_rays"][0].iid == 1
+    assert sel["per_radar_reasons"].get(1) == REASON_PHASE_BASIS_ANCHOR_RELATIVE
+    assert len(sel["rejected_rays"]) == 0
 
 
 def test_bearing_truth_mismatch_not_applied_to_stale_truth():
@@ -572,9 +579,9 @@ def test_bearing_truth_mismatch_not_applied_to_stale_truth():
     loc = _make_localiser(FakeRadarState(models, syncs, det_by_icao))
 
     sel = loc.select_authoritative_observations("XYZ", None, now)
-    # Should be accepted because position_age is too old for the gate to fire.
-    assert len(sel["accepted"]) == 1
-    assert sel["per_radar_reasons"] == {}
+    # Anchor_relative phase → geographic phase gate rejects; bearing-truth gate never reached.
+    assert sel["accepted"] == []
+    assert sel["per_radar_reasons"].get(1) == REASON_PHASE_BASIS_ANCHOR_RELATIVE
 
 
 # ---------------------------------------------------------------------------
@@ -628,4 +635,4 @@ def test_solve_for_icao_global_reason_uses_derive():
     fix = loc._solve_for_icao("ABC")
     assert fix is None
     reasons = loc._last_rejection_reasons_by_icao["ABC"]
-    assert reasons["global"] == REASON_STALE_OBSERVATION
+    assert reasons["global"] == REASON_PHASE_BASIS_ANCHOR_RELATIVE

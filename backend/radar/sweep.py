@@ -748,6 +748,12 @@ def _live_sync_state_to_dict(
     elif not operational_has_python_fit and period_authority in {"py_base", "py_refined"}:
         operational_refinement_unavailable_reason = "python_fit_state_not_live"
 
+    phase_offset_basis = {
+        "sweep_epoch_only": "sweep_epoch",
+        "anchor_relative": "anchor_relative",
+        "geographic": "geographic",
+    }.get(phase_basis, "unavailable")
+
     payload.update({
         "base_period_s": base_period_s,
         "period_delta_s": period_delta_s,
@@ -774,6 +780,7 @@ def _live_sync_state_to_dict(
             "unavailable"
         ),
         "phase_offset_deg": float(getattr(sync, "phase_offset_deg") or 0.0),
+        "phase_offset_basis": phase_offset_basis,
         "phase_offset_geographic_deg": None,
         "phase_anchor_icao": phase_anchor_icao,
         "phase_anchor_status": phase_anchor_status,
@@ -979,7 +986,10 @@ def _normalise_phase_fields(payload: dict) -> dict:
     phase_is_absolute = bool(payload.get("phase_is_absolute", False))
     phase_offset_geographic_deg = payload.get("phase_offset_geographic_deg")
     phase_authority = str(payload.get("phase_authority") or "")
+    provided_offset_basis = payload.get("phase_offset_basis")
     warnings = list(payload.get("consistency_warnings") or [])
+
+    valid_offset_bases = {"sweep_epoch", "anchor_relative", "geographic", "unavailable"}
 
     if phase_basis == "sweep_epoch_only":
         phase_offset_basis = "sweep_epoch"
@@ -990,9 +1000,25 @@ def _normalise_phase_fields(payload: dict) -> dict:
     else:
         phase_offset_basis = "unavailable"
 
+    if provided_offset_basis is not None and str(provided_offset_basis) != phase_offset_basis:
+        warnings.append(
+            "phase_offset_basis_mismatch_normalised_from_"
+            + str(provided_offset_basis)
+            + "_to_"
+            + phase_offset_basis
+        )
+
+    if provided_offset_basis is not None and str(provided_offset_basis) not in valid_offset_bases:
+        warnings.append(
+            "phase_offset_basis_invalid_normalised_from_"
+            + str(provided_offset_basis)
+            + "_to_"
+            + phase_offset_basis
+        )
+
     if phase_is_absolute and phase_basis != "geographic":
-        phase_is_absolute = False
         warnings.append("phase_is_absolute_normalised_to_false_not_geographic")
+        phase_is_absolute = False
 
     if phase_basis != "geographic" or not phase_is_absolute:
         phase_offset_geographic_deg = None
@@ -1001,9 +1027,11 @@ def _normalise_phase_fields(payload: dict) -> dict:
         phase_is_absolute = False
 
     absolute_authority_keywords = ("go_runtime", "geographic", "trusted")
-    if phase_is_absolute and not any(kw in phase_authority.lower() for kw in absolute_authority_keywords):
-        if phase_basis != "geographic":
-            warnings.append("phase_authority_phase_basis_mismatch")
+    if phase_is_absolute and phase_basis == "geographic" and not any(kw in phase_authority.lower() for kw in absolute_authority_keywords):
+        warnings.append("phase_authority_phase_basis_mismatch")
+
+    if not phase_is_absolute and phase_basis == "geographic" and phase_authority and any(kw in phase_authority.lower() for kw in absolute_authority_keywords):
+        pass
 
     return {
         **payload,

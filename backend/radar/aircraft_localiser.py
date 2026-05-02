@@ -92,6 +92,11 @@ REASON_POOR_GEOMETRY = "poor_geometry"
 REASON_NO_ELIGIBLE_RADARS = "no_eligible_radars"
 REASON_ABSOLUTE_PHASE_UNTRUSTED = "absolute_phase_untrusted"
 REASON_BEARING_TRUTH_MISMATCH = "bearing_truth_mismatch"
+REASON_PHASE_NOT_GEOGRAPHIC = "phase_not_geographic"
+REASON_PHASE_BASIS_SWEEP_EPOCH_ONLY = "phase_basis_sweep_epoch_only"
+REASON_PHASE_BASIS_ANCHOR_RELATIVE = "phase_basis_anchor_relative"
+REASON_PHASE_ABSOLUTE_FALSE = "phase_absolute_false"
+REASON_PHASE_OFFSET_GEOGRAPHIC_UNAVAILABLE = "phase_offset_geographic_unavailable"
 
 # Weight floor (prevents single observation from dominating)
 _MIN_OBS_WEIGHT = 0.01
@@ -1113,10 +1118,81 @@ class AircraftLocaliser:
         Only the Python simple sync model (source == "multi_aircraft_burst") can
         supply a trusted phase.  Trust is determined solely by phase_status;
         heuristic fallbacks and Go-sourced sync are not accepted.
+
+        Deprecated in Stage 6: use _sync_state_has_geographic_phase() for
+        geographic/localisation consumers. This method remains for backward
+        compatibility with anchor-relative diagnostics.
         """
         if getattr(sync_state, "source", None) != "multi_aircraft_burst":
             return False
         return getattr(sync_state, "phase_status", "untrusted") == "trusted"
+
+    @staticmethod
+    def _derive_phase_basis(sync_state) -> str:
+        """Derive the canonical phase basis from a LiveSyncState.
+
+        Mirrors the logic in _live_sync_state_to_dict() to ensure consistency
+        between serialisation and downstream gating.
+        """
+        phase_anchor_icao = getattr(sync_state, "phase_anchor_icao", None)
+        phase_anchor_status = str(getattr(sync_state, "phase_anchor_status", "") or "")
+        if phase_anchor_icao and phase_anchor_status in {"selected", "anchor_only"}:
+            return "anchor_relative"
+        return "sweep_epoch_only"
+
+    @staticmethod
+    def _sync_state_has_geographic_phase(sync_state, sync_state_dict: dict | None = None) -> tuple[bool, str | None]:
+        """Return (True, None) if sync state carries a geographic phase suitable
+        for bearing-ray / localisation consumption.
+
+        Accepts an optional pre-serialised sync_state_dict to check
+        phase_is_absolute without requiring the field on the dataclass.
+
+        Returns (False, reason) when geographic phase is unavailable.
+        Reasons are one of:
+          phase_not_geographic
+          phase_basis_sweep_epoch_only
+          phase_basis_anchor_relative
+          phase_absolute_false
+          phase_offset_geographic_unavailable
+        """
+        if sync_state is None:
+            return False, "phase_not_geographic"
+
+        phase_basis = sync_state_dict.get("phase_basis") if sync_state_dict is not None else None
+        if phase_basis is None:
+            phase_basis = AircraftLocaliser._derive_phase_basis(sync_state)
+
+        if phase_basis == "sweep_epoch_only":
+            return False, REASON_PHASE_BASIS_SWEEP_EPOCH_ONLY
+
+        if phase_basis == "anchor_relative":
+            return False, REASON_PHASE_BASIS_ANCHOR_RELATIVE
+
+        if phase_basis != "geographic":
+            return False, REASON_PHASE_NOT_GEOGRAPHIC
+
+        phase_is_absolute = False
+        if sync_state_dict is not None:
+            phase_is_absolute = bool(sync_state_dict.get("phase_is_absolute", False))
+        else:
+            phase_is_absolute = bool(getattr(sync_state, "phase_is_absolute", False))
+
+        if not phase_is_absolute:
+            return False, REASON_PHASE_ABSOLUTE_FALSE
+
+        if sync_state_dict is not None:
+            geographic_offset = sync_state_dict.get("phase_offset_geographic_deg")
+            if geographic_offset is None:
+                return False, REASON_PHASE_OFFSET_GEOGRAPHIC_UNAVAILABLE
+            try:
+                float_val = float(geographic_offset)
+                if not math.isfinite(float_val):
+                    return False, REASON_PHASE_OFFSET_GEOGRAPHIC_UNAVAILABLE
+            except (TypeError, ValueError):
+                return False, REASON_PHASE_OFFSET_GEOGRAPHIC_UNAVAILABLE
+
+        return True, None
 
     @staticmethod
     def _bearing_matches_current_truth(
@@ -1149,6 +1225,11 @@ class AircraftLocaliser:
             return next(iter(reasons))
         priority = [
             REASON_BEARING_TRUTH_MISMATCH,
+            REASON_PHASE_NOT_GEOGRAPHIC,
+            REASON_PHASE_BASIS_SWEEP_EPOCH_ONLY,
+            REASON_PHASE_BASIS_ANCHOR_RELATIVE,
+            REASON_PHASE_ABSOLUTE_FALSE,
+            REASON_PHASE_OFFSET_GEOGRAPHIC_UNAVAILABLE,
             REASON_ABSOLUTE_PHASE_UNTRUSTED,
             REASON_STALE_OBSERVATION,
             REASON_SYNC_QUALITY_LOW,
@@ -1231,6 +1312,16 @@ class AircraftLocaliser:
 
             if not self._sync_state_has_trusted_absolute_phase(sync_state):
                 per_radar_reasons[iid] = REASON_ABSOLUTE_PHASE_UNTRUSTED
+                continue
+
+            # Stage 6 geographic-phase gate: localisation/ray generation must
+            # reject sweep-relative and anchor-relative phase.  Only a
+            # validated geographic beam direction (phase_basis == geographic,
+            # phase_is_absolute == True) is acceptable for bearing-ray
+            # construction.
+            geo_ok, geo_reason = self._sync_state_has_geographic_phase(sync_state)
+            if not geo_ok:
+                per_radar_reasons[iid] = geo_reason or REASON_PHASE_NOT_GEOGRAPHIC
                 continue
 
             # Pull all recent detections for this ICAO from the shared buffer.
