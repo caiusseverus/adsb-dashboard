@@ -146,6 +146,15 @@ class LiveSyncState:
     update_epoch_last_strict_gate_pass: bool | None = None
     population_validation_state: str | None = None  # "pass" | "fail" | "insufficient_data" | "disabled"
     population_validation_reason: str | None = None  # compact reason string
+    contamination_state: str | None = None  # "single_family" | "contaminated" | "insufficient_data" | "disabled"
+    contamination_reason: str | None = None  # compact decision explanation
+    contamination_total_observations: int = 0
+    contamination_distinct_icaos: int = 0
+    contamination_primary_observations: int = 0
+    contamination_secondary_observations: int = 0
+    contamination_secondary_icaos: int = 0
+    contamination_family_separation_deg: float | None = None
+    contamination_secondary_support_ratio: float | None = None
 
 
 @dataclass

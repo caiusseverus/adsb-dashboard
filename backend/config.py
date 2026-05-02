@@ -255,6 +255,11 @@ RADAR_SYNC_GO_REFINER_OPERATIONAL: bool = _bool("RADAR_SYNC_GO_REFINER_OPERATION
 # Default True: the demotion path was already wired before this flag existed,
 # so True preserves existing runtime behaviour and adds hysteresis + typed state.
 RADAR_SYNC_POPULATION_MONITOR_ENABLED: bool = _bool("RADAR_SYNC_POPULATION_MONITOR_ENABLED", True)
+# Phase-family contamination detection: when True, contamination blocks operational Go
+# authority (sync_authority=go_runtime) and phase authority from a contaminated family.
+# Default False (diagnostic-only): contamination is computed and exposed in the API
+# but does not block authority transitions.
+RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED: bool = _bool("RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED", False)
 
 # ---------------------------------------------------------------------------
 # Stage 3 — aircraft localisation from known radar bearings

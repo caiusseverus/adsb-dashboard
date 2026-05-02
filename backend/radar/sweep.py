@@ -932,7 +932,7 @@ def _live_sync_state_to_dict(
             if _period_stable_gate.get("passed") is True
             else (_period_stable_gate.get("reason") or None)
         ) if _py_gates else None,
-        "contamination_state": (
+        "contamination_state": getattr(sync, "contamination_state", None) or (
             _go_gates.get("go_contamination_state", {}).get("reason") or "not_evaluated"
         ) if _go_gates else "not_evaluated",
         "slope_trend_state": (
@@ -3424,10 +3424,29 @@ class RadarState:
         gates["go_refinement_history_sufficient"] = _gate_value(history_sufficient, None if history_sufficient is not False else "go_refinement_history_insufficient")
         holdover = bool(go_sync.get("holdover", False)) if present else False
         gates["go_not_holdover"] = _gate_value((not holdover) if present else None, None if not holdover else "go_holdover")
-        # Pre-Stage-8 stub: no family detection yet; emit typed non-blocking state.
-        # This will be replaced by real Go contamination detection in Stage 8.
-        contamination_stub = "single_family" if present else "insufficient_data"
-        gates["go_contamination_state"] = _gate_value(True, contamination_stub)
+        # Stage 8: real phase-family contamination detection.
+        contamination = self._detect_contamination_locked(iid)
+        c_state = contamination["state"]
+        c_reason = contamination["reason"]
+        if c_state == "disabled":
+            gates["go_contamination_state"] = _gate_value(None, "contamination_detection_disabled")
+        elif c_state == "contaminated":
+            gates["go_contamination_state"] = _gate_value(False, c_reason)
+        elif c_state == "single_family":
+            gates["go_contamination_state"] = _gate_value(True, c_reason)
+        else:
+            gates["go_contamination_state"] = _gate_value(None, c_reason)
+        sync = self._live_sync_states.get(iid)
+        if sync is not None:
+            sync.contamination_state = c_state
+            sync.contamination_reason = str(c_reason) if c_reason else None
+            sync.contamination_total_observations = contamination["total_observations"]
+            sync.contamination_distinct_icaos = contamination["distinct_icaos"]
+            sync.contamination_primary_observations = contamination["primary_observations"]
+            sync.contamination_secondary_observations = contamination["secondary_observations"]
+            sync.contamination_secondary_icaos = contamination["secondary_icaos"]
+            sync.contamination_family_separation_deg = contamination["family_separation_deg"]
+            sync.contamination_secondary_support_ratio = contamination["secondary_support_ratio"]
         gates["go_period_stable"] = self._evaluate_period_stability_gate_locked(iid)
         gates["go_slope_converged"] = self._evaluate_slope_trend_gate_locked(iid)
         effective = float(go_sync["effective_period_s"]) if present and _finite_positive(go_sync.get("effective_period_s")) else None
@@ -3444,6 +3463,227 @@ class RadarState:
         )
         ready = all(v["passed"] is not False for v in gates.values())
         return {"go_ready": bool(ready), "go_base_period_s": go_base, "go_effective_period_s": effective, "gates": gates}
+
+    # ── Stage 8 contamination thresholds ──────────────────────────────────────
+    _CONTAMINATION_MIN_TOTAL_OBS = 12
+    _CONTAMINATION_MIN_DISTINCT_ICAOS = 3
+    _CONTAMINATION_SECONDARY_MIN_OBS = 4
+    _CONTAMINATION_SECONDARY_MIN_ICAOS = 2
+    _CONTAMINATION_FAMILY_SEPARATION_DEG = 25.0
+    _CONTAMINATION_SECONDARY_SUPPORT_RATIO = 0.25
+    _CONTAMINATION_DETECTION_WINDOW_BASE_S = 120.0
+    _CONTAMINATION_PRIMARY_TOLERANCE_DEG = 15.0
+    _CONTAMINATION_PER_ICAO_MIN_OBS = 2
+
+    def _detect_contamination_locked(self, iid: int) -> dict:
+        """Stage 8: detect phase-family contamination from recent residual observations.
+
+        Returns a dict with state, reason, and diagnostic fields suitable for
+        gate evaluation and snapshot exposure.
+
+        States:
+            single_family    — one coherent residual phase family
+            contaminated     — evidence of >=2 stable residual phase families
+            insufficient_data — not enough observations or ICAOs to decide
+            disabled         — feature flag is off
+
+        The detector groups recent fit-eligible burst residuals by ICAO, computes
+        per-ICAO circular median residuals, finds the dominant cluster, and checks
+        whether a secondary cluster is coherent and well-supported.
+        """
+        import config as _cfg
+        enabled = bool(getattr(_cfg, "RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED", False))
+        if not enabled:
+            return {
+                "state": "disabled", "reason": "contamination_detection_disabled",
+                "total_observations": 0, "distinct_icaos": 0,
+                "primary_observations": 0, "secondary_observations": 0,
+                "secondary_icaos": 0, "family_separation_deg": None,
+                "secondary_support_ratio": None,
+            }
+
+        sync = self._live_sync_states.get(iid)
+        event_buf = self._live_burst_residual_events.get(iid)
+        if not event_buf:
+            return {
+                "state": "insufficient_data", "reason": "no_recorded_burst_residual_events",
+                "total_observations": 0, "distinct_icaos": 0,
+                "primary_observations": 0, "secondary_observations": 0,
+                "secondary_icaos": 0, "family_separation_deg": None,
+                "secondary_support_ratio": None,
+            }
+
+        period_s = float(getattr(sync, "period_s", 0.0) or 0.0) if sync else 0.0
+        window_s = self._CONTAMINATION_DETECTION_WINDOW_BASE_S
+        if period_s > 0:
+            window_s = max(period_s * 6.0 * 3.0, self._CONTAMINATION_DETECTION_WINDOW_BASE_S)
+        now_ts = time.time()
+        cutoff_ts = now_ts - window_s
+
+        by_icao: dict[str, list[float]] = defaultdict(list)
+        for event in event_buf:
+            if not event.get("fit_eligible", False):
+                continue
+            if float(event.get("wall_ts", 0)) < cutoff_ts:
+                continue
+            icao = str(event.get("icao") or "")
+            if not icao or icao == "000000":
+                continue
+            residual = float(event.get("residual_deg", 0))
+            by_icao[icao].append(residual)
+
+        distinct_icaos = len(by_icao)
+        total_obs = sum(len(v) for v in by_icao.values())
+        if total_obs < self._CONTAMINATION_MIN_TOTAL_OBS:
+            return {
+                "state": "insufficient_data", "reason": f"insufficient_observations_{total_obs}_lt_{self._CONTAMINATION_MIN_TOTAL_OBS}",
+                "total_observations": total_obs, "distinct_icaos": distinct_icaos,
+                "primary_observations": 0, "secondary_observations": 0,
+                "secondary_icaos": 0, "family_separation_deg": None,
+                "secondary_support_ratio": None,
+            }
+
+        icaos_with_enough = [icao for icao, residuals in by_icao.items()
+                             if len(residuals) >= self._CONTAMINATION_PER_ICAO_MIN_OBS]
+        if len(icaos_with_enough) < self._CONTAMINATION_MIN_DISTINCT_ICAOS:
+            return {
+                "state": "insufficient_data", "reason": f"insufficient_distinct_icaos_{len(icaos_with_enough)}_lt_{self._CONTAMINATION_MIN_DISTINCT_ICAOS}",
+                "total_observations": total_obs, "distinct_icaos": len(icaos_with_enough),
+                "primary_observations": 0, "secondary_observations": 0,
+                "secondary_icaos": 0, "family_separation_deg": None,
+                "secondary_support_ratio": None,
+            }
+
+        per_icao_median: dict[str, float] = {}
+        per_icao_count: dict[str, int] = {}
+        for icao in icaos_with_enough:
+            residuals = by_icao[icao]
+            med = _median_float(residuals)
+            if med is not None:
+                per_icao_median[icao] = med
+                per_icao_count[icao] = len(residuals)
+
+        if len(per_icao_median) < self._CONTAMINATION_MIN_DISTINCT_ICAOS:
+            return {
+                "state": "insufficient_data", "reason": f"insufficient_computable_icaos_{len(per_icao_median)}_lt_{self._CONTAMINATION_MIN_DISTINCT_ICAOS}",
+                "total_observations": total_obs, "distinct_icaos": len(per_icao_median),
+                "primary_observations": 0, "secondary_observations": 0,
+                "secondary_icaos": 0, "family_separation_deg": None,
+                "secondary_support_ratio": None,
+            }
+
+        # Find the dominant ICAO by observation count and use its median as
+        # the primary cluster reference.  This avoids the midpoint problem
+        # where a circular weighted mean of two well-separated families
+        # lands between them.
+        sorted_icaos = sorted(per_icao_median, key=lambda icao: per_icao_count[icao], reverse=True)
+        dominant_icao = sorted_icaos[0]
+        primary_seed = per_icao_median[dominant_icao]
+        if primary_seed is None:
+            return {
+                "state": "insufficient_data", "reason": "unable_to_compute_primary_center",
+                "total_observations": total_obs, "distinct_icaos": len(per_icao_median),
+                "primary_observations": 0, "secondary_observations": 0,
+                "secondary_icaos": 0, "family_separation_deg": None,
+                "secondary_support_ratio": None,
+            }
+
+        # Build primary cluster: all ICAOs with median within tolerance of
+        # the dominant-ICAO median.  Iterate once to collect, then recompute
+        # the primary centre from only the primary-cluster members.
+        primary_icaos: set[str] = set()
+        secondary_icaos: set[str] = set()
+        primary_count: int = 0
+        secondary_count: int = 0
+        for icao in per_icao_median:
+            delta = abs(_circular_delta_deg(per_icao_median[icao], primary_seed) or 0.0)
+            if delta <= self._CONTAMINATION_PRIMARY_TOLERANCE_DEG:
+                primary_icaos.add(icao)
+                primary_count += per_icao_count[icao]
+            else:
+                secondary_icaos.add(icao)
+                secondary_count += per_icao_count[icao]
+
+        primary_medians = [per_icao_median[icao] for icao in primary_icaos]
+        primary_counts = [per_icao_count[icao] for icao in primary_icaos]
+        primary_center = _circular_weighted_mean_deg(primary_medians, primary_counts)
+        if primary_center is None:
+            return {
+                "state": "insufficient_data", "reason": "unable_to_compute_primary_center_from_cluster",
+                "total_observations": total_obs, "distinct_icaos": len(per_icao_median),
+                "primary_observations": primary_count, "secondary_observations": secondary_count,
+                "secondary_icaos": len(secondary_icaos), "family_separation_deg": None,
+                "secondary_support_ratio": None,
+            }
+
+        secondary_n_icaos = len(secondary_icaos)
+        if secondary_n_icaos < self._CONTAMINATION_SECONDARY_MIN_ICAOS:
+            return {
+                "state": "single_family", "reason": f"secondary_icaos_{secondary_n_icaos}_lt_{self._CONTAMINATION_SECONDARY_MIN_ICAOS}",
+                "total_observations": total_obs, "distinct_icaos": len(per_icao_median),
+                "primary_observations": primary_count, "secondary_observations": secondary_count,
+                "secondary_icaos": secondary_n_icaos, "family_separation_deg": None,
+                "secondary_support_ratio": round(secondary_count / max(total_obs, 1), 3),
+            }
+
+        if secondary_count < self._CONTAMINATION_SECONDARY_MIN_OBS:
+            return {
+                "state": "single_family", "reason": f"secondary_observations_{secondary_count}_lt_{self._CONTAMINATION_SECONDARY_MIN_OBS}",
+                "total_observations": total_obs, "distinct_icaos": len(per_icao_median),
+                "primary_observations": primary_count, "secondary_observations": secondary_count,
+                "secondary_icaos": secondary_n_icaos, "family_separation_deg": None,
+                "secondary_support_ratio": round(secondary_count / max(total_obs, 1), 3),
+            }
+
+        support_ratio = secondary_count / max(total_obs, 1)
+        if support_ratio < self._CONTAMINATION_SECONDARY_SUPPORT_RATIO:
+            return {
+                "state": "single_family", "reason": f"secondary_support_ratio_{support_ratio:.3f}_lt_{self._CONTAMINATION_SECONDARY_SUPPORT_RATIO}",
+                "total_observations": total_obs, "distinct_icaos": len(per_icao_median),
+                "primary_observations": primary_count, "secondary_observations": secondary_count,
+                "secondary_icaos": secondary_n_icaos, "family_separation_deg": None,
+                "secondary_support_ratio": round(support_ratio, 3),
+            }
+
+        secondary_medians = [per_icao_median[icao] for icao in secondary_icaos]
+        secondary_counts = [per_icao_count[icao] for icao in secondary_icaos]
+        secondary_center = _circular_weighted_mean_deg(secondary_medians, secondary_counts)
+        if secondary_center is None:
+            return {
+                "state": "single_family", "reason": "secondary_center_not_computable",
+                "total_observations": total_obs, "distinct_icaos": len(per_icao_median),
+                "primary_observations": primary_count, "secondary_observations": secondary_count,
+                "secondary_icaos": secondary_n_icaos, "family_separation_deg": None,
+                "secondary_support_ratio": round(support_ratio, 3),
+            }
+
+        family_sep = abs(_circular_delta_deg(secondary_center, primary_center) or 0.0)
+        if family_sep < self._CONTAMINATION_FAMILY_SEPARATION_DEG:
+            return {
+                "state": "single_family", "reason": f"family_separation_{family_sep:.1f}deg_lt_{self._CONTAMINATION_FAMILY_SEPARATION_DEG}deg",
+                "total_observations": total_obs, "distinct_icaos": len(per_icao_median),
+                "primary_observations": primary_count, "secondary_observations": secondary_count,
+                "secondary_icaos": secondary_n_icaos, "family_separation_deg": round(family_sep, 1),
+                "secondary_support_ratio": round(support_ratio, 3),
+            }
+
+        secondary_spread = _circular_mad_deg(secondary_medians, secondary_center)
+        if secondary_spread is not None and secondary_spread > 30.0:
+            return {
+                "state": "single_family", "reason": f"secondary_incoherent_spread_{secondary_spread:.1f}deg",
+                "total_observations": total_obs, "distinct_icaos": len(per_icao_median),
+                "primary_observations": primary_count, "secondary_observations": secondary_count,
+                "secondary_icaos": secondary_n_icaos, "family_separation_deg": round(family_sep, 1),
+                "secondary_support_ratio": round(support_ratio, 3),
+            }
+
+        return {
+            "state": "contaminated", "reason": f"secondary_family_detected_sep_{family_sep:.1f}deg_{secondary_n_icaos}icaos",
+            "total_observations": total_obs, "distinct_icaos": len(per_icao_median),
+            "primary_observations": primary_count, "secondary_observations": secondary_count,
+            "secondary_icaos": secondary_n_icaos, "family_separation_deg": round(family_sep, 1),
+            "secondary_support_ratio": round(support_ratio, 3),
+        }
 
     def _evaluate_phase_authority_gates_locked(self, iid: int, sync: LiveSyncState | None) -> dict:
         gates: dict[str, dict] = {}
@@ -3513,6 +3753,16 @@ class RadarState:
 
         trusted = str(getattr(sync, "phase_status", "") or "") == "trusted"
         gates["phase_state_trusted"] = _gate_value(trusted, None if trusted else "phase_untrusted")
+
+        c_state = str(getattr(sync, "contamination_state", "") or "")
+        if c_state == "contaminated":
+            gates["phase_not_contaminated"] = _gate_value(False, "phase_family_contaminated")
+        elif c_state == "disabled":
+            gates["phase_not_contaminated"] = _gate_value(None, "contamination_detection_disabled")
+        elif c_state == "insufficient_data":
+            gates["phase_not_contaminated"] = _gate_value(None, "contamination_insufficient_data")
+        else:
+            gates["phase_not_contaminated"] = _gate_value(True, None)
 
         ready = all(v["passed"] is not False for v in gates.values())
         return {"phase_ready": bool(ready), "gates": gates, "phase_basis": phase_basis}

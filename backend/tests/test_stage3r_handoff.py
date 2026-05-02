@@ -280,34 +280,62 @@ def test_period_stability_gate_insufficient_when_no_history():
 
 
 # ===========================================================================
-# 5. Pre-Stage-8 contamination stub
+# 5. Stage 8 contamination detection — flag-disabled baseline
 # ===========================================================================
 
-def test_contamination_stub_not_not_evaluated():
-    """Pre-Stage-8 stub must emit single_family or insufficient_data, not not_evaluated."""
+def test_contamination_flag_disabled_emits_disabled():
+    """When RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED=False, gate emits disabled."""
     state = _make_state_with_python_model(3001)
     state.update_go_iid_state(_go_sync_for_gates(3001, 4.0))
     go_gates = state._evaluate_go_readiness_gates_locked(3001, 4.0)
     contamination_gate = go_gates["gates"].get("go_contamination_state", {})
-    assert contamination_gate.get("reason") != "not_evaluated"
-    assert contamination_gate.get("reason") in ("single_family", "insufficient_data")
+    assert contamination_gate.get("reason") == "contamination_detection_disabled"
+    assert contamination_gate.get("passed") is None
 
 
-def test_contamination_stub_nonblocking():
-    """Pre-Stage-8 contamination stub must not block Go readiness (passed is not False)."""
+def test_contamination_flag_disabled_sync_has_state():
+    """When flag disabled, LiveSyncState gets contamination_state='disabled'."""
     state = _make_state_with_python_model(3002)
     state.update_go_iid_state(_go_sync_for_gates(3002, 4.0))
-    go_gates = state._evaluate_go_readiness_gates_locked(3002, 4.0)
+    state._evaluate_go_readiness_gates_locked(3002, 4.0)
+    sync = state.get_live_sync_state(3002)
+    assert sync.contamination_state == "disabled"
+
+
+def test_contamination_disabled_nonblocking_for_authority():
+    """With flag disabled, disabled contamination does not block Go readiness."""
+    state = _make_state_with_python_model(3003)
+    state.update_go_iid_state(_go_sync_for_gates(3003, 4.0))
+    go_gates = state._evaluate_go_readiness_gates_locked(3003, 4.0)
     contamination_gate = go_gates["gates"].get("go_contamination_state", {})
     assert contamination_gate.get("passed") is not False
 
 
-def test_contamination_stub_emits_insufficient_data_when_go_absent():
-    """When Go sync absent, contamination stub emits insufficient_data."""
+# ===========================================================================
+# 6. Stage 8 contamination detection — flag-enabled
+# ===========================================================================
+
+def test_contamination_emits_insufficient_data_when_no_burst_events(monkeypatch):
+    """When no burst residual events exist, contamination emits insufficient_data."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED", True)
     state = RadarState()
-    go_gates = state._evaluate_go_readiness_gates_locked(3003, 4.0)
+    go_gates = state._evaluate_go_readiness_gates_locked(3004, 4.0)
     contamination_gate = go_gates["gates"].get("go_contamination_state", {})
-    assert contamination_gate.get("reason") == "insufficient_data"
+    assert contamination_gate.get("reason") == "no_recorded_burst_residual_events"
+    assert contamination_gate.get("passed") is None  # non-blocking
+
+
+def test_contamination_insufficient_data_not_blocking(monkeypatch):
+    """insufficient_data should be non-blocking (permits bootstrap before evidence)."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED", True)
+    state = _make_state_with_python_model(3005)
+    state.update_go_iid_state(_go_sync_for_gates(3005, 4.0))
+    go_gates = state._evaluate_go_readiness_gates_locked(3005, 4.0)
+    contamination_gate = go_gates["gates"].get("go_contamination_state", {})
+    assert contamination_gate.get("reason") is not None
+    assert contamination_gate.get("passed") is not False
 
 
 # ===========================================================================
@@ -512,7 +540,7 @@ def test_snapshot_exposes_contamination_state(monkeypatch):
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(6002))
     assert "contamination_state" in payload
     assert payload["contamination_state"] != "not_evaluated"
-    assert payload["contamination_state"] in ("single_family", "insufficient_data")
+    assert payload["contamination_state"] in ("single_family", "insufficient_data", "disabled")
 
 
 def test_snapshot_exposes_slope_trend_state(monkeypatch):
@@ -718,3 +746,240 @@ def test_population_validation_disabled_allows_phase_authority(monkeypatch):
     # Phase authority proceeds when population monitor is intentionally disabled.
     assert updated.phase_authority == "go_runtime"
     assert updated.handoff_state == "GO_REFINED_READY"
+
+
+# ===========================================================================
+# 13. Stage 8 contamination detection — flag-enabled detailed tests
+# ===========================================================================
+
+
+def _inject_burst_residual_events(state: RadarState, iid: int,
+                                   icao_residuals: list[tuple[str, float]]):
+    """Inject synthetic burst residual events for one IID.
+
+    Each tuple is (icao_hex, residual_deg). Events have wall_ts=now and
+    are added to state._live_burst_residual_events[iid].
+    """
+    now = time.time()
+    events = []
+    for i, (icao, resid) in enumerate(icao_residuals):
+        events.append({
+            "event_id": f"{iid}:burst:{icao}:{now:.3f}-{i}",
+            "event_kind": "burst",
+            "wall_ts": now,
+            "arrival_beast_us": 1000000.0 + i * 1000.0,
+            "beam_center_us": 1000000.0 + i * 1000.0,
+            "iid": iid,
+            "icao": icao,
+            "centroid_timestamp_us": 1000000.0 + i * 1000.0,
+            "residual_deg": resid,
+            "residual_basis": "runtime_effective",
+            "display_residual_class": "burst_inlier",
+            "classification": "inlier",
+            "timing_class": None,
+            "bearing_deg": resid,
+            "predicted_deg": 0.0,
+            "range_nm": 50.0,
+            "corrected_residual_deg": resid,
+            "pos_age_s": 2.0,
+            "aircraft_position_age_s": 2.0,
+            "n_replies": 5,
+            "signal_dbfs": -25.0,
+            "sync_update_eligible": True,
+            "fit_eligible": True,
+            "dominant_family": True,
+            "refinement_status": "stable",
+            "reject_reason": None,
+            "base_period_s": 4.0,
+            "period_delta_s": 0.0,
+            "effective_period_s": 4.0,
+            "period_authority": "py_base",
+            "sync_authority": "py_bootstrap",
+            "phase_authority": "py_bootstrap",
+            "event_base_period_s": 4.0,
+            "event_period_delta_s": 0.0,
+            "event_effective_period_s": 4.0,
+            "event_period_authority": "py_base",
+            "event_sync_authority": "py_bootstrap",
+            "event_phase_authority": "py_bootstrap",
+            "phase_basis": "sweep_epoch_only",
+            "event_phase_basis": "sweep_epoch_only",
+            "phase_is_absolute": False,
+            "event_phase_is_absolute": False,
+            "phase_offset_deg": 0.0,
+            "event_phase_offset_deg": 0.0,
+            "phase_offset_basis": None,
+            "event_phase_offset_basis": None,
+            "phase_offset_geographic_deg": None,
+            "event_phase_offset_geographic_deg": None,
+            "phase_anchor_icao": None,
+            "event_phase_anchor_icao": None,
+            "phase_anchor_status": None,
+            "event_phase_anchor_status": None,
+            "phase_epoch_us": 0.0,
+            "effective_period_source": "none",
+            "period_delta_source": "none",
+            "source_path": "recorded_burst_alignment",
+            "recording_path_kind": "recorded_burst_alignment",
+            "handoff_state": "UNTRUSTED",
+            "handoff_reason": "diagnostic_frame_accumulation_only",
+            "event_handoff_state": "UNTRUSTED",
+            "event_handoff_reason": "diagnostic_frame_accumulation_only",
+            "sync_revision": 0,
+        })
+    state._live_burst_residual_events.setdefault(iid, deque()).extend(events)
+
+
+def _setup_contamination_test(monkeypatch, iid: int = 9101,
+                               period_s: float = 4.0) -> RadarState:
+    """Set up state with Go operational, flag enabled, and basic sync."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED", True)
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = _make_state_with_python_model(iid, period_s)
+    _inject_stable_period_history(state, iid, period_s)
+    _inject_stable_slope_history(state, iid, near_zero=True)
+    return state
+
+
+def test_coherent_single_family_emits_single_family(monkeypatch):
+    """A coherent single residual family (all residuals near zero) emits single_family."""
+    state = _setup_contamination_test(monkeypatch, 9101)
+    _inject_burst_residual_events(state, 9101, [
+        ("AAAAAA", 0.5), ("AAAAAA", -0.3), ("AAAAAA", 1.0),
+        ("BBBBBB", -1.0), ("BBBBBB", 0.0), ("BBBBBB", 0.8),
+        ("CCCCCC", 1.5), ("CCCCCC", -0.5), ("CCCCCC", 0.2),
+        ("DDDDDD", -1.5), ("DDDDDD", 0.3), ("DDDDDD", -0.1),
+        ("EEEEEE", 2.0), ("EEEEEE", -2.0), ("EEEEEE", 0.0),
+    ])
+    result = state._detect_contamination_locked(9101)
+    assert result["state"] == "single_family"
+    assert result["distinct_icaos"] >= 3
+    assert result["total_observations"] >= 12
+
+
+def test_single_family_permits_go_readiness(monkeypatch):
+    """single_family contamination state permits Go readiness when other gates pass."""
+    state = _setup_contamination_test(monkeypatch, 9102)
+    _inject_burst_residual_events(state, 9102, [
+        ("AAAAAA", 0.5), ("AAAAAA", -0.3), ("AAAAAA", 1.0),
+        ("BBBBBB", -1.0), ("BBBBBB", 0.0), ("BBBBBB", 0.8),
+        ("CCCCCC", 1.5), ("CCCCCC", -0.5), ("CCCCCC", 0.2),
+        ("DDDDDD", -1.5), ("DDDDDD", 0.3), ("DDDDDD", -0.1),
+    ])
+    state.update_go_iid_state(_go_sync_for_gates(9102, 4.0))
+    updated = state.get_live_sync_state(9102)
+    assert updated.handoff_state == "GO_REFINED_READY"
+    assert updated.sync_authority == "go_runtime"
+
+
+def test_isolated_outliers_do_not_emit_contaminated(monkeypatch):
+    """Isolated outliers (a few far residuals from one ICAO) do not cause contamination."""
+    state = _setup_contamination_test(monkeypatch, 9103)
+    # 12 observations from 3 ICAOs near zero, plus 2 from one far ICAO
+    events = [("AAAAAA", r) for r in [0.5, -0.3, 1.0, -1.0]]
+    events += [("BBBBBB", r) for r in [-0.5, 0.0, 0.8, -1.2]]
+    events += [("CCCCCC", r) for r in [1.5, -0.5, 0.2, -0.1]]
+    # Outliers: only 2 observations from DDDDDD at 50 deg
+    events += [("DDDDDD", 50.0), ("DDDDDD", 52.0)]
+    _inject_burst_residual_events(state, 9103, events)
+    result = state._detect_contamination_locked(9103)
+    assert result["state"] == "single_family"
+    assert result["secondary_icaos"] > 0  # outlier ICAO detected but rejected
+
+
+def test_coherent_secondary_family_emits_contaminated(monkeypatch):
+    """A coherent secondary family with >=4 obs and >=2 ICAOs emits contaminated."""
+    state = _setup_contamination_test(monkeypatch, 9104)
+    events = []
+    # Primary family: 4 ICAOs, each with 4 observations near 0 deg
+    for icao in ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD"]:
+        for r in [-2.0, -0.5, 0.5, 2.0]:
+            events.append((icao, r))
+    # Secondary family: 2 ICAOs, each with 4 observations near 60 deg
+    for icao in ["EEEEEE", "FFFFFF"]:
+        for r in [58.0, 59.0, 61.0, 62.0]:
+            events.append((icao, r))
+    _inject_burst_residual_events(state, 9104, events)
+    result = state._detect_contamination_locked(9104)
+    assert result["state"] == "contaminated"
+    assert result["secondary_icaos"] >= 2
+    assert result["secondary_observations"] >= 4
+    assert result["family_separation_deg"] is not None
+    assert result["family_separation_deg"] >= 25.0
+    assert result["secondary_support_ratio"] >= 0.25
+
+
+def test_contaminated_blocks_go_refined_ready(monkeypatch):
+    """contaminated state blocks GO_REFINED_READY and sync_authority=go_runtime."""
+    state = _setup_contamination_test(monkeypatch, 9105)
+    events = []
+    for icao in ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD"]:
+        for r in [-2.0, -0.5, 0.5, 2.0]:
+            events.append((icao, r))
+    for icao in ["EEEEEE", "FFFFFF"]:
+        for r in [58.0, 59.0, 61.0, 62.0]:
+            events.append((icao, r))
+    _inject_burst_residual_events(state, 9105, events)
+    state.update_go_iid_state(_go_sync_for_gates(9105, 4.0))
+    updated = state.get_live_sync_state(9105)
+    assert updated.sync_authority != "go_runtime"
+    assert updated.handoff_state != "GO_REFINED_READY"
+
+
+def test_contaminated_blocks_phase_authority(monkeypatch):
+    """contaminated state blocks phase_authority=go_runtime even when other gates pass."""
+    state = _setup_contamination_test(monkeypatch, 9106)
+    events = []
+    for icao in ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD"]:
+        for r in [-2.0, -0.5, 0.5, 2.0]:
+            events.append((icao, r))
+    for icao in ["EEEEEE", "FFFFFF"]:
+        for r in [58.0, 59.0, 61.0, 62.0]:
+            events.append((icao, r))
+    _inject_burst_residual_events(state, 9106, events)
+    state.update_go_iid_state(_go_sync_for_gates(9106, 4.0))
+    updated = state.get_live_sync_state(9106)
+    assert updated.phase_authority != "go_runtime"
+
+
+def test_contamination_diagnostic_fields_in_snapshot(monkeypatch):
+    """Contamination diagnostic fields appear in the live sync/API snapshot."""
+    state = _setup_contamination_test(monkeypatch, 9107)
+    events = []
+    for icao in ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD"]:
+        for r in [-2.0, -0.5, 0.5, 2.0]:
+            events.append((icao, r))
+    for icao in ["EEEEEE", "FFFFFF"]:
+        for r in [58.0, 59.0, 61.0, 62.0]:
+            events.append((icao, r))
+    _inject_burst_residual_events(state, 9107, events)
+    state.update_go_iid_state(_go_sync_for_gates(9107, 4.0))
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(9107))
+    assert payload["contamination_state"] == "contaminated"
+    assert payload["contamination_total_observations"] > 0
+    assert payload["contamination_distinct_icaos"] > 0
+    assert payload["contamination_primary_observations"] > 0
+    assert payload["contamination_secondary_observations"] > 0
+    assert payload["contamination_secondary_icaos"] > 0
+    assert payload["contamination_family_separation_deg"] is not None
+    assert payload["contamination_family_separation_deg"] >= 25.0
+    assert payload["contamination_secondary_support_ratio"] is not None
+    assert payload["contamination_secondary_support_ratio"] >= 0.25
+
+
+def test_incoherent_secondary_no_contamination(monkeypatch):
+    """A secondary cluster with high spread is not coherent, no contamination."""
+    state = _setup_contamination_test(monkeypatch, 9108)
+    events = []
+    for icao in ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD"]:
+        for r in [-2.0, -0.5, 0.5, 2.0]:
+            events.append((icao, r))
+    # Secondary candidates: 2 ICAOs but scattered across wide range → not coherent
+    # Place them >15 deg from primary but widely separated from each other
+    for icao in ["EEEEEE", "FFFFFF"]:
+        for r in [40.0, 70.0, -50.0, -80.0]:
+            events.append((icao, r))
+    _inject_burst_residual_events(state, 9108, events)
+    result = state._detect_contamination_locked(9108)
+    assert result["state"] in ("single_family", "insufficient_data")
