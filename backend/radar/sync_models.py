@@ -155,6 +155,8 @@ class LiveSyncState:
     contamination_secondary_icaos: int = 0
     contamination_family_separation_deg: float | None = None
     contamination_secondary_support_ratio: float | None = None
+    phase_blocking_gate: str | None = None
+    phase_blocking_reason: str | None = None
 
 
 @dataclass

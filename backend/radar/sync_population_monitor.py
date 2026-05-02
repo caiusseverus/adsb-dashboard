@@ -102,6 +102,7 @@ class PopulationResidualSummary:
     worst_icao: str | None
     worst_icao_delta_deg: float | None
     per_icao: list[dict] = field(default_factory=list)
+    rejection_counts: dict[str, int] = field(default_factory=dict)
 
     def to_api_dict(self) -> dict:
         """Serialise to a JSON-safe dict suitable for API payloads.
@@ -135,6 +136,7 @@ class PopulationResidualSummary:
             "per_icao": trimmed,
             "per_icao_total_count": len(self.per_icao),
             "per_icao_omitted_count": omitted,
+            "rejection_counts": dict(self.rejection_counts),
             "thresholds": DEFAULT_THRESHOLDS,
         }
 
@@ -205,6 +207,7 @@ def _make_empty(
     per_icao: list[dict] | None = None,
     contributing_icao_count: int = 0,
     anchor_residual_mean_deg: float | None = None,
+    rejection_counts: dict[str, int] | None = None,
 ) -> PopulationResidualSummary:
     return PopulationResidualSummary(
         iid=iid,
@@ -223,6 +226,7 @@ def _make_empty(
         worst_icao=None,
         worst_icao_delta_deg=None,
         per_icao=per_icao or [],
+        rejection_counts=rejection_counts or {},
     )
 
 
@@ -266,36 +270,46 @@ def compute_population_residual_summary(
 
     total_count = len(entries)
 
-    # ── Eligibility filtering ─────────────────────────────────────────────
+    rejection_counts: dict[str, int] = {}
+
     eligible: list[dict] = []
     hard_rejected_count = 0
     for entry in entries:
         if not entry.get("sync_update_eligible"):
+            rejection_counts["not_sync_update_eligible"] = rejection_counts.get("not_sync_update_eligible", 0) + 1
             continue
         residual_raw = entry.get("residual_deg")
         if residual_raw is None:
+            rejection_counts["missing_residual"] = rejection_counts.get("missing_residual", 0) + 1
             continue
         try:
             residual = float(residual_raw)
         except (TypeError, ValueError):
+            rejection_counts["invalid_residual"] = rejection_counts.get("invalid_residual", 0) + 1
             continue
         if not math.isfinite(residual):
+            rejection_counts["invalid_residual"] = rejection_counts.get("invalid_residual", 0) + 1
             continue
         icao = entry.get("icao")
         if not icao:
+            rejection_counts["missing_icao"] = rejection_counts.get("missing_icao", 0) + 1
             continue
         pos_age_raw = entry.get("pos_age_s")
         if pos_age_raw is None:
+            rejection_counts["missing_pos_age"] = rejection_counts.get("missing_pos_age", 0) + 1
             continue
         try:
             pos_age = float(pos_age_raw)
         except (TypeError, ValueError):
+            rejection_counts["missing_pos_age"] = rejection_counts.get("missing_pos_age", 0) + 1
             continue
         if not math.isfinite(pos_age) or pos_age > freshness_gate_s:
+            rejection_counts["stale_position"] = rejection_counts.get("stale_position", 0) + 1
             continue
         cls = entry.get("classification")
         if cls == "rejected":
             hard_rejected_count += 1
+            rejection_counts["hard_rejected"] = rejection_counts.get("hard_rejected", 0) + 1
             continue
         eligible.append(entry)
 
@@ -310,6 +324,7 @@ def compute_population_residual_summary(
             iid, "insufficient_data", reason,
             anchor_icao=phase_anchor_icao,
             observation_count=total_count,
+            rejection_counts=rejection_counts,
         )
 
     # ── Window span ───────────────────────────────────────────────────────
@@ -329,10 +344,13 @@ def compute_population_residual_summary(
     # ── Build per-ICAO rows (all ICAOs that appear in eligible obs) ───────
     all_per_icao: list[dict] = []
     contributing_summaries: list[dict] = []
+    below_min_obs_count = 0
     for icao in sorted(by_icao, key=lambda k: -len(by_icao[k])):
         residuals = by_icao[icao]
         count = len(residuals)
         is_contributing = count >= MIN_OBS_PER_ICAO
+        if not is_contributing:
+            below_min_obs_count += 1
         mean = _circular_mean_residuals_deg(residuals) if is_contributing else None
         spread = _circular_spread_deg(residuals) if is_contributing and count >= 2 else None
         row: dict = {
@@ -350,6 +368,7 @@ def compute_population_residual_summary(
             contributing_summaries.append(row)
 
     contributing_icao_count = len(contributing_summaries)
+    rejection_counts["below_min_obs_per_icao"] = below_min_obs_count
 
     if contributing_icao_count == 0:
         return _make_empty(
@@ -359,6 +378,7 @@ def compute_population_residual_summary(
             eligible_observation_count=len(eligible),
             window_s=window_s,
             per_icao=all_per_icao,
+            rejection_counts=rejection_counts,
         )
 
     # ── Anchor availability check ─────────────────────────────────────────
@@ -374,6 +394,7 @@ def compute_population_residual_summary(
             window_s=window_s,
             per_icao=all_per_icao,
             contributing_icao_count=contributing_icao_count,
+            rejection_counts=rejection_counts,
         )
 
     # ── Non-anchor count check ────────────────────────────────────────────
@@ -388,6 +409,7 @@ def compute_population_residual_summary(
             per_icao=all_per_icao,
             contributing_icao_count=contributing_icao_count,
             anchor_residual_mean_deg=anchor_mean,
+            rejection_counts=rejection_counts,
         )
 
     # ── Population mean (non-anchor contributing ICAOs) ───────────────────
@@ -451,4 +473,5 @@ def compute_population_residual_summary(
         worst_icao=worst_icao,
         worst_icao_delta_deg=_round2(worst_delta),
         per_icao=all_per_icao,
+        rejection_counts=rejection_counts,
     )

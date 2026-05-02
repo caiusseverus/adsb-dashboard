@@ -453,6 +453,9 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_last_rejected_delta_reason": go_payload.get("last_rejected_delta_reason"),
         "go_diagnostic_last_rejected_delta_epoch_id": go_payload.get("last_rejected_delta_epoch_id"),
         "go_diagnostic_consecutive_hard_bound_rejects": go_payload.get("consecutive_hard_bound_rejects"),
+        "go_diagnostic_reacquire_support_obs_count": go_payload.get("reacquire_support_obs_count"),
+        "go_diagnostic_reacquire_support_icao_count": go_payload.get("reacquire_support_icao_count"),
+        "go_diagnostic_fit_epoch_reset_holdover_churn": go_payload.get("fit_epoch_reset_holdover_churn"),
     }
 
 
@@ -830,13 +833,18 @@ def _live_sync_state_to_dict(
         "sync_authority": sync_authority,
         "period_refinement_status": period_refinement_status,
         "phase_authority": phase_authority,
+        "phase_blocking_gate": getattr(sync, "phase_blocking_gate", None),
+        "phase_blocking_reason": getattr(sync, "phase_blocking_reason", None),
         "handoff_state": handoff_state or (
             "UNTRUSTED" if source == "go_frame_sync" else
             "GO_REFINING" if period_authority == "py_refined" else
             "BASE_PERIOD_READY" if period_authority == "py_base" else
             "BOOTSTRAPPING_PY"
         ),
-        "handoff_reason": handoff_reason or ("derived_from_sync_source" if source else "sync_state_unavailable"),
+        "handoff_reason": handoff_reason or (
+            "go_diagnostic_shadow" if source == "go_frame_sync" else
+            "sync_state_unavailable"
+        ),
         "last_handoff_transition_ts": last_handoff_transition_ts,
         "handoff_gate_failures": handoff_gate_failures,
         "phase_basis": phase_basis,
@@ -3220,6 +3228,9 @@ class RadarState:
                 "update_epoch_reject_stale_ref_pos": int(entry.get("update_epoch_reject_stale_ref_pos") or 0),
                 "update_epoch_reject_insufficient_aircraft": int(entry.get("update_epoch_reject_insufficient_aircraft") or 0),
                 "update_epoch_last_strict_gate_pass": bool(entry.get("update_epoch_last_strict_gate_pass", False)),
+                "reacquire_support_obs_count": int(entry.get("reacquire_support_obs_count") or 0),
+                "reacquire_support_icao_count": int(entry.get("reacquire_support_icao_count") or 0),
+                "fit_epoch_reset_holdover_churn": bool(entry.get("fit_epoch_reset_holdover_churn", False)),
             }
         except Exception:
             return None
@@ -3787,7 +3798,13 @@ class RadarState:
             gates["phase_not_contaminated"] = _gate_value(True, None)
 
         ready = all(v["passed"] is not False for v in gates.values())
-        return {"phase_ready": bool(ready), "gates": gates, "phase_basis": phase_basis}
+        blocking_gate = None
+        if not ready:
+            for gate_name, gv in gates.items():
+                if gv["passed"] is False:
+                    blocking_gate = {"gate": gate_name, "reason": gv.get("reason", "unknown")}
+                    break
+        return {"phase_ready": bool(ready), "gates": gates, "phase_basis": phase_basis, "blocking_gate": blocking_gate}
 
     def _set_handoff_state_locked(
         self,
@@ -3849,6 +3866,12 @@ class RadarState:
             "go_readiness": go_gates["gates"],
             "phase_readiness": phase_eval["gates"],
         }
+        if phase_eval.get("blocking_gate"):
+            sync.phase_blocking_gate = phase_eval["blocking_gate"]["gate"]
+            sync.phase_blocking_reason = phase_eval["blocking_gate"]["reason"]
+        else:
+            sync.phase_blocking_gate = None
+            sync.phase_blocking_reason = None
         import config as _cfg
         _go_operational_enabled = bool(getattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False))
 
@@ -4407,6 +4430,9 @@ class RadarState:
                 "update_epoch_reject_stale_ref_pos": iid_state.get("ues"),
                 "update_epoch_reject_insufficient_aircraft": iid_state.get("uei2"),
                 "update_epoch_last_strict_gate_pass": iid_state.get("uesp"),
+                "reacquire_support_obs_count": iid_state.get("rso"),
+                "reacquire_support_icao_count": iid_state.get("rsi"),
+                "fit_epoch_reset_holdover_churn": iid_state.get("frh"),
             })
             if go_sync is not None:
                 self._go_sync_states_by_iid[iid] = go_sync

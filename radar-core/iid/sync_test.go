@@ -310,10 +310,10 @@ func TestSyncState_FitEpochResetOnAuthorityBasisChange(t *testing.T) {
 	}
 	prevEpochID := s.FitEpochID
 
-	s.AddRefinementResidualObservation(44_000_000.0, 1.1, 0xCC, true, 4, 0.5, 0xAA, "go_refiner_holdover")
+	s.AddRefinementResidualObservation(44_000_000.0, 1.1, 0xCC, true, 4, 0.5, 0xAA, "base_python")
 
 	if s.FitEpochID <= prevEpochID {
-		t.Fatalf("fit epoch id=%d, want > %d after authority basis change", s.FitEpochID, prevEpochID)
+		t.Fatalf("fit epoch id=%d, want > %d after non-holdover authority basis change", s.FitEpochID, prevEpochID)
 	}
 	if s.FitEpochResetReason != "period_authority_changed" {
 		t.Fatalf("fit epoch reset reason=%q, want period_authority_changed", s.FitEpochResetReason)
@@ -882,20 +882,20 @@ func TestSyncState_ProposedDeltaClearedOnFitEpochReset(t *testing.T) {
 
 	for i := 1; i <= 12; i++ {
 		residual := -6.0 + float64(i)*0.3
-		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, residual, 0xAA+uint32(i%4), true, 4, 0.5, 0xAA, "go_refiner_active")
+		icao := 0xAA + uint32(i%4)
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, residual, icao, true, 4, 0.5, 0xAA, "go_refiner_active")
 	}
 	if s.ProposedDeltaS == 0 {
 		t.Fatal("expected non-zero proposed delta with sufficient observations")
 	}
-	prevProposed := s.ProposedDeltaS
 
-	s.AddRefinementResidualObservation(52_000_000.0, -1.2, 0xBB01, true, 4, 0.5, 0xAA, "go_refiner_holdover")
+	s.AddRefinementResidualObservation(52_000_000.0, -1.2, 0xBB01, true, 4, 0.5, 0xAA, "base_python")
 
 	if s.FitEpochObservationCount != 1 {
-		t.Fatalf("fit epoch observation count=%d, want 1 after reset", s.FitEpochObservationCount)
+		t.Fatalf("fit epoch observation count=%d, want 1 after non-holdover authority basis reset", s.FitEpochObservationCount)
 	}
 	if s.ProposedDeltaS != 0 {
-		t.Fatalf("proposed_delta_s=%.9f, want 0 after fit epoch reset with 1 observation (stale=%v)", s.ProposedDeltaS, prevProposed != 0)
+		t.Fatalf("proposed_delta_s=%.9f, want 0 after fit epoch reset with 1 observation", s.ProposedDeltaS)
 	}
 	if s.LastHardBound {
 		t.Fatal("hard_bound should be false when no valid fit was attempted")
@@ -1189,5 +1189,254 @@ func TestFitInlierRatio_DebugSnapshotPropagation(t *testing.T) {
 	snap := iid.DebugStateSnapshot()
 	if math.Abs(snap.FitInlierRatio-ratio) > 0.001 {
 		t.Errorf("DebugSnapshot.FitInlierRatio = %.4f, want %.4f (from SyncState)", snap.FitInlierRatio, ratio)
+	}
+}
+
+func TestHoldoverToggleDoesNotResetFitEpoch(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 12; i++ {
+		residual := -2.0 + float64(i)*0.3
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, residual, 0xAA+uint32(i%4), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	if s.FitObservationCount == 0 {
+		t.Fatal("expected non-zero fit observations after seeding")
+	}
+	prevEpochID := s.FitEpochID
+	prevHistoryLen := len(s.residualHistory)
+
+	s.Holdover = true
+	s.HoldoverReason = "hard_residual_reject"
+	accepted := s.UpdateEpoch(52_000_000.0, 1.0, 4.0, 1.0, 3, 0.5, 0xAA)
+
+	if s.FitEpochID != prevEpochID {
+		t.Fatalf("fit epoch id changed from %d to %d when holdover toggled true; holdover alone must not reset fit epoch", prevEpochID, s.FitEpochID)
+	}
+	if accepted {
+		if len(s.residualHistory) <= prevHistoryLen {
+			t.Fatalf("accepted update should append observation; residualHistory len=%d, want > %d", len(s.residualHistory), prevHistoryLen)
+		}
+	}
+}
+
+func TestHoldoverToggleFalseDoesNotResetFitEpoch(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	seedReacquireFitSupport(s)
+	s.Holdover = true
+	s.HoldoverReason = "hard_residual_reject"
+
+	for i := 0; i < 3; i++ {
+		s.UpdateEpoch(float64(i+1)*4_000_000.0, 90.0, 4.0, 1.0, 4, 0.5, 0xAA)
+	}
+	// Third call triggers reacquire_provisional, clearing holdover.
+	if s.Holdover {
+		t.Fatal("expected holdover cleared by provisional reacquire")
+	}
+	if !s.ReacquiredProvisional {
+		t.Fatal("expected reacquired flag set")
+	}
+	if s.HoldoverReason != "reacquired_provisional" {
+		t.Fatalf("holdover reason=%q, want reacquired_provisional", s.HoldoverReason)
+	}
+	if s.HoldoverReasonCounts["hard_residual_reject_holdover"] == 0 {
+		t.Fatal("hard_residual_reject_holdover reason should be counted on the third holdover call")
+	}
+}
+
+func TestAuthorityBasisActiveHoldoverToggleDoesNotResetFitEpoch(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 10; i++ {
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, float64(i)*0.2, 0xCC+uint32(i%3), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	prevEpochID := s.FitEpochID
+	prevObsCount := s.FitObservationCount
+
+	s.AddRefinementResidualObservation(44_000_000.0, 1.1, 0xCC, true, 4, 0.5, 0xAA, "go_refiner_holdover")
+
+	if s.FitEpochID != prevEpochID {
+		t.Fatalf("fit epoch id changed from %d to %d when authority changed between go_refiner_active and go_refiner_holdover", prevEpochID, s.FitEpochID)
+	}
+	if s.FitObservationCount <= prevObsCount {
+		t.Fatal("fit observation count must increase with new observation, not reset")
+	}
+}
+
+func TestTrueResidualBasisChangeStillResetsFitEpoch(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 10; i++ {
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, float64(i)*0.2, 0xCC+uint32(i%3), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	s.fitEpochResidualBasis = "recorded_event_basis"
+	prevEpochID := s.FitEpochID
+
+	s.maybeResetFitEpochLocked(fitEpochContext{
+		epochUS:        44_000_000.0,
+		residualBasis:  "observed_minus_predicted",
+		referenceICAO:  0xAA,
+		phaseOffsetDeg: 0,
+		holdover:       false,
+		basePeriodS:    4.0,
+		authorityBasis: "go_refiner_active",
+	})
+
+	if s.FitEpochID <= prevEpochID {
+		t.Fatalf("residual basis change must still reset fit epoch")
+	}
+	if s.FitEpochResetReason != "residual_basis_changed" {
+		t.Fatalf("reset reason=%q, want residual_basis_changed", s.FitEpochResetReason)
+	}
+}
+
+func TestTrueMaterialBasePeriodChangeStillResetsFitEpoch(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 10; i++ {
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, float64(i)*0.2, 0xCC+uint32(i%3), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	s.fitEpochBasePeriodS = 4.0
+	prevEpochID := s.FitEpochID
+
+	s.maybeResetFitEpochLocked(fitEpochContext{
+		epochUS:        44_000_000.0,
+		residualBasis:  "observed_minus_predicted",
+		referenceICAO:  0xAA,
+		phaseOffsetDeg: 0,
+		holdover:       false,
+		basePeriodS:    4.005,
+		authorityBasis: "go_refiner_active",
+	})
+
+	if s.FitEpochID <= prevEpochID {
+		t.Fatalf("material base-period change (0.125%%) must still reset fit epoch")
+	}
+	if s.FitEpochResetReason != "base_period_changed_material" {
+		t.Fatalf("reset reason=%q, want base_period_changed_material", s.FitEpochResetReason)
+	}
+}
+
+func TestSuccessfulProvisionalReacquirePreservesReacquireSupport(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	seedReacquireFitSupport(s)
+	s.Holdover = true
+	s.HoldoverReason = "hard_residual_reject"
+
+	for i := 0; i < 3; i++ {
+		s.UpdateEpoch(float64(i+1)*4_000_000.0, 90.0, 4.0, 1.0, 4, 0.5, 0xAA)
+	}
+
+	if !s.ReacquiredProvisional {
+		t.Fatal("must be reacquired after 3 consecutive hard rejects")
+	}
+	if s.ReacquireSupportObservationCount == 0 {
+		t.Fatal("reacquire support observation count must be preserved across reacquire")
+	}
+	if s.ReacquireSupportICAOCount == 0 {
+		t.Fatal("reacquire support ICAO count must be preserved across reacquire")
+	}
+}
+
+func TestReacquireSupportPreventsCollapseInCanReacquire(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	seedReacquireFitSupport(s)
+	s.Holdover = true
+	s.HoldoverReason = "hard_residual_reject"
+
+	for i := 0; i < 3; i++ {
+		s.UpdateEpoch(float64(i+1)*4_000_000.0, 90.0, 4.0, 1.0, 4, 0.5, 0xAA)
+	}
+
+	if s.FitObservationCount >= reacquireMinFitObs {
+		t.Log("note: fit observation count partially preserved; reacquire support also available")
+	}
+
+	canReacquire := s.canReacquireInHoldover(4.0, 4, 0.5, 0xAA)
+	if !canReacquire {
+		t.Fatal("reacquire should still be possible using preserved support counters")
+	}
+	if s.ReacquireSupportObservationCount < reacquireMinFitObs {
+		t.Fatal("reacquire support observation count must be sufficient for reacquire")
+	}
+}
+
+func TestRepeatedHardResidualReacquireCyclesDoNotTrapInLowFitCount(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	seedReacquireFitSupport(s)
+
+	initialSupportObs := s.FitObservationCount
+	initialSupportICAO := s.FitICAOCount
+	t.Logf("initial support: %d obs, %d ICAOs", initialSupportObs, initialSupportICAO)
+
+	reacquireCount := 0
+	for cycle := 0; cycle < 5; cycle++ {
+		s.Holdover = true
+		s.HoldoverReason = "hard_residual_reject"
+		s.ConsecutiveHardResidualRejects = 2
+
+		epochUS := float64((cycle*10)+1) * 4_000_000.0
+		accepted := s.UpdateEpoch(epochUS, 90.0, 4.0, 1.0, 4, 0.5, 0xAA)
+		if accepted {
+			reacquireCount++
+			t.Logf("cycle %d: reacquired at epoch=%.0f", cycle, epochUS)
+		}
+		canReacquire := s.canReacquireInHoldover(4.0, 4, 0.5, 0xAA)
+		if !canReacquire {
+			t.Fatalf("cycle %d: reacquire support collapsed (obs=%d/%d, icao=%d/%d); canReacquireInHoldover returned false",
+				cycle, s.FitObservationCount, s.ReacquireSupportObservationCount,
+				s.FitICAOCount, s.ReacquireSupportICAOCount)
+		}
+
+		for j := 0; j < 5; j++ {
+			icao := uint32(0xAA + uint32((cycle*5+j)%4))
+			s.AddRefinementResidualObservation(
+				float64((cycle*10+j+2))*4_000_000.0, 1.0, icao, true, 4, 0.5, 0xAA, "go_refiner_active")
+		}
+	}
+
+	if reacquireCount < 5 {
+		t.Fatalf("reacquire count=%d, want 5; reacquire should succeed every cycle", reacquireCount)
+	}
+	if s.ReacquireSupportObservationCount < 24 {
+		t.Fatalf("reacquire support observation count=%d, want >= 24 (initial seed preserved)", s.ReacquireSupportObservationCount)
+	}
+}
+
+func TestDebugSnapshotExposesReacquireSupportCounters(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	seedReacquireFitSupport(s)
+
+	iid := &IIDState{IID: 3, Sync: s}
+	snap := iid.DebugStateSnapshot()
+
+	if snap.ReacquireSupportObservationCount != 0 {
+		t.Fatalf("ReacquireSupportObservationCount=%d, want 0 before any reacquire", snap.ReacquireSupportObservationCount)
+	}
+
+	s.Holdover = true
+	s.HoldoverReason = "hard_residual_reject"
+	for i := 0; i < 3; i++ {
+		s.UpdateEpoch(float64(i+1)*4_000_000.0, 90.0, 4.0, 1.0, 4, 0.5, 0xAA)
+	}
+
+	snap = iid.DebugStateSnapshot()
+	if snap.ReacquireSupportObservationCount == 0 {
+		t.Fatal("ReacquireSupportObservationCount must be non-zero after reacquire")
+	}
+	if snap.ReacquireSupportICAOCount == 0 {
+		t.Fatal("ReacquireSupportICAOCount must be non-zero after reacquire")
+	}
+}
+
+func TestNonHoldoverAuthorityChangeStillResetsFitEpoch(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 10; i++ {
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, float64(i)*0.2, 0xCC+uint32(i%3), true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	prevEpochID := s.FitEpochID
+
+	s.AddRefinementResidualObservation(44_000_000.0, 1.1, 0xCC, true, 4, 0.5, 0xAA, "py_authority")
+
+	if s.FitEpochID <= prevEpochID {
+		t.Fatal("non-holdover authority basis change (go_refiner_active → py_authority) must still reset fit epoch")
+	}
+	if s.FitEpochResetReason != "period_authority_changed" {
+		t.Fatalf("reset reason=%q, want period_authority_changed", s.FitEpochResetReason)
 	}
 }

@@ -140,6 +140,9 @@ type SyncState struct {
 	ReferenceLastChangeUnix                  float64
 	ObservationDropCountsByReason            map[string]uint64
 	LastUpdateEpochRefPosMissingReason       string // "not_in_cache", "stale", or ""
+	ReacquireSupportObservationCount         int     // preserved across reacquire for canReacquireInHoldover
+	ReacquireSupportICAOCount                int     // preserved across reacquire for canReacquireInHoldover
+	FitEpochResetHoldoverChurn               bool    // true when last reset was caused by holdover/authority churn (not true basis change)
 }
 
 const (
@@ -249,6 +252,8 @@ func NewSyncState(iid uint8, periodS, epochUS, phaseOffsetDeg, quality float64) 
 		FitEpochResetCountByReason:  make(map[string]uint64),
 		ObservationDropCountsByReason: make(map[string]uint64),
 		LastAcceptedEpochUS:         epochUS,
+		ReacquireSupportObservationCount: 0,
+		ReacquireSupportICAOCount:        0,
 		LastAcceptedEpochAtUnix:     float64(time.Now().UnixNano()) / 1e9,
 	}
 }
@@ -316,16 +321,33 @@ func (s *SyncState) canReacquireInHoldover(periodS float64, nAircraft int, refPo
 	if nAircraft < 2 {
 		return false
 	}
-	if s.FitObservationCount < reacquireMinFitObs || s.FitICAOCount < reacquireMinFitICAOs {
+	obsCount := s.FitObservationCount
+	if s.ReacquireSupportObservationCount > obsCount {
+		obsCount = s.ReacquireSupportObservationCount
+	}
+	icaoCount := s.FitICAOCount
+	if s.ReacquireSupportICAOCount > icaoCount {
+		icaoCount = s.ReacquireSupportICAOCount
+	}
+	if obsCount < reacquireMinFitObs || icaoCount < reacquireMinFitICAOs {
 		return false
 	}
 	return true
 }
 
 func (s *SyncState) hasStrongResidualSupport() bool {
-	return s.FitObservationCount >= maintenanceMinFitObs &&
-		s.FitICAOCount >= maintenanceMinFitICAOs &&
-		s.FitSpanS >= maintenanceMinFitSpanS
+	obsCount := s.FitObservationCount
+	if s.ReacquireSupportObservationCount > obsCount {
+		obsCount = s.ReacquireSupportObservationCount
+	}
+	icaoCount := s.FitICAOCount
+	if s.ReacquireSupportICAOCount > icaoCount {
+		icaoCount = s.ReacquireSupportICAOCount
+	}
+	spanS := s.FitSpanS
+	return obsCount >= maintenanceMinFitObs &&
+		icaoCount >= maintenanceMinFitICAOs &&
+		spanS >= maintenanceMinFitSpanS
 }
 
 func (s *SyncState) ResetFitEpochOnModelChange(reason string, referenceICAO uint32, authorityBasis string) {
@@ -406,6 +428,46 @@ func (s *SyncState) rotateFitEpochLocked(reason string, ctx fitEpochContext) {
 	s.startFitEpochIfNeededLocked(ctx)
 }
 
+func (s *SyncState) reacquireClearSlopeFitHistoryLocked() {
+	if s.FitObservationCount > s.ReacquireSupportObservationCount {
+		s.ReacquireSupportObservationCount = s.FitObservationCount
+	}
+	if s.FitICAOCount > s.ReacquireSupportICAOCount {
+		s.ReacquireSupportICAOCount = s.FitICAOCount
+	}
+	dropped := len(s.residualHistory)
+	if dropped > 0 {
+		s.FitDroppedOnEpochReset += dropped
+	}
+	s.residualHistory = nil
+	s.slopeHistory = nil
+	s.FitObservationCount = 0
+	s.FitSpanS = 0
+	s.FitICAOCount = 0
+	s.FitPerICAOMin = 0
+	s.FitPerICAOMedian = 0
+	s.FitPerICAOMax = 0
+	s.FitGlobalCapHit = false
+	s.FitLastEvictionReason = ""
+	s.FitEpochResetReason = "phase_epoch_reacquired"
+	s.FitInlierRatio = -1.0
+	s.fitEpochFirstEpochUS = 0
+	s.fitEpochLastEpochUS = 0
+	s.ProposedDeltaS = 0
+	s.AppliedDeltaS = 0
+	s.LastSlewLimited = false
+	s.LastHardBound = false
+	s.HardBoundReason = ""
+	s.ResidualSlopeDegPerS = 0
+	s.RequestedDeltaS = 0
+	s.RequestedDeltaPPM = 0
+	s.FitObservationsAddedSinceReset = 0
+	s.FitObservationsRejectedSinceReset = 0
+	s.LastFitObservationRejectReason = ""
+	s.FitEpochResetCountByReason["phase_epoch_reacquired"] = s.FitEpochResetCountByReason["phase_epoch_reacquired"] + 1
+	s.LastFitEpochResetUnix = float64(time.Now().UnixNano()) / 1e9
+}
+
 func (s *SyncState) maybeResetFitEpochLocked(ctx fitEpochContext) {
 	if ctx.residualBasis == "" {
 		ctx.residualBasis = "observed_minus_predicted"
@@ -430,13 +492,13 @@ func (s *SyncState) maybeResetFitEpochLocked(ctx fitEpochContext) {
 			return
 		}
 	}
-	if ctx.holdover != s.fitEpochHoldover {
-		s.rotateFitEpochLocked("holdover_basis_changed", ctx)
-		return
-	}
 	if ctx.authorityBasis != s.fitEpochAuthorityBasis {
-		s.rotateFitEpochLocked("period_authority_changed", ctx)
-		return
+		isHoldoverToggle := (ctx.authorityBasis == "go_refiner_active" && s.fitEpochAuthorityBasis == "go_refiner_holdover") ||
+			(ctx.authorityBasis == "go_refiner_holdover" && s.fitEpochAuthorityBasis == "go_refiner_active")
+		if !isHoldoverToggle {
+			s.rotateFitEpochLocked("period_authority_changed", ctx)
+			return
+		}
 	}
 	if math.Abs(circularDiff(ctx.phaseOffsetDeg, s.fitEpochPhaseOffsetDeg)) > fitEpochPhaseOffsetResetDeg {
 		s.rotateFitEpochLocked("phase_offset_discontinuity", ctx)
@@ -608,7 +670,8 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 				s.ConsecutiveHardResidualRejects = 0
 				s.LastAcceptedEpochAgeS = 0
 				s.SyncEpochAgeS = 0
-				s.rotateFitEpochLocked("phase_epoch_reacquired", fitEpochContext{
+				s.reacquireClearSlopeFitHistoryLocked()
+				s.startFitEpochIfNeededLocked(fitEpochContext{
 					epochUS:        newEpochUS,
 					residualBasis:  "observed_minus_predicted",
 					referenceICAO:  refICAO,
