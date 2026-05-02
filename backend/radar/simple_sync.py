@@ -481,6 +481,36 @@ def update_simple_live_sync_state(
         (refined_period_s - base_period_s) / base_period_s * 1e6 if base_period_s > 0 else 0.0
     )
 
+    import config as _cfg
+    go_is_operational = (
+        bool(getattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False))
+        and bool(state._go_operational_by_iid.get(iid, False))
+    )
+    if go_is_operational:
+        # Store Python shadow refinement data for diagnostics only.
+        # Go owns the operational period delta; Python writes base period
+        # and captures its would-be refinement as a shadow comparison.
+        py_shadow_delta_s = refined_period_s - base_period_s
+        state._py_shadow_sync_states[iid] = {
+            "py_shadow_period_delta_s": py_shadow_delta_s,
+            "py_shadow_period_correction_ppm": (
+                py_shadow_delta_s / base_period_s * 1e6
+                if base_period_s > 0 and py_shadow_delta_s != 0.0
+                else 0.0
+            ),
+            "py_shadow_effective_period_s": refined_period_s,
+            "py_shadow_residual_slope_deg_per_s": smoothed_slope,
+            "py_shadow_fit_observation_count": len(fit_scored),
+            "py_shadow_fit_span_s": fit_span_s,
+            "py_shadow_refinement_status": (
+                "stable" if period_update_allowed else "holding"
+            ),
+            "py_shadow_base_period_s": base_period_s,
+        }
+        # Demote Python: no operational refinement when Go is primary.
+        refined_period_s = base_period_s
+        period_correction_ppm = 0.0
+
     inlier_abs = [abs(e["residual"]) for e in scored if e["status"] == "inlier"]
     if len(inlier_abs) >= 3:
         try:
@@ -556,6 +586,13 @@ def update_simple_live_sync_state(
         motion_comp_phase_enabled=bool(RADAR_SYNC_MOTION_COMP_PHASE_ENABLED),
         motion_comp_fit_enabled=bool(RADAR_SYNC_MOTION_COMP_FIT_ENABLED),
     )
+    if go_is_operational:
+        new_state.period_authority = "go_refined"
+        new_state.sync_authority = "go_runtime"
+        new_state.handoff_state = getattr(existing, "handoff_state", None) or "GO_REFINED_READY"
+        new_state.handoff_reason = getattr(existing, "handoff_reason", None) or "go_ready"
+        new_state.handoff_gate_failures = getattr(existing, "handoff_gate_failures", None) or {}
+        new_state.period_refinement_status = "stable"
     state._live_sync_states[iid] = new_state
 
     state._live_period_history.setdefault(iid, deque(maxlen=80)).append(

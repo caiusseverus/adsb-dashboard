@@ -236,9 +236,9 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
 
     assert payload["sync_state"]["source"] == "go_frame_sync"
     assert stage0_keys.issubset(set(payload["sync_state"].keys()))
-    assert payload["sync_state"]["period_authority"] == "go_refined"
-    assert payload["sync_state"]["sync_authority"] == "go_runtime"
-    assert payload["sync_state"]["period_refinement_status"] == "stable"
+    assert payload["sync_state"]["period_authority"] == "py_base"
+    assert payload["sync_state"]["sync_authority"] == "py_bootstrap"
+    assert payload["sync_state"]["period_refinement_status"] == "unavailable"
     assert payload["sync_state"]["base_period_s"] == pytest.approx(4.25)
     assert payload["sync_state"]["period_delta_s"] == pytest.approx(0.0)
     assert payload["sync_state"]["effective_period_s"] == pytest.approx(4.25)
@@ -256,7 +256,7 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     assert payload["sync_state"]["holdover_reason"] == "hard_residual_reject"
     assert payload["sync_state"]["last_sync_reject_reason"] == "hard_residual_reject"
     assert payload["sync_state"]["holdover_hard_residual_reject"] == 7
-    assert payload["sync_state"]["effective_period_source"] == "go_runtime.base_period_s"
+    assert payload["sync_state"]["effective_period_source"] == "python_simple_sync.period_base_s"
     assert payload["sync_state"]["operational_period_refinement_status"] is not None
     assert payload["sync_state"]["go_diagnostic_fit_observation_count"] == 14
     assert payload["sync_state"]["go_diagnostic_proposed_delta_s"] == pytest.approx(0.0005)

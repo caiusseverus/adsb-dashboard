@@ -2626,7 +2626,18 @@ def build_selected_iid_page_state_payload(
             if fallback_sync is not None and getattr(fallback_sync, "source", None) == "multi_aircraft_burst":
                 legacy_python_sync = fallback_sync
         operational_sync = state.get_live_sync_state(iid)
-        sync_state = _live_sync_state_to_dict(operational_sync, go_sync=go_runtime_sync) if operational_sync is not None else {}
+        import config as _cfg
+        sync_state = (
+            _live_sync_state_to_dict(
+                operational_sync,
+                go_sync=go_runtime_sync,
+                py_shadow=state.get_py_shadow_sync_state(iid),
+                authority_transitions=state.get_period_authority_transitions(iid),
+                go_refiner_operational_enabled=bool(getattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)),
+            )
+            if operational_sync is not None
+            else {}
+        )
         with state._lock:
             latest_arrival_us = state._iid_latest_arrival_us.get(iid)
             go_sweep_frame_count = int(len(state._go_sweep_frames_by_iid.get(iid, ())))

@@ -3294,10 +3294,12 @@ def test_go_handoff_allows_period_authority_when_gates_pass():
         "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1, "bps": 4.0, "eps": 4.0, "pag": True,
     })
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(33))
-    assert payload["period_authority"] == "go_refined"
-    assert payload["sync_authority"] == "go_runtime"
+    # With RADAR_SYNC_GO_REFINER_OPERATIONAL=False (default), Go remains diagnostic.
+    # The flag gates Go operational authority; when disabled, Go is never promoted.
+    assert payload["period_authority"] == "py_base"
+    assert payload["sync_authority"] == "py_bootstrap"
     assert payload["handoff_state"] == "GO_REFINED_READY"
-    assert payload["phase_authority"] != "go_runtime"
+    assert payload["handoff_reason"] == "go_ready_flag_disabled"
 
 
 def test_handoff_transition_log_only_on_state_change(caplog):
@@ -3964,3 +3966,334 @@ def test_go_refined_stable_with_fit_data_not_labelled_insufficient():
     assert fields["go_diagnostic_retained_delta_s"] == pytest.approx(0.00104)
     assert fields["go_diagnostic_proposed_delta_s"] == pytest.approx(0.00106)
     assert fields["go_diagnostic_applied_delta_s"] == pytest.approx(0.00104)
+
+
+# =============================================================================
+# Stage 5: RADAR_SYNC_GO_REFINER_OPERATIONAL feature flag tests
+# =============================================================================
+
+
+def _go_sync_for_gates(iid=100, period_s=4.0) -> dict:
+    return {
+        "i": iid, "sp": True, "su": True, "sps": period_s, "sep": 1000.0, "sod": 10.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1,
+        "bps": period_s, "eps": period_s, "pag": True,
+    }
+
+
+def test_stage5_flag_disabled_go_stays_diagnostic(monkeypatch):
+    """With RADAR_SYNC_GO_REFINER_OPERATIONAL=False (default), Go refiner
+    remains diagnostic even when readiness gates pass."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
+    state = RadarState()
+    state._models[111] = RadarIID(iid=111, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state.update_go_iid_state(_go_sync_for_gates(111, 4.0))
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(111))
+    assert payload["period_authority"] == "py_base"
+    assert payload["sync_authority"] == "py_bootstrap"
+    assert payload["handoff_state"] == "GO_REFINED_READY"
+    assert payload["handoff_reason"] == "go_ready_flag_disabled"
+    assert payload["go_refiner_operational_enabled"] is False
+    assert not state._go_operational_by_iid.get(111, False)
+
+
+def test_stage5_flag_disabled_go_diagnostic_delta_not_operational(monkeypatch):
+    """When flag is disabled, Go diagnostic delta must not appear as
+    the operational period delta."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
+    state = RadarState()
+    state._models[112] = RadarIID(iid=112, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state.update_go_iid_state(_go_sync_for_gates(112, 4.0))
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(112))
+    assert payload["period_authority"] == "py_base"
+    assert payload["period_delta_source"] != "go_runtime_delta"
+    assert payload["period_delta_s"] == 0.0 or payload["period_delta_s"] is None
+    assert payload["go_diagnostic_period_delta_s"] is not None
+    assert payload["go_diagnostic_period_delta_s"] is not None
+
+
+def test_stage5_flag_enabled_go_ready_becomes_operational(monkeypatch):
+    """When RADAR_SYNC_GO_REFINER_OPERATIONAL=True and Go reaches
+    GO_REFINED_READY, Go becomes the sole operational period refiner."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    state._models[200] = RadarIID(iid=200, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state.update_go_iid_state(_go_sync_for_gates(200, 4.0))
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(200))
+    assert payload["period_authority"] == "go_refined"
+    assert payload["sync_authority"] == "go_runtime"
+    assert payload["handoff_state"] == "GO_REFINED_READY"
+    assert payload["handoff_reason"] == "go_ready"
+    assert payload["go_refiner_operational_enabled"] is True
+    assert state._go_operational_by_iid.get(200, False) is True
+
+
+def test_stage5_flag_enabled_go_ready_effective_equals_base_plus_delta(monkeypatch):
+    """When Go is operational, the operational period triple must satisfy
+    Effective = Base + Delta."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    state._models[201] = RadarIID(iid=201, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state.update_go_iid_state({
+        "i": 201, "sp": True, "su": True, "sps": 4.001, "sep": 1000.0, "sod": 10.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1,
+        "bps": 4.0, "eps": 4.001, "pag": True, "pds": 0.001,
+    })
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(201))
+    assert payload["period_authority"] == "go_refined"
+    base = payload["base_period_s"]
+    delta = payload["period_delta_s"]
+    effective = payload["effective_period_s"]
+    assert base is not None
+    assert delta is not None
+    assert effective is not None
+    assert abs((base + delta) - effective) < 1e-12
+
+
+def test_stage5_flag_enabled_go_ready_effective_period_source_is_go(monkeypatch):
+    """When Go is operational, effective_period_source must be
+    go_runtime.effective_period_s."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    state._models[202] = RadarIID(iid=202, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state.update_go_iid_state(_go_sync_for_gates(202, 4.0))
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(202))
+    assert payload["period_authority"] == "go_refined"
+    assert payload["effective_period_source"] == "go_runtime.base_period_s"
+
+
+def test_stage5_flag_enabled_go_not_ready_falls_back_to_python(monkeypatch):
+    """When the flag is enabled but Go readiness gates fail, fall back
+    to Python safe path and expose failure reason."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    state._models[210] = RadarIID(iid=210, status="SINGLE_RADAR", period_s=4.0, primary_support_count=6)
+    # Go period disagrees with Python base → not_ready
+    state.update_go_iid_state({
+        "i": 210, "sp": True, "su": True, "sps": 4.8, "sep": 1000.0, "sod": 10.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1,
+        "bps": 4.8, "eps": 4.8, "pag": True,
+    })
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(210))
+    assert payload["period_authority"] == "py_base"
+    assert payload["handoff_state"] == "BASE_PERIOD_READY"
+    assert payload["handoff_reason"] == "go_not_ready"
+    assert not state._go_operational_by_iid.get(210, False)
+    assert payload["go_refiner_operational_enabled"] is True
+
+
+def test_stage5_flag_enabled_cold_start_no_python_base_blocks_go(monkeypatch):
+    """No Python DF/base period means Go cannot become operational
+    authority even with the flag enabled."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    # No Python model set up → missing_python_base_period
+    state.update_go_iid_state(_go_sync_for_gates(300, 4.0))
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(300))
+    assert payload["period_authority"] == "py_bootstrap"
+    assert payload["handoff_state"] == "BOOTSTRAPPING_PY"
+    assert not state._go_operational_by_iid.get(300, False)
+    assert payload["go_refiner_operational_enabled"] is True
+
+
+def test_stage5_flag_enabled_no_silent_go_adoption_without_python_base(monkeypatch):
+    """Go must not silently become operational authority merely because
+    Python sync is absent, even with the flag enabled."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    # Go state present, but no Python model → should be BOOTSTRAPPING_PY
+    state.update_go_iid_state(_go_sync_for_gates(301, 4.0))
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(301))
+    assert payload["period_authority"] != "go_refined"
+    assert payload["period_authority"] == "py_bootstrap"
+    assert not state._go_operational_by_iid.get(301, False)
+
+
+def test_stage5_transition_recorded_when_go_becomes_operational(monkeypatch):
+    """When Go transitions to operational authority, the transition is
+    recorded with from/to/reason metadata."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    # First set up Go not-ready to establish a baseline
+    state._models[400] = RadarIID(iid=400, status="SINGLE_RADAR", period_s=4.0, primary_support_count=6)
+    state.update_go_iid_state({
+        "i": 400, "sp": True, "su": True, "sps": 4.8, "sep": 1000.0, "sod": 10.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1,
+        "bps": 4.8, "eps": 4.8, "pag": True,
+    })
+    # Now make Go ready
+    state.update_go_iid_state(_go_sync_for_gates(400, 4.0))
+    payload = sweep._live_sync_state_to_dict(
+        state.get_live_sync_state(400),
+        authority_transitions=state._period_authority_transitions.get(400),
+    )
+    assert payload["period_authority"] == "go_refined"
+    assert payload["last_period_authority_transition_from"] is not None
+    assert payload["last_period_authority_transition_to"] == "go_refined"
+    assert isinstance(payload["last_period_authority_transition_ts"], float)
+    assert payload["last_period_authority_transition_reason"] is not None
+
+
+def test_stage5_transition_recorded_when_go_loses_operational(monkeypatch):
+    """When Go loses readiness, the fallback transition is recorded."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    state._models[401] = RadarIID(iid=401, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    # Make Go operational first
+    state.update_go_iid_state(_go_sync_for_gates(401, 4.0))
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(401))
+    assert payload["period_authority"] == "go_refined"
+    # Now make Go lose readiness (period disagrees)
+    state.update_go_iid_state({
+        "i": 401, "sp": True, "su": True, "sps": 4.8, "sep": 1000.0, "sod": 10.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 3000.0, "rv": 2,
+        "bps": 4.8, "eps": 4.8, "pag": True,
+    })
+    payload = sweep._live_sync_state_to_dict(
+        state.get_live_sync_state(401),
+        authority_transitions=state._period_authority_transitions.get(401),
+    )
+    assert payload["period_authority"] == "py_base"
+    assert payload["last_period_authority_transition_to"] == "py_base"
+    assert not state._go_operational_by_iid.get(401, False)
+
+
+def test_stage5_py_shadow_fields_present_when_go_operational(monkeypatch):
+    """Python shadow fields are populated separately when Go is operational
+    and Python simple_sync runs."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    state._models[500] = RadarIID(iid=500, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state.update_go_iid_state(_go_sync_for_gates(500, 4.0))
+    assert state._go_operational_by_iid.get(500, False) is True
+    # Simulate Python running and writing shadow data
+    state._py_shadow_sync_states[500] = {
+        "py_shadow_period_delta_s": 0.001,
+        "py_shadow_period_correction_ppm": 250.0,
+        "py_shadow_effective_period_s": 4.001,
+        "py_shadow_residual_slope_deg_per_s": 0.0005,
+        "py_shadow_fit_observation_count": 25,
+        "py_shadow_fit_span_s": 120.0,
+        "py_shadow_refinement_status": "stable",
+    }
+    payload = sweep._live_sync_state_to_dict(
+        state.get_live_sync_state(500),
+        py_shadow=state._py_shadow_sync_states.get(500),
+    )
+    assert payload["period_authority"] == "go_refined"
+    assert payload["py_shadow_period_delta_s"] == 0.001
+    assert payload["py_shadow_period_correction_ppm"] == 250.0
+    assert payload["py_shadow_effective_period_s"] == 4.001
+    assert payload["py_shadow_fit_observation_count"] == 25
+    assert payload["py_shadow_refinement_status"] == "stable"
+    assert payload["py_shadow_period_delta_s"] != payload["period_delta_s"]
+
+
+def test_stage5_shadow_vs_go_comparison_field(monkeypatch):
+    """The comparison field py_shadow_delta_ppm_minus_go_delta_ppm
+    is populated when both shadow and Go diagnostic deltas are available."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    state._models[501] = RadarIID(iid=501, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state.update_go_iid_state({
+        "i": 501, "sp": True, "su": True, "sps": 4.002, "sep": 1000.0, "sod": 10.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1,
+        "bps": 4.0, "eps": 4.002, "pag": True, "pds": 0.002,
+    })
+    state._py_shadow_sync_states[501] = {
+        "py_shadow_period_delta_s": 0.001,
+        "py_shadow_period_correction_ppm": 250.0,
+        "py_shadow_effective_period_s": 4.001,
+        "py_shadow_residual_slope_deg_per_s": 0.0005,
+        "py_shadow_fit_observation_count": 25,
+        "py_shadow_fit_span_s": 120.0,
+        "py_shadow_refinement_status": "stable",
+        "py_shadow_base_period_s": 4.0,
+    }
+    payload = sweep._live_sync_state_to_dict(
+        state.get_live_sync_state(501),
+        go_sync=state.get_go_live_sync_state(501) or {},
+        py_shadow=state._py_shadow_sync_states.get(501),
+    )
+    comparison = payload["py_shadow_delta_ppm_minus_go_delta_ppm"]
+    assert comparison is not None
+    assert isinstance(comparison, float)
+
+
+def test_stage5_go_operational_gate_failures_exposed(monkeypatch):
+    """When Go readiness gates fail, go_operational_gate_failures exposes
+    which gates blocked Go from becoming operational."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    state._models[502] = RadarIID(iid=502, status="SINGLE_RADAR", period_s=4.0, primary_support_count=6)
+    state.update_go_iid_state({
+        "i": 502, "sp": True, "su": True, "sps": 4.8, "sep": 1000.0, "sod": 10.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1,
+        "bps": 4.8, "eps": 4.8, "pag": True,
+    })
+    payload = sweep._live_sync_state_to_dict(
+        state.get_live_sync_state(502),
+        authority_transitions=state._period_authority_transitions.get(502),
+    )
+    failures = payload.get("go_operational_gate_failures")
+    assert isinstance(failures, dict)
+    assert "go_readiness.go_base_agrees_with_python_base" in failures
+    assert payload["period_authority"] != "go_refined"
+
+
+def test_stage5_flag_disabled_go_diagnostic_not_labelled_operational(monkeypatch):
+    """When flag is disabled, Go diagnostic delta is NOT used as operational
+    and period_authority is never go_refined just because Go exists."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
+    state = RadarState()
+    state._models[600] = RadarIID(iid=600, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state.update_go_iid_state(_go_sync_for_gates(600, 4.0))
+    payload = sweep._live_sync_state_to_dict(
+        state.get_live_sync_state(600),
+        go_sync=state.get_go_live_sync_state(600) or {},
+    )
+    assert payload["period_authority"] != "go_refined"
+    assert payload["go_diagnostic_period_delta_s"] is not None
+    assert payload["period_delta_source"] != "go_runtime_delta"
+    assert payload["effective_period_source"] != "go_runtime.effective_period_s"
+    assert payload["go_refiner_operational_enabled"] is False
+
+
+def test_stage5_only_one_operational_delta_exposed(monkeypatch):
+    """When Go is operational, only one operational delta is exposed.
+    The Python shadow delta must not appear in the operational triple."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    state._models[601] = RadarIID(iid=601, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    state.update_go_iid_state(_go_sync_for_gates(601, 4.0))
+    state._py_shadow_sync_states[601] = {
+        "py_shadow_period_delta_s": 0.001,
+        "py_shadow_period_correction_ppm": 250.0,
+        "py_shadow_effective_period_s": 4.001,
+        "py_shadow_residual_slope_deg_per_s": 0.0005,
+        "py_shadow_fit_observation_count": 25,
+        "py_shadow_fit_span_s": 120.0,
+        "py_shadow_refinement_status": "stable",
+    }
+    payload = sweep._live_sync_state_to_dict(
+        state.get_live_sync_state(601),
+        py_shadow=state._py_shadow_sync_states.get(601),
+    )
+    assert payload["period_authority"] == "go_refined"
+    assert payload["period_delta_source"] == "none" or payload["period_delta_source"] == "go_runtime_delta"
+    assert payload["py_shadow_period_delta_s"] != payload["period_delta_s"]

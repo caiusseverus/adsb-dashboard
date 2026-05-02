@@ -243,6 +243,12 @@ RADAR_SYNC_PROP_DELAY_ENABLED: bool = _bool("RADAR_SYNC_PROP_DELAY_ENABLED", Tru
 # both paths even if one side is disabled.
 RADAR_SYNC_MOTION_COMP_PHASE_ENABLED: bool = _bool("RADAR_SYNC_MOTION_COMP_PHASE_ENABLED", True)
 RADAR_SYNC_MOTION_COMP_FIT_ENABLED: bool = _bool("RADAR_SYNC_MOTION_COMP_FIT_ENABLED", True)
+# When True, Go becomes the operational period refinement authority when handoff
+# readiness gates pass (GO_REFINED_READY). Python continues to own the DF/base
+# period and runs its own refinement as a shadow diagnostic. When False (default),
+# current operational behaviour is preserved: Python period refinement remains
+# operational and Go refiner is diagnostic/shadow only.
+RADAR_SYNC_GO_REFINER_OPERATIONAL: bool = _bool("RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
 
 # ---------------------------------------------------------------------------
 # Stage 3 — aircraft localisation from known radar bearings

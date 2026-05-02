@@ -466,12 +466,21 @@ def _clone_sync_for_projection(
     )
 
 
-def _live_sync_state_to_dict(sync: "LiveSyncState", go_sync: dict | None = None) -> dict:
+def _live_sync_state_to_dict(
+    sync: "LiveSyncState",
+    go_sync: dict | None = None,
+    py_shadow: dict | None = None,
+    authority_transitions: list[dict] | None = None,
+    go_refiner_operational_enabled: bool | None = None,
+) -> dict:
     """Serialise a LiveSyncState to a plain dict for API/verification payloads.
 
     Exposed phase metadata is anchor-relative/sweep-relative in current stages.
     Geographic/absolute radar beam direction is not available.
     """
+    if go_refiner_operational_enabled is None:
+        import config as _cfg
+        go_refiner_operational_enabled = bool(getattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False))
     import dataclasses
     payload: dict = {}
     for field in dataclasses.fields(sync):
@@ -520,24 +529,27 @@ def _live_sync_state_to_dict(sync: "LiveSyncState", go_sync: dict | None = None)
     period_refinement_status = str(getattr(sync, "period_refinement_status", "") or "").strip() or None
 
     usable = bool(getattr(sync, "usable", False))
+    canonical_base = getattr(sync, "base_period_s", None)
+    canonical_effective = getattr(sync, "effective_period_s", None)
+    canonical_delta = getattr(sync, "period_delta_s", None)
+
+    # Derive operational period fields from canonical or raw values.
+    # This runs for both usable and non-usable states so diagnostics and
+    # fallback authorities always have accessible period information.
+    if _is_finite_number(canonical_base) and float(canonical_base) > 0.0:
+        base_period_s = float(canonical_base)
+    elif period_base_s > 0.0:
+        base_period_s = period_base_s
+    if _is_finite_number(canonical_effective) and float(canonical_effective) > 0.0:
+        effective_period_s = float(canonical_effective)
+    elif period_s > 0.0:
+        effective_period_s = period_s
+    if _is_finite_number(canonical_delta):
+        period_delta_s = float(canonical_delta)
+    elif base_period_s is not None and effective_period_s is not None:
+        period_delta_s = effective_period_s - base_period_s
+
     if usable:
-        canonical_base = getattr(sync, "base_period_s", None)
-        canonical_effective = getattr(sync, "effective_period_s", None)
-        canonical_delta = getattr(sync, "period_delta_s", None)
-
-        if _is_finite_number(canonical_base) and float(canonical_base) > 0.0:
-            base_period_s = float(canonical_base)
-        elif period_base_s > 0.0:
-            base_period_s = period_base_s
-        if _is_finite_number(canonical_effective) and float(canonical_effective) > 0.0:
-            effective_period_s = float(canonical_effective)
-        elif period_s > 0.0:
-            effective_period_s = period_s
-        if _is_finite_number(canonical_delta):
-            period_delta_s = float(canonical_delta)
-        elif base_period_s is not None and effective_period_s is not None:
-            period_delta_s = effective_period_s - base_period_s
-
         if source == "go_frame_sync" and period_authority == "unavailable":
             period_authority = "go_refined" if effective_period_s is not None else "unavailable"
             sync_authority = "go_runtime" if effective_period_s is not None else "unavailable"
@@ -612,6 +624,14 @@ def _live_sync_state_to_dict(sync: "LiveSyncState", go_sync: dict | None = None)
     elif period_authority in {"holdover", "unavailable"}:
         period_delta_source = "none"
         effective_period_source = "none"
+
+    # When Go is operational authority, use Go's effective period from go_sync
+    # rather than from the local sync state (which may be Python-written with
+    # a different period_s when the feature flag is enabled).
+    if period_authority == "go_refined" and go_sync:
+        go_effective = go_sync.get("effective_period_s")
+        if _is_finite_number(go_effective) and float(go_effective) > 0.0:
+            effective_period_s = float(go_effective)
 
     consistency_warnings: list[str] = []
     if period_authority == "py_base" and effective_period_source.startswith("go_runtime"):
@@ -789,6 +809,69 @@ def _live_sync_state_to_dict(sync: "LiveSyncState", go_sync: dict | None = None)
         "fit_segment_count": getattr(sync, "fit_segment_count", None),
     })
     payload.update(_build_go_diagnostic_fields(sync, go_sync=go_sync))
+
+    # --- Python shadow refinement fields (present when Python runs as shadow) ---
+    payload["py_shadow_period_delta_s"] = None
+    payload["py_shadow_period_correction_ppm"] = None
+    payload["py_shadow_effective_period_s"] = None
+    payload["py_shadow_residual_slope_deg_per_s"] = None
+    payload["py_shadow_fit_observation_count"] = None
+    payload["py_shadow_fit_span_s"] = None
+    payload["py_shadow_refinement_status"] = None
+    if py_shadow:
+        for key in (
+            "py_shadow_period_delta_s",
+            "py_shadow_period_correction_ppm",
+            "py_shadow_effective_period_s",
+            "py_shadow_residual_slope_deg_per_s",
+            "py_shadow_fit_observation_count",
+            "py_shadow_fit_span_s",
+            "py_shadow_refinement_status",
+        ):
+            if key in py_shadow:
+                payload[key] = py_shadow[key]
+
+    # --- Python shadow delta vs Go delta comparison (ppm) ---
+    payload["py_shadow_delta_ppm_minus_go_delta_ppm"] = None
+    py_shadow_delta = payload.get("py_shadow_period_delta_s")
+    py_base_for_ppm = payload.get("base_period_s") or py_shadow.get("py_shadow_base_period_s") if py_shadow else None
+    go_retained_delta = payload.get("go_diagnostic_retained_delta_s")
+    if (
+        _is_finite_number(py_shadow_delta)
+        and _is_finite_number(py_base_for_ppm)
+        and _is_finite_number(go_retained_delta)
+        and float(py_base_for_ppm) > 0.0
+    ):
+        py_shadow_ppm = float(py_shadow_delta) / float(py_base_for_ppm) * 1_000_000.0
+        go_retained_ppm = float(go_retained_delta) / float(py_base_for_ppm) * 1_000_000.0
+        payload["py_shadow_delta_ppm_minus_go_delta_ppm"] = py_shadow_ppm - go_retained_ppm
+
+    # --- Period authority transition diagnostics ---
+    if authority_transitions:
+        last = authority_transitions[-1]
+        payload["last_period_authority_transition_ts"] = last.get("ts")
+        payload["last_period_authority_transition_from"] = last.get("from")
+        payload["last_period_authority_transition_to"] = last.get("to")
+        payload["last_period_authority_transition_reason"] = last.get("reason")
+    else:
+        payload["last_period_authority_transition_ts"] = None
+        payload["last_period_authority_transition_from"] = None
+        payload["last_period_authority_transition_to"] = None
+        payload["last_period_authority_transition_reason"] = None
+
+    # --- Go operational gate failures (from current handoff evaluation) ---
+    go_op_failures: dict[str, str] = {}
+    handoff_failures = payload.get("handoff_gate_failures") or {}
+    for section in ("python_base", "go_readiness", "phase_readiness"):
+        section_gates = handoff_failures.get(section) or {}
+        for gate_name, gate_state in section_gates.items():
+            if isinstance(gate_state, dict) and gate_state.get("passed") is False:
+                go_op_failures[f"{section}.{gate_name}"] = str(gate_state.get("reason") or "failed")
+    payload["go_operational_gate_failures"] = go_op_failures if go_op_failures else None
+
+    # --- Feature flag exposure ---
+    payload["go_refiner_operational_enabled"] = go_refiner_operational_enabled
+
     return payload
 
 
@@ -1055,6 +1138,9 @@ class RadarState:
         self._GO_EVIDENCE_EVENTS_MAX = 60_000
         self._GO_SWEEP_FRAMES_MAX = 256
         self._go_sync_states_by_iid: dict[int, dict] = {}
+        self._go_operational_by_iid: dict[int, bool] = {}
+        self._py_shadow_sync_states: dict[int, dict] = {}
+        self._period_authority_transitions: dict[int, list[dict]] = {}
         self._go_multi_sync_admission_by_iid: dict[int, dict] = {}
         self._go_sync_diagnostic_history_revision: dict[int, int] = {}
         self._compact_sync_debug_by_iid: dict[int, dict] = {}
@@ -3044,6 +3130,7 @@ class RadarState:
         phase_authority: str,
     ) -> None:
         previous = str(getattr(sync, "handoff_state", "") or "")
+        prev_authority = str(getattr(sync, "period_authority", "") or "")
         if previous != handoff_state:
             now_ts = time.time()
             sync.last_handoff_transition_ts = now_ts
@@ -3053,6 +3140,23 @@ class RadarState:
                 previous or "unset",
                 handoff_state,
                 handoff_reason,
+            )
+        if prev_authority != period_authority:
+            now_ts = time.time()
+            transition = {
+                "ts": now_ts,
+                "from": prev_authority or "unset",
+                "to": period_authority,
+                "reason": handoff_reason,
+            }
+            self._period_authority_transitions.setdefault(iid, [])
+            self._period_authority_transitions[iid].append(transition)
+            log.info(
+                "radar_period_authority_transition iid=%s from=%s to=%s reason=%s",
+                iid,
+                transition["from"],
+                transition["to"],
+                transition["reason"],
             )
         sync.handoff_state = handoff_state
         sync.handoff_reason = handoff_reason
@@ -3073,6 +3177,8 @@ class RadarState:
             "go_readiness": go_gates["gates"],
             "phase_readiness": phase_eval["gates"],
         }
+        import config as _cfg
+        _go_operational_enabled = bool(getattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False))
         if not py_gates["base_period_valid"]:
             reason = "missing_python_base_period"
             for gate_name, gate_state in py_gates["gates"].items():
@@ -3080,6 +3186,7 @@ class RadarState:
                     reason = str(gate_state.get("reason") or gate_name)
                     break
             sync.usable = False
+            self._go_operational_by_iid[iid] = False
             self._set_handoff_state_locked(
                 iid,
                 sync,
@@ -3096,6 +3203,7 @@ class RadarState:
             reason = "go_not_ready"
             if bool((self._go_sync_states_by_iid.get(iid) or {}).get("holdover", False)):
                 reason = "go_holdover"
+            self._go_operational_by_iid[iid] = False
             self._set_handoff_state_locked(
                 iid,
                 sync,
@@ -3107,7 +3215,22 @@ class RadarState:
                 phase_authority="py_bootstrap",
             )
             return
+        if not _go_operational_enabled:
+            sync.usable = False
+            self._go_operational_by_iid[iid] = False
+            self._set_handoff_state_locked(
+                iid,
+                sync,
+                handoff_state="GO_REFINED_READY",
+                handoff_reason="go_ready_flag_disabled",
+                handoff_gate_failures=failures,
+                period_authority="py_base",
+                sync_authority="py_bootstrap",
+                phase_authority="py_bootstrap",
+            )
+            return
         sync.usable = True
+        self._go_operational_by_iid[iid] = True
         phase_authority = "go_runtime" if phase_eval["phase_ready"] else "py_anchor_relative"
         self._set_handoff_state_locked(
             iid,
@@ -8948,6 +9071,18 @@ class RadarState:
     def get_all_go_live_sync_states(self) -> dict[int, dict]:
         """Return a snapshot of compact mirrored Go sync state for all IIDs."""
         return {iid: dict(state) for iid, state in self._go_sync_states_by_iid.items()}
+
+    def get_py_shadow_sync_state(self, iid: int) -> dict | None:
+        """Return Python shadow refinement data for one IID, or None."""
+        return self._py_shadow_sync_states.get(iid)
+
+    def get_period_authority_transitions(self, iid: int) -> list[dict] | None:
+        """Return period authority transition records for one IID, or None."""
+        return self._period_authority_transitions.get(iid)
+
+    def is_go_operational(self, iid: int) -> bool:
+        """Return True if Go is the current operational period authority for this IID."""
+        return bool(self._go_operational_by_iid.get(iid, False))
 
     def update_live_sync_state(self, iid: int, **kwargs) -> None:
         """Merge updated fields into an existing LiveSyncState (e.g. jitter from calibration)."""
