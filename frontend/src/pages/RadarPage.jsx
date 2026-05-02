@@ -2178,6 +2178,124 @@ function phaseStatusDisplayLabel(value) {
   }
 }
 
+function PopulationResidualMonitorPanel({ monitor }) {
+  if (!monitor) return null
+  const { status, reason, anchor_icao, contributing_icao_count, disagreeing_icao_count,
+    anchor_population_delta_deg, population_residual_spread_deg, worst_icao,
+    worst_icao_delta_deg, observation_count, eligible_observation_count,
+    window_s, per_icao, per_icao_omitted_count } = monitor
+
+  const isDisagreement = status === 'population_disagrees'
+  const isUnavailable = status === 'unavailable' || status === 'insufficient_data' || status === 'anchor_unavailable'
+
+  const statusLabel = {
+    population_agrees: 'Agrees',
+    population_disagrees: 'Disagrees',
+    population_mixed: 'Mixed',
+    insufficient_data: 'Insufficient data',
+    anchor_unavailable: 'Anchor unavailable',
+    unavailable: 'Unavailable',
+  }[status] ?? status
+
+  const statusColor = isDisagreement ? '#ff7b72' : status === 'population_mixed' ? '#d29922' : isUnavailable ? '#8b949e' : '#3fb950'
+
+  return (
+    <div style={{
+      padding: '6px 8px', marginBottom: '0.5rem',
+      border: `1px solid ${isDisagreement ? '#ff7b7240' : '#30363d'}`,
+      borderRadius: '4px',
+      background: isDisagreement ? '#1a0d0d' : '#0b0f14',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
+        <div>
+          <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Population phase agreement</div>
+          <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>
+            Circular residual consistency across the current aircraft population vs the selected anchor.
+          </div>
+        </div>
+        <span style={{
+          fontSize: '0.78rem', fontWeight: 700, color: statusColor,
+          padding: '2px 8px', borderRadius: '3px',
+          background: `${statusColor}18`, border: `1px solid ${statusColor}44`,
+        }}>
+          {statusLabel}
+        </span>
+      </div>
+
+      {isDisagreement && (
+        <div style={{
+          marginBottom: '6px', padding: '5px 8px',
+          background: '#ff7b7218', border: '1px solid #ff7b7240', borderRadius: '3px',
+          color: '#ff9090', fontSize: '0.74rem',
+        }}>
+          Population residuals disagree with selected anchor ({anchor_icao ?? '—'}); possible bad anchor or same-IID contamination.
+          {reason ? ` Reason: ${reason}.` : ''}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: isUnavailable ? 0 : '6px', fontSize: '0.72rem' }}>
+        <span className={styles.metricPill}>Status <span style={{ color: statusColor }}>{statusLabel}</span></span>
+        {anchor_icao && <span className={styles.metricPill}>Anchor <span className={styles.metricValue}>{anchor_icao}</span></span>}
+        {!isUnavailable && (
+          <>
+            <span className={styles.metricPill}>Contributing ICAOs <span className={styles.metricValue}>{contributing_icao_count ?? '—'}</span></span>
+            <span className={styles.metricPill}>Disagreeing ICAOs <span style={{ color: disagreeing_icao_count > 0 ? '#d29922' : '#3fb950' }}>{disagreeing_icao_count ?? 0}</span></span>
+            {anchor_population_delta_deg != null && (
+              <span className={styles.metricPill}>Anchor ↔ population Δ <span style={{ color: Math.abs(anchor_population_delta_deg) > 25 ? '#ff7b72' : '#c9d1d9' }}>{anchor_population_delta_deg > 0 ? '+' : ''}{anchor_population_delta_deg.toFixed(1)}°</span></span>
+            )}
+            {population_residual_spread_deg != null && (
+              <span className={styles.metricPill}>Spread <span className={styles.metricValue}>{population_residual_spread_deg.toFixed(1)}°</span></span>
+            )}
+            {worst_icao && worst_icao_delta_deg != null && (
+              <span className={styles.metricPill}>Worst ICAO <span className={styles.metricValue}>{worst_icao} ({worst_icao_delta_deg > 0 ? '+' : ''}{worst_icao_delta_deg.toFixed(1)}°)</span></span>
+            )}
+            <span className={styles.metricPill}>Eligible obs <span className={styles.metricValue}>{eligible_observation_count ?? 0}/{observation_count ?? 0}</span></span>
+            {window_s != null && window_s > 0 && (
+              <span className={styles.metricPill}>Window <span className={styles.metricValue}>{window_s.toFixed(0)}s</span></span>
+            )}
+          </>
+        )}
+        {isUnavailable && reason && (
+          <span className={styles.metricPill} style={{ color: '#8b949e' }}>Reason <span className={styles.metricValue}>{reason}</span></span>
+        )}
+      </div>
+
+      {!isUnavailable && Array.isArray(per_icao) && per_icao.length > 0 && (
+        <div style={{ marginTop: '4px', paddingTop: '4px', borderTop: '1px solid #30363d' }}>
+          <div style={{ color: '#8b949e', fontSize: '0.70rem', marginBottom: '3px' }}>Per-ICAO residuals</div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '3px' }}>
+            {per_icao.map(row => (
+              <span
+                key={row.icao}
+                className={styles.metricPill}
+                style={{
+                  border: row.disagrees ? '1px solid #ff7b7255' : row.is_anchor ? '1px solid #388bfd55' : undefined,
+                  background: row.disagrees ? '#ff7b7210' : row.is_anchor ? '#388bfd10' : undefined,
+                }}
+              >
+                <span style={{ color: row.is_anchor ? '#58a6ff' : row.disagrees ? '#ff7b72' : '#8b949e' }}>
+                  {row.icao}
+                </span>
+                {row.residual_mean_deg != null && (
+                  <span className={styles.metricValue}> {row.residual_mean_deg > 0 ? '+' : ''}{row.residual_mean_deg.toFixed(1)}°</span>
+                )}
+                {row.delta_from_anchor_deg != null && (
+                  <span style={{ color: '#8b949e' }}> Δ{row.delta_from_anchor_deg > 0 ? '+' : ''}{row.delta_from_anchor_deg.toFixed(1)}°</span>
+                )}
+                <span style={{ color: '#555' }}> n={row.count}</span>
+                {row.is_anchor && <span style={{ color: '#388bfd', fontSize: '0.65rem' }}> ⚓</span>}
+              </span>
+            ))}
+            {per_icao_omitted_count > 0 && (
+              <span className={styles.metricPill} style={{ color: '#555' }}>+{per_icao_omitted_count} more</span>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function SyncModeStatusPanel({
   syncState,
   modeDiagnostics,
@@ -3369,6 +3487,8 @@ function RotationAlignmentPanel({
         residualChartMode={residualChartMode}
         recordedEventTimeNotice={burstTimeline?.recorded_event_time_notice}
       />
+
+      <PopulationResidualMonitorPanel monitor={burstTimeline?.population_residual_monitor ?? null} />
 
       <PhaseAnchorPanel
         syncState={syncState}

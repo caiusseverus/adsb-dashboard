@@ -69,6 +69,7 @@ from .simple_sync import (
     update_simple_live_sync_state,
 )
 from .sync_models import AlignedBurstSyncObs, IcaoSyncQuality, LiveSyncState
+from .sync_population_monitor import compute_population_residual_summary
 from .sweep_diagnostics import (
     apply_selected_anchor_relative_offsets as _apply_selected_anchor_relative_offsets_helper,
     build_compact_burst_sync_timeline_entries as _build_compact_burst_sync_timeline_entries_helper,
@@ -7035,6 +7036,7 @@ class RadarState:
                 "burst_sync_diagnostic": burst_sync_diagnostic,
                 "recorded_event_diagnostics": recorded_event_diagnostics,
                 "recorded_event_time_notice": "Chart points use event-time authority snapshots; current authority is shown separately.",
+                "population_residual_monitor": compute_population_residual_summary([], sync, iid).to_api_dict(),
             }
 
         if not _sync_source_has_rich_python_diagnostics(sync):
@@ -7222,6 +7224,7 @@ class RadarState:
                 "diagnostics_mode": "compact_go_sync",
                 "alignment_status": alignment_status,
                 "sync_mode_diagnostics": sync_mode_diagnostics,
+                "population_residual_monitor": compute_population_residual_summary(entries, sync, iid).to_api_dict(),
             }
 
         now_ts = time.time()
@@ -7554,6 +7557,7 @@ class RadarState:
             ),
             "alignment_status": alignment_status,
             "sync_mode_diagnostics": sync_mode_diagnostics,
+            "population_residual_monitor": compute_population_residual_summary(entries, sync, iid).to_api_dict(),
         }
 
     def get_live_sync_snapshot(self, iid: int, window_s: float = 90.0, debug_limit: int = 120) -> dict:
@@ -7673,6 +7677,7 @@ class RadarState:
             "alignment_status": burst_timeline.get("alignment_status"),
             "sync_mode_diagnostics": burst_timeline.get("sync_mode_diagnostics"),
             "sync_horizons": burst_timeline.get("sync_horizons"),
+            "population_residual_monitor": burst_timeline.get("population_residual_monitor"),
             "transport": {
                 "source": "shared_snapshot",
                 "cached": False,
