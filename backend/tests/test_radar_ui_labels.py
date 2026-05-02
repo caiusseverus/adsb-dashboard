@@ -29,7 +29,7 @@ def test_radar_page_shows_authority_labels_and_separates_diagnostic_delta():
     assert "Handoff state" in text
     assert "Handoff reason" in text
     assert "Blocking gates:" in text
-    assert "Go Δ (diagnostic)" in text
+    assert "Retained Go Δ" in text
     assert "Current operational state" in text
     assert "Go diagnostic refiner" in text
     assert "Recorded event chart semantics" in text

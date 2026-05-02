@@ -2304,7 +2304,7 @@ function SyncModeStatusPanel({
             <span className={styles.metricPill}>Fit span <span className={styles.metricValue}>{fmtNumber(syncState.go_diagnostic_fit_span_s, 1, 's')}</span></span>
             <span className={styles.metricPill}>Fit ICAOs <span className={styles.metricValue}>{syncState.go_diagnostic_fit_icao_count ?? 0}</span></span>
             {goDeltaVisible && (
-              <span className={styles.metricPill}>Go Δ (diagnostic) <span className={styles.metricValue}>{fmtNumber(Number(syncState.go_diagnostic_period_delta_s) * 1000, 2, 'ms')}</span></span>
+              <span className={styles.metricPill}>Retained Go Δ <span className={styles.metricValue}>{fmtNumber(Number(syncState.go_diagnostic_retained_delta_s ?? syncState.go_diagnostic_period_delta_s) * 1000, 2, 'ms')}</span></span>
             )}
             <span className={styles.metricPill}>Proposed Δ <span className={styles.metricValue}>{syncState.go_diagnostic_proposed_delta_s != null ? fmtNumber(Number(syncState.go_diagnostic_proposed_delta_s) * 1000, 3, 'ms') : '—'}</span></span>
             <span className={styles.metricPill}>Applied Δ <span className={styles.metricValue}>{syncState.go_diagnostic_applied_delta_s != null ? fmtNumber(Number(syncState.go_diagnostic_applied_delta_s) * 1000, 3, 'ms') : '—'}</span></span>

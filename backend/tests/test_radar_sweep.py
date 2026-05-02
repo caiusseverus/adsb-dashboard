@@ -3701,7 +3701,7 @@ def test_diagnostic_proposed_delta_null_when_fit_insufficient():
         },
     )
     assert fields["go_diagnostic_proposed_delta_s"] is None
-    assert fields["go_diagnostic_applied_delta_s"] == 0
+    assert fields["go_diagnostic_applied_delta_s"] is None
     assert fields["go_diagnostic_last_hard_bound"] is False
     assert fields["go_diagnostic_hard_bound_reason"] == "unavailable_due_to_insufficient_fit"
     assert fields["go_diagnostic_refinement_status"] == "insufficient_history"
@@ -3828,3 +3828,139 @@ def test_diagnostic_proposal_resumes_when_fit_sufficient():
     assert fields["go_diagnostic_last_rejected_delta_s"] == 0.006
     assert fields["go_diagnostic_last_rejected_delta_ppm"] == 1500.0
     assert fields["go_diagnostic_consecutive_hard_bound_rejects"] == 0
+
+
+def _make_go_refined_ready_sync(iid: int) -> "LiveSyncState":
+    """LiveSyncState representing GO_REFINED_READY operational state."""
+    return LiveSyncState(
+        iid=iid,
+        period_s=4.00104,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=1_000.0,
+        source="go_frame_sync",
+        usable=True,
+        period_base_s=4.0,
+        period_delta_s=0.00104,
+        effective_period_s=4.00104,
+        period_authority="go_refined",
+        sync_authority="go_runtime",
+    )
+
+
+def test_go_refined_ready_post_reset_fit_empty_shows_insufficient_history():
+    """After epoch reset: retained operational delta present, fit empty → insufficient_history."""
+    from radar.sweep import _build_go_diagnostic_fields
+
+    fields = _build_go_diagnostic_fields(
+        _make_go_refined_ready_sync(300),
+        go_sync={
+            "base_period_s": 4.0,
+            "period_delta_s": 0.00104,
+            "effective_period_s": 4.00104,
+            "period_source": "go_runtime.effective_period_s",
+            # Go has not yet set period_refinement_status after epoch reset
+            "period_refinement_status": "",
+            "fit_observation_count": 0,
+            "fit_icao_count": 0,
+            "fit_span_s": 0.0,
+            "proposed_delta_s": 0.0,
+            "applied_delta_s": 0.0,
+            "last_hard_bound": False,
+            "hard_bound_reason": "",
+            "holdover": False,
+            "fit_epoch_id": 7,
+            "fit_epoch_reset_reason": "reference_changed",
+            "fit_epoch_observation_count": 0,
+        },
+    )
+    assert fields["go_diagnostic_refinement_status"] == "insufficient_history"
+    assert fields["go_diagnostic_retained_delta_s"] == pytest.approx(0.00104)
+    assert fields["go_diagnostic_period_delta_s"] == pytest.approx(0.00104)
+    assert fields["go_diagnostic_proposed_delta_s"] is None
+    assert fields["go_diagnostic_applied_delta_s"] is None
+
+
+def test_go_refined_ready_post_reset_retained_delta_separate_from_proposal():
+    """Retained operational delta is exposed even when current fit epoch is empty."""
+    from radar.sweep import _build_go_diagnostic_fields
+
+    fields = _build_go_diagnostic_fields(
+        _make_go_refined_ready_sync(301),
+        go_sync={
+            "base_period_s": 4.0,
+            "period_delta_s": 0.00104,
+            "effective_period_s": 4.00104,
+            "period_source": "go_runtime.effective_period_s",
+            "period_refinement_status": "",
+            "fit_observation_count": 0,
+            "fit_icao_count": 0,
+            "fit_span_s": 0.0,
+            "proposed_delta_s": 0.0,
+            "applied_delta_s": 0.0,
+            "last_hard_bound": False,
+            "hard_bound_reason": "",
+            "holdover": False,
+        },
+    )
+    # retained_delta_s always reflects PeriodDeltaS regardless of fit state
+    assert fields["go_diagnostic_retained_delta_s"] == pytest.approx(0.00104)
+    # proposal/applied are None — not shown as 0 which would be misleading
+    assert fields["go_diagnostic_proposed_delta_s"] is None
+    assert fields["go_diagnostic_applied_delta_s"] is None
+
+
+def test_go_refined_ready_with_single_observation_shows_insufficient_history():
+    """Fit epoch with 1 obs and 0 ICAOs after reset → still insufficient, not stable."""
+    from radar.sweep import _build_go_diagnostic_fields
+
+    fields = _build_go_diagnostic_fields(
+        _make_go_refined_ready_sync(302),
+        go_sync={
+            "base_period_s": 4.0,
+            "period_delta_s": 0.00104,
+            "effective_period_s": 4.00104,
+            "period_source": "go_runtime.effective_period_s",
+            "period_refinement_status": "",
+            "fit_observation_count": 1,
+            "fit_icao_count": 0,
+            "fit_span_s": 0.5,
+            "proposed_delta_s": 0.0,
+            "applied_delta_s": 0.0,
+            "last_hard_bound": False,
+            "hard_bound_reason": "",
+            "holdover": False,
+        },
+    )
+    assert fields["go_diagnostic_refinement_status"] == "insufficient_history"
+    assert fields["go_diagnostic_retained_delta_s"] == pytest.approx(0.00104)
+
+
+def test_go_refined_stable_with_fit_data_not_labelled_insufficient():
+    """Normal stable state with populated fit: status must remain stable, not insufficient_history."""
+    from radar.sweep import _build_go_diagnostic_fields
+
+    fields = _build_go_diagnostic_fields(
+        _make_go_refined_ready_sync(303),
+        go_sync={
+            "base_period_s": 4.0,
+            "period_delta_s": 0.00104,
+            "effective_period_s": 4.00104,
+            "period_source": "go_runtime.effective_period_s",
+            "period_refinement_status": "",
+            "fit_observation_count": 25,
+            "fit_icao_count": 3,
+            "fit_span_s": 120.0,
+            "proposed_delta_s": 0.00106,
+            "applied_delta_s": 0.00104,
+            "last_hard_bound": False,
+            "hard_bound_reason": "",
+            "holdover": False,
+        },
+    )
+    assert fields["go_diagnostic_refinement_status"] == "stable"
+    assert fields["go_diagnostic_retained_delta_s"] == pytest.approx(0.00104)
+    assert fields["go_diagnostic_proposed_delta_s"] == pytest.approx(0.00106)
+    assert fields["go_diagnostic_applied_delta_s"] == pytest.approx(0.00104)

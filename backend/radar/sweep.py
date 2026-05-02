@@ -361,6 +361,13 @@ def _build_go_diagnostic_fields(
 
     ref_status = go_payload.get("period_refinement_status") or ""
     fit_insufficient = ref_status.startswith("insufficient_")
+    # Post-epoch-reset: Go hasn't assigned a status yet but fit counters are zero.
+    # Retained operational PeriodDeltaS is still valid; current fit epoch is empty.
+    _fit_obs_count = int(go_payload.get("fit_observation_count") or 0)
+    _fit_icao_count = int(go_payload.get("fit_icao_count") or 0)
+    fit_epoch_empty = (not ref_status) and (_fit_obs_count == 0 or _fit_icao_count == 0)
+    if fit_epoch_empty:
+        fit_insufficient = True
     hard_bound_reason = go_payload.get("hard_bound_reason")
     if fit_insufficient:
         hard_bound_reason = (
@@ -377,6 +384,7 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_refinement_status": ref_status or (
             "holdover"
             if go_payload.get("holdover")
+            else "insufficient_history" if fit_epoch_empty and _is_finite_number(effective_period_s)
             else "stable" if _is_finite_number(effective_period_s)
             else "unavailable"
         ),
@@ -389,11 +397,12 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_residual_slope_deg_per_s": go_payload.get("residual_slope_deg_per_s"),
         "go_diagnostic_slope_ema_deg_per_s": go_payload.get("slope_ema_deg_per_s"),
         "go_diagnostic_slope_std_deg_per_s": go_payload.get("slope_std_deg_per_s"),
+        "go_diagnostic_retained_delta_s": float(period_delta_s) if _is_finite_number(period_delta_s) else None,
         "go_diagnostic_proposed_delta_s": (
             None if fit_insufficient else go_payload.get("proposed_delta_s")
         ),
         "go_diagnostic_applied_delta_s": (
-            0 if fit_insufficient else go_payload.get("applied_delta_s")
+            None if fit_insufficient else go_payload.get("applied_delta_s")
         ),
         "go_diagnostic_last_slew_limited": go_payload.get("last_slew_limited"),
         "go_diagnostic_last_hard_bound": (
