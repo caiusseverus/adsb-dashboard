@@ -249,6 +249,12 @@ RADAR_SYNC_MOTION_COMP_FIT_ENABLED: bool = _bool("RADAR_SYNC_MOTION_COMP_FIT_ENA
 # current operational behaviour is preserved: Python period refinement remains
 # operational and Go refiner is diagnostic/shadow only.
 RADAR_SYNC_GO_REFINER_OPERATIONAL: bool = _bool("RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
+# Population residual monitor: when True (default), per-sweep population
+# validation can demote a phase anchor when the non-anchor population strongly
+# disagrees.  Set to False for immediate rollback without code revert.
+# Default True: the demotion path was already wired before this flag existed,
+# so True preserves existing runtime behaviour and adds hysteresis + typed state.
+RADAR_SYNC_POPULATION_MONITOR_ENABLED: bool = _bool("RADAR_SYNC_POPULATION_MONITOR_ENABLED", True)
 
 # ---------------------------------------------------------------------------
 # Stage 3 — aircraft localisation from known radar bearings

@@ -1352,6 +1352,11 @@ class RadarState:
         self._GO_SWEEP_FRAMES_MAX = 256
         self._go_sync_states_by_iid: dict[int, dict] = {}
         self._go_operational_by_iid: dict[int, bool] = {}
+        # Hysteresis hold for population-based anchor demotion.
+        # Maps (iid, anchor_icao) -> expiry_wall_ts.  Once an anchor is demoted
+        # it stays demoted until expiry passes, even if the population agrees
+        # on the next sweep.
+        self._population_demotion_hold: dict[tuple[int, str], float] = {}
         self._py_shadow_sync_states: dict[int, dict] = {}
         self._period_authority_transitions: dict[int, list[dict]] = {}
         self._go_multi_sync_admission_by_iid: dict[int, dict] = {}
@@ -5197,6 +5202,8 @@ class RadarState:
         phase_anchor_since_ts = existing.phase_anchor_since_ts
         phase_anchor_replacement_reason = anchor_selection.get("replacement_reason")
         new_offset = mixed_fallback_offset
+        population_validation_state: str | None = None
+        population_validation_reason: str | None = None
 
         if selected_anchor is not None:
             phase_anchor_icao = selected_anchor["icao"]
@@ -5221,17 +5228,52 @@ class RadarState:
                     existing,
                     epoch_us,
                 )
-                if (
-                    validation["status"] == "population_disagrees"
-                    and validation["reject_count"] >= 2
-                    and validation["contributor_count"] == 0
-                ):
-                    phase_anchor_status = "population_veto"
-                    phase_anchor_replacement_reason = "population_veto"
-                    new_offset = mixed_fallback_offset
-                else:
+                import config as _cfg
+                monitor_enabled = bool(getattr(_cfg, "RADAR_SYNC_POPULATION_MONITOR_ENABLED", True))
+
+                if not monitor_enabled:
                     new_offset = (phase_anchor_smoothed + validation["nudge_deg"]) % 360.0
                     phase_anchor_status = "selected" if validation["status"] != "anchor_only" else "anchor_only"
+                    population_validation_state = "disabled"
+                    population_validation_reason = "monitor_disabled"
+                else:
+                    hold_key = (iid, phase_anchor_icao)
+                    hold_expiry = self._population_demotion_hold.get(hold_key, 0.0)
+                    in_hold = now_ts < hold_expiry
+
+                    strong_disagree = (
+                        validation["status"] == "population_disagrees"
+                        and validation["reject_count"] >= 2
+                        and validation["contributor_count"] == 0
+                    )
+
+                    if strong_disagree or in_hold:
+                        if strong_disagree:
+                            self._population_demotion_hold[hold_key] = now_ts + 10.0
+                        phase_anchor_status = "population_demoted"
+                        phase_anchor_replacement_reason = "population_demoted"
+                        new_offset = mixed_fallback_offset
+                        population_validation_state = "fail"
+                        population_validation_reason = (
+                            "population_demoted_hold_active"
+                            if (in_hold and not strong_disagree)
+                            else "population_demoted"
+                        )
+                    else:
+                        new_offset = (phase_anchor_smoothed + validation["nudge_deg"]) % 360.0
+                        phase_anchor_status = "selected" if validation["status"] != "anchor_only" else "anchor_only"
+                        if validation["status"] in {"confirmed", "anchor_only"}:
+                            population_validation_state = "pass"
+                            population_validation_reason = validation["status"]
+                        else:
+                            population_validation_state = "insufficient_data"
+                            population_validation_reason = validation["status"]
+
+                    # Lazy cleanup: evict holds that expired more than 60 s ago.
+                    self._population_demotion_hold = {
+                        k: v for k, v in self._population_demotion_hold.items()
+                        if v > now_ts - 60.0
+                    }
             else:
                 phase_anchor_status = "fallback_mixed_anchor_solve_failed"
                 phase_anchor_replacement_reason = "anchor_solve_failed"
@@ -5250,6 +5292,8 @@ class RadarState:
             "phase_anchor_since_ts": phase_anchor_since_ts,
             "phase_anchor_replacement_reason": phase_anchor_replacement_reason,
             "phase_anchor_no_candidate_reason": anchor_selection.get("no_candidate_reason"),
+            "population_validation_state": population_validation_state,
+            "population_validation_reason": population_validation_reason,
         }
 
     def _update_simple_live_sync_state(

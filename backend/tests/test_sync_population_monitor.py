@@ -459,3 +459,210 @@ class TestApiPayload:
             entries.extend(_make_entries_for_icao(f"BBB{i:03d}", [1.0] * 3))
         result = compute_population_residual_summary(entries, sync, iid=1)
         assert result.status == "anchor_unavailable"
+
+
+# ── Stage 7R: feature flag, hysteresis, typed validation state ────────────────
+
+
+import time as _time
+
+import config as _cfg
+
+from radar.sync_models import LiveSyncState
+from radar.simple_sync import _derive_phase_trust_reason
+from radar.sweep import RadarState, _live_sync_state_to_dict
+
+
+def _make_radar_state_stub():
+    """Minimal stub satisfying _resolve_phase_anchor_state's attribute access."""
+    state = MagicMock(spec=[
+        "_select_phase_anchor_aircraft",
+        "_solve_phase_anchor_from_icao",
+        "_validate_phase_anchor_against_population",
+        "_population_demotion_hold",
+    ])
+    state._population_demotion_hold = {}
+    return state
+
+
+def _make_existing(iid: int = 1, anchor_icao: str = "ABCD12") -> LiveSyncState:
+    return LiveSyncState(
+        iid=iid,
+        period_s=4.5,
+        phase_epoch_us=1_000_000_000.0,
+        phase_offset_deg=45.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=_time.time(),
+        source="multi_aircraft_burst",
+        usable=True,
+        phase_anchor_icao=anchor_icao,
+        phase_anchor_since_ts=_time.time() - 30.0,
+    )
+
+
+def _strong_disagree_val() -> dict:
+    return {
+        "contributors": [],
+        "rejected": [
+            {"icao": "X1", "reason": "branch_disagreement", "error_deg": 50.0},
+            {"icao": "X2", "reason": "branch_disagreement", "error_deg": 48.0},
+        ],
+        "contributor_count": 0,
+        "contributor_icaos": [],
+        "reject_count": 2,
+        "median_error_deg": None,
+        "nudge_deg": 0.0,
+        "status": "population_disagrees",
+    }
+
+
+def _agree_val() -> dict:
+    return {
+        "contributors": [{"icao": "Y1", "error_deg": 1.0, "offset_deg": 46.0, "spread_deg": 2.0, "obs_count": 3, "weight": 1.0}],
+        "rejected": [],
+        "contributor_count": 1,
+        "contributor_icaos": ["Y1"],
+        "reject_count": 0,
+        "median_error_deg": 1.0,
+        "nudge_deg": 0.1,
+        "status": "confirmed",
+    }
+
+
+def _call_resolve(state, existing: LiveSyncState, validation: dict, now_ts: float = 1000.0, anchor_icao: str = "ABCD12") -> dict:
+    """Drive RadarState._resolve_phase_anchor_state unbound on the stub."""
+    state._select_phase_anchor_aircraft.return_value = {
+        "selected": {"icao": anchor_icao, "score": 0.9},
+        "candidates": [{"icao": anchor_icao, "score": 0.9}],
+        "replacement_reason": None,
+        "no_candidate_reason": None,
+    }
+    state._solve_phase_anchor_from_icao.return_value = {
+        "offset_raw_deg": 45.0,
+        "offset_smoothed_deg": 45.5,
+        "spread_deg": 3.0,
+        "delta_from_existing_deg": 0.5,
+        "obs_count": 5,
+    }
+    state._validate_phase_anchor_against_population.return_value = validation
+    return RadarState._resolve_phase_anchor_state(
+        state,
+        iid=existing.iid,
+        scored=[],
+        existing=existing,
+        epoch_us=1_000_000_000.0,
+        now_ts=now_ts,
+        mixed_fallback_offset=0.0,
+    )
+
+
+class TestStage7RPopulationMonitor:
+    """Stage 7R: feature flag, demotion hysteresis, typed validation state."""
+
+    def test_flag_disabled_no_demotion(self, monkeypatch):
+        """Flag=False: strong disagreement must NOT produce population_demoted."""
+        monkeypatch.setattr(_cfg, "RADAR_SYNC_POPULATION_MONITOR_ENABLED", False)
+        state = _make_radar_state_stub()
+        result = _call_resolve(state, _make_existing(), _strong_disagree_val())
+        assert result["phase_anchor_status"] != "population_demoted"
+        assert result["phase_anchor_status"] != "population_veto"
+
+    def test_flag_disabled_validation_state_is_disabled(self, monkeypatch):
+        """Flag=False → population_validation_state=='disabled', reason=='monitor_disabled'."""
+        monkeypatch.setattr(_cfg, "RADAR_SYNC_POPULATION_MONITOR_ENABLED", False)
+        state = _make_radar_state_stub()
+        result = _call_resolve(state, _make_existing(), _strong_disagree_val())
+        assert result["population_validation_state"] == "disabled"
+        assert result["population_validation_reason"] == "monitor_disabled"
+
+    def test_strong_disagreement_demotes_anchor(self, monkeypatch):
+        """Flag=True + strong disagree → phase_anchor_status=='population_demoted', state=='fail'."""
+        monkeypatch.setattr(_cfg, "RADAR_SYNC_POPULATION_MONITOR_ENABLED", True)
+        state = _make_radar_state_stub()
+        result = _call_resolve(state, _make_existing(), _strong_disagree_val(), now_ts=1000.0)
+        assert result["phase_anchor_status"] == "population_demoted"
+        assert result["population_validation_state"] == "fail"
+        assert result["population_validation_reason"] == "population_demoted"
+
+    def test_demotion_persists_during_hold(self, monkeypatch):
+        """After demotion at t=0: at t=5 (agreement) still demoted; at t=11 (agreement) recovered."""
+        monkeypatch.setattr(_cfg, "RADAR_SYNC_POPULATION_MONITOR_ENABLED", True)
+        state = _make_radar_state_stub()
+        existing = _make_existing(anchor_icao="ABCD12")
+        hold_key = (existing.iid, "ABCD12")
+
+        # t=0: trigger demotion
+        r0 = _call_resolve(state, existing, _strong_disagree_val(), now_ts=1000.0)
+        assert r0["phase_anchor_status"] == "population_demoted"
+        assert state._population_demotion_hold.get(hold_key, 0.0) == pytest.approx(1010.0)
+
+        # t=5: population now agrees, but hold is still active → still demoted
+        r5 = _call_resolve(state, existing, _agree_val(), now_ts=1005.0)
+        assert r5["phase_anchor_status"] == "population_demoted"
+        assert r5["population_validation_state"] == "fail"
+        assert "hold" in (r5["population_validation_reason"] or "")
+
+        # t=11: hold expired (1010 < 1011), population agrees → anchor recovers
+        r11 = _call_resolve(state, existing, _agree_val(), now_ts=1011.0)
+        assert r11["phase_anchor_status"] != "population_demoted"
+        assert r11["population_validation_state"] == "pass"
+
+    def test_borderline_reject_count_no_demotion(self, monkeypatch):
+        """Only 1 reject (< 2 threshold) → no demotion."""
+        monkeypatch.setattr(_cfg, "RADAR_SYNC_POPULATION_MONITOR_ENABLED", True)
+        state = _make_radar_state_stub()
+        weak = {**_strong_disagree_val(), "reject_count": 1}
+        result = _call_resolve(state, _make_existing(), weak)
+        assert result["phase_anchor_status"] != "population_demoted"
+
+    def test_borderline_contributor_present_no_demotion(self, monkeypatch):
+        """2 rejects but 1 contributor → not a strong disagree → no demotion."""
+        monkeypatch.setattr(_cfg, "RADAR_SYNC_POPULATION_MONITOR_ENABLED", True)
+        state = _make_radar_state_stub()
+        mixed = {**_strong_disagree_val(), "contributor_count": 1}
+        result = _call_resolve(state, _make_existing(), mixed)
+        assert result["phase_anchor_status"] != "population_demoted"
+
+    def test_phase_trust_reason_derivation_from_status(self):
+        """_derive_phase_trust_reason returns 'population_demoted' for demoted anchor."""
+        result = _derive_phase_trust_reason(
+            phase_anchor_icao="ABCD12",
+            phase_anchor_status="population_demoted",
+            validation={"status": "confirmed"},
+            anchor_selection={"candidates": [{"icao": "ABCD12"}]},
+            phase_status="untrusted",
+        )
+        assert result == "population_demoted"
+
+    def test_phase_trust_reason_derivation_from_validation_status(self):
+        """_derive_phase_trust_reason returns 'population_demoted' via v_status check."""
+        result = _derive_phase_trust_reason(
+            phase_anchor_icao="ABCD12",
+            phase_anchor_status="selected",
+            validation={"status": "population_disagrees"},
+            anchor_selection={"candidates": [{"icao": "ABCD12"}, {"icao": "EFGH34"}]},
+            phase_status="untrusted",
+        )
+        assert result == "population_demoted"
+
+    def test_snapshot_exposes_population_validation_fields(self):
+        """_live_sync_state_to_dict output includes population_validation_state and _reason."""
+        sync = LiveSyncState(
+            iid=1,
+            period_s=4.5,
+            phase_epoch_us=1_000_000_000.0,
+            phase_offset_deg=45.0,
+            sync_quality=0.9,
+            sync_jitter_deg=2.0,
+            last_sync_update_ts=1000.0,
+            source="multi_aircraft_burst",
+            usable=True,
+            population_validation_state="fail",
+            population_validation_reason="population_demoted",
+        )
+        payload = _live_sync_state_to_dict(sync)
+        assert "population_validation_state" in payload
+        assert "population_validation_reason" in payload
+        assert payload["population_validation_state"] == "fail"
+        assert payload["population_validation_reason"] == "population_demoted"

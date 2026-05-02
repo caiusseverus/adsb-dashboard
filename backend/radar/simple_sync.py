@@ -53,8 +53,11 @@ def _derive_phase_trust_reason(
     if not phase_anchor_icao:
         return "no_anchor"
 
+    if phase_anchor_status == "population_demoted":
+        return "population_demoted"
+
     v_status = str(validation.get("status", ""))
-    if v_status in {"population_disagrees", "population_veto"}:
+    if v_status in {"population_disagrees", "population_veto", "population_demoted"}:
         return "population_demoted"
 
     if phase_anchor_status not in {"selected", "anchor_only"}:
@@ -412,7 +415,7 @@ def update_simple_live_sync_state(
         phase_anchor_status == "selected"
         and phase_anchor_spread_val < 8.0
         and v_icao_count >= 2
-        and v_status not in {"population_disagrees", "population_veto"}
+        and v_status not in {"population_disagrees", "population_veto", "population_demoted"}
         and abs(v_median_err) < 10.0
     ):
         phase_status = "trusted"
@@ -638,6 +641,8 @@ def update_simple_live_sync_state(
             anchor_selection=anchor_selection,
             phase_status=phase_status,
         ),
+        population_validation_state=anchor_resolution.get("population_validation_state"),
+        population_validation_reason=anchor_resolution.get("population_validation_reason"),
     )
     if go_is_operational:
         new_state.period_authority = "go_refined"

@@ -1755,7 +1755,7 @@ def test_go_sync_snapshot_falls_back_to_sweep_frames_when_burst_evidence_aged_ou
     assert snapshot["alignment_status"]["reason"] == "go_sweep_frames_projected"
 
 
-def test_resolve_phase_anchor_state_population_veto_keeps_mixed_fallback(monkeypatch):
+def test_resolve_phase_anchor_state_population_demoted_keeps_mixed_fallback(monkeypatch):
     state = RadarState()
     existing = LiveSyncState(
         iid=7,
@@ -1808,12 +1808,14 @@ def test_resolve_phase_anchor_state_population_veto_keeps_mixed_fallback(monkeyp
 
     assert resolved["offset_deg"] == pytest.approx(47.0)
     assert resolved["phase_anchor_icao"] == "NEW222"
-    assert resolved["phase_anchor_status"] == "population_veto"
-    assert resolved["phase_anchor_replacement_reason"] == "population_veto"
+    assert resolved["phase_anchor_status"] == "population_demoted"
+    assert resolved["phase_anchor_replacement_reason"] == "population_demoted"
     assert resolved["phase_anchor_since_ts"] == pytest.approx(1_000.0)
     assert resolved["phase_anchor_no_candidate_reason"] is None
     assert resolved["phase_anchor_obs_count"] == 4
     assert resolved["validation"] == veto
+    assert resolved["population_validation_state"] == "fail"
+    assert resolved["population_validation_reason"] == "population_demoted"
 
 
 def test_period_fit_rejects_large_residuals_without_hiding_timeline(monkeypatch):

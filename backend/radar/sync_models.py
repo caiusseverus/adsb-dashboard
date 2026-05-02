@@ -143,6 +143,8 @@ class LiveSyncState:
     update_epoch_reject_stale_ref_pos: int = 0
     update_epoch_reject_insufficient_aircraft: int = 0
     update_epoch_last_strict_gate_pass: bool | None = None
+    population_validation_state: str | None = None  # "pass" | "fail" | "insufficient_data" | "disabled"
+    population_validation_reason: str | None = None  # compact reason string
 
 
 @dataclass
