@@ -718,6 +718,42 @@ function useIidSyncSnapshot(iid, windowS, debugLimit = 120) {
   return { data, status }
 }
 
+function useChartHistory(iid, windowS, maxBurstPoints, maxDf11Points, mode, basis) {
+  const [data, setData] = useState(null)
+
+  useEffect(() => {
+    if (iid == null) {
+      setData(null)
+      return
+    }
+    const controller = new AbortController()
+    async function poll() {
+      const params = new URLSearchParams({
+        window_s: String(windowS),
+        max_burst_points: String(maxBurstPoints ?? -1),
+        max_df11_points: String(maxDf11Points ?? -1),
+        mode: mode ?? 'recorded',
+        basis: basis ?? 'runtime_effective',
+      })
+      const d = await trackedRadarFetchJson(
+        `${API_BASE}/api/radar/iids/${iid}/chart-history?${params}`,
+        {
+          endpoint: 'chart_history',
+          trigger: 'iid_change_or_poll',
+          signal: controller.signal,
+        },
+      )
+      if (controller.signal.aborted || !d) return
+      setData(d)
+    }
+    poll()
+    const id = setInterval(poll, BURST_SYNC_POLL_MS)
+    return () => { controller.abort(); clearInterval(id) }
+  }, [iid, windowS, maxBurstPoints, maxDf11Points, mode, basis])
+
+  return { data }
+}
+
 function useIidTimeline(iid, enabled, windowS = BURST_SYNC_ALIGNMENT_WINDOW_S) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -2710,6 +2746,7 @@ function RotationAlignmentPanel({
   rows,
   onSelectIid,
   syncSnapshot,
+  chartHistory,
   syncFeedStatus,
   timingPacket,
 }) {
@@ -2750,7 +2787,7 @@ function RotationAlignmentPanel({
     }
   }, [iid])
 
-  const burstTimeline = syncSnapshot
+  const burstTimeline = chartHistory ?? syncSnapshot    // chart data from chart-history, compact state from sync-snapshot
   const rotation = syncSnapshot?.rotation ?? null
   const rawRecordedObservations = Array.isArray(burstTimeline?.recorded_observations)
     ? burstTimeline.recorded_observations
@@ -5729,6 +5766,13 @@ export default function RadarPage() {
     selectedIid,
     BURST_SYNC_ALIGNMENT_WINDOW_S,
   )
+  const { data: chartHistory } = useChartHistory(
+    selectedIid,
+    BURST_SYNC_ALIGNMENT_WINDOW_S,
+    -1,
+    -1,
+    'recorded',
+  )
 
   useEffect(() => {
     if (rows.length === 0) return
@@ -5834,6 +5878,7 @@ return (
             rows={rows}
             onSelectIid={handleSelectIid}
             syncSnapshot={syncSnapshot}
+            chartHistory={chartHistory}
             syncFeedStatus={syncFeedStatus}
             timingPacket={sharedTimingPacket}
           />

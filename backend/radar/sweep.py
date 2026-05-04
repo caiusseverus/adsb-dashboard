@@ -1596,6 +1596,10 @@ class RadarState:
         self._live_sync_snapshot_cache: dict[int, tuple[tuple, dict]] = {}
         self._live_sync_snapshot_seq: dict[int, int] = {}
         self._live_sync_snapshot_last_cache_hit: dict[int, bool] = {}
+        self._chart_burst_residual_seq: dict[int, int] = {}
+        self._chart_df11_residual_seq: dict[int, int] = {}
+        self._chart_history_cache: dict[tuple, tuple[float, dict]] = {}
+        self._chart_history_last_cache_hit: dict[tuple, bool] = {}
         self._live_sweep_frame_summary_cache: dict[int, dict] = {}
         self._live_sweep_frame_summary_signature: dict[int, tuple] = {}
         self._live_sweep_frame_summary_revision: dict[int, int] = {}
@@ -1912,8 +1916,14 @@ class RadarState:
         event_kind = str(event.get("event_kind") or "")
         if event_kind == "burst":
             counters["appended_burst_total"] += 1
+            seq = self._chart_burst_residual_seq.get(iid, 0) + 1
+            self._chart_burst_residual_seq[iid] = seq
+            event["event_seq"] = seq
         elif event_kind == "df11":
             counters["appended_df11_total"] += 1
+            seq = self._chart_df11_residual_seq.get(iid, 0) + 1
+            self._chart_df11_residual_seq[iid] = seq
+            event["event_seq"] = seq
         cutoff_ts = now_ts - self._LIVE_BURST_RESIDUAL_EVENTS_RETENTION_S
         while event_buf and float(event_buf[0].get("wall_ts") or now_ts) < cutoff_ts:
             event_buf.popleft()
@@ -2033,6 +2043,8 @@ class RadarState:
                 "models":              len(self._models),
                 "iid_events":          len(self._iid_events),
                 "iid_events_max":      _IID_EVENTS_MAX,
+                "df11_residual_events": len(self._df11_residual_events),
+                "df11_residual_events_max": _IID_EVENTS_MAX,
                 "burst_records_total": n_burst_records,
                 "burst_records_iids":  len(non_empty_burst_counts),
                 "burst_records_max_per_iid": max(burst_record_counts, default=0),
@@ -2058,6 +2070,10 @@ class RadarState:
                 "radar_core_frames_injected_iids": len(self._radar_core_frames_injected_by_iid),
                 "python_frames_finalized_total": self._python_frames_finalized_total,
                 "python_frames_finalized_iids": len(self._python_frames_finalized_by_iid),
+                "sync_snapshot_cache_size": len(self._live_sync_snapshot_cache),
+                "chart_history_cache_size": len(self._chart_history_cache),
+                "chart_burst_residual_seqs": list(self._chart_burst_residual_seq.values()),
+                "chart_df11_residual_seqs": list(self._chart_df11_residual_seq.values()),
             }
 
     def _process_fired_bursts(self, iid: int, fired_bursts: list[dict]) -> dict:
@@ -5469,6 +5485,58 @@ class RadarState:
         return n_weight * sig_weight * age_weight
 
     @staticmethod
+    def _decimate_observations(
+        entries: list[dict],
+        max_points: int,
+        *,
+        class_key: str = "classification",
+        time_key: str = "beam_center_us",
+    ) -> list[dict]:
+        """Deterministically decimate a list of residual observation dicts.
+
+        When len(entries) > max_points, the list is downsampled with a stride
+        that keeps point count <= max_points while preserving the oldest and
+        newest entry.  Class-balanced mode is attempted first: each residual
+        class (inlier/soft/rejected) gets a proportional share of the budget
+        so rare rejected points are not erased by dense inlier bands.
+        Falls back to uniform stride when class information is unavailable.
+        """
+        n = len(entries)
+        if n <= max_points:
+            return entries
+        classes: dict[str, list[int]] = {}
+        for i, entry in enumerate(entries):
+            cls = str(entry.get(class_key) or "unclassified")
+            classes.setdefault(cls, []).append(i)
+        n_classes = sum(1 for idxs in classes.values() if idxs)
+        if n_classes <= 1:
+            stride = max(1, (n + max_points - 1) // max_points)
+            indices = sorted({0, n - 1} | set(range(0, n, stride)))
+            return [entries[i] for i in sorted(indices) if i < n]
+        budget = max(n_classes, max_points)
+        per_class = max(1, budget // n_classes)
+        selected: set[int] = set()
+        for idxs in classes.values():
+            n_cls = len(idxs)
+            if n_cls <= per_class:
+                selected.update(idxs)
+                continue
+            stride = max(1, n_cls // per_class)
+            for j in range(0, n_cls, stride):
+                selected.add(idxs[j])
+            selected.add(idxs[0])
+            selected.add(idxs[-1])
+        if len(selected) > max_points:
+            stride = max(1, (len(selected) + max_points - 1) // max_points)
+            sorted_selected = sorted(selected)
+            selected = {sorted_selected[0], sorted_selected[-1]}
+            for j in range(0, len(sorted_selected), stride):
+                selected.add(sorted_selected[j])
+        selected.add(0)
+        selected.add(n - 1)
+        return [entries[i] for i in sorted(selected) if i < n]
+
+    @staticmethod
     def _classify_sync_residual(abs_residual_deg: float) -> str:
         """Classify a sync residual magnitude as 'inlier', 'soft', or 'rejected'.
 
@@ -6960,11 +7028,14 @@ class RadarState:
                                self._df11_residual_events,
                                self._live_sync_snapshot_cache,
                                self._live_sync_snapshot_seq,
-                               self._live_sweep_frame_summary_cache,
-                               self._live_sweep_frame_summary_signature,
-                               self._live_sweep_frame_summary_revision,
-                               self._live_sweep_frame_summary_last_cache_hit,
-                               self._rotation_analysis_meta,
+                                self._live_sweep_frame_summary_cache,
+                                self._live_sweep_frame_summary_signature,
+                                self._live_sweep_frame_summary_revision,
+                                self._live_sweep_frame_summary_last_cache_hit,
+                                self._chart_burst_residual_seq,
+                                self._chart_df11_residual_seq,
+                                self._chart_history_last_cache_hit,
+                                self._rotation_analysis_meta,
                                self._burst_record_dynamic_cap_by_iid,
                                self._burst_record_cap_hits_by_iid,
                                self._burst_record_last_active_aircraft_by_iid,
@@ -7073,6 +7144,14 @@ class RadarState:
                 filtered_keys = {key for key in self._seen_pair_keys if key[0] != iid}
                 had_any = had_any or len(filtered_keys) != len(self._seen_pair_keys)
                 self._seen_pair_keys = filtered_keys
+            to_remove = [key for key in self._chart_history_cache if key[0] == iid]
+            if to_remove:
+                for key in to_remove:
+                    del self._chart_history_cache[key]
+                had_any = True
+            if iid in self._live_sync_snapshot_cache:
+                del self._live_sync_snapshot_cache[iid]
+                had_any = True
             return had_any
 
     def reset_all(self) -> dict:
@@ -7121,6 +7200,10 @@ class RadarState:
             self._live_sync_snapshot_cache.clear()
             self._live_sync_snapshot_seq.clear()
             self._live_sync_snapshot_last_cache_hit.clear()
+            self._chart_burst_residual_seq.clear()
+            self._chart_df11_residual_seq.clear()
+            self._chart_history_cache.clear()
+            self._chart_history_last_cache_hit.clear()
             self._live_sweep_frame_summary_cache.clear()
             self._live_sweep_frame_summary_signature.clear()
             self._live_sweep_frame_summary_revision.clear()
@@ -7614,9 +7697,10 @@ class RadarState:
             latest_arrival_us_for_iid = self._iid_latest_arrival_us.get(iid)
             go_admission = dict(self._go_multi_sync_admission_by_iid.get(iid) or {})
             _df11_cutoff_us = (latest_arrival_us_for_iid or 0.0) - window_s * 1_000_000.0
-            # Take a fast deque snapshot under lock; filtering happens outside so the
-            # decoder thread is not blocked while we scan 30k+ elements at Python speed.
-            _iid_events_copy = list(self._df11_residual_events)
+            _iid_events_copy = [
+                _ev for _ev in self._df11_residual_events
+                if _ev[0] >= _df11_cutoff_us and _ev[1] == iid
+            ]
 
         if has_go_evidence:
             timeline_obs_snapshot = self._go_burst_sync_timeline_snapshot(iid, window_s=window_s)
@@ -7669,11 +7753,7 @@ class RadarState:
             }
         sync_mode_diagnostics = self._build_sync_mode_diagnostics(iid, sync, alignment_status)
 
-        # Filter outside the lock — safe since we operate on an immutable snapshot.
-        iid_events_for_df11 = [
-            _ev for _ev in _iid_events_copy
-            if _ev[0] >= _df11_cutoff_us and _ev[1] == iid
-        ]
+        iid_events_for_df11 = _iid_events_copy  # already filtered under lock above
         residual_events = [
             event for event in residual_events_snapshot
             if float(event.get("beam_center_us") or 0.0) >= _df11_cutoff_us
@@ -8284,135 +8364,243 @@ class RadarState:
         }
 
     def get_live_sync_snapshot(self, iid: int, window_s: float = 90.0, debug_limit: int = 120) -> dict:
-        """Return the shared compact sync snapshot used by the pushed Radar UI feed.
+        """Return the compact sync snapshot — authority, period, phase, anchor.
 
-        The snapshot combines the fast-changing sync payloads that previously
-        required separate frontend polls.  A signature cache prevents the
-        websocket loop, HTTP fallback, and reconnects from rebuilding the
-        lightweight live sync state when no relevant input has changed.
+        Heavy residual/timeline point arrays are excluded.  The snapshot
+        includes chart stream sequence IDs so the frontend can fetch new
+        chart points incrementally from the separate chart-history endpoint.
         """
         with self._lock:
             sync = self._live_sync_states.get(iid)
             model = self._models.get(iid)
-            go_evidence = [entry for entry in self._go_evidence_events if int(entry.get("iid", -1)) == iid]
-            go_admission = dict(self._go_multi_sync_admission_by_iid.get(iid) or {})
-            compact_debug = dict(self._compact_sync_debug_by_iid.get(iid) or {})
-            go_frame_revision = self._go_sweep_frames_revision.get(iid, 0)
-            sync_history_revision = int(self._go_sync_diagnostic_history_revision.get(iid, 0))
-            obs_buf = None if go_evidence else (self._live_burst_timeline_obs.get(iid) or self._live_aligned_burst_obs.get(iid))
+            go_sync = dict(self._go_sync_states_by_iid.get(iid) or {})
             burst_recorded_buf = self._live_burst_residual_events.get(iid)
             df11_recorded_buf = self._live_df11_recorded_residual_events.get(iid)
-            obs_len = len(go_evidence) if go_evidence else (len(obs_buf) if obs_buf else 0)
             burst_recorded_len = len(burst_recorded_buf) if burst_recorded_buf else 0
             df11_recorded_len = len(df11_recorded_buf) if df11_recorded_buf else 0
-            last_obs_us = None
-            last_obs_ts = None
-            last_burst_recorded_us = None
-            last_df11_recorded_us = None
-            if go_evidence:
-                last_obs = go_evidence[-1]
-                last_obs_us = last_obs.get("arrival_us")
-                last_obs_ts = last_obs.get("wall_ts")
-            elif obs_buf:
-                last_obs = obs_buf[-1]
-                last_obs_us = getattr(last_obs, "burst_centroid_us", None)
-                last_obs_ts = getattr(last_obs, "ts", None)
-            if burst_recorded_buf:
-                last_burst_recorded_us = burst_recorded_buf[-1].get("beam_center_us")
-            if df11_recorded_buf:
-                last_df11_recorded_us = df11_recorded_buf[-1].get("arrival_beast_us")
-            signature = (
-                float(window_s),
-                int(debug_limit),
-                self._iid_latest_arrival_us.get(iid),
-                getattr(sync, "last_sync_update_ts", None),
-                getattr(sync, "period_s", None),
-                getattr(sync, "period_correction_ppm", None),
-                getattr(model, "last_updated", None),
-                getattr(model, "period_s", None),
-                getattr(model, "status", None),
-                obs_len,
-                burst_recorded_len,
-                df11_recorded_len,
-                last_obs_us,
-                last_obs_ts,
-                last_burst_recorded_us,
-                last_df11_recorded_us,
-                go_admission.get("last_reason"),
-                go_admission.get("last_ts"),
-                tuple(sorted((go_admission.get("counts") or {}).items())),
-                compact_debug.get("current_reference_icao"),
-                compact_debug.get("last_reference_icao"),
-                compact_debug.get("last_reference_change_ts"),
-                compact_debug.get("current_phase_epoch_us"),
-                compact_debug.get("last_phase_epoch_change_ts"),
-                compact_debug.get("last_sync_reset_ts"),
-                compact_debug.get("last_holdover_transition_ts"),
-                go_frame_revision,
-                sync_history_revision,
-            )
+            burst_residual_seq = self._chart_burst_residual_seq.get(iid, 0)
+            df11_residual_seq = self._chart_df11_residual_seq.get(iid, 0)
+            sig = self._live_sync_snapshot_sig_tuple(iid, window_s, debug_limit, sync, model,
+                                                       burst_recorded_len, df11_recorded_len,
+                                                       burst_residual_seq, df11_residual_seq)
             cached = self._live_sync_snapshot_cache.get(iid)
-            if cached is not None and cached[0] == signature:
+            if cached is not None and cached[0] == sig:
                 self._live_sync_snapshot_last_cache_hit[iid] = True
                 return cached[1]
-            sequence = self._live_sync_snapshot_seq.get(iid, 0) + 1
-            self._live_sync_snapshot_seq[iid] = sequence
             self._live_sync_snapshot_last_cache_hit[iid] = False
+            update_history = list(self._live_period_update_history.get(iid) or [])
+            slope_history = list(self._live_slope_history.get(iid) or [])
+            period_history = list(self._live_period_history.get(iid) or [])
+            py_shadow = self._py_shadow_sync_states.get(iid)
+            authority_transitions = self._period_authority_transitions.get(iid)
+            sync_horizons = self._sync_horizons_payload(sync, display_window_s=window_s)
 
-        burst_timeline = self.get_burst_sync_timeline(iid, window_s=window_s)
-        recorded_observations = burst_timeline.get("recorded_observations", [])
-        recomputed_observations = burst_timeline.get("recomputed_observations", [])
-        recorded_df11_residual_observations = burst_timeline.get("recorded_df11_residual_observations", [])
-        recomputed_df11_residual_observations = burst_timeline.get("recomputed_df11_residual_observations", [])
-        display_observations = burst_timeline.get("observations", [])
+        sequence = self._live_sync_snapshot_seq.get(iid, 0) + 1
+        self._live_sync_snapshot_seq[iid] = sequence
+
+        sync_state = _live_sync_state_to_dict(
+            sync,
+            go_sync=go_sync,
+            py_shadow=py_shadow,
+            authority_transitions=authority_transitions,
+        ) if sync else None
+
         snapshot = {
             "type": "radar_sync",
             "iid": iid,
             "sequence": sequence,
             "server_ts": time.time(),
             "window_s": window_s,
-            "sync_state": burst_timeline.get("sync_state"),
-            "observations": display_observations,
-            "recorded_observations": recorded_observations,
-            "recomputed_observations": recomputed_observations,
-            "recorded_df11_residual_observations": recorded_df11_residual_observations,
-            "recomputed_df11_residual_observations": recomputed_df11_residual_observations,
-            "recomputed_observations_by_basis": burst_timeline.get("recomputed_observations_by_basis", {}),
-            "recomputed_df11_residual_observations_by_basis": burst_timeline.get("recomputed_df11_residual_observations_by_basis", {}),
-            "residual_chart_default_mode": burst_timeline.get("residual_chart_default_mode", "recorded"),
-            "projection_basis_options": burst_timeline.get("projection_basis_options", []),
-            # Backend-computed DF11 residual observations for the burst-sync chart overlay.
-            # Both "observations" (burst) and "df11_residual_observations" are derived from
-            # the same authoritative sync snapshot and predict_sync_observation() path.
-            # chart_overlay_consistent=True confirms they are directly comparable.
-            "df11_residual_observations": recorded_df11_residual_observations,
-            "chart_overlay_consistent": burst_timeline.get("chart_overlay_consistent", False),
-            "phase_anchor_candidates": burst_timeline.get("phase_anchor_candidates", []),
-            "burst_sync_diagnostic": burst_timeline.get("burst_sync_diagnostic"),
-            "recorded_event_diagnostics": burst_timeline.get("recorded_event_diagnostics"),
-            "recorded_event_time_notice": burst_timeline.get("recorded_event_time_notice"),
-            "period_update_history": burst_timeline.get("period_update_history", []),
-            "slope_history": burst_timeline.get("slope_history", []),
-            "period_history": burst_timeline.get("period_history", []),
-            "motion_comp_summary": burst_timeline.get("motion_comp_summary"),
-            "retention_diagnostics": burst_timeline.get("retention_diagnostics"),
-            "display_retention_diagnostic": burst_timeline.get("display_retention_diagnostic"),
-            "alignment_status": burst_timeline.get("alignment_status"),
-            "sync_mode_diagnostics": burst_timeline.get("sync_mode_diagnostics"),
-            "sync_horizons": burst_timeline.get("sync_horizons"),
-            "population_residual_monitor": burst_timeline.get("population_residual_monitor"),
-            "transport": {
-                "source": "shared_snapshot",
-                "cached": False,
+            "sync_state": sync_state,
+            "chart_streams": {
+                "burst_residual_seq": burst_residual_seq,
+                "df11_residual_seq": df11_residual_seq,
             },
+            "buffer_sizes": {
+                "burst_recorded": burst_recorded_len,
+                "df11_recorded": df11_recorded_len,
+            },
+            "period_update_history": update_history,
+            "slope_history": slope_history,
+            "period_history": period_history,
+            "sync_horizons": sync_horizons,
+            "period_authority_transitions": authority_transitions,
+            "transport": {"source": "compact_sync_snapshot", "cached": False},
         }
         with self._lock:
-            self._live_sync_snapshot_cache[iid] = (signature, snapshot)
+            self._live_sync_snapshot_cache[iid] = (sig, snapshot)
         return snapshot
+
+    def _live_sync_snapshot_sig_tuple(
+        self,
+        iid: int,
+        window_s: float,
+        debug_limit: int,
+        sync,
+        model,
+        burst_recorded_len: int,
+        df11_recorded_len: int,
+        burst_residual_seq: int,
+        df11_residual_seq: int,
+    ) -> tuple:
+        return (
+            float(window_s),
+            int(debug_limit),
+            self._iid_latest_arrival_us.get(iid),
+            getattr(sync, "last_sync_update_ts", None) if sync is not None else None,
+            getattr(sync, "period_s", None) if sync is not None else None,
+            getattr(sync, "period_correction_ppm", None) if sync is not None else None,
+            getattr(model, "last_updated", None) if model is not None else None,
+            getattr(model, "period_s", None) if model is not None else None,
+            getattr(model, "status", None) if model is not None else None,
+            getattr(sync, "holdover", False) if sync is not None else None,
+            getattr(sync, "handoff_state", None) if sync is not None else None,
+            getattr(sync, "phase_anchor_icao", None) if sync is not None else None,
+            getattr(sync, "phase_anchor_status", None) if sync is not None else None,
+            getattr(sync, "population_validation_state", None) if sync is not None else None,
+            getattr(sync, "fit_total_observations", 0) if sync is not None else 0,
+            getattr(sync, "period_refinement_status", None) if sync is not None else None,
+            burst_recorded_len,
+            df11_recorded_len,
+            burst_residual_seq,
+            df11_residual_seq,
+        )
 
     def get_live_sync_snapshot_last_cache_hit(self, iid: int) -> bool:
         with self._lock:
             return bool(self._live_sync_snapshot_last_cache_hit.get(iid, False))
+
+    def get_chart_history(
+        self,
+        iid: int,
+        *,
+        window_s: float = 90.0,
+        max_burst_points: int = 2000,
+        max_df11_points: int = 1000,
+        mode: str = "recorded",
+        basis: str = "runtime_effective",
+        since_burst_seq: int = 0,
+        since_df11_seq: int = 0,
+    ) -> dict:
+        """Return bounded, cached chart history for one IID.
+
+        The heavy burst-timeline computation is decoupled from the compact
+        sync snapshot.  A TTL cache prevents repeated frontend refreshes from
+        rebuilding the same dataset.  When stored history exceeds the per‑class
+        budget, points are deterministically decimated before serialisation.
+        """
+        import config as _cfg
+
+        cache_key = (
+            iid,
+            window_s,
+            max_burst_points,
+            max_df11_points,
+            mode,
+            basis,
+        )
+        now = time.monotonic()
+        cached = self._chart_history_cache.get(cache_key)
+        if cached is not None:
+            cache_ts, cache_payload = cached
+            if now - cache_ts < (getattr(_cfg, "CHART_HISTORY_CACHE_TTL_S", 2.0) or 2.0):
+                self._chart_history_last_cache_hit[cache_key] = True
+                return cache_payload
+        self._chart_history_last_cache_hit[cache_key] = False
+
+        burst_timeline = self.get_burst_sync_timeline(iid, window_s=window_s)
+
+        recorded_burst = burst_timeline.get("recorded_observations") or []
+        recorded_df11 = burst_timeline.get("recorded_df11_residual_observations") or []
+
+        if since_burst_seq > 0:
+            recorded_burst = [e for e in recorded_burst
+                              if int(e.get("event_seq", 0) or 0) > since_burst_seq]
+        if since_df11_seq > 0:
+            recorded_df11 = [e for e in recorded_df11
+                             if int(e.get("event_seq", 0) or 0) > since_df11_seq]
+
+        recomputed_burst: list[dict] = []
+        recomputed_df11: list[dict] = []
+        recomputed_by_basis: dict = {}
+        recomputed_df11_by_basis: dict = {}
+
+        if mode in ("recomputed", "all"):
+            recomputed_burst = burst_timeline.get("recomputed_observations") or []
+            recomputed_df11 = burst_timeline.get("recomputed_df11_residual_observations") or []
+            recomputed_by_basis = burst_timeline.get("recomputed_observations_by_basis") or {}
+            recomputed_df11_by_basis = burst_timeline.get("recomputed_df11_residual_observations_by_basis") or {}
+
+        recorded_burst = self._decimate_observations(
+            recorded_burst, max_burst_points,
+            class_key="classification",
+            time_key="beam_center_us",
+        )
+        recorded_df11 = self._decimate_observations(
+            recorded_df11, max_df11_points,
+            class_key="timing_class",
+            time_key="arrival_beast_us",
+        )
+        recomputed_burst = self._decimate_observations(
+            recomputed_burst, max_burst_points,
+            class_key="classification",
+            time_key="beam_center_us",
+        )
+        recomputed_df11 = self._decimate_observations(
+            recomputed_df11, max_df11_points,
+            class_key="timing_class",
+            time_key="arrival_beast_us",
+        )
+
+        for _basis_key, _entries in recomputed_by_basis.items():
+            recomputed_by_basis[_basis_key] = self._decimate_observations(
+                _entries, max_burst_points,
+                class_key="classification",
+                time_key="beam_center_us",
+            )
+        for _basis_key, _entries in recomputed_df11_by_basis.items():
+            recomputed_df11_by_basis[_basis_key] = self._decimate_observations(
+                _entries, max_df11_points,
+                class_key="timing_class",
+                time_key="arrival_beast_us",
+            )
+
+        payload = {
+            "type": "radar_chart_history",
+            "iid": iid,
+            "sequence": burst_timeline.get("sequence"),
+            "server_ts": time.time(),
+            "window_s": window_s,
+            "sync_state": burst_timeline.get("sync_state"),
+            "chart_overlay_consistent": burst_timeline.get("chart_overlay_consistent", False),
+            "residual_chart_default_mode": burst_timeline.get("residual_chart_default_mode", "recorded"),
+            "projection_basis_options": burst_timeline.get("projection_basis_options", []),
+            "recorded_observations": recorded_burst,
+            "recorded_df11_residual_observations": recorded_df11,
+            "recomputed_observations": recomputed_burst,
+            "recomputed_df11_residual_observations": recomputed_df11,
+            "recomputed_observations_by_basis": recomputed_by_basis,
+            "recomputed_df11_residual_observations_by_basis": recomputed_df11_by_basis,
+            "population_residual_monitor": burst_timeline.get("population_residual_monitor"),
+            "recorded_event_diagnostics": burst_timeline.get("recorded_event_diagnostics"),
+            "motion_comp_summary": burst_timeline.get("motion_comp_summary"),
+            "alignment_status": burst_timeline.get("alignment_status"),
+            "sync_mode_diagnostics": burst_timeline.get("sync_mode_diagnostics"),
+            "display_retention_diagnostic": burst_timeline.get("display_retention_diagnostic"),
+            "retention_diagnostics": burst_timeline.get("retention_diagnostics"),
+            "burst_sync_diagnostic": burst_timeline.get("burst_sync_diagnostic"),
+            "sync_horizons": burst_timeline.get("sync_horizons"),
+            "phase_anchor_candidates": burst_timeline.get("phase_anchor_candidates", []),
+            "recorded_event_time_notice": burst_timeline.get("recorded_event_time_notice"),
+            "transport": {"source": "chart_history", "cached": False},
+        }
+
+        self._chart_history_cache[cache_key] = (now, payload)
+        return payload
+
+    def get_chart_history_last_cache_hit(self, iid: int) -> bool:
+        with self._lock:
+            return bool(self._chart_history_last_cache_hit.get((iid,), False))
 
     def get_sync_debug_payload(self, iid: int, window_s: float = 60.0, limit: int = 80) -> dict:
         """Return per-observation sync consistency diagnostics for one IID.

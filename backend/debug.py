@@ -256,6 +256,7 @@ async def get_perf() -> dict:
             "elapsed_avg": sample_avg(timing_ws_t, "elapsed_ms"),
             "event_count_avg": sample_avg(timing_ws_t, "event_count"),
             "raw_event_count_avg": sample_avg(timing_ws_t, "raw_event_count"),
+            "sent_event_count_avg": sample_avg(timing_ws_t, "sent_event_count"),
             "send_count": sum(1 for sample in timing_ws_t if sample.get("sent")),
         },
         "decoder_thread_ms": {

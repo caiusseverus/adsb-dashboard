@@ -1177,7 +1177,7 @@ def build_iid_sync_snapshot_payload(
     window_s: float = 90.0,
     debug_limit: int = 120,
 ) -> dict:
-    """Build the shared selected-IID sync snapshot for HTTP and websocket clients."""
+    """Build the compact selected-IID sync snapshot for HTTP and websocket clients."""
     if state is None:
         return {
             "type": "radar_sync",
@@ -1187,14 +1187,8 @@ def build_iid_sync_snapshot_payload(
             "window_s": window_s,
             "rotation": {"iid": iid, "status": None},
             "sync_state": None,
-            "observations": [],
-            "df11_residual_observations": [],
-            "chart_overlay_consistent": False,
-            "phase_anchor_candidates": [],
-            "motion_comp_summary": None,
-            "retention_diagnostics": None,
-            "display_retention_diagnostic": None,
-            "sync_horizons": None,
+            "chart_streams": {"burst_residual_seq": 0, "df11_residual_seq": 0},
+            "buffer_sizes": {"burst_recorded": 0, "df11_recorded": 0},
         }
     snapshot = state.get_live_sync_snapshot(iid, window_s=window_s, debug_limit=debug_limit)
     payload = dict(snapshot)
@@ -1433,6 +1427,65 @@ async def get_iid_sync_snapshot(
             t0,
             cache_status="hit" if cache_hit else "miss",
         )
+
+
+@router.get("/iids/{iid}/chart-history")
+async def get_iid_chart_history(
+    iid: int,
+    window_s: float = Query(default=90.0, ge=10, le=300),
+    max_burst_points: int = Query(default=-1, ge=-1, le=50000),
+    max_df11_points: int = Query(default=-1, ge=-1, le=50000),
+    mode: str = Query(default="recorded"),
+    basis: str = Query(default="runtime_effective"),
+    since_burst_seq: int = Query(default=0, ge=0),
+    since_df11_seq: int = Query(default=0, ge=0),
+):
+    """Bounded chart history endpoint — burst residuals, DF11 dots, diagnostics.
+
+    Returns immutably-recorded residual events for the selected IID and time
+    window.  Points are decimated when they exceed the configured budget.
+    The compact sync_snapshot endpoint carries chart stream sequence IDs so
+    the frontend can fetch only new points with since_{burst,df11}_seq.
+    """
+    import config as _cfg
+
+    t0 = time.perf_counter()
+    try:
+        if _state is None:
+            return {"iid": iid, "available": False, "reason": "radar module not initialised"}
+        _mbp = max_burst_points if max_burst_points > 0 else _cfg.CHART_MAX_BURST_RESIDUAL_POINTS
+        _mdp = max_df11_points if max_df11_points > 0 else _cfg.CHART_MAX_DF11_RESIDUAL_POINTS
+        payload = _state.get_chart_history(
+            iid,
+            window_s=window_s,
+            max_burst_points=_mbp,
+            max_df11_points=_mdp,
+            mode=mode,
+            basis=basis,
+            since_burst_seq=since_burst_seq,
+            since_df11_seq=since_df11_seq,
+        )
+        payload["request"] = {
+            "window_s": window_s,
+            "max_burst_points": _mbp,
+            "max_df11_points": _mdp,
+            "mode": mode,
+            "basis": basis,
+            "since_burst_seq": since_burst_seq,
+            "since_df11_seq": since_df11_seq,
+        }
+        burst_count = len(payload.get("recorded_observations") or [])
+        df11_count = len(payload.get("recorded_df11_residual_observations") or [])
+        _record_api_timing(
+            "chart_history",
+            t0,
+            burst_points=burst_count,
+            df11_points=df11_count,
+        )
+        return payload
+    except Exception:
+        _record_api_timing("chart_history", t0)
+        raise
 
 
 @router.get("/iids/{iid}/data-path-diagnostics")

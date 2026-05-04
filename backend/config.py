@@ -222,6 +222,17 @@ RADAR_UPDATE_BUDGET_MS: float = float(os.getenv("RADAR_UPDATE_BUDGET_MS", "750")
 RADAR_IID_WS_REBUILD_INTERVAL_S: float = float(os.getenv("RADAR_IID_WS_REBUILD_INTERVAL_S", "5.0"))
 RADAR_COINCIDENT_BACKGROUND_ENABLED: bool = _bool("RADAR_COINCIDENT_BACKGROUND_ENABLED", False)
 
+# Chart-history payload budgets — limit the number of residual points returned
+# per chart-history response.  When stored history exceeds the budget, points
+# are deterministically decimated (class-balanced where possible) before
+# serialisation.  Tune downward on Pi deployments to reduce serialisation cost.
+CHART_MAX_BURST_RESIDUAL_POINTS: int = int(os.getenv("CHART_MAX_BURST_RESIDUAL_POINTS", "2000"))
+CHART_MAX_DF11_RESIDUAL_POINTS: int = int(os.getenv("CHART_MAX_DF11_RESIDUAL_POINTS", "1000"))
+CHART_HISTORY_CACHE_TTL_S: float = float(os.getenv("CHART_HISTORY_CACHE_TTL_S", "2.0"))
+# How many events the timing WebSocket may send per cycle.  When the raw
+# event count exceeds this limit, events are downsampled before serialisation.
+TIMING_WS_MAX_SENT_EVENTS: int = int(os.getenv("TIMING_WS_MAX_SENT_EVENTS", "1000"))
+
 # Enable radar diagnostics endpoints and hot-path debug instrumentation.
 # When False (default): flash events, burst sync timeline, and other
 # diagnostics-only structures are not populated, saving CPU and memory.

@@ -248,6 +248,7 @@ _ws_selected_state_emissions: int = 0
 _ws_live_emissions: int = 0     # radar-live state payloads sent (change-driven)
 _radar_worker_timings: _deque[dict] = _deque(maxlen=400)
 _TIMING_WS_BATCH_LIMIT = 5_000
+_TIMING_WS_MAX_SENT_EVENTS = int(getattr(config, "TIMING_WS_MAX_SENT_EVENTS", 1000) or 1000)
 _TIMING_PAGE_BATCH_LIMIT = 60_000
 _AGGREGATE_REBUILD_INTERVAL_S = 0.25
 _RADAR_IID_REBUILD_INTERVAL_S = max(1.0, config.RADAR_IID_WS_REBUILD_INTERVAL_S)
@@ -2034,8 +2035,13 @@ async def timing_websocket_endpoint(ws: WebSocket) -> None:
                         )
                     ]
             if events_raw:
+                sent_event_count = len(events_raw)
+                if sent_event_count > _TIMING_WS_MAX_SENT_EVENTS:
+                    stride = max(1, (sent_event_count + _TIMING_WS_MAX_SENT_EVENTS - 1) // _TIMING_WS_MAX_SENT_EVENTS)
+                    events_raw = events_raw[::stride]
+                now_us = state.get_timing_now_us()
                 await ws.send_text(_json_dumps({
-                    "now_us": state.get_timing_now_us(),
+                    "now_us": now_us,
                     "events": [
                         [seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg, range_nm, iid]
                         for seq, arrival_us, df, msg_len, signal_dbfs, source_class, icao, bearing_deg, range_nm, iid in events_raw
@@ -2050,6 +2056,7 @@ async def timing_websocket_endpoint(ws: WebSocket) -> None:
                 "elapsed_ms": round((time.perf_counter() - loop_t0) * 1000, 2),
                 "event_count": len(events_raw),
                 "raw_event_count": raw_event_count,
+                "sent_event_count": len(events_raw) if events_raw else 0,
                 "sent": bool(events_raw),
             })
             await asyncio.sleep(0.1)

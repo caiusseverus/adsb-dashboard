@@ -265,12 +265,9 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     assert "handoff_gate_failures" in payload["sync_state"]
     assert "data_path_diagnostics" in payload
     assert payload["data_path_diagnostics"]["go_evidence_event_count"] >= 1
-    assert len(payload["observations"]) == 1
-    assert payload["observations"][0]["bearing_deg"] is None
-    assert payload["observations"][0]["range_nm"] is None
-    assert payload["alignment_status"]["reason"] == "go_evidence_projected"
-    assert payload["alignment_status"]["multi_sync_admission"]["last_reason"] == "no_receiver_config"
-    assert payload["alignment_status"]["multi_sync_admission"]["counts"]["no_receiver_config"] == 7
+    assert "chart_streams" in payload
+    assert "buffer_sizes" in payload
+    assert payload["transport"]["source"] == "compact_sync_snapshot"
 
 
 def test_get_iid_data_path_diagnostics_endpoint_reports_compact_counters():
@@ -424,10 +421,12 @@ def test_get_iid_sync_snapshot_endpoint_combines_fast_sync_payloads(monkeypatch)
     assert payload["type"] == "radar_sync"
     assert payload["sequence"] >= 1
     assert payload["rotation"]["iid"] == 23
-    assert "observations" in payload
+    assert "chart_streams" in payload
+    assert "buffer_sizes" in payload
     assert "sync_state" in payload
-    assert "phase_anchor_candidates" in payload
-    assert payload["retention_diagnostics"]["timeline"]["count"] == 1
+    assert "period_update_history" in payload
+    assert "sync_horizons" in payload
+    assert payload["transport"]["source"] == "compact_sync_snapshot"
 
 
 def test_build_radar_live_state_payload_prefers_go_sync_summary():
@@ -592,8 +591,8 @@ def test_get_iid_sync_snapshot_uses_compact_go_sync_diagnostics_for_go_owned_syn
     debug_payload = state.get_sync_debug_payload(23, window_s=60.0, limit=20)
 
     assert payload["sync_state"]["source"] == "go_frame_sync"
-    assert payload["phase_anchor_candidates"] == []
-    assert payload["observations"][0]["phase_anchor_contributor"] is False
+    assert "chart_streams" in payload
+    assert "buffer_sizes" in payload
     assert debug_payload["summary"]["diagnostics_mode"] == "compact_go_sync"
     assert debug_payload["summary"]["rich_diagnostics_available"] is False
 

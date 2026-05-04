@@ -1427,8 +1427,8 @@ def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monke
     assert first is second
     assert first["sequence"] == second["sequence"]
     assert first["type"] == "radar_sync"
-    assert "phase_anchor_candidates" in first
-    assert first["retention_diagnostics"]["timeline"]["count"] == 1
+    assert "chart_streams" in first
+    assert "buffer_sizes" in first
     assert first["sync_state"]["period_authority"] == "py_base"
     assert first["sync_state"]["sync_authority"] == "py_bootstrap"
     assert first["sync_state"]["period_refinement_status"] == "bootstrapping"
@@ -1442,7 +1442,8 @@ def test_live_sync_snapshot_reuses_cached_payload_until_sync_inputs_change(monke
     assert first["sync_state"]["fit_span_s"] is None
     assert first["sync_state"]["slope_sign_convention"] == "observed_minus_predicted"
     assert first["sync_state"]["effective_period_source"] == "python_simple_sync.period_base_s"
-    assert "event-time authority snapshots" in first["recorded_event_time_notice"]
+    assert first["transport"]["source"] == "compact_sync_snapshot"
+    assert not first["transport"]["cached"]
 
 
 def test_canonical_period_invariant_for_python_refined_state():
@@ -1684,13 +1685,9 @@ def test_go_sync_snapshot_and_debug_use_compact_diagnostics_path(monkeypatch):
     debug_payload = state.get_sync_debug_payload(7, window_s=60.0, limit=20)
 
     assert snapshot["sync_state"]["source"] == "go_frame_sync"
-    assert snapshot["phase_anchor_candidates"] == []
-    assert snapshot["observations"][0]["phase_anchor_contributor"] is False
-    assert snapshot["retention_diagnostics"]["timeline"]["count"] == 1
-    assert snapshot["sync_mode_diagnostics"]["active_mode"] == "compact_bootstrap"
-    assert snapshot["sync_mode_diagnostics"]["compact"]["reference_icao"] == "AAAAAA"
-    assert snapshot["sync_mode_diagnostics"]["compact"]["last_reference_icao"] == "BBBBBB"
-    assert snapshot["sync_mode_diagnostics"]["compact"]["reference_changed_recently"] is True
+    assert "chart_streams" in snapshot
+    assert "buffer_sizes" in snapshot
+    assert snapshot["sync_state"]["period_refinement_status"] is not None
 
     assert debug_payload["available"] is True
     assert debug_payload["summary"]["diagnostics_mode"] == "compact_go_sync"
@@ -1749,12 +1746,15 @@ def test_go_sync_snapshot_falls_back_to_sweep_frames_when_burst_evidence_aged_ou
     })
 
     snapshot = state.get_live_sync_snapshot(9, window_s=90.0, debug_limit=20)
+    chart = state.get_chart_history(9, window_s=90.0, max_burst_points=2000, max_df11_points=1000, mode="recomputed")
 
-    assert snapshot["recomputed_observations"]
-    assert snapshot["recomputed_observations"][0]["burst_center_method"] == "go_sweep_frame"
-    assert snapshot["recomputed_df11_residual_observations"]
-    assert snapshot["recomputed_df11_residual_observations"][0]["residual_source"] == "go_sweep_frame_compact"
-    assert snapshot["alignment_status"]["reason"] == "go_sweep_frames_projected"
+    assert snapshot["type"] == "radar_sync"
+    assert "chart_streams" in snapshot
+    assert chart["recomputed_observations"]
+    assert chart["recomputed_observations"][0]["burst_center_method"] == "go_sweep_frame"
+    assert chart["recomputed_df11_residual_observations"]
+    assert chart["recomputed_df11_residual_observations"][0]["residual_source"] == "go_sweep_frame_compact"
+    assert chart["alignment_status"]["reason"] == "go_sweep_frames_projected"
 
 
 def test_resolve_phase_anchor_state_population_demoted_keeps_mixed_fallback(monkeypatch):
@@ -3443,8 +3443,11 @@ def test_burst_timeline_includes_display_retention_diagnostic(monkeypatch):
     state = RadarState()
     state._models[3] = RadarIID(iid=3, status="SINGLE_RADAR", period_s=4.0)
     snapshot = state.get_live_sync_snapshot(3, window_s=300.0, debug_limit=20)
-    diag = snapshot.get("display_retention_diagnostic")
-    assert diag is not None, "display_retention_diagnostic missing from snapshot"
+    assert snapshot["type"] == "radar_sync"
+    assert "chart_streams" in snapshot
+    chart = state.get_chart_history(3, window_s=300.0)
+    diag = chart.get("display_retention_diagnostic")
+    assert diag is not None, "display_retention_diagnostic missing from chart history"
     assert diag["axis_window_s"] == pytest.approx(300.0)
     assert diag["display_window_s"] == pytest.approx(300.0)
     assert "fit_window_s" in diag
