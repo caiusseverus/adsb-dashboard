@@ -2752,8 +2752,8 @@ function RotationAlignmentPanel({
 }) {
   const [alignmentMode, setAlignmentMode] = useState(BURST_SYNC_VIEW_MODE_RESIDUALS)
   const [residualChartMode, setResidualChartMode] = useState(RESIDUAL_CHART_MODE_RECORDED)
-  const [syncDrivingOnlyMode, setSyncDrivingOnlyMode] = useState(false)
-  const [showDf11Overlay, setShowDf11Overlay] = useState(true)
+  const [syncDrivingOnlyMode, setSyncDrivingOnlyMode] = useState('all')
+  const [showDf11Overlay, setShowDf11Overlay] = useState('show')
   const [resetting, setResetting] = useState(false)
   const [refOverride, setRefOverride] = useState(null)
   const [refOverrideSent, setRefOverrideSent] = useState(false)
@@ -2947,7 +2947,11 @@ function RotationAlignmentPanel({
     const sampleUs = Number(obs?.beam_center_us ?? 0)
     if (!Number.isFinite(sampleUs) || sampleUs < windowStartUs || sampleUs > windowEndUs) return false
     if (selectedIcao && obs?.icao !== selectedIcao) return false
-    if (syncDrivingOnlyMode && obs.sync_update_eligible !== true) return false
+    if (syncDrivingOnlyMode === 'sync' && !(
+      obs.sync_update_eligible === true
+      && obs.fit_eligible === true
+      && obs.event_kind === 'burst'
+    )) return false
     return true
   })
   const activeProjectionOption = projectionBasisOptions.find(option => option?.id === activeRecomputedBasis)
@@ -2958,12 +2962,12 @@ function RotationAlignmentPanel({
   const burstResidualLabel = residualChartMode === RESIDUAL_CHART_MODE_RECORDED
     ? 'recorded event residual'
     : `${displayedResidualBasis} residual`
-  const visibleDf11ResidualDots = syncDrivingOnlyMode ? [] : (showDf11Overlay ? df11ResidualDots : [])
+  const visibleDf11ResidualDots = syncDrivingOnlyMode === 'sync' ? [] : (showDf11Overlay === 'show' ? df11ResidualDots : [])
   const allDf11ResidualDots = df11ResidualDots
   const inlierCount = filteredObservations.filter(obs => obs.classification === 'inlier').length
   const softCount = filteredObservations.filter(obs => obs.classification === 'soft').length
   const rejectedCount = filteredObservations.filter(obs => obs.classification === 'rejected').length
-  const syncDrivingCount = filteredObservations.filter(obs => obs?.sync_update_eligible !== false).length
+  const syncDrivingCount = filteredObservations.filter(obs => obs?.sync_update_eligible === true && obs?.fit_eligible === true && obs?.event_kind === 'burst').length
   const nonSyncDrivingCount = filteredObservations.length - syncDrivingCount
   // Full-population counts (before syncDrivingOnlyMode filter)
   const allFilteredObs = observations.filter(obs => {
@@ -2975,8 +2979,8 @@ function RotationAlignmentPanel({
   const fullInlierCount = allFilteredObs.filter(obs => obs.classification === 'inlier').length
   const fullSoftCount = allFilteredObs.filter(obs => obs.classification === 'soft').length
   const fullRejectedCount = allFilteredObs.filter(obs => obs.classification === 'rejected').length
-  const fullSyncDrivingCount = allFilteredObs.filter(obs => obs?.sync_update_eligible !== false).length
-  const fullNonSyncDrivingCount = allFilteredObs.length - fullSyncDrivingCount
+  const fullNonSyncBurstCount = allFilteredObs.filter(obs => obs?.sync_update_eligible === false || obs?.fit_eligible === false || obs?.event_kind !== 'burst').length
+  const fullSyncFitCount = allFilteredObs.filter(obs => obs?.sync_update_eligible === true && obs?.fit_eligible === true && obs?.event_kind === 'burst').length
   const fullDfEarlyCount = allDf11ResidualDots.filter(dot => dot.timing_class === 'early').length
   const fullDfOnTimeCount = allDf11ResidualDots.filter(dot => dot.timing_class === 'on_time').length
   const fullDfLateCount = allDf11ResidualDots.filter(dot => dot.timing_class === 'late').length
@@ -3340,23 +3344,23 @@ function RotationAlignmentPanel({
             </span>
           )}
           {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS && (
-            <span className={styles.metricPill} title="When enabled, only observations eligible for sync updates and fit refinement are plotted. DF11 overlay dots and rejected/non-dominant bursts are hidden.">
+            <span className={styles.metricPill} title="When sync-driving only, only burst-centre observations with sync_update_eligible=true AND fit_eligible=true are plotted. DF11 overlay dots are hidden. Excluded burst diagnostics have different opacity and stroke in all-diagnostics mode.">
               Sync-driving only
               <select
                 value={syncDrivingOnlyMode}
-                onChange={e => setSyncDrivingOnlyMode(e.target.value === '1')}
+                onChange={e => setSyncDrivingOnlyMode(e.target.value)}
                 style={{
                   background: 'transparent',
                   border: '1px solid #30363d',
                   borderRadius: '3px',
-                  color: syncDrivingOnlyMode ? '#58a6ff' : '#c9d1d9',
+                  color: syncDrivingOnlyMode === 'sync' ? '#58a6ff' : '#c9d1d9',
                   fontSize: '0.72rem',
                   marginLeft: '4px',
                   padding: '1px 3px',
                 }}
               >
-                <option value="0">All diagnostics</option>
-                <option value="1">Sync-driving only</option>
+                <option value="all">All diagnostics</option>
+                <option value="sync">Sync-driving only</option>
               </select>
             </span>
           )}
@@ -3365,7 +3369,7 @@ function RotationAlignmentPanel({
               DF11 overlay
               <select
                 value={showDf11Overlay}
-                onChange={e => setShowDf11Overlay(e.target.value === '1')}
+                onChange={e => setShowDf11Overlay(e.target.value)}
                 style={{
                   background: 'transparent',
                   border: '1px solid #30363d',
@@ -3376,8 +3380,8 @@ function RotationAlignmentPanel({
                   padding: '1px 3px',
                 }}
               >
-                <option value="1">Show DF11 dots</option>
-                <option value="0">Hide DF11 dots</option>
+                <option value="show">Show DF11 dots</option>
+                <option value="hide">Hide DF11 dots</option>
               </select>
             </span>
           )}
@@ -3815,7 +3819,7 @@ function RotationAlignmentPanel({
                     const displayedResidual = burstResidualValue(obs)
                     const y = residualToY(displayedResidual)
                     const weight = Number(obs.weight ?? 0)
-                    const syncEligible = obs?.sync_update_eligible !== false
+                    const syncEligible = obs?.sync_update_eligible === true && obs?.fit_eligible === true && obs?.event_kind === 'burst'
                     const radiusBase = syncEligible ? 2.7 : 2.1
                     const radius = Math.max(radiusBase, Math.min(5.4, radiusBase + weight * 2.2))
                     return (
@@ -3843,25 +3847,24 @@ function RotationAlignmentPanel({
               </div>
               <div style={{ fontSize: '0.74rem', color: '#8b949e', marginTop: '0.5rem', textAlign: 'center' }}>
                 Burst inlier {inlierCount} · Soft {softCount} · Rejected {rejectedCount}
-                {' · '}Sync-driving bursts {syncDrivingCount}
-                {nonSyncDrivingCount > 0 ? ` · Non-sync-driving bursts ${nonSyncDrivingCount}` : ''}
+                {' · '}Sync-driving fit points {syncDrivingCount}
+                {nonSyncDrivingCount > 0 ? ` · Excluded burst diagnostics ${nonSyncDrivingCount}` : ''}
                 {` · DF11 early ${dfEarlyCount} · on time ${dfOnTimeCount} · late ${dfLateCount}`}
                 {syncState?.sync_jitter_deg != null ? ` · Sync jitter ±${syncState.sync_jitter_deg.toFixed(1)}°` : ''}
                 {residualChartMode === RESIDUAL_CHART_MODE_RECORDED && recordedEventDiagnostics?.recorded_event_count_total != null
                   ? ` · total retained ${recordedEventDiagnostics.recorded_event_count_total} · oldest age ${recordedEventDiagnostics.oldest_recorded_event_age_s != null ? `${Number(recordedEventDiagnostics.oldest_recorded_event_age_s).toFixed(0)}s` : '—'}`
                   : ''}
-                {!(syncDrivingOnlyMode) ? (
+                {syncDrivingOnlyMode !== 'sync' ? (
                   <>
-                    {' · '}Full population: inlier {fullInlierCount} · soft {fullSoftCount} · rejected {fullRejectedCount}
-                    {fullSyncDrivingCount > 0 ? ` · sync-driving ${fullSyncDrivingCount}` : ''}
-                    {fullNonSyncDrivingCount > 0 ? ` · display-only ${fullNonSyncDrivingCount}` : ''}
+                    {' · '}Full: inlier {fullInlierCount} · soft {fullSoftCount} · rejected {fullRejectedCount}
+                    {' · '}sync-fit {fullSyncFitCount} · excluded diagnostics {fullNonSyncBurstCount}
                     {fullDfOnTimeCount + fullDfEarlyCount + fullDfLateCount > 0
                       ? ` · DF11 on-time ${fullDfOnTimeCount} early ${fullDfEarlyCount} late ${fullDfLateCount}`
                       : ''}
                   </>
                 ) : (
                   <>
-                    {' · '}Filtered to sync-driving only ({syncDrivingCount} of {fullInlierCount + fullSoftCount + fullRejectedCount} burst points)
+                    {' · '}Sync-fit only: {syncDrivingCount} of {fullInlierCount + fullSoftCount + fullRejectedCount} burst points · {fullNonSyncBurstCount} excluded diagnostics · {fullDfOnTimeCount + fullDfEarlyCount + fullDfLateCount} DF11 hidden
                   </>
                 )}
               </div>
