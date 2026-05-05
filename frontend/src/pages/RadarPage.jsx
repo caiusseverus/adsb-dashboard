@@ -2373,7 +2373,7 @@ function SyncModeStatusPanel({
           <span className={styles.metricPill}>Operational period mode <span className={styles.metricValue}>{authoritySummary}</span></span>
           <span className={styles.metricPill}>Sync authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.sync_authority)}</span></span>
           <span className={styles.metricPill}>Period authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.period_authority)}</span></span>
-          <span className={styles.metricPill}>Phase authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.phase_authority)}</span></span>
+          <span className={styles.metricPill} title="Handoff/operational-level authority. Separate from anchor-relative phase trust. py_bootstrap / unavailable when RADAR_SYNC_GO_REFINER_OPERATIONAL is disabled, even if anchor-relative phase is trusted.">Phase authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.phase_authority)}</span></span>
           <span className={styles.metricPill}>Handoff state <span className={styles.metricValue}>{formatAuthorityLabel(syncState.handoff_state)}</span></span>
           <span className={styles.metricPill}>Handoff reason <span className={styles.metricValue}>{formatAuthorityLabel(syncState.handoff_reason)}</span></span>
           <span className={styles.metricPill}>Refinement status <span className={styles.metricValue}>{formatAuthorityLabel(syncState.operational_period_refinement_status)}</span></span>
@@ -2391,7 +2391,7 @@ function SyncModeStatusPanel({
             <span className={styles.metricPill}>Operational mode <span className={styles.metricValue}>{authoritySummary}</span></span>
             <span className={styles.metricPill}>Period authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.period_authority)}</span></span>
             <span className={styles.metricPill}>Sync authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.sync_authority)}</span></span>
-            <span className={styles.metricPill}>Phase authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.phase_authority)}</span></span>
+          <span className={styles.metricPill} title="Handoff/operational-level authority. Separate from anchor-relative phase trust. py_bootstrap / unavailable when RADAR_SYNC_GO_REFINER_OPERATIONAL is disabled, even if anchor-relative phase is trusted.">Phase authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.phase_authority)}</span></span>
             <span className={styles.metricPill}>Base <span className={styles.metricValue}>{fmtNumber(operationalPeriod?.base, 4, 's')}</span></span>
             <span className={styles.metricPill}>Δ <span className={styles.metricValue}>{fmtNumber(operationalPeriod?.delta != null ? operationalPeriod.delta * 1000 : null, 2, 'ms')}</span></span>
             <span className={styles.metricPill}>Effective <span className={styles.metricValue}>{fmtNumber(operationalPeriod?.effective, 4, 's')}</span></span>
@@ -2609,7 +2609,7 @@ function PhaseAnchorPanel({ syncState, observations, candidates }) {
               <span className={styles.metricPill} title="Phase is anchor-relative only. Geographic radar beam direction is unavailable.">Phase basis <span className={styles.metricValue}>{phaseBasis}</span></span>
               <span className={styles.metricPill}>Not geographic</span>
               <span className={styles.metricPill}>Anchor age <span className={styles.metricValue}>{Number.isFinite(sinceAgeS) ? `${Math.max(0, sinceAgeS).toFixed(0)}s` : '—'}</span></span>
-              <span className={styles.metricPill} title="Anchor-relative phase status: trusted = Stage 3 eligible; provisional = display only; untrusted = blocked">Anchor-relative phase trust <span className={styles.metricValue} style={{ color: syncState.phase_status === 'trusted' ? '#3fb950' : syncState.phase_status === 'provisional' ? '#e3b341' : '#8b949e' }}>{phaseStatusDisplayLabel(syncState.phase_status_display ?? syncState.phase_status)}</span></span>
+              <span className={styles.metricPill} title="Background: trusted = population validates the anchor offset; provisional = anchor selected but insufficient population validation; untrusted = no usable anchor-relative basis">Anchor-relative phase trust <span className={styles.metricValue} style={{ color: syncState.phase_status === 'trusted' ? '#3fb950' : syncState.phase_status === 'provisional' ? '#e3b341' : '#8b949e' }}>{phaseStatusDisplayLabel(syncState.phase_status)}</span></span>
               <span className={styles.metricPill}>Agree/reject <span className={styles.metricValue}>{syncState.phase_validation_contributors ?? 0}/{syncState.phase_validation_reject_count ?? 0}</span></span>
               <span className={styles.metricPill}>Median Δ <span className={styles.metricValue}>{fmtNumber(syncState.phase_validation_median_error_deg, 2, '°')}</span></span>
               <span className={styles.metricPill}>Candidates <span className={styles.metricValue}>{syncState.phase_anchor_candidate_count ?? candidateRows.length}</span></span>
