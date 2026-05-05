@@ -4,6 +4,8 @@ import {
   getOperationalPeriodTriple,
   isFiniteValue,
   fmtNumber,
+  selectCurrentSyncState,
+  isWindowedPopulationAnchorMismatch,
 } from './radarSync.js'
 
 describe('radarSync', () => {
@@ -83,6 +85,21 @@ describe('radarSync', () => {
       const retainedDeltaMs =
         Number(syncState.go_diagnostic_retained_delta_s ?? syncState.go_diagnostic_period_delta_s) * 1000
       assert.strictEqual(fmtNumber(retainedDeltaMs, 2, 'ms'), '13.81ms')
+    })
+  })
+
+  describe('snapshot consistency policy', () => {
+    it('prefers compact sync snapshot for current sync state', () => {
+      const syncSnapshot = { sync_state: { phase_anchor_icao: '4D2270', sequence: 120 } }
+      const burstTimeline = { sync_state: { phase_anchor_icao: 'AAD213', sequence: 119 } }
+      const selected = selectCurrentSyncState(syncSnapshot, burstTimeline)
+      assert.deepStrictEqual(selected, syncSnapshot.sync_state)
+    })
+
+    it('flags mismatch between current and windowed anchors', () => {
+      assert.strictEqual(isWindowedPopulationAnchorMismatch('4D2270', 'AAD213'), true)
+      assert.strictEqual(isWindowedPopulationAnchorMismatch('4D2270', '4D2270'), false)
+      assert.strictEqual(isWindowedPopulationAnchorMismatch('4D2270', null), false)
     })
   })
 })

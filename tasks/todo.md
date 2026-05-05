@@ -306,3 +306,33 @@ Review:
 Verification:
 - `cd radar-core && GOCACHE=/tmp/go-build-cache go test ./iid`
 - `cd radar-core && GOCACHE=/tmp/go-build-cache go test ./cmd/radar-core`
+## 2026-05-05 Radar Page Snapshot Consistency Investigation
+
+- [x] Review existing lessons and document scope constraints for this investigation.
+- [x] Run GitNexus impact analysis for frontend snapshot/render symbols before edits and report blast radius/risk.
+- [x] Trace radar page data sources for sync snapshot, chart history, compact timeline, and frontend cached/local state.
+- [x] Confirm whether population and phase panels can consume different anchors from mixed snapshot generations.
+- [x] Add visible snapshot identity diagnostics (sync sequence, chart sequence, snapshot timestamp, anchor ICAO, population/phase timestamps) for each panel.
+- [x] Enforce coherent rendering semantics: main population panel uses compact sync snapshot for current state; chart-history population is explicitly labelled as windowed/event-history diagnostics.
+- [x] Add/update frontend tests covering anchor-change consistency and stale/windowed labeling behavior.
+- [x] Run focused verification and document review/results.
+
+Plan confirmation:
+- Do not implement Stage 10.
+- Do not change sync/period/holdover behavior.
+- Do not change validation thresholds.
+
+Review:
+- Confirmed `RadarPage` was mixing logical sources: `syncState` and population monitor both came from `burstTimeline = chartHistory ?? syncSnapshot`, allowing chart-history snapshot lag to present a different anchor than current phase state.
+- Kept current phase/anchor panel on compact sync snapshot (`syncSnapshot.sync_state`) via `selectCurrentSyncState(...)`.
+- Made population phase agreement explicitly windowed/event-history diagnostics from `chartHistory.population_residual_monitor` only, with visible source metadata and mismatch warning when windowed anchor differs from current sync anchor.
+- Added per-panel snapshot identity/debug pills: sync/chart sequence, snapshot timestamps, phase state timestamp, anchor ICAOs, and population window.
+- Added static utility tests to enforce policy: current state prefers compact sync snapshot; anchor mismatch is detected and label-triggerable.
+- No Stage 10 changes, no sync/period/holdover behavior changes, no validation-threshold changes.
+
+Verification:
+- `cd frontend && npm run test:static`
+- `cd frontend && npm run build`
+
+Residual risk:
+- GitNexus MCP impact function was unavailable in this session (only `mcp__gitnexus__.tool_map` exposed), so blast radius was assessed from direct call-site tracing in `RadarPage.jsx` rather than graph-backed impact output.

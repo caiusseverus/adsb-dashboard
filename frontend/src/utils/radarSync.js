@@ -60,3 +60,12 @@ export function fmtNumber(value, digits = 2, suffix = '') {
   const n = Number(value)
   return Number.isFinite(n) ? `${n.toFixed(digits)}${suffix}` : '-'
 }
+
+export function selectCurrentSyncState(syncSnapshot, burstTimeline) {
+  return syncSnapshot?.sync_state ?? burstTimeline?.sync_state ?? null
+}
+
+export function isWindowedPopulationAnchorMismatch(currentAnchorIcao, windowedAnchorIcao) {
+  if (!currentAnchorIcao || !windowedAnchorIcao) return false
+  return String(currentAnchorIcao) !== String(windowedAnchorIcao)
+}

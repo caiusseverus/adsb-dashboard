@@ -25,6 +25,8 @@ import {
   getOperationalPeriodTriple,
   isFiniteValue,
   fmtNumber,
+  selectCurrentSyncState,
+  isWindowedPopulationAnchorMismatch,
 } from '../utils/radarSync'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
@@ -2214,7 +2216,7 @@ function phaseStatusDisplayLabel(value) {
   }
 }
 
-function PopulationResidualMonitorPanel({ monitor }) {
+function PopulationResidualMonitorPanel({ monitor, identity, currentAnchorIcao }) {
   if (!monitor) return null
   const { status, reason, anchor_icao, contributing_icao_count, disagreeing_icao_count,
     anchor_population_delta_deg, population_residual_spread_deg, worst_icao,
@@ -2234,6 +2236,13 @@ function PopulationResidualMonitorPanel({ monitor }) {
   }[status] ?? status
 
   const statusColor = isDisagreement ? '#ff7b72' : status === 'population_mixed' ? '#d29922' : isUnavailable ? '#8b949e' : '#3fb950'
+  const hasAnchorMismatch = isWindowedPopulationAnchorMismatch(currentAnchorIcao, anchor_icao)
+  const snapshotTsLabel = Number.isFinite(Number(identity?.snapshotTs))
+    ? new Date(Number(identity.snapshotTs) * 1000).toLocaleTimeString()
+    : '—'
+  const summaryTsLabel = Number.isFinite(Number(identity?.summaryTs))
+    ? new Date(Number(identity.summaryTs) * 1000).toLocaleTimeString()
+    : '—'
 
   return (
     <div style={{
@@ -2244,9 +2253,9 @@ function PopulationResidualMonitorPanel({ monitor }) {
     }}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px', marginBottom: '0.35rem' }}>
         <div>
-          <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Population phase agreement</div>
+          <div style={{ color: '#c9d1d9', fontWeight: 600 }}>Population phase agreement (windowed/event-history)</div>
           <div style={{ color: '#8b949e', fontSize: '0.72rem' }}>
-            Circular residual consistency across the current aircraft population vs the selected anchor.
+            Event-window diagnostics from chart history; can lag current sync snapshot.
           </div>
         </div>
         <span style={{
@@ -2257,6 +2266,25 @@ function PopulationResidualMonitorPanel({ monitor }) {
           {statusLabel}
         </span>
       </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px', fontSize: '0.72rem' }}>
+        <span className={styles.metricPill}>Source <span className={styles.metricValue}>{identity?.source ?? 'chart_history'}</span></span>
+        <span className={styles.metricPill}>Chart seq <span className={styles.metricValue}>{identity?.chartSequence ?? '—'}</span></span>
+        <span className={styles.metricPill}>Sync seq (current) <span className={styles.metricValue}>{identity?.syncSequence ?? '—'}</span></span>
+        <span className={styles.metricPill}>Chart snapshot ts <span className={styles.metricValue}>{snapshotTsLabel}</span></span>
+        <span className={styles.metricPill}>Summary ts <span className={styles.metricValue}>{summaryTsLabel}</span></span>
+        <span className={styles.metricPill}>Window <span className={styles.metricValue}>{identity?.summaryWindowS ?? window_s ?? '—'}s</span></span>
+        <span className={styles.metricPill}>Anchor (windowed) <span className={styles.metricValue}>{anchor_icao ?? '—'}</span></span>
+        <span className={styles.metricPill}>Anchor (current sync) <span className={styles.metricValue}>{currentAnchorIcao ?? '—'}</span></span>
+      </div>
+      {hasAnchorMismatch && (
+        <div style={{
+          marginBottom: '6px', padding: '5px 8px',
+          background: '#d2992218', border: '1px solid #d2992240', borderRadius: '3px',
+          color: '#e3b341', fontSize: '0.74rem',
+        }}>
+          Windowed population anchor differs from current sync anchor; these are different snapshots.
+        </div>
+      )}
 
       {isDisagreement && (
         <div style={{
@@ -2479,7 +2507,7 @@ function SyncModeStatusPanel({
   )
 }
 
-function PhaseAnchorPanel({ syncState, observations, candidates }) {
+function PhaseAnchorPanel({ syncState, observations, candidates, identity }) {
   if (!syncState) {
     return (
       <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
@@ -2641,6 +2669,17 @@ function PhaseAnchorPanel({ syncState, observations, candidates }) {
             </>
           )}
         </div>
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px', fontSize: '0.72rem' }}>
+        <span className={styles.metricPill}>Source <span className={styles.metricValue}>{identity?.source ?? 'compact_sync_snapshot'}</span></span>
+        <span className={styles.metricPill}>Sync seq <span className={styles.metricValue}>{identity?.syncSequence ?? '—'}</span></span>
+        <span className={styles.metricPill}>Sync snapshot ts <span className={styles.metricValue}>
+          {Number.isFinite(Number(identity?.snapshotTs)) ? new Date(Number(identity.snapshotTs) * 1000).toLocaleTimeString() : '—'}
+        </span></span>
+        <span className={styles.metricPill}>Phase state ts <span className={styles.metricValue}>
+          {Number.isFinite(Number(identity?.phaseStateTs)) ? new Date(Number(identity.phaseStateTs) * 1000).toLocaleTimeString() : '—'}
+        </span></span>
+        <span className={styles.metricPill}>Anchor ICAO <span className={styles.metricValue}>{identity?.anchorIcao ?? anchorIcao ?? '—'}</span></span>
       </div>
 
       {phaseBasis === 'anchor_relative' && syncState.phase_anchor_replacement_reason && (
@@ -2840,7 +2879,22 @@ function RotationAlignmentPanel({
   const displayRetentionDiagnostic = burstTimeline?.display_retention_diagnostic ?? null
   const syncHorizons = burstTimeline?.sync_horizons ?? null
   const legacyIcaosRaw = Array.isArray(legacyTimeline?.icaos) ? legacyTimeline.icaos : []
-  const syncState = burstTimeline?.sync_state ?? null
+  const syncState = selectCurrentSyncState(syncSnapshot, burstTimeline)
+  const phaseIdentity = useMemo(() => ({
+    source: syncSnapshot?.transport?.source ?? 'compact_sync_snapshot',
+    syncSequence: syncSnapshot?.sequence ?? streamStatus.sequence ?? null,
+    snapshotTs: syncSnapshot?.server_ts ?? null,
+    phaseStateTs: syncState?.last_sync_update_ts ?? null,
+    anchorIcao: syncState?.phase_anchor_icao ?? null,
+  }), [syncSnapshot, streamStatus.sequence, syncState])
+  const populationIdentity = useMemo(() => ({
+    source: chartHistory?.transport?.source ?? 'chart_history',
+    chartSequence: chartHistory?.sequence ?? null,
+    syncSequence: syncSnapshot?.sequence ?? streamStatus.sequence ?? null,
+    snapshotTs: chartHistory?.server_ts ?? null,
+    summaryTs: chartHistory?.server_ts ?? null,
+    summaryWindowS: chartHistory?.window_s ?? burstTimeline?.population_residual_monitor?.window_s ?? null,
+  }), [chartHistory, syncSnapshot, streamStatus.sequence, burstTimeline])
   const loading = legacyLoading || streamStatus.mode === 'connecting' || streamStatus.mode === 'reconnecting'
   const periodS = isFiniteValue(syncState?.effective_period_s)
     ? Number(syncState.effective_period_s)
@@ -3649,12 +3703,17 @@ function RotationAlignmentPanel({
         recordedEventTimeNotice={burstTimeline?.recorded_event_time_notice}
       />
 
-      <PopulationResidualMonitorPanel monitor={burstTimeline?.population_residual_monitor ?? null} />
+      <PopulationResidualMonitorPanel
+        monitor={chartHistory?.population_residual_monitor ?? null}
+        identity={populationIdentity}
+        currentAnchorIcao={syncState?.phase_anchor_icao ?? null}
+      />
 
       <PhaseAnchorPanel
         syncState={syncState}
         observations={filteredObservations}
         candidates={burstTimeline?.phase_anchor_candidates}
+        identity={phaseIdentity}
       />
 
       {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS ? (
