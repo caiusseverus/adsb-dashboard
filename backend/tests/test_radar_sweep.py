@@ -3333,6 +3333,12 @@ def test_go_iid_state_maps_discontinuity_and_sync_usable_diagnostics():
         "pdr": int("BBBBBB", 16),
         "pdrc": True,
         "pdb": "go_internal_relative_phase",
+        "wfdc": 2,
+        "wfdd": -41.6,
+        "wfdo": 312.8,
+        "wfdn": 271.2,
+        "wfob": 1,
+        "wfio": 0,
         "ueou": "accepted",
         "ueca": 4.0,
         "pocr": 20.0,
@@ -3369,6 +3375,12 @@ def test_go_iid_state_maps_discontinuity_and_sync_usable_diagnostics():
     assert payload["go_diagnostic_phase_offset_delta_after_blend_deg"] == pytest.approx(-41.0)
     assert payload["go_diagnostic_phase_offset_previous_deg"] == pytest.approx(312.8)
     assert payload["go_diagnostic_phase_offset_previous_fit_epoch_deg"] == pytest.approx(312.8)
+    assert payload["go_diagnostic_weak_fit_discontinuity_ignored_count"] == 2
+    assert payload["go_diagnostic_last_weak_fit_discontinuity_delta_deg"] == pytest.approx(-41.6)
+    assert payload["go_diagnostic_last_weak_fit_discontinuity_old_deg"] == pytest.approx(312.8)
+    assert payload["go_diagnostic_last_weak_fit_discontinuity_new_deg"] == pytest.approx(271.2)
+    assert payload["go_diagnostic_last_weak_fit_discontinuity_fit_obs"] == 1
+    assert payload["go_diagnostic_last_weak_fit_discontinuity_fit_icaos"] == 0
     assert payload["go_diagnostic_go_sync_unusable_reason"] == "strict_gate_failed"
     assert payload["go_diagnostic_go_sync_usable_quality_ok"] is True
     assert payload["go_diagnostic_go_sync_usable_strict_gate_pass"] is False

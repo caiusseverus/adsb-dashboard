@@ -250,6 +250,12 @@ type IIDState struct {
 	PhaseOffsetDiscontinuityCurrentRefICAO   *uint32  `codec:"pdr"`
 	PhaseOffsetDiscontinuityReferenceChanged bool     `codec:"pdrc"`
 	PhaseOffsetDiscontinuityBasisNote        string   `codec:"pdb"`
+	WeakFitDiscontinuityIgnoredCount         uint32   `codec:"wfdc"`
+	LastWeakFitDiscontinuityDeltaDeg         *float64 `codec:"wfdd"`
+	LastWeakFitDiscontinuityOldDeg           *float64 `codec:"wfdo"`
+	LastWeakFitDiscontinuityNewDeg           *float64 `codec:"wfdn"`
+	LastWeakFitDiscontinuityFitObs           uint16   `codec:"wfob"`
+	LastWeakFitDiscontinuityFitICAOs         uint16   `codec:"wfio"`
 	GoSyncUnusableReason                     string   `codec:"gsur"`
 	GoSyncUsableQualityOK                    bool     `codec:"gsuq"`
 	GoSyncUsableQualityValue                 *float64 `codec:"gsuv"`

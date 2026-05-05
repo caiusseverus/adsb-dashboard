@@ -172,6 +172,12 @@ type SyncState struct {
 	PhaseOffsetDiscontinuityCurrentRefICAO        uint32
 	PhaseOffsetDiscontinuityReferenceChanged      bool
 	PhaseOffsetDiscontinuityBasisNote             string
+	WeakFitDiscontinuityIgnoredCount              uint64
+	LastWeakFitDiscontinuityDeltaDeg              float64
+	LastWeakFitDiscontinuityOldDeg                float64
+	LastWeakFitDiscontinuityNewDeg                float64
+	LastWeakFitDiscontinuityFitObs                int
+	LastWeakFitDiscontinuityFitICAOs              int
 	SyncUnusableReason                            string
 	SyncUsableQualityOK                           bool
 	SyncUsableQualityValue                        float64
@@ -560,6 +566,22 @@ func (s *SyncState) maybeResetFitEpochLocked(ctx fitEpochContext) {
 	}
 	deltaDeg := circularDiff(ctx.phaseOffsetDeg, s.fitEpochPhaseOffsetDeg)
 	if math.Abs(deltaDeg) > fitEpochPhaseOffsetResetDeg {
+		if !s.hasSupportedFitEpochForDiscontinuity() {
+			s.WeakFitDiscontinuityIgnoredCount++
+			s.LastWeakFitDiscontinuityDeltaDeg = deltaDeg
+			s.LastWeakFitDiscontinuityOldDeg = wrap360(s.fitEpochPhaseOffsetDeg)
+			s.LastWeakFitDiscontinuityNewDeg = wrap360(ctx.phaseOffsetDeg)
+			s.LastWeakFitDiscontinuityFitObs = s.FitObservationCount
+			s.LastWeakFitDiscontinuityFitICAOs = s.FitICAOCount
+			// Weak-fit epochs are not trusted enough for destructive
+			// discontinuity rotation. Rebase context to avoid churn.
+			s.fitEpochPhaseOffsetDeg = ctx.phaseOffsetDeg
+			if ctx.referenceICAO != 0 {
+				s.fitEpochReferenceICAO = ctx.referenceICAO
+			}
+			s.FitEpochResetReason = "phase_offset_discontinuity_ignored_weak_fit"
+			return
+		}
 		s.LastUpdateEpochPreviousFitEpochPhaseOffsetDeg = wrap360(s.fitEpochPhaseOffsetDeg)
 		s.LastUpdateEpochPreviousPhaseOffsetDeg = wrap360(s.PhaseOffsetDeg)
 		s.PhaseOffsetDiscontinuityOldDeg = wrap360(s.fitEpochPhaseOffsetDeg)
@@ -575,6 +597,11 @@ func (s *SyncState) maybeResetFitEpochLocked(ctx fitEpochContext) {
 		s.PhaseOffsetDiscontinuityBasisNote = "go_internal_relative_phase"
 		s.rotateFitEpochLocked("phase_offset_discontinuity", ctx)
 	}
+}
+
+func (s *SyncState) hasSupportedFitEpochForDiscontinuity() bool {
+	return s.FitObservationCount >= reacquireMinFitObs &&
+		s.FitICAOCount >= reacquireMinFitICAOs
 }
 
 func (s *SyncState) refreshSyncUsableDiagnosticsLocked() bool {

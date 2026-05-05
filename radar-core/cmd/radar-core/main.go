@@ -770,6 +770,12 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 			"phase_offset_discontinuity_current_ref_icao":       snap.PhaseOffsetDiscontinuityCurrentRefICAO,
 			"phase_offset_discontinuity_reference_changed":      snap.PhaseOffsetDiscontinuityReferenceChanged,
 			"phase_offset_discontinuity_basis_note":             snap.PhaseOffsetDiscontinuityBasisNote,
+			"weak_fit_discontinuity_ignored_count":              snap.WeakFitDiscontinuityIgnoredCount,
+			"last_weak_fit_discontinuity_delta_deg":             snap.LastWeakFitDiscontinuityDeltaDeg,
+			"last_weak_fit_discontinuity_old_deg":               snap.LastWeakFitDiscontinuityOldDeg,
+			"last_weak_fit_discontinuity_new_deg":               snap.LastWeakFitDiscontinuityNewDeg,
+			"last_weak_fit_discontinuity_fit_obs":               snap.LastWeakFitDiscontinuityFitObs,
+			"last_weak_fit_discontinuity_fit_icaos":             snap.LastWeakFitDiscontinuityFitICAOs,
 			"go_sync_unusable_reason":                           snap.GoSyncUnusableReason,
 			"go_sync_usable_quality_ok":                         snap.GoSyncUsableQualityOK,
 			"go_sync_usable_quality_value":                      snap.GoSyncUsableQualityValue,
@@ -1160,6 +1166,12 @@ func (e *engine) emitIIDState(iidNum uint8, s *iid.IIDState, nBurstRecords uint1
 		PhaseOffsetDiscontinuityCurrentRefICAO:   snapPhaseOffsetDiscontinuityCurrentRefICAO(s),
 		PhaseOffsetDiscontinuityReferenceChanged: snapPhaseOffsetDiscontinuityReferenceChanged(s),
 		PhaseOffsetDiscontinuityBasisNote:        snapPhaseOffsetDiscontinuityBasisNote(s),
+		WeakFitDiscontinuityIgnoredCount:         snapWeakFitDiscontinuityIgnoredCount(s),
+		LastWeakFitDiscontinuityDeltaDeg:         snapLastWeakFitDiscontinuityDeltaDeg(s),
+		LastWeakFitDiscontinuityOldDeg:           snapLastWeakFitDiscontinuityOldDeg(s),
+		LastWeakFitDiscontinuityNewDeg:           snapLastWeakFitDiscontinuityNewDeg(s),
+		LastWeakFitDiscontinuityFitObs:           snapLastWeakFitDiscontinuityFitObs(s),
+		LastWeakFitDiscontinuityFitICAOs:         snapLastWeakFitDiscontinuityFitICAOs(s),
 		GoSyncUnusableReason:                     snapGoSyncUnusableReason(s),
 		GoSyncUsableQualityOK:                    snapGoSyncUsableQualityOK(s),
 		GoSyncUsableQualityValue:                 snapGoSyncUsableQualityValue(s),
@@ -1649,6 +1661,51 @@ func snapPhaseOffsetDiscontinuityReferenceChanged(s *iid.IIDState) bool {
 
 func snapPhaseOffsetDiscontinuityBasisNote(s *iid.IIDState) string {
 	return s.DebugStateSnapshot().PhaseOffsetDiscontinuityBasisNote
+}
+
+func snapWeakFitDiscontinuityIgnoredCount(s *iid.IIDState) uint32 {
+	v := s.DebugStateSnapshot().WeakFitDiscontinuityIgnoredCount
+	if v > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(v)
+}
+
+func snapLastWeakFitDiscontinuityDeltaDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastWeakFitDiscontinuityDeltaDeg
+	return &v
+}
+
+func snapLastWeakFitDiscontinuityOldDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastWeakFitDiscontinuityOldDeg
+	return &v
+}
+
+func snapLastWeakFitDiscontinuityNewDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastWeakFitDiscontinuityNewDeg
+	return &v
+}
+
+func snapLastWeakFitDiscontinuityFitObs(s *iid.IIDState) uint16 {
+	v := s.DebugStateSnapshot().LastWeakFitDiscontinuityFitObs
+	if v < 0 {
+		return 0
+	}
+	if v > math.MaxUint16 {
+		return math.MaxUint16
+	}
+	return uint16(v)
+}
+
+func snapLastWeakFitDiscontinuityFitICAOs(s *iid.IIDState) uint16 {
+	v := s.DebugStateSnapshot().LastWeakFitDiscontinuityFitICAOs
+	if v < 0 {
+		return 0
+	}
+	if v > math.MaxUint16 {
+		return math.MaxUint16
+	}
+	return uint16(v)
 }
 
 func snapGoSyncUnusableReason(s *iid.IIDState) string {

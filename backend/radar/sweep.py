@@ -484,6 +484,12 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_phase_offset_discontinuity_current_ref_icao": go_payload.get("phase_offset_discontinuity_current_ref_icao"),
         "go_diagnostic_phase_offset_discontinuity_reference_changed": go_payload.get("phase_offset_discontinuity_reference_changed"),
         "go_diagnostic_phase_offset_discontinuity_basis_note": go_payload.get("phase_offset_discontinuity_basis_note"),
+        "go_diagnostic_weak_fit_discontinuity_ignored_count": go_payload.get("weak_fit_discontinuity_ignored_count"),
+        "go_diagnostic_last_weak_fit_discontinuity_delta_deg": go_payload.get("last_weak_fit_discontinuity_delta_deg"),
+        "go_diagnostic_last_weak_fit_discontinuity_old_deg": go_payload.get("last_weak_fit_discontinuity_old_deg"),
+        "go_diagnostic_last_weak_fit_discontinuity_new_deg": go_payload.get("last_weak_fit_discontinuity_new_deg"),
+        "go_diagnostic_last_weak_fit_discontinuity_fit_obs": go_payload.get("last_weak_fit_discontinuity_fit_obs"),
+        "go_diagnostic_last_weak_fit_discontinuity_fit_icaos": go_payload.get("last_weak_fit_discontinuity_fit_icaos"),
         "go_diagnostic_go_sync_unusable_reason": go_payload.get("go_sync_unusable_reason"),
         "go_diagnostic_go_sync_usable_quality_ok": go_payload.get("go_sync_usable_quality_ok"),
         "go_diagnostic_go_sync_usable_quality_value": go_payload.get("go_sync_usable_quality_value"),
@@ -3373,6 +3379,18 @@ class RadarState:
                 "phase_offset_discontinuity_current_ref_icao": str(entry.get("phase_offset_discontinuity_current_ref_icao") or ""),
                 "phase_offset_discontinuity_reference_changed": bool(entry.get("phase_offset_discontinuity_reference_changed", False)),
                 "phase_offset_discontinuity_basis_note": str(entry.get("phase_offset_discontinuity_basis_note") or ""),
+                "weak_fit_discontinuity_ignored_count": int(entry.get("weak_fit_discontinuity_ignored_count") or 0),
+                "last_weak_fit_discontinuity_delta_deg": (
+                    float(entry["last_weak_fit_discontinuity_delta_deg"]) if entry.get("last_weak_fit_discontinuity_delta_deg") is not None else None
+                ),
+                "last_weak_fit_discontinuity_old_deg": (
+                    float(entry["last_weak_fit_discontinuity_old_deg"]) if entry.get("last_weak_fit_discontinuity_old_deg") is not None else None
+                ),
+                "last_weak_fit_discontinuity_new_deg": (
+                    float(entry["last_weak_fit_discontinuity_new_deg"]) if entry.get("last_weak_fit_discontinuity_new_deg") is not None else None
+                ),
+                "last_weak_fit_discontinuity_fit_obs": int(entry.get("last_weak_fit_discontinuity_fit_obs") or 0),
+                "last_weak_fit_discontinuity_fit_icaos": int(entry.get("last_weak_fit_discontinuity_fit_icaos") or 0),
                 "go_sync_unusable_reason": str(entry.get("go_sync_unusable_reason") or ""),
                 "go_sync_usable_quality_ok": bool(entry.get("go_sync_usable_quality_ok", False)),
                 "go_sync_usable_quality_value": (
@@ -4638,6 +4656,12 @@ class RadarState:
                 "phase_offset_discontinuity_current_ref_icao": iid_state.get("pdr"),
                 "phase_offset_discontinuity_reference_changed": iid_state.get("pdrc"),
                 "phase_offset_discontinuity_basis_note": iid_state.get("pdb"),
+                "weak_fit_discontinuity_ignored_count": iid_state.get("wfdc"),
+                "last_weak_fit_discontinuity_delta_deg": iid_state.get("wfdd"),
+                "last_weak_fit_discontinuity_old_deg": iid_state.get("wfdo"),
+                "last_weak_fit_discontinuity_new_deg": iid_state.get("wfdn"),
+                "last_weak_fit_discontinuity_fit_obs": iid_state.get("wfob"),
+                "last_weak_fit_discontinuity_fit_icaos": iid_state.get("wfio"),
                 "go_sync_unusable_reason": iid_state.get("gsur"),
                 "go_sync_usable_quality_ok": iid_state.get("gsuq"),
                 "go_sync_usable_quality_value": iid_state.get("gsuv"),

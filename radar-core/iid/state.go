@@ -262,6 +262,12 @@ type DebugSnapshot struct {
 	PhaseOffsetDiscontinuityCurrentRefICAO        uint32
 	PhaseOffsetDiscontinuityReferenceChanged      bool
 	PhaseOffsetDiscontinuityBasisNote             string
+	WeakFitDiscontinuityIgnoredCount              uint64
+	LastWeakFitDiscontinuityDeltaDeg              float64
+	LastWeakFitDiscontinuityOldDeg                float64
+	LastWeakFitDiscontinuityNewDeg                float64
+	LastWeakFitDiscontinuityFitObs                int
+	LastWeakFitDiscontinuityFitICAOs              int
 	GoSyncUnusableReason                          string
 	GoSyncUsableQualityOK                         bool
 	GoSyncUsableQualityValue                      float64
@@ -1012,6 +1018,12 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.PhaseOffsetDiscontinuityCurrentRefICAO = s.Sync.PhaseOffsetDiscontinuityCurrentRefICAO
 		out.PhaseOffsetDiscontinuityReferenceChanged = s.Sync.PhaseOffsetDiscontinuityReferenceChanged
 		out.PhaseOffsetDiscontinuityBasisNote = s.Sync.PhaseOffsetDiscontinuityBasisNote
+		out.WeakFitDiscontinuityIgnoredCount = s.Sync.WeakFitDiscontinuityIgnoredCount
+		out.LastWeakFitDiscontinuityDeltaDeg = s.Sync.LastWeakFitDiscontinuityDeltaDeg
+		out.LastWeakFitDiscontinuityOldDeg = s.Sync.LastWeakFitDiscontinuityOldDeg
+		out.LastWeakFitDiscontinuityNewDeg = s.Sync.LastWeakFitDiscontinuityNewDeg
+		out.LastWeakFitDiscontinuityFitObs = s.Sync.LastWeakFitDiscontinuityFitObs
+		out.LastWeakFitDiscontinuityFitICAOs = s.Sync.LastWeakFitDiscontinuityFitICAOs
 		out.GoSyncUnusableReason = s.Sync.SyncUnusableReason
 		out.GoSyncUsableQualityOK = s.Sync.SyncUsableQualityOK
 		out.GoSyncUsableQualityValue = s.Sync.SyncUsableQualityValue

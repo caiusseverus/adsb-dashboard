@@ -1551,8 +1551,9 @@ func TestReacquireSupportNotClearedOnReacquire(t *testing.T) {
 
 func TestPhaseOffsetDiscontinuityDiagnosticsCapturedWithWrappedDelta(t *testing.T) {
 	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
-	for i := 1; i <= 10; i++ {
-		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, 0.1, 0xAA, true, 4, 0.5, 0xAA, "go_refiner_active")
+	for i := 0; i < reacquireMinFitObs; i++ {
+		icao := uint32(0xAA + (i % reacquireMinFitICAOs))
+		s.AddRefinementResidualObservation(float64(i+1)*4_000_000.0, 0.1, icao, true, 4, 0.5, 0xAA, "go_refiner_active")
 	}
 	s.fitEpochPhaseOffsetDeg = 350.0
 	s.fitEpochReferenceICAO = 0xAAAAAA
@@ -1592,6 +1593,91 @@ func TestPhaseOffsetDiscontinuityDiagnosticsCapturedWithWrappedDelta(t *testing.
 	}
 	if s.LastUpdateEpochOutcome != "" {
 		t.Fatalf("unexpected outcome marker during direct maybeReset call: %q", s.LastUpdateEpochOutcome)
+	}
+}
+
+func TestPhaseOffsetDiscontinuityIgnoredWhenWeakFit(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 2; i++ {
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, 0.1, 0, true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	prevEpochID := s.FitEpochID
+	s.fitEpochPhaseOffsetDeg = 200.0
+	s.maybeResetFitEpochLocked(fitEpochContext{
+		epochUS:        12_000_000.0,
+		residualBasis:  "observed_minus_predicted",
+		referenceICAO:  0xBBBBBB,
+		phaseOffsetDeg: 240.5,
+		holdover:       false,
+		basePeriodS:    4.0,
+		authorityBasis: "go_refiner_active",
+	})
+	if s.FitEpochID != prevEpochID {
+		t.Fatalf("weak-fit discontinuity should not rotate fit epoch: epoch %d -> %d", prevEpochID, s.FitEpochID)
+	}
+	if s.FitEpochResetReason != "phase_offset_discontinuity_ignored_weak_fit" {
+		t.Fatalf("reset reason=%q", s.FitEpochResetReason)
+	}
+	if s.WeakFitDiscontinuityIgnoredCount == 0 {
+		t.Fatal("expected weak-fit discontinuity ignore count to increment")
+	}
+	if math.Abs(s.LastWeakFitDiscontinuityDeltaDeg-40.5) > 1e-6 {
+		t.Fatalf("weak-fit delta=%.3f", s.LastWeakFitDiscontinuityDeltaDeg)
+	}
+}
+
+func TestWeakFitDiscontinuityRebasesAndPreventsImmediateRepeat(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 2; i++ {
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, 0.1, 0, true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	s.fitEpochPhaseOffsetDeg = 100.0
+	s.maybeResetFitEpochLocked(fitEpochContext{
+		epochUS:        12_000_000.0,
+		residualBasis:  "observed_minus_predicted",
+		referenceICAO:  0xAAAAAA,
+		phaseOffsetDeg: 145.0,
+		holdover:       false,
+		basePeriodS:    4.0,
+		authorityBasis: "go_refiner_active",
+	})
+	ignoredAfterFirst := s.WeakFitDiscontinuityIgnoredCount
+	s.maybeResetFitEpochLocked(fitEpochContext{
+		epochUS:        16_000_000.0,
+		residualBasis:  "observed_minus_predicted",
+		referenceICAO:  0xAAAAAA,
+		phaseOffsetDeg: 148.0,
+		holdover:       false,
+		basePeriodS:    4.0,
+		authorityBasis: "go_refiner_active",
+	})
+	if s.WeakFitDiscontinuityIgnoredCount != ignoredAfterFirst {
+		t.Fatalf("rebased weak-fit epoch should not immediately re-trigger; count %d -> %d", ignoredAfterFirst, s.WeakFitDiscontinuityIgnoredCount)
+	}
+}
+
+func TestPhaseOffsetDiscontinuityStillResetsWithSupportedFit(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 0; i < reacquireMinFitObs; i++ {
+		icao := uint32(0xAA + (i % reacquireMinFitICAOs))
+		s.AddRefinementResidualObservation(float64(i+1)*4_000_000.0, 0.1, icao, true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	s.fitEpochPhaseOffsetDeg = 300.0
+	prevEpochID := s.FitEpochID
+	s.maybeResetFitEpochLocked(fitEpochContext{
+		epochUS:        60_000_000.0,
+		residualBasis:  "observed_minus_predicted",
+		referenceICAO:  0xBBBBBB,
+		phaseOffsetDeg: 260.0,
+		holdover:       false,
+		basePeriodS:    4.0,
+		authorityBasis: "go_refiner_active",
+	})
+	if s.FitEpochID <= prevEpochID {
+		t.Fatal("expected supported fit discontinuity to rotate fit epoch")
+	}
+	if s.FitEpochResetReason != "phase_offset_discontinuity" {
+		t.Fatalf("reason=%q", s.FitEpochResetReason)
 	}
 }
 

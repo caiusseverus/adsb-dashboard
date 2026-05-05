@@ -401,3 +401,28 @@ Review:
 Verification:
 - `cd radar-core && GOCACHE=/tmp/go-build-cache go test ./iid ./cmd/radar-core ./protocol`
 - `UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_radar_sweep.py -k "go_iid_state_maps_discontinuity_and_sync_usable_diagnostics" -q`
+
+## 2026-05-05 Weak-Fit Discontinuity Churn Fix
+
+- [x] Add fit-support gate for destructive `phase_offset_discontinuity` handling in Go sync epoch-reset logic.
+- [x] Keep destructive reset path unchanged for supported fit epochs (same 30° threshold).
+- [x] Add weak-fit non-destructive rebase behavior to prevent repeated discontinuity churn on unsupported epochs.
+- [x] Add weak-fit discontinuity diagnostics (ignored count + last delta/old/new/fit obs/fit ICAOs) to Go state and snapshot payloads.
+- [x] Propagate new compact fields through backend normalization and sync snapshot `go_diagnostic_*` exposure.
+- [x] Add/update Go tests for weak-fit ignore + rebase, supported-fit reset preservation, and existing reset invariants.
+- [x] Update backend mapping tests for new diagnostics.
+- [x] Run focused verification.
+
+Review:
+- `maybeResetFitEpochLocked(...)` now checks `hasSupportedFitEpochForDiscontinuity()` before destructive discontinuity rotation.
+- Support gate uses existing reacquire support thresholds (`reacquireMinFitObs=12`, `reacquireMinFitICAOs=3`) rather than introducing new unrelated constants.
+- When `|delta| > 30°` on weak-fit epochs, the code:
+  - does not rotate/reset fit epoch;
+  - rebases `fitEpochPhaseOffsetDeg` to current context;
+  - records `phase_offset_discontinuity_ignored_weak_fit`;
+  - increments weak-fit discontinuity diagnostics.
+- Supported epochs keep the existing destructive behavior with reason `phase_offset_discontinuity`.
+
+Verification:
+- `cd radar-core && GOCACHE=/tmp/go-build-cache go test ./iid ./cmd/radar-core ./protocol`
+- `UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_radar_sweep.py -k "go_iid_state_maps_discontinuity_and_sync_usable_diagnostics" -q`
