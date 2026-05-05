@@ -148,6 +148,14 @@ class LiveSyncState:
     update_epoch_reject_stale_ref_pos: int = 0
     update_epoch_reject_insufficient_aircraft: int = 0
     update_epoch_last_strict_gate_pass: bool | None = None
+    last_update_epoch_residual_deg: float | None = None
+    last_update_epoch_predicted_deg: float | None = None
+    last_update_epoch_observed_deg: float | None = None
+    consecutive_hard_residual_rejects: int = 0
+    sync_epoch_age_s: float | None = None
+    current_phase_epoch_us: float | None = None
+    candidate_epoch_us: float | None = None
+    sync_reacquired_provisional: bool = False
     population_validation_state: str | None = None  # "pass" | "fail" | "insufficient_data" | "disabled"
     population_validation_reason: str | None = None  # compact reason string
     contamination_state: str | None = None  # "single_family" | "contaminated" | "insufficient_data" | "disabled"

@@ -238,3 +238,31 @@ Verification:
 - `cd frontend && npm run test:static` — 5 tests pass
 - `cd frontend && npm run build` — builds cleanly
 - `uv run --directory backend pytest tests/test_radar_ui_labels.py -q` — 11 passed
+
+
+## 2026-05-05 High-Traffic Provisional Reacquire Instability Investigation
+
+- [x] Review lessons and inspect current Go/Python sync-state transition/diagnostic paths for provisional reacquire and hard residual reject behavior.
+- [x] Run GitNexus impact analysis for symbols to be edited and record risk.
+- [x] Add missing Go->Python diagnostic field passthrough for provisional reacquire and fit-epoch counters.
+- [x] Surface reacquire support vs current fit epoch counters in Radar UI diagnostics.
+- [x] Add/update focused backend tests for new diagnostic field normalization/serialization.
+- [x] Run focused verification and produce diagnosis report, including unresolved runtime-measurement gaps.
+
+Plan confirmation:
+- No Stage 10 implementation.
+- No Go operational default changes.
+- No period tolerance changes.
+- No removal of diagnostic chart recording.
+
+Review:
+- Added Go->Python passthrough for provisional-reacquire transition diagnostics: observed/predicted/residual at update epoch, hard-reject streak, epoch-age/candidate/current epoch, and provisional flag.
+- Added Radar UI diagnostics to show provisional state, hard-reject counters, last update residual triple, reacquire support counts, and current fit-epoch obs/ICAO/age.
+- Kept operational behavior unchanged: no Stage 10 changes, no Go default changes, no period tolerance changes, and no chart-recording removal.
+
+Verification:
+- `uv run --directory backend pytest tests/test_radar_sweep.py -k "reacquire_and_epoch_diagnostics or go_sync_snapshot_exposes_holdover_reason_counters" -q`
+- `cd frontend && npm run build`
+
+Residual risk:
+- 5-minute runtime percentages were not measured in this offline dev session; those require a live feed or replay trace.

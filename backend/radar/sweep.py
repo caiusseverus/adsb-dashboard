@@ -446,6 +446,14 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_fit_epoch_reset_reason": go_payload.get("fit_epoch_reset_reason"),
         "go_diagnostic_fit_epoch_observation_count": go_payload.get("fit_epoch_observation_count"),
         "go_diagnostic_fit_epoch_span_s": go_payload.get("fit_epoch_span_s"),
+        "go_diagnostic_sync_reacquired_provisional": go_payload.get("sync_reacquired_provisional"),
+        "go_diagnostic_consecutive_hard_residual_rejects": go_payload.get("consecutive_hard_residual_rejects"),
+        "go_diagnostic_last_update_epoch_residual_deg": go_payload.get("last_update_epoch_residual_deg"),
+        "go_diagnostic_last_update_epoch_predicted_deg": go_payload.get("last_update_epoch_predicted_deg"),
+        "go_diagnostic_last_update_epoch_observed_deg": go_payload.get("last_update_epoch_observed_deg"),
+        "go_diagnostic_sync_epoch_age_s": go_payload.get("sync_epoch_age_s"),
+        "go_diagnostic_current_phase_epoch_us": go_payload.get("current_phase_epoch_us"),
+        "go_diagnostic_candidate_epoch_us": go_payload.get("candidate_epoch_us"),
         "go_diagnostic_fit_dropped_on_epoch_reset": go_payload.get("fit_dropped_on_epoch_reset"),
         "go_diagnostic_fit_segment_count": go_payload.get("fit_segment_count"),
         "go_diagnostic_last_rejected_delta_s": go_payload.get("last_rejected_delta_s"),
@@ -946,6 +954,14 @@ def _live_sync_state_to_dict(
         "update_epoch_reject_stale_ref_pos": getattr(sync, "update_epoch_reject_stale_ref_pos", None),
         "update_epoch_reject_insufficient_aircraft": getattr(sync, "update_epoch_reject_insufficient_aircraft", None),
         "update_epoch_last_strict_gate_pass": getattr(sync, "update_epoch_last_strict_gate_pass", None),
+        "last_update_epoch_residual_deg": getattr(sync, "last_update_epoch_residual_deg", None),
+        "last_update_epoch_predicted_deg": getattr(sync, "last_update_epoch_predicted_deg", None),
+        "last_update_epoch_observed_deg": getattr(sync, "last_update_epoch_observed_deg", None),
+        "consecutive_hard_residual_rejects": getattr(sync, "consecutive_hard_residual_rejects", None),
+        "sync_epoch_age_s": getattr(sync, "sync_epoch_age_s", None),
+        "current_phase_epoch_us": getattr(sync, "current_phase_epoch_us", None),
+        "candidate_epoch_us": getattr(sync, "candidate_epoch_us", None),
+        "sync_reacquired_provisional": getattr(sync, "sync_reacquired_provisional", None),
         "fit_epoch_id": getattr(sync, "fit_epoch_id", None),
         "fit_epoch_started_ts": getattr(sync, "fit_epoch_started_ts", None),
         "fit_epoch_reset_reason": getattr(sync, "fit_epoch_reset_reason", None),
@@ -3251,6 +3267,26 @@ class RadarState:
                 "update_epoch_reject_stale_ref_pos": int(entry.get("update_epoch_reject_stale_ref_pos") or 0),
                 "update_epoch_reject_insufficient_aircraft": int(entry.get("update_epoch_reject_insufficient_aircraft") or 0),
                 "update_epoch_last_strict_gate_pass": bool(entry.get("update_epoch_last_strict_gate_pass", False)),
+                "last_update_epoch_residual_deg": (
+                    float(entry["last_update_epoch_residual_deg"]) if entry.get("last_update_epoch_residual_deg") is not None else None
+                ),
+                "last_update_epoch_predicted_deg": (
+                    float(entry["last_update_epoch_predicted_deg"]) if entry.get("last_update_epoch_predicted_deg") is not None else None
+                ),
+                "last_update_epoch_observed_deg": (
+                    float(entry["last_update_epoch_observed_deg"]) if entry.get("last_update_epoch_observed_deg") is not None else None
+                ),
+                "consecutive_hard_residual_rejects": int(entry.get("consecutive_hard_residual_rejects") or 0),
+                "sync_epoch_age_s": (
+                    float(entry["sync_epoch_age_s"]) if entry.get("sync_epoch_age_s") is not None else None
+                ),
+                "current_phase_epoch_us": (
+                    float(entry["current_phase_epoch_us"]) if entry.get("current_phase_epoch_us") is not None else None
+                ),
+                "candidate_epoch_us": (
+                    float(entry["candidate_epoch_us"]) if entry.get("candidate_epoch_us") is not None else None
+                ),
+                "sync_reacquired_provisional": bool(entry.get("sync_reacquired_provisional", False)),
                 "reacquire_support_obs_count": int(entry.get("reacquire_support_obs_count") or 0),
                 "reacquire_support_icao_count": int(entry.get("reacquire_support_icao_count") or 0),
             }
@@ -4325,6 +4361,32 @@ class RadarState:
             update_epoch_reject_stale_ref_pos=int(go_sync.get("update_epoch_reject_stale_ref_pos") or 0),
             update_epoch_reject_insufficient_aircraft=int(go_sync.get("update_epoch_reject_insufficient_aircraft") or 0),
             update_epoch_last_strict_gate_pass=bool(go_sync.get("update_epoch_last_strict_gate_pass", False)),
+            last_update_epoch_residual_deg=(
+                float(go_sync["last_update_epoch_residual_deg"])
+                if go_sync.get("last_update_epoch_residual_deg") is not None else None
+            ),
+            last_update_epoch_predicted_deg=(
+                float(go_sync["last_update_epoch_predicted_deg"])
+                if go_sync.get("last_update_epoch_predicted_deg") is not None else None
+            ),
+            last_update_epoch_observed_deg=(
+                float(go_sync["last_update_epoch_observed_deg"])
+                if go_sync.get("last_update_epoch_observed_deg") is not None else None
+            ),
+            consecutive_hard_residual_rejects=int(go_sync.get("consecutive_hard_residual_rejects") or 0),
+            sync_epoch_age_s=(
+                float(go_sync["sync_epoch_age_s"])
+                if go_sync.get("sync_epoch_age_s") is not None else None
+            ),
+            current_phase_epoch_us=(
+                float(go_sync["current_phase_epoch_us"])
+                if go_sync.get("current_phase_epoch_us") is not None else None
+            ),
+            candidate_epoch_us=(
+                float(go_sync["candidate_epoch_us"])
+                if go_sync.get("candidate_epoch_us") is not None else None
+            ),
+            sync_reacquired_provisional=bool(go_sync.get("sync_reacquired_provisional", False)),
             handoff_state=(
                 str(getattr(existing, "handoff_state", "") or "UNTRUSTED")
                 if existing is not None else
@@ -4452,6 +4514,14 @@ class RadarState:
                 "update_epoch_reject_stale_ref_pos": iid_state.get("ues"),
                 "update_epoch_reject_insufficient_aircraft": iid_state.get("uei2"),
                 "update_epoch_last_strict_gate_pass": iid_state.get("uesp"),
+                "last_update_epoch_residual_deg": iid_state.get("ued"),
+                "last_update_epoch_predicted_deg": iid_state.get("ueg"),
+                "last_update_epoch_observed_deg": iid_state.get("ueo"),
+                "consecutive_hard_residual_rejects": iid_state.get("uek"),
+                "sync_epoch_age_s": iid_state.get("ues2"),
+                "current_phase_epoch_us": iid_state.get("uec2"),
+                "candidate_epoch_us": iid_state.get("uen2"),
+                "sync_reacquired_provisional": iid_state.get("uerp"),
                 "reacquire_support_obs_count": iid_state.get("rso"),
                 "reacquire_support_icao_count": iid_state.get("rsi"),
             })

@@ -4610,6 +4610,36 @@ def test_normalise_go_sync_state_fit_inlier_ratio_none_when_null():
     assert result["fit_inlier_ratio"] is None
 
 
+def test_normalise_go_sync_state_reacquire_and_epoch_diagnostics():
+    from radar.sweep import RadarState
+
+    entry = {
+        "sync_state_present": True,
+        "sync_period_s": 4.0,
+        "sync_phase_epoch_us": 1000.0,
+        "sync_phase_offset_deg": 10.0,
+        "last_update_epoch_residual_deg": 42.5,
+        "last_update_epoch_predicted_deg": 110.0,
+        "last_update_epoch_observed_deg": 152.5,
+        "consecutive_hard_residual_rejects": 3,
+        "sync_epoch_age_s": 2.5,
+        "current_phase_epoch_us": 9_000_000.0,
+        "candidate_epoch_us": 9_004_000.0,
+        "sync_reacquired_provisional": True,
+    }
+
+    result = RadarState._normalise_go_sync_state(entry)
+    assert result is not None
+    assert result["last_update_epoch_residual_deg"] == pytest.approx(42.5)
+    assert result["last_update_epoch_predicted_deg"] == pytest.approx(110.0)
+    assert result["last_update_epoch_observed_deg"] == pytest.approx(152.5)
+    assert result["consecutive_hard_residual_rejects"] == 3
+    assert result["sync_epoch_age_s"] == pytest.approx(2.5)
+    assert result["current_phase_epoch_us"] == pytest.approx(9_000_000.0)
+    assert result["candidate_epoch_us"] == pytest.approx(9_004_000.0)
+    assert result["sync_reacquired_provisional"] is True
+
+
 def test_live_sync_state_carries_fit_inlier_ratio():
     from radar.sync_models import LiveSyncState
     sync = LiveSyncState(
