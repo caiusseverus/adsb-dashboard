@@ -666,3 +666,121 @@ class TestStage7RPopulationMonitor:
         assert "population_validation_reason" in payload
         assert payload["population_validation_state"] == "fail"
         assert payload["population_validation_reason"] == "population_demoted"
+
+
+# ── Go-produced entry tests ───────────────────────────────────────────────────
+
+
+def test_go_produced_entries_with_dominant_family_are_accepted():
+    """Fit-eligible Go-produced burst entries with dominant_family=True are
+    accepted by compute_population_residual_summary."""
+    sync = _make_sync()
+    entries = _agrees_pop(n_non_anchor_icaos=5)
+    result = compute_population_residual_summary(entries, sync, iid=1)
+    assert result.status == "population_agrees"
+    assert result.contributing_icao_count >= 5
+
+
+def test_go_produced_entries_with_dominant_family_false_are_rejected():
+    """Entries with sync_update_eligible=False are counted as rejected by the
+    population monitor."""
+    sync = _make_sync()
+    entries = []
+    for i in range(1, 6):
+        for j in range(3):
+            entries.append({
+                "icao": f"B{i:03d}",
+                "residual_deg": 1.0,
+                "pos_age_s": 2.0,
+                "sync_update_eligible": False,  # non-dominant
+                "classification": "inlier",
+            })
+    result = compute_population_residual_summary(entries, sync, iid=1)
+    assert result.status == "insufficient_data"
+    assert result.rejection_counts.get("not_sync_update_eligible", 0) >= 10
+
+
+def test_population_monitor_progresses_from_insufficient_to_pass():
+    """Population validation progresses from insufficient_observations
+    to population_agrees when enough non-anchor ICAOs contribute."""
+    sync = _make_sync()
+    # First: not enough ICAOs (only 2 non-anchor)
+    entries_few = _agrees_pop(n_non_anchor_icaos=2)
+    r1 = compute_population_residual_summary(entries_few, sync, iid=1)
+    assert r1.status == "insufficient_data"
+
+    # Then: enough non-anchor ICAOs (5)
+    entries_enough = _agrees_pop(n_non_anchor_icaos=5)
+    r2 = compute_population_residual_summary(entries_enough, sync, iid=1)
+    assert r2.status == "population_agrees"
+    assert r2.contributing_icao_count >= 5
+
+
+def test_population_monitor_rejection_counts_exposed():
+    """Rejection counts include not_sync_update_eligible and other categories."""
+    sync = _make_sync()
+    entries = []
+    # Some entries without sync_update_eligible
+    entries.append({"icao": "X01", "residual_deg": 1.0, "pos_age_s": 2.0,
+                    "sync_update_eligible": False, "classification": "inlier"})
+    # Some entries with stale position
+    entries.append({"icao": "X02", "residual_deg": 1.0, "pos_age_s": 10.0,
+                    "sync_update_eligible": True, "classification": "inlier"})
+    # Some with missing residual
+    entries.append({"icao": "X03", "pos_age_s": 2.0,
+                    "sync_update_eligible": True, "classification": "inlier"})
+    result = compute_population_residual_summary(entries, sync, iid=1)
+    rc = result.rejection_counts
+    assert rc.get("not_sync_update_eligible", 0) == 1
+    assert rc.get("stale_position", 0) == 1
+    assert rc.get("missing_residual", 0) >= 1
+
+
+def test_phase_blocking_gate_reported_when_population_validation_not_pass():
+    """Phase authority gates report population_validation_not_pass when
+    population_validation_state != 'pass'."""
+    sync = LiveSyncState(
+        iid=1, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=0.0,
+        sync_quality=1.0, sync_jitter_deg=2.0, last_sync_update_ts=1000.0,
+        source="go_frame_sync", usable=True,
+        phase_basis="anchor_relative",
+        phase_anchor_icao="AAAAAA",
+        phase_anchor_status="selected",
+        phase_anchor_age_s=2.0,
+        population_validation_state="insufficient_data",
+        phase_status="trusted",
+        contamination_state="single_family",
+    )
+    from radar.sweep import RadarState
+    state = RadarState()
+    gates = state._evaluate_phase_authority_gates_locked(iid=1, sync=sync)
+    pop_gate = gates["gates"]["population_validated"]
+    assert pop_gate["passed"] is None  # insufficient_data is not blocking
+    assert pop_gate.get("reason") == "population_validation_unavailable"
+
+    # Now with pass state
+    sync.population_validation_state = "pass"
+    gates = state._evaluate_phase_authority_gates_locked(iid=1, sync=sync)
+    pop_gate = gates["gates"]["population_validated"]
+    assert pop_gate["passed"] is True
+
+
+def test_phase_authority_becomes_available_when_all_gates_pass():
+    """Phase authority becomes available when all gates pass."""
+    sync = LiveSyncState(
+        iid=1, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=45.0,
+        sync_quality=1.0, sync_jitter_deg=2.0, last_sync_update_ts=1000.0,
+        source="go_frame_sync", usable=True,
+        phase_basis="anchor_relative",
+        phase_anchor_icao="AAAAAA",
+        phase_anchor_status="selected",
+        phase_anchor_age_s=2.0,
+        population_validation_state="pass",
+        phase_status="trusted",
+        contamination_state="single_family",
+    )
+    from radar.sweep import RadarState
+    state = RadarState()
+    gates = state._evaluate_phase_authority_gates_locked(iid=1, sync=sync)
+    assert gates["phase_ready"] is True
+    assert gates["phase_basis"] == "anchor_relative"

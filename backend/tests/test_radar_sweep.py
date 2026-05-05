@@ -705,7 +705,7 @@ def test_get_burst_sync_timeline_includes_go_evidence_in_diagnostic_timeline(mon
     assert len(observations) == 1
     obs = observations[0]
     assert obs["icao"] == "BBBBBB"
-    assert obs["sync_update_eligible"] is False
+    assert obs["sync_update_eligible"] is True
     assert obs["burst_center_method"] == "amplitude_weighted"
     assert obs["burst_center_simple_us"] == pytest.approx(8_198_000.0)
     assert obs["burst_center_weighted_us"] == pytest.approx(8_200_000.0)

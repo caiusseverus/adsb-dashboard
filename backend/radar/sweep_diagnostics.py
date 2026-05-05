@@ -470,7 +470,7 @@ def go_burst_sync_timeline_snapshot(state: Any, iid: int, window_s: float) -> li
             pos_age_s=pos_age_s,
             range_nm=range_nm,
             ts=wall_ts,
-            sync_update_eligible=bool(entry.get("go_compact_timing_candidate", entry.get("go_timing_candidate", False))),
+            sync_update_eligible=bool(entry.get("dominant_family", False)),
             raw_arrival_us=float(entry["arrival_us"]),
             prop_delay_aircraft_to_receiver_us=prop_delay_us,
             prop_delay_radar_to_aircraft_us=None,
