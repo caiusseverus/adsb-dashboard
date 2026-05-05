@@ -2298,12 +2298,22 @@ function PopulationResidualMonitorPanel({ monitor }) {
 
       {!isUnavailable && Array.isArray(per_icao) && per_icao.length > 0 && (
         <div style={{ marginTop: '4px', paddingTop: '4px', borderTop: '1px solid #30363d' }}>
-          <div style={{ color: '#8b949e', fontSize: '0.70rem', marginBottom: '3px' }}>Per-ICAO residuals</div>
+          <div style={{ color: '#8b949e', fontSize: '0.70rem', marginBottom: '3px' }}>
+            Per-ICAO residuals
+            <span style={{ color: '#555', fontSize: '0.65rem', marginLeft: '6px' }}>
+              main=circular mean of corrected residuals; Δ=delta from anchor residual mean
+            </span>
+          </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '3px' }}>
             {per_icao.map(row => (
               <span
                 key={row.icao}
                 className={styles.metricPill}
+                title={
+                  `${row.icao}: residual_mean=${row.residual_mean_deg != null ? (row.residual_mean_deg > 0 ? '+' : '') + row.residual_mean_deg.toFixed(1) + '°' : '—'} (round mean of bearing − predicted_bearing, includes corrections). ` +
+                  `Δ from anchor=${row.delta_from_anchor_deg != null ? (row.delta_from_anchor_deg > 0 ? '+' : '') + row.delta_from_anchor_deg.toFixed(1) + '°' : '—'}. ` +
+                  `${row.disagrees ? 'DISAGREES (>25° from anchor).' : row.is_anchor ? 'ANCHOR AIRCRAFT — non-zero values expected due to correction terms.' : ''}`
+                }
                 style={{
                   border: row.disagrees ? '1px solid #ff7b7255' : row.is_anchor ? '1px solid #388bfd55' : undefined,
                   background: row.disagrees ? '#ff7b7210' : row.is_anchor ? '#388bfd10' : undefined,
@@ -2603,6 +2613,15 @@ function PhaseAnchorPanel({ syncState, observations, candidates }) {
               <span className={styles.metricPill}>Agree/reject <span className={styles.metricValue}>{syncState.phase_validation_contributors ?? 0}/{syncState.phase_validation_reject_count ?? 0}</span></span>
               <span className={styles.metricPill}>Median Δ <span className={styles.metricValue}>{fmtNumber(syncState.phase_validation_median_error_deg, 2, '°')}</span></span>
               <span className={styles.metricPill}>Candidates <span className={styles.metricValue}>{syncState.phase_anchor_candidate_count ?? candidateRows.length}</span></span>
+              {syncState.phase_trust_reason && (
+                <span className={styles.metricPill} title="Machine-readable trust derivation reason">Trust reason <span className={styles.metricValue}>{syncState.phase_trust_reason}</span></span>
+              )}
+              {syncState.phase_blocking_gate && (
+                <span className={styles.metricPill} style={{ color: '#ff7b72' }} title="Gate that is currently blocking phase authority">Blocking <span className={styles.metricValue}>{syncState.phase_blocking_gate}</span></span>
+              )}
+              {syncState.phase_blocking_reason && (
+                <span className={styles.metricPill} style={{ color: '#ff7b72' }} title="Why the gate is failing">Reason <span className={styles.metricValue}>{syncState.phase_blocking_reason}</span></span>
+              )}
             </>
           )}
           {phaseBasis === 'geographic' && (

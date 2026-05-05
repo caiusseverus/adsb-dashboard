@@ -103,12 +103,24 @@ class PopulationResidualSummary:
     worst_icao_delta_deg: float | None
     per_icao: list[dict] = field(default_factory=list)
     rejection_counts: dict[str, int] = field(default_factory=dict)
+    phase_basis: str | None = None
 
     def to_api_dict(self) -> dict:
         """Serialise to a JSON-safe dict suitable for API payloads.
 
         per_icao is trimmed to MAX_PER_ICAO_IN_PAYLOAD entries, sorted with
         the anchor ICAO first and remaining ICAOs by descending |delta|.
+
+        Per-ICAO chip value semantics:
+          residual_mean_deg  — circular mean of corrected residual_deg
+                               (bearing - predicted_bearing, ±180°).
+                               Includes propagation, motion, and waveform
+                               corrections.  NOT a raw phase offset.
+                               Anchor chips may show non-zero values because
+                               residual = true_offset + correction_terms.
+          delta_from_anchor_deg — circular delta from the anchor's
+                                  residual_mean_deg.  This is what
+                                  determines agreement/disagreement.
         """
         anchor_rows = [r for r in self.per_icao if r.get("is_anchor")]
         non_anchor_rows = sorted(
@@ -121,6 +133,7 @@ class PopulationResidualSummary:
         return {
             "status": self.status,
             "reason": self.reason,
+            "phase_basis": self.phase_basis,
             "window_s": round(self.window_s, 1),
             "observation_count": self.observation_count,
             "eligible_observation_count": self.eligible_observation_count,
@@ -138,6 +151,13 @@ class PopulationResidualSummary:
             "per_icao_omitted_count": omitted,
             "rejection_counts": dict(self.rejection_counts),
             "thresholds": DEFAULT_THRESHOLDS,
+            "residual_basis_description": (
+                "residual_mean_deg = circular_mean(bearing - predicted_bearing) "
+                "with propagation, motion, and waveform corrections applied. "
+                "Anchor chips may show non-zero values because residual ≈ "
+                "true_offset + correction_terms. Agreement is determined by "
+                "delta_from_anchor_deg, not absolute residual_mean_deg."
+            ),
         }
 
 
@@ -208,11 +228,13 @@ def _make_empty(
     contributing_icao_count: int = 0,
     anchor_residual_mean_deg: float | None = None,
     rejection_counts: dict[str, int] | None = None,
+    phase_basis: str | None = None,
 ) -> PopulationResidualSummary:
     return PopulationResidualSummary(
         iid=iid,
         status=status,
         reason=reason,
+        phase_basis=phase_basis,
         window_s=window_s,
         observation_count=observation_count,
         eligible_observation_count=eligible_observation_count,
@@ -258,14 +280,14 @@ def compute_population_residual_summary(
         Defaults to POS_FRESHNESS_GATE_S (8s).
     """
     if sync is None:
-        return _make_empty(iid, "unavailable", "no_sync_state", observation_count=len(entries))
+        return _make_empty(iid, "unavailable", "no_sync_state", observation_count=len(entries), phase_basis=None)
 
     phase_basis, phase_anchor_icao, phase_anchor_status = _derive_phase_basis_and_anchor(sync)
 
     if phase_basis not in _ELIGIBLE_PHASE_BASES:
         return _make_empty(
             iid, "unavailable", "phase_basis_unavailable",
-            observation_count=len(entries),
+            observation_count=len(entries), phase_basis=phase_basis,
         )
 
     total_count = len(entries)
@@ -325,6 +347,7 @@ def compute_population_residual_summary(
             anchor_icao=phase_anchor_icao,
             observation_count=total_count,
             rejection_counts=rejection_counts,
+            phase_basis=phase_basis,
         )
 
     # ── Window span ───────────────────────────────────────────────────────
@@ -379,6 +402,7 @@ def compute_population_residual_summary(
             window_s=window_s,
             per_icao=all_per_icao,
             rejection_counts=rejection_counts,
+            phase_basis=phase_basis,
         )
 
     # ── Anchor availability check ─────────────────────────────────────────
@@ -395,6 +419,7 @@ def compute_population_residual_summary(
             per_icao=all_per_icao,
             contributing_icao_count=contributing_icao_count,
             rejection_counts=rejection_counts,
+            phase_basis=phase_basis,
         )
 
     # ── Non-anchor count check ────────────────────────────────────────────
@@ -410,6 +435,7 @@ def compute_population_residual_summary(
             contributing_icao_count=contributing_icao_count,
             anchor_residual_mean_deg=anchor_mean,
             rejection_counts=rejection_counts,
+            phase_basis=phase_basis,
         )
 
     # ── Population mean (non-anchor contributing ICAOs) ───────────────────
@@ -460,6 +486,7 @@ def compute_population_residual_summary(
         iid=iid,
         status=status,
         reason=reason,
+        phase_basis=phase_basis,
         window_s=window_s,
         observation_count=total_count,
         eligible_observation_count=len(eligible),
