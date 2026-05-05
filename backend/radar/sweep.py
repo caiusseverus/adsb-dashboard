@@ -455,6 +455,10 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_consecutive_hard_bound_rejects": go_payload.get("consecutive_hard_bound_rejects"),
         "go_diagnostic_reacquire_support_obs_count": go_payload.get("reacquire_support_obs_count"),
         "go_diagnostic_reacquire_support_icao_count": go_payload.get("reacquire_support_icao_count"),
+        "go_diagnostic_compact_period_agrees_with_df": go_payload.get("compact_period_agrees_with_df"),
+        "go_diagnostic_compact_period_diagnostic_reason": go_payload.get("compact_period_diagnostic_reason"),
+        "go_diagnostic_compact_period_disagreement_s": go_payload.get("compact_period_disagreement_s"),
+        "go_diagnostic_compact_period_disagreement_ppm": go_payload.get("compact_period_disagreement_ppm"),
     }
 
 
@@ -913,6 +917,10 @@ def _live_sync_state_to_dict(
         "df_base_period_s": getattr(sync, "df_base_period_s", None),
         "period_disagreement_s": getattr(sync, "period_disagreement_s", None),
         "period_disagreement_ppm": getattr(sync, "period_disagreement_ppm", None),
+        "compact_period_agrees_with_df": getattr(sync, "compact_period_agrees_with_df", None),
+        "compact_period_diagnostic_reason": getattr(sync, "compact_period_diagnostic_reason", None),
+        "compact_period_disagreement_s": getattr(sync, "compact_period_disagreement_s", None),
+        "compact_period_disagreement_ppm": getattr(sync, "compact_period_disagreement_ppm", None),
         "holdover_reason": getattr(sync, "holdover_reason", None),
         "last_sync_reject_reason": getattr(sync, "holdover_reason", None),
         "holdover_quality_gate_failed": getattr(sync, "holdover_quality_gate_failed", None),

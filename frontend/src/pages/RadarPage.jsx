@@ -2997,11 +2997,13 @@ function RotationAlignmentPanel({
     return counts
   }, [allFilteredObs, allDf11ResidualDots])
   const sourceCounts = useMemo(() => {
-    const counts = { go: 0, python: 0 }
+    const counts = { go: 0, python: 0, holdover: 0, unknown: 0 }
     for (const obs of allFilteredObs) {
-      const auth = obs?.event_sync_authority || obs?.sync_authority || ''
-      if (auth && auth.startsWith('go_')) counts.go++
-      else if (auth) counts.python++
+      const path = obs?.source_path || ''
+      if (path.startsWith('recorded_go_')) counts.go++
+      else if (path.startsWith('recorded_python_') || path.startsWith('recorded_burst_alignment')) counts.python++
+      else if (path === 'recorded_df11_timing') { /* df11 events counted separately */ }
+      else counts.unknown++
     }
     for (const dot of allDf11ResidualDots) {
       const src = dot?.residual_source || ''
@@ -3871,8 +3873,8 @@ function RotationAlignmentPanel({
               {allFilteredObs.length + allDf11ResidualDots.length > 0 && (
                 <div style={{ color: '#8b949e', fontSize: '0.66rem', marginTop: '2px', display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
                   <span>Phase basis counts: {Object.entries(phaseBasisCounts).map(([pb, n]) => `${pb}=${n}`).join(' · ') || 'none'}</span>
-                  {sourceCounts.go > 0 || sourceCounts.python > 0 ? (
-                    <span>Source: Go={sourceCounts.go} · Python={sourceCounts.python}</span>
+                  {sourceCounts.go > 0 || sourceCounts.python > 0 || sourceCounts.holdover > 0 ? (
+                    <span>Source: Go={sourceCounts.go} · Python={sourceCounts.python}{sourceCounts.holdover > 0 ? ` · Holdover=${sourceCounts.holdover}` : ''}{sourceCounts.unknown > 0 ? ` · Unknown=${sourceCounts.unknown}` : ''}</span>
                   ) : null}
                 </div>
               )}

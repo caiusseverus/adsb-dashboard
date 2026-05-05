@@ -112,6 +112,10 @@ class LiveSyncState:
     df_base_period_s: float | None = None
     period_disagreement_s: float | None = None
     period_disagreement_ppm: float | None = None
+    compact_period_agrees_with_df: bool | None = None
+    compact_period_diagnostic_reason: str | None = None
+    compact_period_disagreement_s: float | None = None
+    compact_period_disagreement_ppm: float | None = None
     fit_epoch_id: int = 0
     fit_epoch_started_ts: float | None = None
     fit_epoch_reset_reason: str | None = None

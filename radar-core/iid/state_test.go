@@ -82,11 +82,19 @@ func TestDFBasePeriodOverridesDisagreeingCompactPeriod(t *testing.T) {
 		t.Fatalf("operational period=%v, want DF base %.2f", got, dfBasePeriod)
 	}
 	snap := s.DebugStateSnapshot()
-	if snap.PeriodAgreesWithDF {
-		t.Fatal("expected compact/DF period disagreement")
+	// Operational: refined effective == DF base (no delta), so they agree.
+	if !snap.PeriodAgreesWithDF {
+		t.Fatal("expected refined effective period agrees with DF base")
 	}
-	if snap.PeriodRejectReason != "compact_period_disagrees_with_df" {
-		t.Fatalf("period reject reason=%q", snap.PeriodRejectReason)
+	if snap.PeriodRejectReason != "" {
+		t.Fatalf("period reject reason=%q, want empty", snap.PeriodRejectReason)
+	}
+	// Diagnostic: compact period 2.01 disagrees with DF base 4.79.
+	if snap.CompactPeriodAgreesWithDF {
+		t.Fatal("expected compact period diagnostic disagreement")
+	}
+	if snap.CompactPeriodDiagnosticReason != "compact_period_disagrees_with_df" {
+		t.Fatalf("compact diagnostic reason=%q", snap.CompactPeriodDiagnosticReason)
 	}
 	if snap.EffectivePeriodS != dfBasePeriod {
 		t.Fatalf("effective period=%.2f, want DF base %.2f", snap.EffectivePeriodS, dfBasePeriod)
@@ -564,11 +572,19 @@ func TestReinforceReportsDFPeriodDisagreementStatus(t *testing.T) {
 	if s.Status != "DF_PERIOD_DISAGREE" {
 		t.Fatalf("status=%q, want DF_PERIOD_DISAGREE", s.Status)
 	}
-	if s.PeriodAgreesWithDF {
-		t.Fatal("expected period disagreement")
+	// Operational: no Sync, refined effective == DF base, so operational agreement is true.
+	if !s.PeriodAgreesWithDF {
+		t.Fatal("expected refined operational period agreement (effective == DF base)")
 	}
-	if s.PeriodRejectReason != "compact_period_disagrees_with_df" {
-		t.Fatalf("period reject reason=%q", s.PeriodRejectReason)
+	if s.PeriodRejectReason != "" {
+		t.Fatalf("period reject reason=%q, want empty (operational)", s.PeriodRejectReason)
+	}
+	// Diagnostic: compact period disagrees with DF base.
+	if s.CompactPeriodAgreesWithDF {
+		t.Fatal("expected compact diagnostic disagreement")
+	}
+	if s.CompactPeriodDiagnosticReason != "compact_period_disagrees_with_df" {
+		t.Fatalf("compact diagnostic reason=%q", s.CompactPeriodDiagnosticReason)
 	}
 }
 
@@ -629,5 +645,109 @@ func TestRefreshReference_PrefersPositionHoldingCandidate(t *testing.T) {
 	}
 	if s.LastRefSelMissingReason != "" {
 		t.Errorf("LastRefSelMissingReason=%q, want empty", s.LastRefSelMissingReason)
+	}
+}
+
+func TestSetBasePeriod_NoHoldoverOnCompactDisagreement(t *testing.T) {
+	s := NewIIDState(20)
+	compactPeriod := 2.01
+	s.PeriodS = &compactPeriod
+
+	dfBasePeriod := 4.79
+	s.SetBasePeriod(dfBasePeriod)
+
+	if s.PeriodAgreesWithDF {
+		// Because the refined effective (DF base + delta=0) equals the incoming DF base,
+		// operational agreement must be true.
+	}
+	if s.PeriodRejectReason != "" {
+		t.Fatalf("PeriodRejectReason=%q, want empty (compact disagree is diagnostic-only)", s.PeriodRejectReason)
+	}
+	// Compact diagnostic must flag the disagreement.
+	if s.CompactPeriodAgreesWithDF {
+		t.Fatal("CompactPeriodAgreesWithDF should be false for 2.01 vs 4.79")
+	}
+	if s.CompactPeriodDiagnosticReason != "compact_period_disagrees_with_df" {
+		t.Fatalf("CompactPeriodDiagnosticReason=%q", s.CompactPeriodDiagnosticReason)
+	}
+	if s.CompactPeriodDisagreementS == 0 {
+		t.Fatal("CompactPeriodDisagreementS should be non-zero")
+	}
+}
+
+func TestSetBasePeriod_HoldoverOnRefinedDisagreement(t *testing.T) {
+	s := NewIIDState(21)
+	dfBasePeriod := 4.79
+	s.SetBasePeriod(dfBasePeriod)
+
+	// Manually create a Sync with a large refinement delta to force refined disagreement.
+	s.RefICAO = new(uint32)
+	*s.RefICAO = 0xAAAAAA
+	s.Sync = NewSyncState(s.IID, dfBasePeriod, 0.0, 0.0, 1.0)
+	s.Sync.BasePeriodS = dfBasePeriod
+	s.Sync.PeriodDeltaS = dfBasePeriod * 0.02 // 2% delta -> refined effective is 2% off base
+	s.Sync.EffectivePeriodS = s.Sync.BasePeriodS + s.Sync.PeriodDeltaS
+
+	// Calling SetBasePeriod again should trigger operational holdover because
+	// the refined effective is >1% away from the incoming DF base.
+	s.SetBasePeriod(dfBasePeriod)
+
+	if s.PeriodAgreesWithDF {
+		t.Fatal("expected operational PeriodAgreesWithDF=false (refined effective disagrees with DF base)")
+	}
+	if s.PeriodRejectReason != "refined_period_disagrees_with_df" {
+		t.Fatalf("PeriodRejectReason=%q, want refined_period_disagrees_with_df", s.PeriodRejectReason)
+	}
+}
+
+func TestSetBasePeriod_SmallDeltaDoesNotTriggerRefinedDisagreement(t *testing.T) {
+	s := NewIIDState(22)
+	dfBasePeriod := 4.98
+
+	// Simulate a realistic retained delta of 4.58ms on 4.98s → 0.092% → well within 1%.
+	retainedDelta := 0.00458
+
+	s.RefICAO = new(uint32)
+	*s.RefICAO = 0xBBBBBB
+	s.Sync = NewSyncState(s.IID, dfBasePeriod, 0.0, 0.0, 1.0)
+	s.Sync.BasePeriodS = dfBasePeriod
+	s.Sync.PeriodDeltaS = retainedDelta
+	s.Sync.EffectivePeriodS = s.Sync.BasePeriodS + s.Sync.PeriodDeltaS
+
+	s.SetBasePeriod(dfBasePeriod)
+
+	if !s.PeriodAgreesWithDF {
+		t.Fatal("expected operational PeriodAgreesWithDF=true (4.58ms on 4.98s is 0.092%, within 1% tolerance)")
+	}
+	if s.PeriodRejectReason != "" {
+		t.Fatalf("PeriodRejectReason=%q, want empty", s.PeriodRejectReason)
+	}
+}
+
+func TestReinforceCompactDisagreementIsDiagnosticOnly(t *testing.T) {
+	s := NewIIDState(23)
+	dfBasePeriod := 4.79
+	compactPeriod := 2.01
+	s.SetBasePeriod(dfBasePeriod)
+	reinforce(s, &RotationModel{
+		DominantPeriodS:    &compactPeriod,
+		Status:             "SINGLE_RADAR",
+		PrimaryDirectCount: 6,
+	})
+
+	// Operational agreement must remain true (no Sync, refined = base).
+	if !s.PeriodAgreesWithDF {
+		t.Fatal("operational PeriodAgreesWithDF should be true (reinforce does not gate operational)")
+	}
+	if s.PeriodRejectReason != "" {
+		t.Fatalf("PeriodRejectReason=%q, want empty (reinforce is diagnostic-only)", s.PeriodRejectReason)
+	}
+	// Compact diagnostic must still flag the disagreement.
+	if s.CompactPeriodAgreesWithDF {
+		t.Fatal("CompactPeriodAgreesWithDF should be false")
+	}
+	// Status still reflects the diagnostic disagreement.
+	if s.Status != "DF_PERIOD_DISAGREE" {
+		t.Fatalf("Status=%q, want DF_PERIOD_DISAGREE", s.Status)
 	}
 }

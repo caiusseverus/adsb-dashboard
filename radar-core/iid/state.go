@@ -61,6 +61,12 @@ type IIDState struct {
 	PeriodAgreesWithDF bool
 	PeriodRejectReason string
 
+	// Compact rotation period vs DF base (diagnostic-only; does not gate holdover).
+	CompactPeriodAgreesWithDF   bool
+	CompactPeriodDiagnosticReason string
+	CompactPeriodDisagreementS    float64
+	CompactPeriodDisagreementPPM  float64
+
 	// Stage 3: reference aircraft and compact sync state.
 	RefICAO *uint32 // selected reference aircraft (nil until stable)
 	Sync    *SyncState
@@ -96,6 +102,10 @@ type DebugSnapshot struct {
 	PeriodSource                             string
 	PeriodAgreesWithDF                       bool
 	PeriodRejectReason                       string
+	CompactPeriodAgreesWithDF                bool
+	CompactPeriodDiagnosticReason            string
+	CompactPeriodDisagreementS               float64
+	CompactPeriodDisagreementPPM             float64
 	ResidualSlopeDegPerS                     float64
 	PeriodRefinementStatus                   string
 	RefinementPlottedCount                   uint64
@@ -346,6 +356,10 @@ func (s *IIDState) Reset() {
 	s.PeriodSource = ""
 	s.PeriodAgreesWithDF = false
 	s.PeriodRejectReason = ""
+	s.CompactPeriodAgreesWithDF = false
+	s.CompactPeriodDiagnosticReason = ""
+	s.CompactPeriodDisagreementS = 0
+	s.CompactPeriodDisagreementPPM = 0
 }
 
 // SetBasePeriod stores the Python DF-alignment-derived period used by
@@ -361,6 +375,8 @@ func (s *IIDState) SetBasePeriod(periodS float64) {
 		s.PeriodSource = ""
 		s.PeriodAgreesWithDF = false
 		s.PeriodRejectReason = "missing_df_base_period"
+		s.CompactPeriodAgreesWithDF = false
+		s.CompactPeriodDiagnosticReason = "missing_df_base_period"
 		if s.Sync != nil {
 			refICAO := uint32(0)
 			if s.RefICAO != nil {
@@ -409,17 +425,38 @@ func (s *IIDState) SetBasePeriod(periodS float64) {
 		s.EffectivePeriodS = &periodS
 		s.PeriodSource = "df_alignment"
 	}
+
+	// ── Operational check: refined effective period vs DF base ──────────
 	s.PeriodAgreesWithDF = true
 	s.PeriodRejectReason = ""
-	if s.PeriodS != nil && !periodsAgree(*s.PeriodS, periodS) {
-		s.PeriodAgreesWithDF = false
-		s.PeriodRejectReason = "compact_period_disagrees_with_df"
+	if s.Sync != nil {
+		refinedEffective := s.Sync.BasePeriodS + s.Sync.PeriodDeltaS
+		s.PeriodAgreesWithDF = periodsAgree(refinedEffective, periodS)
+		if !s.PeriodAgreesWithDF {
+			s.PeriodRejectReason = "refined_period_disagrees_with_df"
+		}
 	}
 	if s.Sync != nil {
 		s.Sync.PeriodAgreesWithDF = s.PeriodAgreesWithDF
 		s.Sync.PeriodRejectReason = s.PeriodRejectReason
-		if s.PeriodRejectReason == "compact_period_disagrees_with_df" {
+		if s.PeriodRejectReason == "refined_period_disagrees_with_df" {
 			s.Sync.enterHoldover("period_disagreement")
+		}
+	}
+
+	// ── Diagnostic: compact rotation period vs DF base ─────────────────
+	s.CompactPeriodAgreesWithDF = false
+	s.CompactPeriodDiagnosticReason = ""
+	s.CompactPeriodDisagreementS = 0
+	s.CompactPeriodDisagreementPPM = 0
+	if s.PeriodS != nil {
+		s.CompactPeriodAgreesWithDF = periodsAgree(*s.PeriodS, periodS)
+		if !s.CompactPeriodAgreesWithDF {
+			s.CompactPeriodDisagreementS = *s.PeriodS - periodS
+			if periodS > 0 {
+				s.CompactPeriodDisagreementPPM = s.CompactPeriodDisagreementS / periodS * 1e6
+			}
+			s.CompactPeriodDiagnosticReason = "compact_period_disagrees_with_df"
 		}
 	}
 }
@@ -551,9 +588,6 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 	s.PeriodSource = s.Sync.PeriodSource
 	s.Sync.PeriodAgreesWithDF = s.PeriodAgreesWithDF
 	s.Sync.PeriodRejectReason = s.PeriodRejectReason
-	if s.PeriodRejectReason == "compact_period_disagrees_with_df" {
-		s.Sync.enterHoldover("period_disagreement")
-	}
 }
 
 // BurstRecordsWindow returns a copy of burst records within +/-halfWindowUS around centerEpochUS.
@@ -759,6 +793,10 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 	out.PeriodSource = s.PeriodSource
 	out.PeriodAgreesWithDF = s.PeriodAgreesWithDF
 	out.PeriodRejectReason = s.PeriodRejectReason
+	out.CompactPeriodAgreesWithDF = s.CompactPeriodAgreesWithDF
+	out.CompactPeriodDiagnosticReason = s.CompactPeriodDiagnosticReason
+	out.CompactPeriodDisagreementS = s.CompactPeriodDisagreementS
+	out.CompactPeriodDisagreementPPM = s.CompactPeriodDisagreementPPM
 	if s.Sync != nil {
 		out.ResidualSlopeDegPerS = s.Sync.ResidualSlopeDegPerS
 		out.ResidualSlopeEMADegPerS = s.Sync.ResidualSlopeEMADegPerS
@@ -1097,16 +1135,23 @@ func reinforce(s *IIDState, model *RotationModel) {
 			s.PeriodDeltaS = 0
 			s.PeriodSource = "df_alignment"
 		}
-		s.PeriodAgreesWithDF = model.DominantPeriodS != nil && periodsAgree(*model.DominantPeriodS, *s.BasePeriodS)
-		if s.PeriodAgreesWithDF {
-			s.PeriodRejectReason = ""
-		} else {
-			s.PeriodRejectReason = "compact_period_disagrees_with_df"
+
+		// ── Diagnostic: compact rotation period vs DF base ──────────
+		s.CompactPeriodAgreesWithDF = model.DominantPeriodS != nil && periodsAgree(*model.DominantPeriodS, *s.BasePeriodS)
+		s.CompactPeriodDisagreementS = 0
+		s.CompactPeriodDisagreementPPM = 0
+		if !s.CompactPeriodAgreesWithDF && model.DominantPeriodS != nil && s.BasePeriodS != nil && *s.BasePeriodS > 0 {
+			s.CompactPeriodDisagreementS = *model.DominantPeriodS - *s.BasePeriodS
+			s.CompactPeriodDisagreementPPM = s.CompactPeriodDisagreementS / *s.BasePeriodS * 1e6
+		}
+		s.CompactPeriodDiagnosticReason = ""
+		if model.DominantPeriodS != nil && !s.CompactPeriodAgreesWithDF {
+			s.CompactPeriodDiagnosticReason = "compact_period_disagrees_with_df"
 		}
 	}
 
 	confidence := confidenceFromSupport(primarySupport)
-	if s.BasePeriodS != nil && !s.PeriodAgreesWithDF {
+	if s.BasePeriodS != nil && !s.CompactPeriodAgreesWithDF {
 		s.Status = "DF_PERIOD_DISAGREE"
 		s.MultiRadarFlag = true
 		return

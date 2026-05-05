@@ -5185,3 +5185,140 @@ def test_emit_consistency_warning_suppress_prevents_all_logs(caplog):
     ]
     assert len(consistency_records) == 0
     sweep._consistency_warning_last_emitted.clear()
+
+
+# ── Compact period diagnostic tests ──────────────────────────────────────────
+
+
+def test_go_diagnostic_compact_period_fields_exposed(monkeypatch):
+    """Compact period diagnostic fields appear in the Go diagnostic payload when
+    present in the go_payload dict read by _build_go_diagnostic_fields."""
+    # Test _build_go_diagnostic_fields directly with fields in the go_payload.
+    go_diag = sweep._build_go_diagnostic_fields(
+        LiveSyncState(
+            iid=60, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=0.0,
+            sync_quality=0.9, sync_jitter_deg=1.0, last_sync_update_ts=1000.0,
+            source="go_frame_sync", usable=True,
+            base_period_s=4.0, effective_period_s=4.0,
+        ),
+        go_sync={
+            "period_agrees_with_df": True,
+            "period_reject_reason": "",
+            "compact_period_agrees_with_df": False,
+            "compact_period_diagnostic_reason": "compact_period_disagrees_with_df",
+            "compact_period_disagreement_s": 0.79,
+            "compact_period_disagreement_ppm": 165972.0,
+        },
+    )
+    assert go_diag["go_diagnostic_compact_period_agrees_with_df"] is False
+    assert go_diag["go_diagnostic_compact_period_diagnostic_reason"] == "compact_period_disagrees_with_df"
+    assert go_diag["go_diagnostic_compact_period_disagreement_s"] == 0.79
+    assert go_diag["go_diagnostic_compact_period_disagreement_ppm"] == 165972.0
+
+
+def test_go_diagnostic_compact_period_missing_defaults_none():
+    """When compact fields are absent from Go payload, defaults are None."""
+    go_diag = sweep._build_go_diagnostic_fields(
+        LiveSyncState(
+            iid=61, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=0.0,
+            sync_quality=0.9, sync_jitter_deg=1.0, last_sync_update_ts=1000.0,
+            source="go_frame_sync", usable=True,
+            base_period_s=4.0, effective_period_s=4.0,
+        ),
+        go_sync={},
+    )
+    assert go_diag["go_diagnostic_compact_period_agrees_with_df"] is None
+    assert go_diag["go_diagnostic_compact_period_diagnostic_reason"] is None
+    assert go_diag["go_diagnostic_compact_period_disagreement_s"] is None
+    assert go_diag["go_diagnostic_compact_period_disagreement_ppm"] is None
+
+
+def test_go_handoff_not_holdover_from_compact_disagreement_alone(monkeypatch):
+    """HOLDOVER is not caused solely by compact_period_disagrees_with_df.
+    When Go reports compact disagreement but period agrees, handoff should not be HOLDOVER."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
+    state = RadarState()
+    state._models[62] = RadarIID(iid=62, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
+    # Go sync present with matching period but compact diagnostic disagreement.
+    # Period agrees operationally, so handoff should not be in holdover.
+    state.update_go_iid_state({
+        "i": 62, "sp": True, "su": True, "sps": 4.0, "sep": 1000.0, "sod": 10.0,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1, "bps": 4.0, "eps": 4.0, "pag": True,
+        "prr": "",  # no operational reject reason
+        # Note: compact diagnostic fields would be in the go_payload dict,
+        # not the iid_state message — they are separate diagnostic surface fields
+        # from DebugStateSnapshot. The handoff state machine uses period_agrees_with_df
+        # (operational) and period_reject_reason (operational), not compact fields.
+    })
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(62))
+    # With RADAR_SYNC_GO_REFINER_OPERATIONAL=False and Go gates passing (period agrees),
+        # handoff should be GO_REFINED_READY (flag-disabled), not HOLDOVER.
+    assert payload["handoff_state"] in ("GO_REFINED_READY", "BASE_PERIOD_READY", "GO_REFINING")
+    assert payload["handoff_state"] != "HOLDOVER"
+    assert payload["handoff_reason"] != "period_disagreement"
+
+
+def test_recorded_event_source_path_distinguishes_go_from_python():
+    """Event source_path correctly identifies Go vs Python producer."""
+    state = RadarState()
+    # Set up sync state with go_frame_sync source.
+    state._live_sync_states[80] = LiveSyncState(
+        iid=80, period_s=4.0, phase_epoch_us=0.0, phase_offset_deg=0.0,
+        sync_quality=1.0, sync_jitter_deg=3.0, last_sync_update_ts=1_000.0,
+        source="go_frame_sync", usable=True,
+        period_authority="go_refined", sync_authority="go_runtime",
+    )
+    sync_snapshot = sweep._live_sync_state_to_dict(state.get_live_sync_state(80))
+    # Go runtime source_path
+    go_path = sweep._recorded_source_path(
+        event_kind="burst",
+        sync_snapshot=sync_snapshot,
+        prefer_go_runtime=True,
+    )
+    assert go_path == "recorded_go_runtime"
+    # Python bootstrap source_path
+    py_sync_snapshot = {**sync_snapshot, "period_authority": "py_base"}
+    py_path = sweep._recorded_source_path(
+        event_kind="burst",
+        sync_snapshot=py_sync_snapshot,
+        prefer_go_runtime=False,
+    )
+    assert py_path == "recorded_python_bootstrap"
+    # DF11 events always have df11 source
+    df11_path = sweep._recorded_source_path(
+        event_kind="df11",
+        sync_snapshot=sync_snapshot,
+        prefer_go_runtime=True,
+    )
+    assert df11_path == "recorded_df11_timing"
+
+
+def test_sync_snapshot_compact_fields_in_live_sync_state_to_dict():
+    """Sync snapshot exposes compact diagnostic fields when set on LiveSyncState."""
+    sync = LiveSyncState(
+        iid=90, period_s=4.79, phase_epoch_us=0.0, phase_offset_deg=0.0,
+        sync_quality=0.8, sync_jitter_deg=1.0, last_sync_update_ts=1000.0,
+        source="multi_aircraft_burst", usable=True,
+        period_base_s=4.79, base_period_s=4.79, effective_period_s=4.79,
+        compact_period_agrees_with_df=None,
+        compact_period_diagnostic_reason=None,
+        compact_period_disagreement_s=None,
+        compact_period_disagreement_ppm=None,
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload.get("compact_period_agrees_with_df") is None
+    assert payload.get("compact_period_diagnostic_reason") is None
+    assert payload.get("compact_period_disagreement_s") is None
+    assert payload.get("compact_period_disagreement_ppm") is None
+
+    # Now set diagnostic values.
+    sync.compact_period_agrees_with_df = False
+    sync.compact_period_diagnostic_reason = "compact_period_disagrees_with_df"
+    sync.compact_period_disagreement_s = 1.23
+    sync.compact_period_disagreement_ppm = 256789.0
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload.get("compact_period_agrees_with_df") is False
+    assert payload.get("compact_period_diagnostic_reason") == "compact_period_disagrees_with_df"
+    assert payload.get("compact_period_disagreement_s") == 1.23
+    assert payload.get("compact_period_disagreement_ppm") == 256789.0
