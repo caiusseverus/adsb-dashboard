@@ -3308,6 +3308,72 @@ def test_go_handoff_allows_period_authority_when_gates_pass():
     assert payload["handoff_reason"] == "go_ready_flag_disabled"
 
 
+def test_go_iid_state_maps_discontinuity_and_sync_usable_diagnostics():
+    state = RadarState()
+    state.update_go_iid_state({
+        "i": 88,
+        "sp": True,
+        "su": False,
+        "sps": 4.0,
+        "sep": 1000.0,
+        "sod": 10.0,
+        "sq": 0.9,
+        "sh": False,
+        "lu": 2000.0,
+        "rv": 1,
+        "frr": "phase_offset_discontinuity",
+        "pdo": 350.0,
+        "pdn": 20.0,
+        "pdd": 30.0,
+        "pdt": 30.0,
+        "pdf": 7,
+        "pdc": 996.0,
+        "pdx": 1000.0,
+        "pdp": int("AAAAAA", 16),
+        "pdr": int("BBBBBB", 16),
+        "pdrc": True,
+        "pdb": "go_internal_relative_phase",
+        "ueou": "accepted",
+        "ueca": 4.0,
+        "pocr": 20.0,
+        "pocw": 20.0,
+        "pobd": 19.0,
+        "podd": 1.0,
+        "podb": 10.0,
+        "poda": -41.0,
+        "popr": 312.8,
+        "pofe": 312.8,
+        "gsur": "strict_gate_failed",
+        "gsuq": True,
+        "gsuv": 0.9,
+        "gsuh": True,
+        "gsup": True,
+        "gsupr": "",
+        "gsus": False,
+    })
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(88), state.get_go_live_sync_state(88))
+    assert payload["go_diagnostic_fit_epoch_reset_reason"] == "phase_offset_discontinuity"
+    assert payload["go_diagnostic_phase_offset_discontinuity_old_deg"] == pytest.approx(350.0)
+    assert payload["go_diagnostic_phase_offset_discontinuity_new_deg"] == pytest.approx(20.0)
+    assert payload["go_diagnostic_phase_offset_discontinuity_delta_deg"] == pytest.approx(30.0)
+    assert payload["go_diagnostic_phase_offset_discontinuity_threshold_deg"] == pytest.approx(30.0)
+    assert payload["go_diagnostic_phase_offset_discontinuity_previous_ref_icao"] == "11184810"
+    assert payload["go_diagnostic_phase_offset_discontinuity_current_ref_icao"] == "12303291"
+    assert payload["go_diagnostic_last_update_epoch_outcome"] == "accepted"
+    assert payload["go_diagnostic_last_update_epoch_candidate_epoch_age_s"] == pytest.approx(4.0)
+    assert payload["go_diagnostic_phase_offset_candidate_raw_deg"] == pytest.approx(20.0)
+    assert payload["go_diagnostic_phase_offset_candidate_wrapped_deg"] == pytest.approx(20.0)
+    assert payload["go_diagnostic_phase_offset_blended_deg"] == pytest.approx(19.0)
+    assert payload["go_diagnostic_phase_offset_blend_delta_deg"] == pytest.approx(1.0)
+    assert payload["go_diagnostic_phase_offset_delta_before_blend_deg"] == pytest.approx(10.0)
+    assert payload["go_diagnostic_phase_offset_delta_after_blend_deg"] == pytest.approx(-41.0)
+    assert payload["go_diagnostic_phase_offset_previous_deg"] == pytest.approx(312.8)
+    assert payload["go_diagnostic_phase_offset_previous_fit_epoch_deg"] == pytest.approx(312.8)
+    assert payload["go_diagnostic_go_sync_unusable_reason"] == "strict_gate_failed"
+    assert payload["go_diagnostic_go_sync_usable_quality_ok"] is True
+    assert payload["go_diagnostic_go_sync_usable_strict_gate_pass"] is False
+
+
 def test_handoff_transition_log_only_on_state_change(caplog):
     state = RadarState()
     state._models[34] = RadarIID(iid=34, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)

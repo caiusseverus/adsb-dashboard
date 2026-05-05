@@ -608,157 +608,190 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 		key := strconv.Itoa(int(iidNum))
 		snap := s.DebugStateSnapshot()
 		iidPayload := map[string]interface{}{
-			"status":                                         snap.Status,
-			"has_period":                                     snap.HasPeriod,
-			"period_s":                                       nil,
-			"has_reference_icao":                             snap.HasRefICAO,
-			"reference_icao":                                 nil,
-			"sync_state_present":                             snap.SyncPresent,
-			"sync_quality":                                   snap.SyncQuality,
-			"sync_state_usable":                              snap.SyncUsable,
-			"sync_period_s":                                  nil,
-			"sync_phase_epoch_us":                            nil,
-			"sync_phase_offset_deg":                          nil,
-			"sync_jitter_deg":                                nil,
-			"sync_residual_ema_deg":                          nil,
-			"sync_last_residual_deg":                         nil,
-			"sync_holdover":                                  snap.SyncHoldover,
-			"sync_n_frames":                                  snap.SyncNSyncFrames,
-			"sync_n_rejected_frames":                         snap.SyncNRejectedFrames,
-			"sync_last_updated":                              nil,
-			"period_source":                                  snap.PeriodSource,
-			"base_period_s":                                  nil,
-			"period_delta_s":                                 snap.PeriodDeltaS,
-			"effective_period_s":                             nil,
-			"residual_slope_deg_per_s":                       snap.ResidualSlopeDegPerS,
-			"slope_ema_deg_per_s":                            snap.ResidualSlopeEMADegPerS,
-			"slope_std_deg_per_s":                            snap.ResidualSlopeStdDegPerS,
-			"proposed_delta_s":                               snap.ProposedDeltaS,
-			"applied_delta_s":                                snap.AppliedDeltaS,
-			"last_slew_limited":                              snap.LastSlewLimited,
-			"last_hard_bound":                                snap.LastHardBound,
-			"hard_bound_reason":                              snap.HardBoundReason,
-			"hard_bound_limit_s":                             snap.HardBoundLimitS,
-			"hard_bound_limit_ppm":                           snap.HardBoundLimitPPM,
-			"last_rejected_delta_s":                          snap.LastRejectedDeltaS,
-			"last_rejected_delta_ppm":                        snap.LastRejectedDeltaPPM,
-			"last_rejected_delta_reason":                     snap.LastRejectedDeltaReason,
-			"last_rejected_delta_epoch_id":                   snap.LastRejectedDeltaEpochID,
-			"requested_delta_s":                              snap.RequestedDeltaS,
-			"requested_delta_ppm":                            snap.RequestedDeltaPPM,
-			"current_delta_s":                                snap.CurrentDeltaS,
-			"current_delta_ppm":                              snap.CurrentDeltaPPM,
-			"delta_to_base_s":                                snap.DeltaToBaseS,
-			"delta_to_base_ppm":                              snap.DeltaToBasePPM,
-			"df_base_period_s":                               snap.DFBasePeriodS,
-			"period_disagreement_s":                          snap.PeriodDisagreementS,
-			"period_disagreement_ppm":                        snap.PeriodDisagreementPPM,
-			"period_refinement_status":                       snap.PeriodRefinementStatus,
-		"period_agrees_with_df":                          snap.PeriodAgreesWithDF,
-		"period_reject_reason":                           snap.PeriodRejectReason,
-		"compact_period_agrees_with_df":                  snap.CompactPeriodAgreesWithDF,
-		"compact_period_diagnostic_reason":               snap.CompactPeriodDiagnosticReason,
-		"compact_period_disagreement_s":                  snap.CompactPeriodDisagreementS,
-		"compact_period_disagreement_ppm":                snap.CompactPeriodDisagreementPPM,
-			"holdover_reason":                                snap.HoldoverReason,
-			"holdover_quality_gate_failed":                   snap.HoldoverQualityGateFailed,
-			"holdover_missing_df_base_period":                snap.HoldoverMissingDFBasePeriod,
-			"holdover_hard_residual_reject":                  snap.HoldoverHardResidualReject,
-			"holdover_no_reference":                          snap.HoldoverNoReference,
-			"holdover_stale_reference_position":              snap.HoldoverStaleReferencePosition,
-			"holdover_period_disagreement":                   snap.HoldoverPeriodDisagreement,
-			"holdover_insufficient_aircraft":                 snap.HoldoverInsufficientAircraft,
-			"holdover_no_dominant_family":                    snap.HoldoverNoDominantFamily,
-			"holdover_sync_state_missing":                    snap.HoldoverSyncStateMissing,
-			"update_epoch_attempts":                          snap.UpdateEpochAttempts,
-			"update_epoch_accepts":                           snap.UpdateEpochAccepts,
-			"update_epoch_rejects":                           snap.UpdateEpochRejects,
-			"last_update_epoch_reject_reason":                snap.LastUpdateEpochRejectReason,
-			"last_update_epoch_n_aircraft":                   snap.LastUpdateEpochNAircraft,
-			"last_update_epoch_ref_pos_age_s":                snap.LastUpdateEpochRefPosAgeS,
-			"last_update_epoch_ref_icao":                     snap.LastUpdateEpochRefICAO,
-			"last_update_epoch_residual_deg":                 snap.LastUpdateEpochResidualDeg,
-			"last_update_epoch_raw_residual_deg":             snap.LastUpdateEpochRawResidualDeg,
-			"last_update_epoch_wrapped_residual_deg":         snap.LastUpdateEpochWrappedResidualDeg,
-			"last_update_epoch_predicted_deg":                snap.LastUpdateEpochPredictedDeg,
-			"last_update_epoch_predicted_wrapped_deg":        snap.LastUpdateEpochPredictedWrappedDeg,
-			"last_update_epoch_observed_deg":                 snap.LastUpdateEpochObservedDeg,
-			"last_update_epoch_ref_bearing_deg":              snap.LastUpdateEpochRefBearingDeg,
-			"last_update_epoch_ref_range_nm":                 snap.LastUpdateEpochRefRangeNM,
-			"hard_reject_transition_consecutive_before":      snap.HardRejectTransitionConsecutiveBefore,
-			"hard_reject_transition_consecutive_after":       snap.HardRejectTransitionConsecutiveAfter,
-			"hard_reject_entered_holdover_bool":              snap.HardRejectEnteredHoldover,
-			"hard_reject_gate_reason":                        snap.HardRejectGateReason,
-			"consecutive_hard_residual_rejects":              snap.ConsecutiveHardResidualRejects,
-			"consecutive_hard_bound_rejects":                 snap.ConsecutiveHardBoundRejects,
-			"last_accepted_epoch_age_s":                      snap.LastAcceptedEpochAgeS,
-			"sync_epoch_age_s":                               snap.SyncEpochAgeS,
-			"current_phase_epoch_us":                         snap.CurrentPhaseEpochUS,
-			"candidate_epoch_us":                             snap.CandidateEpochUS,
-			"sync_reacquired_provisional":                    snap.ReacquiredProvisional,
-			"last_update_epoch_raw_candidate_aircraft_count": snap.LastUpdateEpochRawCandidateAircraftCount,
-			"last_update_epoch_positioned_aircraft_count":    snap.LastUpdateEpochPositionedAircraftCount,
-			"last_update_epoch_dominant_aircraft_count":      snap.LastUpdateEpochDominantAircraftCount,
-			"last_update_epoch_frame_observation_count":      snap.LastUpdateEpochFrameObservationCount,
-			"last_update_epoch_input_reference_icao":         snap.LastUpdateEpochInputReferenceICAO,
-			"last_update_epoch_input_reference_burst_us":     snap.LastUpdateEpochInputReferenceBurstUS,
-			"last_update_epoch_input_reference_pos_age_s":    snap.LastUpdateEpochInputReferencePosAgeS,
-			"last_update_epoch_excluded_missing_position":    snap.LastUpdateEpochExcludedMissingPosition,
-			"last_update_epoch_excluded_stale_position":      snap.LastUpdateEpochExcludedStalePosition,
-			"last_update_epoch_excluded_not_dominant":        snap.LastUpdateEpochExcludedNotDominant,
-			"last_update_epoch_excluded_outside_window":      snap.LastUpdateEpochExcludedOutsideWindow,
-			"update_epoch_reject_quality_gate":               snap.UpdateEpochRejectQualityGate,
-			"update_epoch_reject_missing_base":               snap.UpdateEpochRejectMissingBase,
-			"update_epoch_reject_hard_residual":              snap.UpdateEpochRejectHardResidual,
-			"update_epoch_reject_no_reference":               snap.UpdateEpochRejectNoReference,
-			"update_epoch_reject_stale_ref_pos":              snap.UpdateEpochRejectStaleRefPos,
-			"update_epoch_reject_insufficient_aircraft":      snap.UpdateEpochRejectInsufficientAC,
-			"update_epoch_last_strict_gate_pass":             snap.UpdateEpochLastStrictGatePass,
-			"period_refinement_plotted_count":                snap.RefinementPlottedCount,
-			"period_refinement_eligible_count":               snap.RefinementEligibleCount,
-			"period_refinement_rejected_count":               snap.RefinementRejectedCount,
-			"sync_reference_update_count":                    snap.RefinementReferenceUpdates,
-			"refinement_plotted_count":                       snap.RefinementPlottedCount,
-			"refinement_eligible_count":                      snap.RefinementEligibleCount,
-			"refinement_rejected_count":                      snap.RefinementRejectedCount,
-			"refinement_reference_updates":                   snap.RefinementReferenceUpdates,
-			"refinement_last_reject_reason":                  snap.RefinementLastRejectReason,
-			"refinement_last_observation_age_s":              snap.RefinementLastObservationAgeS,
-			"refinement_history_len":                         snap.RefinementHistoryLen,
-			"fit_observation_count":                          snap.FitObservationCount,
-			"fit_span_s":                                     snap.FitSpanS,
-			"fit_icao_count":                                 snap.FitICAOCount,
-			"fit_observations_per_icao_min":                  snap.FitObservationsPerICAOMin,
-			"fit_observations_per_icao_median":               snap.FitObservationsPerICAOMedian,
-			"fit_observations_per_icao_max":                  snap.FitObservationsPerICAOMax,
-			"fit_retention_window_s":                         snap.FitRetentionWindowS,
-			"fit_global_cap_hit":                             snap.FitGlobalCapHit,
-			"fit_last_eviction_reason":                       snap.FitLastEvictionReason,
-			"fit_inlier_ratio":                               snap.FitInlierRatio,
-			"suspicious_icao_count":                          snap.SuspiciousICAOCount,
-			"suspicious_icao_last_reason":                    snap.SuspiciousICAOLastReason,
-			"fit_epoch_id":                                   snap.FitEpochID,
-			"fit_epoch_started_ts":                           snap.FitEpochStartedUnix,
-			"fit_epoch_reset_reason":                         snap.FitEpochResetReason,
-			"fit_epoch_observation_count":                    snap.FitEpochObservationCount,
-			"fit_epoch_span_s":                               snap.FitEpochSpanS,
-			"fit_dropped_on_epoch_reset":                     snap.FitDroppedOnEpochReset,
-			"fit_segment_count":                              snap.FitSegmentCount,
-			"fit_epoch_reset_count_by_reason":               snap.FitEpochResetCountByReason,
-			"last_fit_epoch_reset_age_s":                    snap.LastFitEpochResetAgeS,
-			"fit_observations_added_since_reset":            snap.FitObservationsAddedSinceReset,
-			"fit_observations_rejected_since_reset":         snap.FitObservationsRejectedSinceReset,
-			"last_fit_observation_reject_reason":            snap.LastFitObservationRejectReason,
-			"current_reference_icao":                        snap.CurrentReferenceICAO,
-			"previous_reference_icao":                       snap.PreviousReferenceICAO,
-			"reference_change_count":                        snap.ReferenceChangeCount,
-			"reference_churn_rate":                          snap.ReferenceChurnRate,
-			"observation_drop_counts_by_reason":              snap.ObservationDropCountsByReason,
-			"holdover_missing_reference_position":            snap.HoldoverMissingReferencePosition,
-			"update_epoch_reject_missing_ref_pos":            snap.UpdateEpochRejectMissingRefPos,
-			"last_ref_sel_has_position":                      snap.LastRefSelHasPosition,
-			"last_ref_sel_position_age_s":                    snap.LastRefSelPositionAgeS,
-			"last_ref_sel_missing_reason":                    snap.LastRefSelMissingReason,
+			"status":                                            snap.Status,
+			"has_period":                                        snap.HasPeriod,
+			"period_s":                                          nil,
+			"has_reference_icao":                                snap.HasRefICAO,
+			"reference_icao":                                    nil,
+			"sync_state_present":                                snap.SyncPresent,
+			"sync_quality":                                      snap.SyncQuality,
+			"sync_state_usable":                                 snap.SyncUsable,
+			"sync_period_s":                                     nil,
+			"sync_phase_epoch_us":                               nil,
+			"sync_phase_offset_deg":                             nil,
+			"sync_jitter_deg":                                   nil,
+			"sync_residual_ema_deg":                             nil,
+			"sync_last_residual_deg":                            nil,
+			"sync_holdover":                                     snap.SyncHoldover,
+			"sync_n_frames":                                     snap.SyncNSyncFrames,
+			"sync_n_rejected_frames":                            snap.SyncNRejectedFrames,
+			"sync_last_updated":                                 nil,
+			"period_source":                                     snap.PeriodSource,
+			"base_period_s":                                     nil,
+			"period_delta_s":                                    snap.PeriodDeltaS,
+			"effective_period_s":                                nil,
+			"residual_slope_deg_per_s":                          snap.ResidualSlopeDegPerS,
+			"slope_ema_deg_per_s":                               snap.ResidualSlopeEMADegPerS,
+			"slope_std_deg_per_s":                               snap.ResidualSlopeStdDegPerS,
+			"proposed_delta_s":                                  snap.ProposedDeltaS,
+			"applied_delta_s":                                   snap.AppliedDeltaS,
+			"last_slew_limited":                                 snap.LastSlewLimited,
+			"last_hard_bound":                                   snap.LastHardBound,
+			"hard_bound_reason":                                 snap.HardBoundReason,
+			"hard_bound_limit_s":                                snap.HardBoundLimitS,
+			"hard_bound_limit_ppm":                              snap.HardBoundLimitPPM,
+			"last_rejected_delta_s":                             snap.LastRejectedDeltaS,
+			"last_rejected_delta_ppm":                           snap.LastRejectedDeltaPPM,
+			"last_rejected_delta_reason":                        snap.LastRejectedDeltaReason,
+			"last_rejected_delta_epoch_id":                      snap.LastRejectedDeltaEpochID,
+			"requested_delta_s":                                 snap.RequestedDeltaS,
+			"requested_delta_ppm":                               snap.RequestedDeltaPPM,
+			"current_delta_s":                                   snap.CurrentDeltaS,
+			"current_delta_ppm":                                 snap.CurrentDeltaPPM,
+			"delta_to_base_s":                                   snap.DeltaToBaseS,
+			"delta_to_base_ppm":                                 snap.DeltaToBasePPM,
+			"df_base_period_s":                                  snap.DFBasePeriodS,
+			"period_disagreement_s":                             snap.PeriodDisagreementS,
+			"period_disagreement_ppm":                           snap.PeriodDisagreementPPM,
+			"period_refinement_status":                          snap.PeriodRefinementStatus,
+			"period_agrees_with_df":                             snap.PeriodAgreesWithDF,
+			"period_reject_reason":                              snap.PeriodRejectReason,
+			"compact_period_agrees_with_df":                     snap.CompactPeriodAgreesWithDF,
+			"compact_period_diagnostic_reason":                  snap.CompactPeriodDiagnosticReason,
+			"compact_period_disagreement_s":                     snap.CompactPeriodDisagreementS,
+			"compact_period_disagreement_ppm":                   snap.CompactPeriodDisagreementPPM,
+			"holdover_reason":                                   snap.HoldoverReason,
+			"holdover_quality_gate_failed":                      snap.HoldoverQualityGateFailed,
+			"holdover_missing_df_base_period":                   snap.HoldoverMissingDFBasePeriod,
+			"holdover_hard_residual_reject":                     snap.HoldoverHardResidualReject,
+			"holdover_no_reference":                             snap.HoldoverNoReference,
+			"holdover_stale_reference_position":                 snap.HoldoverStaleReferencePosition,
+			"holdover_period_disagreement":                      snap.HoldoverPeriodDisagreement,
+			"holdover_insufficient_aircraft":                    snap.HoldoverInsufficientAircraft,
+			"holdover_no_dominant_family":                       snap.HoldoverNoDominantFamily,
+			"holdover_sync_state_missing":                       snap.HoldoverSyncStateMissing,
+			"update_epoch_attempts":                             snap.UpdateEpochAttempts,
+			"update_epoch_accepts":                              snap.UpdateEpochAccepts,
+			"update_epoch_rejects":                              snap.UpdateEpochRejects,
+			"last_update_epoch_reject_reason":                   snap.LastUpdateEpochRejectReason,
+			"last_update_epoch_n_aircraft":                      snap.LastUpdateEpochNAircraft,
+			"last_update_epoch_ref_pos_age_s":                   snap.LastUpdateEpochRefPosAgeS,
+			"last_update_epoch_ref_icao":                        snap.LastUpdateEpochRefICAO,
+			"last_update_epoch_residual_deg":                    snap.LastUpdateEpochResidualDeg,
+			"last_update_epoch_raw_residual_deg":                snap.LastUpdateEpochRawResidualDeg,
+			"last_update_epoch_wrapped_residual_deg":            snap.LastUpdateEpochWrappedResidualDeg,
+			"last_update_epoch_predicted_deg":                   snap.LastUpdateEpochPredictedDeg,
+			"last_update_epoch_predicted_wrapped_deg":           snap.LastUpdateEpochPredictedWrappedDeg,
+			"last_update_epoch_observed_deg":                    snap.LastUpdateEpochObservedDeg,
+			"last_update_epoch_outcome":                         snap.LastUpdateEpochOutcome,
+			"last_update_epoch_candidate_epoch_age_s":           snap.LastUpdateEpochCandidateEpochAgeS,
+			"phase_offset_candidate_raw_deg":                    snap.LastUpdateEpochPhaseOffsetCandidateRawDeg,
+			"phase_offset_candidate_wrapped_deg":                snap.LastUpdateEpochPhaseOffsetCandidateWrappedDeg,
+			"phase_offset_blended_deg":                          snap.LastUpdateEpochPhaseOffsetBlendedDeg,
+			"phase_offset_blend_delta_deg":                      snap.LastUpdateEpochPhaseOffsetBlendDeltaDeg,
+			"phase_offset_delta_before_blend_deg":               snap.LastUpdateEpochPhaseOffsetDeltaBeforeBlendDeg,
+			"phase_offset_delta_after_blend_deg":                snap.LastUpdateEpochPhaseOffsetDeltaAfterBlendDeg,
+			"phase_offset_previous_deg":                         snap.LastUpdateEpochPreviousPhaseOffsetDeg,
+			"phase_offset_previous_fit_epoch_deg":               snap.LastUpdateEpochPreviousFitEpochPhaseOffsetDeg,
+			"last_update_epoch_ref_bearing_deg":                 snap.LastUpdateEpochRefBearingDeg,
+			"last_update_epoch_ref_range_nm":                    snap.LastUpdateEpochRefRangeNM,
+			"hard_reject_transition_consecutive_before":         snap.HardRejectTransitionConsecutiveBefore,
+			"hard_reject_transition_consecutive_after":          snap.HardRejectTransitionConsecutiveAfter,
+			"hard_reject_entered_holdover_bool":                 snap.HardRejectEnteredHoldover,
+			"hard_reject_gate_reason":                           snap.HardRejectGateReason,
+			"consecutive_hard_residual_rejects":                 snap.ConsecutiveHardResidualRejects,
+			"consecutive_hard_bound_rejects":                    snap.ConsecutiveHardBoundRejects,
+			"last_accepted_epoch_age_s":                         snap.LastAcceptedEpochAgeS,
+			"sync_epoch_age_s":                                  snap.SyncEpochAgeS,
+			"current_phase_epoch_us":                            snap.CurrentPhaseEpochUS,
+			"candidate_epoch_us":                                snap.CandidateEpochUS,
+			"sync_reacquired_provisional":                       snap.ReacquiredProvisional,
+			"last_update_epoch_raw_candidate_aircraft_count":    snap.LastUpdateEpochRawCandidateAircraftCount,
+			"last_update_epoch_positioned_aircraft_count":       snap.LastUpdateEpochPositionedAircraftCount,
+			"last_update_epoch_dominant_aircraft_count":         snap.LastUpdateEpochDominantAircraftCount,
+			"last_update_epoch_frame_observation_count":         snap.LastUpdateEpochFrameObservationCount,
+			"last_update_epoch_input_reference_icao":            snap.LastUpdateEpochInputReferenceICAO,
+			"last_update_epoch_input_reference_burst_us":        snap.LastUpdateEpochInputReferenceBurstUS,
+			"last_update_epoch_input_reference_pos_age_s":       snap.LastUpdateEpochInputReferencePosAgeS,
+			"last_update_epoch_excluded_missing_position":       snap.LastUpdateEpochExcludedMissingPosition,
+			"last_update_epoch_excluded_stale_position":         snap.LastUpdateEpochExcludedStalePosition,
+			"last_update_epoch_excluded_not_dominant":           snap.LastUpdateEpochExcludedNotDominant,
+			"last_update_epoch_excluded_outside_window":         snap.LastUpdateEpochExcludedOutsideWindow,
+			"update_epoch_reject_quality_gate":                  snap.UpdateEpochRejectQualityGate,
+			"update_epoch_reject_missing_base":                  snap.UpdateEpochRejectMissingBase,
+			"update_epoch_reject_hard_residual":                 snap.UpdateEpochRejectHardResidual,
+			"update_epoch_reject_no_reference":                  snap.UpdateEpochRejectNoReference,
+			"update_epoch_reject_stale_ref_pos":                 snap.UpdateEpochRejectStaleRefPos,
+			"update_epoch_reject_insufficient_aircraft":         snap.UpdateEpochRejectInsufficientAC,
+			"update_epoch_last_strict_gate_pass":                snap.UpdateEpochLastStrictGatePass,
+			"period_refinement_plotted_count":                   snap.RefinementPlottedCount,
+			"period_refinement_eligible_count":                  snap.RefinementEligibleCount,
+			"period_refinement_rejected_count":                  snap.RefinementRejectedCount,
+			"sync_reference_update_count":                       snap.RefinementReferenceUpdates,
+			"refinement_plotted_count":                          snap.RefinementPlottedCount,
+			"refinement_eligible_count":                         snap.RefinementEligibleCount,
+			"refinement_rejected_count":                         snap.RefinementRejectedCount,
+			"refinement_reference_updates":                      snap.RefinementReferenceUpdates,
+			"refinement_last_reject_reason":                     snap.RefinementLastRejectReason,
+			"refinement_last_observation_age_s":                 snap.RefinementLastObservationAgeS,
+			"refinement_history_len":                            snap.RefinementHistoryLen,
+			"fit_observation_count":                             snap.FitObservationCount,
+			"fit_span_s":                                        snap.FitSpanS,
+			"fit_icao_count":                                    snap.FitICAOCount,
+			"fit_observations_per_icao_min":                     snap.FitObservationsPerICAOMin,
+			"fit_observations_per_icao_median":                  snap.FitObservationsPerICAOMedian,
+			"fit_observations_per_icao_max":                     snap.FitObservationsPerICAOMax,
+			"fit_retention_window_s":                            snap.FitRetentionWindowS,
+			"fit_global_cap_hit":                                snap.FitGlobalCapHit,
+			"fit_last_eviction_reason":                          snap.FitLastEvictionReason,
+			"fit_inlier_ratio":                                  snap.FitInlierRatio,
+			"suspicious_icao_count":                             snap.SuspiciousICAOCount,
+			"suspicious_icao_last_reason":                       snap.SuspiciousICAOLastReason,
+			"fit_epoch_id":                                      snap.FitEpochID,
+			"fit_epoch_started_ts":                              snap.FitEpochStartedUnix,
+			"fit_epoch_reset_reason":                            snap.FitEpochResetReason,
+			"fit_epoch_observation_count":                       snap.FitEpochObservationCount,
+			"fit_epoch_span_s":                                  snap.FitEpochSpanS,
+			"fit_dropped_on_epoch_reset":                        snap.FitDroppedOnEpochReset,
+			"fit_segment_count":                                 snap.FitSegmentCount,
+			"fit_epoch_reset_count_by_reason":                   snap.FitEpochResetCountByReason,
+			"last_fit_epoch_reset_age_s":                        snap.LastFitEpochResetAgeS,
+			"fit_observations_added_since_reset":                snap.FitObservationsAddedSinceReset,
+			"fit_observations_rejected_since_reset":             snap.FitObservationsRejectedSinceReset,
+			"last_fit_observation_reject_reason":                snap.LastFitObservationRejectReason,
+			"phase_offset_discontinuity_old_deg":                snap.PhaseOffsetDiscontinuityOldDeg,
+			"phase_offset_discontinuity_new_deg":                snap.PhaseOffsetDiscontinuityNewDeg,
+			"phase_offset_discontinuity_delta_deg":              snap.PhaseOffsetDiscontinuityDeltaDeg,
+			"phase_offset_discontinuity_threshold_deg":          snap.PhaseOffsetDiscontinuityThresholdDeg,
+			"phase_offset_discontinuity_fit_epoch_id":           snap.PhaseOffsetDiscontinuityFitEpochID,
+			"phase_offset_discontinuity_current_phase_epoch_us": snap.PhaseOffsetDiscontinuityCurrentEpochUS,
+			"phase_offset_discontinuity_candidate_epoch_us":     snap.PhaseOffsetDiscontinuityCandidateEpochUS,
+			"phase_offset_discontinuity_previous_ref_icao":      snap.PhaseOffsetDiscontinuityPreviousRefICAO,
+			"phase_offset_discontinuity_current_ref_icao":       snap.PhaseOffsetDiscontinuityCurrentRefICAO,
+			"phase_offset_discontinuity_reference_changed":      snap.PhaseOffsetDiscontinuityReferenceChanged,
+			"phase_offset_discontinuity_basis_note":             snap.PhaseOffsetDiscontinuityBasisNote,
+			"go_sync_unusable_reason":                           snap.GoSyncUnusableReason,
+			"go_sync_usable_quality_ok":                         snap.GoSyncUsableQualityOK,
+			"go_sync_usable_quality_value":                      snap.GoSyncUsableQualityValue,
+			"go_sync_usable_holdover_ok":                        snap.GoSyncUsableHoldoverOK,
+			"go_sync_usable_period_agrees":                      snap.GoSyncUsablePeriodAgrees,
+			"go_sync_usable_period_reject_reason":               snap.GoSyncUsablePeriodRejectReason,
+			"go_sync_usable_strict_gate_pass":                   snap.GoSyncUsableStrictGatePass,
+			"go_sync_usable_reacquired_provisional":             snap.ReacquiredProvisional,
+			"go_sync_usable_fit_obs":                            snap.FitObservationCount,
+			"go_sync_usable_fit_icaos":                          snap.FitICAOCount,
+			"go_sync_usable_reacquire_support_obs":              snap.ReacquireSupportObservationCount,
+			"go_sync_usable_reacquire_support_icaos":            snap.ReacquireSupportICAOCount,
+			"current_reference_icao":                            snap.CurrentReferenceICAO,
+			"previous_reference_icao":                           snap.PreviousReferenceICAO,
+			"reference_change_count":                            snap.ReferenceChangeCount,
+			"reference_churn_rate":                              snap.ReferenceChurnRate,
+			"observation_drop_counts_by_reason":                 snap.ObservationDropCountsByReason,
+			"holdover_missing_reference_position":               snap.HoldoverMissingReferencePosition,
+			"update_epoch_reject_missing_ref_pos":               snap.UpdateEpochRejectMissingRefPos,
+			"last_ref_sel_has_position":                         snap.LastRefSelHasPosition,
+			"last_ref_sel_position_age_s":                       snap.LastRefSelPositionAgeS,
+			"last_ref_sel_missing_reason":                       snap.LastRefSelMissingReason,
 			"retained_state": map[string]interface{}{
 				"active_aircraft_estimate":           snap.ActiveAircraftEstimate,
 				"burst_records_total":                snap.BurstRecordsTotal,
@@ -1007,108 +1040,136 @@ func (e *engine) emitIIDState(iidNum uint8, s *iid.IIDState, nBurstRecords uint1
 	}
 
 	msg := &protocol.IIDState{
-		MsgType:                         protocol.MsgIIDState,
-		IID:                             iidNum,
-		PeriodS:                         periodS,
-		RPM:                             rpmMsg,
-		Status:                          status,
-		RefICAO:                         refICAO,
-		SyncQuality:                     syncQuality,
-		SyncStatePresent:                syncPresent,
-		SyncStateUsable:                 syncUsable,
-		SyncPeriodS:                     syncPeriodS,
-		SyncPhaseEpochUS:                syncPhaseEpochUS,
-		SyncPhaseOffsetDeg:              syncPhaseOffsetDeg,
-		SyncJitterDeg:                   syncJitterDeg,
-		SyncResidualEMA:                 syncResidualEMA,
-		SyncLastResidual:                syncLastResidual,
-		SyncNFrames:                     syncNFrames,
-		SyncNRejected:                   syncNRejected,
-		SyncHoldover:                    syncHoldover,
-		PeriodSource:                    snapPeriodSource(s),
-		BasePeriodS:                     snapBasePeriod(s),
-		PeriodDeltaS:                    snapPeriodDelta(s),
-		EffectivePeriodS:                snapEffectivePeriod(s),
-		ResidualSlopeDegPS:              snapResidualSlope(s),
-		ResidualSlopeEMADegPS:           snapResidualSlopeEMA(s),
-		ResidualSlopeStdDegPS:           snapResidualSlopeStd(s),
-		ProposedDeltaS:                  snapProposedDelta(s),
-		AppliedDeltaS:                   snapAppliedDelta(s),
-		LastSlewLimited:                 snapLastSlewLimited(s),
-		LastHardBound:                   snapLastHardBound(s),
-		HardBoundReason:                 snapHardBoundReason(s),
-		HardBoundLimitS:                 snapHardBoundLimitS(s),
-		HardBoundLimitPPM:               snapHardBoundLimitPPM(s),
-		RequestedDeltaS:                 snapRequestedDeltaS(s),
-		RequestedDeltaPPM:               snapRequestedDeltaPPM(s),
-		CurrentDeltaS:                   snapCurrentDeltaS(s),
-		CurrentDeltaPPM:                 snapCurrentDeltaPPM(s),
-		DeltaToBaseS:                    snapDeltaToBaseS(s),
-		DeltaToBasePPM:                  snapDeltaToBasePPM(s),
-		DFBasePeriodS:                   snapDFBasePeriodS(s),
-		PeriodDisagreementS:             snapPeriodDisagreementS(s),
-		PeriodDisagreementPPM:           snapPeriodDisagreementPPM(s),
-		PeriodRefineStatus:              snapPeriodRefineStatus(s),
-		PeriodAgreesWithDF:              snapPeriodAgrees(s),
-		PeriodRejectReason:              snapPeriodRejectReason(s),
-		FitObservationCount:             snapFitObservationCount(s),
-		FitSpanS:                        snapFitSpanS(s),
-		FitICAOCount:                    snapFitICAOCount(s),
-		FitPerICAOMin:                   snapFitPerICAOMin(s),
-		FitPerICAOMedian:                snapFitPerICAOMedian(s),
-		FitPerICAOMax:                   snapFitPerICAOMax(s),
-		FitRetentionWindowS:             snapFitRetentionWindowS(s),
-		FitGlobalCapHit:                 snapFitGlobalCapHit(s),
-		FitLastEvictionReason:           snapFitLastEvictionReason(s),
-		FitInlierRatio:                  snapFitInlierRatio(s),
-		SuspiciousICAOCount:             snapSuspiciousICAOCount(s),
-		SuspiciousICAOLastReason:        snapSuspiciousICAOLastReason(s),
-		FitEpochID:                      snapFitEpochID(s),
-		FitEpochStartedUnix:             snapFitEpochStartedUnix(s),
-		FitEpochResetReason:             snapFitEpochResetReason(s),
-		FitEpochObservationCount:        snapFitEpochObservationCount(s),
-		FitEpochSpanS:                   snapFitEpochSpanS(s),
-		FitDroppedOnEpochReset:          snapFitDroppedOnEpochReset(s),
-		FitSegmentCount:                 snapFitSegmentCount(s),
-		SlopeSignConvention:             snapSlopeSignConvention(s),
-		HoldoverReason:                  snapHoldoverReason(s),
-		HoldoverQualityGateFailed:       snapHoldoverCount(s, "quality_gate_failed"),
-		HoldoverMissingDFBasePeriod:     snapHoldoverCount(s, "missing_df_base_period"),
-		HoldoverHardResidualReject:      snapHoldoverCount(s, "hard_residual_reject"),
-		HoldoverNoReference:             snapHoldoverCount(s, "no_reference"),
-		HoldoverStaleReferencePosition:  snapHoldoverCount(s, "stale_reference_position"),
-		HoldoverPeriodDisagreement:      snapHoldoverCount(s, "period_disagreement"),
-		HoldoverInsufficientAircraft:    snapHoldoverCount(s, "insufficient_aircraft"),
-		HoldoverNoDominantFamily:        snapHoldoverCount(s, "no_dominant_family"),
-		HoldoverSyncStateMissing:        snapHoldoverCount(s, "sync_state_missing"),
-		UpdateEpochAttempts:             snapUpdateEpochAttempts(s),
-		UpdateEpochAccepts:              snapUpdateEpochAccepts(s),
-		UpdateEpochRejects:              snapUpdateEpochRejects(s),
-		LastUpdateEpochRejectReason:     snapLastUpdateEpochRejectReason(s),
-		LastUpdateEpochNAircraft:        snapLastUpdateEpochNAircraft(s),
-		LastUpdateEpochRefPosAgeS:       snapLastUpdateEpochRefPosAgeS(s),
-		LastUpdateEpochRefICAO:          snapLastUpdateEpochRefICAO(s),
-		LastUpdateEpochResidualDeg:      snapLastUpdateEpochResidualDeg(s),
-		LastUpdateEpochPredictedDeg:     snapLastUpdateEpochPredictedDeg(s),
-		LastUpdateEpochObservedDeg:      snapLastUpdateEpochObservedDeg(s),
-		ConsecutiveHardResidualRejects:  snapConsecutiveHardResidualRejects(s),
-		LastAcceptedEpochAgeS:           snapLastAcceptedEpochAgeS(s),
-		SyncEpochAgeS:                   snapSyncEpochAgeS(s),
-		CurrentPhaseEpochUS:             snapCurrentPhaseEpochUS(s),
-		CandidateEpochUS:                snapCandidateEpochUS(s),
-		SyncReacquiredProvisional:       snapSyncReacquiredProvisional(s),
-		UpdateEpochRejectQualityGate:    snapUpdateEpochRejectCount(s, "quality_gate_failed"),
-		UpdateEpochRejectMissingBase:    snapUpdateEpochRejectCount(s, "missing_df_base_period"),
-		UpdateEpochRejectHardResidual:   snapUpdateEpochRejectCount(s, "hard_residual_reject"),
-		UpdateEpochRejectNoReference:    snapUpdateEpochRejectCount(s, "no_reference"),
-		UpdateEpochRejectStaleRefPos:    snapUpdateEpochRejectCount(s, "stale_reference_position"),
-		UpdateEpochRejectInsufficientAC: snapUpdateEpochRejectCount(s, "insufficient_aircraft"),
-		UpdateEpochLastStrictGatePass:   snapUpdateEpochLastStrictGatePass(s),
-		ReacquireSupportObsCount:       snapReacquireSupportObsCount(s),
-		ReacquireSupportICAOCount:      snapReacquireSupportICAOCount(s),
-		NBurstRecords:                   nBurstRecords,
-		LastUpdated:                     float64(time.Now().UnixMicro()) / 1e6,
-		Revision:                        rev,
+		MsgType:                                  protocol.MsgIIDState,
+		IID:                                      iidNum,
+		PeriodS:                                  periodS,
+		RPM:                                      rpmMsg,
+		Status:                                   status,
+		RefICAO:                                  refICAO,
+		SyncQuality:                              syncQuality,
+		SyncStatePresent:                         syncPresent,
+		SyncStateUsable:                          syncUsable,
+		SyncPeriodS:                              syncPeriodS,
+		SyncPhaseEpochUS:                         syncPhaseEpochUS,
+		SyncPhaseOffsetDeg:                       syncPhaseOffsetDeg,
+		SyncJitterDeg:                            syncJitterDeg,
+		SyncResidualEMA:                          syncResidualEMA,
+		SyncLastResidual:                         syncLastResidual,
+		SyncNFrames:                              syncNFrames,
+		SyncNRejected:                            syncNRejected,
+		SyncHoldover:                             syncHoldover,
+		PeriodSource:                             snapPeriodSource(s),
+		BasePeriodS:                              snapBasePeriod(s),
+		PeriodDeltaS:                             snapPeriodDelta(s),
+		EffectivePeriodS:                         snapEffectivePeriod(s),
+		ResidualSlopeDegPS:                       snapResidualSlope(s),
+		ResidualSlopeEMADegPS:                    snapResidualSlopeEMA(s),
+		ResidualSlopeStdDegPS:                    snapResidualSlopeStd(s),
+		ProposedDeltaS:                           snapProposedDelta(s),
+		AppliedDeltaS:                            snapAppliedDelta(s),
+		LastSlewLimited:                          snapLastSlewLimited(s),
+		LastHardBound:                            snapLastHardBound(s),
+		HardBoundReason:                          snapHardBoundReason(s),
+		HardBoundLimitS:                          snapHardBoundLimitS(s),
+		HardBoundLimitPPM:                        snapHardBoundLimitPPM(s),
+		RequestedDeltaS:                          snapRequestedDeltaS(s),
+		RequestedDeltaPPM:                        snapRequestedDeltaPPM(s),
+		CurrentDeltaS:                            snapCurrentDeltaS(s),
+		CurrentDeltaPPM:                          snapCurrentDeltaPPM(s),
+		DeltaToBaseS:                             snapDeltaToBaseS(s),
+		DeltaToBasePPM:                           snapDeltaToBasePPM(s),
+		DFBasePeriodS:                            snapDFBasePeriodS(s),
+		PeriodDisagreementS:                      snapPeriodDisagreementS(s),
+		PeriodDisagreementPPM:                    snapPeriodDisagreementPPM(s),
+		PeriodRefineStatus:                       snapPeriodRefineStatus(s),
+		PeriodAgreesWithDF:                       snapPeriodAgrees(s),
+		PeriodRejectReason:                       snapPeriodRejectReason(s),
+		FitObservationCount:                      snapFitObservationCount(s),
+		FitSpanS:                                 snapFitSpanS(s),
+		FitICAOCount:                             snapFitICAOCount(s),
+		FitPerICAOMin:                            snapFitPerICAOMin(s),
+		FitPerICAOMedian:                         snapFitPerICAOMedian(s),
+		FitPerICAOMax:                            snapFitPerICAOMax(s),
+		FitRetentionWindowS:                      snapFitRetentionWindowS(s),
+		FitGlobalCapHit:                          snapFitGlobalCapHit(s),
+		FitLastEvictionReason:                    snapFitLastEvictionReason(s),
+		FitInlierRatio:                           snapFitInlierRatio(s),
+		SuspiciousICAOCount:                      snapSuspiciousICAOCount(s),
+		SuspiciousICAOLastReason:                 snapSuspiciousICAOLastReason(s),
+		FitEpochID:                               snapFitEpochID(s),
+		FitEpochStartedUnix:                      snapFitEpochStartedUnix(s),
+		FitEpochResetReason:                      snapFitEpochResetReason(s),
+		FitEpochObservationCount:                 snapFitEpochObservationCount(s),
+		FitEpochSpanS:                            snapFitEpochSpanS(s),
+		FitDroppedOnEpochReset:                   snapFitDroppedOnEpochReset(s),
+		FitSegmentCount:                          snapFitSegmentCount(s),
+		SlopeSignConvention:                      snapSlopeSignConvention(s),
+		HoldoverReason:                           snapHoldoverReason(s),
+		HoldoverQualityGateFailed:                snapHoldoverCount(s, "quality_gate_failed"),
+		HoldoverMissingDFBasePeriod:              snapHoldoverCount(s, "missing_df_base_period"),
+		HoldoverHardResidualReject:               snapHoldoverCount(s, "hard_residual_reject"),
+		HoldoverNoReference:                      snapHoldoverCount(s, "no_reference"),
+		HoldoverStaleReferencePosition:           snapHoldoverCount(s, "stale_reference_position"),
+		HoldoverPeriodDisagreement:               snapHoldoverCount(s, "period_disagreement"),
+		HoldoverInsufficientAircraft:             snapHoldoverCount(s, "insufficient_aircraft"),
+		HoldoverNoDominantFamily:                 snapHoldoverCount(s, "no_dominant_family"),
+		HoldoverSyncStateMissing:                 snapHoldoverCount(s, "sync_state_missing"),
+		UpdateEpochAttempts:                      snapUpdateEpochAttempts(s),
+		UpdateEpochAccepts:                       snapUpdateEpochAccepts(s),
+		UpdateEpochRejects:                       snapUpdateEpochRejects(s),
+		LastUpdateEpochRejectReason:              snapLastUpdateEpochRejectReason(s),
+		LastUpdateEpochNAircraft:                 snapLastUpdateEpochNAircraft(s),
+		LastUpdateEpochRefPosAgeS:                snapLastUpdateEpochRefPosAgeS(s),
+		LastUpdateEpochRefICAO:                   snapLastUpdateEpochRefICAO(s),
+		LastUpdateEpochResidualDeg:               snapLastUpdateEpochResidualDeg(s),
+		LastUpdateEpochPredictedDeg:              snapLastUpdateEpochPredictedDeg(s),
+		LastUpdateEpochObservedDeg:               snapLastUpdateEpochObservedDeg(s),
+		LastUpdateEpochOutcome:                   snapLastUpdateEpochOutcome(s),
+		LastUpdateEpochCandidateEpochAgeS:        snapLastUpdateEpochCandidateEpochAgeS(s),
+		PhaseOffsetCandidateRawDeg:               snapPhaseOffsetCandidateRawDeg(s),
+		PhaseOffsetCandidateWrappedDeg:           snapPhaseOffsetCandidateWrappedDeg(s),
+		PhaseOffsetBlendedDeg:                    snapPhaseOffsetBlendedDeg(s),
+		PhaseOffsetBlendDeltaDeg:                 snapPhaseOffsetBlendDeltaDeg(s),
+		PhaseOffsetDeltaBeforeBlendDeg:           snapPhaseOffsetDeltaBeforeBlendDeg(s),
+		PhaseOffsetDeltaAfterBlendDeg:            snapPhaseOffsetDeltaAfterBlendDeg(s),
+		PhaseOffsetPreviousDeg:                   snapPhaseOffsetPreviousDeg(s),
+		PhaseOffsetPreviousFitEpochDeg:           snapPhaseOffsetPreviousFitEpochDeg(s),
+		ConsecutiveHardResidualRejects:           snapConsecutiveHardResidualRejects(s),
+		LastAcceptedEpochAgeS:                    snapLastAcceptedEpochAgeS(s),
+		SyncEpochAgeS:                            snapSyncEpochAgeS(s),
+		CurrentPhaseEpochUS:                      snapCurrentPhaseEpochUS(s),
+		CandidateEpochUS:                         snapCandidateEpochUS(s),
+		SyncReacquiredProvisional:                snapSyncReacquiredProvisional(s),
+		UpdateEpochRejectQualityGate:             snapUpdateEpochRejectCount(s, "quality_gate_failed"),
+		UpdateEpochRejectMissingBase:             snapUpdateEpochRejectCount(s, "missing_df_base_period"),
+		UpdateEpochRejectHardResidual:            snapUpdateEpochRejectCount(s, "hard_residual_reject"),
+		UpdateEpochRejectNoReference:             snapUpdateEpochRejectCount(s, "no_reference"),
+		UpdateEpochRejectStaleRefPos:             snapUpdateEpochRejectCount(s, "stale_reference_position"),
+		UpdateEpochRejectInsufficientAC:          snapUpdateEpochRejectCount(s, "insufficient_aircraft"),
+		UpdateEpochLastStrictGatePass:            snapUpdateEpochLastStrictGatePass(s),
+		ReacquireSupportObsCount:                 snapReacquireSupportObsCount(s),
+		ReacquireSupportICAOCount:                snapReacquireSupportICAOCount(s),
+		PhaseOffsetDiscontinuityOldDeg:           snapPhaseOffsetDiscontinuityOldDeg(s),
+		PhaseOffsetDiscontinuityNewDeg:           snapPhaseOffsetDiscontinuityNewDeg(s),
+		PhaseOffsetDiscontinuityDeltaDeg:         snapPhaseOffsetDiscontinuityDeltaDeg(s),
+		PhaseOffsetDiscontinuityThresholdDeg:     snapPhaseOffsetDiscontinuityThresholdDeg(s),
+		PhaseOffsetDiscontinuityFitEpochID:       snapPhaseOffsetDiscontinuityFitEpochID(s),
+		PhaseOffsetDiscontinuityCurrentEpochUS:   snapPhaseOffsetDiscontinuityCurrentEpochUS(s),
+		PhaseOffsetDiscontinuityCandidateEpochUS: snapPhaseOffsetDiscontinuityCandidateEpochUS(s),
+		PhaseOffsetDiscontinuityPreviousRefICAO:  snapPhaseOffsetDiscontinuityPreviousRefICAO(s),
+		PhaseOffsetDiscontinuityCurrentRefICAO:   snapPhaseOffsetDiscontinuityCurrentRefICAO(s),
+		PhaseOffsetDiscontinuityReferenceChanged: snapPhaseOffsetDiscontinuityReferenceChanged(s),
+		PhaseOffsetDiscontinuityBasisNote:        snapPhaseOffsetDiscontinuityBasisNote(s),
+		GoSyncUnusableReason:                     snapGoSyncUnusableReason(s),
+		GoSyncUsableQualityOK:                    snapGoSyncUsableQualityOK(s),
+		GoSyncUsableQualityValue:                 snapGoSyncUsableQualityValue(s),
+		GoSyncUsableHoldoverOK:                   snapGoSyncUsableHoldoverOK(s),
+		GoSyncUsablePeriodAgrees:                 snapGoSyncUsablePeriodAgrees(s),
+		GoSyncUsablePeriodRejectReason:           snapGoSyncUsablePeriodRejectReason(s),
+		GoSyncUsableStrictGatePass:               snapGoSyncUsableStrictGatePass(s),
+		NBurstRecords:                            nBurstRecords,
+		LastUpdated:                              float64(time.Now().UnixMicro()) / 1e6,
+		Revision:                                 rev,
 	}
 	e.writer.SendIIDState(msg)
 
@@ -1185,17 +1246,26 @@ func snapLastHardBound(s *iid.IIDState) bool    { return s.DebugStateSnapshot().
 func snapHardBoundReason(s *iid.IIDState) string {
 	return s.DebugStateSnapshot().HardBoundReason
 }
-func snapHardBoundLimitS(s *iid.IIDState) *float64 { v := s.DebugStateSnapshot().HardBoundLimitS; return &v }
+func snapHardBoundLimitS(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().HardBoundLimitS
+	return &v
+}
 func snapHardBoundLimitPPM(s *iid.IIDState) *float64 {
 	v := s.DebugStateSnapshot().HardBoundLimitPPM
 	return &v
 }
-func snapRequestedDeltaS(s *iid.IIDState) *float64 { v := s.DebugStateSnapshot().RequestedDeltaS; return &v }
+func snapRequestedDeltaS(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().RequestedDeltaS
+	return &v
+}
 func snapRequestedDeltaPPM(s *iid.IIDState) *float64 {
 	v := s.DebugStateSnapshot().RequestedDeltaPPM
 	return &v
 }
-func snapCurrentDeltaS(s *iid.IIDState) *float64 { v := s.DebugStateSnapshot().CurrentDeltaS; return &v }
+func snapCurrentDeltaS(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().CurrentDeltaS
+	return &v
+}
 func snapCurrentDeltaPPM(s *iid.IIDState) *float64 {
 	v := s.DebugStateSnapshot().CurrentDeltaPPM
 	return &v
@@ -1205,7 +1275,10 @@ func snapDeltaToBasePPM(s *iid.IIDState) *float64 {
 	v := s.DebugStateSnapshot().DeltaToBasePPM
 	return &v
 }
-func snapDFBasePeriodS(s *iid.IIDState) *float64 { v := s.DebugStateSnapshot().DFBasePeriodS; return &v }
+func snapDFBasePeriodS(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().DFBasePeriodS
+	return &v
+}
 func snapPeriodDisagreementS(s *iid.IIDState) *float64 {
 	v := s.DebugStateSnapshot().PeriodDisagreementS
 	return &v
@@ -1421,6 +1494,45 @@ func snapLastUpdateEpochObservedDeg(s *iid.IIDState) *float64 {
 	v := s.DebugStateSnapshot().LastUpdateEpochObservedDeg
 	return &v
 }
+func snapLastUpdateEpochOutcome(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().LastUpdateEpochOutcome
+}
+func snapLastUpdateEpochCandidateEpochAgeS(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastUpdateEpochCandidateEpochAgeS
+	return &v
+}
+func snapPhaseOffsetCandidateRawDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastUpdateEpochPhaseOffsetCandidateRawDeg
+	return &v
+}
+func snapPhaseOffsetCandidateWrappedDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastUpdateEpochPhaseOffsetCandidateWrappedDeg
+	return &v
+}
+func snapPhaseOffsetBlendedDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastUpdateEpochPhaseOffsetBlendedDeg
+	return &v
+}
+func snapPhaseOffsetBlendDeltaDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastUpdateEpochPhaseOffsetBlendDeltaDeg
+	return &v
+}
+func snapPhaseOffsetDeltaBeforeBlendDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastUpdateEpochPhaseOffsetDeltaBeforeBlendDeg
+	return &v
+}
+func snapPhaseOffsetDeltaAfterBlendDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastUpdateEpochPhaseOffsetDeltaAfterBlendDeg
+	return &v
+}
+func snapPhaseOffsetPreviousDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastUpdateEpochPreviousPhaseOffsetDeg
+	return &v
+}
+func snapPhaseOffsetPreviousFitEpochDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().LastUpdateEpochPreviousFitEpochPhaseOffsetDeg
+	return &v
+}
 func snapConsecutiveHardResidualRejects(s *iid.IIDState) uint32 {
 	v := s.DebugStateSnapshot().ConsecutiveHardResidualRejects
 	if v > math.MaxUint32 {
@@ -1485,6 +1597,87 @@ func snapReacquireSupportObsCount(s *iid.IIDState) uint16 {
 
 func snapReacquireSupportICAOCount(s *iid.IIDState) uint16 {
 	return uint16(s.DebugStateSnapshot().ReacquireSupportICAOCount)
+}
+
+func snapPhaseOffsetDiscontinuityOldDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().PhaseOffsetDiscontinuityOldDeg
+	return &v
+}
+
+func snapPhaseOffsetDiscontinuityNewDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().PhaseOffsetDiscontinuityNewDeg
+	return &v
+}
+
+func snapPhaseOffsetDiscontinuityDeltaDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().PhaseOffsetDiscontinuityDeltaDeg
+	return &v
+}
+
+func snapPhaseOffsetDiscontinuityThresholdDeg(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().PhaseOffsetDiscontinuityThresholdDeg
+	return &v
+}
+
+func snapPhaseOffsetDiscontinuityFitEpochID(s *iid.IIDState) uint32 {
+	return uint32(s.DebugStateSnapshot().PhaseOffsetDiscontinuityFitEpochID)
+}
+
+func snapPhaseOffsetDiscontinuityCurrentEpochUS(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().PhaseOffsetDiscontinuityCurrentEpochUS
+	return &v
+}
+
+func snapPhaseOffsetDiscontinuityCandidateEpochUS(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().PhaseOffsetDiscontinuityCandidateEpochUS
+	return &v
+}
+
+func snapPhaseOffsetDiscontinuityPreviousRefICAO(s *iid.IIDState) *uint32 {
+	v := s.DebugStateSnapshot().PhaseOffsetDiscontinuityPreviousRefICAO
+	return &v
+}
+
+func snapPhaseOffsetDiscontinuityCurrentRefICAO(s *iid.IIDState) *uint32 {
+	v := s.DebugStateSnapshot().PhaseOffsetDiscontinuityCurrentRefICAO
+	return &v
+}
+
+func snapPhaseOffsetDiscontinuityReferenceChanged(s *iid.IIDState) bool {
+	return s.DebugStateSnapshot().PhaseOffsetDiscontinuityReferenceChanged
+}
+
+func snapPhaseOffsetDiscontinuityBasisNote(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().PhaseOffsetDiscontinuityBasisNote
+}
+
+func snapGoSyncUnusableReason(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().GoSyncUnusableReason
+}
+
+func snapGoSyncUsableQualityOK(s *iid.IIDState) bool {
+	return s.DebugStateSnapshot().GoSyncUsableQualityOK
+}
+
+func snapGoSyncUsableQualityValue(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().GoSyncUsableQualityValue
+	return &v
+}
+
+func snapGoSyncUsableHoldoverOK(s *iid.IIDState) bool {
+	return s.DebugStateSnapshot().GoSyncUsableHoldoverOK
+}
+
+func snapGoSyncUsablePeriodAgrees(s *iid.IIDState) bool {
+	return s.DebugStateSnapshot().GoSyncUsablePeriodAgrees
+}
+
+func snapGoSyncUsablePeriodRejectReason(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().GoSyncUsablePeriodRejectReason
+}
+
+func snapGoSyncUsableStrictGatePass(s *iid.IIDState) bool {
+	return s.DebugStateSnapshot().GoSyncUsableStrictGatePass
 }
 
 func (e *engine) runFMWorker(stop <-chan struct{}) {

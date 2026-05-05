@@ -212,6 +212,23 @@ func TestSyncState_UpdateEpoch_ResidualBlendCrossesWrap(t *testing.T) {
 	}
 }
 
+func TestSyncState_UpdateEpoch_UsesCircularBlendShortestArc(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 350.0, 1.0)
+	accepted := s.UpdateEpoch(4_000_000.0, 10.0, 4.0, 1.0, 4, 0.5, 0xAA)
+	if !accepted {
+		t.Fatal("expected update to be accepted")
+	}
+	if math.Abs(s.LastUpdateEpochPhaseOffsetDeltaBeforeBlendDeg-20.0) > 0.01 {
+		t.Fatalf("delta_before_blend=%.2f, want +20 (short arc)", s.LastUpdateEpochPhaseOffsetDeltaBeforeBlendDeg)
+	}
+	if math.Abs(s.LastUpdateEpochPhaseOffsetCandidateWrappedDeg-10.0) > 0.01 {
+		t.Fatalf("candidate_wrapped=%.2f, want 10", s.LastUpdateEpochPhaseOffsetCandidateWrappedDeg)
+	}
+	if math.Abs(s.PhaseOffsetDeg-0.0) > 0.01 {
+		t.Fatalf("phase_offset=%.2f, expected circular blend midpoint at 0 deg", s.PhaseOffsetDeg)
+	}
+}
+
 // TestSyncState_QualityGate_3AircraftUnknownAge verifies that n_aircraft==3
 // with an unknown ref position age (modelled as a very large value) is rejected.
 // Note: Go's UpdateEpoch takes refPosAgeS as float64, so callers representing
@@ -1529,6 +1546,73 @@ func TestReacquireSupportNotClearedOnReacquire(t *testing.T) {
 	}
 	if s.ReacquireSupportICAOCount < beforeICAO {
 		t.Fatalf("reacquire support icao count=%d, want >= %d (preserved from before reacquire)", s.ReacquireSupportICAOCount, beforeICAO)
+	}
+}
+
+func TestPhaseOffsetDiscontinuityDiagnosticsCapturedWithWrappedDelta(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 1; i <= 10; i++ {
+		s.AddRefinementResidualObservation(float64(i)*4_000_000.0, 0.1, 0xAA, true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	s.fitEpochPhaseOffsetDeg = 350.0
+	s.fitEpochReferenceICAO = 0xAAAAAA
+	prevEpochID := s.FitEpochID
+	s.maybeResetFitEpochLocked(fitEpochContext{
+		epochUS:        44_000_000.0,
+		residualBasis:  "observed_minus_predicted",
+		referenceICAO:  0xBBBBBB,
+		phaseOffsetDeg: 21.0,
+		holdover:       false,
+		basePeriodS:    4.0,
+		authorityBasis: "go_refiner_active",
+	})
+	if s.FitEpochID <= prevEpochID {
+		t.Fatal("expected fit epoch reset")
+	}
+	if s.FitEpochResetReason != "phase_offset_discontinuity" {
+		t.Fatalf("reason=%q", s.FitEpochResetReason)
+	}
+	if math.Abs(s.PhaseOffsetDiscontinuityDeltaDeg-31.0) > 1e-6 {
+		t.Fatalf("delta=%.3f want 31.0 wrapped", s.PhaseOffsetDiscontinuityDeltaDeg)
+	}
+	if s.PhaseOffsetDiscontinuityThresholdDeg != fitEpochPhaseOffsetResetDeg {
+		t.Fatalf("threshold=%.3f", s.PhaseOffsetDiscontinuityThresholdDeg)
+	}
+	if s.PhaseOffsetDiscontinuityPreviousRefICAO != 0xAAAAAA || s.PhaseOffsetDiscontinuityCurrentRefICAO != 0xBBBBBB {
+		t.Fatal("expected previous/current ref ICAO diagnostics")
+	}
+	if !s.PhaseOffsetDiscontinuityReferenceChanged {
+		t.Fatal("expected reference_changed=true")
+	}
+	if s.PhaseOffsetDiscontinuityBasisNote == "" {
+		t.Fatal("expected basis note")
+	}
+	if math.Abs(s.LastUpdateEpochPreviousFitEpochPhaseOffsetDeg-350.0) > 1e-6 {
+		t.Fatalf("previous fit phase offset=%.3f want 350", s.LastUpdateEpochPreviousFitEpochPhaseOffsetDeg)
+	}
+	if s.LastUpdateEpochOutcome != "" {
+		t.Fatalf("unexpected outcome marker during direct maybeReset call: %q", s.LastUpdateEpochOutcome)
+	}
+}
+
+func TestSyncUsableDiagnosticsExposeDominantFailureReason(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 0.2)
+	s.Holdover = true
+	s.PeriodAgreesWithDF = false
+	s.PeriodRejectReason = "period_reject_test"
+	s.LastUpdateEpochStrictGatePass = false
+	usable := s.refreshSyncUsableDiagnosticsLocked()
+	if usable {
+		t.Fatal("expected unusable")
+	}
+	if s.SyncUnusableReason != "quality_below_threshold" {
+		t.Fatalf("reason=%q want quality_below_threshold", s.SyncUnusableReason)
+	}
+	if s.SyncUsableQualityOK {
+		t.Fatal("quality gate should fail")
+	}
+	if s.SyncUsableHoldoverOK {
+		t.Fatal("holdover gate should fail")
 	}
 }
 

@@ -336,3 +336,68 @@ Verification:
 
 Residual risk:
 - GitNexus MCP impact function was unavailable in this session (only `mcp__gitnexus__.tool_map` exposed), so blast radius was assessed from direct call-site tracing in `RadarPage.jsx` rather than graph-backed impact output.
+
+## 2026-05-05 Go Discontinuity + Sync-Usable Diagnostics (In Progress)
+
+- [x] Confirm scope constraints: no Stage 10, no default flag changes, no period tolerance change, no discontinuity-threshold relaxation, no new debounce/suppression behavior.
+- [x] Run impact checks for Go sync/discontinuity symbols and report blast radius before edits.
+- [x] Add Go `phase_offset_discontinuity` diagnostics to SyncState/DebugSnapshot/IID_STATE payload with wrapped delta + fit-epoch/reference context.
+- [x] Add Go `sync_usable` component diagnostics + dominant failure reason in SyncState/DebugSnapshot/IID_STATE payload.
+- [x] Ingest/map new compact IID fields in backend, preserve in normalized Go sync dict, and expose `go_diagnostic_*` fields in sync snapshot API.
+- [x] Update frontend diagnostics rendering for discontinuity reset details and go_sync_unusable component gates with graceful missing handling.
+- [x] Add/update Go, backend, and frontend tests for emission/mapping/rendering behavior.
+- [x] Run focused verification and record review/results here.
+
+Plan confirmation:
+- Instrumentation-only change; no runtime behavior gating relaxations.
+- Keep compact sync snapshot as the source of truth for current phase/anchor operational state.
+
+Review:
+- Added Go diagnostics for `phase_offset_discontinuity` capture (`old/new/delta/threshold`, fit-epoch context, epoch timings, reference ICAOs/change flag, basis note) and sync-usable gate components with a dominant failure reason.
+- Exposed diagnostics through both Go debug snapshot payload and compact IID state codec fields for backend ingestion.
+- Added backend normalization/mapping + API exposure using `go_diagnostic_*` fields for discontinuity and `go_sync_unusable` component diagnostics.
+- Added UI rendering for both required views:
+  - discontinuity detail block when `go_diagnostic_fit_epoch_reset_reason == "phase_offset_discontinuity"`;
+  - sync gate breakdown when `handoff_reason == "go_sync_unusable"`.
+- No Stage 10 work and no behavior relaxations (no flag defaults changed, no period tolerance changed, no discontinuity threshold changed, no debounce/suppression logic added).
+
+Verification:
+- `cd radar-core && GOCACHE=/tmp/go-build-cache go test ./iid ./cmd/radar-core ./protocol`
+- `UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_radar_sweep.py -k "go_iid_state_maps_discontinuity_and_sync_usable_diagnostics or go_diagnostic_fields_remain_diagnostic_when_go_is_not_authoritative" -q`
+- `cd frontend && node --test src/utils/radarSync.test.js`
+
+## 2026-05-05 Phase Offset Jump Root-Cause Investigation
+
+- [x] Trace the exact `ctx.phaseOffsetDeg` computation path from observed/predicted bearing through residual, wrap, blend, and fit-epoch reset gates.
+- [x] Run impact checks by direct symbol/call-site tracing for `SyncState.UpdateEpoch`, `maybeResetFitEpochLocked`, and Go/Python snapshot propagation paths.
+- [x] Add missing discontinuity diagnostics for candidate/raw/wrapped/blended offset, pre/post blend deltas, prior fit/phase offsets, update outcome, and candidate epoch age.
+- [x] Export new diagnostics through Go `DebugSnapshot` -> compact IID_STATE codec -> backend normalization -> sync snapshot payload.
+- [x] Add/extend tests for circular blend behavior and discontinuity diagnostic payload completeness.
+- [x] Run focused verification and finalize diagnosis report with corrective options (no Stage 10 / no threshold or flag changes).
+
+Plan confirmation:
+- Scope is diagnostics and investigation only.
+- No Stage 10 implementation.
+- No default operational-flag changes.
+- No period-tolerance changes.
+- No chart-rendering changes.
+- No discontinuity-threshold relaxation.
+
+Review:
+- Traced `ctx.phaseOffsetDeg` production in Go path: `maybeUpdateSync` computes observed bearing from receiver->reference aircraft, passes it to `SyncState.UpdateEpoch`, which predicts bearing at candidate epoch, computes circular residual, and circularly blends at candidate epoch.
+- Confirmed discontinuity reset compares `circularDiff(blendedOffset, fitEpochPhaseOffsetDeg)` against fixed 30° threshold (`fitEpochPhaseOffsetResetDeg`) in `maybeResetFitEpochLocked`.
+- Added diagnostics around candidate/blended phase offset and delta progression:
+  - update outcome (`accepted`/`provisional_reacquire`/`rejected`)
+  - candidate epoch age
+  - candidate raw/wrapped phase offset
+  - blended phase offset
+  - blend delta, delta-before-blend, delta-after-blend
+  - previous phase offset and previous fit-epoch phase offset
+- Plumbed fields through Go debug snapshot, IID_STATE compact codec, Python compact-field normalization, and API `go_diagnostic_*` payload.
+- Added tests:
+  - circular blend shortest-arc behavior near wrap
+  - discontinuity diagnostics include new candidate/blend context
+
+Verification:
+- `cd radar-core && GOCACHE=/tmp/go-build-cache go test ./iid ./cmd/radar-core ./protocol`
+- `UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_radar_sweep.py -k "go_iid_state_maps_discontinuity_and_sync_usable_diagnostics" -q`

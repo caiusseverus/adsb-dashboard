@@ -451,6 +451,16 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_last_update_epoch_residual_deg": go_payload.get("last_update_epoch_residual_deg"),
         "go_diagnostic_last_update_epoch_predicted_deg": go_payload.get("last_update_epoch_predicted_deg"),
         "go_diagnostic_last_update_epoch_observed_deg": go_payload.get("last_update_epoch_observed_deg"),
+        "go_diagnostic_last_update_epoch_outcome": go_payload.get("last_update_epoch_outcome"),
+        "go_diagnostic_last_update_epoch_candidate_epoch_age_s": go_payload.get("last_update_epoch_candidate_epoch_age_s"),
+        "go_diagnostic_phase_offset_candidate_raw_deg": go_payload.get("phase_offset_candidate_raw_deg"),
+        "go_diagnostic_phase_offset_candidate_wrapped_deg": go_payload.get("phase_offset_candidate_wrapped_deg"),
+        "go_diagnostic_phase_offset_blended_deg": go_payload.get("phase_offset_blended_deg"),
+        "go_diagnostic_phase_offset_blend_delta_deg": go_payload.get("phase_offset_blend_delta_deg"),
+        "go_diagnostic_phase_offset_delta_before_blend_deg": go_payload.get("phase_offset_delta_before_blend_deg"),
+        "go_diagnostic_phase_offset_delta_after_blend_deg": go_payload.get("phase_offset_delta_after_blend_deg"),
+        "go_diagnostic_phase_offset_previous_deg": go_payload.get("phase_offset_previous_deg"),
+        "go_diagnostic_phase_offset_previous_fit_epoch_deg": go_payload.get("phase_offset_previous_fit_epoch_deg"),
         "go_diagnostic_sync_epoch_age_s": go_payload.get("sync_epoch_age_s"),
         "go_diagnostic_current_phase_epoch_us": go_payload.get("current_phase_epoch_us"),
         "go_diagnostic_candidate_epoch_us": go_payload.get("candidate_epoch_us"),
@@ -463,6 +473,29 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_consecutive_hard_bound_rejects": go_payload.get("consecutive_hard_bound_rejects"),
         "go_diagnostic_reacquire_support_obs_count": go_payload.get("reacquire_support_obs_count"),
         "go_diagnostic_reacquire_support_icao_count": go_payload.get("reacquire_support_icao_count"),
+        "go_diagnostic_phase_offset_discontinuity_old_deg": go_payload.get("phase_offset_discontinuity_old_deg"),
+        "go_diagnostic_phase_offset_discontinuity_new_deg": go_payload.get("phase_offset_discontinuity_new_deg"),
+        "go_diagnostic_phase_offset_discontinuity_delta_deg": go_payload.get("phase_offset_discontinuity_delta_deg"),
+        "go_diagnostic_phase_offset_discontinuity_threshold_deg": go_payload.get("phase_offset_discontinuity_threshold_deg"),
+        "go_diagnostic_phase_offset_discontinuity_fit_epoch_id": go_payload.get("phase_offset_discontinuity_fit_epoch_id"),
+        "go_diagnostic_phase_offset_discontinuity_current_phase_epoch_us": go_payload.get("phase_offset_discontinuity_current_phase_epoch_us"),
+        "go_diagnostic_phase_offset_discontinuity_candidate_epoch_us": go_payload.get("phase_offset_discontinuity_candidate_epoch_us"),
+        "go_diagnostic_phase_offset_discontinuity_previous_ref_icao": go_payload.get("phase_offset_discontinuity_previous_ref_icao"),
+        "go_diagnostic_phase_offset_discontinuity_current_ref_icao": go_payload.get("phase_offset_discontinuity_current_ref_icao"),
+        "go_diagnostic_phase_offset_discontinuity_reference_changed": go_payload.get("phase_offset_discontinuity_reference_changed"),
+        "go_diagnostic_phase_offset_discontinuity_basis_note": go_payload.get("phase_offset_discontinuity_basis_note"),
+        "go_diagnostic_go_sync_unusable_reason": go_payload.get("go_sync_unusable_reason"),
+        "go_diagnostic_go_sync_usable_quality_ok": go_payload.get("go_sync_usable_quality_ok"),
+        "go_diagnostic_go_sync_usable_quality_value": go_payload.get("go_sync_usable_quality_value"),
+        "go_diagnostic_go_sync_usable_holdover_ok": go_payload.get("go_sync_usable_holdover_ok"),
+        "go_diagnostic_go_sync_usable_period_agrees": go_payload.get("go_sync_usable_period_agrees"),
+        "go_diagnostic_go_sync_usable_period_reject_reason": go_payload.get("go_sync_usable_period_reject_reason"),
+        "go_diagnostic_go_sync_usable_strict_gate_pass": go_payload.get("go_sync_usable_strict_gate_pass"),
+        "go_diagnostic_go_sync_usable_reacquired_provisional": go_payload.get("sync_reacquired_provisional"),
+        "go_diagnostic_go_sync_usable_fit_obs": go_payload.get("fit_observation_count"),
+        "go_diagnostic_go_sync_usable_fit_icaos": go_payload.get("fit_icao_count"),
+        "go_diagnostic_go_sync_usable_reacquire_support_obs": go_payload.get("reacquire_support_obs_count"),
+        "go_diagnostic_go_sync_usable_reacquire_support_icaos": go_payload.get("reacquire_support_icao_count"),
         "go_diagnostic_compact_period_agrees_with_df": go_payload.get("compact_period_agrees_with_df"),
         "go_diagnostic_compact_period_diagnostic_reason": go_payload.get("compact_period_diagnostic_reason"),
         "go_diagnostic_compact_period_disagreement_s": go_payload.get("compact_period_disagreement_s"),
@@ -3276,6 +3309,34 @@ class RadarState:
                 "last_update_epoch_observed_deg": (
                     float(entry["last_update_epoch_observed_deg"]) if entry.get("last_update_epoch_observed_deg") is not None else None
                 ),
+                "last_update_epoch_outcome": str(entry.get("last_update_epoch_outcome") or ""),
+                "last_update_epoch_candidate_epoch_age_s": (
+                    float(entry["last_update_epoch_candidate_epoch_age_s"]) if entry.get("last_update_epoch_candidate_epoch_age_s") is not None else None
+                ),
+                "phase_offset_candidate_raw_deg": (
+                    float(entry["phase_offset_candidate_raw_deg"]) if entry.get("phase_offset_candidate_raw_deg") is not None else None
+                ),
+                "phase_offset_candidate_wrapped_deg": (
+                    float(entry["phase_offset_candidate_wrapped_deg"]) if entry.get("phase_offset_candidate_wrapped_deg") is not None else None
+                ),
+                "phase_offset_blended_deg": (
+                    float(entry["phase_offset_blended_deg"]) if entry.get("phase_offset_blended_deg") is not None else None
+                ),
+                "phase_offset_blend_delta_deg": (
+                    float(entry["phase_offset_blend_delta_deg"]) if entry.get("phase_offset_blend_delta_deg") is not None else None
+                ),
+                "phase_offset_delta_before_blend_deg": (
+                    float(entry["phase_offset_delta_before_blend_deg"]) if entry.get("phase_offset_delta_before_blend_deg") is not None else None
+                ),
+                "phase_offset_delta_after_blend_deg": (
+                    float(entry["phase_offset_delta_after_blend_deg"]) if entry.get("phase_offset_delta_after_blend_deg") is not None else None
+                ),
+                "phase_offset_previous_deg": (
+                    float(entry["phase_offset_previous_deg"]) if entry.get("phase_offset_previous_deg") is not None else None
+                ),
+                "phase_offset_previous_fit_epoch_deg": (
+                    float(entry["phase_offset_previous_fit_epoch_deg"]) if entry.get("phase_offset_previous_fit_epoch_deg") is not None else None
+                ),
                 "consecutive_hard_residual_rejects": int(entry.get("consecutive_hard_residual_rejects") or 0),
                 "sync_epoch_age_s": (
                     float(entry["sync_epoch_age_s"]) if entry.get("sync_epoch_age_s") is not None else None
@@ -3289,6 +3350,38 @@ class RadarState:
                 "sync_reacquired_provisional": bool(entry.get("sync_reacquired_provisional", False)),
                 "reacquire_support_obs_count": int(entry.get("reacquire_support_obs_count") or 0),
                 "reacquire_support_icao_count": int(entry.get("reacquire_support_icao_count") or 0),
+                "phase_offset_discontinuity_old_deg": (
+                    float(entry["phase_offset_discontinuity_old_deg"]) if entry.get("phase_offset_discontinuity_old_deg") is not None else None
+                ),
+                "phase_offset_discontinuity_new_deg": (
+                    float(entry["phase_offset_discontinuity_new_deg"]) if entry.get("phase_offset_discontinuity_new_deg") is not None else None
+                ),
+                "phase_offset_discontinuity_delta_deg": (
+                    float(entry["phase_offset_discontinuity_delta_deg"]) if entry.get("phase_offset_discontinuity_delta_deg") is not None else None
+                ),
+                "phase_offset_discontinuity_threshold_deg": (
+                    float(entry["phase_offset_discontinuity_threshold_deg"]) if entry.get("phase_offset_discontinuity_threshold_deg") is not None else None
+                ),
+                "phase_offset_discontinuity_fit_epoch_id": int(entry.get("phase_offset_discontinuity_fit_epoch_id") or 0),
+                "phase_offset_discontinuity_current_phase_epoch_us": (
+                    float(entry["phase_offset_discontinuity_current_phase_epoch_us"]) if entry.get("phase_offset_discontinuity_current_phase_epoch_us") is not None else None
+                ),
+                "phase_offset_discontinuity_candidate_epoch_us": (
+                    float(entry["phase_offset_discontinuity_candidate_epoch_us"]) if entry.get("phase_offset_discontinuity_candidate_epoch_us") is not None else None
+                ),
+                "phase_offset_discontinuity_previous_ref_icao": str(entry.get("phase_offset_discontinuity_previous_ref_icao") or ""),
+                "phase_offset_discontinuity_current_ref_icao": str(entry.get("phase_offset_discontinuity_current_ref_icao") or ""),
+                "phase_offset_discontinuity_reference_changed": bool(entry.get("phase_offset_discontinuity_reference_changed", False)),
+                "phase_offset_discontinuity_basis_note": str(entry.get("phase_offset_discontinuity_basis_note") or ""),
+                "go_sync_unusable_reason": str(entry.get("go_sync_unusable_reason") or ""),
+                "go_sync_usable_quality_ok": bool(entry.get("go_sync_usable_quality_ok", False)),
+                "go_sync_usable_quality_value": (
+                    float(entry["go_sync_usable_quality_value"]) if entry.get("go_sync_usable_quality_value") is not None else None
+                ),
+                "go_sync_usable_holdover_ok": bool(entry.get("go_sync_usable_holdover_ok", False)),
+                "go_sync_usable_period_agrees": bool(entry.get("go_sync_usable_period_agrees", False)),
+                "go_sync_usable_period_reject_reason": str(entry.get("go_sync_usable_period_reject_reason") or ""),
+                "go_sync_usable_strict_gate_pass": bool(entry.get("go_sync_usable_strict_gate_pass", False)),
             }
         except Exception:
             return None
@@ -4517,6 +4610,16 @@ class RadarState:
                 "last_update_epoch_residual_deg": iid_state.get("ued"),
                 "last_update_epoch_predicted_deg": iid_state.get("ueg"),
                 "last_update_epoch_observed_deg": iid_state.get("ueo"),
+                "last_update_epoch_outcome": iid_state.get("ueou"),
+                "last_update_epoch_candidate_epoch_age_s": iid_state.get("ueca"),
+                "phase_offset_candidate_raw_deg": iid_state.get("pocr"),
+                "phase_offset_candidate_wrapped_deg": iid_state.get("pocw"),
+                "phase_offset_blended_deg": iid_state.get("pobd"),
+                "phase_offset_blend_delta_deg": iid_state.get("podd"),
+                "phase_offset_delta_before_blend_deg": iid_state.get("podb"),
+                "phase_offset_delta_after_blend_deg": iid_state.get("poda"),
+                "phase_offset_previous_deg": iid_state.get("popr"),
+                "phase_offset_previous_fit_epoch_deg": iid_state.get("pofe"),
                 "consecutive_hard_residual_rejects": iid_state.get("uek"),
                 "sync_epoch_age_s": iid_state.get("ues2"),
                 "current_phase_epoch_us": iid_state.get("uec2"),
@@ -4524,6 +4627,24 @@ class RadarState:
                 "sync_reacquired_provisional": iid_state.get("uerp"),
                 "reacquire_support_obs_count": iid_state.get("rso"),
                 "reacquire_support_icao_count": iid_state.get("rsi"),
+                "phase_offset_discontinuity_old_deg": iid_state.get("pdo"),
+                "phase_offset_discontinuity_new_deg": iid_state.get("pdn"),
+                "phase_offset_discontinuity_delta_deg": iid_state.get("pdd"),
+                "phase_offset_discontinuity_threshold_deg": iid_state.get("pdt"),
+                "phase_offset_discontinuity_fit_epoch_id": iid_state.get("pdf"),
+                "phase_offset_discontinuity_current_phase_epoch_us": iid_state.get("pdc"),
+                "phase_offset_discontinuity_candidate_epoch_us": iid_state.get("pdx"),
+                "phase_offset_discontinuity_previous_ref_icao": iid_state.get("pdp"),
+                "phase_offset_discontinuity_current_ref_icao": iid_state.get("pdr"),
+                "phase_offset_discontinuity_reference_changed": iid_state.get("pdrc"),
+                "phase_offset_discontinuity_basis_note": iid_state.get("pdb"),
+                "go_sync_unusable_reason": iid_state.get("gsur"),
+                "go_sync_usable_quality_ok": iid_state.get("gsuq"),
+                "go_sync_usable_quality_value": iid_state.get("gsuv"),
+                "go_sync_usable_holdover_ok": iid_state.get("gsuh"),
+                "go_sync_usable_period_agrees": iid_state.get("gsup"),
+                "go_sync_usable_period_reject_reason": iid_state.get("gsupr"),
+                "go_sync_usable_strict_gate_pass": iid_state.get("gsus"),
             })
             if go_sync is not None:
                 self._go_sync_states_by_iid[iid] = go_sync

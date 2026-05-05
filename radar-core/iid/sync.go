@@ -13,144 +13,172 @@ import (
 //
 //	bearing_deg = ((arrival_us - PhaseEpochUS) / (PeriodS*1e6) * 360 + PhaseOffsetDeg) mod 360
 type SyncState struct {
-	IID                                      uint8
-	PeriodS                                  float64 // deprecated alias for EffectivePeriodS; kept for tests/compatibility only.
-	BasePeriodS                              float64
-	PeriodDeltaS                             float64
-	EffectivePeriodS                         float64
-	PhaseEpochUS                             float64 // Beast-monotonic centroid of last accepted reference burst
-	PhaseOffsetDeg                           float64 // Geometric bearing from radar to ref aircraft at epoch (0 until radar pos known)
-	SyncQuality                              float64 // 0.0–1.0 from rotation model status
-	SyncJitterDeg                            float64 // 1-sigma jitter estimate from residual EMA
-	ResidualEMA                              float64 // EMA of |circular residual| degrees
-	NSyncFrames                              int     // accepted frame count
-	NRejectedFrames                          int     // rejected frame count
-	LastResidualDeg                          float64
-	Holdover                                 bool // true when last update was rejected / too weak
-	LastUpdated                              time.Time
-	PeriodSource                             string
-	PeriodAgreesWithDF                       bool
-	PeriodRejectReason                       string
-	ResidualSlopeDegPerS                     float64
-	PeriodRefinementStatus                   string
-	RefinementPlottedCount                   uint64
-	RefinementEligibleCount                  uint64
-	RefinementRejectedCount                  uint64
-	RefinementReferenceUpdates               uint64
-	RefinementLastRejectReason               string
-	RefinementLastObservationUnix            float64
-	FitObservationCount                      int
-	FitSpanS                                 float64
-	FitICAOCount                             int
-	FitPerICAOMin                            int
-	FitPerICAOMedian                         float64
-	FitPerICAOMax                            int
-	FitRetentionWindowS                      float64
-	FitGlobalCapHit                          bool
-	FitLastEvictionReason                    string
-	FitEligibleObservations                  int
-	FitRejectedObservations                  int
-	FitInlierRatio                           float64
-	SuspiciousICAOCount                      int
-	SuspiciousICAOLastReason                 string
-	ResidualSlopeEMADegPerS                  float64
-	ResidualSlopeStdDegPerS                  float64
-	ProposedDeltaS                           float64
-	AppliedDeltaS                            float64
-	LastSlewLimited                          bool
-	LastHardBound                            bool
-	HardBoundReason                          string
-	HardBoundLimitS                          float64
-	HardBoundLimitPPM                        float64
-	RequestedDeltaS                          float64
-	RequestedDeltaPPM                        float64
-	CurrentDeltaS                            float64
-	CurrentDeltaPPM                          float64
-	DeltaToBaseS                             float64
-	DeltaToBasePPM                           float64
-	DFBasePeriodS                            float64
-	PeriodDisagreementS                      float64
-	PeriodDisagreementPPM                    float64
-	FitEpochID                               uint64
-	FitEpochStartedUnix                      float64
-	FitEpochResetReason                      string
-	FitEpochObservationCount                 int
-	FitEpochSpanS                            float64
-	FitDroppedOnEpochReset                   int
-	FitSegmentCount                          uint64
-	SlopeSignConvention                      string
-	HoldoverReason                           string
-	HoldoverReasonCounts                     map[string]uint64
-	UpdateEpochAttempts                      uint64
-	UpdateEpochAccepts                       uint64
-	UpdateEpochRejects                       uint64
-	LastUpdateEpochRejectReason              string
-	LastUpdateEpochNAircraft                 int
-	LastUpdateEpochRefPosAgeS                float64
-	LastUpdateEpochRefICAO                   uint32
-	UpdateEpochRejectCounts                  map[string]uint64
-	LastUpdateEpochStrictGatePass            bool
-	LastUpdateEpochResidualDeg               float64
-	LastUpdateEpochRawResidualDeg            float64
-	LastUpdateEpochWrappedResidualDeg        float64
-	LastUpdateEpochPredictedDeg              float64
-	LastUpdateEpochPredictedWrappedDeg       float64
-	LastUpdateEpochObservedDeg               float64
-	LastUpdateEpochRefBearingDeg             float64
-	LastUpdateEpochRefRangeNM                float64
-	HardRejectTransitionConsecutiveBefore    uint64
-	HardRejectTransitionConsecutiveAfter     uint64
-	HardRejectEnteredHoldover                bool
-	HardRejectGateReason                     string
-	ConsecutiveHardResidualRejects           uint64
-	ConsecutiveHardBoundRejects              uint64
-	LastRejectedDeltaS                       float64
-	LastRejectedDeltaReason                  string
-	LastRejectedDeltaEpochID                 uint64
-	LastRejectedDeltaPPM                     float64
-	LastAcceptedEpochUS                      float64
-	LastAcceptedEpochAtUnix                  float64
-	SyncEpochAgeS                            float64
-	LastAcceptedEpochAgeS                    float64
-	CurrentPhaseEpochUS                      float64
-	CandidateEpochUS                         float64
-	ReacquiredProvisional                    bool
-	LastUpdateEpochRawCandidateAircraftCount int
-	LastUpdateEpochPositionedAircraftCount   int
-	LastUpdateEpochDominantAircraftCount     int
-	LastUpdateEpochFrameObservationCount     int
-	LastUpdateEpochInputReferenceICAO        uint32
-	LastUpdateEpochInputReferenceBurstUS     float64
-	LastUpdateEpochInputReferencePosAgeS     float64
-	LastUpdateEpochExcludedMissingPosition   int
-	LastUpdateEpochExcludedStalePosition     int
-	LastUpdateEpochExcludedNotDominant       int
-	LastUpdateEpochExcludedOutsideWindow     int
-	fitEpochFirstEpochUS                     float64
-	fitEpochLastEpochUS                      float64
-	fitEpochResidualBasis                    string
-	fitEpochReferenceICAO                    uint32
-	fitEpochPhaseOffsetDeg                   float64
-	fitEpochHoldover                         bool
-	fitEpochBasePeriodS                      float64
-	fitEpochAuthorityBasis                   string
-	residualHistory                          []residualObservation
-	icaoRejectHistory                        map[uint32][]float64
-	icaoSuspiciousUntil                      map[uint32]float64
-	slopeHistory                             []float64
-	FitEpochResetCountByReason               map[string]uint64
-	LastFitEpochResetUnix                    float64
-	FitObservationsAddedSinceReset           int
-	FitObservationsRejectedSinceReset        int
-	LastFitObservationRejectReason           string
-	CurrentReferenceICAO                     uint32
-	PreviousReferenceICAO                    uint32
-	ReferenceChangeCount                     uint64
-	ReferenceLastChangeUnix                  float64
-	ObservationDropCountsByReason            map[string]uint64
-	LastUpdateEpochRefPosMissingReason       string // "not_in_cache", "stale", or ""
-	ReacquireSupportObservationCount         int     // preserved across reacquire for canReacquireInHoldover
-	ReacquireSupportICAOCount                int     // preserved across reacquire for canReacquireInHoldover
+	IID                                           uint8
+	PeriodS                                       float64 // deprecated alias for EffectivePeriodS; kept for tests/compatibility only.
+	BasePeriodS                                   float64
+	PeriodDeltaS                                  float64
+	EffectivePeriodS                              float64
+	PhaseEpochUS                                  float64 // Beast-monotonic centroid of last accepted reference burst
+	PhaseOffsetDeg                                float64 // Geometric bearing from radar to ref aircraft at epoch (0 until radar pos known)
+	SyncQuality                                   float64 // 0.0–1.0 from rotation model status
+	SyncJitterDeg                                 float64 // 1-sigma jitter estimate from residual EMA
+	ResidualEMA                                   float64 // EMA of |circular residual| degrees
+	NSyncFrames                                   int     // accepted frame count
+	NRejectedFrames                               int     // rejected frame count
+	LastResidualDeg                               float64
+	Holdover                                      bool // true when last update was rejected / too weak
+	LastUpdated                                   time.Time
+	PeriodSource                                  string
+	PeriodAgreesWithDF                            bool
+	PeriodRejectReason                            string
+	ResidualSlopeDegPerS                          float64
+	PeriodRefinementStatus                        string
+	RefinementPlottedCount                        uint64
+	RefinementEligibleCount                       uint64
+	RefinementRejectedCount                       uint64
+	RefinementReferenceUpdates                    uint64
+	RefinementLastRejectReason                    string
+	RefinementLastObservationUnix                 float64
+	FitObservationCount                           int
+	FitSpanS                                      float64
+	FitICAOCount                                  int
+	FitPerICAOMin                                 int
+	FitPerICAOMedian                              float64
+	FitPerICAOMax                                 int
+	FitRetentionWindowS                           float64
+	FitGlobalCapHit                               bool
+	FitLastEvictionReason                         string
+	FitEligibleObservations                       int
+	FitRejectedObservations                       int
+	FitInlierRatio                                float64
+	SuspiciousICAOCount                           int
+	SuspiciousICAOLastReason                      string
+	ResidualSlopeEMADegPerS                       float64
+	ResidualSlopeStdDegPerS                       float64
+	ProposedDeltaS                                float64
+	AppliedDeltaS                                 float64
+	LastSlewLimited                               bool
+	LastHardBound                                 bool
+	HardBoundReason                               string
+	HardBoundLimitS                               float64
+	HardBoundLimitPPM                             float64
+	RequestedDeltaS                               float64
+	RequestedDeltaPPM                             float64
+	CurrentDeltaS                                 float64
+	CurrentDeltaPPM                               float64
+	DeltaToBaseS                                  float64
+	DeltaToBasePPM                                float64
+	DFBasePeriodS                                 float64
+	PeriodDisagreementS                           float64
+	PeriodDisagreementPPM                         float64
+	FitEpochID                                    uint64
+	FitEpochStartedUnix                           float64
+	FitEpochResetReason                           string
+	FitEpochObservationCount                      int
+	FitEpochSpanS                                 float64
+	FitDroppedOnEpochReset                        int
+	FitSegmentCount                               uint64
+	SlopeSignConvention                           string
+	HoldoverReason                                string
+	HoldoverReasonCounts                          map[string]uint64
+	UpdateEpochAttempts                           uint64
+	UpdateEpochAccepts                            uint64
+	UpdateEpochRejects                            uint64
+	LastUpdateEpochRejectReason                   string
+	LastUpdateEpochNAircraft                      int
+	LastUpdateEpochRefPosAgeS                     float64
+	LastUpdateEpochRefICAO                        uint32
+	UpdateEpochRejectCounts                       map[string]uint64
+	LastUpdateEpochStrictGatePass                 bool
+	LastUpdateEpochResidualDeg                    float64
+	LastUpdateEpochRawResidualDeg                 float64
+	LastUpdateEpochWrappedResidualDeg             float64
+	LastUpdateEpochPredictedDeg                   float64
+	LastUpdateEpochPredictedWrappedDeg            float64
+	LastUpdateEpochObservedDeg                    float64
+	LastUpdateEpochRefBearingDeg                  float64
+	LastUpdateEpochRefRangeNM                     float64
+	LastUpdateEpochOutcome                        string
+	LastUpdateEpochCandidateEpochAgeS             float64
+	LastUpdateEpochPhaseOffsetCandidateRawDeg     float64
+	LastUpdateEpochPhaseOffsetCandidateWrappedDeg float64
+	LastUpdateEpochPhaseOffsetBlendedDeg          float64
+	LastUpdateEpochPhaseOffsetBlendDeltaDeg       float64
+	LastUpdateEpochPhaseOffsetDeltaBeforeBlendDeg float64
+	LastUpdateEpochPhaseOffsetDeltaAfterBlendDeg  float64
+	LastUpdateEpochPreviousPhaseOffsetDeg         float64
+	LastUpdateEpochPreviousFitEpochPhaseOffsetDeg float64
+	HardRejectTransitionConsecutiveBefore         uint64
+	HardRejectTransitionConsecutiveAfter          uint64
+	HardRejectEnteredHoldover                     bool
+	HardRejectGateReason                          string
+	ConsecutiveHardResidualRejects                uint64
+	ConsecutiveHardBoundRejects                   uint64
+	LastRejectedDeltaS                            float64
+	LastRejectedDeltaReason                       string
+	LastRejectedDeltaEpochID                      uint64
+	LastRejectedDeltaPPM                          float64
+	LastAcceptedEpochUS                           float64
+	LastAcceptedEpochAtUnix                       float64
+	SyncEpochAgeS                                 float64
+	LastAcceptedEpochAgeS                         float64
+	CurrentPhaseEpochUS                           float64
+	CandidateEpochUS                              float64
+	ReacquiredProvisional                         bool
+	LastUpdateEpochRawCandidateAircraftCount      int
+	LastUpdateEpochPositionedAircraftCount        int
+	LastUpdateEpochDominantAircraftCount          int
+	LastUpdateEpochFrameObservationCount          int
+	LastUpdateEpochInputReferenceICAO             uint32
+	LastUpdateEpochInputReferenceBurstUS          float64
+	LastUpdateEpochInputReferencePosAgeS          float64
+	LastUpdateEpochExcludedMissingPosition        int
+	LastUpdateEpochExcludedStalePosition          int
+	LastUpdateEpochExcludedNotDominant            int
+	LastUpdateEpochExcludedOutsideWindow          int
+	fitEpochFirstEpochUS                          float64
+	fitEpochLastEpochUS                           float64
+	fitEpochResidualBasis                         string
+	fitEpochReferenceICAO                         uint32
+	fitEpochPhaseOffsetDeg                        float64
+	fitEpochHoldover                              bool
+	fitEpochBasePeriodS                           float64
+	fitEpochAuthorityBasis                        string
+	residualHistory                               []residualObservation
+	icaoRejectHistory                             map[uint32][]float64
+	icaoSuspiciousUntil                           map[uint32]float64
+	slopeHistory                                  []float64
+	FitEpochResetCountByReason                    map[string]uint64
+	LastFitEpochResetUnix                         float64
+	FitObservationsAddedSinceReset                int
+	FitObservationsRejectedSinceReset             int
+	LastFitObservationRejectReason                string
+	CurrentReferenceICAO                          uint32
+	PreviousReferenceICAO                         uint32
+	ReferenceChangeCount                          uint64
+	ReferenceLastChangeUnix                       float64
+	ObservationDropCountsByReason                 map[string]uint64
+	LastUpdateEpochRefPosMissingReason            string // "not_in_cache", "stale", or ""
+	ReacquireSupportObservationCount              int    // preserved across reacquire for canReacquireInHoldover
+	ReacquireSupportICAOCount                     int    // preserved across reacquire for canReacquireInHoldover
+	PhaseOffsetDiscontinuityOldDeg                float64
+	PhaseOffsetDiscontinuityNewDeg                float64
+	PhaseOffsetDiscontinuityDeltaDeg              float64
+	PhaseOffsetDiscontinuityThresholdDeg          float64
+	PhaseOffsetDiscontinuityFitEpochID            uint64
+	PhaseOffsetDiscontinuityCurrentEpochUS        float64
+	PhaseOffsetDiscontinuityCandidateEpochUS      float64
+	PhaseOffsetDiscontinuityPreviousRefICAO       uint32
+	PhaseOffsetDiscontinuityCurrentRefICAO        uint32
+	PhaseOffsetDiscontinuityReferenceChanged      bool
+	PhaseOffsetDiscontinuityBasisNote             string
+	SyncUnusableReason                            string
+	SyncUsableQualityOK                           bool
+	SyncUsableQualityValue                        float64
+	SyncUsableHoldoverOK                          bool
+	SyncUsablePeriodAgrees                        bool
+	SyncUsablePeriodRejectReason                  string
+	SyncUsableStrictGatePass                      bool
 }
 
 const (
@@ -233,36 +261,36 @@ func syncQuality(status string, hasPeriod bool) float64 {
 // (0.0 when the radar position is unknown — Stage 3 default).
 func NewSyncState(iid uint8, periodS, epochUS, phaseOffsetDeg, quality float64) *SyncState {
 	return &SyncState{
-		IID:                     iid,
-		PeriodS:                 periodS,
-		BasePeriodS:             periodS,
-		PeriodDeltaS:            0,
-		EffectivePeriodS:        periodS,
-		PhaseEpochUS:            epochUS,
-		PhaseOffsetDeg:          phaseOffsetDeg,
-		SyncQuality:             quality,
-		SyncJitterDeg:           5.0,
-		ResidualEMA:             5.0,
-		NSyncFrames:             1,
-		Holdover:                false,
-		LastUpdated:             time.Now(),
-		PeriodSource:            "df_alignment",
-		PeriodAgreesWithDF:      true,
-		PeriodRefinementStatus:  "base_only",
-		FitRetentionWindowS:     refinementFitWindowS,
-		SlopeSignConvention:     "observed_minus_predicted",
-		HardBoundLimitPPM:       refinementAbsBoundFraction * 1e6,
-		FitInlierRatio:          -1.0,
-		HoldoverReasonCounts:        make(map[string]uint64),
-		UpdateEpochRejectCounts:     make(map[string]uint64),
-		icaoRejectHistory:           make(map[uint32][]float64),
-		icaoSuspiciousUntil:         make(map[uint32]float64),
-		FitEpochResetCountByReason:  make(map[string]uint64),
-		ObservationDropCountsByReason: make(map[string]uint64),
-		LastAcceptedEpochUS:         epochUS,
+		IID:                              iid,
+		PeriodS:                          periodS,
+		BasePeriodS:                      periodS,
+		PeriodDeltaS:                     0,
+		EffectivePeriodS:                 periodS,
+		PhaseEpochUS:                     epochUS,
+		PhaseOffsetDeg:                   phaseOffsetDeg,
+		SyncQuality:                      quality,
+		SyncJitterDeg:                    5.0,
+		ResidualEMA:                      5.0,
+		NSyncFrames:                      1,
+		Holdover:                         false,
+		LastUpdated:                      time.Now(),
+		PeriodSource:                     "df_alignment",
+		PeriodAgreesWithDF:               true,
+		PeriodRefinementStatus:           "base_only",
+		FitRetentionWindowS:              refinementFitWindowS,
+		SlopeSignConvention:              "observed_minus_predicted",
+		HardBoundLimitPPM:                refinementAbsBoundFraction * 1e6,
+		FitInlierRatio:                   -1.0,
+		HoldoverReasonCounts:             make(map[string]uint64),
+		UpdateEpochRejectCounts:          make(map[string]uint64),
+		icaoRejectHistory:                make(map[uint32][]float64),
+		icaoSuspiciousUntil:              make(map[uint32]float64),
+		FitEpochResetCountByReason:       make(map[string]uint64),
+		ObservationDropCountsByReason:    make(map[string]uint64),
+		LastAcceptedEpochUS:              epochUS,
 		ReacquireSupportObservationCount: 0,
 		ReacquireSupportICAOCount:        0,
-		LastAcceptedEpochAtUnix:     float64(time.Now().UnixNano()) / 1e9,
+		LastAcceptedEpochAtUnix:          float64(time.Now().UnixNano()) / 1e9,
 	}
 }
 
@@ -283,6 +311,7 @@ func (s *SyncState) enterHoldover(reason string) {
 func (s *SyncState) rejectUpdateEpoch(reason string) bool {
 	s.UpdateEpochRejects++
 	s.LastUpdateEpochRejectReason = reason
+	s.LastUpdateEpochOutcome = "rejected"
 	if reason != "" {
 		s.UpdateEpochRejectCounts[reason] = s.UpdateEpochRejectCounts[reason] + 1
 	}
@@ -300,6 +329,7 @@ func (s *SyncState) setUpdateEpochDiagnostics(candidateEpochUS, observedDeg, pre
 	s.LastUpdateEpochResidualDeg = wrappedResidualDeg
 	s.LastUpdateEpochRefBearingDeg = observedDeg
 	s.LastUpdateEpochRefRangeNM = -1.0
+	s.LastUpdateEpochOutcome = ""
 	s.HardRejectEnteredHoldover = false
 	s.HardRejectTransitionConsecutiveBefore = s.ConsecutiveHardResidualRejects
 	s.HardRejectTransitionConsecutiveAfter = s.ConsecutiveHardResidualRejects
@@ -323,6 +353,15 @@ func (s *SyncState) setUpdateEpochDiagnostics(candidateEpochUS, observedDeg, pre
 	} else {
 		s.SyncEpochAgeS = 0
 	}
+	s.LastUpdateEpochCandidateEpochAgeS = s.SyncEpochAgeS
+	s.LastUpdateEpochPhaseOffsetCandidateRawDeg = observedDeg
+	s.LastUpdateEpochPhaseOffsetCandidateWrappedDeg = wrap360(observedDeg)
+	s.LastUpdateEpochPhaseOffsetBlendedDeg = wrap360(s.PhaseOffsetDeg)
+	s.LastUpdateEpochPhaseOffsetBlendDeltaDeg = 0
+	s.LastUpdateEpochPhaseOffsetDeltaBeforeBlendDeg = 0
+	s.LastUpdateEpochPhaseOffsetDeltaAfterBlendDeg = 0
+	s.LastUpdateEpochPreviousPhaseOffsetDeg = wrap360(s.PhaseOffsetDeg)
+	s.LastUpdateEpochPreviousFitEpochPhaseOffsetDeg = wrap360(s.fitEpochPhaseOffsetDeg)
 }
 
 func (s *SyncState) canReacquireInHoldover(periodS float64, nAircraft int, refPosAgeS float64, refICAO uint32) bool {
@@ -519,9 +558,45 @@ func (s *SyncState) maybeResetFitEpochLocked(ctx fitEpochContext) {
 			return
 		}
 	}
-	if math.Abs(circularDiff(ctx.phaseOffsetDeg, s.fitEpochPhaseOffsetDeg)) > fitEpochPhaseOffsetResetDeg {
+	deltaDeg := circularDiff(ctx.phaseOffsetDeg, s.fitEpochPhaseOffsetDeg)
+	if math.Abs(deltaDeg) > fitEpochPhaseOffsetResetDeg {
+		s.LastUpdateEpochPreviousFitEpochPhaseOffsetDeg = wrap360(s.fitEpochPhaseOffsetDeg)
+		s.LastUpdateEpochPreviousPhaseOffsetDeg = wrap360(s.PhaseOffsetDeg)
+		s.PhaseOffsetDiscontinuityOldDeg = wrap360(s.fitEpochPhaseOffsetDeg)
+		s.PhaseOffsetDiscontinuityNewDeg = wrap360(ctx.phaseOffsetDeg)
+		s.PhaseOffsetDiscontinuityDeltaDeg = deltaDeg
+		s.PhaseOffsetDiscontinuityThresholdDeg = fitEpochPhaseOffsetResetDeg
+		s.PhaseOffsetDiscontinuityFitEpochID = s.FitEpochID
+		s.PhaseOffsetDiscontinuityCurrentEpochUS = s.fitEpochLastEpochUS
+		s.PhaseOffsetDiscontinuityCandidateEpochUS = ctx.epochUS
+		s.PhaseOffsetDiscontinuityPreviousRefICAO = s.fitEpochReferenceICAO
+		s.PhaseOffsetDiscontinuityCurrentRefICAO = ctx.referenceICAO
+		s.PhaseOffsetDiscontinuityReferenceChanged = s.fitEpochReferenceICAO != 0 && ctx.referenceICAO != 0 && s.fitEpochReferenceICAO != ctx.referenceICAO
+		s.PhaseOffsetDiscontinuityBasisNote = "go_internal_relative_phase"
 		s.rotateFitEpochLocked("phase_offset_discontinuity", ctx)
 	}
+}
+
+func (s *SyncState) refreshSyncUsableDiagnosticsLocked() bool {
+	s.SyncUsableQualityValue = s.SyncQuality
+	s.SyncUsableQualityOK = s.SyncQuality >= 0.3
+	s.SyncUsableHoldoverOK = !s.Holdover
+	s.SyncUsablePeriodAgrees = s.PeriodAgreesWithDF
+	s.SyncUsablePeriodRejectReason = s.PeriodRejectReason
+	s.SyncUsableStrictGatePass = s.LastUpdateEpochStrictGatePass
+	s.SyncUnusableReason = ""
+	if !s.SyncUsableQualityOK {
+		s.SyncUnusableReason = "quality_below_threshold"
+	} else if !s.SyncUsableHoldoverOK {
+		s.SyncUnusableReason = "holdover"
+	} else if !s.SyncUsablePeriodAgrees {
+		s.SyncUnusableReason = "period_disagrees_with_df"
+	} else if s.SyncUsablePeriodRejectReason != "" {
+		s.SyncUnusableReason = s.SyncUsablePeriodRejectReason
+	} else if !s.SyncUsableStrictGatePass {
+		s.SyncUnusableReason = "strict_gate_failed"
+	}
+	return s.SyncUnusableReason == ""
 }
 
 func (s *SyncState) markFitEpochObservationLocked(epochUS float64, referenceICAO uint32, phaseOffsetDeg float64, basePeriodS float64, holdover bool, authorityBasis string) {
@@ -597,6 +672,17 @@ func (s *SyncState) SetLastUpdateEpochInputDiagnostics(
 	s.LastUpdateEpochExcludedStalePosition = excludedStalePosition
 	s.LastUpdateEpochExcludedNotDominant = excludedNotDominant
 	s.LastUpdateEpochExcludedOutsideWindow = excludedOutsideWindow
+}
+
+func (s *SyncState) setPhaseOffsetBlendDiagnostics(existingAtNewEpoch, candidateWrappedDeg, blendedDeg float64) {
+	s.LastUpdateEpochPhaseOffsetCandidateRawDeg = s.LastUpdateEpochObservedDeg
+	s.LastUpdateEpochPhaseOffsetCandidateWrappedDeg = wrap360(candidateWrappedDeg)
+	s.LastUpdateEpochPhaseOffsetBlendedDeg = wrap360(blendedDeg)
+	s.LastUpdateEpochPhaseOffsetBlendDeltaDeg = circularDiff(blendedDeg, existingAtNewEpoch)
+	s.LastUpdateEpochPhaseOffsetDeltaBeforeBlendDeg = circularDiff(candidateWrappedDeg, existingAtNewEpoch)
+	s.LastUpdateEpochPhaseOffsetDeltaAfterBlendDeg = circularDiff(blendedDeg, s.fitEpochPhaseOffsetDeg)
+	s.LastUpdateEpochPreviousPhaseOffsetDeg = wrap360(s.PhaseOffsetDeg)
+	s.LastUpdateEpochPreviousFitEpochPhaseOffsetDeg = wrap360(s.fitEpochPhaseOffsetDeg)
 }
 
 func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float64, nAircraft int, refPosAgeS float64, refICAOOpt ...uint32) bool {
@@ -686,6 +772,7 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 				s.HoldoverReason = "reacquired_provisional"
 				s.LastUpdateEpochStrictGatePass = false
 				s.ReacquiredProvisional = true
+				s.LastUpdateEpochOutcome = "provisional_reacquire"
 				s.UpdateEpochAccepts++
 				s.LastUpdateEpochRejectReason = ""
 				s.LastUpdated = time.Now()
@@ -723,6 +810,7 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 	// Re-express existing sync at the new epoch, then blend in the new observation.
 	existingAtNewEpoch := wrap360((newEpochUS-s.PhaseEpochUS)/periodUS*360.0 + s.PhaseOffsetDeg)
 	blendedOffset := wrap360(existingAtNewEpoch + alpha*residual)
+	s.setPhaseOffsetBlendDiagnostics(existingAtNewEpoch, newOffsetDeg, blendedOffset)
 
 	s.BasePeriodS = periodS
 	s.maybeResetFitEpochLocked(fitEpochContext{
@@ -763,6 +851,7 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 	s.HoldoverReason = ""
 	s.UpdateEpochAccepts++
 	s.ReacquiredProvisional = false
+	s.LastUpdateEpochOutcome = "accepted"
 	s.LastUpdateEpochRejectReason = ""
 	s.LastUpdateEpochStrictGatePass = strictEligible
 	s.LastAcceptedEpochUS = newEpochUS
