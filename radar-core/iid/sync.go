@@ -91,8 +91,17 @@ type SyncState struct {
 	UpdateEpochRejectCounts                  map[string]uint64
 	LastUpdateEpochStrictGatePass            bool
 	LastUpdateEpochResidualDeg               float64
+	LastUpdateEpochRawResidualDeg            float64
+	LastUpdateEpochWrappedResidualDeg        float64
 	LastUpdateEpochPredictedDeg              float64
+	LastUpdateEpochPredictedWrappedDeg       float64
 	LastUpdateEpochObservedDeg               float64
+	LastUpdateEpochRefBearingDeg             float64
+	LastUpdateEpochRefRangeNM                float64
+	HardRejectTransitionConsecutiveBefore    uint64
+	HardRejectTransitionConsecutiveAfter     uint64
+	HardRejectEnteredHoldover                bool
+	HardRejectGateReason                     string
 	ConsecutiveHardResidualRejects           uint64
 	ConsecutiveHardBoundRejects              uint64
 	LastRejectedDeltaS                       float64
@@ -280,12 +289,21 @@ func (s *SyncState) rejectUpdateEpoch(reason string) bool {
 	return false
 }
 
-func (s *SyncState) setUpdateEpochDiagnostics(candidateEpochUS, observedDeg, predictedDeg, residualDeg float64) {
+func (s *SyncState) setUpdateEpochDiagnostics(candidateEpochUS, observedDeg, predictedDeg, rawResidualDeg, wrappedResidualDeg float64) {
 	s.CandidateEpochUS = candidateEpochUS
 	s.CurrentPhaseEpochUS = s.PhaseEpochUS
 	s.LastUpdateEpochObservedDeg = observedDeg
 	s.LastUpdateEpochPredictedDeg = predictedDeg
-	s.LastUpdateEpochResidualDeg = residualDeg
+	s.LastUpdateEpochPredictedWrappedDeg = wrap360(predictedDeg)
+	s.LastUpdateEpochRawResidualDeg = rawResidualDeg
+	s.LastUpdateEpochWrappedResidualDeg = wrappedResidualDeg
+	s.LastUpdateEpochResidualDeg = wrappedResidualDeg
+	s.LastUpdateEpochRefBearingDeg = observedDeg
+	s.LastUpdateEpochRefRangeNM = -1.0
+	s.HardRejectEnteredHoldover = false
+	s.HardRejectTransitionConsecutiveBefore = s.ConsecutiveHardResidualRejects
+	s.HardRejectTransitionConsecutiveAfter = s.ConsecutiveHardResidualRejects
+	s.HardRejectGateReason = ""
 	nowUnix := float64(time.Now().UnixNano()) / 1e9
 	if s.LastAcceptedEpochAtUnix > 0 {
 		age := nowUnix - s.LastAcceptedEpochAtUnix
@@ -638,19 +656,24 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 
 	// Circular residual between the new observation and our current prediction.
 	predicted := s.predictBearingAt(newEpochUS, periodUS)
+	rawResidual := newOffsetDeg - predicted
 	residual := circularDiff(newOffsetDeg, predicted)
 	absResidual := math.Abs(residual)
-	s.setUpdateEpochDiagnostics(newEpochUS, newOffsetDeg, predicted, residual)
+	s.setUpdateEpochDiagnostics(newEpochUS, newOffsetDeg, predicted, rawResidual, residual)
 
 	newResidualEMA := (1.0-residualEMAAlpha)*s.ResidualEMA + residualEMAAlpha*absResidual
 
 	// Hard reject.
 	if absResidual > residualRejectDeg {
+		beforeReject := s.ConsecutiveHardResidualRejects
 		s.NRejectedFrames++
 		s.LastResidualDeg = residual
 		s.ResidualEMA = newResidualEMA
 		s.SyncJitterDeg = clamp(newResidualEMA, 2.0, 20.0)
 		s.ConsecutiveHardResidualRejects++
+		s.HardRejectTransitionConsecutiveBefore = beforeReject
+		s.HardRejectTransitionConsecutiveAfter = s.ConsecutiveHardResidualRejects
+		s.HardRejectGateReason = "wrapped_abs_residual_gt_50deg"
 		if s.Holdover {
 			s.enterHoldover("hard_residual_reject_holdover")
 			if s.canReacquireInHoldover(periodS, nAircraft, refPosAgeS, refICAO) &&
@@ -684,6 +707,7 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 				return true
 			}
 		} else {
+			s.HardRejectEnteredHoldover = true
 			s.enterHoldover("hard_residual_reject")
 		}
 		return s.rejectUpdateEpoch("hard_residual_reject")
@@ -1344,7 +1368,10 @@ func wrap360(deg float64) float64 {
 
 // circularDiff returns the signed difference b-a, normalised to (-180, 180].
 func circularDiff(b, a float64) float64 {
-	d := math.Mod(b-a+540.0, 360.0) - 180.0
+	d := wrap360(b - a)
+	if d > 180.0 {
+		d -= 360.0
+	}
 	return d
 }
 

@@ -266,3 +266,43 @@ Verification:
 
 Residual risk:
 - 5-minute runtime percentages were not measured in this offline dev session; those require a live feed or replay trace.
+
+## 2026-05-05 Hard Residual Holdover Instability Investigation
+
+- [x] Reconfirm residual gate math in `radar-core/iid/sync.go` (wrapped vs raw) and document exact behavior with code references.
+- [x] Run GitNexus impact analysis for every symbol touched and record risk/blast radius before edits.
+- [x] Add Go sync diagnostics for raw vs wrapped residual, rejecting reference-aircraft metadata, and hard-reject transition counters.
+- [x] Ensure existing behavior remains unchanged unless a correctness bug is found (no Stage 10, no default/tolerance changes).
+- [x] Wire new diagnostics through `iid/state.go` and compact snapshot payload exports.
+- [x] Add/update Go tests for residual wrapping semantics, predicted >360 handling, transition counters, and rejecting-reference diagnostics.
+- [x] Run focused verification (`go test` for `radar-core/iid` and any impacted snapshot package tests).
+- [x] Add review notes and recommendations (policy-only for confidence-aware holdover gating).
+
+Plan confirmation:
+- Scope is diagnostics + correctness verification for hard residual reject path only.
+- No period-agreement tolerance changes.
+- No Stage 10 implementation.
+- No Go operational default changes.
+
+Review:
+- Confirmed the hard gate path in `SyncState.UpdateEpoch` computes residual via `circularDiff(...)` and compares `absResidual > residualRejectDeg`.
+- Found and fixed a correctness bug in `circularDiff` under large unwrapped deltas caused by Go `math.Mod` negative remainder behavior; this could emit values outside `(-180, 180]` and trigger false hard rejects.
+- Added explicit diagnostics for both raw and wrapped residuals/predicted angles:
+  - `last_update_epoch_raw_residual_deg`
+  - `last_update_epoch_wrapped_residual_deg`
+  - `last_update_epoch_predicted_wrapped_deg`
+  - legacy `last_update_epoch_residual_deg` remains wrapped for compatibility.
+- Added hard-reject transition diagnostics:
+  - `hard_reject_transition_consecutive_before`
+  - `hard_reject_transition_consecutive_after`
+  - `hard_reject_entered_holdover_bool`
+  - `hard_reject_gate_reason` (`wrapped_abs_residual_gt_50deg`).
+- Added rejecting reference diagnostics currently available in this path:
+  - `last_update_epoch_ref_icao`
+  - `last_update_epoch_ref_bearing_deg`
+  - `last_update_epoch_ref_range_nm` uses `-1` sentinel when unavailable in this stage path.
+- Kept behavior unchanged except the circular-wrap correctness fix; no Stage 10/default/tolerance changes.
+
+Verification:
+- `cd radar-core && GOCACHE=/tmp/go-build-cache go test ./iid`
+- `cd radar-core && GOCACHE=/tmp/go-build-cache go test ./cmd/radar-core`

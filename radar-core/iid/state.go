@@ -182,8 +182,17 @@ type DebugSnapshot struct {
 	UpdateEpochRejectInsufficientAC          uint64
 	UpdateEpochLastStrictGatePass            bool
 	LastUpdateEpochResidualDeg               float64
+	LastUpdateEpochRawResidualDeg            float64
+	LastUpdateEpochWrappedResidualDeg        float64
 	LastUpdateEpochPredictedDeg              float64
+	LastUpdateEpochPredictedWrappedDeg       float64
 	LastUpdateEpochObservedDeg               float64
+	LastUpdateEpochRefBearingDeg             float64
+	LastUpdateEpochRefRangeNM                float64
+	HardRejectTransitionConsecutiveBefore    uint64
+	HardRejectTransitionConsecutiveAfter     uint64
+	HardRejectEnteredHoldover                bool
+	HardRejectGateReason                     string
 	ConsecutiveHardResidualRejects           uint64
 	ConsecutiveHardBoundRejects              uint64
 	LastAcceptedEpochAgeS                    float64
@@ -856,8 +865,17 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.UpdateEpochRejectInsufficientAC = s.Sync.UpdateEpochRejectCounts["insufficient_aircraft"]
 		out.UpdateEpochLastStrictGatePass = s.Sync.LastUpdateEpochStrictGatePass
 		out.LastUpdateEpochResidualDeg = s.Sync.LastUpdateEpochResidualDeg
+		out.LastUpdateEpochRawResidualDeg = s.Sync.LastUpdateEpochRawResidualDeg
+		out.LastUpdateEpochWrappedResidualDeg = s.Sync.LastUpdateEpochWrappedResidualDeg
 		out.LastUpdateEpochPredictedDeg = s.Sync.LastUpdateEpochPredictedDeg
+		out.LastUpdateEpochPredictedWrappedDeg = s.Sync.LastUpdateEpochPredictedWrappedDeg
 		out.LastUpdateEpochObservedDeg = s.Sync.LastUpdateEpochObservedDeg
+		out.LastUpdateEpochRefBearingDeg = s.Sync.LastUpdateEpochRefBearingDeg
+		out.LastUpdateEpochRefRangeNM = s.Sync.LastUpdateEpochRefRangeNM
+		out.HardRejectTransitionConsecutiveBefore = s.Sync.HardRejectTransitionConsecutiveBefore
+		out.HardRejectTransitionConsecutiveAfter = s.Sync.HardRejectTransitionConsecutiveAfter
+		out.HardRejectEnteredHoldover = s.Sync.HardRejectEnteredHoldover
+		out.HardRejectGateReason = s.Sync.HardRejectGateReason
 		out.ConsecutiveHardResidualRejects = s.Sync.ConsecutiveHardResidualRejects
 		out.ConsecutiveHardBoundRejects = s.Sync.ConsecutiveHardBoundRejects
 		out.LastAcceptedEpochAgeS = s.Sync.LastAcceptedEpochAgeS

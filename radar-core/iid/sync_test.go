@@ -59,6 +59,21 @@ func TestSyncState_HardReject(t *testing.T) {
 	if s.PhaseEpochUS != 0.0 {
 		t.Errorf("PhaseEpochUS = %.0f, want unchanged 0", s.PhaseEpochUS)
 	}
+	if math.Abs(s.LastUpdateEpochWrappedResidualDeg-60.0) > 0.01 {
+		t.Fatalf("wrapped residual %.2f, want 60", s.LastUpdateEpochWrappedResidualDeg)
+	}
+	if math.Abs(s.LastUpdateEpochRawResidualDeg+300.0) > 0.01 {
+		t.Fatalf("raw residual %.2f, want -300", s.LastUpdateEpochRawResidualDeg)
+	}
+	if !s.HardRejectEnteredHoldover {
+		t.Fatal("first hard reject should record entered_holdover=true")
+	}
+	if s.HardRejectTransitionConsecutiveBefore != 0 || s.HardRejectTransitionConsecutiveAfter != 1 {
+		t.Fatalf("hard reject transition before/after = %d/%d, want 0/1", s.HardRejectTransitionConsecutiveBefore, s.HardRejectTransitionConsecutiveAfter)
+	}
+	if s.HardRejectGateReason != "wrapped_abs_residual_gt_50deg" {
+		t.Fatalf("hard reject gate reason = %q", s.HardRejectGateReason)
+	}
 }
 
 func TestSyncState_QualityGate(t *testing.T) {
@@ -552,6 +567,30 @@ func TestSyncState_UpdateEpoch_UsesEffectivePeriodForPrediction(t *testing.T) {
 	}
 	if math.Abs(s.LastResidualDeg) > 1.0 {
 		t.Fatalf("residual %.3f too large; prediction likely did not use effective period", s.LastResidualDeg)
+	}
+}
+
+func TestSyncState_UpdateEpoch_PredictedOver360_DoesNotFalseRejectWhenWrappedResidualSmall(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	// 3 periods later: raw prediction is 1080 deg; wrapped prediction is 0 deg.
+	accepted := s.UpdateEpoch(12_000_000.0, 10.0, 4.0, 1.0, 4, 0.5)
+	if !accepted {
+		t.Fatal("expected accept: wrapped residual is only 10 deg")
+	}
+	if s.NRejectedFrames != 0 {
+		t.Fatalf("unexpected rejects: %d", s.NRejectedFrames)
+	}
+	if math.Abs(s.LastUpdateEpochPredictedDeg-1080.0) > 0.01 {
+		t.Fatalf("raw predicted %.2f, want 1080", s.LastUpdateEpochPredictedDeg)
+	}
+	if math.Abs(s.LastUpdateEpochPredictedWrappedDeg-0.0) > 0.01 {
+		t.Fatalf("wrapped predicted %.2f, want 0", s.LastUpdateEpochPredictedWrappedDeg)
+	}
+	if math.Abs(s.LastUpdateEpochRawResidualDeg+1070.0) > 0.01 {
+		t.Fatalf("raw residual %.2f, want -1070", s.LastUpdateEpochRawResidualDeg)
+	}
+	if math.Abs(s.LastUpdateEpochWrappedResidualDeg-10.0) > 0.01 {
+		t.Fatalf("wrapped residual %.2f, want 10", s.LastUpdateEpochWrappedResidualDeg)
 	}
 }
 

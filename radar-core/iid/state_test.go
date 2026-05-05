@@ -390,6 +390,46 @@ func TestUpdateEpochDiagnostics_RecordRejectInputs(t *testing.T) {
 	}
 }
 
+func TestUpdateEpochDiagnostics_HardRejectDetailsExposed(t *testing.T) {
+	s := NewIIDState(63)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Sync = NewSyncState(s.IID, base, 0.0, 0.0, 1.0)
+	ref := uint32(0xA0B0C0)
+	s.RefICAO = &ref
+
+	// Force hard residual reject.
+	s.UpdateSyncEpoch(4_000_000.0, 60.0, 6, 0.5)
+	snap := s.DebugStateSnapshot()
+	if snap.LastUpdateEpochRejectReason != "hard_residual_reject" {
+		t.Fatalf("reject reason=%q", snap.LastUpdateEpochRejectReason)
+	}
+	if math.Abs(snap.LastUpdateEpochRawResidualDeg+300.0) > 0.01 {
+		t.Fatalf("raw residual=%.2f, want -300", snap.LastUpdateEpochRawResidualDeg)
+	}
+	if math.Abs(snap.LastUpdateEpochWrappedResidualDeg-60.0) > 0.01 {
+		t.Fatalf("wrapped residual=%.2f, want 60", snap.LastUpdateEpochWrappedResidualDeg)
+	}
+	if snap.HardRejectTransitionConsecutiveBefore != 0 || snap.HardRejectTransitionConsecutiveAfter != 1 {
+		t.Fatalf("hard reject before/after=%d/%d, want 0/1", snap.HardRejectTransitionConsecutiveBefore, snap.HardRejectTransitionConsecutiveAfter)
+	}
+	if !snap.HardRejectEnteredHoldover {
+		t.Fatal("expected hard reject entered holdover flag")
+	}
+	if snap.HardRejectGateReason != "wrapped_abs_residual_gt_50deg" {
+		t.Fatalf("hard reject gate reason=%q", snap.HardRejectGateReason)
+	}
+	if snap.LastUpdateEpochRefICAO != ref {
+		t.Fatalf("ref icao=%06X, want %06X", snap.LastUpdateEpochRefICAO, ref)
+	}
+	if math.Abs(snap.LastUpdateEpochRefBearingDeg-60.0) > 0.01 {
+		t.Fatalf("ref bearing=%.2f, want 60", snap.LastUpdateEpochRefBearingDeg)
+	}
+	if snap.LastUpdateEpochRefRangeNM != -1.0 {
+		t.Fatalf("ref range=%.2f, want -1 sentinel", snap.LastUpdateEpochRefRangeNM)
+	}
+}
+
 func TestUpdateEpochMaintenanceGateUpdatesWithoutStrictAuthority(t *testing.T) {
 	s := NewIIDState(62)
 	base := 4.0
