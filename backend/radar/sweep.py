@@ -934,6 +934,65 @@ def _live_sync_state_to_dict(
         "geographic": "geographic",
     }.get(phase_basis, "unavailable")
 
+    blocking_gate = getattr(sync, "blocking_gate", None)
+    effective_handoff_state = handoff_state
+    effective_handoff_reason = handoff_reason
+
+    # Stage 10: when operational mode is enabled, avoid generic diagnostic-shadow
+    # fallback labels for non-active go_frame_sync states. If a concrete failed
+    # gate exists in handoff_gate_failures, surface it as blocking_gate and use
+    # its reason before applying legacy defaults.
+    if source == "go_frame_sync" and go_refiner_operational_enabled:
+        if not blocking_gate and isinstance(handoff_gate_failures, dict):
+            for section_name in ("python_base", "go_readiness", "phase_readiness"):
+                gates = handoff_gate_failures.get(section_name) or {}
+                if not isinstance(gates, dict):
+                    continue
+                selected = None
+                for gate_name, gate_state in gates.items():
+                    if not isinstance(gate_state, dict):
+                        continue
+                    if gate_state.get("passed") is False:
+                        selected = (gate_name, gate_state)
+                        break
+                if selected is None:
+                    continue
+                gate_name, gate_state = selected
+                blocking_gate = f"{section_name}.{gate_name}"
+                if not effective_handoff_reason:
+                    effective_handoff_reason = str(gate_state.get("reason") or blocking_gate)
+                break
+
+        is_active_go_operational = (
+            period_authority == "go_refined"
+            and sync_authority == "go_runtime"
+            and str(effective_handoff_state or "") == "GO_REFINED_READY"
+        )
+        if not is_active_go_operational and not blocking_gate:
+            blocking_gate = "go_readiness.unclassified_state"
+        if not is_active_go_operational and not effective_handoff_reason:
+            effective_handoff_reason = "go_state_unclassified"
+        if not effective_handoff_state:
+            if blocking_gate and str(blocking_gate).startswith("python_base."):
+                effective_handoff_state = "BOOTSTRAPPING_PY"
+            elif blocking_gate and str(blocking_gate).startswith("go_readiness."):
+                effective_handoff_state = "GO_REFINING"
+            elif blocking_gate and str(blocking_gate).startswith("phase_readiness."):
+                effective_handoff_state = "GO_REFINING"
+            else:
+                effective_handoff_state = "UNTRUSTED"
+
+    go_operational_active = bool(getattr(sync, "go_operational_active", False))
+    if (
+        not go_operational_active
+        and period_authority == "go_refined"
+        and sync_authority == "go_runtime"
+        and str(effective_handoff_state or "") == "GO_REFINED_READY"
+    ):
+        # Keep serialization consistent if an older in-memory state did not set
+        # go_operational_active despite Go being the active authority.
+        go_operational_active = True
+
     payload.update({
         "base_period_s": base_period_s,
         "period_delta_s": period_delta_s,
@@ -944,14 +1003,14 @@ def _live_sync_state_to_dict(
         "phase_authority": phase_authority,
         "phase_blocking_gate": getattr(sync, "phase_blocking_gate", None),
         "phase_blocking_reason": getattr(sync, "phase_blocking_reason", None),
-        "blocking_gate": getattr(sync, "blocking_gate", None),
-        "handoff_state": handoff_state or (
+        "blocking_gate": blocking_gate,
+        "handoff_state": effective_handoff_state or (
             "UNTRUSTED" if source == "go_frame_sync" else
             "GO_REFINING" if period_authority == "py_refined" else
             "BASE_PERIOD_READY" if period_authority == "py_base" else
             "BOOTSTRAPPING_PY"
         ),
-        "handoff_reason": handoff_reason or (
+        "handoff_reason": effective_handoff_reason or (
             "go_diagnostic_shadow" if source == "go_frame_sync" else
             "sync_state_unavailable"
         ),
@@ -1007,7 +1066,7 @@ def _live_sync_state_to_dict(
         "go_refined_period_delta_s": period_delta_s if period_authority == "go_refined" else None,
         "python_base_period_s": base_period_s,
         "go_operational_enabled": bool(go_refiner_operational_enabled),
-        "go_operational_active": bool(getattr(sync, "go_operational_active", False)),
+        "go_operational_active": go_operational_active,
         "operational_source_path": _source_path_from_period_authority(period_authority),
         "consistency_warnings": consistency_warnings,
         "fit_icao_count": getattr(sync, "fit_icao_count", None),
