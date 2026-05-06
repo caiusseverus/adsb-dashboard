@@ -1465,6 +1465,16 @@ async def get_iid_chart_history(
             since_burst_seq=since_burst_seq,
             since_df11_seq=since_df11_seq,
         )
+        monitor = payload.get("population_residual_monitor")
+        if isinstance(monitor, dict):
+            now_ts = time.time()
+            monitor["population_summary_source"] = "chart_history"
+            generated_ts = monitor.get("population_summary_generated_ts")
+            if generated_ts is not None:
+                try:
+                    monitor["population_summary_lag_s"] = max(0.0, now_ts - float(generated_ts))
+                except (TypeError, ValueError):
+                    pass
         payload["request"] = {
             "window_s": window_s,
             "max_burst_points": _mbp,

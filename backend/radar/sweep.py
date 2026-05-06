@@ -1075,6 +1075,8 @@ def _live_sync_state_to_dict(
         "fit_segment_count": getattr(sync, "fit_segment_count", None),
         "population_validation_state": getattr(sync, "population_validation_state", None),
         "population_validation_reason": getattr(sync, "population_validation_reason", None),
+        "population_used_for_authority": True,
+        "population_authority_source": "current_sync_state.population_validation_state",
     })
 
     # --- Stage 3R diagnostic summaries derived from handoff gate results ---
@@ -4454,11 +4456,11 @@ class RadarState:
             phase_anchor_spread_deg = None
             phase_anchor_since_ts = None
             phase_basis = "sweep_epoch_only"
-            phase_status = "untrusted"
             phase_anchor_retention_reason = None
             last_phase_anchor_clear_ts = getattr(existing, "last_phase_anchor_clear_ts", None) if existing is not None else None
             go_sync_unusable_reason_at_clear = getattr(existing, "go_sync_unusable_reason_at_clear", None) if existing is not None else None
             if previous_phase_anchor_icao:
+                phase_status = "untrusted"
                 if holdover:
                     phase_anchor_clear_reason = "holdover"
                 elif not period_agrees:
@@ -4479,6 +4481,7 @@ class RadarState:
                 last_phase_anchor_clear_ts = last_updated
                 go_sync_unusable_reason_at_clear = go_sync_unusable_reason or None
             else:
+                phase_status = previous_phase_status or None
                 phase_anchor_clear_reason = "no_anchor"
                 phase_basis_override_reason = "serialization_fallback_no_anchor"
         self._live_sync_states[iid] = LiveSyncState(
@@ -8048,6 +8051,44 @@ class RadarState:
     ) -> dict:
         return _build_sync_mode_diagnostics_helper(self, iid, sync, alignment_status)
 
+    def _annotate_population_monitor_payload(
+        self,
+        monitor: dict,
+        *,
+        sync: LiveSyncState | None,
+        source: str,
+        generated_ts: float,
+    ) -> dict:
+        payload = dict(monitor or {})
+        current_anchor_icao = getattr(sync, "phase_anchor_icao", None) if sync is not None else None
+        windowed_anchor_icao = payload.get("anchor_icao")
+        anchor_since_ts = getattr(sync, "phase_anchor_since_ts", None) if sync is not None else None
+        population_anchor_age_s = None
+        if anchor_since_ts is not None:
+            try:
+                population_anchor_age_s = max(0.0, float(generated_ts) - float(anchor_since_ts))
+            except (TypeError, ValueError):
+                population_anchor_age_s = None
+        current_sync_last_update_ts = getattr(sync, "last_sync_update_ts", None) if sync is not None else None
+        population_summary_lag_s = None
+        if current_sync_last_update_ts is not None:
+            try:
+                population_summary_lag_s = max(0.0, float(generated_ts) - float(current_sync_last_update_ts))
+            except (TypeError, ValueError):
+                population_summary_lag_s = None
+        payload.update({
+            "population_summary_source": source,
+            "population_anchor_source": "windowed_population_summary",
+            "population_anchor_age_s": population_anchor_age_s,
+            "population_summary_generated_ts": generated_ts,
+            "population_summary_lag_s": population_summary_lag_s,
+            "current_sync_last_update_ts": current_sync_last_update_ts,
+            "current_anchor_icao": current_anchor_icao,
+            "windowed_anchor_icao": windowed_anchor_icao,
+            "population_used_for_authority": False,
+        })
+        return payload
+
     def get_burst_sync_timeline(self, iid: int, window_s: float = 60.0) -> dict:
         """Return burst-centre sync observations with residuals for verification plotting.
 
@@ -8229,7 +8270,12 @@ class RadarState:
                 "burst_sync_diagnostic": burst_sync_diagnostic,
                 "recorded_event_diagnostics": recorded_event_diagnostics,
                 "recorded_event_time_notice": "Chart points use event-time authority snapshots; current authority is shown separately.",
-                "population_residual_monitor": compute_population_residual_summary([], sync, iid).to_api_dict(),
+                "population_residual_monitor": self._annotate_population_monitor_payload(
+                    compute_population_residual_summary([], sync, iid).to_api_dict(),
+                    sync=sync,
+                    source="burst_sync_timeline",
+                    generated_ts=time.time(),
+                ),
             }
 
         if not _sync_source_has_rich_python_diagnostics(sync):
@@ -8373,7 +8419,12 @@ class RadarState:
                 "radar_position_source": radar_pos.get("source", "none"),
                 "no_obs_reason": None,
             }
-            population_monitor = compute_population_residual_summary(entries, sync, iid).to_api_dict()
+            population_monitor = self._annotate_population_monitor_payload(
+                compute_population_residual_summary(entries, sync, iid).to_api_dict(),
+                sync=sync,
+                source="burst_sync_timeline",
+                generated_ts=time.time(),
+            )
             sync_state_payload.update(
                 _build_discontinuity_population_diagnostics(sync_state_payload, population_monitor)
             )
@@ -8754,7 +8805,12 @@ class RadarState:
             ),
             "alignment_status": alignment_status,
             "sync_mode_diagnostics": sync_mode_diagnostics,
-            "population_residual_monitor": compute_population_residual_summary(entries, sync, iid).to_api_dict(),
+            "population_residual_monitor": self._annotate_population_monitor_payload(
+                compute_population_residual_summary(entries, sync, iid).to_api_dict(),
+                sync=sync,
+                source="burst_sync_timeline",
+                generated_ts=time.time(),
+            ),
         }
 
     def get_live_sync_snapshot(self, iid: int, window_s: float = 90.0, debug_limit: int = 120) -> dict:

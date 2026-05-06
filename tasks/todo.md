@@ -470,3 +470,38 @@ Review:
 Verification:
 - `uv run --directory backend pytest tests/test_radar_sweep.py -k "go_quality_transient_retains_trusted_anchor_relative_phase or go_quality_transient_does_not_retain_through_holdover_or_stale_anchor or go_quality_transient_does_not_retain_through_population_demotion_or_period_disagreement" -q`
 - `uv run --directory backend pytest tests/test_stage3r_handoff.py tests/test_phase_semantics.py -q`
+
+## 2026-05-06 Current-Sync vs Windowed-Population Mismatch (In Progress)
+
+- [x] Trace source-of-truth paths for population summary vs current sync anchor and classify expected lag vs bug.
+- [x] Confirm authority gates consume current sync state only (not chart-history windowed population summary).
+- [x] Add explicit backend diagnostics for population source/anchor source/lag/current-vs-windowed anchors/authority-usage flag.
+- [x] Update frontend labels to distinguish hard-residual consecutive vs total counters with semantically correct totals.
+- [x] Add/update focused backend tests for new diagnostics and counter semantics.
+- [x] Run focused verification and document findings.
+
+Plan confirmation:
+- No Stage 10 changes.
+- No authority promotion changes.
+- No geographic/absolute phase semantic changes.
+- No threshold changes.
+
+Review:
+- The observed mismatch is expected in this architecture: the population panel consumes windowed event-history summary from chart-history, while current phase authority uses the current live sync state.
+- Source trace:
+  - Windowed population summary is built in `get_burst_sync_timeline()` via `compute_population_residual_summary(entries, sync, iid)` and then passed through `get_chart_history()` as `population_residual_monitor`.
+  - Current sync anchor/phase fields come from `get_live_sync_snapshot()` / `_live_sync_state_to_dict()`.
+  - UI intentionally compares these two snapshots in the “Population phase agreement (windowed/event-history)” panel.
+- Authority-gate confirmation: `_evaluate_phase_authority_gates_locked()` reads only `LiveSyncState` fields (`population_validation_state`, `phase_anchor_*`, `phase_status`) and does not consume chart-history population summary.
+- Added diagnostics to make stale/windowed vs current explicit:
+  - `population_summary_source`, `population_anchor_source`, `population_anchor_age_s`, `population_summary_generated_ts`, `population_summary_lag_s`, `current_sync_last_update_ts`, `current_anchor_icao`, `windowed_anchor_icao`, `population_used_for_authority` (false in windowed monitor).
+  - Added sync-state authority indicator fields: `population_used_for_authority` (true) and `population_authority_source`.
+  - Chart-history API now rewrites monitor source to `chart_history` and updates `population_summary_lag_s` at response time.
+- Hard residual reject counters:
+  - The prior UI “total” used `holdover_hard_residual_reject` (holdover-specific), which can disagree with the consecutive counter.
+  - Updated UI to show `consecutive_hard_residual_rejects / update_epoch_reject_hard_residual` as the main pair and display holdover hard-residual rejects separately.
+
+Verification:
+- `uv run --directory backend pytest tests/test_radar_sweep.py -k "population_summary_source or population_authority_flags_are_current_state_based or go_quality_transient" -q`
+- `uv run --directory backend pytest tests/test_radar_api.py -k "chart_history or sync_snapshot" -q`
+- `cd frontend && npm run build`

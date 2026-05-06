@@ -511,6 +511,31 @@ def test_get_burst_sync_timeline_includes_non_sync_driving_observations():
     assert retention["timeline"]["oldest_burst_centroid_us"] == pytest.approx(4_100_000.0)
     assert retention["timeline"]["newest_burst_centroid_us"] == pytest.approx(8_200_000.0)
     assert retention["timeline"]["retained_duration_s"] == pytest.approx(4.1)
+    population = timeline["population_residual_monitor"]
+    assert population["population_summary_source"] == "burst_sync_timeline"
+    assert population["population_anchor_source"] == "windowed_population_summary"
+    assert population["population_used_for_authority"] is False
+    assert "current_anchor_icao" in population
+    assert "windowed_anchor_icao" in population
+    assert "population_summary_lag_s" in population
+
+
+def test_sync_state_population_authority_flags_are_current_state_based():
+    sync = LiveSyncState(
+        iid=33,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=time.time(),
+        source="multi_aircraft_burst",
+        usable=True,
+        population_validation_state="pass",
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["population_used_for_authority"] is True
+    assert payload["population_authority_source"] == "current_sync_state.population_validation_state"
 
 
 def test_burst_residual_recorded_events_are_immutable_across_period_change(monkeypatch):

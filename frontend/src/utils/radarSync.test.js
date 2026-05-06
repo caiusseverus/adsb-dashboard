@@ -6,6 +6,7 @@ import {
   fmtNumber,
   selectCurrentSyncState,
   isWindowedPopulationAnchorMismatch,
+  formatHardResidualRejectCounters,
 } from './radarSync.js'
 
 describe('radarSync', () => {
@@ -100,6 +101,28 @@ describe('radarSync', () => {
       assert.strictEqual(isWindowedPopulationAnchorMismatch('4D2270', 'AAD213'), true)
       assert.strictEqual(isWindowedPopulationAnchorMismatch('4D2270', '4D2270'), false)
       assert.strictEqual(isWindowedPopulationAnchorMismatch('4D2270', null), false)
+    })
+  })
+
+  describe('diagnostic formatting fallbacks', () => {
+    it('formats missing discontinuity fields safely', () => {
+      const syncState = {
+        go_diagnostic_fit_epoch_reset_reason: 'phase_offset_discontinuity',
+        go_diagnostic_phase_offset_discontinuity_old_deg: null,
+        go_diagnostic_phase_offset_discontinuity_new_deg: undefined,
+      }
+      assert.strictEqual(fmtNumber(syncState.go_diagnostic_phase_offset_discontinuity_old_deg, 2), '-')
+      assert.strictEqual(fmtNumber(syncState.go_diagnostic_phase_offset_discontinuity_new_deg, 2), '-')
+    })
+
+    it('formats hard residual reject counters with consistent fields', () => {
+      const counters = formatHardResidualRejectCounters({
+        go_diagnostic_consecutive_hard_residual_rejects: 2,
+        update_epoch_reject_hard_residual: 9,
+        holdover_hard_residual_reject: 4,
+      })
+      assert.strictEqual(counters.primaryLabel, '2 consecutive / 9 epoch-reject total')
+      assert.strictEqual(counters.holdoverLabel, '4')
     })
   })
 })

@@ -27,6 +27,7 @@ import {
   fmtNumber,
   selectCurrentSyncState,
   isWindowedPopulationAnchorMismatch,
+  formatHardResidualRejectCounters,
 } from '../utils/radarSync'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
@@ -2273,8 +2274,13 @@ function PopulationResidualMonitorPanel({ monitor, identity, currentAnchorIcao }
         <span className={styles.metricPill}>Chart snapshot ts <span className={styles.metricValue}>{snapshotTsLabel}</span></span>
         <span className={styles.metricPill}>Summary ts <span className={styles.metricValue}>{summaryTsLabel}</span></span>
         <span className={styles.metricPill}>Window <span className={styles.metricValue}>{identity?.summaryWindowS ?? window_s ?? '—'}s</span></span>
+        <span className={styles.metricPill}>Summary source <span className={styles.metricValue}>{monitor?.population_summary_source ?? '—'}</span></span>
+        <span className={styles.metricPill}>Anchor source <span className={styles.metricValue}>{monitor?.population_anchor_source ?? '—'}</span></span>
+        <span className={styles.metricPill}>Summary lag <span className={styles.metricValue}>{monitor?.population_summary_lag_s != null ? `${Number(monitor.population_summary_lag_s).toFixed(1)}s` : '—'}</span></span>
+        <span className={styles.metricPill}>Population used for authority <span className={styles.metricValue}>{monitor?.population_used_for_authority ? 'yes' : 'no'}</span></span>
         <span className={styles.metricPill}>Anchor (windowed) <span className={styles.metricValue}>{anchor_icao ?? '—'}</span></span>
         <span className={styles.metricPill}>Anchor (current sync) <span className={styles.metricValue}>{currentAnchorIcao ?? '—'}</span></span>
+        <span className={styles.metricPill}>Anchor age (current) <span className={styles.metricValue}>{monitor?.population_anchor_age_s != null ? `${Number(monitor.population_anchor_age_s).toFixed(1)}s` : '—'}</span></span>
       </div>
       {hasAnchorMismatch && (
         <div style={{
@@ -2446,6 +2452,14 @@ function SyncModeStatusPanel({
             {syncState.operational_refinement_unavailable_reason
               ? `Operational refinement unavailable: ${humanizeSyncReason(syncState.operational_refinement_unavailable_reason)}. `
               : ''}
+            {syncState.handoff_reason === 'go_sync_unusable' && (
+              `Go sync unusable: ${humanizeSyncReason(syncState.go_diagnostic_go_sync_unusable_reason || 'go_sync_unusable')}. ` +
+              `quality ${syncState.go_diagnostic_go_sync_usable_quality_ok ? 'ok' : 'fail'} (${fmtNumber(syncState.go_diagnostic_go_sync_usable_quality_value, 3)}), ` +
+              `holdover ${syncState.go_diagnostic_go_sync_usable_holdover_ok ? 'ok' : 'fail'}, ` +
+              `period ${syncState.go_diagnostic_go_sync_usable_period_agrees ? 'ok' : 'fail'} ` +
+              `${syncState.go_diagnostic_go_sync_usable_period_reject_reason ? `(${humanizeSyncReason(syncState.go_diagnostic_go_sync_usable_period_reject_reason)})` : ''}, ` +
+              `strict gate ${syncState.go_diagnostic_go_sync_usable_strict_gate_pass ? 'ok' : 'fail'}.`
+            )}
             {compact.period_reject_reason ? `Period refinement rejected: ${humanizeSyncReason(compact.period_reject_reason)}. ` : ''}
             {syncState.last_handoff_transition_ts ? `Last handoff transition: ${new Date(Number(syncState.last_handoff_transition_ts) * 1000).toLocaleTimeString()}. ` : ''}
             {collectBlockingHandoffGates(syncState).length ? `Blocking gates: ${collectBlockingHandoffGates(syncState).join(', ')}. ` : ''}
@@ -2486,6 +2500,18 @@ function SyncModeStatusPanel({
               : ''}
             {syncState.go_diagnostic_hard_bound_reason ? `Reason: ${humanizeSyncReason(syncState.go_diagnostic_hard_bound_reason)}. ` : ''}
             {syncState.go_diagnostic_fit_epoch_reset_reason ? `Fit epoch reset: ${humanizeSyncReason(syncState.go_diagnostic_fit_epoch_reset_reason)}.` : ''}
+            {syncState.go_diagnostic_fit_epoch_reset_reason === 'phase_offset_discontinuity' ? (
+              ` discontinuity old/new/Δ/thr = ` +
+              `${fmtNumber(syncState.go_diagnostic_phase_offset_discontinuity_old_deg, 2)} / ` +
+              `${fmtNumber(syncState.go_diagnostic_phase_offset_discontinuity_new_deg, 2)} / ` +
+              `${fmtNumber(syncState.go_diagnostic_phase_offset_discontinuity_delta_deg, 2)} / ` +
+              `${fmtNumber(syncState.go_diagnostic_phase_offset_discontinuity_threshold_deg, 2)} deg; ` +
+              `epoch ${syncState.go_diagnostic_phase_offset_discontinuity_fit_epoch_id ?? '—'} ` +
+              `current/candidate ${fmtNumber(syncState.go_diagnostic_phase_offset_discontinuity_current_phase_epoch_us, 0, 'us')} / ${fmtNumber(syncState.go_diagnostic_phase_offset_discontinuity_candidate_epoch_us, 0, 'us')}; ` +
+              `ref ${syncState.go_diagnostic_phase_offset_discontinuity_previous_ref_icao || '—'} -> ${syncState.go_diagnostic_phase_offset_discontinuity_current_ref_icao || '—'} ` +
+              `${syncState.go_diagnostic_phase_offset_discontinuity_reference_changed ? '(changed)' : ''}; ` +
+              `basis ${syncState.go_diagnostic_phase_offset_discontinuity_basis_note || '—'}.`
+            ) : ''}
           </div>
         </div>
 
@@ -2880,6 +2906,7 @@ function RotationAlignmentPanel({
   const syncHorizons = burstTimeline?.sync_horizons ?? null
   const legacyIcaosRaw = Array.isArray(legacyTimeline?.icaos) ? legacyTimeline.icaos : []
   const syncState = selectCurrentSyncState(syncSnapshot, burstTimeline)
+  const hardRejectCounters = formatHardResidualRejectCounters(syncState)
   const phaseIdentity = useMemo(() => ({
     source: syncSnapshot?.transport?.source ?? 'compact_sync_snapshot',
     syncSequence: syncSnapshot?.sequence ?? streamStatus.sequence ?? null,
@@ -3553,7 +3580,8 @@ function RotationAlignmentPanel({
           <span className={styles.metricPill}>Diag: reacquired provisional <span className={styles.metricValue}>{syncState?.go_diagnostic_sync_reacquired_provisional ? 'yes' : 'no'}</span></span>
           <span className={styles.metricPill}>Diag: epoch update A/R <span className={styles.metricValue}>{syncState?.update_epoch_accepts ?? 0}/{syncState?.update_epoch_rejects ?? 0}</span></span>
           <span className={styles.metricPill}>Diag: last epoch reject <span className={styles.metricValue}>{formatAuthorityLabel(syncState?.last_update_epoch_reject_reason)}</span></span>
-          <span className={styles.metricPill}>Diag: hard residual rejects <span className={styles.metricValue}>{syncState?.go_diagnostic_consecutive_hard_residual_rejects ?? 0} consecutive / {syncState?.holdover_hard_residual_reject ?? 0} total</span></span>
+          <span className={styles.metricPill}>Diag: hard residual rejects <span className={styles.metricValue}>{hardRejectCounters.primaryLabel}</span></span>
+          <span className={styles.metricPill}>Diag: holdover hard residual rejects <span className={styles.metricValue}>{hardRejectCounters.holdoverLabel}</span></span>
           <span className={styles.metricPill}>Diag: last epoch nAircraft/refAge <span className={styles.metricValue}>
             {syncState?.last_update_epoch_n_aircraft != null
               ? `${syncState.last_update_epoch_n_aircraft}/${fmtNumber(syncState?.last_update_epoch_ref_pos_age_s, 1, 's')}`

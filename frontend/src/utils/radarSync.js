@@ -69,3 +69,13 @@ export function isWindowedPopulationAnchorMismatch(currentAnchorIcao, windowedAn
   if (!currentAnchorIcao || !windowedAnchorIcao) return false
   return String(currentAnchorIcao) !== String(windowedAnchorIcao)
 }
+
+export function formatHardResidualRejectCounters(syncState) {
+  const consecutive = Number(syncState?.go_diagnostic_consecutive_hard_residual_rejects ?? 0)
+  const epochRejectTotal = Number(syncState?.update_epoch_reject_hard_residual ?? 0)
+  const holdoverTotal = Number(syncState?.holdover_hard_residual_reject ?? 0)
+  return {
+    primaryLabel: `${consecutive} consecutive / ${epochRejectTotal} epoch-reject total`,
+    holdoverLabel: `${holdoverTotal}`,
+  }
+}
