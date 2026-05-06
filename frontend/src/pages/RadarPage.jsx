@@ -2410,6 +2410,11 @@ function SyncModeStatusPanel({
           <span className={styles.metricPill} title="Handoff/operational-level authority. Separate from anchor-relative phase trust. py_bootstrap / unavailable when RADAR_SYNC_GO_REFINER_OPERATIONAL is disabled, even if anchor-relative phase is trusted.">Phase authority <span className={styles.metricValue}>{formatAuthorityLabel(syncState.phase_authority)}</span></span>
           <span className={styles.metricPill}>Handoff state <span className={styles.metricValue}>{formatAuthorityLabel(syncState.handoff_state)}</span></span>
           <span className={styles.metricPill}>Handoff reason <span className={styles.metricValue}>{formatAuthorityLabel(syncState.handoff_reason)}</span></span>
+          <span className={styles.metricPill}>Go operational flag <span className={styles.metricValue}>{syncState.go_operational_enabled ? 'enabled' : 'disabled'}</span></span>
+          <span className={styles.metricPill}>Go operational active <span className={styles.metricValue}>{syncState.go_operational_active ? 'yes' : 'no'}</span></span>
+          {syncState.blocking_gate && (
+            <span className={styles.metricPill} style={{ color: '#ff7b72' }}>Blocking gate <span className={styles.metricValue}>{syncState.blocking_gate}</span></span>
+          )}
           <span className={styles.metricPill}>Refinement status <span className={styles.metricValue}>{formatAuthorityLabel(syncState.operational_period_refinement_status)}</span></span>
           <span className={styles.metricPill}>Effective period source <span className={styles.metricValue}>{formatAuthorityLabel(syncState.effective_period_source)}</span></span>
           <span className={styles.metricPill}>Period Δ source <span className={styles.metricValue}>{formatAuthorityLabel(syncState.period_delta_source)}</span></span>

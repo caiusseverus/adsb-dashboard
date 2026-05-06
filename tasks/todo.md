@@ -505,3 +505,37 @@ Verification:
 - `uv run --directory backend pytest tests/test_radar_sweep.py -k "population_summary_source or population_authority_flags_are_current_state_based or go_quality_transient" -q`
 - `uv run --directory backend pytest tests/test_radar_api.py -k "chart_history or sync_snapshot" -q`
 - `cd frontend && npm run build`
+
+## 2026-05-06 Stage 10 Controlled Go Authority Promotion (In Progress)
+
+- [ ] Run GitNexus impact analysis on Stage 10 touchpoints (`_apply_go_handoff_state_locked`, phase absolute normalisation helpers, sync snapshot/API summary serializers, RadarPage authority diagnostics) and record blast radius/risk.
+- [ ] Implement backend Go operational promotion gating behind `RADAR_SYNC_GO_REFINER_OPERATIONAL` with controlled handoff semantics and fallback to Python base/bootstrap.
+- [ ] Implement/extend hysteresis for Go operational activation/demotion to avoid flapping while preserving hard-failure immediate demotion.
+- [ ] Preserve phase semantics split: trusted anchor-relative may be trusted for internal use but remains non-absolute/non-geographic; geographic absolute remains unchanged and gated by geographic basis/offset validity.
+- [ ] Expose/confirm Stage 10 operational diagnostics fields in sync snapshot/state payloads (`operational_period_source`, `operational_period_s`, `go_refined_period_delta_s`, `python_base_period_s`, `go_operational_enabled`, `go_operational_active`, `blocking_gate`, authorities, handoff fields).
+- [ ] Update RadarPage diagnostics text/labels only as needed to clearly distinguish go-ready-disabled, go-active, Python fallback, and anchor-relative-not-geographic.
+- [ ] Add backend tests for: flag disabled ready-state behavior; flag enabled promotion behavior; gate-failure blocking reasons; phase absolute semantics; hysteresis promotion/demotion behavior; contamination gate semantics.
+- [ ] Run focused verification (`pytest` targeted files + frontend build as needed), then add review/results here.
+
+Plan confirmation:
+- No period tolerance/residual-threshold changes.
+- No chart rendering changes.
+- No removal of diagnostics.
+- No geographic-phase claims from anchor-relative basis.
+- No Python fallback removal.
+- No Stage 8 contamination algorithm changes.
+
+Review (Stage 10 progress):
+- Added controlled Go operational promotion in `_apply_go_handoff_state_locked` behind `RADAR_SYNC_GO_REFINER_OPERATIONAL` with explicit `go_operational_enabled`/`go_operational_active` state.
+- Added promotion hysteresis (`_GO_OPERATIONAL_PROMOTION_CONSECUTIVE=3`) and short soft-failure holdover (`_GO_OPERATIONAL_SOFT_FAILURE_HOLD_S=3.0`) while keeping immediate demotion for hard safety failures (holdover/unusable/base-invalid/base-disagree/contaminated/effective-invalid).
+- Preserved diagnostic-only behavior when flag is false (`GO_REFINED_READY` + `go_ready_flag_disabled`), Python fallback authority, and Stage 8 contamination gate semantics.
+- Added/extended sync payload fields: `operational_period_source`, `operational_period_s`, `go_refined_period_delta_s`, `python_base_period_s`, `blocking_gate`, `go_operational_enabled`, `go_operational_active`.
+- Kept anchor-relative vs geographic absolute semantics untouched; no geographic claims are made from anchor-relative trust.
+- Updated Radar page authority diagnostics to show Go operational flag/active state and current blocking gate.
+- Updated backend tests for new operational handoff reason (`go_runtime_operational`) and hysteresis behavior, including transient-ready and soft-failure holdover coverage.
+
+Verification:
+- `uv run --directory backend pytest tests/test_stage3r_handoff.py -q`
+- `uv run --directory backend pytest tests/test_radar_sweep.py -k "stage5_flag_enabled_go_ready or stage5_flag_disabled_go_ready or operational_full" -q`
+- `uv run --directory backend pytest tests/test_phase_semantics.py tests/test_radar_api.py -k "sync_state or sync_summary or phase_is_absolute or phase_absolute_available or handoff_reason" -q`
+- `cd frontend && npm run build`

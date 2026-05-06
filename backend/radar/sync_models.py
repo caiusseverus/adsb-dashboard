@@ -169,6 +169,9 @@ class LiveSyncState:
     contamination_secondary_support_ratio: float | None = None
     phase_blocking_gate: str | None = None
     phase_blocking_reason: str | None = None
+    blocking_gate: str | None = None
+    go_operational_enabled: bool = False
+    go_operational_active: bool = False
     previous_phase_anchor_icao: str | None = None
     previous_phase_anchor_age_s: float | None = None
     previous_phase_status: str | None = None

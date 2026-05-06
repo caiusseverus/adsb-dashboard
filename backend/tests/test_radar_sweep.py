@@ -4231,6 +4231,11 @@ def _make_state_with_stable_history(iid: int, period_s: float = 4.0) -> RadarSta
     return state
 
 
+def _drive_go_handoff_cycles(state: RadarState, iid: int, cycles: int = 3) -> None:
+    for _ in range(cycles):
+        state._apply_go_handoff_state_locked(iid)
+
+
 def test_stage5_flag_disabled_go_stays_diagnostic(monkeypatch):
     """With RADAR_SYNC_GO_REFINER_OPERATIONAL=False (default), Go refiner
     remains diagnostic even when readiness gates pass."""
@@ -4269,11 +4274,12 @@ def test_stage5_flag_enabled_go_ready_becomes_operational(monkeypatch):
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
     state = _make_state_with_stable_history(200)
     state.update_go_iid_state(_go_sync_for_gates(200, 4.0))
+    _drive_go_handoff_cycles(state, 200, cycles=3)
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(200))
     assert payload["period_authority"] == "go_refined"
     assert payload["sync_authority"] == "go_runtime"
     assert payload["handoff_state"] == "GO_REFINED_READY"
-    assert payload["handoff_reason"] == "go_ready"
+    assert payload["handoff_reason"] == "go_runtime_operational"
     assert payload["go_refiner_operational_enabled"] is True
     assert state._go_operational_by_iid.get(200, False) is True
 
@@ -4289,6 +4295,7 @@ def test_stage5_flag_enabled_go_ready_effective_equals_base_plus_delta(monkeypat
         "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1,
         "bps": 4.0, "eps": 4.001, "pag": True, "pds": 0.001,
     })
+    _drive_go_handoff_cycles(state, 201, cycles=3)
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(201))
     assert payload["period_authority"] == "go_refined"
     base = payload["base_period_s"]
@@ -4307,6 +4314,7 @@ def test_stage5_flag_enabled_go_ready_effective_period_source_is_go(monkeypatch)
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
     state = _make_state_with_stable_history(202)
     state.update_go_iid_state(_go_sync_for_gates(202, 4.0))
+    _drive_go_handoff_cycles(state, 202, cycles=3)
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(202))
     assert payload["period_authority"] == "go_refined"
     assert payload["effective_period_source"] == "go_runtime.base_period_s"
@@ -4379,6 +4387,7 @@ def test_stage5_transition_recorded_when_go_becomes_operational(monkeypatch):
     _inject_stable_period_history(state, 400, 4.0)
     _inject_stable_slope_history(state, 400, near_zero=True)
     state.update_go_iid_state(_go_sync_for_gates(400, 4.0))
+    _drive_go_handoff_cycles(state, 400, cycles=3)
     payload = sweep._live_sync_state_to_dict(
         state.get_live_sync_state(400),
         authority_transitions=state._period_authority_transitions.get(400),
@@ -4397,6 +4406,7 @@ def test_stage5_transition_recorded_when_go_loses_operational(monkeypatch):
     state = _make_state_with_stable_history(401)
     # Make Go operational first
     state.update_go_iid_state(_go_sync_for_gates(401, 4.0))
+    _drive_go_handoff_cycles(state, 401, cycles=3)
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(401))
     assert payload["period_authority"] == "go_refined"
     # Now make Go lose readiness (period disagrees)
@@ -4421,6 +4431,7 @@ def test_stage5_py_shadow_fields_present_when_go_operational(monkeypatch):
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
     state = _make_state_with_stable_history(500)
     state.update_go_iid_state(_go_sync_for_gates(500, 4.0))
+    _drive_go_handoff_cycles(state, 500, cycles=3)
     assert state._go_operational_by_iid.get(500, False) is True
     # Simulate Python running and writing shadow data
     state._py_shadow_sync_states[500] = {
@@ -4524,6 +4535,7 @@ def test_stage5_only_one_operational_delta_exposed(monkeypatch):
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
     state = _make_state_with_stable_history(601)
     state.update_go_iid_state(_go_sync_for_gates(601, 4.0))
+    _drive_go_handoff_cycles(state, 601, cycles=3)
     state._py_shadow_sync_states[601] = {
         "py_shadow_period_delta_s": 0.001,
         "py_shadow_period_correction_ppm": 250.0,
@@ -4622,6 +4634,7 @@ def test_stage5_flag_enabled_go_ready_operational_full(monkeypatch):
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
     state = _make_state_with_stable_history(801)
     state.update_go_iid_state(_go_sync_for_gates(801, 4.0))
+    _drive_go_handoff_cycles(state, 801, cycles=3)
     payload = sweep._live_sync_state_to_dict(
         state.get_live_sync_state(801),
         go_sync=state.get_go_live_sync_state(801) or {},
@@ -4632,7 +4645,7 @@ def test_stage5_flag_enabled_go_ready_operational_full(monkeypatch):
     assert payload["sync_authority"] == "go_runtime"
     assert payload["operational_go_ready"] is True
     assert payload["handoff_state"] == "GO_REFINED_READY"
-    assert payload["handoff_reason"] == "go_ready"
+    assert payload["handoff_reason"] == "go_runtime_operational"
     assert payload["go_refiner_operational_enabled"] is True
 
 

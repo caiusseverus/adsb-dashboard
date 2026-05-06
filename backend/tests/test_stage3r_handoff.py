@@ -65,6 +65,11 @@ def _inject_stable_period_history(state: RadarState, iid: int, period_s: float =
     )
 
 
+def _drive_go_handoff_cycles(state: RadarState, iid: int, cycles: int = 3) -> None:
+    for _ in range(cycles):
+        state._apply_go_handoff_state_locked(iid)
+
+
 # ===========================================================================
 # 1. sync_authority=go_runtime requires Go-readiness gates
 # ===========================================================================
@@ -93,6 +98,7 @@ def test_go_runtime_becomes_authority_when_all_gates_pass(monkeypatch):
     _inject_stable_period_history(state, 1002, 4.0)
     _inject_stable_slope_history(state, 1002, near_zero=True)
     state.update_go_iid_state(_go_sync_for_gates(1002, 4.0))
+    _drive_go_handoff_cycles(state, 1002, cycles=3)
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(1002))
     assert payload["period_authority"] == "go_refined"
     assert payload["sync_authority"] == "go_runtime"
@@ -111,6 +117,7 @@ def test_go_period_authority_without_phase_authority(monkeypatch):
     _inject_stable_period_history(state, 1010, 4.0)
     _inject_stable_slope_history(state, 1010, near_zero=True)
     state.update_go_iid_state(_go_sync_for_gates(1010, 4.0))
+    _drive_go_handoff_cycles(state, 1010, cycles=3)
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(1010))
     # Period authority should be Go, but no phase anchor → phase authority not go_runtime.
     assert payload["period_authority"] == "go_refined"
@@ -147,7 +154,7 @@ def _setup_go_state_for_phase_test(state: RadarState, iid: int, period_s: float,
     state.update_go_iid_state(_go_sync_for_gates(iid, period_s))
     with state._lock:
         state._live_sync_states[iid] = sync
-    state._apply_go_handoff_state_locked(iid)
+    _drive_go_handoff_cycles(state, iid, cycles=3)
 
 
 def test_phase_authority_blocked_by_stale_anchor_age(monkeypatch):
@@ -510,11 +517,41 @@ def test_handoff_state_go_refined_ready_operational(monkeypatch):
     _inject_stable_period_history(state, 5007, 4.0)
     _inject_stable_slope_history(state, 5007, near_zero=True)
     state.update_go_iid_state(_go_sync_for_gates(5007, 4.0))
+    _drive_go_handoff_cycles(state, 5007, cycles=3)
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(5007))
     assert payload["handoff_state"] == "GO_REFINED_READY"
     assert payload["period_authority"] == "go_refined"
     assert payload["sync_authority"] == "go_runtime"
-    assert payload["handoff_reason"] == "go_ready"
+    assert payload["handoff_reason"] == "go_runtime_operational"
+
+
+def test_handoff_hysteresis_requires_sustained_ready(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = _make_state_with_python_model(5008)
+    _inject_stable_period_history(state, 5008, 4.0)
+    _inject_stable_slope_history(state, 5008, near_zero=True)
+    state.update_go_iid_state(_go_sync_for_gates(5008, 4.0))
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(5008))
+    assert payload["period_authority"] == "py_base"
+    assert payload["handoff_reason"] == "go_ready_pending_hysteresis"
+    assert payload["blocking_gate"] == "go_readiness_hysteresis"
+
+
+def test_handoff_soft_failure_holdover_delays_demotion(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = _make_state_with_python_model(5009)
+    _inject_stable_period_history(state, 5009, 4.0)
+    _inject_stable_slope_history(state, 5009, near_zero=True)
+    state.update_go_iid_state(_go_sync_for_gates(5009, 4.0))
+    _drive_go_handoff_cycles(state, 5009, cycles=3)
+    with state._lock:
+        state._go_sync_states_by_iid[5009]["n_sync_frames"] = 1
+    state._apply_go_handoff_state_locked(5009)
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(5009))
+    assert payload["period_authority"] == "go_refined"
+    assert str(payload["handoff_reason"]).startswith("go_soft_failure_holdover:")
 
 
 # ===========================================================================
@@ -687,6 +724,7 @@ def test_stable_period_and_converged_slope_enables_go_operational(monkeypatch):
     _inject_stable_period_history(state, 8005, 4.0)
     _inject_stable_slope_history(state, 8005, near_zero=True)
     state.update_go_iid_state(_go_sync_for_gates(8005, 4.0))
+    _drive_go_handoff_cycles(state, 8005, cycles=3)
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(8005))
     assert payload["sync_authority"] == "go_runtime"
     assert payload["period_authority"] == "go_refined"
@@ -868,6 +906,7 @@ def test_single_family_permits_go_readiness(monkeypatch):
         ("DDDDDD", -1.5), ("DDDDDD", 0.3), ("DDDDDD", -0.1),
     ])
     state.update_go_iid_state(_go_sync_for_gates(9102, 4.0))
+    _drive_go_handoff_cycles(state, 9102, cycles=3)
     updated = state.get_live_sync_state(9102)
     assert updated.handoff_state == "GO_REFINED_READY"
     assert updated.sync_authority == "go_runtime"

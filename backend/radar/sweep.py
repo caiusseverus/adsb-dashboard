@@ -136,6 +136,8 @@ _SLOPE_TREND_NEAR_ZERO_MIN_S = 10.0
 _SLOPE_TREND_REGRESSION_WINDOW_S = 30.0
 _SLOPE_TREND_REGRESSION_R2_MIN = 0.5
 _PERIOD_STABILITY_MIN_SAMPLES = 3
+_GO_OPERATIONAL_PROMOTION_CONSECUTIVE = 3
+_GO_OPERATIONAL_SOFT_FAILURE_HOLD_S = 3.0
 
 _perf_lock = threading.Lock()
 df11_event_timings: deque[float] = deque(maxlen=4000)
@@ -942,6 +944,7 @@ def _live_sync_state_to_dict(
         "phase_authority": phase_authority,
         "phase_blocking_gate": getattr(sync, "phase_blocking_gate", None),
         "phase_blocking_reason": getattr(sync, "phase_blocking_reason", None),
+        "blocking_gate": getattr(sync, "blocking_gate", None),
         "handoff_state": handoff_state or (
             "UNTRUSTED" if source == "go_frame_sync" else
             "GO_REFINING" if period_authority == "py_refined" else
@@ -999,6 +1002,12 @@ def _live_sync_state_to_dict(
         "fit_span_s": fit_span_s,
         "slope_sign_convention": slope_sign_convention,
         "effective_period_source": effective_period_source,
+        "operational_period_source": effective_period_source,
+        "operational_period_s": effective_period_s,
+        "go_refined_period_delta_s": period_delta_s if period_authority == "go_refined" else None,
+        "python_base_period_s": base_period_s,
+        "go_operational_enabled": bool(go_refiner_operational_enabled),
+        "go_operational_active": bool(getattr(sync, "go_operational_active", False)),
         "operational_source_path": _source_path_from_period_authority(period_authority),
         "consistency_warnings": consistency_warnings,
         "fit_icao_count": getattr(sync, "fit_icao_count", None),
@@ -1552,6 +1561,8 @@ class RadarState:
         self._GO_SWEEP_FRAMES_MAX = 256
         self._go_sync_states_by_iid: dict[int, dict] = {}
         self._go_operational_by_iid: dict[int, bool] = {}
+        self._go_operational_ready_streak_by_iid: dict[int, int] = {}
+        self._go_operational_soft_failure_until_by_iid: dict[int, float] = {}
         # Hysteresis hold for population-based anchor demotion.
         # Maps (iid, anchor_icao) -> expiry_wall_ts.  Once an anchor is demoted
         # it stays demoted until expiry passes, even if the population agrees
@@ -4108,26 +4119,55 @@ class RadarState:
         else:
             sync.phase_blocking_gate = None
             sync.phase_blocking_reason = None
+        sync.blocking_gate = None
+        sync.go_operational_enabled = False
+        sync.go_operational_active = False
         import config as _cfg
         _go_operational_enabled = bool(getattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False))
+        sync.go_operational_enabled = _go_operational_enabled
+
+        def _first_blocking_reason(gates: dict, default_reason: str) -> tuple[str, str]:
+            for gate_name, gate_state in gates.items():
+                if gate_state.get("passed") is False:
+                    return gate_name, str(gate_state.get("reason") or gate_name)
+            return "unknown", default_reason
+
+        def _apply_state(
+            *,
+            handoff_state: str,
+            handoff_reason: str,
+            period_authority: str,
+            sync_authority: str,
+            phase_authority: str,
+            blocking_gate: str | None = None,
+            operational_active: bool = False,
+        ) -> None:
+            sync.blocking_gate = blocking_gate
+            sync.go_operational_active = operational_active
+            self._set_handoff_state_locked(
+                iid, sync,
+                handoff_state=handoff_state,
+                handoff_reason=handoff_reason,
+                handoff_gate_failures=failures,
+                period_authority=period_authority,
+                sync_authority=sync_authority,
+                phase_authority=phase_authority,
+            )
 
         # Step 1: Python must have a valid base period.
         if not py_gates["base_period_valid"]:
-            reason = "missing_python_base_period"
-            for gate_name, gate_state in py_gates["gates"].items():
-                if gate_state.get("passed") is False:
-                    reason = str(gate_state.get("reason") or gate_name)
-                    break
+            gate_name, reason = _first_blocking_reason(py_gates["gates"], "missing_python_base_period")
             sync.usable = False
             self._go_operational_by_iid[iid] = False
-            self._set_handoff_state_locked(
-                iid, sync,
+            self._go_operational_ready_streak_by_iid[iid] = 0
+            self._go_operational_soft_failure_until_by_iid.pop(iid, None)
+            _apply_state(
                 handoff_state="BOOTSTRAPPING_PY",
                 handoff_reason=reason,
-                handoff_gate_failures=failures,
                 period_authority="py_bootstrap",
                 sync_authority="py_bootstrap",
                 phase_authority="py_bootstrap",
+                blocking_gate=gate_name,
             )
             return
 
@@ -4139,14 +4179,15 @@ class RadarState:
         if not go_present:
             sync.usable = False
             self._go_operational_by_iid[iid] = False
-            self._set_handoff_state_locked(
-                iid, sync,
+            self._go_operational_ready_streak_by_iid[iid] = 0
+            self._go_operational_soft_failure_until_by_iid.pop(iid, None)
+            _apply_state(
                 handoff_state="BASE_PERIOD_READY",
                 handoff_reason="go_sync_absent",
-                handoff_gate_failures=failures,
                 period_authority="py_base",
                 sync_authority="py_bootstrap",
                 phase_authority="py_bootstrap",
+                blocking_gate="go_state_present",
             )
             return
 
@@ -4154,14 +4195,15 @@ class RadarState:
         if go_holdover:
             sync.usable = False
             self._go_operational_by_iid[iid] = False
-            self._set_handoff_state_locked(
-                iid, sync,
+            self._go_operational_ready_streak_by_iid[iid] = 0
+            self._go_operational_soft_failure_until_by_iid.pop(iid, None)
+            _apply_state(
                 handoff_state="HOLDOVER",
                 handoff_reason="go_holdover",
-                handoff_gate_failures=failures,
                 period_authority="holdover",
                 sync_authority="holdover",
                 phase_authority="holdover",
+                blocking_gate="go_not_holdover",
             )
             return
 
@@ -4172,77 +4214,119 @@ class RadarState:
         go_base_valid = go_gates["gates"].get("go_mirrored_base_period_valid", {}).get("passed")
         go_base_agrees = go_gates["gates"].get("go_base_agrees_with_python_base", {}).get("passed")
         if go_base_valid is True and go_base_agrees is False:
-            reason = "go_base_disagrees_with_python_base"
-            for gate_name, gate_state in go_gates["gates"].items():
-                if gate_state.get("passed") is False:
-                    reason = str(gate_state.get("reason") or gate_name)
-                    break
+            gate_name, reason = _first_blocking_reason(go_gates["gates"], "go_base_disagrees_with_python_base")
             sync.usable = False
             self._go_operational_by_iid[iid] = False
-            self._set_handoff_state_locked(
-                iid, sync,
+            self._go_operational_ready_streak_by_iid[iid] = 0
+            self._go_operational_soft_failure_until_by_iid.pop(iid, None)
+            _apply_state(
                 handoff_state="UNTRUSTED",
                 handoff_reason=reason,
-                handoff_gate_failures=failures,
+                period_authority="py_base",
+                sync_authority="py_bootstrap",
+                phase_authority="py_bootstrap",
+                blocking_gate=gate_name,
+            )
+            return
+
+        # Step 5: Go base accepted (valid + agrees) but refinement gates not yet
+        # satisfied → GO_REFINING.  If Go has no valid base yet → BASE_PERIOD_READY.
+        ready_streak = int(self._go_operational_ready_streak_by_iid.get(iid, 0) or 0)
+        soft_failure_until = float(self._go_operational_soft_failure_until_by_iid.get(iid, 0.0) or 0.0)
+        now_ts = time.time()
+
+        hard_blocking_gate = None
+        hard_failure = False
+        if not go_gates["go_ready"]:
+            for gate_name, gate_state in go_gates["gates"].items():
+                if gate_state.get("passed") is False:
+                    hard_blocking_gate = gate_name
+                    hard_failure = gate_name in {
+                        "go_sync_state_usable",
+                        "go_not_holdover",
+                        "go_base_agrees_with_python_base",
+                        "go_mirrored_base_period_valid",
+                        "go_effective_period_finite_positive",
+                        "go_contamination_state",
+                    }
+                    break
+
+        go_base_accepted = go_base_valid is True and go_base_agrees is True
+        if not go_gates["go_ready"]:
+            gate_name, reason = _first_blocking_reason(go_gates["gates"], "go_not_ready")
+            self._go_operational_ready_streak_by_iid[iid] = 0
+            if hard_failure:
+                self._go_operational_soft_failure_until_by_iid.pop(iid, None)
+            elif self._go_operational_by_iid.get(iid, False):
+                if soft_failure_until <= now_ts:
+                    soft_failure_until = now_ts + _GO_OPERATIONAL_SOFT_FAILURE_HOLD_S
+                    self._go_operational_soft_failure_until_by_iid[iid] = soft_failure_until
+                if now_ts < soft_failure_until:
+                    sync.usable = True
+                    self._go_operational_by_iid[iid] = True
+                    phase_authority = "go_runtime" if phase_eval["phase_ready"] else "py_anchor_relative"
+                    _apply_state(
+                        handoff_state="GO_REFINED_READY",
+                        handoff_reason=f"go_soft_failure_holdover:{reason}",
+                        period_authority="go_refined",
+                        sync_authority="go_runtime",
+                        phase_authority=phase_authority,
+                        blocking_gate=gate_name,
+                        operational_active=True,
+                    )
+                    return
+            if go_base_accepted:
+                sync.usable = False
+                self._go_operational_by_iid[iid] = False
+                _apply_state(
+                    handoff_state="GO_REFINING",
+                    handoff_reason=reason,
+                    period_authority="py_base",
+                    sync_authority="py_bootstrap",
+                    phase_authority="py_bootstrap",
+                    blocking_gate=gate_name,
+                )
+            else:
+                # Go present but hasn't yet accepted Python base → BASE_PERIOD_READY.
+                sync.usable = False
+                self._go_operational_by_iid[iid] = False
+                _apply_state(
+                    handoff_state="BASE_PERIOD_READY",
+                    handoff_reason=reason,
+                    period_authority="py_base",
+                    sync_authority="py_bootstrap",
+                    phase_authority="py_bootstrap",
+                    blocking_gate=gate_name,
+                )
+            return
+
+        # Step 6: All Go gates pass. Operational flag determines whether Go is used.
+        self._go_operational_soft_failure_until_by_iid.pop(iid, None)
+        if not _go_operational_enabled:
+            sync.usable = False
+            self._go_operational_by_iid[iid] = False
+            self._go_operational_ready_streak_by_iid[iid] = 0
+            _apply_state(
+                handoff_state="GO_REFINED_READY",
+                handoff_reason="go_ready_flag_disabled",
                 period_authority="py_base",
                 sync_authority="py_bootstrap",
                 phase_authority="py_bootstrap",
             )
             return
 
-        # Step 5: Go base accepted (valid + agrees) but refinement gates not yet
-        # satisfied → GO_REFINING.  If Go has no valid base yet → BASE_PERIOD_READY.
-        go_base_accepted = go_base_valid is True and go_base_agrees is True
-        if not go_gates["go_ready"]:
-            if go_base_accepted:
-                reason = "go_refining"
-                for gate_name, gate_state in go_gates["gates"].items():
-                    if gate_state.get("passed") is False:
-                        reason = str(gate_state.get("reason") or gate_name)
-                        break
-                sync.usable = False
-                self._go_operational_by_iid[iid] = False
-                self._set_handoff_state_locked(
-                    iid, sync,
-                    handoff_state="GO_REFINING",
-                    handoff_reason=reason,
-                    handoff_gate_failures=failures,
-                    period_authority="py_base",
-                    sync_authority="py_bootstrap",
-                    phase_authority="py_bootstrap",
-                )
-            else:
-                # Go present but hasn't yet accepted Python base → BASE_PERIOD_READY.
-                reason = "go_not_ready"
-                for gate_name, gate_state in go_gates["gates"].items():
-                    if gate_state.get("passed") is False:
-                        reason = str(gate_state.get("reason") or gate_name)
-                        break
-                sync.usable = False
-                self._go_operational_by_iid[iid] = False
-                self._set_handoff_state_locked(
-                    iid, sync,
-                    handoff_state="BASE_PERIOD_READY",
-                    handoff_reason=reason,
-                    handoff_gate_failures=failures,
-                    period_authority="py_base",
-                    sync_authority="py_bootstrap",
-                    phase_authority="py_bootstrap",
-                )
-            return
-
-        # Step 6: All Go gates pass. Operational flag determines whether Go is used.
-        if not _go_operational_enabled:
+        ready_streak += 1
+        self._go_operational_ready_streak_by_iid[iid] = ready_streak
+        if ready_streak < _GO_OPERATIONAL_PROMOTION_CONSECUTIVE:
             sync.usable = False
             self._go_operational_by_iid[iid] = False
-            self._set_handoff_state_locked(
-                iid, sync,
+            _apply_state(
                 handoff_state="GO_REFINED_READY",
-                handoff_reason="go_ready_flag_disabled",
-                handoff_gate_failures=failures,
+                handoff_reason="go_ready_pending_hysteresis",
                 period_authority="py_base",
                 sync_authority="py_bootstrap",
                 phase_authority="py_bootstrap",
+                blocking_gate="go_readiness_hysteresis",
             )
             return
 
@@ -4250,14 +4334,13 @@ class RadarState:
         sync.usable = True
         self._go_operational_by_iid[iid] = True
         phase_authority = "go_runtime" if phase_eval["phase_ready"] else "py_anchor_relative"
-        self._set_handoff_state_locked(
-            iid, sync,
+        _apply_state(
             handoff_state="GO_REFINED_READY",
-            handoff_reason="go_ready",
-            handoff_gate_failures=failures,
+            handoff_reason="go_runtime_operational",
             period_authority="go_refined",
             sync_authority="go_runtime",
             phase_authority=phase_authority,
+            operational_active=True,
         )
 
     @staticmethod
