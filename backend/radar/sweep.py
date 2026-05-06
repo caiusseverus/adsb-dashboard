@@ -935,8 +935,23 @@ def _live_sync_state_to_dict(
     }.get(phase_basis, "unavailable")
 
     blocking_gate = getattr(sync, "blocking_gate", None)
+    phase_blocking_gate_raw = getattr(sync, "phase_blocking_gate", None)
+    phase_blocking_reason = getattr(sync, "phase_blocking_reason", None)
+    phase_blocking_gate = (
+        f"phase_readiness.{phase_blocking_gate_raw}"
+        if phase_blocking_gate_raw and not str(phase_blocking_gate_raw).startswith("phase_readiness.")
+        else phase_blocking_gate_raw
+    )
     effective_handoff_state = handoff_state
     effective_handoff_reason = handoff_reason
+    go_operational_blocking_gate = None
+    go_operational_blocking_reason = None
+
+    is_active_go_operational = (
+        period_authority == "go_refined"
+        and sync_authority == "go_runtime"
+        and str(effective_handoff_state or "") == "GO_REFINED_READY"
+    )
 
     # Stage 10: when operational mode is enabled, avoid generic diagnostic-shadow
     # fallback labels for non-active go_frame_sync states. If a concrete failed
@@ -958,20 +973,54 @@ def _live_sync_state_to_dict(
                 if selected is None:
                     continue
                 gate_name, gate_state = selected
-                blocking_gate = f"{section_name}.{gate_name}"
+                candidate_gate = f"{section_name}.{gate_name}"
+                if is_active_go_operational and candidate_gate.startswith("phase_readiness."):
+                    # Phase-authority readiness may fail while Go period authority
+                    # remains operational. Keep this out of Go blocking_gate.
+                    if not phase_blocking_gate:
+                        phase_blocking_gate = candidate_gate
+                        phase_blocking_reason = str(gate_state.get("reason") or candidate_gate)
+                    continue
+                blocking_gate = candidate_gate
                 if not effective_handoff_reason:
                     effective_handoff_reason = str(gate_state.get("reason") or blocking_gate)
                 break
 
-        is_active_go_operational = (
-            period_authority == "go_refined"
-            and sync_authority == "go_runtime"
-            and str(effective_handoff_state or "") == "GO_REFINED_READY"
-        )
+        # Fallback attribution for cases where gate snapshots are temporarily
+        # absent but Go diagnostics still expose a specific blocker.
+        if not is_active_go_operational and not blocking_gate:
+            go_sync_unusable_reason = str(getattr(sync, "go_sync_unusable_reason", "") or "").strip()
+            holdover_reason = str(getattr(sync, "holdover_reason", "") or "").strip()
+            period_ref_status = str(period_refinement_status or "").strip()
+            contamination_state = str(getattr(sync, "contamination_state", "") or "").strip()
+            if go_sync_unusable_reason:
+                blocking_gate = "go_readiness.go_sync_state_usable"
+                if not effective_handoff_reason:
+                    effective_handoff_reason = go_sync_unusable_reason
+            elif bool(getattr(sync, "holdover", False)) or holdover_reason:
+                blocking_gate = "go_readiness.go_not_holdover"
+                if not effective_handoff_reason:
+                    effective_handoff_reason = holdover_reason or "go_holdover"
+            elif period_ref_status.startswith("insufficient_"):
+                blocking_gate = "go_readiness.go_refinement_history_sufficient"
+                if not effective_handoff_reason:
+                    effective_handoff_reason = "go_refinement_history_insufficient"
+            elif contamination_state == "contaminated":
+                blocking_gate = "go_readiness.go_contamination_state"
+                if not effective_handoff_reason:
+                    effective_handoff_reason = "contamination"
+
         if not is_active_go_operational and not blocking_gate:
             blocking_gate = "go_readiness.unclassified_state"
         if not is_active_go_operational and not effective_handoff_reason:
             effective_handoff_reason = "go_state_unclassified"
+        # Keep phase-only blockers out of operational blocking_gate when Go is active.
+        if is_active_go_operational and blocking_gate and str(blocking_gate).startswith("phase_readiness."):
+            if not phase_blocking_gate:
+                phase_blocking_gate = str(blocking_gate)
+            if not phase_blocking_reason:
+                phase_blocking_reason = effective_handoff_reason
+            blocking_gate = None
         if not effective_handoff_state:
             if blocking_gate and str(blocking_gate).startswith("python_base."):
                 effective_handoff_state = "BOOTSTRAPPING_PY"
@@ -981,6 +1030,10 @@ def _live_sync_state_to_dict(
                 effective_handoff_state = "GO_REFINING"
             else:
                 effective_handoff_state = "UNTRUSTED"
+
+    if blocking_gate and str(blocking_gate).startswith(("python_base.", "go_readiness.")):
+        go_operational_blocking_gate = str(blocking_gate)
+        go_operational_blocking_reason = effective_handoff_reason
 
     go_operational_active = bool(getattr(sync, "go_operational_active", False))
     if (
@@ -1001,8 +1054,12 @@ def _live_sync_state_to_dict(
         "sync_authority": sync_authority,
         "period_refinement_status": period_refinement_status,
         "phase_authority": phase_authority,
-        "phase_blocking_gate": getattr(sync, "phase_blocking_gate", None),
-        "phase_blocking_reason": getattr(sync, "phase_blocking_reason", None),
+        "phase_blocking_gate": phase_blocking_gate,
+        "phase_blocking_reason": phase_blocking_reason,
+        "phase_authority_blocking_gate": phase_blocking_gate,
+        "phase_authority_blocking_reason": phase_blocking_reason,
+        "go_operational_blocking_gate": go_operational_blocking_gate,
+        "go_operational_blocking_reason": go_operational_blocking_reason,
         "blocking_gate": blocking_gate,
         "handoff_state": effective_handoff_state or (
             "UNTRUSTED" if source == "go_frame_sync" else
