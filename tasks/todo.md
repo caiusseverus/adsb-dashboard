@@ -443,3 +443,30 @@ Plan confirmation:
 - No period tolerance changes.
 - No chart rendering changes.
 - No threshold relaxation.
+
+## 2026-05-06 Anchor-Relative Phase Lock Loss Before Stage 10 (In Progress)
+
+- [x] Trace exact anchor-clear/phase-basis override path across `_ingest_go_frame_sync_diagnostic_locked`, `_apply_go_handoff_state_locked`, `_resolve_phase_anchor_state`, `update_simple_live_sync_state`, and `_live_sync_state_to_dict`.
+- [x] Confirm whether anchor loss is dataclass mutation vs serialization-only override; document exact branch producing `phase_basis=sweep_epoch_only`, `phase_anchor_icao=None`, and `population=no_anchor` during `go_sync_unusable_reason=quality_below_threshold`.
+- [x] Add minimal diagnostics for phase-lock loss causality and previous-anchor state.
+- [x] Implement minimal anchor-relative retention/hysteresis only for transient `quality_below_threshold` while anchor remains fresh and no disqualifying failure gates are present.
+- [x] Preserve existing blocking behavior for real failures: holdover, stale/no-anchor, population demotion/disagreement, and period disagreement.
+- [x] Add backend tests for transient retention, holdover clearing, stale-anchor clearing, population demotion behavior, period disagreement behavior, absolute-phase invariants, and clear-reason diagnostics.
+- [x] Run focused backend verification and record a review section here.
+
+Plan confirmation:
+- No Stage 10 implementation.
+- No Go operational authority enablement.
+- No period tolerance changes.
+- No chart rendering changes.
+- No geographic/absolute phase semantic changes.
+
+Review:
+- Root cause confirmed: `_ingest_go_frame_sync_diagnostic_locked` replaced `LiveSyncState` with a new Go-diagnostic object and did not carry anchor-relative fields (`phase_anchor_icao`, `phase_anchor_status`, `phase_basis`, anchor timestamp/status). That dataclass replacement produced immediate `phase_basis=sweep_epoch_only` and null anchor values.
+- This is a true dataclass-state mutation path, not just a serializer override. `_live_sync_state_to_dict` then reflected the cleared fields and could additionally fall back to sweep-epoch semantics when no anchor is present.
+- Added targeted retention only for transient `go_sync_unusable_reason=quality_below_threshold` with strict conditions (previous trusted anchor-relative state, fresh anchor age, not holdover, period agrees, strict gate passes, no population demotion/fail).
+- Added clear/override diagnostics fields to state/payload, including previous anchor metadata, clear reason, override reason, and timestamp/reason at clear.
+
+Verification:
+- `uv run --directory backend pytest tests/test_radar_sweep.py -k "go_quality_transient_retains_trusted_anchor_relative_phase or go_quality_transient_does_not_retain_through_holdover_or_stale_anchor or go_quality_transient_does_not_retain_through_population_demotion_or_period_disagreement" -q`
+- `uv run --directory backend pytest tests/test_stage3r_handoff.py tests/test_phase_semantics.py -q`

@@ -509,6 +509,58 @@ def _build_go_diagnostic_fields(
     }
 
 
+def _build_discontinuity_population_diagnostics(
+    sync_state_payload: dict,
+    population_monitor: dict | None,
+) -> dict:
+    diagnostics = {
+        "discontinuity_ref_icao_population_delta_deg": None,
+        "discontinuity_ref_icao_obs_count": None,
+        "discontinuity_ref_icao_spread_deg": None,
+        "discontinuity_old_offset_population_delta_deg": None,
+        "discontinuity_new_offset_population_delta_deg": None,
+        "discontinuity_population_status": None,
+        "discontinuity_population_spread_deg": None,
+        "discontinuity_contributing_icaos": None,
+        "discontinuity_disagreeing_icaos": None,
+    }
+    if not isinstance(population_monitor, dict):
+        return diagnostics
+    diagnostics["discontinuity_population_status"] = population_monitor.get("status")
+    diagnostics["discontinuity_population_spread_deg"] = population_monitor.get("population_residual_spread_deg")
+    diagnostics["discontinuity_contributing_icaos"] = population_monitor.get("contributing_icao_count")
+    diagnostics["discontinuity_disagreeing_icaos"] = population_monitor.get("disagreeing_icao_count")
+
+    if str(sync_state_payload.get("go_diagnostic_fit_epoch_reset_reason") or "") != "phase_offset_discontinuity":
+        return diagnostics
+
+    ref_icao = str(sync_state_payload.get("go_diagnostic_phase_offset_discontinuity_current_ref_icao") or "")
+    per_icao = population_monitor.get("per_icao")
+    if ref_icao and isinstance(per_icao, list):
+        for row in per_icao:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("icao") or "") != ref_icao:
+                continue
+            diagnostics["discontinuity_ref_icao_population_delta_deg"] = row.get("delta_from_anchor_deg")
+            diagnostics["discontinuity_ref_icao_obs_count"] = row.get("count")
+            diagnostics["discontinuity_ref_icao_spread_deg"] = row.get("residual_spread_deg")
+            break
+
+    old_offset = sync_state_payload.get("go_diagnostic_phase_offset_discontinuity_old_deg")
+    new_offset = sync_state_payload.get("go_diagnostic_phase_offset_discontinuity_new_deg")
+    anchor_population_delta = population_monitor.get("anchor_population_delta_deg")
+    if _is_finite_number(anchor_population_delta):
+        diagnostics["discontinuity_old_offset_population_delta_deg"] = float(anchor_population_delta)
+        if _is_finite_number(old_offset) and _is_finite_number(new_offset):
+            jump_deg = _circular_delta_deg(float(new_offset), float(old_offset))
+            diagnostics["discontinuity_new_offset_population_delta_deg"] = _circular_delta_deg(
+                float(anchor_population_delta) + float(jump_deg),
+                0.0,
+            )
+    return diagnostics
+
+
 def _clone_sync_for_projection(
     sync: "LiveSyncState",
     *,
@@ -589,12 +641,17 @@ def _live_sync_state_to_dict(
     # deriving from anchor state for backward compatibility with states built
     # before the field was added.
     typed_phase_basis = str(getattr(sync, "phase_basis", "") or "")
+    phase_basis_override_reason = getattr(sync, "phase_basis_override_reason", None)
     if typed_phase_basis in {"sweep_epoch_only", "anchor_relative", "geographic"}:
         phase_basis = typed_phase_basis
     elif phase_anchor_icao and phase_anchor_status in {"selected", "anchor_only"}:
         phase_basis = "anchor_relative"
+        if phase_basis_override_reason is None:
+            phase_basis_override_reason = "derived_from_anchor_state"
     else:
         phase_basis = "sweep_epoch_only"
+        if phase_basis_override_reason is None:
+            phase_basis_override_reason = "serialization_fallback_no_anchor"
 
     # Compute anchor age from the wall clock: if an anchor exists and we have
     # its selection timestamp, age is the wall-clock delta.  If no anchor
@@ -914,6 +971,14 @@ def _live_sync_state_to_dict(
         "phase_offset_geographic_deg": typed_phase_offset_geographic,
         "phase_anchor_icao": phase_anchor_icao,
         "phase_anchor_status": phase_anchor_status,
+        "previous_phase_anchor_icao": getattr(sync, "previous_phase_anchor_icao", None),
+        "previous_phase_anchor_age_s": getattr(sync, "previous_phase_anchor_age_s", None),
+        "previous_phase_status": getattr(sync, "previous_phase_status", None),
+        "phase_anchor_clear_reason": getattr(sync, "phase_anchor_clear_reason", None),
+        "phase_basis_override_reason": phase_basis_override_reason,
+        "last_phase_anchor_clear_ts": getattr(sync, "last_phase_anchor_clear_ts", None),
+        "go_sync_unusable_reason_at_clear": getattr(sync, "go_sync_unusable_reason_at_clear", None),
+        "phase_anchor_retention_reason": getattr(sync, "phase_anchor_retention_reason", None),
         "phase_anchor_score": float(getattr(sync, "phase_anchor_score") or 0.0),
         "phase_anchor_obs_count": int(getattr(sync, "phase_anchor_obs_count") or 0),
         "phase_validation_status": str(getattr(sync, "phase_validation_status") or "unavailable"),
@@ -4330,6 +4395,92 @@ class RadarState:
         if phase_epoch_us is None or phase_offset_deg is None:
             return
         last_updated = float(go_sync.get("last_updated") or time.time())
+        previous_phase_anchor_icao = getattr(existing, "phase_anchor_icao", None) if existing is not None else None
+        previous_phase_status = str(getattr(existing, "phase_status", "") or "") if existing is not None else None
+        previous_phase_basis = str(getattr(existing, "phase_basis", "") or "") if existing is not None else ""
+        previous_phase_anchor_since_ts = getattr(existing, "phase_anchor_since_ts", None) if existing is not None else None
+        previous_phase_anchor_age_s = None
+        if previous_phase_anchor_icao and previous_phase_anchor_since_ts is not None:
+            try:
+                previous_phase_anchor_age_s = max(0.0, last_updated - float(previous_phase_anchor_since_ts))
+            except (TypeError, ValueError):
+                previous_phase_anchor_age_s = None
+
+        go_sync_unusable_reason = str(go_sync.get("go_sync_unusable_reason") or "")
+        holdover = bool(go_sync.get("holdover", False))
+        period_agrees = bool(go_sync.get("go_sync_usable_period_agrees", False))
+        strict_gate_pass = bool(go_sync.get("go_sync_usable_strict_gate_pass", False))
+        population_state = str(getattr(existing, "population_validation_state", "") or "") if existing is not None else ""
+        anchor_status = str(getattr(existing, "phase_anchor_status", "") or "") if existing is not None else ""
+        anchor_fresh = previous_phase_anchor_age_s is not None and previous_phase_anchor_age_s <= _PHASE_FRESH_MAX_AGE_S
+        previous_anchor_relative = (
+            previous_phase_basis == "anchor_relative"
+            or (
+                previous_phase_anchor_icao is not None
+                and anchor_status in {"selected", "anchor_only"}
+            )
+        )
+        retain_anchor = (
+            go_sync_unusable_reason == "quality_below_threshold"
+            and previous_anchor_relative
+            and previous_phase_status == "trusted"
+            and previous_phase_anchor_icao is not None
+            and anchor_fresh
+            and not holdover
+            and period_agrees
+            and strict_gate_pass
+            and population_state != "fail"
+            and anchor_status not in {"population_demoted", "stale_anchor", "no_anchor"}
+        )
+        if retain_anchor:
+            phase_anchor_icao = previous_phase_anchor_icao
+            phase_anchor_status = anchor_status or "selected"
+            phase_anchor_score = float(getattr(existing, "phase_anchor_score", 0.0) or 0.0)
+            phase_anchor_obs_count = int(getattr(existing, "phase_anchor_obs_count", 0) or 0)
+            phase_anchor_spread_deg = getattr(existing, "phase_anchor_spread_deg", None)
+            phase_anchor_since_ts = previous_phase_anchor_since_ts
+            phase_basis = "anchor_relative"
+            phase_status = "provisional"
+            phase_anchor_retention_reason = "transient_go_quality_below_threshold"
+            phase_anchor_clear_reason = None
+            phase_basis_override_reason = "retained_anchor_relative_due_to_transient_go_quality"
+            last_phase_anchor_clear_ts = getattr(existing, "last_phase_anchor_clear_ts", None) if existing is not None else None
+            go_sync_unusable_reason_at_clear = getattr(existing, "go_sync_unusable_reason_at_clear", None) if existing is not None else None
+        else:
+            phase_anchor_icao = None
+            phase_anchor_status = "no_anchor"
+            phase_anchor_score = 0.0
+            phase_anchor_obs_count = 0
+            phase_anchor_spread_deg = None
+            phase_anchor_since_ts = None
+            phase_basis = "sweep_epoch_only"
+            phase_status = "untrusted"
+            phase_anchor_retention_reason = None
+            last_phase_anchor_clear_ts = getattr(existing, "last_phase_anchor_clear_ts", None) if existing is not None else None
+            go_sync_unusable_reason_at_clear = getattr(existing, "go_sync_unusable_reason_at_clear", None) if existing is not None else None
+            if previous_phase_anchor_icao:
+                if holdover:
+                    phase_anchor_clear_reason = "holdover"
+                elif not period_agrees:
+                    phase_anchor_clear_reason = "period_disagreement"
+                elif not anchor_fresh:
+                    phase_anchor_clear_reason = "stale_anchor"
+                elif population_state == "fail" or anchor_status == "population_demoted":
+                    phase_anchor_clear_reason = "population_demoted"
+                elif go_sync_unusable_reason:
+                    phase_anchor_clear_reason = (
+                        "quality_below_threshold"
+                        if go_sync_unusable_reason == "quality_below_threshold"
+                        else "go_sync_unusable"
+                    )
+                else:
+                    phase_anchor_clear_reason = "serialization_fallback"
+                phase_basis_override_reason = "anchor_cleared_to_sweep_epoch_only"
+                last_phase_anchor_clear_ts = last_updated
+                go_sync_unusable_reason_at_clear = go_sync_unusable_reason or None
+            else:
+                phase_anchor_clear_reason = "no_anchor"
+                phase_basis_override_reason = "serialization_fallback_no_anchor"
         self._live_sync_states[iid] = LiveSyncState(
             iid=iid,
             period_s=float(effective_period_s),
@@ -4344,7 +4495,7 @@ class RadarState:
             n_sync_frames=int(go_sync.get("n_sync_frames") or 0),
             n_rejected_frames=int(go_sync.get("n_rejected_frames") or 0),
             last_residual_deg=float(go_sync.get("last_residual_deg") or 0.0),
-            holdover=bool(go_sync.get("holdover", False)),
+            holdover=holdover,
             period_base_s=float(base_period_s),
             fit_total_observations=int(go_sync.get("fit_observation_count") or 0),
             fit_span_s=float(go_sync.get("fit_span_s") or 0.0),
@@ -4510,6 +4661,22 @@ class RadarState:
             ),
             last_handoff_transition_ts=getattr(existing, "last_handoff_transition_ts", None) if existing is not None else None,
             handoff_gate_failures=dict(getattr(existing, "handoff_gate_failures", {}) or {}) if existing is not None else {},
+            phase_anchor_icao=phase_anchor_icao,
+            phase_anchor_status=phase_anchor_status,
+            phase_anchor_score=phase_anchor_score,
+            phase_anchor_obs_count=phase_anchor_obs_count,
+            phase_anchor_spread_deg=phase_anchor_spread_deg,
+            phase_anchor_since_ts=phase_anchor_since_ts,
+            phase_basis=phase_basis,
+            phase_status=phase_status,
+            previous_phase_anchor_icao=previous_phase_anchor_icao,
+            previous_phase_anchor_age_s=previous_phase_anchor_age_s,
+            previous_phase_status=previous_phase_status,
+            phase_anchor_clear_reason=phase_anchor_clear_reason,
+            phase_basis_override_reason=phase_basis_override_reason,
+            last_phase_anchor_clear_ts=last_phase_anchor_clear_ts,
+            go_sync_unusable_reason_at_clear=go_sync_unusable_reason_at_clear,
+            phase_anchor_retention_reason=phase_anchor_retention_reason,
         )
         fit_total = int(go_sync.get("fit_observation_count") or 0)
         fit_span = float(go_sync.get("fit_span_s") or 0.0)
@@ -8206,6 +8373,10 @@ class RadarState:
                 "radar_position_source": radar_pos.get("source", "none"),
                 "no_obs_reason": None,
             }
+            population_monitor = compute_population_residual_summary(entries, sync, iid).to_api_dict()
+            sync_state_payload.update(
+                _build_discontinuity_population_diagnostics(sync_state_payload, population_monitor)
+            )
             return {
                 "observations": residual_events if residual_events else entries,
                 "recorded_observations": residual_events,
@@ -8250,7 +8421,7 @@ class RadarState:
                 "diagnostics_mode": "compact_go_sync",
                 "alignment_status": alignment_status,
                 "sync_mode_diagnostics": sync_mode_diagnostics,
-                "population_residual_monitor": compute_population_residual_summary(entries, sync, iid).to_api_dict(),
+                "population_residual_monitor": population_monitor,
             }
 
         now_ts = time.time()

@@ -3386,6 +3386,58 @@ def test_go_iid_state_maps_discontinuity_and_sync_usable_diagnostics():
     assert payload["go_diagnostic_go_sync_usable_strict_gate_pass"] is False
 
 
+def test_discontinuity_population_diagnostics_extract_reference_and_population_fields():
+    sync_payload = {
+        "go_diagnostic_fit_epoch_reset_reason": "phase_offset_discontinuity",
+        "go_diagnostic_phase_offset_discontinuity_current_ref_icao": "123",
+        "go_diagnostic_phase_offset_discontinuity_old_deg": 100.0,
+        "go_diagnostic_phase_offset_discontinuity_new_deg": 145.0,
+    }
+    pop = {
+        "status": "population_agrees",
+        "population_residual_spread_deg": 8.0,
+        "contributing_icao_count": 12,
+        "disagreeing_icao_count": 1,
+        "anchor_population_delta_deg": 5.0,
+        "per_icao": [
+            {"icao": "111", "count": 9, "residual_spread_deg": 4.0, "delta_from_anchor_deg": 2.0},
+            {"icao": "123", "count": 7, "residual_spread_deg": 6.0, "delta_from_anchor_deg": -11.0},
+        ],
+    }
+    diag = sweep._build_discontinuity_population_diagnostics(sync_payload, pop)
+    assert diag["discontinuity_population_status"] == "population_agrees"
+    assert diag["discontinuity_population_spread_deg"] == pytest.approx(8.0)
+    assert diag["discontinuity_contributing_icaos"] == 12
+    assert diag["discontinuity_disagreeing_icaos"] == 1
+    assert diag["discontinuity_ref_icao_population_delta_deg"] == pytest.approx(-11.0)
+    assert diag["discontinuity_ref_icao_obs_count"] == 7
+    assert diag["discontinuity_ref_icao_spread_deg"] == pytest.approx(6.0)
+    assert diag["discontinuity_old_offset_population_delta_deg"] == pytest.approx(5.0)
+    assert diag["discontinuity_new_offset_population_delta_deg"] == pytest.approx(50.0)
+
+
+def test_discontinuity_population_diagnostics_no_discontinuity_keeps_ref_fields_empty():
+    sync_payload = {
+        "go_diagnostic_fit_epoch_reset_reason": "reference_changed",
+        "go_diagnostic_phase_offset_discontinuity_current_ref_icao": "123",
+    }
+    pop = {
+        "status": "population_mixed",
+        "population_residual_spread_deg": 31.0,
+        "contributing_icao_count": 5,
+        "disagreeing_icao_count": 2,
+        "anchor_population_delta_deg": 7.5,
+        "per_icao": [{"icao": "123", "count": 4, "residual_spread_deg": 11.0, "delta_from_anchor_deg": 19.0}],
+    }
+    diag = sweep._build_discontinuity_population_diagnostics(sync_payload, pop)
+    assert diag["discontinuity_population_status"] == "population_mixed"
+    assert diag["discontinuity_ref_icao_population_delta_deg"] is None
+    assert diag["discontinuity_ref_icao_obs_count"] is None
+    assert diag["discontinuity_ref_icao_spread_deg"] is None
+    assert diag["discontinuity_old_offset_population_delta_deg"] is None
+    assert diag["discontinuity_new_offset_population_delta_deg"] is None
+
+
 def test_handoff_transition_log_only_on_state_change(caplog):
     state = RadarState()
     state._models[34] = RadarIID(iid=34, status="SINGLE_RADAR", period_s=4.0, primary_support_count=8)
@@ -4643,6 +4695,144 @@ def test_stage5_serializer_flag_true_no_handoff_state_falls_back(monkeypatch):
     assert "go_frame_sync_unavailable_authority_fallback_blocked" in (
         payload.get("consistency_warnings") or []
     )
+
+
+def test_go_quality_transient_retains_trusted_anchor_relative_phase():
+    state = RadarState()
+    iid = 9901
+    now = time.time()
+    state._live_sync_states[iid] = LiveSyncState(
+        iid=iid,
+        period_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=12.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=now - 1.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        phase_basis="anchor_relative",
+        phase_status="trusted",
+        phase_anchor_icao="ABC123",
+        phase_anchor_status="selected",
+        phase_anchor_since_ts=now - 2.0,
+        population_validation_state="pass",
+    )
+    state.update_go_iid_state({
+        "i": iid, "sp": True, "su": False, "sps": 4.0, "sep": 2000.0, "sod": 20.0,
+        "sq": 0.7, "sj": 2.5, "sh": False, "lu": now, "rv": 1, "bps": 4.0, "eps": 4.0,
+        "pag": True, "gsur": "quality_below_threshold", "gsuh": True, "gsup": True, "gsus": True,
+    })
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(iid), state.get_go_live_sync_state(iid))
+    assert payload["phase_basis"] == "anchor_relative"
+    assert payload["phase_anchor_icao"] == "ABC123"
+    assert payload["phase_anchor_retention_reason"] == "transient_go_quality_below_threshold"
+    assert payload["phase_is_absolute"] is False
+    assert payload["phase_absolute_available"] is False
+
+
+def test_go_quality_transient_does_not_retain_through_holdover_or_stale_anchor():
+    state = RadarState()
+    iid_holdover = 9902
+    iid_stale = 9903
+    now = time.time()
+    for iid, since_ts in ((iid_holdover, now - 2.0), (iid_stale, now - 999.0)):
+        state._live_sync_states[iid] = LiveSyncState(
+            iid=iid,
+            period_s=4.0,
+            phase_epoch_us=1000.0,
+            phase_offset_deg=12.0,
+            sync_quality=0.9,
+            sync_jitter_deg=2.0,
+            last_sync_update_ts=now - 1.0,
+            source="multi_aircraft_burst",
+            usable=True,
+            phase_basis="anchor_relative",
+            phase_status="trusted",
+            phase_anchor_icao="ABC123",
+            phase_anchor_status="selected",
+            phase_anchor_since_ts=since_ts,
+            population_validation_state="pass",
+        )
+    state.update_go_iid_state({
+        "i": iid_holdover, "sp": True, "su": False, "sps": 4.0, "sep": 2000.0, "sod": 20.0,
+        "sq": 0.7, "sj": 2.5, "sh": True, "lu": now, "rv": 1, "bps": 4.0, "eps": 4.0,
+        "pag": True, "gsur": "quality_below_threshold", "gsuh": False, "gsup": True, "gsus": True,
+    })
+    holdover_payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(iid_holdover), state.get_go_live_sync_state(iid_holdover))
+    assert holdover_payload["phase_basis"] == "sweep_epoch_only"
+    assert holdover_payload["phase_anchor_icao"] is None
+    assert holdover_payload["phase_anchor_clear_reason"] == "holdover"
+
+    state.update_go_iid_state({
+        "i": iid_stale, "sp": True, "su": False, "sps": 4.0, "sep": 2000.0, "sod": 20.0,
+        "sq": 0.7, "sj": 2.5, "sh": False, "lu": now, "rv": 1, "bps": 4.0, "eps": 4.0,
+        "pag": True, "gsur": "quality_below_threshold", "gsuh": True, "gsup": True, "gsus": True,
+    })
+    stale_payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(iid_stale), state.get_go_live_sync_state(iid_stale))
+    assert stale_payload["phase_basis"] == "sweep_epoch_only"
+    assert stale_payload["phase_anchor_icao"] is None
+    assert stale_payload["phase_anchor_clear_reason"] == "stale_anchor"
+
+
+def test_go_quality_transient_does_not_retain_through_population_demotion_or_period_disagreement():
+    state = RadarState()
+    now = time.time()
+    iid_pop = 9904
+    iid_period = 9905
+    state._live_sync_states[iid_pop] = LiveSyncState(
+        iid=iid_pop,
+        period_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=12.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=now - 1.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        phase_basis="anchor_relative",
+        phase_status="trusted",
+        phase_anchor_icao="ABC123",
+        phase_anchor_status="population_demoted",
+        phase_anchor_since_ts=now - 2.0,
+        population_validation_state="fail",
+    )
+    state._live_sync_states[iid_period] = LiveSyncState(
+        iid=iid_period,
+        period_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=12.0,
+        sync_quality=0.9,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=now - 1.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        phase_basis="anchor_relative",
+        phase_status="trusted",
+        phase_anchor_icao="ABC123",
+        phase_anchor_status="selected",
+        phase_anchor_since_ts=now - 2.0,
+        population_validation_state="pass",
+    )
+    state.update_go_iid_state({
+        "i": iid_pop, "sp": True, "su": False, "sps": 4.0, "sep": 2000.0, "sod": 20.0,
+        "sq": 0.7, "sj": 2.5, "sh": False, "lu": now, "rv": 1, "bps": 4.0, "eps": 4.0,
+        "pag": True, "gsur": "quality_below_threshold", "gsuh": True, "gsup": True, "gsus": True,
+    })
+    pop_payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(iid_pop), state.get_go_live_sync_state(iid_pop))
+    assert pop_payload["phase_basis"] == "sweep_epoch_only"
+    assert pop_payload["phase_anchor_icao"] is None
+    assert pop_payload["phase_anchor_clear_reason"] == "population_demoted"
+
+    state.update_go_iid_state({
+        "i": iid_period, "sp": True, "su": False, "sps": 4.0, "sep": 2000.0, "sod": 20.0,
+        "sq": 0.7, "sj": 2.5, "sh": False, "lu": now, "rv": 1, "bps": 4.0, "eps": 4.0,
+        "pag": True, "gsur": "quality_below_threshold", "gsuh": True, "gsup": False, "gsus": True,
+    })
+    period_payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(iid_period), state.get_go_live_sync_state(iid_period))
+    assert period_payload["phase_basis"] == "sweep_epoch_only"
+    assert period_payload["phase_anchor_icao"] is None
+    assert period_payload["phase_anchor_clear_reason"] == "period_disagreement"
 
 
 # --- FitInlierRatio tests (Stage 4R) ---
