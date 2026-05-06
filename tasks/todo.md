@@ -426,3 +426,20 @@ Review:
 Verification:
 - `cd radar-core && GOCACHE=/tmp/go-build-cache go test ./iid ./cmd/radar-core ./protocol`
 - `UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend pytest tests/test_radar_sweep.py -k "go_iid_state_maps_discontinuity_and_sync_usable_diagnostics" -q`
+
+## 2026-05-05 Supported Phase Discontinuity Reset Investigation (In Progress)
+
+- [x] Trace the exact supported `phase_offset_discontinuity` reset code path and map every input used to produce old/new offsets.
+- [ ] Run GitNexus impact analysis on symbols that require diagnostic edits and report blast radius/risk before changing code.
+- [ ] Reproduce/collect supported discontinuity reset events from current live capture telemetry for the affected IIDs. (blocked: local backend not running on 127.0.0.1:8000 in this session)
+- [x] Add only missing discontinuity diagnostics required for reset classification (no behavior changes).
+- [x] Verify diagnostics via targeted backend tests and, where possible, live snapshot inspection.
+- [x] Produce a per-reset diagnosis report: source of new offset, reference representativeness, population agreement comparison, staleness analysis, and classification.
+- [ ] Recommend the minimal corrective change for a later fix without implementing behavior changes.
+
+Plan confirmation:
+- No Stage 10 implementation.
+- No default-flag changes.
+- No period tolerance changes.
+- No chart rendering changes.
+- No threshold relaxation.

@@ -230,6 +230,10 @@ type fitEpochContext struct {
 	holdover       bool
 	basePeriodS    float64
 	authorityBasis string
+	// True only for accepted UpdateEpoch calls where per-step blend diagnostics
+	// are available. Used to prevent false discontinuity resets from accumulated
+	// gradual drift across a long fit epoch.
+	allowGradualRebase bool
 }
 
 type residualObservation struct {
@@ -582,6 +586,19 @@ func (s *SyncState) maybeResetFitEpochLocked(ctx fitEpochContext) {
 			s.FitEpochResetReason = "phase_offset_discontinuity_ignored_weak_fit"
 			return
 		}
+		if ctx.allowGradualRebase {
+			perUpdateBlendDeltaDeg := s.LastUpdateEpochPhaseOffsetBlendDeltaDeg
+			if !math.IsNaN(perUpdateBlendDeltaDeg) && !math.IsInf(perUpdateBlendDeltaDeg, 0) && math.Abs(perUpdateBlendDeltaDeg) <= fitEpochPhaseOffsetResetDeg {
+				// Supported epoch but tiny accepted per-update movement: treat this
+				// as gradual drift baseline staleness, not a destructive jump.
+				s.fitEpochPhaseOffsetDeg = ctx.phaseOffsetDeg
+				if ctx.referenceICAO != 0 {
+					s.fitEpochReferenceICAO = ctx.referenceICAO
+				}
+				s.FitEpochResetReason = "phase_offset_discontinuity_rebased_gradual_drift"
+				return
+			}
+		}
 		s.LastUpdateEpochPreviousFitEpochPhaseOffsetDeg = wrap360(s.fitEpochPhaseOffsetDeg)
 		s.LastUpdateEpochPreviousPhaseOffsetDeg = wrap360(s.PhaseOffsetDeg)
 		s.PhaseOffsetDiscontinuityOldDeg = wrap360(s.fitEpochPhaseOffsetDeg)
@@ -841,13 +858,14 @@ func (s *SyncState) UpdateEpoch(newEpochUS, newOffsetDeg, periodS, quality float
 
 	s.BasePeriodS = periodS
 	s.maybeResetFitEpochLocked(fitEpochContext{
-		epochUS:        newEpochUS,
-		residualBasis:  "observed_minus_predicted",
-		referenceICAO:  refICAO,
-		phaseOffsetDeg: blendedOffset,
-		holdover:       s.Holdover,
-		basePeriodS:    s.BasePeriodS,
-		authorityBasis: "go_refiner_active",
+		epochUS:            newEpochUS,
+		residualBasis:      "observed_minus_predicted",
+		referenceICAO:      refICAO,
+		phaseOffsetDeg:     blendedOffset,
+		holdover:           s.Holdover,
+		basePeriodS:        s.BasePeriodS,
+		authorityBasis:     "go_refiner_active",
+		allowGradualRebase: true,
 	})
 	s.appendResidualObservationLocked(newEpochUS, residual, 0, true, false, 1.0, nAircraft, refPosAgeS)
 	s.markFitEpochObservationLocked(newEpochUS, refICAO, blendedOffset, s.BasePeriodS, s.Holdover, "go_refiner_active")

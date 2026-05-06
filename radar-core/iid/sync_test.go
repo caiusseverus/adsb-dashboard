@@ -1681,6 +1681,88 @@ func TestPhaseOffsetDiscontinuityStillResetsWithSupportedFit(t *testing.T) {
 	}
 }
 
+func TestPhaseOffsetDiscontinuitySupportedGradualBlendRebasesNoReset(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 0; i < reacquireMinFitObs; i++ {
+		icao := uint32(0xAA + (i % reacquireMinFitICAOs))
+		s.AddRefinementResidualObservation(float64(i+1)*4_000_000.0, 0.1, icao, true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	s.fitEpochPhaseOffsetDeg = 128.771176
+	s.LastUpdateEpochPhaseOffsetBlendDeltaDeg = -0.64248
+	prevEpochID := s.FitEpochID
+
+	s.maybeResetFitEpochLocked(fitEpochContext{
+		epochUS:            60_000_000.0,
+		residualBasis:      "observed_minus_predicted",
+		referenceICAO:      0xBBBBBB,
+		phaseOffsetDeg:     163.769942,
+		holdover:           false,
+		basePeriodS:        4.0,
+		authorityBasis:     "go_refiner_active",
+		allowGradualRebase: true,
+	})
+
+	if s.FitEpochID != prevEpochID {
+		t.Fatalf("expected no destructive reset on gradual supported movement: epoch %d -> %d", prevEpochID, s.FitEpochID)
+	}
+	if s.FitEpochResetReason != "phase_offset_discontinuity_rebased_gradual_drift" {
+		t.Fatalf("reason=%q", s.FitEpochResetReason)
+	}
+	if math.Abs(s.fitEpochPhaseOffsetDeg-163.769942) > 1e-6 {
+		t.Fatalf("fit epoch baseline not rebased: %.6f", s.fitEpochPhaseOffsetDeg)
+	}
+}
+
+func TestPhaseOffsetDiscontinuitySupportedAbruptBlendStillResets(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 0.0, 1.0)
+	for i := 0; i < reacquireMinFitObs; i++ {
+		icao := uint32(0xAA + (i % reacquireMinFitICAOs))
+		s.AddRefinementResidualObservation(float64(i+1)*4_000_000.0, 0.1, icao, true, 4, 0.5, 0xAA, "go_refiner_active")
+	}
+	s.fitEpochPhaseOffsetDeg = 100.0
+	s.LastUpdateEpochPhaseOffsetBlendDeltaDeg = 35.0
+	prevEpochID := s.FitEpochID
+
+	s.maybeResetFitEpochLocked(fitEpochContext{
+		epochUS:            60_000_000.0,
+		residualBasis:      "observed_minus_predicted",
+		referenceICAO:      0xBBBBBB,
+		phaseOffsetDeg:     140.0,
+		holdover:           false,
+		basePeriodS:        4.0,
+		authorityBasis:     "go_refiner_active",
+		allowGradualRebase: true,
+	})
+
+	if s.FitEpochID <= prevEpochID {
+		t.Fatal("expected abrupt supported jump to rotate fit epoch")
+	}
+	if s.FitEpochResetReason != "phase_offset_discontinuity" {
+		t.Fatalf("reason=%q", s.FitEpochResetReason)
+	}
+	if math.Abs(s.PhaseOffsetDiscontinuityOldDeg-100.0) > 1e-6 {
+		t.Fatalf("old baseline diag=%.6f want 100", s.PhaseOffsetDiscontinuityOldDeg)
+	}
+}
+
+func TestRejectedUpdateDoesNotRebaseFitEpochPhaseBaseline(t *testing.T) {
+	s := NewSyncState(3, 4.0, 0.0, 150.0, 1.0)
+	s.fitEpochPhaseOffsetDeg = 150.0
+	s.FitEpochID = 4
+	s.FitEpochStartedUnix = 1.0
+	s.residualHistory = append(s.residualHistory, residualObservation{EpochUS: 4_000_000, ResidualDeg: 0.1, Dominant: true, Weight: 1.0})
+	s.FitObservationCount = 1
+	s.FitICAOCount = 1
+
+	ok := s.UpdateEpoch(8_000_000.0, 220.0, 4.0, 1.0, 1, 0.5, 0xAA) // insufficient aircraft => reject
+	if ok {
+		t.Fatal("expected reject due to insufficient_aircraft")
+	}
+	if math.Abs(s.fitEpochPhaseOffsetDeg-150.0) > 1e-6 {
+		t.Fatalf("fit epoch baseline changed on reject: %.6f", s.fitEpochPhaseOffsetDeg)
+	}
+}
+
 func TestSyncUsableDiagnosticsExposeDominantFailureReason(t *testing.T) {
 	s := NewSyncState(3, 4.0, 0.0, 0.0, 0.2)
 	s.Holdover = true
