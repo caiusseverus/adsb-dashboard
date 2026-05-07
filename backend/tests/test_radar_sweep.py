@@ -5164,6 +5164,52 @@ def test_stage10_enabled_nonactive_stable_usable_int_flags_map_to_hysteresis(mon
     assert payload["handoff_reason"] == "go_ready_pending_hysteresis"
 
 
+def test_stage10_live_unclassified_shape_with_diag_usable_flags_maps_to_hysteresis(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    from radar.sync_models import LiveSyncState
+    sync = LiveSyncState(
+        iid=28,
+        period_s=4.084356826834769,
+        period_base_s=4.084356826834769,
+        phase_epoch_us=41098203.22979099,
+        phase_offset_deg=191.40649157727808,
+        sync_quality=1.0,
+        sync_jitter_deg=4.951642799377442,
+        last_sync_update_ts=1778114712.4103398,
+        source="go_frame_sync",
+        usable=True,
+        holdover=False,
+        holdover_reason=None,
+        period_authority="py_base",
+        sync_authority="py_bootstrap",
+        handoff_state="GO_REFINING",
+        handoff_reason="go_state_unclassified",
+        handoff_gate_failures={},
+        fit_total_observations=13,
+        fit_icao_count=0,
+        contamination_state="not_evaluated",
+        population_validation_state="pass",
+        period_refinement_status="stable",
+    )
+    sync.go_sync_unusable_reason = None
+    sync.go_diagnostic_go_sync_unusable_reason = ""
+    sync.go_diagnostic_refinement_status = "stable"
+    sync.go_diagnostic_holdover = False
+    sync.go_diagnostic_holdover_reason = ""
+    sync.go_diagnostic_go_sync_usable_quality_ok = True
+    sync.go_diagnostic_go_sync_usable_holdover_ok = True
+    sync.go_diagnostic_go_sync_usable_period_agrees = True
+    sync.go_diagnostic_go_sync_usable_strict_gate_pass = True
+    sync.go_diagnostic_fit_observation_count = 5
+    sync.go_diagnostic_fit_icao_count = 4
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["go_operational_blocking_gate"] == "go_readiness_hysteresis"
+    assert payload["blocking_gate"] == "go_readiness_hysteresis"
+    assert payload["handoff_reason"] == "go_ready_pending_hysteresis"
+    assert payload["handoff_reason"] != "go_state_unclassified"
+
+
 def test_stage10_active_go_with_phase_failure_uses_phase_blocker_not_go_blocker(monkeypatch):
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)

@@ -539,3 +539,28 @@ Verification:
 - `uv run --directory backend pytest tests/test_radar_sweep.py -k "stage5_flag_enabled_go_ready or stage5_flag_disabled_go_ready or operational_full" -q`
 - `uv run --directory backend pytest tests/test_phase_semantics.py tests/test_radar_api.py -k "sync_state or sync_summary or phase_is_absolute or phase_absolute_available or handoff_reason" -q`
 - `cd frontend && npm run build`
+
+## 2026-05-07 Live Unclassified Attribution Shape Fix
+
+- [ ] Extract 5-10 representative live `sync_state` payloads where `handoff_reason == "go_state_unclassified"` or `go_operational_blocking_gate == "go_readiness.unclassified_state"` from restart capture artifacts.
+- [ ] Dump exact raw values + Python types for all fallback-classifier input fields for each extracted sample.
+- [ ] Add a unit test using one exact live unclassified payload shape (verbatim data shape, not approximation).
+- [ ] Run impact analysis for touched symbol(s), apply minimal attribution mapping fix for only that exact shape, and avoid policy/threshold/localiser/holdover behavior changes.
+- [ ] Re-run targeted tests and a short capture/verification script; confirm unclassified attribution is zero or produce exact new remaining shape dump.
+- [ ] Record review + verification results in this file.
+
+Plan confirmation:
+- Scope restricted to fallback attribution mapping in sync-state serialization.
+- No changes to thresholds, readiness policy, localiser behavior, chart logic, phase/geographic logic, or holdover semantics.
+
+Review:
+- Extracted representative samples from `tasks/radar_sync_baseline/sync_capture_all_stage10_unclassified_cleanup_verify_restart_20260507T004454Z.ndjson` where `handoff_reason=go_state_unclassified` / `go_operational_blocking_gate=go_readiness.unclassified_state`.
+- Exact shape observed: `handoff_state=GO_REFINING`, `source=go_frame_sync`, `usable=True`, `holdover=False`, empty `handoff_gate_failures`, `period_refinement_status=stable`, diagnostic usable gates true via `go_diagnostic_go_sync_usable_*`, `fit_icao_count=0`, `go_diagnostic_fit_icao_count>0`.
+- Added regression test using exact live shape values/types and updated fallback attribution mapping only for this shape.
+- Mapping fix treats `go_readiness.unclassified_state` as placeholder, consumes `go_diagnostic_go_sync_usable_*` booleans as fallback inputs, and replaces placeholder reason `go_state_unclassified` when hysteresis inference is valid.
+- No thresholds/policy/localiser/chart/phase-geographic/holdover logic changed.
+
+Verification:
+- `uv run --directory backend pytest tests/test_radar_sweep.py -k "stage10_live_unclassified_shape_with_diag_usable_flags_maps_to_hysteresis or stage10_enabled_nonactive_stable_usable_without_go_sync_dict_maps_to_hysteresis or stage10_enabled_nonactive_stable_usable_without_gate_snapshot_maps_to_hysteresis" -q`
+- `UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend python - <<'PY' ... replay capture ... PY`
+- Replay result on captured unclassified samples: `{'replayed_samples': 94, 'still_unclassified': 0, 'nonactive_null_gate': 0}`.

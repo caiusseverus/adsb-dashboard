@@ -1011,6 +1011,7 @@ def _live_sync_state_to_dict(
                 "go_ready_pending_hysteresis": "go_readiness_hysteresis",
             }
             reason_key = str(effective_handoff_reason or "").strip()
+            reason_is_unclassified_placeholder = reason_key == "go_state_unclassified"
             go_sync_unusable_reason = str(getattr(sync, "go_sync_unusable_reason", "") or "").strip()
             if not go_sync_unusable_reason and isinstance(go_sync, dict):
                 go_sync_unusable_reason = str(go_sync.get("go_sync_unusable_reason") or "").strip()
@@ -1028,26 +1029,52 @@ def _live_sync_state_to_dict(
                 if isinstance(go_sync, dict) else
                 getattr(sync, "go_sync_usable_quality_ok", None)
             )
+            if go_sync_usable_quality_ok is None:
+                go_sync_usable_quality_ok = _bool_or_none(
+                    (go_sync or {}).get("go_diagnostic_go_sync_usable_quality_ok")
+                    if isinstance(go_sync, dict) else
+                    getattr(sync, "go_diagnostic_go_sync_usable_quality_ok", None)
+                )
             go_sync_usable_holdover_ok = _bool_or_none(
                 (go_sync or {}).get("go_sync_usable_holdover_ok")
                 if isinstance(go_sync, dict) else
                 getattr(sync, "go_sync_usable_holdover_ok", None)
             )
+            if go_sync_usable_holdover_ok is None:
+                go_sync_usable_holdover_ok = _bool_or_none(
+                    (go_sync or {}).get("go_diagnostic_go_sync_usable_holdover_ok")
+                    if isinstance(go_sync, dict) else
+                    getattr(sync, "go_diagnostic_go_sync_usable_holdover_ok", None)
+                )
             go_sync_usable_period_agrees = _bool_or_none(
                 (go_sync or {}).get("go_sync_usable_period_agrees")
                 if isinstance(go_sync, dict) else
                 getattr(sync, "go_sync_usable_period_agrees", None)
             )
+            if go_sync_usable_period_agrees is None:
+                go_sync_usable_period_agrees = _bool_or_none(
+                    (go_sync or {}).get("go_diagnostic_go_sync_usable_period_agrees")
+                    if isinstance(go_sync, dict) else
+                    getattr(sync, "go_diagnostic_go_sync_usable_period_agrees", None)
+                )
             go_sync_usable_strict_gate_pass = _bool_or_none(
                 (go_sync or {}).get("go_sync_usable_strict_gate_pass")
                 if isinstance(go_sync, dict) else
                 getattr(sync, "go_sync_usable_strict_gate_pass", None)
             )
+            if go_sync_usable_strict_gate_pass is None:
+                go_sync_usable_strict_gate_pass = _bool_or_none(
+                    (go_sync or {}).get("go_diagnostic_go_sync_usable_strict_gate_pass")
+                    if isinstance(go_sync, dict) else
+                    getattr(sync, "go_diagnostic_go_sync_usable_strict_gate_pass", None)
+                )
             go_blocking_gate = (
                 str(blocking_gate)
                 if blocking_gate and str(blocking_gate).startswith(("python_base.", "go_readiness."))
                 else None
             )
+            if go_blocking_gate == "go_readiness.unclassified_state":
+                go_blocking_gate = None
             go_blocking_reason = effective_handoff_reason
 
             # Precedence: existing go/python blocking gate → handoff_reason mapping
@@ -1092,7 +1119,7 @@ def _live_sync_state_to_dict(
                     # but no concrete gate snapshot arrived with this state.
                     # In Stage 10 this corresponds to pending operational streak.
                     go_blocking_gate = "go_readiness_hysteresis"
-                    if not effective_handoff_reason:
+                    if not effective_handoff_reason or reason_is_unclassified_placeholder:
                         effective_handoff_reason = "go_ready_pending_hysteresis"
                     go_blocking_reason = effective_handoff_reason
 
