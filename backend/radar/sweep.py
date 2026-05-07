@@ -499,6 +499,15 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_go_sync_usable_period_agrees": go_payload.get("go_sync_usable_period_agrees"),
         "go_diagnostic_go_sync_usable_period_reject_reason": go_payload.get("go_sync_usable_period_reject_reason"),
         "go_diagnostic_go_sync_usable_strict_gate_pass": go_payload.get("go_sync_usable_strict_gate_pass"),
+        "go_diagnostic_status_at_quality_eval": go_payload.get("status_at_quality_eval"),
+        "go_diagnostic_exported_rotation_status": go_payload.get("exported_rotation_status"),
+        "go_diagnostic_has_base_period_at_quality_eval": go_payload.get("has_base_period_at_quality_eval"),
+        "go_diagnostic_quality_formula_path": go_payload.get("quality_formula_path"),
+        "go_diagnostic_quality_status_mismatch": go_payload.get("quality_status_mismatch"),
+        "go_diagnostic_quality_expected_from_exported_status": go_payload.get("quality_expected_from_exported_status"),
+        "go_diagnostic_sync_quality": go_payload.get("go_diagnostic_sync_quality"),
+        "go_diagnostic_quality_eval_seq": go_payload.get("quality_eval_seq"),
+        "go_diagnostic_quality_eval_age_s": go_payload.get("quality_eval_age_s"),
         "go_diagnostic_go_sync_usable_reacquired_provisional": go_payload.get("sync_reacquired_provisional"),
         "go_diagnostic_go_sync_usable_fit_obs": go_payload.get("fit_observation_count"),
         "go_diagnostic_go_sync_usable_fit_icaos": go_payload.get("fit_icao_count"),
@@ -3721,6 +3730,24 @@ class RadarState:
                 "go_sync_usable_period_agrees": bool(entry.get("go_sync_usable_period_agrees", False)),
                 "go_sync_usable_period_reject_reason": str(entry.get("go_sync_usable_period_reject_reason") or ""),
                 "go_sync_usable_strict_gate_pass": bool(entry.get("go_sync_usable_strict_gate_pass", False)),
+                "status_at_quality_eval": str(entry.get("status_at_quality_eval") or ""),
+                "exported_rotation_status": str(entry.get("exported_rotation_status") or ""),
+                "has_base_period_at_quality_eval": bool(entry.get("has_base_period_at_quality_eval", False)),
+                "quality_formula_path": str(entry.get("quality_formula_path") or ""),
+                "quality_status_mismatch": bool(entry.get("quality_status_mismatch", False)),
+                "quality_expected_from_exported_status": (
+                    float(entry["quality_expected_from_exported_status"])
+                    if entry.get("quality_expected_from_exported_status") is not None else None
+                ),
+                "go_diagnostic_sync_quality": (
+                    float(entry["go_diagnostic_sync_quality"])
+                    if entry.get("go_diagnostic_sync_quality") is not None else None
+                ),
+                "quality_eval_seq": int(entry.get("quality_eval_seq") or 0),
+                "quality_eval_age_s": (
+                    float(entry["quality_eval_age_s"])
+                    if entry.get("quality_eval_age_s") is not None else None
+                ),
             }
         except Exception:
             return None

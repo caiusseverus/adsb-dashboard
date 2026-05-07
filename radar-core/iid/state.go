@@ -275,6 +275,53 @@ type DebugSnapshot struct {
 	GoSyncUsablePeriodAgrees                      bool
 	GoSyncUsablePeriodRejectReason                string
 	GoSyncUsableStrictGatePass                    bool
+	GoDiagnosticStatusAtQualityEval               string
+	GoDiagnosticExportedRotationStatus            string
+	GoDiagnosticHasBasePeriodAtQualityEval        bool
+	GoDiagnosticQualityFormulaPath                string
+	GoDiagnosticQualityStatusMismatch             bool
+	GoDiagnosticQualityExpectedFromExportedStatus float64
+	GoDiagnosticSyncQuality                       float64
+	GoDiagnosticQualityEvalSeq                    uint64
+	GoDiagnosticQualityEvalAgeS                   float64
+}
+
+func isSyncQualityMappedStatus(status string) bool {
+	switch status {
+	case "SINGLE_RADAR", "LIKELY_SINGLE", "CHECK_MULTI", "MULTI_RADAR":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *IIDState) refreshSyncQualityLocked(source string) float64 {
+	hasBaseAtEval := s.BasePeriodS != nil && *s.BasePeriodS > 0
+	quality := syncQuality(s.Status, hasBaseAtEval)
+	if s.Sync == nil {
+		return quality
+	}
+	s.Sync.SyncQuality = quality
+	s.Sync.QualityStatusAtEval = s.Status
+	s.Sync.ExportedRotationStatusAtQualityEval = s.Status
+	s.Sync.HasBasePeriodAtQualityEval = hasBaseAtEval
+	s.Sync.BasePeriodPresentAtQualityEval = s.BasePeriodS != nil
+	s.Sync.SyncBasePeriodPresentAtQualityEval = s.Sync.BasePeriodS > 0
+	s.Sync.PeriodPresentAtQualityEval = s.PeriodS != nil && *s.PeriodS > 0
+	s.Sync.EffectivePeriodPresentAtQualityEval = s.EffectivePeriodS != nil && *s.EffectivePeriodS > 0
+	s.Sync.PeriodAgreesWithDFAtQualityEval = s.PeriodAgreesWithDF
+	s.Sync.PeriodRejectReasonAtQualityEval = s.PeriodRejectReason
+	s.Sync.HoldoverAtQualityEval = s.Sync.Holdover
+	s.Sync.QualityEvalUnix = float64(time.Now().UnixNano()) / 1e9
+	s.Sync.QualityEvalSeq++
+	s.Sync.QualityFormulaPath = "syncQuality(status,has_base_period)"
+	expected := syncQuality(s.Status, hasBaseAtEval)
+	s.Sync.QualityExpectedFromExportedStatus = expected
+	s.Sync.QualityStatusMismatch = hasBaseAtEval &&
+		isSyncQualityMappedStatus(s.Status) &&
+		math.Abs(s.Sync.SyncQuality-expected) > 1e-9
+	_ = source // reserved to keep diagnostics extension-compatible without behavior branching.
+	return quality
 }
 
 const (
@@ -375,6 +422,7 @@ func (s *IIDState) ApplyRotation(model *RotationModel) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	reinforce(s, model)
+	s.refreshSyncQualityLocked("apply_rotation")
 	s.LastRotationModel = model
 	s.LastUpdated = time.Now()
 }
@@ -430,6 +478,7 @@ func (s *IIDState) SetBasePeriod(periodS float64) {
 			s.Sync.PeriodRejectReason = "missing_df_base_period"
 			s.Sync.PeriodAgreesWithDF = false
 			s.Sync.ResetFitEpochOnModelChange("base_period_unavailable", refICAO, "go_refiner_holdover")
+			s.refreshSyncQualityLocked("set_base_period_missing")
 		}
 		return
 	}
@@ -485,6 +534,7 @@ func (s *IIDState) SetBasePeriod(periodS float64) {
 		if s.PeriodRejectReason == "refined_period_disagrees_with_df" {
 			s.Sync.enterHoldover("period_disagreement")
 		}
+		s.refreshSyncQualityLocked("set_base_period")
 	}
 
 	// ── Diagnostic: compact rotation period vs DF base ─────────────────
@@ -606,7 +656,7 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 		}
 		return
 	}
-	quality := syncQuality(s.Status, s.BasePeriodS != nil)
+	quality := syncQuality(s.Status, s.BasePeriodS != nil && *s.BasePeriodS > 0)
 	if s.Sync == nil {
 		// Bootstrap on first reference burst.
 		eligible := nAircraft >= 2 && refPosAgeS <= refinementStalePositionMaxS
@@ -616,10 +666,12 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 			return
 		}
 		s.Sync = NewSyncState(s.IID, *s.EffectivePeriodS, epochUS, phaseOffsetDeg, quality)
+		s.refreshSyncQualityLocked("update_sync_epoch_bootstrap")
 		s.Sync.PeriodAgreesWithDF = s.PeriodAgreesWithDF
 		s.Sync.PeriodRejectReason = s.PeriodRejectReason
 		return
 	}
+	s.refreshSyncQualityLocked("update_sync_epoch")
 	refICAO := uint32(0)
 	if s.RefICAO != nil {
 		refICAO = *s.RefICAO
@@ -1031,6 +1083,24 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 		out.GoSyncUsablePeriodAgrees = s.Sync.SyncUsablePeriodAgrees
 		out.GoSyncUsablePeriodRejectReason = s.Sync.SyncUsablePeriodRejectReason
 		out.GoSyncUsableStrictGatePass = s.Sync.SyncUsableStrictGatePass
+		out.GoDiagnosticStatusAtQualityEval = s.Sync.QualityStatusAtEval
+		out.GoDiagnosticExportedRotationStatus = s.Status
+		out.GoDiagnosticHasBasePeriodAtQualityEval = s.Sync.HasBasePeriodAtQualityEval
+		out.GoDiagnosticQualityFormulaPath = s.Sync.QualityFormulaPath
+		expectedFromExported := syncQuality(s.Status, s.BasePeriodS != nil && *s.BasePeriodS > 0)
+		out.GoDiagnosticQualityExpectedFromExportedStatus = expectedFromExported
+		out.GoDiagnosticSyncQuality = s.Sync.SyncQuality
+		out.GoDiagnosticQualityStatusMismatch = (s.BasePeriodS != nil && *s.BasePeriodS > 0) &&
+			isSyncQualityMappedStatus(s.Status) &&
+			math.Abs(s.Sync.SyncQuality-expectedFromExported) > 1e-9
+		out.GoDiagnosticQualityEvalSeq = s.Sync.QualityEvalSeq
+		if s.Sync.QualityEvalUnix > 0 {
+			ageS := float64(time.Now().UnixNano())/1e9 - s.Sync.QualityEvalUnix
+			if ageS < 0 {
+				ageS = 0
+			}
+			out.GoDiagnosticQualityEvalAgeS = ageS
+		}
 	}
 	out.ActiveAircraftEstimate = s.lastActiveAircraft
 	out.BurstRecordsTotal = len(s.records)

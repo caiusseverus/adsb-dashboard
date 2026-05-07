@@ -564,3 +564,22 @@ Verification:
 - `uv run --directory backend pytest tests/test_radar_sweep.py -k "stage10_live_unclassified_shape_with_diag_usable_flags_maps_to_hysteresis or stage10_enabled_nonactive_stable_usable_without_go_sync_dict_maps_to_hysteresis or stage10_enabled_nonactive_stable_usable_without_gate_snapshot_maps_to_hysteresis" -q`
 - `UV_CACHE_DIR=/tmp/uv-cache uv run --directory backend python - <<'PY' ... replay capture ... PY`
 - Replay result on captured unclassified samples: `{'replayed_samples': 94, 'still_unclassified': 0, 'nonactive_null_gate': 0}`.
+
+## 2026-05-07 SyncQuality vs Rotation Status Mismatch Fix
+
+- [x] Trace quality computation and status update ordering in Go runtime paths.
+- [x] Add Go diagnostics for quality-eval status/base context and mismatch detection.
+- [x] Fix stale quality behavior by recomputing SyncQuality after rotation/base updates.
+- [x] Expose new diagnostics through Go snapshot payload and Python sync mapping.
+- [x] Add Go + backend tests for mapping and transition behavior.
+- [ ] Run short live capture and report post-fix runtime counts.
+
+Review:
+- Root cause confirmed: `SyncQuality` was calculated on `UpdateSyncEpoch` using current `s.Status`, while `s.Status` is refreshed later on the rotation ticker (`ApplyRotation`/`reinforce`). This allowed `SyncQuality` to stay at `0.0` after status transitioned to `SINGLE_RADAR` until another sync update arrived.
+- Fix: add locked recomputation of SyncQuality and quality-eval diagnostics whenever rotation/base-period context updates, and surface mismatch diagnostics if exported status and quality diverge under mapped statuses with base present.
+- No changes to Stage 10 handoff policy, thresholds, tolerances, holdover policy, localiser, chart rendering, phase authority, or geographic semantics.
+
+Verification:
+- `cd radar-core && GOCACHE=/tmp/go-build go test ./iid/... ./cmd/radar-core/...`
+- `uv run --directory backend pytest tests/test_radar_sweep.py -k "go_quality_eval_diagnostics_fields_are_mapped or stage10_live_unclassified_shape_with_diag_usable_flags_maps_to_hysteresis" -q`
+- Live capture verification pending because no backend was reachable at `127.0.0.1:8000` in this session.

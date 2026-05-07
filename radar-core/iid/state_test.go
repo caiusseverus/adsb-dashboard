@@ -69,6 +69,61 @@ func TestRefreshReference_ClearsWhenNoDominantCandidates(t *testing.T) {
 	}
 }
 
+func TestSyncQualityRecomputedAfterStatusTransitionToSingleRadar(t *testing.T) {
+	s := NewIIDState(41)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Status = "UNKNOWN"
+	s.UpdateSyncEpoch(0.0, 0.0, 4, 0.5)
+	if s.Sync == nil {
+		t.Fatal("expected sync state after bootstrap")
+	}
+	if s.Sync.SyncQuality != 0.0 {
+		t.Fatalf("bootstrap sync quality=%.2f, want 0.0 while status is UNKNOWN", s.Sync.SyncQuality)
+	}
+
+	model := &RotationModel{
+		DominantPeriodS:    &base,
+		Status:             "CHECK_MULTI",
+		PrimaryDirectCount: 12,
+		PeriodStdS:         0.01,
+	}
+	s.ApplyRotation(model)
+	snap := s.DebugStateSnapshot()
+	if snap.Status != "SINGLE_RADAR" {
+		t.Fatalf("status=%q, want SINGLE_RADAR", snap.Status)
+	}
+	if math.Abs(snap.SyncQuality-1.0) > 1e-9 {
+		t.Fatalf("sync quality=%.6f, want 1.0 after SINGLE_RADAR transition", snap.SyncQuality)
+	}
+	if snap.GoDiagnosticStatusAtQualityEval != "SINGLE_RADAR" {
+		t.Fatalf("status_at_quality_eval=%q, want SINGLE_RADAR", snap.GoDiagnosticStatusAtQualityEval)
+	}
+	if snap.GoDiagnosticQualityStatusMismatch {
+		t.Fatal("quality status mismatch should be false after recompute")
+	}
+}
+
+func TestSyncQualityMismatchDiagnosticFlagsStaleValue(t *testing.T) {
+	s := NewIIDState(42)
+	base := 4.0
+	s.SetBasePeriod(base)
+	s.Status = "SINGLE_RADAR"
+	s.Sync = NewSyncState(s.IID, base, 0.0, 0.0, 0.0)
+	// Simulate stale cached quality from pre-status state.
+	s.Sync.SyncQuality = 0.0
+	s.Sync.QualityStatusAtEval = "UNKNOWN"
+	s.Sync.HasBasePeriodAtQualityEval = true
+
+	snap := s.DebugStateSnapshot()
+	if !snap.GoDiagnosticQualityStatusMismatch {
+		t.Fatal("expected mismatch diagnostic for stale sync quality")
+	}
+	if math.Abs(snap.GoDiagnosticQualityExpectedFromExportedStatus-1.0) > 1e-9 {
+		t.Fatalf("expected quality from exported status=%.6f, want 1.0", snap.GoDiagnosticQualityExpectedFromExportedStatus)
+	}
+}
+
 func TestDFBasePeriodOverridesDisagreeingCompactPeriod(t *testing.T) {
 	s := NewIIDState(12)
 	compactPeriod := 2.01

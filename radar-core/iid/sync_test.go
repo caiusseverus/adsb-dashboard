@@ -894,6 +894,29 @@ func TestIIDState_UpdateSyncEpoch(t *testing.T) {
 	}
 }
 
+func TestSyncQualityStatusMapping(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    string
+		hasPeriod bool
+		want      float64
+	}{
+		{name: "single", status: "SINGLE_RADAR", hasPeriod: true, want: 1.0},
+		{name: "likely", status: "LIKELY_SINGLE", hasPeriod: true, want: 0.8},
+		{name: "check_multi", status: "CHECK_MULTI", hasPeriod: true, want: 0.5},
+		{name: "multi", status: "MULTI_RADAR", hasPeriod: true, want: 0.3},
+		{name: "no_period", status: "SINGLE_RADAR", hasPeriod: false, want: 0.0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := syncQuality(tc.status, tc.hasPeriod)
+			if math.Abs(got-tc.want) > 1e-9 {
+				t.Fatalf("syncQuality(%q,%v)=%.6f want %.6f", tc.status, tc.hasPeriod, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestPositionCache_SetAndGet(t *testing.T) {
 	c := NewPositionCache()
 	c.Update(0xAA, 51.5, -0.1, nil, float64(time.Now().Unix()))

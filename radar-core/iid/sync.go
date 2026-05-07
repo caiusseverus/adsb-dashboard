@@ -185,6 +185,21 @@ type SyncState struct {
 	SyncUsablePeriodAgrees                        bool
 	SyncUsablePeriodRejectReason                  string
 	SyncUsableStrictGatePass                      bool
+	QualityStatusAtEval                           string
+	ExportedRotationStatusAtQualityEval           string
+	HasBasePeriodAtQualityEval                    bool
+	BasePeriodPresentAtQualityEval                bool
+	SyncBasePeriodPresentAtQualityEval            bool
+	PeriodPresentAtQualityEval                    bool
+	EffectivePeriodPresentAtQualityEval           bool
+	PeriodAgreesWithDFAtQualityEval               bool
+	PeriodRejectReasonAtQualityEval               string
+	HoldoverAtQualityEval                         bool
+	QualityEvalUnix                               float64
+	QualityEvalSeq                                uint64
+	QualityFormulaPath                            string
+	QualityStatusMismatch                         bool
+	QualityExpectedFromExportedStatus             float64
 }
 
 const (

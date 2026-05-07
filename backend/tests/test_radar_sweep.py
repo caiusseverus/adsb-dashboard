@@ -4181,6 +4181,34 @@ def test_go_refined_stable_with_fit_data_not_labelled_insufficient():
     assert fields["go_diagnostic_applied_delta_s"] == pytest.approx(0.00104)
 
 
+def test_go_quality_eval_diagnostics_fields_are_mapped():
+    from radar.sweep import _build_go_diagnostic_fields
+
+    fields = _build_go_diagnostic_fields(
+        _make_go_refined_ready_sync(304),
+        go_sync={
+            "status_at_quality_eval": "SINGLE_RADAR",
+            "exported_rotation_status": "SINGLE_RADAR",
+            "has_base_period_at_quality_eval": True,
+            "quality_formula_path": "syncQuality(status,has_base_period)",
+            "quality_status_mismatch": False,
+            "quality_expected_from_exported_status": 1.0,
+            "go_diagnostic_sync_quality": 1.0,
+            "quality_eval_seq": 7,
+            "quality_eval_age_s": 0.25,
+        },
+    )
+    assert fields["go_diagnostic_status_at_quality_eval"] == "SINGLE_RADAR"
+    assert fields["go_diagnostic_exported_rotation_status"] == "SINGLE_RADAR"
+    assert fields["go_diagnostic_has_base_period_at_quality_eval"] is True
+    assert fields["go_diagnostic_quality_formula_path"] == "syncQuality(status,has_base_period)"
+    assert fields["go_diagnostic_quality_status_mismatch"] is False
+    assert fields["go_diagnostic_quality_expected_from_exported_status"] == pytest.approx(1.0)
+    assert fields["go_diagnostic_sync_quality"] == pytest.approx(1.0)
+    assert fields["go_diagnostic_quality_eval_seq"] == 7
+    assert fields["go_diagnostic_quality_eval_age_s"] == pytest.approx(0.25)
+
+
 # =============================================================================
 # Stage 5: RADAR_SYNC_GO_REFINER_OPERATIONAL feature flag tests
 # =============================================================================
