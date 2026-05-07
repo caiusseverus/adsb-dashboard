@@ -180,6 +180,16 @@ class LiveSyncState:
     last_phase_anchor_clear_ts: float | None = None
     go_sync_unusable_reason_at_clear: str | None = None
     phase_anchor_retention_reason: str | None = None
+    last_go_evidence_event_ts: float | None = None
+    last_burst_sync_observation_ts: float | None = None
+    last_eligible_burst_observation_age_s: float | None = None
+    last_sync_driving_fit_observation_age_s: float | None = None
+    fit_epoch_last_observation_age_s: float | None = None
+    anchor_last_validation_age_s: float | None = None
+    anchor_retained_without_current_evidence: bool = False
+    fit_epoch_retained_without_current_evidence: bool = False
+    burst_rows_absence_reason: str | None = None
+    fit_counters_source: str | None = None
 
 
 @dataclass

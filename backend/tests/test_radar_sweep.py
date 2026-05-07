@@ -5415,6 +5415,66 @@ def test_go_quality_transient_does_not_retain_through_population_demotion_or_per
     assert period_payload["phase_anchor_clear_reason"] == "period_disagreement"
 
 
+def test_stale_go_evidence_marks_fit_and_anchor_retained_not_live():
+    state = RadarState()
+    iid = 9910
+    now = time.time()
+    # Existing trusted anchor state from prior live period.
+    state._live_sync_states[iid] = LiveSyncState(
+        iid=iid,
+        period_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=now - 1.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        phase_basis="anchor_relative",
+        phase_status="trusted",
+        phase_anchor_icao="A1B2C3",
+        phase_anchor_status="selected",
+        phase_anchor_since_ts=now - 2.0,
+        population_validation_state="insufficient_data",
+    )
+    # Stale evidence: no recent rows inside LIVE_SYNC_OBS_RETENTION_S window.
+    state._go_evidence_events.append({"iid": iid, "wall_ts": now - (state._LIVE_SYNC_OBS_RETENTION_S + 30.0)})
+
+    state.update_go_iid_state({
+        "i": iid, "sp": True, "su": True, "sps": 4.0, "sep": 2200.0, "sod": 25.0,
+        "sq": 1.0, "sj": 2.0, "sh": False, "lu": now, "rv": 1, "bps": 4.0, "eps": 4.0,
+        "foc": 256, "fic": 33, "feo": 256, "fep": 120.0, "pag": True,
+    })
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(iid), state.get_go_live_sync_state(iid))
+
+    assert payload["go_sync_unusable_reason"] == "stale_go_evidence"
+    assert payload["go_diagnostic_fit_epoch_retained_without_current_evidence"] is True
+    assert payload["go_diagnostic_anchor_retained_without_current_evidence"] is False
+    assert payload["go_diagnostic_fit_counters_source"] == "retained"
+    assert payload["phase_status_display"] != "anchor_trusted"
+    # Historical anchor may be retained or cleared, but cannot be trusted-live.
+    assert payload["phase_authority"] != "go_runtime"
+    assert payload["handoff_gate_failures"]["go_readiness"]["go_sync_state_usable"]["passed"] is False
+
+
+def test_stale_go_evidence_exposes_absent_row_reason_and_observation_ages():
+    state = RadarState()
+    iid = 9911
+    now = time.time()
+    state._go_evidence_events.append({"iid": iid, "wall_ts": now - (state._LIVE_SYNC_OBS_RETENTION_S + 5.0)})
+    state.update_go_iid_state({
+        "i": iid, "sp": True, "su": True, "sps": 4.0, "sep": 2100.0, "sod": 15.0,
+        "sq": 1.0, "sj": 2.0, "sh": False, "lu": now, "rv": 1, "bps": 4.0, "eps": 4.0,
+        "foc": 12, "fic": 4, "pag": True,
+    })
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(iid), state.get_go_live_sync_state(iid))
+
+    assert payload["go_diagnostic_burst_rows_absence_reason"] == "no_burst_sync_rows"
+    assert payload["go_diagnostic_last_go_evidence_event_ts"] is not None
+    assert payload["go_diagnostic_fit_epoch_last_observation_age_s"] is not None
+    assert payload["go_diagnostic_fit_epoch_last_observation_age_s"] > state._LIVE_SYNC_OBS_RETENTION_S
+
+
 # --- FitInlierRatio tests (Stage 4R) ---
 
 def test_normalise_go_sync_state_fit_inlier_ratio_present():

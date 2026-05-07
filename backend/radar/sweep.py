@@ -517,6 +517,16 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_compact_period_diagnostic_reason": go_payload.get("compact_period_diagnostic_reason"),
         "go_diagnostic_compact_period_disagreement_s": go_payload.get("compact_period_disagreement_s"),
         "go_diagnostic_compact_period_disagreement_ppm": go_payload.get("compact_period_disagreement_ppm"),
+        "go_diagnostic_last_go_evidence_event_ts": go_payload.get("last_go_evidence_event_ts"),
+        "go_diagnostic_last_burst_sync_observation_ts": go_payload.get("last_burst_sync_observation_ts"),
+        "go_diagnostic_last_eligible_burst_observation_age_s": go_payload.get("last_eligible_burst_observation_age_s"),
+        "go_diagnostic_last_sync_driving_fit_observation_age_s": go_payload.get("last_sync_driving_fit_observation_age_s"),
+        "go_diagnostic_fit_epoch_last_observation_age_s": go_payload.get("fit_epoch_last_observation_age_s"),
+        "go_diagnostic_anchor_last_validation_age_s": go_payload.get("anchor_last_validation_age_s"),
+        "go_diagnostic_anchor_retained_without_current_evidence": go_payload.get("anchor_retained_without_current_evidence"),
+        "go_diagnostic_fit_epoch_retained_without_current_evidence": go_payload.get("fit_epoch_retained_without_current_evidence"),
+        "go_diagnostic_burst_rows_absence_reason": go_payload.get("burst_rows_absence_reason"),
+        "go_diagnostic_fit_counters_source": go_payload.get("fit_counters_source"),
     }
 
 
@@ -3967,6 +3977,11 @@ class RadarState:
         )
         usable = bool(go_sync.get("usable", False)) if present else False
         gates["go_sync_state_usable"] = _gate_value(usable if present else None, None if usable else "go_sync_unusable")
+        evidence_fresh = bool(go_sync.get("evidence_fresh", True)) if present else None
+        gates["go_evidence_fresh"] = _gate_value(
+            evidence_fresh if present else None,
+            None if evidence_fresh else "stale_go_evidence",
+        )
         period_agrees = bool(go_sync.get("period_agrees_with_df", False)) if present else False
         gates["go_period_agrees_with_df"] = _gate_value(period_agrees if present else None, None if period_agrees else "go_period_disagrees_with_df")
         n_sync_frames = int(go_sync.get("n_sync_frames") or 0) if present else 0
@@ -4739,6 +4754,88 @@ class RadarState:
     def _go_multi_sync_admission_snapshot(self, iid: int) -> dict | None:
         return _go_multi_sync_admission_snapshot_helper(self, iid)
 
+    def _compute_go_evidence_freshness_locked(
+        self,
+        iid: int,
+        *,
+        now_ts: float,
+        fit_observation_count: int,
+        phase_anchor_icao: str | None,
+    ) -> dict:
+        live_window_s = float(self._LIVE_SYNC_OBS_RETENTION_S)
+
+        go_evidence = [entry for entry in self._go_evidence_events if int(entry.get("iid", -1)) == iid]
+        last_go_evidence_event_ts = None
+        if go_evidence:
+            last_go_evidence_event_ts = float(go_evidence[-1].get("wall_ts") or 0.0) or None
+
+        burst_rows = list(self._live_burst_timeline_obs.get(iid, ()))
+        last_burst_sync_observation_ts = None
+        if burst_rows:
+            last_burst_sync_observation_ts = float(getattr(burst_rows[-1], "ts", 0.0) or 0.0) or None
+
+        aligned_rows = list(self._live_aligned_burst_obs.get(iid, ()))
+        eligible_ts = [
+            float(getattr(obs, "ts", 0.0) or 0.0)
+            for obs in aligned_rows
+            if bool(getattr(obs, "sync_update_eligible", False))
+        ]
+        last_eligible_ts = max(eligible_ts) if eligible_ts else None
+        last_eligible_burst_observation_age_s = (
+            max(0.0, now_ts - last_eligible_ts) if last_eligible_ts is not None else None
+        )
+
+        evidence_anchor_ts_candidates = [
+            ts for ts in (last_go_evidence_event_ts, last_burst_sync_observation_ts, last_eligible_ts)
+            if ts is not None
+        ]
+        latest_evidence_ts = max(evidence_anchor_ts_candidates) if evidence_anchor_ts_candidates else None
+
+        evidence_known = latest_evidence_ts is not None
+        evidence_fresh = (
+            (now_ts - latest_evidence_ts) <= live_window_s
+            if evidence_known else True
+        )
+        fit_epoch_retained_without_current_evidence = bool(
+            fit_observation_count > 0 and evidence_known and not evidence_fresh
+        )
+        anchor_retained_without_current_evidence = bool(
+            phase_anchor_icao and evidence_known and not evidence_fresh
+        )
+
+        if last_burst_sync_observation_ts is None:
+            burst_rows_absence_reason = "no_burst_sync_rows"
+        elif (now_ts - last_burst_sync_observation_ts) > live_window_s:
+            burst_rows_absence_reason = "burst_rows_stale"
+        else:
+            burst_rows_absence_reason = None
+
+        if not evidence_known:
+            fit_counters_source = "unknown_no_local_evidence"
+        else:
+            fit_counters_source = "live_current" if evidence_fresh else "retained"
+
+        fit_epoch_last_observation_age_s = last_eligible_burst_observation_age_s
+        if fit_epoch_last_observation_age_s is None and latest_evidence_ts is not None:
+            fit_epoch_last_observation_age_s = max(0.0, now_ts - latest_evidence_ts)
+
+        return {
+            "last_go_evidence_event_ts": last_go_evidence_event_ts,
+            "last_burst_sync_observation_ts": last_burst_sync_observation_ts,
+            "last_eligible_burst_observation_age_s": last_eligible_burst_observation_age_s,
+            "last_sync_driving_fit_observation_age_s": last_eligible_burst_observation_age_s,
+            "fit_epoch_last_observation_age_s": fit_epoch_last_observation_age_s,
+            "anchor_last_validation_age_s": (
+                max(0.0, now_ts - latest_evidence_ts) if latest_evidence_ts is not None else None
+            ),
+            "anchor_retained_without_current_evidence": anchor_retained_without_current_evidence,
+            "fit_epoch_retained_without_current_evidence": fit_epoch_retained_without_current_evidence,
+            "burst_rows_absence_reason": burst_rows_absence_reason,
+            "fit_counters_source": fit_counters_source,
+            "evidence_fresh": evidence_fresh,
+            "evidence_known": evidence_known,
+        }
+
     def _ingest_go_frame_sync_diagnostic_locked(self, iid: int, go_sync: dict) -> None:
         existing = self._live_sync_states.get(iid)
         effective_period_s = go_sync.get("effective_period_s") or go_sync.get("period_s")
@@ -4750,6 +4847,7 @@ class RadarState:
         if phase_epoch_us is None or phase_offset_deg is None:
             return
         last_updated = float(go_sync.get("last_updated") or time.time())
+        now_ts = time.time()
         previous_phase_anchor_icao = getattr(existing, "phase_anchor_icao", None) if existing is not None else None
         previous_phase_status = str(getattr(existing, "phase_status", "") or "") if existing is not None else None
         previous_phase_basis = str(getattr(existing, "phase_basis", "") or "") if existing is not None else ""
@@ -4837,6 +4935,37 @@ class RadarState:
                 phase_status = previous_phase_status or None
                 phase_anchor_clear_reason = "no_anchor"
                 phase_basis_override_reason = "serialization_fallback_no_anchor"
+
+        evidence_diag = self._compute_go_evidence_freshness_locked(
+            iid,
+            now_ts=now_ts,
+            fit_observation_count=int(go_sync.get("fit_observation_count") or 0),
+            phase_anchor_icao=phase_anchor_icao,
+        )
+        if bool(evidence_diag.get("evidence_known", False)) and not evidence_diag.get("evidence_fresh", False):
+            # Keep retained diagnostics, but do not allow stale evidence to appear
+            # as live-trusted/usable for authority or handoff promotion.
+            go_sync["usable"] = False
+            go_sync["go_sync_unusable_reason"] = "stale_go_evidence"
+            go_sync["go_sync_usable_quality_ok"] = False
+            go_sync["go_sync_usable_strict_gate_pass"] = False
+            phase_status = "untrusted"
+            if phase_anchor_icao is not None:
+                phase_anchor_clear_reason = phase_anchor_clear_reason or "stale_go_evidence"
+                phase_basis_override_reason = "anchor_retained_stale_go_evidence"
+
+        go_sync.update({
+            "last_go_evidence_event_ts": evidence_diag.get("last_go_evidence_event_ts"),
+            "last_burst_sync_observation_ts": evidence_diag.get("last_burst_sync_observation_ts"),
+            "last_eligible_burst_observation_age_s": evidence_diag.get("last_eligible_burst_observation_age_s"),
+            "last_sync_driving_fit_observation_age_s": evidence_diag.get("last_sync_driving_fit_observation_age_s"),
+            "fit_epoch_last_observation_age_s": evidence_diag.get("fit_epoch_last_observation_age_s"),
+            "anchor_last_validation_age_s": evidence_diag.get("anchor_last_validation_age_s"),
+            "anchor_retained_without_current_evidence": evidence_diag.get("anchor_retained_without_current_evidence"),
+            "fit_epoch_retained_without_current_evidence": evidence_diag.get("fit_epoch_retained_without_current_evidence"),
+            "burst_rows_absence_reason": evidence_diag.get("burst_rows_absence_reason"),
+            "fit_counters_source": evidence_diag.get("fit_counters_source"),
+        })
         self._live_sync_states[iid] = LiveSyncState(
             iid=iid,
             period_s=float(effective_period_s),
@@ -5033,6 +5162,16 @@ class RadarState:
             last_phase_anchor_clear_ts=last_phase_anchor_clear_ts,
             go_sync_unusable_reason_at_clear=go_sync_unusable_reason_at_clear,
             phase_anchor_retention_reason=phase_anchor_retention_reason,
+            last_go_evidence_event_ts=evidence_diag.get("last_go_evidence_event_ts"),
+            last_burst_sync_observation_ts=evidence_diag.get("last_burst_sync_observation_ts"),
+            last_eligible_burst_observation_age_s=evidence_diag.get("last_eligible_burst_observation_age_s"),
+            last_sync_driving_fit_observation_age_s=evidence_diag.get("last_sync_driving_fit_observation_age_s"),
+            fit_epoch_last_observation_age_s=evidence_diag.get("fit_epoch_last_observation_age_s"),
+            anchor_last_validation_age_s=evidence_diag.get("anchor_last_validation_age_s"),
+            anchor_retained_without_current_evidence=bool(evidence_diag.get("anchor_retained_without_current_evidence", False)),
+            fit_epoch_retained_without_current_evidence=bool(evidence_diag.get("fit_epoch_retained_without_current_evidence", False)),
+            burst_rows_absence_reason=evidence_diag.get("burst_rows_absence_reason"),
+            fit_counters_source=evidence_diag.get("fit_counters_source"),
         )
         fit_total = int(go_sync.get("fit_observation_count") or 0)
         fit_span = float(go_sync.get("fit_span_s") or 0.0)
