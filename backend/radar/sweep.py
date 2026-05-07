@@ -986,34 +986,68 @@ def _live_sync_state_to_dict(
                     effective_handoff_reason = str(gate_state.get("reason") or blocking_gate)
                 break
 
-        # Fallback attribution for cases where gate snapshots are temporarily
-        # absent but Go diagnostics still expose a specific blocker.
-        if not is_active_go_operational and not blocking_gate:
+        if not is_active_go_operational:
+            handoff_reason_to_gate = {
+                "go_sync_unusable": "go_readiness.go_sync_state_usable",
+                "go_holdover": "go_readiness.go_not_holdover",
+                "insufficient_contributing_icaos": "python_base.enough_icaos",
+                "slope_not_converged": "go_readiness.go_slope_converged",
+                "go_refinement_history_insufficient": "go_readiness.go_refinement_history_sufficient",
+                "go_ready_pending_hysteresis": "go_readiness_hysteresis",
+            }
+            reason_key = str(effective_handoff_reason or "").strip()
             go_sync_unusable_reason = str(getattr(sync, "go_sync_unusable_reason", "") or "").strip()
+            if not go_sync_unusable_reason and isinstance(go_sync, dict):
+                go_sync_unusable_reason = str(go_sync.get("go_sync_unusable_reason") or "").strip()
             holdover_reason = str(getattr(sync, "holdover_reason", "") or "").strip()
             period_ref_status = str(period_refinement_status or "").strip()
+            if (not period_ref_status or period_ref_status == "unavailable") and isinstance(go_sync, dict):
+                period_ref_status = str(go_sync.get("period_refinement_status") or period_ref_status or "").strip()
             contamination_state = str(getattr(sync, "contamination_state", "") or "").strip()
-            if go_sync_unusable_reason:
-                blocking_gate = "go_readiness.go_sync_state_usable"
-                if not effective_handoff_reason:
-                    effective_handoff_reason = go_sync_unusable_reason
-            elif bool(getattr(sync, "holdover", False)) or holdover_reason:
-                blocking_gate = "go_readiness.go_not_holdover"
-                if not effective_handoff_reason:
-                    effective_handoff_reason = holdover_reason or "go_holdover"
-            elif period_ref_status.startswith("insufficient_"):
-                blocking_gate = "go_readiness.go_refinement_history_sufficient"
-                if not effective_handoff_reason:
-                    effective_handoff_reason = "go_refinement_history_insufficient"
-            elif contamination_state == "contaminated":
-                blocking_gate = "go_readiness.go_contamination_state"
-                if not effective_handoff_reason:
-                    effective_handoff_reason = "contamination"
+            diag_go_sync_unusable_reason = str(getattr(sync, "go_diagnostic_go_sync_unusable_reason", "") or "").strip()
+            go_blocking_gate = (
+                str(blocking_gate)
+                if blocking_gate and str(blocking_gate).startswith(("python_base.", "go_readiness."))
+                else None
+            )
+            go_blocking_reason = effective_handoff_reason
 
-        if not is_active_go_operational and not blocking_gate:
-            blocking_gate = "go_readiness.unclassified_state"
-        if not is_active_go_operational and not effective_handoff_reason:
-            effective_handoff_reason = "go_state_unclassified"
+            # Precedence: existing go/python blocking gate → handoff_reason mapping
+            # → diagnostic fields → unclassified fallback.
+            if not go_blocking_gate:
+                mapped_gate = handoff_reason_to_gate.get(reason_key)
+                if mapped_gate:
+                    go_blocking_gate = mapped_gate
+                elif go_sync_unusable_reason or diag_go_sync_unusable_reason:
+                    go_blocking_gate = "go_readiness.go_sync_state_usable"
+                    if not effective_handoff_reason:
+                        effective_handoff_reason = go_sync_unusable_reason or diag_go_sync_unusable_reason
+                    go_blocking_reason = effective_handoff_reason
+                elif period_ref_status in {"insufficient_history", "unavailable"}:
+                    go_blocking_gate = "go_readiness.go_refinement_history_sufficient"
+                    if not effective_handoff_reason:
+                        effective_handoff_reason = "go_refinement_history_insufficient"
+                    go_blocking_reason = effective_handoff_reason
+                elif bool(getattr(sync, "holdover", False)) or holdover_reason:
+                    go_blocking_gate = "go_readiness.go_not_holdover"
+                    if not effective_handoff_reason:
+                        effective_handoff_reason = holdover_reason or "go_holdover"
+                    go_blocking_reason = effective_handoff_reason
+                elif contamination_state == "contaminated":
+                    go_blocking_gate = "go_readiness.go_contamination_state"
+                    if not effective_handoff_reason:
+                        effective_handoff_reason = "contamination"
+                    go_blocking_reason = effective_handoff_reason
+
+            if not go_blocking_gate:
+                go_blocking_gate = "go_readiness.unclassified_state"
+            if not effective_handoff_reason:
+                effective_handoff_reason = "go_state_unclassified"
+                go_blocking_reason = effective_handoff_reason
+            if not blocking_gate:
+                blocking_gate = go_blocking_gate
+            go_operational_blocking_gate = go_blocking_gate
+            go_operational_blocking_reason = go_blocking_reason
         # Keep phase-only blockers out of operational blocking_gate when Go is active.
         if is_active_go_operational and blocking_gate and str(blocking_gate).startswith("phase_readiness."):
             if not phase_blocking_gate:
@@ -1031,7 +1065,11 @@ def _live_sync_state_to_dict(
             else:
                 effective_handoff_state = "UNTRUSTED"
 
-    if blocking_gate and str(blocking_gate).startswith(("python_base.", "go_readiness.")):
+    if (
+        go_operational_blocking_gate is None
+        and blocking_gate
+        and str(blocking_gate).startswith(("python_base.", "go_readiness."))
+    ):
         go_operational_blocking_gate = str(blocking_gate)
         go_operational_blocking_reason = effective_handoff_reason
 
@@ -1097,6 +1135,11 @@ def _live_sync_state_to_dict(
         "phase_basis_override_reason": phase_basis_override_reason,
         "last_phase_anchor_clear_ts": getattr(sync, "last_phase_anchor_clear_ts", None),
         "go_sync_unusable_reason_at_clear": getattr(sync, "go_sync_unusable_reason_at_clear", None),
+        "go_sync_unusable_reason": (
+            str(getattr(sync, "go_sync_unusable_reason", "") or "").strip()
+            or (str(go_sync.get("go_sync_unusable_reason") or "").strip() if isinstance(go_sync, dict) else "")
+            or None
+        ),
         "phase_anchor_retention_reason": getattr(sync, "phase_anchor_retention_reason", None),
         "phase_anchor_score": float(getattr(sync, "phase_anchor_score") or 0.0),
         "phase_anchor_obs_count": int(getattr(sync, "phase_anchor_obs_count") or 0),
