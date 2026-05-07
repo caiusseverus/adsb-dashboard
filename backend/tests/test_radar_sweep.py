@@ -4921,8 +4921,9 @@ def test_stage10_enabled_nonactive_without_gate_details_gets_unclassified_blocki
     payload = sweep._live_sync_state_to_dict(sync)
     assert payload["go_refiner_operational_enabled"] is True
     assert payload["go_operational_active"] is False
-    assert payload["blocking_gate"] == "go_readiness.unclassified_state"
-    assert payload["handoff_reason"] == "go_state_unclassified"
+    assert payload["blocking_gate"] == "go_readiness.go_refinement_history_sufficient"
+    assert payload["go_operational_blocking_gate"] == "go_readiness.go_refinement_history_sufficient"
+    assert payload["handoff_reason"] == "go_refinement_history_insufficient"
 
 
 def test_stage10_enabled_nonactive_uses_go_sync_unusable_reason_before_unclassified(monkeypatch):
@@ -5061,6 +5062,106 @@ def test_stage10_enabled_nonactive_phase_blocker_still_sets_go_blocker_from_go_s
     assert payload["go_operational_blocking_gate"] == "go_readiness.go_sync_state_usable"
     assert payload["go_sync_unusable_reason"] == "strict_gate_failed"
     assert payload["handoff_reason"] != "go_state_unclassified"
+
+
+def test_stage10_enabled_nonactive_stable_usable_without_gate_snapshot_maps_to_hysteresis(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    from radar.sync_models import LiveSyncState
+    sync = LiveSyncState(
+        iid=914,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=2000.0,
+        source="go_frame_sync",
+        usable=False,
+        handoff_state="GO_REFINING",
+        handoff_reason="",
+        handoff_gate_failures={},
+    )
+    payload = sweep._live_sync_state_to_dict(
+        sync,
+        go_sync={
+            "period_refinement_status": "stable",
+            "go_sync_usable_quality_ok": True,
+            "go_sync_usable_holdover_ok": True,
+            "go_sync_usable_period_agrees": True,
+            "go_sync_usable_strict_gate_pass": True,
+        },
+    )
+    assert payload["go_operational_active"] is False
+    assert payload["go_operational_blocking_gate"] == "go_readiness_hysteresis"
+    assert payload["handoff_reason"] == "go_ready_pending_hysteresis"
+    assert payload["go_operational_blocking_reason"] == "go_ready_pending_hysteresis"
+
+
+def test_stage10_enabled_nonactive_stable_usable_without_go_sync_dict_maps_to_hysteresis(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    from radar.sync_models import LiveSyncState
+    sync = LiveSyncState(
+        iid=915,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=2000.0,
+        source="go_frame_sync",
+        usable=False,
+        handoff_state="GO_REFINING",
+        handoff_reason="",
+        handoff_gate_failures={},
+        period_refinement_status="stable",
+    )
+    sync.go_sync_usable_quality_ok = True
+    sync.go_sync_usable_holdover_ok = True
+    sync.go_sync_usable_period_agrees = True
+    sync.go_sync_usable_strict_gate_pass = True
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["go_operational_active"] is False
+    assert payload["go_operational_blocking_gate"] == "go_readiness_hysteresis"
+    assert payload["handoff_reason"] == "go_ready_pending_hysteresis"
+
+
+def test_stage10_enabled_nonactive_stable_usable_int_flags_map_to_hysteresis(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    from radar.sync_models import LiveSyncState
+    sync = LiveSyncState(
+        iid=916,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=2000.0,
+        source="go_frame_sync",
+        usable=False,
+        handoff_state="GO_REFINING",
+        handoff_reason="",
+        handoff_gate_failures={},
+        period_refinement_status="stable",
+    )
+    payload = sweep._live_sync_state_to_dict(
+        sync,
+        go_sync={
+            "period_refinement_status": "stable",
+            "go_sync_usable_quality_ok": 1,
+            "go_sync_usable_holdover_ok": 1,
+            "go_sync_usable_period_agrees": 1,
+            "go_sync_usable_strict_gate_pass": 1,
+        },
+    )
+    assert payload["go_operational_active"] is False
+    assert payload["go_operational_blocking_gate"] == "go_readiness_hysteresis"
+    assert payload["handoff_reason"] == "go_ready_pending_hysteresis"
 
 
 def test_stage10_active_go_with_phase_failure_uses_phase_blocker_not_go_blocker(monkeypatch):

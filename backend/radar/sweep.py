@@ -958,6 +958,21 @@ def _live_sync_state_to_dict(
     # gate exists in handoff_gate_failures, surface it as blocking_gate and use
     # its reason before applying legacy defaults.
     if source == "go_frame_sync" and go_refiner_operational_enabled:
+        def _bool_or_none(value: object) -> bool | None:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                v = value.strip().lower()
+                if v in {"true", "1", "yes", "on"}:
+                    return True
+                if v in {"false", "0", "no", "off"}:
+                    return False
+            return None
+
         if not blocking_gate and isinstance(handoff_gate_failures, dict):
             for section_name in ("python_base", "go_readiness", "phase_readiness"):
                 gates = handoff_gate_failures.get(section_name) or {}
@@ -1005,6 +1020,29 @@ def _live_sync_state_to_dict(
                 period_ref_status = str(go_sync.get("period_refinement_status") or period_ref_status or "").strip()
             contamination_state = str(getattr(sync, "contamination_state", "") or "").strip()
             diag_go_sync_unusable_reason = str(getattr(sync, "go_diagnostic_go_sync_unusable_reason", "") or "").strip()
+            go_diag_refinement_status = str((go_sync or {}).get("period_refinement_status") or "").strip() if isinstance(go_sync, dict) else ""
+            if not go_diag_refinement_status:
+                go_diag_refinement_status = str(getattr(sync, "period_refinement_status", "") or "").strip()
+            go_sync_usable_quality_ok = _bool_or_none(
+                (go_sync or {}).get("go_sync_usable_quality_ok")
+                if isinstance(go_sync, dict) else
+                getattr(sync, "go_sync_usable_quality_ok", None)
+            )
+            go_sync_usable_holdover_ok = _bool_or_none(
+                (go_sync or {}).get("go_sync_usable_holdover_ok")
+                if isinstance(go_sync, dict) else
+                getattr(sync, "go_sync_usable_holdover_ok", None)
+            )
+            go_sync_usable_period_agrees = _bool_or_none(
+                (go_sync or {}).get("go_sync_usable_period_agrees")
+                if isinstance(go_sync, dict) else
+                getattr(sync, "go_sync_usable_period_agrees", None)
+            )
+            go_sync_usable_strict_gate_pass = _bool_or_none(
+                (go_sync or {}).get("go_sync_usable_strict_gate_pass")
+                if isinstance(go_sync, dict) else
+                getattr(sync, "go_sync_usable_strict_gate_pass", None)
+            )
             go_blocking_gate = (
                 str(blocking_gate)
                 if blocking_gate and str(blocking_gate).startswith(("python_base.", "go_readiness."))
@@ -1028,6 +1066,11 @@ def _live_sync_state_to_dict(
                     if not effective_handoff_reason:
                         effective_handoff_reason = "go_refinement_history_insufficient"
                     go_blocking_reason = effective_handoff_reason
+                elif go_diag_refinement_status in {"insufficient_history", "unavailable"}:
+                    go_blocking_gate = "go_readiness.go_refinement_history_sufficient"
+                    if not effective_handoff_reason:
+                        effective_handoff_reason = "go_refinement_history_insufficient"
+                    go_blocking_reason = effective_handoff_reason
                 elif bool(getattr(sync, "holdover", False)) or holdover_reason:
                     go_blocking_gate = "go_readiness.go_not_holdover"
                     if not effective_handoff_reason:
@@ -1037,6 +1080,20 @@ def _live_sync_state_to_dict(
                     go_blocking_gate = "go_readiness.go_contamination_state"
                     if not effective_handoff_reason:
                         effective_handoff_reason = "contamination"
+                    go_blocking_reason = effective_handoff_reason
+                elif (
+                    go_diag_refinement_status == "stable"
+                    and go_sync_usable_quality_ok is True
+                    and go_sync_usable_holdover_ok is True
+                    and go_sync_usable_period_agrees is True
+                    and go_sync_usable_strict_gate_pass is True
+                ):
+                    # Go diagnostics indicate readiness components are satisfied,
+                    # but no concrete gate snapshot arrived with this state.
+                    # In Stage 10 this corresponds to pending operational streak.
+                    go_blocking_gate = "go_readiness_hysteresis"
+                    if not effective_handoff_reason:
+                        effective_handoff_reason = "go_ready_pending_hysteresis"
                     go_blocking_reason = effective_handoff_reason
 
             if not go_blocking_gate:
