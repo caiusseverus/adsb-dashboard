@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import config
 import pytest
 from radar import sweep
+from radar import sweep_diagnostics
 from radar.sweep import _analyse_iid_events
 from radar.models import BurstRecord, LiveFrameState, RadarIID, ReferenceAircraftInfo, RotationModel
 from radar.sync_models import (
@@ -1882,6 +1883,121 @@ def test_period_fit_rejects_large_residuals_without_hiding_timeline(monkeypatch)
     assert len(timeline["recomputed_observations"]) == 1
     assert timeline["recomputed_observations"][0]["fit_eligible"] is False
     assert timeline["recomputed_observations"][0]["fit_reject_reason"] == "residual_gate"
+
+
+def _build_compact_recomputed_row(
+    monkeypatch,
+    *,
+    bearing_deg: float | None,
+    pos_age_s: float = 0.2,
+    sync_update_eligible: bool = True,
+    score_override: float | None = None,
+):
+    monkeypatch.setattr(sweep_diagnostics.time, "time", lambda: 1_000.0)
+
+    state = RadarState()
+    sync = LiveSyncState(
+        iid=7,
+        period_s=10.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=10.0,
+    )
+    obs = AlignedBurstSyncObs(
+        burst_centroid_us=1_000_000.0,
+        icao="AAAAAA",
+        bearing_deg=bearing_deg,
+        n_replies=4,
+        signal_dbfs=-12.0,
+        pos_age_s=pos_age_s,
+        range_nm=5.0,
+        ts=999.0,
+        sync_update_eligible=sync_update_eligible,
+    )
+    if score_override is not None:
+        monkeypatch.setattr(state, "_score_sync_burst_observation", lambda _obs: score_override)
+    rows = sweep_diagnostics.build_compact_burst_sync_timeline_entries(
+        state,
+        sync,
+        [obs],
+        window_s=60.0,
+    )
+    assert len(rows) == 1
+    return rows[0]
+
+
+def test_compact_recomputed_near_wrap_reason(monkeypatch):
+    obs = _build_compact_recomputed_row(monkeypatch, bearing_deg=220.0, pos_age_s=0.2)
+    assert obs["fit_eligible"] is False
+    assert obs["fit_reject_reason"] == "near_wrap_residual"
+    assert obs["fit_reject_reason_source"] == "compact_recomputed"
+    assert obs["near_wrap_residual"] is True
+
+
+def test_compact_recomputed_stale_position_reason(monkeypatch):
+    # Keep residual below residual-gate threshold; combine stale age with an existing
+    # ineligibility condition (zero weight) so stale can be the primary label
+    # without changing fit-eligibility behavior.
+    obs = _build_compact_recomputed_row(
+        monkeypatch,
+        bearing_deg=40.0,
+        pos_age_s=9.5,
+        score_override=0.0,
+    )
+    assert obs["fit_eligible"] is False
+    assert obs["fit_reject_reason"] == "stale_position"
+    assert obs["stale_position"] is True
+    assert obs["residual_gate_failed"] is False
+    assert obs["near_wrap_residual"] is False
+
+
+def test_compact_recomputed_missing_geometry_reason(monkeypatch):
+    obs = _build_compact_recomputed_row(monkeypatch, bearing_deg=None, pos_age_s=0.2)
+    assert obs["fit_eligible"] is False
+    assert obs["fit_reject_reason"] == "missing_geometry"
+    assert obs["missing_geometry"] is True
+
+
+def test_compact_recomputed_zero_weight_reason(monkeypatch):
+    obs = _build_compact_recomputed_row(
+        monkeypatch,
+        bearing_deg=40.0,
+        pos_age_s=0.2,
+        sync_update_eligible=True,
+        score_override=0.0,
+    )
+    assert obs["fit_eligible"] is False
+    assert obs["fit_reject_reason"] == "zero_weight"
+    assert obs["zero_weight"] is True
+
+
+def test_compact_recomputed_emits_dominant_family_flag(monkeypatch):
+    obs_false = _build_compact_recomputed_row(
+        monkeypatch,
+        bearing_deg=40.0,
+        sync_update_eligible=False,
+    )
+    assert obs_false["dominant_family"] is False
+    assert obs_false["fit_reject_reason"] == "not_sync_update_eligible"
+
+    obs_true = _build_compact_recomputed_row(
+        monkeypatch,
+        bearing_deg=40.0,
+        sync_update_eligible=True,
+    )
+    assert obs_true["dominant_family"] is True
+
+
+def test_compact_recomputed_fit_eligible_true_remains_true(monkeypatch):
+    obs = _build_compact_recomputed_row(monkeypatch, bearing_deg=40.0, pos_age_s=0.2)
+    assert obs["fit_eligible"] is True
+    assert obs["fit_reject_reason"] is None
+    assert obs["fit_reject_reason_source"] == "compact_recomputed"
 
 
 def test_update_rotation_models_defers_recently_stable_iids(monkeypatch):

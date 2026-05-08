@@ -121,12 +121,42 @@ def build_compact_burst_sync_timeline_entries(
         )
         classification = state._classify_sync_residual(abs(residual_deg)) if residual_deg is not None else "rejected"
         weight = state._score_sync_burst_observation(obs)
+        sync_update_eligible = bool(getattr(obs, "sync_update_eligible", True))
+        residual_abs_deg = abs(residual_deg) if residual_deg is not None else None
+        near_wrap_residual = bool(residual_abs_deg is not None and residual_abs_deg >= 150.0)
+        residual_gate_failed = bool(
+            residual_abs_deg is not None
+            and residual_abs_deg > 35.0
+            and not near_wrap_residual
+        )
+        stale_position = bool(getattr(obs, "pos_age_s", 0.0) > 8.0)
+        missing_geometry = bool(residual_deg is None)
+        zero_weight = bool(weight <= 0)
+        classification_rejected = bool(classification == "rejected")
         fit_eligible = (
-            bool(getattr(obs, "sync_update_eligible", True))
+            sync_update_eligible
             and classification != "rejected"
             and weight > 0
             and residual_deg is not None
         )
+        fit_reject_reason = None
+        if not fit_eligible:
+            if not sync_update_eligible:
+                fit_reject_reason = "not_sync_update_eligible"
+            elif near_wrap_residual:
+                fit_reject_reason = "near_wrap_residual"
+            elif residual_gate_failed:
+                fit_reject_reason = "residual_gate"
+            elif stale_position:
+                fit_reject_reason = "stale_position"
+            elif missing_geometry:
+                fit_reject_reason = "missing_geometry"
+            elif zero_weight:
+                fit_reject_reason = "zero_weight"
+            elif classification_rejected:
+                fit_reject_reason = "classification_rejected"
+            else:
+                fit_reject_reason = "compact_go_sync_unknown"
         entries.append({
             "beam_center_us": obs.burst_centroid_us,
             "wall_ts": obs.ts,
@@ -166,12 +196,21 @@ def build_compact_burst_sync_timeline_entries(
             "weight": weight,
             "classification": classification,
             "fit_eligible": fit_eligible,
-            "fit_reject_reason": None if fit_eligible else ("missing_geometry" if residual_deg is None else "compact_go_sync"),
+            "fit_reject_reason": fit_reject_reason,
+            "fit_reject_reason_source": "compact_recomputed",
+            "dominant_family": sync_update_eligible,
+            "residual_abs_deg": residual_abs_deg,
+            "near_wrap_residual": near_wrap_residual,
+            "residual_gate_failed": residual_gate_failed,
+            "stale_position": stale_position,
+            "missing_geometry": missing_geometry,
+            "zero_weight": zero_weight,
+            "classification_rejected": classification_rejected,
             "n_replies": obs.n_replies,
             "signal_dbfs": obs.signal_dbfs,
             "pos_age_s": obs.pos_age_s,
             "range_nm": obs.range_nm,
-            "sync_update_eligible": bool(getattr(obs, "sync_update_eligible", True)),
+            "sync_update_eligible": sync_update_eligible,
             "burst_center_method": getattr(obs, "burst_center_method", "centroid"),
             "burst_center_simple_us": getattr(obs, "burst_center_simple_us", None),
             "burst_center_weighted_us": getattr(obs, "burst_center_weighted_us", None),
