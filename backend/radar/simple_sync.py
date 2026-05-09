@@ -386,8 +386,6 @@ def update_simple_live_sync_state(
         if transition_quarantine_active:
             transition_quarantine_count += 1
             transition_quarantine_fit_excluded_count += 1
-            if current_residual_failed:
-                transition_quarantine_hard_reject_suppressed_count += 1
             transition_quarantine_last_ts = obs.ts
             transition_quarantine_last_reason = transition_quarantine_reason
         scored.append(
@@ -721,6 +719,12 @@ def update_simple_live_sync_state(
         ),
         population_validation_state=anchor_resolution.get("population_validation_state"),
         population_validation_reason=anchor_resolution.get("population_validation_reason"),
+        transition_quarantine_count=int(compact_entry.get("transition_quarantine_count") or 0),
+        transition_quarantine_fit_excluded_count=int(compact_entry.get("transition_quarantine_fit_excluded_count") or 0),
+        transition_quarantine_hard_reject_suppressed_count=int(compact_entry.get("transition_quarantine_hard_reject_suppressed_count") or 0),
+        transition_quarantine_last_ts=compact_entry.get("transition_quarantine_last_ts"),
+        transition_quarantine_last_reason=compact_entry.get("transition_quarantine_last_reason"),
+        transition_quarantine_window_s=_TRANSITION_QUARANTINE_WINDOW_S,
     )
     if go_is_operational:
         new_state.period_authority = "go_refined"

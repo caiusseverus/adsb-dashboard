@@ -190,6 +190,12 @@ class LiveSyncState:
     fit_epoch_retained_without_current_evidence: bool = False
     burst_rows_absence_reason: str | None = None
     fit_counters_source: str | None = None
+    transition_quarantine_count: int = 0
+    transition_quarantine_fit_excluded_count: int = 0
+    transition_quarantine_hard_reject_suppressed_count: int = 0
+    transition_quarantine_last_ts: float | None = None
+    transition_quarantine_last_reason: str | None = None
+    transition_quarantine_window_s: float | None = None
 
 
 @dataclass

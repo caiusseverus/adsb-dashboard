@@ -15,6 +15,7 @@ import math as _math
 import statistics
 import threading
 import time
+import traceback
 from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Optional, Any
 
@@ -118,6 +119,71 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 _CONSISTENCY_WARNING_THROTTLE_S = 60.0
+
+
+class ProfilingLock:
+    """threading.Lock wrapper that tracks current owner and hold duration."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._meta_lock = threading.Lock()
+        self._owner_tid: int | None = None
+        self._owner_name: str | None = None
+        self._acquired_at_s: float | None = None
+        self._owner_stack_tail: list[str] = []
+        self._max_hold_ms: float = 0.0
+        self._last_release_ts: float = 0.0
+        self._last_owner_name: str | None = None
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        ok = self._lock.acquire(blocking, timeout)
+        if ok:
+            now = time.time()
+            current = threading.current_thread()
+            with self._meta_lock:
+                self._owner_tid = current.ident
+                self._owner_name = current.name
+                self._acquired_at_s = now
+                self._owner_stack_tail = traceback.format_stack(limit=8)
+        return ok
+
+    def release(self) -> None:
+        now = time.time()
+        with self._meta_lock:
+            start = self._acquired_at_s
+            if start is not None:
+                hold_ms = (now - start) * 1000.0
+                self._max_hold_ms = max(self._max_hold_ms, hold_ms)
+            self._last_release_ts = now
+            self._last_owner_name = self._owner_name
+            self._owner_tid = None
+            self._owner_name = None
+            self._acquired_at_s = None
+            self._owner_stack_tail = []
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False
+
+    def snapshot(self) -> dict:
+        now = time.time()
+        with self._meta_lock:
+            held_s = (now - self._acquired_at_s) if self._acquired_at_s is not None else 0.0
+            return {
+                "held": self._acquired_at_s is not None,
+                "owner_thread": self._owner_name,
+                "owner_tid": self._owner_tid,
+                "held_s": round(held_s, 6),
+                "max_hold_ms": round(self._max_hold_ms, 3),
+                "last_release_ts": self._last_release_ts,
+                "last_owner_thread": self._last_owner_name,
+                "owner_stack_tail": self._owner_stack_tail[-5:],
+            }
 _consistency_warning_last_emitted: dict[tuple[int | str, str], float] = {}
 
 # Warning reasons that are expected behaviour when RADAR_SYNC_GO_REFINER_OPERATIONAL
@@ -392,6 +458,26 @@ def _build_go_diagnostic_fields(
             if not (go_payload.get("last_hard_bound"))
             else go_payload.get("hard_bound_reason")
         )
+    transition_quarantine_count = go_payload.get(
+        "transition_quarantine_count",
+        getattr(sync, "transition_quarantine_count", 0),
+    )
+    transition_quarantine_fit_excluded_count = go_payload.get(
+        "transition_quarantine_fit_excluded_count",
+        getattr(sync, "transition_quarantine_fit_excluded_count", 0),
+    )
+    transition_quarantine_hard_reject_suppressed_count = go_payload.get(
+        "transition_quarantine_hard_reject_suppressed_count",
+        getattr(sync, "transition_quarantine_hard_reject_suppressed_count", 0),
+    )
+    transition_quarantine_last_reason = go_payload.get(
+        "transition_quarantine_last_reason",
+        getattr(sync, "transition_quarantine_last_reason", None),
+    )
+    transition_quarantine_window_s = go_payload.get(
+        "transition_quarantine_window_s",
+        getattr(sync, "transition_quarantine_window_s", None),
+    )
 
     return {
         "go_diagnostic_base_period_s": float(base_period_s) if _is_finite_number(base_period_s) else None,
@@ -527,6 +613,11 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_fit_epoch_retained_without_current_evidence": go_payload.get("fit_epoch_retained_without_current_evidence"),
         "go_diagnostic_burst_rows_absence_reason": go_payload.get("burst_rows_absence_reason"),
         "go_diagnostic_fit_counters_source": go_payload.get("fit_counters_source"),
+        "go_diagnostic_transition_quarantine_count": transition_quarantine_count,
+        "go_diagnostic_transition_quarantine_fit_excluded_count": transition_quarantine_fit_excluded_count,
+        "go_diagnostic_transition_quarantine_hard_reject_suppressed_count": transition_quarantine_hard_reject_suppressed_count,
+        "go_diagnostic_transition_quarantine_last_reason": transition_quarantine_last_reason,
+        "go_diagnostic_transition_quarantine_window_s": transition_quarantine_window_s,
     }
 
 
@@ -1591,6 +1682,36 @@ def _live_sync_state_to_dict(
     })
 
     payload.update(_build_go_diagnostic_fields(sync, go_sync=go_sync))
+    payload["transition_quarantine_count"] = int(
+        (go_sync or {}).get(
+            "transition_quarantine_count",
+            payload.get("transition_quarantine_count", 0),
+        ) or 0
+    )
+    payload["transition_quarantine_fit_excluded_count"] = int(
+        (go_sync or {}).get(
+            "transition_quarantine_fit_excluded_count",
+            payload.get("transition_quarantine_fit_excluded_count", 0),
+        ) or 0
+    )
+    payload["transition_quarantine_hard_reject_suppressed_count"] = int(
+        (go_sync or {}).get(
+            "transition_quarantine_hard_reject_suppressed_count",
+            payload.get("transition_quarantine_hard_reject_suppressed_count", 0),
+        ) or 0
+    )
+    payload["transition_quarantine_last_ts"] = (go_sync or {}).get(
+        "transition_quarantine_last_ts",
+        payload.get("transition_quarantine_last_ts"),
+    )
+    payload["transition_quarantine_last_reason"] = (go_sync or {}).get(
+        "transition_quarantine_last_reason",
+        payload.get("transition_quarantine_last_reason"),
+    )
+    payload["transition_quarantine_window_s"] = (go_sync or {}).get(
+        "transition_quarantine_window_s",
+        payload.get("transition_quarantine_window_s"),
+    )
 
     # --- Python shadow refinement fields (present when Python runs as shadow) ---
     payload["py_shadow_period_delta_s"] = None
@@ -2165,7 +2286,7 @@ class RadarState:
         self._live_detection_buffer: deque[Stage3LiveDetection] = deque(maxlen=self._LIVE_DETECTION_BUFFER_MAX)
 
         import threading
-        self._lock = threading.Lock()
+        self._lock = ProfilingLock()
         self._update_active = threading.Event()
 
         # Injected at startup; called outside _lock for each completed good/marginal frame.
@@ -2230,10 +2351,52 @@ class RadarState:
         # Minimum new-event delta required to re-run analysis for an already
         # established IID.  Lower deltas are deferred until the next cycle.
         self._ROTATION_ANALYSIS_MIN_DELTA = 40
+        self._lock_timing_samples: deque = deque(maxlen=500)
+        self._lock_timing_seq: int = 0
 
     # ------------------------------------------------------------------
     # Frame ingestion
     # ------------------------------------------------------------------
+
+    def _record_lock_timing(self, op: str, wait_s: float, hold_s: float) -> None:
+        self._lock_timing_seq += 1
+        self._lock_timing_samples.append({
+            "seq": self._lock_timing_seq,
+            "ts": time.time(),
+            "op": op,
+            "wait_ms": round(wait_s * 1000.0, 3),
+            "hold_ms": round(hold_s * 1000.0, 3),
+        })
+
+    def get_lock_timing_stats(self) -> dict:
+        with self._lock:
+            samples = list(self._lock_timing_samples)
+        if not samples:
+            return {
+                "samples": 0,
+                "wait_ms": {"p50": 0.0, "p95": 0.0, "max": 0.0},
+                "hold_ms": {"p50": 0.0, "p95": 0.0, "max": 0.0},
+                "top_ops_by_hold_ms": [],
+            }
+        waits = sorted(float(s.get("wait_ms", 0.0)) for s in samples)
+        holds = sorted(float(s.get("hold_ms", 0.0)) for s in samples)
+        per_op: dict[str, float] = {}
+        for sample in samples:
+            op = str(sample.get("op") or "unknown")
+            per_op[op] = per_op.get(op, 0.0) + float(sample.get("hold_ms", 0.0))
+
+        def _pct(vals: list[float], q: float) -> float:
+            return round(vals[min(len(vals) - 1, int(len(vals) * q))], 3)
+
+        top_ops = sorted(per_op.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        return {
+            "samples": len(samples),
+            "wait_ms": {"p50": _pct(waits, 0.50), "p95": _pct(waits, 0.95), "max": round(waits[-1], 3)},
+            "hold_ms": {"p50": _pct(holds, 0.50), "p95": _pct(holds, 0.95), "max": round(holds[-1], 3)},
+            "top_ops_by_hold_ms": [{"op": op, "hold_ms_total": round(total, 3)} for op, total in top_ops],
+            "last_samples": samples[-30:],
+            "runtime_lock": self._lock.snapshot() if hasattr(self._lock, "snapshot") else {},
+        }
 
     def _unwrap(self, raw_ticks: int) -> int:
         """Unwrap Beast 48-bit counter to a monotonic tick count."""
@@ -2642,7 +2805,11 @@ class RadarState:
 
     def get_memory_stats(self) -> dict:
         """Return current sizes of key in-memory structures for observability."""
-        with self._lock:
+        t_wait_start = time.perf_counter()
+        self._lock.acquire()
+        wait_s = time.perf_counter() - t_wait_start
+        t_hold_start = time.perf_counter()
+        try:
             n_icao_quality = sum(len(v) for v in self._live_icao_sync_quality.values())
             n_last_arrival = sum(len(v) for v in self._live_last_arrival.values())
             n_live_bursts  = sum(len(v) for v in self._live_bursts.values())
@@ -2686,6 +2853,10 @@ class RadarState:
                 "chart_burst_residual_seqs": list(self._chart_burst_residual_seq.values()),
                 "chart_df11_residual_seqs": list(self._chart_df11_residual_seq.values()),
             }
+        finally:
+            hold_s = time.perf_counter() - t_hold_start
+            self._lock.release()
+            self._record_lock_timing("get_memory_stats", wait_s, hold_s)
 
     def _process_fired_bursts(self, iid: int, fired_bursts: list[dict]) -> dict:
         metrics = _new_fired_burst_phase_metrics()
@@ -6524,34 +6695,34 @@ class RadarState:
                 event_buf=event_buf,
                 now_ts=float(evidence.get("wall_ts") or time.time()),
             )
-            if _bridge_aligned:
-                self._record_aligned_burst_sync_obs(
-                    iid=iid,
-                    icao=str(evidence.get("icao") or ""),
-                    burst_centroid_us=float(centroid_us),
-                    radar_lat=float(radar_lat),
-                    radar_lon=float(radar_lon),
-                    aircraft_lat=float(truth_lat),
-                    aircraft_lon=float(truth_lon),
-                    n_replies=int(evidence.get("n_replies") or 0),
-                    signal_dbfs=evidence.get("signal_dbfs"),
-                    pos_age_s=float(pos_age_s or 0.0),
-                    period_s=_aligned_period_s,
-                )
-            if _obs_geometry_ok and _obs_period_ok:
-                self._record_aligned_burst_sync_obs(
-                    iid=iid,
-                    icao=str(evidence.get("icao") or ""),
-                    burst_centroid_us=float(centroid_us),
-                    radar_lat=float(radar_lat),
-                    radar_lon=float(radar_lon),
-                    aircraft_lat=float(truth_lat),
-                    aircraft_lon=float(truth_lon),
-                    n_replies=int(evidence.get("n_replies") or 0),
-                    signal_dbfs=evidence.get("signal_dbfs"),
-                    pos_age_s=float(pos_age_s or 0.0),
-                    period_s=_aligned_period_s,
-                )
+        if _bridge_aligned:
+            self._record_aligned_burst_sync_obs(
+                iid=iid,
+                icao=str(evidence.get("icao") or ""),
+                burst_centroid_us=float(centroid_us),
+                radar_lat=float(radar_lat),
+                radar_lon=float(radar_lon),
+                aircraft_lat=float(truth_lat),
+                aircraft_lon=float(truth_lon),
+                n_replies=int(evidence.get("n_replies") or 0),
+                signal_dbfs=evidence.get("signal_dbfs"),
+                pos_age_s=float(pos_age_s or 0.0),
+                period_s=_aligned_period_s,
+            )
+        if _obs_geometry_ok and _obs_period_ok:
+            self._record_aligned_burst_sync_obs(
+                iid=iid,
+                icao=str(evidence.get("icao") or ""),
+                burst_centroid_us=float(centroid_us),
+                radar_lat=float(radar_lat),
+                radar_lon=float(radar_lon),
+                aircraft_lat=float(truth_lat),
+                aircraft_lon=float(truth_lon),
+                n_replies=int(evidence.get("n_replies") or 0),
+                signal_dbfs=evidence.get("signal_dbfs"),
+                pos_age_s=float(pos_age_s or 0.0),
+                period_s=_aligned_period_s,
+            )
 
     @staticmethod
     def _score_sync_burst_observation(obs: AlignedBurstSyncObs) -> float:
@@ -8532,7 +8703,11 @@ class RadarState:
         Bootstrap fallback: _iid_events (used for IIDs not yet in _burst_records,
         e.g. after purge/reset, so the IID selector shows activity during bootstrap).
         """
-        with self._lock:
+        t_wait_start = time.perf_counter()
+        self._lock.acquire()
+        wait_s = time.perf_counter() - t_wait_start
+        t_hold_start = time.perf_counter()
+        try:
             latest_burst_us = max(
                 (br_deque[-1].centroid_us for br_deque in self._burst_records.values() if br_deque),
                 default=None,
@@ -8549,6 +8724,10 @@ class RadarState:
                 [ev for ev in self._iid_events if ev[1] not in iids_with_bursts]
                 if self._iid_events else []
             )
+        finally:
+            hold_s = time.perf_counter() - t_hold_start
+            self._lock.release()
+            self._record_lock_timing("get_iid_activity", wait_s, hold_s)
 
         activity: dict[int, dict] = {}
         for iid, records in burst_snapshot.items():
@@ -9542,7 +9721,11 @@ class RadarState:
         includes chart stream sequence IDs so the frontend can fetch new
         chart points incrementally from the separate chart-history endpoint.
         """
-        with self._lock:
+        t_wait_start = time.perf_counter()
+        self._lock.acquire()
+        wait_s = time.perf_counter() - t_wait_start
+        t_hold_start = time.perf_counter()
+        try:
             sync = self._live_sync_states.get(iid)
             model = self._models.get(iid)
             go_sync = dict(self._go_sync_states_by_iid.get(iid) or {})
@@ -9566,6 +9749,10 @@ class RadarState:
             py_shadow = self._py_shadow_sync_states.get(iid)
             authority_transitions = self._period_authority_transitions.get(iid)
             sync_horizons = self._sync_horizons_payload(sync, display_window_s=window_s)
+        finally:
+            hold_s = time.perf_counter() - t_hold_start
+            self._lock.release()
+            self._record_lock_timing("get_live_sync_snapshot", wait_s, hold_s)
 
         sequence = self._live_sync_snapshot_seq.get(iid, 0) + 1
         self._live_sync_snapshot_seq[iid] = sequence
@@ -9599,8 +9786,16 @@ class RadarState:
             "period_authority_transitions": authority_transitions,
             "transport": {"source": "compact_sync_snapshot", "cached": False},
         }
-        with self._lock:
+        t_wait_start = time.perf_counter()
+        self._lock.acquire()
+        wait_s = time.perf_counter() - t_wait_start
+        t_hold_start = time.perf_counter()
+        try:
             self._live_sync_snapshot_cache[iid] = (sig, snapshot)
+        finally:
+            hold_s = time.perf_counter() - t_hold_start
+            self._lock.release()
+            self._record_lock_timing("get_live_sync_snapshot_cache_store", wait_s, hold_s)
         return snapshot
 
     def _live_sync_snapshot_sig_tuple(

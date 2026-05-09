@@ -177,6 +177,12 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
                 "holdover_reason": "hard_residual_reject",
                 "holdover_quality_gate_failed": 2,
                 "holdover_hard_residual_reject": 7,
+                "transition_quarantine_count": 11,
+                "transition_quarantine_fit_excluded_count": 9,
+                "transition_quarantine_hard_reject_suppressed_count": 0,
+                "transition_quarantine_last_ts": 998.0,
+                "transition_quarantine_last_reason": "anchor_changed",
+                "transition_quarantine_window_s": 30.0,
                 "period_agrees_with_df": True,
                 "multi_sync_admission": {
                     "last_reason": "no_receiver_config",
@@ -261,6 +267,17 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     assert payload["sync_state"]["go_diagnostic_fit_observation_count"] == 14
     assert payload["sync_state"]["go_diagnostic_proposed_delta_s"] == pytest.approx(0.0005)
     assert payload["sync_state"]["go_diagnostic_applied_delta_s"] == pytest.approx(0.0001)
+    assert "transition_quarantine_count" in payload["sync_state"]
+    assert "transition_quarantine_fit_excluded_count" in payload["sync_state"]
+    assert "transition_quarantine_hard_reject_suppressed_count" in payload["sync_state"]
+    assert "transition_quarantine_last_ts" in payload["sync_state"]
+    assert "transition_quarantine_last_reason" in payload["sync_state"]
+    assert "transition_quarantine_window_s" in payload["sync_state"]
+    assert "go_diagnostic_transition_quarantine_count" in payload["sync_state"]
+    assert "go_diagnostic_transition_quarantine_fit_excluded_count" in payload["sync_state"]
+    assert "go_diagnostic_transition_quarantine_hard_reject_suppressed_count" in payload["sync_state"]
+    assert "go_diagnostic_transition_quarantine_last_reason" in payload["sync_state"]
+    assert "go_diagnostic_transition_quarantine_window_s" in payload["sync_state"]
     assert "handoff_state" in payload["sync_state"]
     assert "handoff_gate_failures" in payload["sync_state"]
     assert "data_path_diagnostics" in payload
@@ -312,6 +329,36 @@ def test_sync_state_exposes_phase_status_alias_without_removing_legacy_value():
     payload = radar_api.build_iid_sync_snapshot_payload(state, 99, window_s=60.0, debug_limit=20)
     assert payload["sync_state"]["phase_status"] == "trusted"
     assert payload["sync_state"]["phase_status_display"] == "anchor_trusted"
+
+
+def test_sync_snapshot_exposes_transition_quarantine_counters_from_live_sync_state():
+    state = RadarState()
+    now_ts = 1_000.0
+    state._iid_latest_arrival_us[98] = 4_100_000.0
+    state._live_sync_states[98] = LiveSyncState(
+        iid=98,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=now_ts,
+        source="multi_aircraft_burst",
+        usable=True,
+        transition_quarantine_count=7,
+        transition_quarantine_fit_excluded_count=5,
+        transition_quarantine_hard_reject_suppressed_count=0,
+        transition_quarantine_last_ts=999.0,
+        transition_quarantine_last_reason="anchor_changed",
+        transition_quarantine_window_s=30.0,
+    )
+    payload = radar_api.build_iid_sync_snapshot_payload(state, 98, window_s=60.0, debug_limit=20)
+    assert payload["sync_state"]["transition_quarantine_count"] == 7
+    assert payload["sync_state"]["transition_quarantine_fit_excluded_count"] == 5
+    assert payload["sync_state"]["transition_quarantine_hard_reject_suppressed_count"] == 0
+    assert payload["sync_state"]["transition_quarantine_last_ts"] == pytest.approx(999.0)
+    assert payload["sync_state"]["transition_quarantine_last_reason"] == "anchor_changed"
+    assert payload["sync_state"]["transition_quarantine_window_s"] == pytest.approx(30.0)
 
 
 def test_get_iid_sync_debug_endpoint_exposes_summary_and_observation(monkeypatch):

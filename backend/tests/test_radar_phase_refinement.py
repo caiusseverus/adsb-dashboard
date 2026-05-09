@@ -958,6 +958,9 @@ class TestPeriodSInvariant:
         compact = state._compact_sync_debug_by_iid[self._IID]
         assert compact["transition_quarantine_count"] > 0
         assert compact["transition_quarantine_fit_excluded_count"] > 0
+        assert compact["transition_quarantine_hard_reject_suppressed_count"] == 0
+        assert compact["transition_quarantine_last_reason"] in {"anchor_changed", "reference_changed", "multiple"}
+        assert compact["transition_quarantine_last_ts"] == pytest.approx(self._NOW_TS)
 
     def test_transition_adjacent_coherent_rows_not_quarantined(self, monkeypatch):
         import radar.sweep as sweep_module
