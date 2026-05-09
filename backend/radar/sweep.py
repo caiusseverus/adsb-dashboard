@@ -1003,10 +1003,17 @@ def _live_sync_state_to_dict(
     )
     phase_evidence_fresh: bool | None = None
     if phase_basis in {"anchor_relative", "geographic"}:
-        phase_evidence_fresh = (
-            phase_evidence_age_s is not None
-            and phase_evidence_age_s <= _PHASE_FRESH_MAX_AGE_S
-        )
+        burst_rows_absence_reason = str(getattr(sync, "burst_rows_absence_reason", "") or "")
+        if not burst_rows_absence_reason and isinstance(go_sync, dict):
+            burst_rows_absence_reason = str(go_sync.get("burst_rows_absence_reason") or "")
+        explicit_stale_absence = burst_rows_absence_reason in {"no_burst_sync_rows", "burst_rows_stale"}
+        if phase_evidence_age_s is not None:
+            phase_evidence_fresh = phase_evidence_age_s <= _PHASE_FRESH_MAX_AGE_S
+        elif explicit_stale_absence:
+            phase_evidence_fresh = False
+        else:
+            # Unknown evidence age is non-blocking here; explicit stale markers still block.
+            phase_evidence_fresh = None
     phase_state_ts = _to_finite_float(getattr(sync, "last_sync_update_ts", None))
 
     # --- typed phase fields from the dataclass (populated by the updater) ---
@@ -1471,6 +1478,21 @@ def _live_sync_state_to_dict(
                     go_blocking_gate = "go_readiness_hysteresis"
                     if not effective_handoff_reason or reason_is_unclassified_placeholder:
                         effective_handoff_reason = "go_ready_pending_hysteresis"
+                    go_blocking_reason = effective_handoff_reason
+                elif (
+                    reason_is_unclassified_placeholder
+                    and str(effective_handoff_state or "") == "GO_REFINING"
+                    and go_diag_refinement_status == "stable"
+                    and not go_sync_unusable_reason
+                    and not diag_go_sync_unusable_reason
+                    and not bool(getattr(sync, "holdover", False))
+                ):
+                    # Captured stale-unclassified shape: diagnostics indicate
+                    # refining/stable readiness path but no explicit failed gate
+                    # snapshot was attached. Attribute to hysteresis instead of
+                    # emitting unclassified placeholders.
+                    go_blocking_gate = "go_readiness_hysteresis"
+                    effective_handoff_reason = "go_ready_pending_hysteresis"
                     go_blocking_reason = effective_handoff_reason
 
             if not go_blocking_gate:
@@ -4735,10 +4757,14 @@ class RadarState:
                 phase_evidence_age_s = float(getattr(sync, "last_sync_driving_fit_observation_age_s"))
             elif _is_finite_number(getattr(sync, "anchor_last_validation_age_s", None)):
                 phase_evidence_age_s = float(getattr(sync, "anchor_last_validation_age_s"))
-            phase_evidence_fresh = (
-                phase_evidence_age_s is not None
-                and phase_evidence_age_s <= _PHASE_FRESH_MAX_AGE_S
-            )
+            burst_rows_absence_reason = str(getattr(sync, "burst_rows_absence_reason", "") or "")
+            explicit_stale_absence = burst_rows_absence_reason in {"no_burst_sync_rows", "burst_rows_stale"}
+            if phase_evidence_age_s is not None:
+                phase_evidence_fresh = phase_evidence_age_s <= _PHASE_FRESH_MAX_AGE_S
+            elif explicit_stale_absence:
+                phase_evidence_fresh = False
+            else:
+                phase_evidence_fresh = None
         else:
             phase_evidence_fresh = None
         gates["phase_evidence_fresh"] = _gate_value(
@@ -5265,7 +5291,11 @@ class RadarState:
         )
 
         if last_burst_sync_observation_ts is None:
-            burst_rows_absence_reason = "no_burst_sync_rows"
+            burst_rows_absence_reason = (
+                "no_display_burst_sync_rows"
+                if evidence_known and evidence_fresh
+                else "no_burst_sync_rows"
+            )
         elif (now_ts - last_burst_sync_observation_ts) > live_window_s:
             burst_rows_absence_reason = "burst_rows_stale"
         else:

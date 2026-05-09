@@ -29,3 +29,12 @@
 - Added Stage-10 non-active stale-shape remap from unclassified placeholder to concrete freshness blocker.
 - Added regression tests for stale screenshot-like shape and unclassified stale mapping.
 - Short live capture executed in an isolated runtime; no active IIDs were present (`SAMPLES 0`), so production-like stale-lock incidence could not be observed in this environment.
+
+## 2026-05-09 Stale Anchor UI + Stage 10 Attribution Follow-up
+
+- [x] Reproduce and extract captured `go_state_unclassified` / `go_readiness.unclassified_state` sample shapes from active-IID capture.
+- [x] Update phase trust UI rendering to prefer `phase_status_display` and keep legacy `phase_status` only as fallback.
+- [x] Ensure retained stale trust (`anchor_retained_stale`) is visually distinct from `anchor_trusted`.
+- [x] Map captured non-active GO_REFINING unclassified shape to concrete Stage 10 gate attribution.
+- [x] Clarify burst-row absence reason when evidence is fresh but burst-row display rows are absent.
+- [ ] Run targeted/backend tests and replay + fresh 5–6 minute live validation; report requested metrics.

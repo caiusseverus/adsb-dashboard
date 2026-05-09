@@ -2210,11 +2210,26 @@ const legendDotStyle = {
 
 function phaseStatusDisplayLabel(value) {
   switch (value) {
+    case 'anchor_trusted': return 'anchor_trusted'
+    case 'anchor_provisional': return 'anchor_provisional'
+    case 'anchor_untrusted': return 'anchor_untrusted'
+    case 'anchor_retained_stale': return 'anchor_retained_stale'
     case 'trusted': return 'anchor_trusted'
     case 'provisional': return 'anchor_provisional'
     case 'untrusted': return 'anchor_untrusted'
     default: return 'unavailable'
   }
+}
+
+function phaseTrustDisplay(syncState) {
+  const display = phaseStatusDisplayLabel(syncState?.phase_status_display ?? syncState?.phase_status)
+  const color = (
+    display === 'anchor_trusted' ? '#3fb950' :
+    display === 'anchor_provisional' ? '#e3b341' :
+    display === 'anchor_retained_stale' ? '#ff7b72' :
+    '#8b949e'
+  )
+  return { display, color }
 }
 
 function PopulationResidualMonitorPanel({ monitor, identity, currentAnchorIcao }) {
@@ -2640,6 +2655,7 @@ function PhaseAnchorPanel({ syncState, observations, candidates, identity }) {
     : phaseBasis === 'geographic'
     ? 'Radar beam direction known'
     : 'Phase is unavailable'
+  const trustDisplay = phaseTrustDisplay(syncState)
 
   return (
     <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
@@ -2668,7 +2684,7 @@ function PhaseAnchorPanel({ syncState, observations, candidates, identity }) {
               <span className={styles.metricPill} title="Phase is anchor-relative only. Geographic radar beam direction is unavailable.">Phase basis <span className={styles.metricValue}>{phaseBasis}</span></span>
               <span className={styles.metricPill}>Not geographic</span>
               <span className={styles.metricPill}>Anchor age <span className={styles.metricValue}>{Number.isFinite(sinceAgeS) ? `${Math.max(0, sinceAgeS).toFixed(0)}s` : '—'}</span></span>
-              <span className={styles.metricPill} title="Background: trusted = population validates the anchor offset; provisional = anchor selected but insufficient population validation; untrusted = no usable anchor-relative basis">Anchor-relative phase trust <span className={styles.metricValue} style={{ color: syncState.phase_status === 'trusted' ? '#3fb950' : syncState.phase_status === 'provisional' ? '#e3b341' : '#8b949e' }}>{phaseStatusDisplayLabel(syncState.phase_status)}</span></span>
+              <span className={styles.metricPill} title="Background: trusted = population validates the anchor offset; provisional = anchor selected but insufficient population validation; retained_stale = retained diagnostic anchor without current evidence; untrusted = no usable anchor-relative basis">Anchor-relative phase trust <span className={styles.metricValue} style={{ color: trustDisplay.color }}>{trustDisplay.display}</span></span>
               <span className={styles.metricPill}>Agree/reject <span className={styles.metricValue}>{syncState.phase_validation_contributors ?? 0}/{syncState.phase_validation_reject_count ?? 0}</span></span>
               <span className={styles.metricPill}>Median Δ <span className={styles.metricValue}>{fmtNumber(syncState.phase_validation_median_error_deg, 2, '°')}</span></span>
               <span className={styles.metricPill}>Candidates <span className={styles.metricValue}>{syncState.phase_anchor_candidate_count ?? candidateRows.length}</span></span>

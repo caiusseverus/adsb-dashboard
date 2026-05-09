@@ -5651,6 +5651,89 @@ def test_stage10_live_unclassified_shape_with_diag_usable_flags_maps_to_hysteres
     assert payload["handoff_reason"] != "go_state_unclassified"
 
 
+def test_stage10_live_captured_unclassified_shape_without_go_sync_maps_to_hysteresis(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    from radar.sync_models import LiveSyncState
+    sync = LiveSyncState(
+        iid=281,
+        period_s=4.084356826834769,
+        period_base_s=4.084356826834769,
+        phase_epoch_us=41098203.22979099,
+        phase_offset_deg=191.40649157727808,
+        sync_quality=1.0,
+        sync_jitter_deg=4.951642799377442,
+        last_sync_update_ts=1778114712.4103398,
+        source="go_frame_sync",
+        usable=True,
+        holdover=False,
+        holdover_reason=None,
+        period_authority="py_base",
+        sync_authority="py_bootstrap",
+        handoff_state="GO_REFINING",
+        handoff_reason="go_state_unclassified",
+        handoff_gate_failures={},
+        fit_total_observations=605,
+        fit_icao_count=0,
+        period_refinement_status="stable",
+        last_sync_driving_fit_observation_age_s=0.2,
+        anchor_last_validation_age_s=0.2,
+        phase_basis="anchor_relative",
+        phase_status="trusted",
+        phase_anchor_icao="ABC123",
+        phase_anchor_status="selected",
+        phase_anchor_since_ts=time.time() - 1.0,
+    )
+    sync.go_sync_unusable_reason = None
+    sync.go_diagnostic_go_sync_unusable_reason = ""
+    sync.go_diagnostic_refinement_status = "stable"
+    sync.go_diagnostic_go_sync_usable_quality_ok = True
+    sync.go_diagnostic_go_sync_usable_holdover_ok = True
+    sync.go_diagnostic_go_sync_usable_period_agrees = True
+    sync.go_diagnostic_go_sync_usable_strict_gate_pass = True
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["go_operational_blocking_gate"] == "go_readiness_hysteresis"
+    assert payload["blocking_gate"] == "go_readiness_hysteresis"
+    assert payload["handoff_reason"] == "go_ready_pending_hysteresis"
+    assert payload["handoff_reason"] != "go_state_unclassified"
+
+
+def test_stage10_non_go_source_unclassified_shape_maps_to_hysteresis(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    from radar.sync_models import LiveSyncState
+    sync = LiveSyncState(
+        iid=282,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1_000_000.0,
+        phase_offset_deg=10.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=time.time(),
+        source="multi_aircraft_burst",
+        usable=True,
+        holdover=False,
+        handoff_state="GO_REFINING",
+        handoff_reason="go_state_unclassified",
+        handoff_gate_failures={},
+        period_authority="py_base",
+        sync_authority="py_bootstrap",
+        period_refinement_status="stable",
+    )
+    sync.go_diagnostic_refinement_status = "stable"
+    sync.go_diagnostic_go_sync_usable_quality_ok = True
+    sync.go_diagnostic_go_sync_usable_holdover_ok = True
+    sync.go_diagnostic_go_sync_usable_period_agrees = True
+    sync.go_diagnostic_go_sync_usable_strict_gate_pass = True
+    sync.go_diagnostic_go_sync_unusable_reason = ""
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["go_operational_blocking_gate"] == "go_readiness_hysteresis"
+    assert payload["blocking_gate"] == "go_readiness_hysteresis"
+    assert payload["handoff_reason"] == "go_ready_pending_hysteresis"
+    assert payload["handoff_reason"] != "go_state_unclassified"
+
+
 def test_stage10_active_go_with_phase_failure_uses_phase_blocker_not_go_blocker(monkeypatch):
     import config as _cfg
     monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
@@ -5949,6 +6032,20 @@ def test_stale_go_evidence_exposes_absent_row_reason_and_observation_ages():
     assert payload["go_diagnostic_last_go_evidence_event_ts"] is not None
     assert payload["go_diagnostic_fit_epoch_last_observation_age_s"] is not None
     assert payload["go_diagnostic_fit_epoch_last_observation_age_s"] > state._LIVE_SYNC_OBS_RETENTION_S
+
+
+def test_fresh_go_evidence_without_burst_rows_uses_display_absence_reason():
+    state = RadarState()
+    iid = 9912
+    now = time.time()
+    state._go_evidence_events.append({"iid": iid, "wall_ts": now - 1.0})
+    state.update_go_iid_state({
+        "i": iid, "sp": True, "su": True, "sps": 4.0, "sep": 2100.0, "sod": 15.0,
+        "sq": 1.0, "sj": 2.0, "sh": False, "lu": now, "rv": 1, "bps": 4.0, "eps": 4.0,
+        "foc": 12, "fic": 4, "pag": True,
+    })
+    payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(iid), state.get_go_live_sync_state(iid))
+    assert payload["go_diagnostic_burst_rows_absence_reason"] == "no_display_burst_sync_rows"
 
 
 # --- FitInlierRatio tests (Stage 4R) ---
