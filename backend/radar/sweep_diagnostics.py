@@ -101,6 +101,22 @@ def build_compact_burst_sync_timeline_entries(
     obs_snapshot: list["AlignedBurstSyncObs"],
     window_s: float,
 ) -> list[dict]:
+    transition_window_s = 30.0
+    anchor_age_s = None
+    if getattr(sync, "phase_anchor_since_ts", None) is not None:
+        try:
+            anchor_age_s = max(0.0, time.time() - float(sync.phase_anchor_since_ts))
+        except (TypeError, ValueError):
+            anchor_age_s = None
+    reference_age_s = None
+    compact_debug = dict(getattr(state, "_compact_sync_debug_by_iid", {}).get(getattr(sync, "iid", 0)) or {})
+    if compact_debug.get("last_reference_change_ts") is not None:
+        try:
+            reference_age_s = max(0.0, time.time() - float(compact_debug.get("last_reference_change_ts")))
+        except (TypeError, ValueError):
+            reference_age_s = None
+    anchor_transition_recent = bool(anchor_age_s is not None and anchor_age_s <= transition_window_s)
+    reference_transition_recent = bool(reference_age_s is not None and reference_age_s <= transition_window_s)
     now_ts = time.time()
     cutoff_ts = now_ts - window_s
     entries: list[dict] = []
@@ -133,16 +149,33 @@ def build_compact_burst_sync_timeline_entries(
         missing_geometry = bool(residual_deg is None)
         zero_weight = bool(weight <= 0)
         classification_rejected = bool(classification == "rejected")
+        transition_basis_reasons: list[str] = []
+        if anchor_transition_recent:
+            transition_basis_reasons.append("anchor_changed")
+        if reference_transition_recent:
+            transition_basis_reasons.append("reference_changed")
+        transition_quarantine_reason = (
+            "multiple" if len(transition_basis_reasons) > 1
+            else (transition_basis_reasons[0] if transition_basis_reasons else "none")
+        )
+        transition_quarantine_active = bool(
+            (anchor_transition_recent or reference_transition_recent)
+            and bool(transition_basis_reasons)
+            and (near_wrap_residual or residual_gate_failed)
+        )
         fit_eligible = (
             sync_update_eligible
             and classification != "rejected"
             and weight > 0
             and residual_deg is not None
+            and not transition_quarantine_active
         )
         fit_reject_reason = None
         if not fit_eligible:
             if not sync_update_eligible:
                 fit_reject_reason = "not_sync_update_eligible"
+            elif transition_quarantine_active:
+                fit_reject_reason = "transition_quarantined"
             elif near_wrap_residual:
                 fit_reject_reason = "near_wrap_residual"
             elif residual_gate_failed:
@@ -206,6 +239,14 @@ def build_compact_burst_sync_timeline_entries(
             "missing_geometry": missing_geometry,
             "zero_weight": zero_weight,
             "classification_rejected": classification_rejected,
+            "transition_quarantine_active": transition_quarantine_active,
+            "transition_quarantine_reason": transition_quarantine_reason,
+            "transition_quarantine_window_s": transition_window_s,
+            "transition_quarantine_basis_mismatch_reason": transition_quarantine_reason,
+            "transition_quarantine_anchor_age_s": anchor_age_s,
+            "transition_quarantine_reference_age_s": reference_age_s,
+            "transition_quarantine_event_residual_abs_deg": None,
+            "transition_quarantine_current_residual_abs_deg": residual_abs_deg,
             "n_replies": obs.n_replies,
             "signal_dbfs": obs.signal_dbfs,
             "pos_age_s": obs.pos_age_s,
@@ -326,6 +367,11 @@ def build_sync_mode_diagnostics(state: Any, iid: int, sync: "LiveSyncState | Non
             "effective_period_s": go_sync.get("effective_period_s") or go_sync.get("period_s"),
             "period_agrees_with_df": go_sync.get("period_agrees_with_df"),
             "period_reject_reason": go_sync.get("period_reject_reason"),
+            "transition_quarantine_count": int(compact_debug.get("transition_quarantine_count") or 0),
+            "transition_quarantine_fit_excluded_count": int(compact_debug.get("transition_quarantine_fit_excluded_count") or 0),
+            "transition_quarantine_hard_reject_suppressed_count": int(compact_debug.get("transition_quarantine_hard_reject_suppressed_count") or 0),
+            "transition_quarantine_last_ts": compact_debug.get("transition_quarantine_last_ts"),
+            "transition_quarantine_last_reason": compact_debug.get("transition_quarantine_last_reason"),
         },
         "python_sync": {
             "present": refined_active,

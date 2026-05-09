@@ -582,6 +582,214 @@ def _build_discontinuity_population_diagnostics(
     return diagnostics
 
 
+def _dual_basis_row_match_key(row: dict) -> tuple[str | None, float]:
+    icao = row.get("icao")
+    ts = row.get("beam_center_us")
+    if ts is None:
+        ts = row.get("arrival_beast_us")
+    try:
+        ts_value = round(float(ts), 3)
+    except (TypeError, ValueError):
+        ts_value = 0.0
+    return icao, ts_value
+
+
+def _float_differs(a, b, tol: float = 0.0) -> bool:
+    if a is None and b is None:
+        return False
+    if a is None or b is None:
+        return True
+    try:
+        af = float(a)
+        bf = float(b)
+    except (TypeError, ValueError):
+        return True
+    if not _is_finite_number(af) or not _is_finite_number(bf):
+        return True
+    return abs(af - bf) > tol
+
+
+def _annotate_compact_recomputed_dual_basis_rows(
+    entries: list[dict],
+    recorded_observations: list[dict],
+    sync_state_payload: dict | None,
+    *,
+    current_reference_icao: str | None = None,
+) -> None:
+    now_ts = time.time()
+    recorded_index = {
+        _dual_basis_row_match_key(row): row
+        for row in (recorded_observations or [])
+        if isinstance(row, dict)
+    }
+    for row in entries:
+        if not isinstance(row, dict):
+            continue
+        current_predicted = row.get("predicted_deg")
+        current_observed = row.get("bearing_deg")
+        current_residual = row.get("residual_deg")
+        current_abs = abs(float(current_residual)) if _is_finite_number(current_residual) else None
+        current_period_s = sync_state_payload.get("effective_period_s") if isinstance(sync_state_payload, dict) else None
+        current_phase_epoch = sync_state_payload.get("phase_epoch_us") if isinstance(sync_state_payload, dict) else None
+        current_phase_offset = sync_state_payload.get("phase_offset_deg") if isinstance(sync_state_payload, dict) else None
+        current_sync_authority = sync_state_payload.get("sync_authority") if isinstance(sync_state_payload, dict) else None
+        current_period_authority = sync_state_payload.get("period_authority") if isinstance(sync_state_payload, dict) else None
+        current_phase_basis = sync_state_payload.get("phase_basis") if isinstance(sync_state_payload, dict) else None
+        current_anchor_icao = sync_state_payload.get("phase_anchor_icao") if isinstance(sync_state_payload, dict) else None
+        previous_anchor_icao = sync_state_payload.get("previous_phase_anchor_icao") if isinstance(sync_state_payload, dict) else None
+        anchor_replacement_reason = sync_state_payload.get("phase_anchor_replacement_reason") if isinstance(sync_state_payload, dict) else None
+        anchor_age_s = sync_state_payload.get("phase_anchor_age_s") if isinstance(sync_state_payload, dict) else None
+        anchor_last_validation_age_s = sync_state_payload.get("anchor_last_validation_age_s") if isinstance(sync_state_payload, dict) else None
+        reference_change_count = sync_state_payload.get("reference_change_count") if isinstance(sync_state_payload, dict) else None
+        previous_reference_icao = sync_state_payload.get("last_reference_icao") if isinstance(sync_state_payload, dict) else None
+        reference_changed_recently = sync_state_payload.get("reference_changed_recently") if isinstance(sync_state_payload, dict) else None
+        last_reference_change_ts = sync_state_payload.get("last_reference_change_ts") if isinstance(sync_state_payload, dict) else None
+        authority_source = sync_state_payload.get("operational_source_path") if isinstance(sync_state_payload, dict) else None
+
+        row_wall_ts = row.get("wall_ts")
+        try:
+            row_wall_ts_f = float(row_wall_ts)
+            row_wall_ts_valid = _is_finite_number(row_wall_ts_f)
+        except (TypeError, ValueError):
+            row_wall_ts_f = None
+            row_wall_ts_valid = False
+
+        anchor_change_ts = None
+        if _is_finite_number(anchor_age_s):
+            try:
+                anchor_change_ts = float(now_ts) - float(anchor_age_s)
+            except (TypeError, ValueError):
+                anchor_change_ts = None
+        reference_change_ts = None
+        if _is_finite_number(last_reference_change_ts):
+            try:
+                reference_change_ts = float(last_reference_change_ts)
+            except (TypeError, ValueError):
+                reference_change_ts = None
+
+        def _within_s(change_ts: float | None, seconds: float) -> bool | None:
+            if change_ts is None or not row_wall_ts_valid:
+                return None
+            return abs(row_wall_ts_f - change_ts) <= seconds
+
+        row["current_predicted_bearing_deg"] = current_predicted
+        row["current_observed_bearing_deg"] = current_observed
+        row["current_residual_deg"] = current_residual
+        row["current_residual_abs_deg"] = current_abs
+        row["current_period_s"] = current_period_s
+        row["current_phase_epoch_us"] = current_phase_epoch
+        row["current_phase_offset_deg"] = current_phase_offset
+        row["current_sync_authority"] = current_sync_authority
+        row["current_period_authority"] = current_period_authority
+        row["current_phase_basis"] = current_phase_basis
+        row["current_anchor_icao"] = current_anchor_icao
+        row["previous_anchor_icao"] = previous_anchor_icao
+        row["anchor_replacement_reason"] = anchor_replacement_reason
+        row["anchor_age_s"] = anchor_age_s
+        row["anchor_last_validation_age_s"] = anchor_last_validation_age_s
+        row["reference_icao"] = current_reference_icao
+        row["previous_reference_icao"] = previous_reference_icao
+        row["reference_change_count"] = reference_change_count
+        row["reference_changed_recently"] = reference_changed_recently
+        row["last_reference_change_ts"] = reference_change_ts
+        row["reference_position_age_s"] = None
+        row["authority_source"] = authority_source
+        row["within_5s_anchor_change"] = _within_s(anchor_change_ts, 5.0)
+        row["within_15s_anchor_change"] = _within_s(anchor_change_ts, 15.0)
+        row["within_30s_anchor_change"] = _within_s(anchor_change_ts, 30.0)
+        row["within_60s_anchor_change"] = _within_s(anchor_change_ts, 60.0)
+        row["within_5s_reference_change"] = _within_s(reference_change_ts, 5.0)
+        row["within_15s_reference_change"] = _within_s(reference_change_ts, 15.0)
+        row["within_30s_reference_change"] = _within_s(reference_change_ts, 30.0)
+        row["within_60s_reference_change"] = _within_s(reference_change_ts, 60.0)
+        row["reference_changed_since_previous_row"] = bool(reference_changed_recently)
+
+        match = recorded_index.get(_dual_basis_row_match_key(row))
+        if not isinstance(match, dict):
+            row["event_predicted_bearing_deg"] = None
+            row["event_observed_bearing_deg"] = None
+            row["event_residual_deg"] = None
+            row["event_residual_abs_deg"] = None
+            row["event_period_s"] = None
+            row["event_phase_epoch_us"] = None
+            row["event_phase_offset_deg"] = None
+            row["event_sync_authority"] = None
+            row["event_period_authority"] = None
+            row["event_phase_basis"] = None
+            row["event_anchor_icao"] = None
+            row["event_reference_icao"] = None
+            row["basis_mismatch"] = True
+            row["basis_mismatch_reason"] = "missing_event_snapshot"
+            row["basis_mismatch_reasons"] = ["missing_event_snapshot"]
+            continue
+
+        event_predicted = match.get("predicted_deg")
+        event_observed = match.get("bearing_deg")
+        event_residual = match.get("residual_deg")
+        event_abs = abs(float(event_residual)) if _is_finite_number(event_residual) else None
+        event_period_s = match.get("event_effective_period_s")
+        event_phase_epoch = match.get("event_phase_epoch_us")
+        event_phase_offset = match.get("event_phase_offset_deg")
+        event_sync_authority = match.get("event_sync_authority")
+        event_period_authority = match.get("event_period_authority")
+        event_phase_basis = match.get("event_phase_basis")
+        event_anchor_icao = match.get("event_phase_anchor_icao")
+        event_reference_icao = match.get("event_reference_icao")
+
+        row["event_predicted_bearing_deg"] = event_predicted
+        row["event_observed_bearing_deg"] = event_observed
+        row["event_residual_deg"] = event_residual
+        row["event_residual_abs_deg"] = event_abs
+        row["event_period_s"] = event_period_s
+        row["event_phase_epoch_us"] = event_phase_epoch
+        row["event_phase_offset_deg"] = event_phase_offset
+        row["event_sync_authority"] = event_sync_authority
+        row["event_period_authority"] = event_period_authority
+        row["event_phase_basis"] = event_phase_basis
+        row["event_anchor_icao"] = event_anchor_icao
+        row["event_reference_icao"] = event_reference_icao
+
+        reasons: list[str] = []
+        if not isinstance(sync_state_payload, dict):
+            reasons.append("missing_current_snapshot")
+        else:
+            if event_sync_authority != current_sync_authority:
+                reasons.append("sync_authority_changed")
+            if event_period_authority != current_period_authority:
+                reasons.append("period_authority_changed")
+            if event_phase_basis != current_phase_basis:
+                reasons.append("phase_basis_changed")
+            if _float_differs(event_phase_epoch, current_phase_epoch, tol=1e-6):
+                reasons.append("phase_epoch_changed")
+            if (
+                _is_finite_number(event_phase_offset)
+                and _is_finite_number(current_phase_offset)
+                and abs(_circular_delta_deg(float(event_phase_offset), float(current_phase_offset)) or 0.0) > 1e-6
+            ) or (
+                (event_phase_offset is None) != (current_phase_offset is None)
+            ):
+                reasons.append("phase_offset_changed")
+            if _float_differs(event_period_s, current_period_s, tol=_CANONICAL_PERIOD_INVARIANT_TOL_S):
+                reasons.append("effective_period_changed")
+            if event_anchor_icao != current_anchor_icao:
+                reasons.append("anchor_changed")
+            if event_reference_icao is not None and event_reference_icao != current_reference_icao:
+                reasons.append("reference_changed")
+
+        if not reasons:
+            row["basis_mismatch"] = False
+            row["basis_mismatch_reason"] = "none"
+            row["basis_mismatch_reasons"] = []
+        elif len(reasons) == 1:
+            row["basis_mismatch"] = True
+            row["basis_mismatch_reason"] = reasons[0]
+            row["basis_mismatch_reasons"] = reasons
+        else:
+            row["basis_mismatch"] = True
+            row["basis_mismatch_reason"] = "multiple"
+            row["basis_mismatch_reasons"] = reasons
+
+
 def _clone_sync_for_projection(
     sync: "LiveSyncState",
     *,
@@ -3799,6 +4007,11 @@ class RadarState:
         entry.setdefault("holdover", None)
         entry.setdefault("last_holdover_transition_ts", None)
         entry.setdefault("last_holdover_transition", None)
+        entry.setdefault("transition_quarantine_count", 0)
+        entry.setdefault("transition_quarantine_fit_excluded_count", 0)
+        entry.setdefault("transition_quarantine_hard_reject_suppressed_count", 0)
+        entry.setdefault("transition_quarantine_last_ts", None)
+        entry.setdefault("transition_quarantine_last_reason", None)
         entry.setdefault("source", None)
 
         if source:
@@ -6024,6 +6237,7 @@ class RadarState:
             "phase_anchor_status": sync_snapshot.get("phase_anchor_status"),
             "event_phase_anchor_status": sync_snapshot.get("phase_anchor_status"),
             "phase_epoch_us": float(sync_snapshot.get("phase_epoch_us") or 0.0),
+            "event_phase_epoch_us": float(sync_snapshot.get("phase_epoch_us") or 0.0),
             "effective_period_source": sync_snapshot.get("effective_period_source"),
             "period_delta_source": sync_snapshot.get("period_delta_source"),
             "source_path": _recorded_source_path(
@@ -8814,6 +9028,14 @@ class RadarState:
                 py_shadow=self._py_shadow_sync_states.get(iid),
                 authority_transitions=self._period_authority_transitions.get(iid),
             )
+            current_reference_icao = ((sync_mode_diagnostics.get("compact") or {}).get("reference_icao")
+                                      if isinstance(sync_mode_diagnostics, dict) else None)
+            _annotate_compact_recomputed_dual_basis_rows(
+                entries,
+                residual_events,
+                sync_state_payload,
+                current_reference_icao=current_reference_icao,
+            )
             recomputed_observations_by_basis = {
                 "runtime_effective": entries,
             }
@@ -9165,6 +9387,14 @@ class RadarState:
             go_sync=go_sync,
             py_shadow=self._py_shadow_sync_states.get(iid),
             authority_transitions=self._period_authority_transitions.get(iid),
+        )
+        current_reference_icao = ((sync_mode_diagnostics.get("compact") or {}).get("reference_icao")
+                                  if isinstance(sync_mode_diagnostics, dict) else None)
+        _annotate_compact_recomputed_dual_basis_rows(
+            entries,
+            residual_events,
+            sync_state_payload,
+            current_reference_icao=current_reference_icao,
         )
         recomputed_observations_by_basis = {
             "runtime_effective": entries,

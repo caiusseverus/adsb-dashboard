@@ -23,6 +23,8 @@ from radar.sweep import (
     IcaoSyncQuality,
     LiveSyncState,
     RadarState,
+    _annotate_compact_recomputed_dual_basis_rows,
+    _live_sync_state_to_dict,
     _icao_quality_anchor_warning,
     _icao_quality_reject_reason,
     _icao_quality_memory_score,
@@ -1705,6 +1707,11 @@ def test_go_sync_snapshot_and_debug_use_compact_diagnostics_path(monkeypatch):
         "phase_epoch_changed_recently": True,
         "sync_reset_count": 1,
         "last_sync_reset_reason": "sync_state_missing",
+        "transition_quarantine_count": 5,
+        "transition_quarantine_fit_excluded_count": 4,
+        "transition_quarantine_hard_reject_suppressed_count": 3,
+        "transition_quarantine_last_ts": 999.5,
+        "transition_quarantine_last_reason": "anchor_changed",
     }
 
     snapshot = state.get_live_sync_snapshot(7, window_s=90.0, debug_limit=20)
@@ -1721,6 +1728,35 @@ def test_go_sync_snapshot_and_debug_use_compact_diagnostics_path(monkeypatch):
     assert debug_payload["summary"]["sync_source"] == "go_frame_sync"
     assert debug_payload["observation_model_diagnostics"]["mode"] == "compact_go_sync"
     assert debug_payload["observations"][0]["icao"] == "AAAAAA"
+
+
+def test_sync_mode_diagnostics_exposes_transition_quarantine_counters():
+    state = RadarState()
+    sync = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=999.0,
+        source="go_frame_sync",
+        usable=True,
+        period_base_s=4.0,
+    )
+    state._compact_sync_debug_by_iid[7] = {
+        "transition_quarantine_count": 5,
+        "transition_quarantine_fit_excluded_count": 4,
+        "transition_quarantine_hard_reject_suppressed_count": 3,
+        "transition_quarantine_last_ts": 999.5,
+        "transition_quarantine_last_reason": "anchor_changed",
+    }
+    diag = sweep_diagnostics.build_sync_mode_diagnostics(state, 7, sync, alignment_status=None)
+    compact = diag["compact"]
+    assert compact["transition_quarantine_count"] == 5
+    assert compact["transition_quarantine_fit_excluded_count"] == 4
+    assert compact["transition_quarantine_hard_reject_suppressed_count"] == 3
+    assert compact["transition_quarantine_last_reason"] == "anchor_changed"
 
 
 def test_go_sync_snapshot_falls_back_to_sweep_frames_when_burst_evidence_aged_out(monkeypatch):
@@ -1892,6 +1928,8 @@ def _build_compact_recomputed_row(
     pos_age_s: float = 0.2,
     sync_update_eligible: bool = True,
     score_override: float | None = None,
+    phase_anchor_since_ts: float | None = None,
+    last_reference_change_ts: float | None = None,
 ):
     monkeypatch.setattr(sweep_diagnostics.time, "time", lambda: 1_000.0)
 
@@ -1907,7 +1945,12 @@ def _build_compact_recomputed_row(
         source="multi_aircraft_burst",
         usable=True,
         period_base_s=10.0,
+        phase_anchor_since_ts=phase_anchor_since_ts,
     )
+    if last_reference_change_ts is not None:
+        state._compact_sync_debug_by_iid[7] = {
+            "last_reference_change_ts": last_reference_change_ts,
+        }
     obs = AlignedBurstSyncObs(
         burst_centroid_us=1_000_000.0,
         icao="AAAAAA",
@@ -1976,6 +2019,32 @@ def test_compact_recomputed_zero_weight_reason(monkeypatch):
     assert obs["zero_weight"] is True
 
 
+def test_compact_recomputed_transition_quarantine_reason(monkeypatch):
+    obs = _build_compact_recomputed_row(
+        monkeypatch,
+        bearing_deg=220.0,
+        pos_age_s=0.2,
+        phase_anchor_since_ts=999.0,
+        last_reference_change_ts=999.0,
+    )
+    assert obs["fit_eligible"] is False
+    assert obs["fit_reject_reason"] == "transition_quarantined"
+    assert obs["transition_quarantine_active"] is True
+    assert obs["transition_quarantine_window_s"] == pytest.approx(30.0)
+
+
+def test_compact_recomputed_transition_adjacent_pass_not_quarantined(monkeypatch):
+    obs = _build_compact_recomputed_row(
+        monkeypatch,
+        bearing_deg=40.0,
+        pos_age_s=0.2,
+        phase_anchor_since_ts=999.0,
+        last_reference_change_ts=999.0,
+    )
+    assert obs["fit_eligible"] is True
+    assert obs["transition_quarantine_active"] is False
+
+
 def test_compact_recomputed_emits_dominant_family_flag(monkeypatch):
     obs_false = _build_compact_recomputed_row(
         monkeypatch,
@@ -1998,6 +2067,205 @@ def test_compact_recomputed_fit_eligible_true_remains_true(monkeypatch):
     assert obs["fit_eligible"] is True
     assert obs["fit_reject_reason"] is None
     assert obs["fit_reject_reason_source"] == "compact_recomputed"
+
+
+def _make_dual_basis_entry() -> dict:
+    return {
+        "icao": "ABC123",
+        "beam_center_us": 1_000_000.0,
+        "predicted_deg": 120.0,
+        "bearing_deg": 140.0,
+        "residual_deg": 20.0,
+        "fit_reject_reason": "residual_gate",
+    }
+
+
+def _make_event_row(**overrides) -> dict:
+    row = {
+        "icao": "ABC123",
+        "beam_center_us": 1_000_000.0,
+        "predicted_deg": 120.0,
+        "bearing_deg": 140.0,
+        "residual_deg": 20.0,
+        "event_effective_period_s": 4.0,
+        "event_phase_epoch_us": 12345.0,
+        "event_phase_offset_deg": 50.0,
+        "event_sync_authority": "py_bootstrap",
+        "event_period_authority": "py_base",
+        "event_phase_basis": "anchor_relative",
+        "event_phase_anchor_icao": "C0FFEE",
+    }
+    row.update(overrides)
+    return row
+
+
+def _make_current_payload(**overrides) -> dict:
+    payload = {
+        "effective_period_s": 4.0,
+        "phase_epoch_us": 12345.0,
+        "phase_offset_deg": 50.0,
+        "sync_authority": "py_bootstrap",
+        "period_authority": "py_base",
+        "phase_basis": "anchor_relative",
+        "phase_anchor_icao": "C0FFEE",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_compact_dual_basis_no_mismatch_when_identical():
+    entry = _make_dual_basis_entry()
+    _annotate_compact_recomputed_dual_basis_rows(
+        [entry],
+        [_make_event_row()],
+        _make_current_payload(),
+        current_reference_icao="REF001",
+    )
+    assert entry["basis_mismatch"] is False
+    assert entry["basis_mismatch_reason"] == "none"
+    assert entry["event_residual_deg"] == pytest.approx(20.0)
+    assert entry["current_residual_deg"] == pytest.approx(20.0)
+
+
+def test_compact_dual_basis_mismatch_on_phase_epoch():
+    entry = _make_dual_basis_entry()
+    _annotate_compact_recomputed_dual_basis_rows(
+        [entry],
+        [_make_event_row(event_phase_epoch_us=99.0)],
+        _make_current_payload(phase_epoch_us=100.0),
+    )
+    assert entry["basis_mismatch"] is True
+    assert "phase_epoch_changed" in entry["basis_mismatch_reasons"]
+
+
+def test_compact_dual_basis_mismatch_on_phase_basis():
+    entry = _make_dual_basis_entry()
+    _annotate_compact_recomputed_dual_basis_rows(
+        [entry],
+        [_make_event_row(event_phase_basis="sweep_epoch_only")],
+        _make_current_payload(phase_basis="anchor_relative"),
+    )
+    assert entry["basis_mismatch"] is True
+    assert "phase_basis_changed" in entry["basis_mismatch_reasons"]
+
+
+def test_compact_dual_basis_mismatch_on_period_authority():
+    entry = _make_dual_basis_entry()
+    _annotate_compact_recomputed_dual_basis_rows(
+        [entry],
+        [_make_event_row(event_period_authority="holdover")],
+        _make_current_payload(period_authority="py_base"),
+    )
+    assert entry["basis_mismatch"] is True
+    assert "period_authority_changed" in entry["basis_mismatch_reasons"]
+
+
+def test_compact_dual_basis_missing_event_snapshot_sets_nulls():
+    entry = _make_dual_basis_entry()
+    _annotate_compact_recomputed_dual_basis_rows(
+        [entry],
+        [],
+        _make_current_payload(),
+    )
+    assert entry["basis_mismatch"] is True
+    assert entry["basis_mismatch_reason"] == "missing_event_snapshot"
+    assert entry["event_predicted_bearing_deg"] is None
+    assert entry["event_residual_deg"] is None
+
+
+def test_compact_dual_basis_keeps_compatibility_fields():
+    entry = _make_dual_basis_entry()
+    _annotate_compact_recomputed_dual_basis_rows(
+        [entry],
+        [_make_event_row()],
+        _make_current_payload(),
+    )
+    assert entry["residual_deg"] == pytest.approx(20.0)
+    assert entry["fit_reject_reason"] == "residual_gate"
+
+
+def test_compact_dual_basis_emits_anchor_reference_transition_fields(monkeypatch):
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 200.0)
+    entry = _make_dual_basis_entry()
+    entry["wall_ts"] = 198.0
+    _annotate_compact_recomputed_dual_basis_rows(
+        [entry],
+        [_make_event_row(event_reference_icao="REF001")],
+        _make_current_payload(
+            phase_anchor_icao="ANCH02",
+            previous_phase_anchor_icao="ANCH01",
+            phase_anchor_replacement_reason="quality_dropped",
+            phase_anchor_age_s=2.0,
+            anchor_last_validation_age_s=0.7,
+            reference_change_count=3,
+            last_reference_icao="REF000",
+            reference_changed_recently=True,
+            last_reference_change_ts=197.0,
+            operational_source_path="go_compact.active",
+        ),
+        current_reference_icao="REF001",
+    )
+    assert entry["current_anchor_icao"] == "ANCH02"
+    assert entry["previous_anchor_icao"] == "ANCH01"
+    assert entry["anchor_replacement_reason"] == "quality_dropped"
+    assert entry["anchor_age_s"] == pytest.approx(2.0)
+    assert entry["anchor_last_validation_age_s"] == pytest.approx(0.7)
+    assert entry["reference_icao"] == "REF001"
+    assert entry["previous_reference_icao"] == "REF000"
+    assert entry["reference_change_count"] == 3
+    assert entry["reference_changed_recently"] is True
+    assert entry["reference_changed_since_previous_row"] is True
+    assert entry["last_reference_change_ts"] == pytest.approx(197.0)
+    assert entry["reference_position_age_s"] is None
+    assert entry["authority_source"] == "go_compact.active"
+    assert entry["within_5s_anchor_change"] is True
+    assert entry["within_5s_reference_change"] is True
+
+
+def test_compact_dual_basis_transition_windows_null_without_row_wall_ts():
+    entry = _make_dual_basis_entry()
+    _annotate_compact_recomputed_dual_basis_rows(
+        [entry],
+        [_make_event_row()],
+        _make_current_payload(
+            phase_anchor_age_s=1.0,
+            last_reference_change_ts=100.0,
+        ),
+    )
+    assert entry["within_5s_anchor_change"] is None
+    assert entry["within_15s_anchor_change"] is None
+    assert entry["within_30s_anchor_change"] is None
+    assert entry["within_60s_anchor_change"] is None
+    assert entry["within_5s_reference_change"] is None
+    assert entry["within_15s_reference_change"] is None
+    assert entry["within_30s_reference_change"] is None
+    assert entry["within_60s_reference_change"] is None
+
+
+def test_go_unclassified_attribution_shape_is_stable():
+    sync = LiveSyncState(
+        iid=7,
+        period_s=4.0,
+        phase_epoch_us=1_000_000.0,
+        phase_offset_deg=20.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=1000.0,
+        source="go_frame_sync",
+        usable=True,
+        handoff_state="GO_REFINING",
+        handoff_reason="go_state_unclassified",
+        blocking_gate="go_readiness.unclassified_state",
+        period_refinement_status="stable",
+        contamination_state="not_evaluated",
+    )
+    payload = _live_sync_state_to_dict(sync, go_sync={}, suppress_consistency_logging=True)
+    assert payload["handoff_state"] == "GO_REFINING"
+    assert payload["handoff_reason"] == "go_state_unclassified"
+    assert payload["blocking_gate"] == "go_readiness.unclassified_state"
+    assert payload["period_refinement_status"] == "stable"
 
 
 def test_update_rotation_models_defers_recently_stable_iids(monkeypatch):

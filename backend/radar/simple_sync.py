@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 _SIMPLE_SYNC_FIT_WINDOW_ROTATIONS = 6.0
 _SIMPLE_SYNC_FIT_WINDOW_MIN_S = 30.0
+_TRANSITION_QUARANTINE_WINDOW_S = 30.0
 
 
 def _derive_phase_trust_reason(
@@ -295,6 +296,26 @@ def update_simple_live_sync_state(
         return
 
     icao_quality = state._live_icao_sync_quality.setdefault(iid, {})
+    compact_debug = dict(state._compact_sync_debug_by_iid.get(iid) or {})
+    anchor_age_s = None
+    if getattr(existing, "phase_anchor_since_ts", None) is not None:
+        try:
+            anchor_age_s = max(0.0, now_ts - float(existing.phase_anchor_since_ts))
+        except (TypeError, ValueError):
+            anchor_age_s = None
+    reference_age_s = None
+    if compact_debug.get("last_reference_change_ts") is not None:
+        try:
+            reference_age_s = max(0.0, now_ts - float(compact_debug.get("last_reference_change_ts")))
+        except (TypeError, ValueError):
+            reference_age_s = None
+    anchor_transition_recent = bool(anchor_age_s is not None and anchor_age_s <= _TRANSITION_QUARANTINE_WINDOW_S)
+    reference_transition_recent = bool(reference_age_s is not None and reference_age_s <= _TRANSITION_QUARANTINE_WINDOW_S)
+    transition_quarantine_count = 0
+    transition_quarantine_fit_excluded_count = 0
+    transition_quarantine_hard_reject_suppressed_count = 0
+    transition_quarantine_last_ts = None
+    transition_quarantine_last_reason = None
 
     scored: list[dict] = []
     for obs in recent_obs:
@@ -326,9 +347,30 @@ def update_simple_live_sync_state(
         else:
             effective_w = base_w * q_multiplier
 
+        current_residual_abs_deg = abs_r
+        current_residual_failed = bool(abs_r >= 150.0 or abs_r > 35.0)
+        transition_basis_reasons: list[str] = []
+        if anchor_transition_recent:
+            transition_basis_reasons.append("anchor_changed")
+        if reference_transition_recent:
+            transition_basis_reasons.append("reference_changed")
+        transition_basis_mismatch = bool(transition_basis_reasons)
+        transition_within_window = bool(anchor_transition_recent or reference_transition_recent)
+        transition_quarantine_reason = (
+            "multiple" if len(transition_basis_reasons) > 1
+            else (transition_basis_reasons[0] if transition_basis_reasons else "none")
+        )
+        transition_quarantine_active = bool(
+            transition_within_window
+            and transition_basis_mismatch
+            and current_residual_failed
+        )
+
         fit_reject_reason = None
         if not getattr(obs, "sync_update_eligible", True):
             fit_reject_reason = "not_sync_update_eligible"
+        elif transition_quarantine_active:
+            fit_reject_reason = "transition_quarantined"
         elif abs_r >= 150.0:
             fit_reject_reason = "near_wrap_residual"
         elif abs_r > 35.0:
@@ -341,6 +383,13 @@ def update_simple_live_sync_state(
             fit_reject_reason = "zero_weight"
 
         fit_eligible = fit_reject_reason is None
+        if transition_quarantine_active:
+            transition_quarantine_count += 1
+            transition_quarantine_fit_excluded_count += 1
+            if current_residual_failed:
+                transition_quarantine_hard_reject_suppressed_count += 1
+            transition_quarantine_last_ts = obs.ts
+            transition_quarantine_last_reason = transition_quarantine_reason
         scored.append(
             {
                 "residual": residual,
@@ -353,6 +402,14 @@ def update_simple_live_sync_state(
                 "obs_ts": obs.ts,
                 "fit_eligible": fit_eligible,
                 "fit_reject_reason": fit_reject_reason,
+                "transition_quarantine_active": transition_quarantine_active,
+                "transition_quarantine_reason": transition_quarantine_reason,
+                "transition_quarantine_window_s": _TRANSITION_QUARANTINE_WINDOW_S,
+                "transition_quarantine_basis_mismatch_reason": transition_quarantine_reason,
+                "transition_quarantine_anchor_age_s": anchor_age_s,
+                "transition_quarantine_reference_age_s": reference_age_s,
+                "transition_quarantine_event_residual_abs_deg": None,
+                "transition_quarantine_current_residual_abs_deg": current_residual_abs_deg,
                 "prediction": pred,
                 "obs": obs,
             }
@@ -367,11 +424,31 @@ def update_simple_live_sync_state(
         e for e in scored if e["fit_eligible"] and e["weight"] > 0 and e["status"] != "rejected"
     ]
     fit_contributing_icaos = {e["icao"] for e in fit_scored}
+    with state._lock:
+        compact_entry = dict(state._compact_sync_debug_by_iid.get(iid) or {})
+        compact_entry["transition_quarantine_count"] = (
+            int(compact_entry.get("transition_quarantine_count") or 0)
+            + int(transition_quarantine_count)
+        )
+        compact_entry["transition_quarantine_fit_excluded_count"] = (
+            int(compact_entry.get("transition_quarantine_fit_excluded_count") or 0)
+            + int(transition_quarantine_fit_excluded_count)
+        )
+        compact_entry["transition_quarantine_hard_reject_suppressed_count"] = (
+            int(compact_entry.get("transition_quarantine_hard_reject_suppressed_count") or 0)
+            + int(transition_quarantine_hard_reject_suppressed_count)
+        )
+        if transition_quarantine_last_ts is not None:
+            compact_entry["transition_quarantine_last_ts"] = float(transition_quarantine_last_ts)
+        if transition_quarantine_last_reason is not None:
+            compact_entry["transition_quarantine_last_reason"] = transition_quarantine_last_reason
+        state._compact_sync_debug_by_iid[iid] = compact_entry
 
     anchor_pool = [
         e
         for e in scored
-        if e.get("anchor_weight", 0.0) > 0.0 and e.get("fit_reject_reason") != "near_wrap_residual"
+        if e.get("anchor_weight", 0.0) > 0.0
+        and e.get("fit_reject_reason") not in {"near_wrap_residual", "transition_quarantined"}
     ]
     if not anchor_pool:
         existing.holdover = True

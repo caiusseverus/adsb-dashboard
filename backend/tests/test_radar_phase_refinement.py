@@ -935,3 +935,66 @@ class TestPeriodSInvariant:
         from dataclasses import fields
         field_names = {f.name for f in fields(LiveSyncState)}
         assert "period_authoritative_source" not in field_names
+
+    def test_transition_quarantine_applies_to_failed_residuals_with_recent_transition(self, monkeypatch):
+        import radar.sweep as sweep_module
+        monkeypatch.setattr(sweep_module.time, "time", lambda: self._NOW_TS)
+
+        state = RadarState()
+        state._live_sync_states[self._IID] = self._base_sync_state(
+            phase_anchor_since_ts=self._NOW_TS - 2.0,
+        )
+        state._compact_sync_debug_by_iid[self._IID] = {
+            "last_reference_change_ts": self._NOW_TS - 2.0,
+        }
+        obs = self._make_burst_obs(period_s=self._PERIOD_S, now_ts=self._NOW_TS)
+        for row in obs:
+            row.bearing_deg = (row.bearing_deg + 90.0) % 360.0
+
+        sync = self._run(state, obs)
+
+        assert sync is not None
+        assert sync.fit_eligible_observations == 0
+        compact = state._compact_sync_debug_by_iid[self._IID]
+        assert compact["transition_quarantine_count"] > 0
+        assert compact["transition_quarantine_fit_excluded_count"] > 0
+
+    def test_transition_adjacent_coherent_rows_not_quarantined(self, monkeypatch):
+        import radar.sweep as sweep_module
+        monkeypatch.setattr(sweep_module.time, "time", lambda: self._NOW_TS)
+
+        state = RadarState()
+        state._live_sync_states[self._IID] = self._base_sync_state(
+            phase_anchor_since_ts=self._NOW_TS - 2.0,
+        )
+        state._compact_sync_debug_by_iid[self._IID] = {
+            "last_reference_change_ts": self._NOW_TS - 2.0,
+        }
+        obs = self._make_burst_obs(period_s=self._PERIOD_S, now_ts=self._NOW_TS)
+        sync = self._run(state, obs)
+
+        assert sync is not None
+        assert sync.fit_eligible_observations > 0
+        compact = state._compact_sync_debug_by_iid[self._IID]
+        assert compact.get("transition_quarantine_count", 0) == 0
+
+    def test_failed_residuals_outside_transition_window_keep_residual_gate(self, monkeypatch):
+        import radar.sweep as sweep_module
+        monkeypatch.setattr(sweep_module.time, "time", lambda: self._NOW_TS)
+
+        state = RadarState()
+        state._live_sync_states[self._IID] = self._base_sync_state(
+            phase_anchor_since_ts=self._NOW_TS - 120.0,
+        )
+        state._compact_sync_debug_by_iid[self._IID] = {
+            "last_reference_change_ts": self._NOW_TS - 120.0,
+        }
+        obs = self._make_burst_obs(period_s=self._PERIOD_S, now_ts=self._NOW_TS)
+        for row in obs:
+            row.bearing_deg = (row.bearing_deg + 90.0) % 360.0
+        sync = self._run(state, obs)
+
+        assert sync is not None
+        compact = state._compact_sync_debug_by_iid.get(self._IID, {})
+        assert compact.get("transition_quarantine_count", 0) == 0
+        assert sync.fit_eligible_observations == 0
