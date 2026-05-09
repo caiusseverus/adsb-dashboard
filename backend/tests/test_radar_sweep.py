@@ -2244,7 +2244,9 @@ def test_compact_dual_basis_transition_windows_null_without_row_wall_ts():
     assert entry["within_60s_reference_change"] is None
 
 
-def test_go_unclassified_attribution_shape_is_stable():
+def test_go_unclassified_stale_evidence_shape_maps_to_concrete_freshness_gate(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
     sync = LiveSyncState(
         iid=7,
         period_s=4.0,
@@ -2260,11 +2262,38 @@ def test_go_unclassified_attribution_shape_is_stable():
         blocking_gate="go_readiness.unclassified_state",
         period_refinement_status="stable",
         contamination_state="not_evaluated",
+        phase_basis="anchor_relative",
+        phase_status="trusted",
+        phase_anchor_icao="ABC123",
+        phase_anchor_status="selected",
+        last_sync_driving_fit_observation_age_s=5000.0,
+        anchor_last_validation_age_s=5000.0,
+        burst_rows_absence_reason="no_burst_sync_rows",
+        fit_total_observations=120,
+        fit_icao_count=7,
     )
-    payload = _live_sync_state_to_dict(sync, go_sync={}, suppress_consistency_logging=True)
+    payload = _live_sync_state_to_dict(
+        sync,
+        go_sync={
+            "period_refinement_status": "stable",
+            "go_sync_usable_quality_ok": True,
+            "go_sync_usable_holdover_ok": True,
+            "go_sync_usable_period_agrees": True,
+            "go_sync_usable_strict_gate_pass": True,
+            "fit_observation_count": 120,
+            "fit_icao_count": 7,
+            "burst_rows_absence_reason": "no_burst_sync_rows",
+            "last_sync_driving_fit_observation_age_s": 5000.0,
+            "anchor_last_validation_age_s": 5000.0,
+        },
+        suppress_consistency_logging=True,
+    )
     assert payload["handoff_state"] == "GO_REFINING"
-    assert payload["handoff_reason"] == "go_state_unclassified"
-    assert payload["blocking_gate"] == "go_readiness.unclassified_state"
+    assert payload["handoff_reason"] != "go_state_unclassified"
+    assert payload["blocking_gate"] == "go_readiness.go_evidence_fresh"
+    assert payload["phase_status_display"] == "anchor_retained_stale"
+    assert payload["phase_anchor_retained_without_current_evidence"] is True
+    assert payload["phase_anchor_clear_reason"] == "stale_phase_evidence"
     assert payload["period_refinement_status"] == "stable"
 
 
@@ -5836,9 +5865,72 @@ def test_stale_go_evidence_marks_fit_and_anchor_retained_not_live():
     assert payload["go_diagnostic_anchor_retained_without_current_evidence"] is False
     assert payload["go_diagnostic_fit_counters_source"] == "retained"
     assert payload["phase_status_display"] != "anchor_trusted"
+    assert payload["phase_status_display"] == "anchor_untrusted"
+    assert payload["phase_anchor_retained_without_current_evidence"] is False
     # Historical anchor may be retained or cleared, but cannot be trusted-live.
     assert payload["phase_authority"] != "go_runtime"
     assert payload["handoff_gate_failures"]["go_readiness"]["go_sync_state_usable"]["passed"] is False
+    assert payload["handoff_reason"] != "go_state_unclassified"
+
+
+def test_screenshot_shape_stale_anchor_not_emitted_as_trusted_and_gate_is_concrete(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    sync = LiveSyncState(
+        iid=9920,
+        period_s=4.0,
+        phase_epoch_us=1_000_000.0,
+        phase_offset_deg=10.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=time.time() - 4100.0,
+        source="go_frame_sync",
+        usable=True,
+        handoff_state="GO_REFINING",
+        handoff_reason="go_state_unclassified",
+        period_refinement_status="stable",
+        phase_basis="anchor_relative",
+        phase_status="trusted",
+        phase_anchor_icao="A1B2C3",
+        phase_anchor_status="selected",
+        phase_anchor_since_ts=time.time() - 4134.0,
+        population_validation_state="insufficient_data",
+        population_validation_reason="no_observations",
+        fit_total_observations=243,
+        fit_icao_count=6,
+        n_burst_obs_inliers=0,
+        n_burst_obs_rejected=0,
+        last_sync_driving_fit_observation_age_s=4100.0,
+        anchor_last_validation_age_s=4100.0,
+        burst_rows_absence_reason="no_burst_sync_rows",
+        phase_anchor_candidates=[{"icao": "A1B2C3", "score": 1.0}],
+    )
+    state = RadarState()
+    phase_eval = state._evaluate_phase_authority_gates_locked(9920, sync)
+    payload = _live_sync_state_to_dict(
+        sync,
+        go_sync={
+            "period_refinement_status": "stable",
+            "fit_observation_count": 243,
+            "fit_icao_count": 6,
+            "go_sync_usable_quality_ok": True,
+            "go_sync_usable_holdover_ok": True,
+            "go_sync_usable_period_agrees": True,
+            "go_sync_usable_strict_gate_pass": True,
+            "last_sync_driving_fit_observation_age_s": 4100.0,
+            "anchor_last_validation_age_s": 4100.0,
+            "burst_rows_absence_reason": "no_burst_sync_rows",
+        },
+        suppress_consistency_logging=True,
+    )
+    assert payload["phase_status_display"] != "anchor_trusted"
+    assert payload["phase_status_display"] == "anchor_retained_stale"
+    assert phase_eval["gates"]["phase_state_trusted"]["passed"] is False
+    assert phase_eval["gates"]["phase_evidence_fresh"]["passed"] is False
+    assert payload["phase_anchor_icao"] == "A1B2C3"
+    assert payload["phase_anchor_candidates"]
+    assert payload["blocking_gate"] == "go_readiness.go_evidence_fresh"
+    assert payload["handoff_reason"] != "go_state_unclassified"
 
 
 def test_stale_go_evidence_exposes_absent_row_reason_and_observation_ages():

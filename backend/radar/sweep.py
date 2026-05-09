@@ -956,6 +956,7 @@ def _live_sync_state_to_dict(
     phase_anchor_status = str(getattr(sync, "phase_anchor_status", "") or "")
     phase_anchor_icao = getattr(sync, "phase_anchor_icao", None)
     phase_anchor_since_ts = getattr(sync, "phase_anchor_since_ts", None)
+    raw_phase_status = str(getattr(sync, "phase_status", "") or "")
 
     # Use the typed phase_basis from LiveSyncState if populated; fall back to
     # deriving from anchor state for backward compatibility with states built
@@ -983,6 +984,30 @@ def _live_sync_state_to_dict(
             phase_anchor_age_s = max(0.0, time.time() - float(phase_anchor_since_ts))
         except (TypeError, ValueError):
             phase_anchor_age_s = None
+
+    def _to_finite_float(value: object) -> float | None:
+        if not _is_finite_number(value):
+            return None
+        return float(value)
+
+    sync_driving_fit_age_s = _to_finite_float(getattr(sync, "last_sync_driving_fit_observation_age_s", None))
+    if sync_driving_fit_age_s is None and isinstance(go_sync, dict):
+        sync_driving_fit_age_s = _to_finite_float(go_sync.get("last_sync_driving_fit_observation_age_s"))
+    anchor_validation_age_s = _to_finite_float(getattr(sync, "anchor_last_validation_age_s", None))
+    if anchor_validation_age_s is None and isinstance(go_sync, dict):
+        anchor_validation_age_s = _to_finite_float(go_sync.get("anchor_last_validation_age_s"))
+    phase_evidence_age_s = (
+        sync_driving_fit_age_s
+        if sync_driving_fit_age_s is not None
+        else anchor_validation_age_s
+    )
+    phase_evidence_fresh: bool | None = None
+    if phase_basis in {"anchor_relative", "geographic"}:
+        phase_evidence_fresh = (
+            phase_evidence_age_s is not None
+            and phase_evidence_age_s <= _PHASE_FRESH_MAX_AGE_S
+        )
+    phase_state_ts = _to_finite_float(getattr(sync, "last_sync_update_ts", None))
 
     # --- typed phase fields from the dataclass (populated by the updater) ---
     typed_phase_is_absolute = bool(getattr(sync, "phase_is_absolute", False))
@@ -1393,6 +1418,8 @@ def _live_sync_state_to_dict(
             )
             if go_blocking_gate == "go_readiness.unclassified_state":
                 go_blocking_gate = None
+                if str(blocking_gate) == "go_readiness.unclassified_state":
+                    blocking_gate = None
             go_blocking_reason = effective_handoff_reason
 
             # Precedence: existing go/python blocking gate → handoff_reason mapping
@@ -1401,6 +1428,11 @@ def _live_sync_state_to_dict(
                 mapped_gate = handoff_reason_to_gate.get(reason_key)
                 if mapped_gate:
                     go_blocking_gate = mapped_gate
+                elif phase_evidence_fresh is False:
+                    go_blocking_gate = "go_readiness.go_evidence_fresh"
+                    if not effective_handoff_reason or reason_is_unclassified_placeholder:
+                        effective_handoff_reason = "stale_go_evidence"
+                    go_blocking_reason = effective_handoff_reason
                 elif go_sync_unusable_reason or diag_go_sync_unusable_reason:
                     go_blocking_gate = "go_readiness.go_sync_state_usable"
                     if not effective_handoff_reason:
@@ -1486,6 +1518,30 @@ def _live_sync_state_to_dict(
         # go_operational_active despite Go being the active authority.
         go_operational_active = True
 
+    phase_status_display = (
+        "anchor_trusted" if raw_phase_status == "trusted" else
+        "anchor_provisional" if raw_phase_status == "provisional" else
+        "anchor_untrusted" if raw_phase_status == "untrusted" else
+        "unavailable"
+    )
+    phase_anchor_clear_reason = getattr(sync, "phase_anchor_clear_reason", None)
+    phase_anchor_retained_without_current_evidence = bool(
+        getattr(sync, "anchor_retained_without_current_evidence", False)
+    )
+    if (
+        phase_basis == "anchor_relative"
+        and raw_phase_status in {"trusted", "provisional"}
+        and phase_evidence_fresh is False
+    ):
+        phase_status_display = "anchor_retained_stale"
+        phase_anchor_clear_reason = phase_anchor_clear_reason or "stale_phase_evidence"
+        phase_anchor_retained_without_current_evidence = True
+
+    current_fit_epoch_age_s = None
+    fit_epoch_started_ts = _to_finite_float(getattr(sync, "fit_epoch_started_ts", None))
+    if fit_epoch_started_ts is not None:
+        current_fit_epoch_age_s = max(0.0, time.time() - fit_epoch_started_ts)
+
     payload.update({
         "base_period_s": base_period_s,
         "period_delta_s": period_delta_s,
@@ -1519,12 +1575,10 @@ def _live_sync_state_to_dict(
         "phase_absolute_available": phase_absolute_available,
         "phase_trust_reason": typed_phase_trust_reason,
         "phase_anchor_age_s": phase_anchor_age_s,
-        "phase_status_display": (
-            "anchor_trusted" if str(getattr(sync, "phase_status", "") or "") == "trusted" else
-            "anchor_provisional" if str(getattr(sync, "phase_status", "") or "") == "provisional" else
-            "anchor_untrusted" if str(getattr(sync, "phase_status", "") or "") == "untrusted" else
-            "unavailable"
-        ),
+        "phase_status_display": phase_status_display,
+        "phase_state_ts": phase_state_ts,
+        "phase_evidence_age_s": phase_evidence_age_s,
+        "phase_evidence_fresh": phase_evidence_fresh,
         "phase_offset_deg": float(getattr(sync, "phase_offset_deg") or 0.0),
         "phase_offset_basis": phase_offset_basis,
         "phase_offset_geographic_deg": typed_phase_offset_geographic,
@@ -1533,7 +1587,7 @@ def _live_sync_state_to_dict(
         "previous_phase_anchor_icao": getattr(sync, "previous_phase_anchor_icao", None),
         "previous_phase_anchor_age_s": getattr(sync, "previous_phase_anchor_age_s", None),
         "previous_phase_status": getattr(sync, "previous_phase_status", None),
-        "phase_anchor_clear_reason": getattr(sync, "phase_anchor_clear_reason", None),
+        "phase_anchor_clear_reason": phase_anchor_clear_reason,
         "phase_basis_override_reason": phase_basis_override_reason,
         "last_phase_anchor_clear_ts": getattr(sync, "last_phase_anchor_clear_ts", None),
         "go_sync_unusable_reason_at_clear": getattr(sync, "go_sync_unusable_reason_at_clear", None),
@@ -1543,6 +1597,7 @@ def _live_sync_state_to_dict(
             or None
         ),
         "phase_anchor_retention_reason": getattr(sync, "phase_anchor_retention_reason", None),
+        "phase_anchor_retained_without_current_evidence": phase_anchor_retained_without_current_evidence,
         "phase_anchor_score": float(getattr(sync, "phase_anchor_score") or 0.0),
         "phase_anchor_obs_count": int(getattr(sync, "phase_anchor_obs_count") or 0),
         "phase_validation_status": str(getattr(sync, "phase_validation_status") or "unavailable"),
@@ -1641,6 +1696,7 @@ def _live_sync_state_to_dict(
         "fit_epoch_reset_reason": getattr(sync, "fit_epoch_reset_reason", None),
         "fit_epoch_observation_count": getattr(sync, "fit_epoch_observation_count", None),
         "fit_epoch_span_s": getattr(sync, "fit_epoch_span_s", None),
+        "current_fit_epoch_age_s": current_fit_epoch_age_s,
         "fit_dropped_on_epoch_reset": getattr(sync, "fit_dropped_on_epoch_reset", None),
         "fit_segment_count": getattr(sync, "fit_segment_count", None),
         "population_validation_state": getattr(sync, "population_validation_state", None),
@@ -4671,6 +4727,25 @@ class RadarState:
             None if anchor_fresh is not False else "anchor_age_stale_or_missing",
         )
 
+        # Fresh evidence gate: requires recent sync-driving/anchor-validation evidence
+        # for anchor/geographic phase to be considered current.
+        if phase_basis in {"anchor_relative", "geographic"}:
+            phase_evidence_age_s = None
+            if _is_finite_number(getattr(sync, "last_sync_driving_fit_observation_age_s", None)):
+                phase_evidence_age_s = float(getattr(sync, "last_sync_driving_fit_observation_age_s"))
+            elif _is_finite_number(getattr(sync, "anchor_last_validation_age_s", None)):
+                phase_evidence_age_s = float(getattr(sync, "anchor_last_validation_age_s"))
+            phase_evidence_fresh = (
+                phase_evidence_age_s is not None
+                and phase_evidence_age_s <= _PHASE_FRESH_MAX_AGE_S
+            )
+        else:
+            phase_evidence_fresh = None
+        gates["phase_evidence_fresh"] = _gate_value(
+            phase_evidence_fresh,
+            None if phase_evidence_fresh is not False else "stale_phase_evidence",
+        )
+
         # Population validation gate.
         pop_state = str(getattr(sync, "population_validation_state", "") or "")
         if pop_state == "pass":
@@ -4701,6 +4776,8 @@ class RadarState:
                 gates["phase_anchor_status_ok"] = _gate_value(None, "anchor_status_unknown")
 
         trusted = str(getattr(sync, "phase_status", "") or "") == "trusted"
+        if phase_basis in {"anchor_relative", "geographic"} and phase_evidence_fresh is False:
+            trusted = False
         gates["phase_state_trusted"] = _gate_value(trusted, None if trusted else "phase_untrusted")
 
         c_state = str(getattr(sync, "contamination_state", "") or "")

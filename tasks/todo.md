@@ -13,3 +13,19 @@
 - Kept behavior unchanged: no threshold/tolerance/policy/localiser/chart/semantic changes.
 - `transition_quarantine_hard_reject_suppressed_count` remains zero unless an explicit suppression path is implemented.
 - 10-minute top-20 capture completed successfully with no request failures and no observable latency regression in sampled endpoints.
+
+## 2026-05-09 Stale Anchor-Relative Trust Guard
+
+- [x] Trace source-of-truth for requested snapshot fields (`phase_status`, `phase_status_display`, anchor fields, population validation, burst/fit evidence counters/ages, Go diagnostic fit counters).
+- [x] Implement freshness guard in sync serialization/readiness so stale retained anchor state is never emitted as current trusted (`anchor_trusted`) without fresh eligible sync-driving evidence.
+- [x] Ensure retained diagnostics remain visible and explicitly marked retained/stale (`anchor_retained_stale`, `stale_phase_evidence`, `phase_anchor_retained_without_current_evidence`).
+- [x] Ensure stale-evidence shape maps to concrete blocking gate (`go_readiness.go_evidence_fresh` and/or `phase_readiness.phase_evidence_fresh`), not `go_state_unclassified` / `go_readiness.unclassified_state`.
+- [x] Add regression tests for screenshot-like stale shape and verify no Stage 10/threshold/tolerance/localiser/chart/geographic semantics changes.
+- [x] Re-run focused tests and short live capture; report requested stale-lock counters and dwell metrics.
+
+### Review
+- Added serializer freshness signals (`phase_state_ts`, `phase_evidence_age_s`, `phase_evidence_fresh`, `current_fit_epoch_age_s`) and stale anchor display guard.
+- Added phase-readiness gate `phase_evidence_fresh`; trusted gate now requires fresh evidence for anchor/geographic basis.
+- Added Stage-10 non-active stale-shape remap from unclassified placeholder to concrete freshness blocker.
+- Added regression tests for stale screenshot-like shape and unclassified stale mapping.
+- Short live capture executed in an isolated runtime; no active IIDs were present (`SAMPLES 0`), so production-like stale-lock incidence could not be observed in this environment.

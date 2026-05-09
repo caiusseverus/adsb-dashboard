@@ -324,6 +324,8 @@ def test_sync_state_exposes_phase_status_alias_without_removing_legacy_value():
         phase_status="trusted",
         phase_anchor_icao="ABC123",
         phase_anchor_status="selected",
+        last_sync_driving_fit_observation_age_s=1.0,
+        anchor_last_validation_age_s=1.0,
     )
 
     payload = radar_api.build_iid_sync_snapshot_payload(state, 99, window_s=60.0, debug_limit=20)
