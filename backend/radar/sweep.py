@@ -1385,6 +1385,10 @@ def _live_sync_state_to_dict(
                     if isinstance(go_sync, dict) else
                     getattr(sync, "go_diagnostic_go_sync_usable_quality_ok", None)
                 )
+            if go_sync_usable_quality_ok is None:
+                go_sync_usable_quality_ok = _bool_or_none(
+                    getattr(sync, "go_diagnostic_go_sync_usable_quality_ok", None)
+                )
             go_sync_usable_holdover_ok = _bool_or_none(
                 (go_sync or {}).get("go_sync_usable_holdover_ok")
                 if isinstance(go_sync, dict) else
@@ -1394,6 +1398,10 @@ def _live_sync_state_to_dict(
                 go_sync_usable_holdover_ok = _bool_or_none(
                     (go_sync or {}).get("go_diagnostic_go_sync_usable_holdover_ok")
                     if isinstance(go_sync, dict) else
+                    getattr(sync, "go_diagnostic_go_sync_usable_holdover_ok", None)
+                )
+            if go_sync_usable_holdover_ok is None:
+                go_sync_usable_holdover_ok = _bool_or_none(
                     getattr(sync, "go_diagnostic_go_sync_usable_holdover_ok", None)
                 )
             go_sync_usable_period_agrees = _bool_or_none(
@@ -1407,6 +1415,10 @@ def _live_sync_state_to_dict(
                     if isinstance(go_sync, dict) else
                     getattr(sync, "go_diagnostic_go_sync_usable_period_agrees", None)
                 )
+            if go_sync_usable_period_agrees is None:
+                go_sync_usable_period_agrees = _bool_or_none(
+                    getattr(sync, "go_diagnostic_go_sync_usable_period_agrees", None)
+                )
             go_sync_usable_strict_gate_pass = _bool_or_none(
                 (go_sync or {}).get("go_sync_usable_strict_gate_pass")
                 if isinstance(go_sync, dict) else
@@ -1416,6 +1428,10 @@ def _live_sync_state_to_dict(
                 go_sync_usable_strict_gate_pass = _bool_or_none(
                     (go_sync or {}).get("go_diagnostic_go_sync_usable_strict_gate_pass")
                     if isinstance(go_sync, dict) else
+                    getattr(sync, "go_diagnostic_go_sync_usable_strict_gate_pass", None)
+                )
+            if go_sync_usable_strict_gate_pass is None:
+                go_sync_usable_strict_gate_pass = _bool_or_none(
                     getattr(sync, "go_diagnostic_go_sync_usable_strict_gate_pass", None)
                 )
             go_blocking_gate = (
@@ -1528,6 +1544,53 @@ def _live_sync_state_to_dict(
     ):
         go_operational_blocking_gate = str(blocking_gate)
         go_operational_blocking_reason = effective_handoff_reason
+
+    # Attribution fallback: some non-go_frame_sync rows can carry ready-like Go
+    # diagnostics but no explicit blocking gate snapshot. Keep this as a
+    # serialization-only mapping to avoid leaking unclassified placeholders.
+    if (
+        go_refiner_operational_enabled
+        and go_operational_blocking_gate is None
+        and not is_active_go_operational
+        and str(effective_handoff_reason or "").strip() == "go_state_unclassified"
+    ):
+        def _diag_bool(value: object) -> bool | None:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                v = value.strip().lower()
+                if v in {"true", "1", "yes", "on"}:
+                    return True
+                if v in {"false", "0", "no", "off"}:
+                    return False
+            return None
+
+        diag_refinement_status = str(
+            getattr(sync, "go_diagnostic_refinement_status", "") or period_refinement_status or ""
+        ).strip()
+        diag_quality_ok = _diag_bool(getattr(sync, "go_diagnostic_go_sync_usable_quality_ok", None))
+        diag_holdover_ok = _diag_bool(getattr(sync, "go_diagnostic_go_sync_usable_holdover_ok", None))
+        diag_period_agrees = _diag_bool(getattr(sync, "go_diagnostic_go_sync_usable_period_agrees", None))
+        diag_strict_pass = _diag_bool(getattr(sync, "go_diagnostic_go_sync_usable_strict_gate_pass", None))
+        diag_unusable_reason = str(getattr(sync, "go_diagnostic_go_sync_unusable_reason", "") or "").strip()
+        if (
+            diag_refinement_status == "stable"
+            and diag_quality_ok is True
+            and diag_holdover_ok is True
+            and diag_period_agrees is True
+            and diag_strict_pass is True
+            and not diag_unusable_reason
+            and not bool(getattr(sync, "holdover", False))
+        ):
+            go_operational_blocking_gate = "go_readiness_hysteresis"
+            go_operational_blocking_reason = "go_ready_pending_hysteresis"
+            if not blocking_gate:
+                blocking_gate = "go_readiness_hysteresis"
+            effective_handoff_reason = "go_ready_pending_hysteresis"
 
     go_operational_active = bool(getattr(sync, "go_operational_active", False))
     if (
@@ -9870,6 +9933,111 @@ class RadarState:
             py_shadow=py_shadow,
             authority_transitions=authority_transitions,
         ) if sync else None
+        if sync_state is None and go_sync:
+            try:
+                import config as _cfg  # local import avoids test harness import failures
+                go_operational_enabled = bool(getattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False))
+            except Exception:
+                go_operational_enabled = False
+            if go_operational_enabled:
+                handoff_reason = str(go_sync.get("handoff_reason") or "").strip()
+                blocking_gate = str(go_sync.get("blocking_gate") or "").strip()
+                phase_blocking_gate = str(go_sync.get("phase_blocking_gate") or "").strip()
+                if phase_blocking_gate and not phase_blocking_gate.startswith("phase_readiness."):
+                    phase_blocking_gate = f"phase_readiness.{phase_blocking_gate}"
+                go_sync_unusable_reason = str(go_sync.get("go_sync_unusable_reason") or "").strip()
+                diag_unusable_reason = str(go_sync.get("go_diagnostic_go_sync_unusable_reason") or "").strip()
+                holdover = bool(go_sync.get("holdover", False))
+                holdover_reason = str(go_sync.get("holdover_reason") or "").strip()
+                refinement_status = str(
+                    go_sync.get("go_diagnostic_refinement_status")
+                    or go_sync.get("period_refinement_status")
+                    or ""
+                ).strip()
+                phase_evidence_fresh = go_sync.get("phase_evidence_fresh")
+                if phase_evidence_fresh is None:
+                    age_s = go_sync.get("last_sync_driving_fit_observation_age_s")
+                    if _is_finite_number(age_s):
+                        phase_evidence_fresh = float(age_s) <= _PHASE_FRESH_MAX_AGE_S
+
+                handoff_reason_to_gate = {
+                    "go_holdover": "go_readiness.go_not_holdover",
+                    "go_sync_unusable": "go_readiness.go_sync_state_usable",
+                    "strict_gate_failed": "go_readiness.go_sync_state_usable",
+                    "slope_not_converged": "go_readiness.go_slope_converged",
+                    "go_ready_pending_hysteresis": "go_readiness_hysteresis",
+                    "go_refinement_history_insufficient": "go_readiness.go_refinement_history_sufficient",
+                    "insufficient_contributing_icaos": "python_base.enough_icaos",
+                }
+                go_blocking_gate = None
+                if blocking_gate.startswith(("python_base.", "go_readiness.")):
+                    go_blocking_gate = blocking_gate
+                elif blocking_gate.startswith("phase_readiness."):
+                    # Never treat phase blockers as Go operational blockers.
+                    pass
+                elif blocking_gate:
+                    for prefix in ("go_readiness.", "python_base."):
+                        candidate = f"{prefix}{blocking_gate}"
+                        if candidate.startswith(("go_readiness.", "python_base.")):
+                            go_blocking_gate = candidate
+                            break
+                if not go_blocking_gate:
+                    go_blocking_gate = handoff_reason_to_gate.get(handoff_reason)
+                if not go_blocking_gate:
+                    if holdover or diag_unusable_reason == "holdover":
+                        go_blocking_gate = "go_readiness.go_not_holdover"
+                        if not handoff_reason:
+                            handoff_reason = holdover_reason or "go_holdover"
+                    elif go_sync_unusable_reason or diag_unusable_reason:
+                        go_blocking_gate = "go_readiness.go_sync_state_usable"
+                        if not handoff_reason:
+                            handoff_reason = go_sync_unusable_reason or diag_unusable_reason
+                    elif refinement_status == "insufficient_history":
+                        go_blocking_gate = "go_readiness.go_refinement_history_sufficient"
+                        if not handoff_reason:
+                            handoff_reason = "go_refinement_history_insufficient"
+                    elif phase_evidence_fresh is False:
+                        go_blocking_gate = "go_readiness.go_evidence_fresh"
+                        if not handoff_reason:
+                            handoff_reason = "stale_go_evidence"
+                if not go_blocking_gate:
+                    ready_like = (
+                        refinement_status == "stable"
+                        and bool(go_sync.get("go_diagnostic_go_sync_usable_quality_ok", go_sync.get("go_sync_usable_quality_ok")))
+                        and bool(go_sync.get("go_diagnostic_go_sync_usable_holdover_ok", go_sync.get("go_sync_usable_holdover_ok")))
+                        and bool(go_sync.get("go_diagnostic_go_sync_usable_period_agrees", go_sync.get("go_sync_usable_period_agrees")))
+                        and bool(go_sync.get("go_diagnostic_go_sync_usable_strict_gate_pass", go_sync.get("go_sync_usable_strict_gate_pass")))
+                    )
+                    if ready_like:
+                        go_blocking_gate = "go_readiness_hysteresis"
+                        handoff_reason = handoff_reason or "go_ready_pending_hysteresis"
+                if not go_blocking_gate:
+                    go_blocking_gate = "go_readiness.unclassified_state"
+                    handoff_reason = handoff_reason or "go_state_unclassified"
+
+                sync_state = {
+                    "iid": iid,
+                    "source": str(go_sync.get("source") or "go_frame_sync"),
+                    "usable": False,
+                    "period_authority": str(go_sync.get("period_authority") or "unavailable"),
+                    "sync_authority": str(go_sync.get("sync_authority") or "unavailable"),
+                    "phase_authority": str(go_sync.get("phase_authority") or "unavailable"),
+                    "handoff_state": str(go_sync.get("handoff_state") or "GO_REFINING"),
+                    "handoff_reason": handoff_reason,
+                    "blocking_gate": go_blocking_gate,
+                    "holdover": holdover,
+                    "holdover_reason": holdover_reason or None,
+                    "go_sync_unusable_reason": go_sync_unusable_reason,
+                    "go_diagnostic_go_sync_unusable_reason": diag_unusable_reason,
+                    "go_diagnostic_refinement_status": refinement_status,
+                    "phase_evidence_fresh": phase_evidence_fresh,
+                    "go_operational_enabled": True,
+                    "go_operational_active": False,
+                    "go_operational_blocking_gate": go_blocking_gate,
+                    "go_operational_blocking_reason": handoff_reason,
+                    "phase_authority_blocking_gate": phase_blocking_gate or None,
+                    "phase_authority_blocking_reason": str(go_sync.get("phase_blocking_reason") or "") or None,
+                }
 
         snapshot = {
             "type": "radar_sync",

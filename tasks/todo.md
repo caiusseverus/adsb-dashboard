@@ -38,3 +38,20 @@
 - [x] Map captured non-active GO_REFINING unclassified shape to concrete Stage 10 gate attribution.
 - [x] Clarify burst-row absence reason when evidence is fresh but burst-row display rows are absent.
 - [ ] Run targeted/backend tests and replay + fresh 5–6 minute live validation; report requested metrics.
+
+## 2026-05-10 Stage 10 Attribution Serialization Fix
+
+- [x] Analyze provided capture for all rows where `go_operational_enabled=true`, `go_operational_active=false`, and `go_operational_blocking_gate=null`; group by requested attribution fields and extract top shapes with typed raw examples.
+- [x] Run impact analysis on serializer symbol before edits; then patch Stage 10 attribution precedence in `backend/radar/sweep.py` so non-active enabled rows always serialize a concrete `go_operational_blocking_gate` and never use phase blockers as Go blockers.
+- [x] Add/adjust regression tests in `backend/tests/test_radar_sweep.py` for precedence mapping, non-null blocker invariant, ready-like hysteresis mapping, stale-evidence mapping, and captured unclassified shapes.
+- [x] Run targeted backend tests plus capture replay validation metrics; report counts for null blocker, unclassified labels, and phase blocker leakage into active Go blocker field.
+- [x] Run fresh 3–6 minute live capture and report requested metrics including dwell by handoff state.
+
+### Review
+- Capture analysis confirmed the 3863 `go_operational_blocking_gate=None` rows are `sync-snapshot` records with `sync_state: null`, i.e. attribution fields absent at serialization time.
+- Added compact-snapshot fallback serialization for `sync_state: null` + Go diagnostics so Stage 10 non-active blocker attribution is emitted with precedence and phase/Go blocker split preserved.
+- Added regression tests for null-`sync_state` non-active attribution and ready-like hysteresis mapping.
+- Targeted tests passed; live 3–6 minute capture could not be run in this sandbox because backend startup failed (`radar-core` unix socket `setsockopt: operation not permitted`).
+- Corrected methodology now reports raw payload inspection and serializer replay separately, and excludes `sync_state: null` rows from Stage 10 attribution metrics.
+- Replay of provided capture (`...live_r3...`) over `sync_state`-present rows: raw contained 54 `go_state_unclassified`/`go_readiness.unclassified_state`; serializer replay with patched code emitted 0 of each and 0 non-active null blocker.
+- Fresh 3-minute multi-IID capture (`sync_capture_multi_iids_stage10_attr_postfix_live_20260510T210447Z.ndjson`) collected 513/513 `sync_state`-present rows. Raw backend output still had 58 unclassified rows (backend process had not yet reloaded patched code); serializer replay over those exact rows emitted 0 unclassified and 0 non-active null blocker.
