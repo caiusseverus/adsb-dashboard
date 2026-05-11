@@ -594,6 +594,12 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_sync_quality": go_payload.get("go_diagnostic_sync_quality"),
         "go_diagnostic_quality_eval_seq": go_payload.get("quality_eval_seq"),
         "go_diagnostic_quality_eval_age_s": go_payload.get("quality_eval_age_s"),
+        "go_diagnostic_quality_demoted_df_period_disagree": go_payload.get("quality_demoted_df_period_disagree"),
+        "go_diagnostic_quality_demoted_df_period_disagree_reason": go_payload.get("quality_demoted_df_period_disagree_reason"),
+        "go_diagnostic_quality_original_status": go_payload.get("quality_original_status"),
+        "go_diagnostic_quality_effective_status": go_payload.get("quality_effective_status"),
+        "go_diagnostic_quality_original_value": go_payload.get("quality_original_value"),
+        "go_diagnostic_quality_effective_value": go_payload.get("quality_effective_value"),
         "go_diagnostic_go_sync_usable_reacquired_provisional": go_payload.get("sync_reacquired_provisional"),
         "go_diagnostic_go_sync_usable_fit_obs": go_payload.get("fit_observation_count"),
         "go_diagnostic_go_sync_usable_fit_icaos": go_payload.get("fit_icao_count"),
@@ -680,6 +686,11 @@ def _build_go_promotion_failure_diagnostic_aliases(payload: dict, go_sync: dict 
     or threshold logic is changed here.
     """
     go_payload = go_sync if isinstance(go_sync, dict) else {}
+    def _first_non_none(*vals):
+        for v in vals:
+            if v is not None:
+                return v
+        return None
     ref_icao = payload.get("go_diagnostic_last_update_epoch_ref_icao") or payload.get("last_update_epoch_ref_icao")
     phase_anchor_icao = payload.get("phase_anchor_icao")
     phase_anchor_candidates = payload.get("phase_anchor_candidates") or []
@@ -714,6 +725,81 @@ def _build_go_promotion_failure_diagnostic_aliases(payload: dict, go_sync: dict 
     elif payload.get("go_diagnostic_go_sync_usable_quality_ok") is False:
         quality_gate_fail_reason = "quality_check_failed"
 
+    strict_quality_fail = payload.get("go_diagnostic_go_sync_usable_quality_ok") is False
+    strict_holdover_fail = (
+        payload.get("go_diagnostic_go_sync_usable_holdover_ok") is False
+        or str(payload.get("go_sync_unusable_reason") or "") == "holdover"
+    )
+    strict_period_agreement_fail = (
+        payload.get("go_diagnostic_go_sync_usable_period_agrees") is False
+        or str(payload.get("go_diagnostic_go_sync_usable_period_reject_reason") or "") != ""
+    )
+    strict_epoch_fail = payload.get("go_diagnostic_go_sync_usable_strict_gate_pass") is False
+    fit_obs = payload.get("go_diagnostic_fit_observation_count")
+    fit_icaos = payload.get("go_diagnostic_fit_icao_count")
+    min_fit_obs = go_payload.get("go_sync_usable_min_fit_obs")
+    min_fit_icaos = go_payload.get("go_sync_usable_min_fit_icaos")
+    strict_support_fail = bool(
+        (_is_finite_number(fit_obs) and _is_finite_number(min_fit_obs) and float(fit_obs) < float(min_fit_obs))
+        or (_is_finite_number(fit_icaos) and _is_finite_number(min_fit_icaos) and float(fit_icaos) < float(min_fit_icaos))
+    )
+    strict_reference_fail = str(payload.get("go_diagnostic_last_update_epoch_reject_reason") or "") in {
+        "no_reference",
+        "stale_reference_position",
+    }
+    strict_residual_fail = str(payload.get("go_diagnostic_last_update_epoch_reject_reason") or "") in {
+        "hard_residual_reject",
+        "hard_residual_reject_holdover",
+    }
+    strict_unknown_fail = bool(strict_gate_pass is False) and not any((
+        strict_quality_fail,
+        strict_holdover_fail,
+        strict_period_agreement_fail,
+        strict_epoch_fail,
+        strict_support_fail,
+        strict_reference_fail,
+        strict_residual_fail,
+    ))
+    strict_primary_fail_reason = None
+    if strict_gate_pass is False:
+        if strict_quality_fail:
+            strict_primary_fail_reason = "strict_gate_failed_quality"
+        elif strict_holdover_fail:
+            strict_primary_fail_reason = "strict_gate_failed_holdover"
+        elif strict_period_agreement_fail:
+            strict_primary_fail_reason = "strict_gate_failed_period_agreement"
+        elif strict_epoch_fail:
+            strict_primary_fail_reason = "strict_gate_failed_strict_epoch"
+        elif strict_support_fail:
+            strict_primary_fail_reason = "strict_gate_failed_support"
+        elif strict_reference_fail:
+            strict_primary_fail_reason = "strict_gate_failed_reference"
+        elif strict_residual_fail:
+            strict_primary_fail_reason = "strict_gate_failed_residual"
+        else:
+            strict_primary_fail_reason = "strict_gate_failed_unknown"
+
+    sync_quality_value = payload.get("go_diagnostic_sync_quality", payload.get("sync_quality"))
+    sync_quality_threshold = go_payload.get("go_sync_usable_quality_threshold")
+    if sync_quality_threshold is None:
+        sync_quality_threshold = 0.3
+    quality_diagnostics_unavailable_reason = None
+    if quality_gate_fail_reason == "quality_below_threshold":
+        missing_quality_fields: list[str] = []
+        if sync_quality_value is None:
+            missing_quality_fields.append("sync_quality")
+        if str(payload.get("go_diagnostic_status_at_quality_eval") or "") == "":
+            missing_quality_fields.append("status_at_quality_eval")
+        if payload.get("go_diagnostic_has_base_period_at_quality_eval") is None:
+            missing_quality_fields.append("has_base_period_at_quality_eval")
+        if str(payload.get("go_diagnostic_quality_formula_path") or "") == "":
+            missing_quality_fields.append("quality_formula_path")
+        quality_eval_seq = payload.get("go_diagnostic_quality_eval_seq")
+        if not _is_finite_number(quality_eval_seq) or float(quality_eval_seq) <= 0.0:
+            missing_quality_fields.append("quality_eval_seq")
+        if missing_quality_fields:
+            quality_diagnostics_unavailable_reason = "missing:" + ",".join(missing_quality_fields)
+
     strict_thresholds = {
         # Existing threshold-like diagnostic hints exported by Go, not recomputed.
         "quality_ok_required": True,
@@ -734,17 +820,110 @@ def _build_go_promotion_failure_diagnostic_aliases(payload: dict, go_sync: dict 
         if strict_gate_fit_span_s is None:
             strict_gate_fit_span_s = 0.0
 
+    compact_period_s = _first_non_none(
+        payload.get("period_s"),
+        payload.get("go_diagnostic_base_period_s"),
+        go_payload.get("period_s"),
+    )
+    df_base_period_s = _first_non_none(
+        payload.get("go_diagnostic_base_period_s"),
+        payload.get("python_base_period_s"),
+        go_payload.get("base_period_s"),
+        go_payload.get("df_base_period_s"),
+    )
+    compact_period_agrees_with_df = _first_non_none(
+        payload.get("go_diagnostic_compact_period_agrees_with_df"),
+        payload.get("compact_period_agrees_with_df"),
+    )
+    compact_period_disagreement_s = _first_non_none(
+        payload.get("go_diagnostic_compact_period_disagreement_s"),
+        payload.get("compact_period_disagreement_s"),
+    )
+    compact_period_disagreement_ppm = _first_non_none(
+        payload.get("go_diagnostic_compact_period_disagreement_ppm"),
+        payload.get("compact_period_disagreement_ppm"),
+    )
+    compact_period_diagnostic_reason = _first_non_none(
+        payload.get("go_diagnostic_compact_period_diagnostic_reason"),
+        payload.get("compact_period_diagnostic_reason"),
+    )
+    if (
+        compact_period_agrees_with_df is None
+        and "compact_period_agrees_with_df" not in payload
+        and _is_finite_number(compact_period_s)
+        and _is_finite_number(df_base_period_s)
+    ):
+        denom = max(abs(float(compact_period_s)), abs(float(df_base_period_s)))
+        if denom > 0:
+            diff_s = float(compact_period_s) - float(df_base_period_s)
+            compact_period_disagreement_s = diff_s
+            compact_period_disagreement_ppm = diff_s / denom * 1e6
+            compact_period_agrees_with_df = abs(diff_s) / denom <= 0.01
+            if compact_period_diagnostic_reason in (None, "") and compact_period_agrees_with_df is False:
+                compact_period_diagnostic_reason = "compact_period_disagrees_with_df"
+
+    refined_effective_period_s = _first_non_none(
+        payload.get("go_diagnostic_effective_period_s"),
+        payload.get("effective_period_s"),
+        go_payload.get("effective_period_s"),
+    )
+    refined_effective_period_agrees_with_df = _first_non_none(
+        payload.get("go_diagnostic_period_agrees_with_df"),
+        go_payload.get("period_agrees_with_df"),
+        go_payload.get("go_sync_usable_period_agrees"),
+    )
+    refined_effective_period_disagreement_s = None
+    refined_effective_period_disagreement_ppm = None
+    if _is_finite_number(refined_effective_period_s) and _is_finite_number(df_base_period_s):
+        denom = max(abs(float(refined_effective_period_s)), abs(float(df_base_period_s)))
+        if denom > 0:
+            refined_effective_period_disagreement_s = float(refined_effective_period_s) - float(df_base_period_s)
+            refined_effective_period_disagreement_ppm = refined_effective_period_disagreement_s / denom * 1e6
+            if refined_effective_period_agrees_with_df is None:
+                refined_effective_period_agrees_with_df = abs(refined_effective_period_disagreement_s) / denom <= 0.01
+
+    strict_epoch_actual_n_aircraft = _first_non_none(
+        payload.get("go_diagnostic_last_update_epoch_n_aircraft"),
+        payload.get("last_update_epoch_n_aircraft"),
+    )
+    strict_epoch_actual_ref_age_s = _first_non_none(
+        payload.get("go_diagnostic_last_update_epoch_ref_pos_age_s"),
+        payload.get("last_update_epoch_ref_pos_age_s"),
+    )
+    strict_epoch_fail_reason = None
+    if strict_epoch_fail and strict_gate_pass is False:
+        if _is_finite_number(strict_epoch_actual_n_aircraft) and int(float(strict_epoch_actual_n_aircraft)) < 3:
+            strict_epoch_fail_reason = "insufficient_aircraft"
+        elif _is_finite_number(strict_epoch_actual_n_aircraft) and int(float(strict_epoch_actual_n_aircraft)) == 3:
+            if _is_finite_number(strict_epoch_actual_ref_age_s) and float(strict_epoch_actual_ref_age_s) > 2.0:
+                strict_epoch_fail_reason = "reference_position_stale_for_three_aircraft_case"
+            else:
+                strict_epoch_fail_reason = "strict_epoch_failed_with_three_aircraft"
+        elif _is_finite_number(strict_epoch_actual_n_aircraft) and int(float(strict_epoch_actual_n_aircraft)) >= 4:
+            strict_epoch_fail_reason = "strict_epoch_failed_despite_aircraft_count_threshold_met"
+        else:
+            strict_epoch_fail_reason = "strict_epoch_context_unavailable"
+
     return {
         # Strict gate diagnostics
         "strict_gate_pass": strict_gate_pass,
         "strict_gate_fail_reason": strict_gate_fail_reason,
+        "strict_gate_failed_quality": strict_quality_fail if strict_gate_pass is False else False,
+        "strict_gate_failed_holdover": strict_holdover_fail if strict_gate_pass is False else False,
+        "strict_gate_failed_period_agreement": strict_period_agreement_fail if strict_gate_pass is False else False,
+        "strict_gate_failed_strict_epoch": strict_epoch_fail if strict_gate_pass is False else False,
+        "strict_gate_failed_support": strict_support_fail if strict_gate_pass is False else False,
+        "strict_gate_failed_reference": strict_reference_fail if strict_gate_pass is False else False,
+        "strict_gate_failed_residual": strict_residual_fail if strict_gate_pass is False else False,
+        "strict_gate_failed_unknown": strict_unknown_fail if strict_gate_pass is False else False,
+        "strict_gate_primary_fail_reason": strict_primary_fail_reason,
         "strict_gate_thresholds_used": strict_thresholds,
         "strict_gate_residual_deg": strict_gate_residual_deg,
         "strict_gate_abs_residual_deg": strict_gate_abs_residual_deg,
         "strict_gate_ref_icao": ref_icao or None,
-        "strict_gate_ref_pos_age_s": payload.get("go_diagnostic_last_update_epoch_ref_pos_age_s") or payload.get("last_update_epoch_ref_pos_age_s"),
+        "strict_gate_ref_pos_age_s": strict_epoch_actual_ref_age_s,
         "strict_gate_ref_range_nm": go_payload.get("last_update_epoch_ref_range_nm"),
-        "strict_gate_n_aircraft": payload.get("go_diagnostic_last_update_epoch_n_aircraft") or payload.get("last_update_epoch_n_aircraft"),
+        "strict_gate_n_aircraft": strict_epoch_actual_n_aircraft,
         "strict_gate_fit_obs": strict_gate_fit_obs,
         "strict_gate_fit_icaos": strict_gate_fit_icaos,
         "strict_gate_fit_span_s": strict_gate_fit_span_s,
@@ -764,9 +943,27 @@ def _build_go_promotion_failure_diagnostic_aliases(payload: dict, go_sync: dict 
         "strict_gate_recent_hard_rejects": payload.get("go_diagnostic_consecutive_hard_residual_rejects"),
         "strict_gate_last_epoch_age_s": payload.get("go_diagnostic_sync_epoch_age_s") or payload.get("sync_epoch_age_s"),
         "strict_gate_last_update_outcome": payload.get("go_diagnostic_last_update_epoch_outcome") or payload.get("last_update_epoch_outcome"),
+        "last_update_epoch_n_aircraft": strict_epoch_actual_n_aircraft,
+        "last_update_epoch_ref_icao": _first_non_none(
+            payload.get("go_diagnostic_last_update_epoch_ref_icao"),
+            payload.get("last_update_epoch_ref_icao"),
+        ),
+        "last_update_epoch_ref_pos_age_s": strict_epoch_actual_ref_age_s,
+        "last_update_epoch_ref_range_nm": go_payload.get("last_update_epoch_ref_range_nm"),
+        "last_update_epoch_residual_deg": strict_gate_residual_deg,
+        "last_update_epoch_abs_residual_deg": strict_gate_abs_residual_deg,
+        "last_update_epoch_outcome": _first_non_none(
+            payload.get("go_diagnostic_last_update_epoch_outcome"),
+            payload.get("last_update_epoch_outcome"),
+        ),
+        "strict_epoch_required_min_aircraft": 4,
+        "strict_epoch_required_ref_age_s": 2.0,
+        "strict_epoch_actual_n_aircraft": strict_epoch_actual_n_aircraft,
+        "strict_epoch_actual_ref_age_s": strict_epoch_actual_ref_age_s,
+        "strict_epoch_fail_reason": strict_epoch_fail_reason,
         # Quality gate diagnostics
-        "sync_quality": payload.get("go_diagnostic_sync_quality", payload.get("sync_quality")),
-        "sync_quality_threshold": go_payload.get("go_sync_usable_quality_threshold"),
+        "sync_quality": sync_quality_value,
+        "sync_quality_threshold": sync_quality_threshold,
         "status_at_quality_eval": payload.get("go_diagnostic_status_at_quality_eval"),
         "exported_rotation_status": payload.get("go_diagnostic_exported_rotation_status"),
         "has_base_period_at_quality_eval": payload.get("go_diagnostic_has_base_period_at_quality_eval"),
@@ -777,6 +974,29 @@ def _build_go_promotion_failure_diagnostic_aliases(payload: dict, go_sync: dict 
         "quality_eval_seq": payload.get("go_diagnostic_quality_eval_seq"),
         "quality_eval_age_s": payload.get("go_diagnostic_quality_eval_age_s"),
         "quality_gate_fail_reason": quality_gate_fail_reason,
+        "quality_diagnostics_unavailable_reason": quality_diagnostics_unavailable_reason,
+        "quality_demoted_df_period_disagree": payload.get("go_diagnostic_quality_demoted_df_period_disagree"),
+        "quality_demoted_df_period_disagree_reason": payload.get("go_diagnostic_quality_demoted_df_period_disagree_reason"),
+        "quality_original_status": payload.get("go_diagnostic_quality_original_status"),
+        "quality_effective_status": payload.get("go_diagnostic_quality_effective_status"),
+        "quality_original_value": payload.get("go_diagnostic_quality_original_value"),
+        "quality_effective_value": payload.get("go_diagnostic_quality_effective_value"),
+        "compact_period_s": compact_period_s,
+        "df_base_period_s": df_base_period_s,
+        "compact_period_agrees_with_df": compact_period_agrees_with_df,
+        "compact_period_disagreement_s": compact_period_disagreement_s,
+        "compact_period_disagreement_ppm": compact_period_disagreement_ppm,
+        "compact_period_diagnostic_reason": compact_period_diagnostic_reason,
+        "refined_effective_period_s": refined_effective_period_s,
+        "refined_effective_period_agrees_with_df": refined_effective_period_agrees_with_df,
+        "refined_effective_period_disagreement_s": refined_effective_period_disagreement_s,
+        "refined_effective_period_disagreement_ppm": refined_effective_period_disagreement_ppm,
+        "period_reject_reason": _first_non_none(
+            payload.get("go_diagnostic_go_sync_usable_period_reject_reason"),
+            payload.get("go_diagnostic_reject_reason"),
+            payload.get("period_reject_reason"),
+            payload.get("go_sync_unusable_reason"),
+        ),
         # Reference / outlier diagnostics
         "strict_gate_reference_in_anchor_candidates": (
             bool(ref_icao) and str(ref_icao) in candidate_icaos
@@ -1571,11 +1791,6 @@ def _live_sync_state_to_dict(
                 mapped_gate = handoff_reason_to_gate.get(reason_key)
                 if mapped_gate:
                     go_blocking_gate = mapped_gate
-                elif phase_evidence_fresh is False:
-                    go_blocking_gate = "go_readiness.go_evidence_fresh"
-                    if not effective_handoff_reason or reason_is_unclassified_placeholder:
-                        effective_handoff_reason = "stale_go_evidence"
-                    go_blocking_reason = effective_handoff_reason
                 elif go_sync_unusable_reason or diag_go_sync_unusable_reason:
                     go_blocking_gate = "go_readiness.go_sync_state_usable"
                     if not effective_handoff_reason:
@@ -1646,6 +1861,11 @@ def _live_sync_state_to_dict(
                     # emitting unclassified placeholders.
                     go_blocking_gate = "go_readiness_hysteresis"
                     effective_handoff_reason = "go_ready_pending_hysteresis"
+                    go_blocking_reason = effective_handoff_reason
+                elif phase_evidence_fresh is False:
+                    go_blocking_gate = "go_readiness.go_evidence_fresh"
+                    if not effective_handoff_reason or reason_is_unclassified_placeholder:
+                        effective_handoff_reason = "stale_go_evidence"
                     go_blocking_reason = effective_handoff_reason
 
             if not go_blocking_gate:
@@ -4475,7 +4695,11 @@ class RadarState:
                 "go_sync_usable_strict_gate_pass": bool(entry.get("go_sync_usable_strict_gate_pass", False)),
                 "status_at_quality_eval": str(entry.get("status_at_quality_eval") or ""),
                 "exported_rotation_status": str(entry.get("exported_rotation_status") or ""),
-                "has_base_period_at_quality_eval": bool(entry.get("has_base_period_at_quality_eval", False)),
+                "has_base_period_at_quality_eval": (
+                    None
+                    if entry.get("has_base_period_at_quality_eval") is None
+                    else bool(entry.get("has_base_period_at_quality_eval"))
+                ),
                 "quality_formula_path": str(entry.get("quality_formula_path") or ""),
                 "quality_status_mismatch": bool(entry.get("quality_status_mismatch", False)),
                 "quality_expected_from_exported_status": (
@@ -4490,6 +4714,22 @@ class RadarState:
                 "quality_eval_age_s": (
                     float(entry["quality_eval_age_s"])
                     if entry.get("quality_eval_age_s") is not None else None
+                ),
+                "quality_demoted_df_period_disagree": (
+                    None
+                    if entry.get("quality_demoted_df_period_disagree") is None
+                    else bool(entry.get("quality_demoted_df_period_disagree"))
+                ),
+                "quality_demoted_df_period_disagree_reason": str(entry.get("quality_demoted_df_period_disagree_reason") or ""),
+                "quality_original_status": str(entry.get("quality_original_status") or ""),
+                "quality_effective_status": str(entry.get("quality_effective_status") or ""),
+                "quality_original_value": (
+                    float(entry["quality_original_value"])
+                    if entry.get("quality_original_value") is not None else None
+                ),
+                "quality_effective_value": (
+                    float(entry["quality_effective_value"])
+                    if entry.get("quality_effective_value") is not None else None
                 ),
             }
         except Exception:
@@ -6098,6 +6338,21 @@ class RadarState:
                 "go_sync_usable_period_agrees": iid_state.get("gsup"),
                 "go_sync_usable_period_reject_reason": iid_state.get("gsupr"),
                 "go_sync_usable_strict_gate_pass": iid_state.get("gsus"),
+                "status_at_quality_eval": iid_state.get("qst"),
+                "exported_rotation_status": iid_state.get("qrs"),
+                "has_base_period_at_quality_eval": iid_state.get("qbp"),
+                "quality_formula_path": iid_state.get("qfp"),
+                "quality_status_mismatch": iid_state.get("qsm"),
+                "quality_expected_from_exported_status": iid_state.get("qex"),
+                "go_diagnostic_sync_quality": iid_state.get("qdq"),
+                "quality_eval_seq": iid_state.get("qev"),
+                "quality_eval_age_s": iid_state.get("qea"),
+                "quality_demoted_df_period_disagree": iid_state.get("qdd"),
+                "quality_demoted_df_period_disagree_reason": iid_state.get("qdr"),
+                "quality_original_status": iid_state.get("qos"),
+                "quality_effective_status": iid_state.get("qes"),
+                "quality_original_value": iid_state.get("qov"),
+                "quality_effective_value": iid_state.get("qef"),
             })
             if go_sync is not None:
                 self._go_sync_states_by_iid[iid] = go_sync
@@ -10209,10 +10464,6 @@ class RadarState:
                         go_blocking_gate = "go_readiness.go_refinement_history_sufficient"
                         if not handoff_reason:
                             handoff_reason = "go_refinement_history_insufficient"
-                    elif phase_evidence_fresh is False:
-                        go_blocking_gate = "go_readiness.go_evidence_fresh"
-                        if not handoff_reason:
-                            handoff_reason = "stale_go_evidence"
                 if not go_blocking_gate:
                     ready_like = (
                         refinement_status == "stable"
@@ -10224,6 +10475,10 @@ class RadarState:
                     if ready_like:
                         go_blocking_gate = "go_readiness_hysteresis"
                         handoff_reason = handoff_reason or "go_ready_pending_hysteresis"
+                if not go_blocking_gate and phase_evidence_fresh is False:
+                    go_blocking_gate = "go_readiness.go_evidence_fresh"
+                    if not handoff_reason:
+                        handoff_reason = "stale_go_evidence"
                 if not go_blocking_gate:
                     go_blocking_gate = "go_readiness.unclassified_state"
                     handoff_reason = handoff_reason or "go_state_unclassified"
@@ -10264,6 +10519,12 @@ class RadarState:
                     "go_diagnostic_quality_expected_from_exported_status": go_sync.get("quality_expected_from_exported_status"),
                     "go_diagnostic_quality_eval_seq": go_sync.get("quality_eval_seq"),
                     "go_diagnostic_quality_eval_age_s": go_sync.get("quality_eval_age_s"),
+                    "go_diagnostic_quality_demoted_df_period_disagree": go_sync.get("quality_demoted_df_period_disagree"),
+                    "go_diagnostic_quality_demoted_df_period_disagree_reason": go_sync.get("quality_demoted_df_period_disagree_reason"),
+                    "go_diagnostic_quality_original_status": go_sync.get("quality_original_status"),
+                    "go_diagnostic_quality_effective_status": go_sync.get("quality_effective_status"),
+                    "go_diagnostic_quality_original_value": go_sync.get("quality_original_value"),
+                    "go_diagnostic_quality_effective_value": go_sync.get("quality_effective_value"),
                     "go_diagnostic_fit_observation_count": go_sync.get("fit_observation_count"),
                     "go_diagnostic_fit_icao_count": go_sync.get("fit_icao_count"),
                     "go_diagnostic_fit_span_s": go_sync.get("fit_span_s"),

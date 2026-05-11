@@ -309,7 +309,7 @@ def test_get_iid_data_path_diagnostics_endpoint_reports_compact_counters():
 
 def test_sync_state_exposes_phase_status_alias_without_removing_legacy_value():
     state = RadarState()
-    now_ts = 1_000.0
+    now_ts = time.time()
     state._iid_latest_arrival_us[99] = 4_100_000.0
     state._live_sync_states[99] = LiveSyncState(
         iid=99,

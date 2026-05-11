@@ -683,6 +683,242 @@ func TestReinforceReportsDFPeriodDisagreementStatus(t *testing.T) {
 	}
 }
 
+func TestDFPeriodDisagreeWithRefinedAgreementDoesNotForceZeroQuality(t *testing.T) {
+	s := NewIIDState(151)
+	dfBasePeriod := 4.79
+	compactPeriod := 2.01
+	s.SetBasePeriod(dfBasePeriod)
+	reinforce(s, &RotationModel{
+		DominantPeriodS:    &compactPeriod,
+		Status:             "SINGLE_RADAR",
+		PrimaryDirectCount: 6,
+	})
+	if s.Status != "DF_PERIOD_DISAGREE" {
+		t.Fatalf("status=%q, want DF_PERIOD_DISAGREE", s.Status)
+	}
+	if !s.PeriodAgreesWithDF {
+		t.Fatal("expected refined operational period agreement")
+	}
+	s.UpdateSyncEpoch(0.0, 0.0, 4, 0.5)
+	if s.Sync == nil {
+		t.Fatal("expected sync state")
+	}
+	if s.Sync.SyncQuality <= 0.0 {
+		t.Fatalf("sync quality=%.6f, want non-zero for DF_PERIOD_DISAGREE with refined agreement", s.Sync.SyncQuality)
+	}
+	if !s.Sync.QualityDemotedDFPeriodDisagree {
+		t.Fatal("expected quality demotion diagnostic flag")
+	}
+	if s.Sync.QualityOriginalStatusAtEval != "DF_PERIOD_DISAGREE" {
+		t.Fatalf("original quality status=%q", s.Sync.QualityOriginalStatusAtEval)
+	}
+	if s.Sync.QualityEffectiveStatusAtEval == "DF_PERIOD_DISAGREE" {
+		t.Fatalf("effective quality status should be demoted, got %q", s.Sync.QualityEffectiveStatusAtEval)
+	}
+}
+
+func TestDFPeriodDisagreeWithRefinedDisagreementRemainsBlocking(t *testing.T) {
+	s := NewIIDState(152)
+	dfBasePeriod := 4.79
+	s.SetBasePeriod(dfBasePeriod)
+	s.RefICAO = new(uint32)
+	*s.RefICAO = 0xAAAAAA
+	s.Sync = NewSyncState(s.IID, dfBasePeriod, 0.0, 0.0, 1.0)
+	s.Sync.BasePeriodS = dfBasePeriod
+	s.Sync.PeriodDeltaS = dfBasePeriod * 0.02
+	s.Sync.EffectivePeriodS = s.Sync.BasePeriodS + s.Sync.PeriodDeltaS
+	compactPeriod := 2.01
+	reinforce(s, &RotationModel{
+		DominantPeriodS:    &compactPeriod,
+		Status:             "SINGLE_RADAR",
+		PrimaryDirectCount: 6,
+	})
+	s.SetBasePeriod(dfBasePeriod)
+	if s.PeriodAgreesWithDF {
+		t.Fatal("expected refined effective disagreement")
+	}
+	s.UpdateSyncEpoch(0.0, 0.0, 4, 0.5)
+	if s.Sync == nil {
+		t.Fatal("expected sync state")
+	}
+	if s.Sync.SyncQuality != 0.0 {
+		t.Fatalf("sync quality=%.6f, want 0.0 when refined effective disagrees", s.Sync.SyncQuality)
+	}
+	if s.Sync.QualityDemotedDFPeriodDisagree {
+		t.Fatal("demotion must not apply when refined effective disagrees")
+	}
+}
+
+func TestDFPeriodDisagreeDemotionSyncQualityPropagatesThroughUpdateEpoch(t *testing.T) {
+	s := NewIIDState(153)
+	dfBasePeriod := 4.0
+	compactPeriod := 2.0
+	s.SetBasePeriod(dfBasePeriod)
+	s.RefICAO = new(uint32)
+	*s.RefICAO = 0xAAAAAA
+
+	// First give the IID a valid status via reinforce so bootstrap gets non-zero quality.
+	reinforce(s, &RotationModel{
+		DominantPeriodS:    &dfBasePeriod,
+		Status:             "SINGLE_RADAR",
+		PrimaryDirectCount: 6,
+	})
+	// Bootstrap sync state so the next call enters the non-bootstrap path.
+	s.UpdateSyncEpoch(0.0, 0.0, 4, 0.5)
+	if s.Sync == nil {
+		t.Fatal("expected sync state after bootstrap")
+	}
+	if s.Sync.SyncQuality <= 0.0 {
+		t.Fatalf("bootstrap quality=%.6f, expected non-zero", s.Sync.SyncQuality)
+	}
+
+	// Now set up DF_PERIOD_DISAGREE with refined agreement.
+	// The compact period differs from DF but refined effective == DF base.
+	reinforce(s, &RotationModel{
+		DominantPeriodS:    &compactPeriod,
+		Status:             "SINGLE_RADAR",
+		PrimaryDirectCount: 6,
+	})
+	if s.Status != "DF_PERIOD_DISAGREE" {
+		t.Fatalf("status=%q, want DF_PERIOD_DISAGREE", s.Status)
+	}
+	if !s.PeriodAgreesWithDF {
+		t.Fatal("expected refined operational period agreement")
+	}
+
+	// Trigger the non-bootstrap UpdateSyncEpoch path with an epoch aligned
+	// to the 4.0s period so the residual is near zero and the epoch is
+	// accepted. This is the critical path: UpdateEpoch overwrites SyncQuality
+	// on accepted epochs (sync.go:911).
+	s.UpdateSyncEpoch(4_000_000.0, 0.0, 4, 0.5)
+
+	if s.Sync.SyncQuality <= 0.0 {
+		t.Fatalf("sync quality=%.6f, want non-zero after demotion propagation through UpdateEpoch", s.Sync.SyncQuality)
+	}
+	if !s.Sync.QualityDemotedDFPeriodDisagree {
+		t.Fatal("expected quality demotion diagnostic flag")
+	}
+	if s.Sync.QualityOriginalStatusAtEval != "DF_PERIOD_DISAGREE" {
+		t.Fatalf("original quality status=%q, want DF_PERIOD_DISAGREE", s.Sync.QualityOriginalStatusAtEval)
+	}
+	if s.Sync.QualityEffectiveStatusAtEval == "DF_PERIOD_DISAGREE" {
+		t.Fatalf("effective quality status should be demoted, got %q", s.Sync.QualityEffectiveStatusAtEval)
+	}
+	if s.Sync.QualityOriginalValueAtEval >= 0.1 {
+		t.Fatalf("original quality value=%.6f, want 0.0", s.Sync.QualityOriginalValueAtEval)
+	}
+	if s.Sync.QualityEffectiveValueAtEval <= 0.9 {
+		t.Fatalf("effective quality value=%.6f, want 1.0", s.Sync.QualityEffectiveValueAtEval)
+	}
+	// SyncQuality must be the effective value, not the original zero.
+	if s.Sync.SyncQuality != s.Sync.QualityEffectiveValueAtEval {
+		t.Fatalf("sync quality=%.6f, effective quality value=%.6f; must match",
+			s.Sync.SyncQuality, s.Sync.QualityEffectiveValueAtEval)
+	}
+}
+
+func TestDFPeriodDisagreeDemotionSyncQualityEqualsEffectiveValue(t *testing.T) {
+	s := NewIIDState(154)
+	dfBasePeriod := 4.0
+	compactPeriod := 2.0
+	s.SetBasePeriod(dfBasePeriod)
+	s.RefICAO = new(uint32)
+	*s.RefICAO = 0xAAAAAA
+	// Give IID a valid status before bootstrap.
+	reinforce(s, &RotationModel{
+		DominantPeriodS:    &dfBasePeriod,
+		Status:             "SINGLE_RADAR",
+		PrimaryDirectCount: 6,
+	})
+	// Bootstrap sync state with SINGLE_RADAR quality.
+	s.UpdateSyncEpoch(0.0, 0.0, 4, 0.5)
+	if s.Sync == nil {
+		t.Fatal("expected sync state after bootstrap")
+	}
+	// Apply DF_PERIOD_DISAGREE with refined agreement.
+	reinforce(s, &RotationModel{
+		DominantPeriodS:    &compactPeriod,
+		Status:             "SINGLE_RADAR",
+		PrimaryDirectCount: 6,
+	})
+	if s.Status != "DF_PERIOD_DISAGREE" {
+		t.Fatalf("status=%q, want DF_PERIOD_DISAGREE", s.Status)
+	}
+	if !s.PeriodAgreesWithDF {
+		t.Fatal("expected refined operational period agreement")
+	}
+	// First acceptance triggers demotion.
+	s.UpdateSyncEpoch(4_000_000.0, 0.0, 4, 0.5)
+	firstQuality := s.Sync.SyncQuality
+	firstEffective := s.Sync.QualityEffectiveValueAtEval
+	if firstQuality != firstEffective {
+		t.Fatalf("first call: sync_quality=%.6f, effective=%.6f; must match", firstQuality, firstEffective)
+	}
+	// Second acceptance must preserve effective quality as well.
+	s.UpdateSyncEpoch(8_000_000.0, 0.0, 4, 0.5)
+	secondQuality := s.Sync.SyncQuality
+	secondEffective := s.Sync.QualityEffectiveValueAtEval
+	if secondQuality != secondEffective {
+		t.Fatalf("second call: sync_quality=%.6f, effective=%.6f; must match", secondQuality, secondEffective)
+	}
+	if secondQuality <= 0.0 {
+		t.Fatalf("second call quality=%.6f, want non-zero", secondQuality)
+	}
+}
+
+func TestDFPeriodDisagreeDemotionSyncUsableDiagnostics(t *testing.T) {
+	s := NewIIDState(155)
+	dfBasePeriod := 4.0
+	compactPeriod := 2.0
+	s.SetBasePeriod(dfBasePeriod)
+	s.RefICAO = new(uint32)
+	*s.RefICAO = 0xAAAAAA
+	// Give IID a valid status before bootstrap.
+	reinforce(s, &RotationModel{
+		DominantPeriodS:    &dfBasePeriod,
+		Status:             "SINGLE_RADAR",
+		PrimaryDirectCount: 6,
+	})
+	// Bootstrap sync state.
+	s.UpdateSyncEpoch(0.0, 0.0, 4, 0.5)
+	if s.Sync == nil {
+		t.Fatal("expected sync state after bootstrap")
+	}
+	// Apply DF_PERIOD_DISAGREE with refined agreement.
+	reinforce(s, &RotationModel{
+		DominantPeriodS:    &compactPeriod,
+		Status:             "SINGLE_RADAR",
+		PrimaryDirectCount: 6,
+	})
+	if s.Status != "DF_PERIOD_DISAGREE" {
+		t.Fatalf("status=%q, want DF_PERIOD_DISAGREE", s.Status)
+	}
+	if !s.PeriodAgreesWithDF {
+		t.Fatal("expected refined operational period agreement")
+	}
+	// Trigger UpdateEpoch with demotion. Use an epoch aligned with the 4.0s
+	// period so the predicted phase matches the observed offset.
+	s.UpdateSyncEpoch(4_000_000.0, 0.0, 4, 0.5)
+	// Use SyncProtocolSnapshot to trigger refreshSyncUsableDiagnosticsLocked.
+	present, usable, _, _, _, _, _, _, _, _, _ := s.SyncProtocolSnapshot()
+	if !present {
+		t.Fatal("expected sync state present")
+	}
+	if !usable {
+		reason := s.DebugStateSnapshot().GoSyncUnusableReason
+		t.Fatalf("expected usable, got unusable reason=%q", reason)
+	}
+	// Verify SyncUsableQualityOK is computed from effective quality.
+	refreshDiagnostics := s.DebugStateSnapshot()
+	if !refreshDiagnostics.GoSyncUsableQualityOK {
+		t.Fatalf("sync usable quality ok=false, effective quality=%.6f",
+			s.Sync.QualityEffectiveValueAtEval)
+	}
+	if refreshDiagnostics.GoSyncUnusableReason == "quality_below_threshold" {
+		t.Fatal("unusable reason must NOT be quality_below_threshold when effective quality passes threshold")
+	}
+}
+
 func TestAddBurst_UsesDensityAwareCap(t *testing.T) {
 	s := NewIIDState(11)
 

@@ -55,3 +55,19 @@
 - Corrected methodology now reports raw payload inspection and serializer replay separately, and excludes `sync_state: null` rows from Stage 10 attribution metrics.
 - Replay of provided capture (`...live_r3...`) over `sync_state`-present rows: raw contained 54 `go_state_unclassified`/`go_readiness.unclassified_state`; serializer replay with patched code emitted 0 of each and 0 non-active null blocker.
 - Fresh 3-minute multi-IID capture (`sync_capture_multi_iids_stage10_attr_postfix_live_20260510T210447Z.ndjson`) collected 513/513 `sync_state`-present rows. Raw backend output still had 58 unclassified rows (backend process had not yet reloaded patched code); serializer replay over those exact rows emitted 0 unclassified and 0 non-active null blocker.
+
+## 2026-05-11 Compact Sync Snapshot Quality Diagnostics Propagation
+
+- [x] Run impact analysis for touched symbols and classify break location across Go state, protocol transport, backend mapping, and compact snapshot serializers.
+- [x] Patch propagation only (no logic changes): ensure quality-eval diagnostics and strict-gate subreason diagnostics are transported from Go IID_STATE into backend compact snapshot diagnostics.
+- [x] Add explicit `quality_diagnostics_unavailable_reason` when quality-below-threshold diagnostics are absent.
+- [x] Add/adjust strict-gate primary subreason export without changing strict gate behavior.
+- [x] Add regression tests for mapping, compact snapshot exposure, unavailable-reason fallback, and strict-gate subreason presence.
+- [~] Run targeted backend and radar-core tests proving no behavior/promotion-policy changes.
+- [ ] Re-run compact validation capture (20-IID style, 5 minutes) and report requested breakdown metrics.
+
+### Review
+- Root cause confirmed: IID_STATE protocol transport omitted quality-eval diagnostic fields; backend IID_STATE mapping therefore could not populate compact snapshot quality diagnostics.
+- Added transport + mapping for quality-eval fields, explicit quality diagnostics unavailable-reason fallback, and strict gate primary/subreason diagnostics (diagnostic-only).
+- Targeted backend tests passed; full radar-core Go test run could not complete in this sandbox due toolchain/cache environment constraints.
+- Live 5-minute capture could not be run because no backend process was reachable on `127.0.0.1:8000` in this sandbox session.

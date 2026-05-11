@@ -200,6 +200,12 @@ type SyncState struct {
 	QualityFormulaPath                            string
 	QualityStatusMismatch                         bool
 	QualityExpectedFromExportedStatus             float64
+	QualityOriginalStatusAtEval                   string
+	QualityEffectiveStatusAtEval                  string
+	QualityOriginalValueAtEval                    float64
+	QualityEffectiveValueAtEval                   float64
+	QualityDemotedDFPeriodDisagree                bool
+	QualityDemotedDFPeriodDisagreeReason          string
 }
 
 const (

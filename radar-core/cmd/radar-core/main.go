@@ -792,6 +792,12 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 			"go_diagnostic_sync_quality":                        snap.GoDiagnosticSyncQuality,
 			"quality_eval_seq":                                  snap.GoDiagnosticQualityEvalSeq,
 			"quality_eval_age_s":                                snap.GoDiagnosticQualityEvalAgeS,
+			"quality_demoted_df_period_disagree":                snap.GoDiagnosticQualityDemotedDFPeriodDisagree,
+			"quality_demoted_df_period_disagree_reason":         snap.GoDiagnosticQualityDemotedReason,
+			"quality_original_status":                           snap.GoDiagnosticQualityOriginalStatus,
+			"quality_effective_status":                          snap.GoDiagnosticQualityEffectiveStatus,
+			"quality_original_value":                            snap.GoDiagnosticQualityOriginalValue,
+			"quality_effective_value":                           snap.GoDiagnosticQualityEffectiveValue,
 			"go_sync_usable_reacquired_provisional":             snap.ReacquiredProvisional,
 			"go_sync_usable_fit_obs":                            snap.FitObservationCount,
 			"go_sync_usable_fit_icaos":                          snap.FitICAOCount,
@@ -1188,6 +1194,21 @@ func (e *engine) emitIIDState(iidNum uint8, s *iid.IIDState, nBurstRecords uint1
 		GoSyncUsablePeriodAgrees:                 snapGoSyncUsablePeriodAgrees(s),
 		GoSyncUsablePeriodRejectReason:           snapGoSyncUsablePeriodRejectReason(s),
 		GoSyncUsableStrictGatePass:               snapGoSyncUsableStrictGatePass(s),
+		QualityStatusAtEval:                      snapQualityStatusAtEval(s),
+		ExportedRotationStatusAtQualityEval:      snapExportedRotationStatusAtQualityEval(s),
+		HasBasePeriodAtQualityEval:               snapHasBasePeriodAtQualityEval(s),
+		QualityFormulaPath:                       snapQualityFormulaPath(s),
+		QualityStatusMismatch:                    snapQualityStatusMismatch(s),
+		QualityExpectedFromExportedStatus:        snapQualityExpectedFromExportedStatus(s),
+		GoDiagnosticSyncQuality:                  snapGoDiagnosticSyncQuality(s),
+		QualityEvalSeq:                           snapQualityEvalSeq(s),
+		QualityEvalAgeS:                          snapQualityEvalAgeS(s),
+		QualityDemotedDFPeriodDisagree:           snapQualityDemotedDFPeriodDisagree(s),
+		QualityDemotedDFPeriodDisagreeReason:     snapQualityDemotedDFPeriodDisagreeReason(s),
+		QualityOriginalStatus:                    snapQualityOriginalStatus(s),
+		QualityEffectiveStatus:                   snapQualityEffectiveStatus(s),
+		QualityOriginalValue:                     snapQualityOriginalValue(s),
+		QualityEffectiveValue:                    snapQualityEffectiveValue(s),
 		NBurstRecords:                            nBurstRecords,
 		LastUpdated:                              float64(time.Now().UnixMicro()) / 1e6,
 		Revision:                                 rev,
@@ -1744,6 +1765,75 @@ func snapGoSyncUsablePeriodRejectReason(s *iid.IIDState) string {
 
 func snapGoSyncUsableStrictGatePass(s *iid.IIDState) bool {
 	return s.DebugStateSnapshot().GoSyncUsableStrictGatePass
+}
+
+func snapQualityStatusAtEval(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().GoDiagnosticStatusAtQualityEval
+}
+
+func snapExportedRotationStatusAtQualityEval(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().GoDiagnosticExportedRotationStatus
+}
+
+func snapHasBasePeriodAtQualityEval(s *iid.IIDState) bool {
+	return s.DebugStateSnapshot().GoDiagnosticHasBasePeriodAtQualityEval
+}
+
+func snapQualityFormulaPath(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().GoDiagnosticQualityFormulaPath
+}
+
+func snapQualityStatusMismatch(s *iid.IIDState) bool {
+	return s.DebugStateSnapshot().GoDiagnosticQualityStatusMismatch
+}
+
+func snapQualityExpectedFromExportedStatus(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().GoDiagnosticQualityExpectedFromExportedStatus
+	return &v
+}
+
+func snapGoDiagnosticSyncQuality(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().GoDiagnosticSyncQuality
+	return &v
+}
+
+func snapQualityEvalSeq(s *iid.IIDState) uint32 {
+	v := s.DebugStateSnapshot().GoDiagnosticQualityEvalSeq
+	if v > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(v)
+}
+
+func snapQualityEvalAgeS(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().GoDiagnosticQualityEvalAgeS
+	return &v
+}
+
+func snapQualityDemotedDFPeriodDisagree(s *iid.IIDState) bool {
+	return s.DebugStateSnapshot().GoDiagnosticQualityDemotedDFPeriodDisagree
+}
+
+func snapQualityDemotedDFPeriodDisagreeReason(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().GoDiagnosticQualityDemotedReason
+}
+
+func snapQualityOriginalStatus(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().GoDiagnosticQualityOriginalStatus
+}
+
+func snapQualityEffectiveStatus(s *iid.IIDState) string {
+	return s.DebugStateSnapshot().GoDiagnosticQualityEffectiveStatus
+}
+
+func snapQualityOriginalValue(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().GoDiagnosticQualityOriginalValue
+	return &v
+}
+
+func snapQualityEffectiveValue(s *iid.IIDState) *float64 {
+	v := s.DebugStateSnapshot().GoDiagnosticQualityEffectiveValue
+	return &v
 }
 
 func (e *engine) runFMWorker(stop <-chan struct{}) {

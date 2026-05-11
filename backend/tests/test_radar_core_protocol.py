@@ -213,11 +213,32 @@ class TestIIDStateDecode:
             "i": 3, "p": 4.008, "rpm": 14.97,
             "st": "SINGLE_RADAR", "rc": 0xDEAD01,
             "sq": 0.95, "nb": 212,
+            "qst": "SINGLE_RADAR",
+            "qrs": "SINGLE_RADAR",
+            "qbp": True,
+            "qfp": "syncQuality(status,has_base_period)",
+            "qsm": False,
+            "qex": 1.0,
+            "qdq": 0.2,
+            "qev": 9,
+            "qea": 0.5,
+            "qdd": True,
+            "qdr": "df_period_disagree_compact_only_refined_agrees_with_df",
+            "qos": "DF_PERIOD_DISAGREE",
+            "qes": "SINGLE_RADAR",
+            "qov": 0.0,
+            "qef": 1.0,
             "lu": 1714000100.0, "rv": 7,
         })
         assert d["st"] == "SINGLE_RADAR"
         assert d["rv"] == 7
         assert d["p"] == pytest.approx(4.008)
+        assert d["qst"] == "SINGLE_RADAR"
+        assert d["qfp"] == "syncQuality(status,has_base_period)"
+        assert d["qdq"] == pytest.approx(0.2)
+        assert d["qdd"] is True
+        assert d["qos"] == "DF_PERIOD_DISAGREE"
+        assert d["qes"] == "SINGLE_RADAR"
 
     def test_nil_fields(self):
         d = _make_outbound({

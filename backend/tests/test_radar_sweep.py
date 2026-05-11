@@ -1740,6 +1740,17 @@ def test_go_sync_snapshot_without_live_sync_state_serializes_nonactive_go_blocke
         "phase_blocking_gate": "phase_basis_supported",
         "phase_blocking_reason": "phase_basis_not_supported",
         "period_refinement_status": "stable",
+        "go_sync_usable_strict_gate_pass": False,
+        "last_update_epoch_n_aircraft": 0,
+        "last_update_epoch_ref_pos_age_s": 0.0,
+        "last_update_epoch_ref_icao": "",
+        "last_update_epoch_residual_deg": 0.0,
+        "last_update_epoch_outcome": "",
+        "fit_observation_count": 0,
+        "fit_icao_count": 0,
+        "fit_span_s": 0.0,
+        "reacquire_support_obs_count": 0,
+        "reacquire_support_icao_count": 0,
     }
     snapshot = state.get_live_sync_snapshot(71, window_s=90.0, debug_limit=20)
     sync_state = snapshot["sync_state"]
@@ -1756,6 +1767,18 @@ def test_go_sync_snapshot_without_live_sync_state_serializes_nonactive_go_blocke
     assert sync_state["strict_gate_fit_icaos"] == 0
     assert sync_state["strict_gate_fit_span_s"] in {None, 0.0}
     assert sync_state["strict_gate_thresholds_used"]["strict_gate_pass_required"] is True
+    assert sync_state["strict_gate_primary_fail_reason"] in {
+        "strict_gate_failed_strict_epoch",
+        "strict_gate_failed_unknown",
+    }
+    assert sync_state["strict_epoch_required_min_aircraft"] == 4
+    assert sync_state["strict_epoch_required_ref_age_s"] == pytest.approx(2.0)
+    assert sync_state["strict_epoch_actual_n_aircraft"] == 0
+    assert sync_state["strict_epoch_actual_ref_age_s"] == pytest.approx(0.0)
+    assert sync_state["last_update_epoch_n_aircraft"] == 0
+    assert sync_state["last_update_epoch_ref_pos_age_s"] == pytest.approx(0.0)
+    assert sync_state["last_update_epoch_residual_deg"] == pytest.approx(0.0)
+    assert sync_state["last_update_epoch_abs_residual_deg"] == pytest.approx(0.0)
 
 
 def test_go_sync_snapshot_quality_below_threshold_exports_quality_components(monkeypatch):
@@ -1776,6 +1799,10 @@ def test_go_sync_snapshot_quality_below_threshold_exports_quality_components(mon
         "quality_eval_seq": 9,
         "quality_eval_age_s": 0.5,
         "go_sync_usable_quality_ok": False,
+        "base_period_s": 4.0,
+        "effective_period_s": 4.0,
+        "period_s": 4.0,
+        "go_sync_usable_period_agrees": True,
     }
     snapshot = state.get_live_sync_snapshot(171, window_s=90.0, debug_limit=20)
     sync_state = snapshot["sync_state"]
@@ -1793,6 +1820,95 @@ def test_go_sync_snapshot_quality_below_threshold_exports_quality_components(mon
     assert sync_state["sync_quality"] == pytest.approx(0.2)
     assert sync_state["quality_eval_seq"] == 9
     assert sync_state["quality_eval_age_s"] == pytest.approx(0.5)
+    assert sync_state["quality_diagnostics_unavailable_reason"] is None
+    assert sync_state["compact_period_s"] == pytest.approx(4.0)
+    assert sync_state["df_base_period_s"] == pytest.approx(4.0)
+    assert sync_state["compact_period_agrees_with_df"] is True
+    assert sync_state["refined_effective_period_s"] == pytest.approx(4.0)
+    assert sync_state["refined_effective_period_agrees_with_df"] is True
+
+
+def test_go_sync_snapshot_quality_below_threshold_without_eval_fields_sets_unavailable_reason(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    state._go_sync_states_by_iid[172] = {
+        "source": "go_frame_sync",
+        "go_sync_unusable_reason": "quality_below_threshold",
+        "go_diagnostic_sync_quality": None,
+    }
+    snapshot = state.get_live_sync_snapshot(172, window_s=90.0, debug_limit=20)
+    sync_state = snapshot["sync_state"]
+    assert sync_state is not None
+    assert sync_state["quality_gate_fail_reason"] == "quality_below_threshold"
+    assert isinstance(sync_state["quality_diagnostics_unavailable_reason"], str)
+    assert sync_state["quality_diagnostics_unavailable_reason"] != ""
+
+
+def test_df_period_disagree_exports_compact_and_refined_period_diagnostics(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    state._go_sync_states_by_iid[173] = {
+        "source": "go_frame_sync",
+        "go_sync_unusable_reason": "quality_below_threshold",
+        "status_at_quality_eval": "DF_PERIOD_DISAGREE",
+        "has_base_period_at_quality_eval": True,
+        "quality_formula_path": "syncQuality(status,has_base_period)",
+        "go_diagnostic_sync_quality": 0.0,
+        "quality_eval_seq": 3,
+        "base_period_s": 4.0,
+        "effective_period_s": 4.0,
+        "period_s": 2.0,
+        "go_sync_usable_period_agrees": True,
+        "go_sync_usable_period_reject_reason": "",
+    }
+    snapshot = state.get_live_sync_snapshot(173, window_s=90.0, debug_limit=20)
+    sync_state = snapshot["sync_state"]
+    assert sync_state is not None
+    assert sync_state["status_at_quality_eval"] == "DF_PERIOD_DISAGREE"
+    assert sync_state["compact_period_s"] == pytest.approx(2.0)
+    assert sync_state["df_base_period_s"] == pytest.approx(4.0)
+    assert sync_state["compact_period_agrees_with_df"] is False
+    assert sync_state["compact_period_disagreement_s"] == pytest.approx(-2.0)
+    assert sync_state["compact_period_diagnostic_reason"] == "compact_period_disagrees_with_df"
+    assert sync_state["refined_effective_period_s"] == pytest.approx(4.0)
+    assert sync_state["refined_effective_period_agrees_with_df"] is True
+    assert sync_state["refined_effective_period_disagreement_s"] == pytest.approx(0.0)
+
+
+def test_df_period_disagree_demoted_quality_does_not_emit_quality_below_threshold_reason(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    state._go_sync_states_by_iid[174] = {
+        "source": "go_frame_sync",
+        "go_sync_unusable_reason": "",
+        "status_at_quality_eval": "DF_PERIOD_DISAGREE",
+        "has_base_period_at_quality_eval": True,
+        "quality_formula_path": "syncQuality(effective_status,has_base_period)",
+        "quality_demoted_df_period_disagree": True,
+        "quality_demoted_df_period_disagree_reason": "df_period_disagree_compact_only_refined_agrees_with_df",
+        "quality_original_status": "DF_PERIOD_DISAGREE",
+        "quality_effective_status": "SINGLE_RADAR",
+        "quality_original_value": 0.0,
+        "quality_effective_value": 1.0,
+        "go_diagnostic_sync_quality": 1.0,
+        "quality_eval_seq": 4,
+        "base_period_s": 4.0,
+        "effective_period_s": 4.0,
+        "period_s": 4.0,
+        "go_sync_usable_period_agrees": True,
+    }
+    snapshot = state.get_live_sync_snapshot(174, window_s=90.0, debug_limit=20)
+    sync_state = snapshot["sync_state"]
+    assert sync_state is not None
+    assert sync_state["quality_gate_fail_reason"] is None
+    assert sync_state["quality_demoted_df_period_disagree"] is True
+    assert sync_state["quality_original_status"] == "DF_PERIOD_DISAGREE"
+    assert sync_state["quality_effective_status"] == "SINGLE_RADAR"
+    assert sync_state["quality_original_value"] == pytest.approx(0.0)
+    assert sync_state["quality_effective_value"] == pytest.approx(1.0)
 
 
 def test_go_sync_snapshot_without_live_sync_state_ready_like_maps_to_hysteresis(monkeypatch):
@@ -3817,11 +3933,13 @@ def test_go_handoff_rejects_period_disagreement():
     assert payload["sync_authority"] != "go_runtime"
 
 
-def test_go_handoff_allows_period_authority_when_gates_pass():
+def test_go_handoff_allows_period_authority_when_gates_pass(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
     state = _make_state_with_stable_history(33)
     state.update_go_iid_state({
         "i": 33, "sp": True, "su": True, "sps": 4.0, "sep": 1000.0, "sod": 10.0,
-        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1, "bps": 4.0, "eps": 4.0, "pag": True,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": time.time(), "rv": 1, "bps": 4.0, "eps": 4.0, "pag": True,
     })
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(33))
     # With RADAR_SYNC_GO_REFINER_OPERATIONAL=False (default), Go remains diagnostic.
@@ -4716,7 +4834,7 @@ def test_go_quality_eval_diagnostics_fields_are_mapped():
 def _go_sync_for_gates(iid=100, period_s=4.0) -> dict:
     return {
         "i": iid, "sp": True, "su": True, "sps": period_s, "sep": 1000.0, "sod": 10.0,
-        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": time.time(), "rv": 1,
         "bps": period_s, "eps": period_s, "pag": True,
     }
 
@@ -4725,7 +4843,7 @@ def _inject_stable_period_history(state: RadarState, iid: int, period_s: float =
     """Inject period history so the period stability gate evaluates as pass."""
     stable_values = [period_s + 0.0001 * (i % 3 - 1) for i in range(10)]
     state._live_period_history[iid] = deque(
-        [{"ts": float(i), "period_base_s": v, "period_s": v, "period_correction_ppm": 0.0}
+        [{"ts": time.time() - (len(stable_values) - 1 - i), "period_base_s": v, "period_s": v, "period_correction_ppm": 0.0}
          for i, v in enumerate(stable_values)],
         maxlen=80,
     )
@@ -5603,7 +5721,7 @@ def test_stage10_enabled_nonactive_stable_usable_without_gate_snapshot_maps_to_h
         phase_offset_deg=10.0,
         sync_quality=0.9,
         sync_jitter_deg=1.0,
-        last_sync_update_ts=2000.0,
+        last_sync_update_ts=time.time(),
         source="go_frame_sync",
         usable=False,
         handoff_state="GO_REFINING",
@@ -5638,7 +5756,7 @@ def test_stage10_enabled_nonactive_stable_usable_without_go_sync_dict_maps_to_hy
         phase_offset_deg=10.0,
         sync_quality=0.9,
         sync_jitter_deg=1.0,
-        last_sync_update_ts=2000.0,
+        last_sync_update_ts=time.time(),
         source="go_frame_sync",
         usable=False,
         handoff_state="GO_REFINING",
@@ -5668,7 +5786,7 @@ def test_stage10_enabled_nonactive_stable_usable_int_flags_map_to_hysteresis(mon
         phase_offset_deg=10.0,
         sync_quality=0.9,
         sync_jitter_deg=1.0,
-        last_sync_update_ts=2000.0,
+        last_sync_update_ts=time.time(),
         source="go_frame_sync",
         usable=False,
         handoff_state="GO_REFINING",
@@ -5703,7 +5821,7 @@ def test_stage10_live_unclassified_shape_with_diag_usable_flags_maps_to_hysteres
         phase_offset_deg=191.40649157727808,
         sync_quality=1.0,
         sync_jitter_deg=4.951642799377442,
-        last_sync_update_ts=1778114712.4103398,
+        last_sync_update_ts=time.time(),
         source="go_frame_sync",
         usable=True,
         holdover=False,
@@ -5749,7 +5867,7 @@ def test_stage10_live_captured_unclassified_shape_without_go_sync_maps_to_hyster
         phase_offset_deg=191.40649157727808,
         sync_quality=1.0,
         sync_jitter_deg=4.951642799377442,
-        last_sync_update_ts=1778114712.4103398,
+        last_sync_update_ts=time.time(),
         source="go_frame_sync",
         usable=True,
         holdover=False,
@@ -6549,6 +6667,97 @@ def test_go_iid_state_populates_diagnostic_histories():
     assert len(slope_history) >= 1
     assert slope_history[-1]["residual_slope_deg_per_s"] == pytest.approx(0.02)
     assert slope_history[-1]["source"] == "go_frame_sync"
+
+
+def test_go_iid_state_maps_quality_eval_diagnostics_from_iid_state_payload():
+    state = RadarState()
+    state._models[78] = RadarIID(iid=78, status="SINGLE_RADAR", period_s=4.0, primary_support_count=6)
+    state.update_go_iid_state({
+        "i": 78, "sp": True, "su": False, "sps": 4.0, "sep": 500_000.0, "sod": 12.0,
+        "sq": 0.2, "sj": 1.0, "snf": 10, "sh": False, "lu": 2_000.0, "rv": 1,
+        "gsur": "quality_below_threshold",
+        "qst": "SINGLE_RADAR",
+        "qrs": "SINGLE_RADAR",
+        "qbp": True,
+        "qfp": "syncQuality(status,has_base_period)",
+        "qsm": False,
+        "qex": 1.0,
+        "qdq": 0.2,
+        "qev": 9,
+        "qea": 0.5,
+        "qdd": True,
+        "qdr": "df_period_disagree_compact_only_refined_agrees_with_df",
+        "qos": "DF_PERIOD_DISAGREE",
+        "qes": "SINGLE_RADAR",
+        "qov": 0.0,
+        "qef": 1.0,
+    })
+    go_sync = state._go_sync_states_by_iid.get(78) or {}
+    assert go_sync.get("status_at_quality_eval") == "SINGLE_RADAR"
+    assert go_sync.get("exported_rotation_status") == "SINGLE_RADAR"
+    assert go_sync.get("has_base_period_at_quality_eval") is True
+    assert go_sync.get("quality_formula_path") == "syncQuality(status,has_base_period)"
+    assert go_sync.get("quality_eval_seq") == 9
+    assert go_sync.get("quality_eval_age_s") == pytest.approx(0.5)
+    assert go_sync.get("quality_demoted_df_period_disagree") is True
+    assert go_sync.get("quality_demoted_df_period_disagree_reason") == "df_period_disagree_compact_only_refined_agrees_with_df"
+    assert go_sync.get("quality_original_status") == "DF_PERIOD_DISAGREE"
+    assert go_sync.get("quality_effective_status") == "SINGLE_RADAR"
+    assert go_sync.get("quality_original_value") == pytest.approx(0.0)
+    assert go_sync.get("quality_effective_value") == pytest.approx(1.0)
+
+
+def test_go_iid_state_sync_quality_equals_effective_value_when_demoted():
+    """When Go emits sq=1.0 matching qef=1.0 (demotion applied),
+    sync_quality must be the effective value and go_sync_unusable_reason
+    must NOT be quality_below_threshold."""
+    state = RadarState()
+    state._models[79] = RadarIID(iid=79, status="DF_PERIOD_DISAGREE", period_s=4.0, primary_support_count=6)
+    state.update_go_iid_state({
+        "i": 79, "sp": True, "su": True, "sps": 4.0, "sep": 500_000.0, "sod": 12.0,
+        "sq": 1.0, "sj": 1.0, "snf": 10, "sh": False, "lu": 2_000.0, "rv": 1,
+        "gsur": "",
+        "gsuq": True,
+        "gsuv": 1.0,
+        "qdd": True,
+        "qdr": "df_period_disagree_compact_only_refined_agrees_with_df",
+        "qos": "DF_PERIOD_DISAGREE",
+        "qes": "SINGLE_RADAR",
+        "qov": 0.0,
+        "qef": 1.0,
+    })
+    go_sync = state._go_sync_states_by_iid.get(79) or {}
+    # sync_quality must be the effective value, not the original zero.
+    assert go_sync.get("sync_quality") == pytest.approx(1.0)
+    # quality_effective_value matches sync_quality.
+    assert go_sync.get("quality_effective_value") == pytest.approx(1.0)
+    # go_sync_unusable_reason must NOT be quality_below_threshold.
+    assert go_sync.get("go_sync_unusable_reason") != "quality_below_threshold"
+    assert go_sync.get("go_sync_usable_quality_ok") is True
+
+
+def test_go_iid_state_rejects_df_period_disagree_with_refined_disagreement():
+    """When sq=0.0 and qef=0.0 (no demotion, refined effective disagrees),
+    sync_quality stays 0.0 and go_sync_unusable_reason may be
+    quality_below_threshold or period_disagrees_with_df."""
+    state = RadarState()
+    state._models[80] = RadarIID(iid=80, status="DF_PERIOD_DISAGREE", period_s=4.0, primary_support_count=6)
+    state.update_go_iid_state({
+        "i": 80, "sp": True, "su": False, "sps": 4.0, "sep": 500_000.0, "sod": 12.0,
+        "sq": 0.0, "sj": 1.0, "snf": 10, "sh": False, "lu": 2_000.0, "rv": 1,
+        "gsur": "quality_below_threshold",
+        "gsuq": False,
+        "gsuv": 0.0,
+        "qdd": False,
+        "qos": "DF_PERIOD_DISAGREE",
+        "qes": "DF_PERIOD_DISAGREE",
+        "qov": 0.0,
+        "qef": 0.0,
+    })
+    go_sync = state._go_sync_states_by_iid.get(80) or {}
+    assert go_sync.get("sync_quality") == pytest.approx(0.0)
+    assert go_sync.get("quality_effective_value") == pytest.approx(0.0)
+    assert go_sync.get("go_sync_usable_quality_ok") is False
 
 
 def test_period_stability_gate_can_pass_after_go_history_bridged():

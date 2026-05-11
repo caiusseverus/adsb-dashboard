@@ -263,6 +263,21 @@ type IIDState struct {
 	GoSyncUsablePeriodAgrees                 bool     `codec:"gsup"`
 	GoSyncUsablePeriodRejectReason           string   `codec:"gsupr"`
 	GoSyncUsableStrictGatePass               bool     `codec:"gsus"`
+	QualityStatusAtEval                      string   `codec:"qst"`
+	ExportedRotationStatusAtQualityEval      string   `codec:"qrs"`
+	HasBasePeriodAtQualityEval               bool     `codec:"qbp"`
+	QualityFormulaPath                       string   `codec:"qfp"`
+	QualityStatusMismatch                    bool     `codec:"qsm"`
+	QualityExpectedFromExportedStatus        *float64 `codec:"qex"`
+	GoDiagnosticSyncQuality                  *float64 `codec:"qdq"`
+	QualityEvalSeq                           uint32   `codec:"qev"`
+	QualityEvalAgeS                          *float64 `codec:"qea"`
+	QualityDemotedDFPeriodDisagree           bool     `codec:"qdd"`
+	QualityDemotedDFPeriodDisagreeReason     string   `codec:"qdr"`
+	QualityOriginalStatus                    string   `codec:"qos"`
+	QualityEffectiveStatus                   string   `codec:"qes"`
+	QualityOriginalValue                     *float64 `codec:"qov"`
+	QualityEffectiveValue                    *float64 `codec:"qef"`
 	NBurstRecords                            uint16   `codec:"nb"`
 	LastUpdated                              float64  `codec:"lu"`
 	Revision                                 uint32   `codec:"rv"`

@@ -284,6 +284,12 @@ type DebugSnapshot struct {
 	GoDiagnosticSyncQuality                       float64
 	GoDiagnosticQualityEvalSeq                    uint64
 	GoDiagnosticQualityEvalAgeS                   float64
+	GoDiagnosticQualityDemotedDFPeriodDisagree    bool
+	GoDiagnosticQualityDemotedReason              string
+	GoDiagnosticQualityOriginalStatus             string
+	GoDiagnosticQualityEffectiveStatus            string
+	GoDiagnosticQualityOriginalValue              float64
+	GoDiagnosticQualityEffectiveValue             float64
 }
 
 func isSyncQualityMappedStatus(status string) bool {
@@ -297,13 +303,28 @@ func isSyncQualityMappedStatus(status string) bool {
 
 func (s *IIDState) refreshSyncQualityLocked(source string) float64 {
 	hasBaseAtEval := s.BasePeriodS != nil && *s.BasePeriodS > 0
-	quality := syncQuality(s.Status, hasBaseAtEval)
+	originalStatus := s.Status
+	originalQuality := syncQuality(originalStatus, hasBaseAtEval)
+	effectiveStatus := originalStatus
+	qualityDemoted := false
+	qualityDemotedReason := ""
+	if originalStatus == "DF_PERIOD_DISAGREE" && hasBaseAtEval && s.PeriodAgreesWithDF {
+		// DF_PERIOD_DISAGREE can represent compact-model disagreement while the
+		// DF-authoritative refined effective period still agrees operationally.
+		// In that case quality should not be vetoed to 0.0 solely by diagnostic
+		// compact disagreement.
+		effectiveStatus = "SINGLE_RADAR"
+		qualityDemoted = true
+		qualityDemotedReason = "df_period_disagree_compact_only_refined_agrees_with_df"
+	}
+	effectiveQuality := syncQuality(effectiveStatus, hasBaseAtEval)
+	quality := effectiveQuality
 	if s.Sync == nil {
 		return quality
 	}
 	s.Sync.SyncQuality = quality
-	s.Sync.QualityStatusAtEval = s.Status
-	s.Sync.ExportedRotationStatusAtQualityEval = s.Status
+	s.Sync.QualityStatusAtEval = originalStatus
+	s.Sync.ExportedRotationStatusAtQualityEval = originalStatus
 	s.Sync.HasBasePeriodAtQualityEval = hasBaseAtEval
 	s.Sync.BasePeriodPresentAtQualityEval = s.BasePeriodS != nil
 	s.Sync.SyncBasePeriodPresentAtQualityEval = s.Sync.BasePeriodS > 0
@@ -314,12 +335,18 @@ func (s *IIDState) refreshSyncQualityLocked(source string) float64 {
 	s.Sync.HoldoverAtQualityEval = s.Sync.Holdover
 	s.Sync.QualityEvalUnix = float64(time.Now().UnixNano()) / 1e9
 	s.Sync.QualityEvalSeq++
-	s.Sync.QualityFormulaPath = "syncQuality(status,has_base_period)"
-	expected := syncQuality(s.Status, hasBaseAtEval)
+	s.Sync.QualityFormulaPath = "syncQuality(effective_status,has_base_period)"
+	expected := syncQuality(effectiveStatus, hasBaseAtEval)
 	s.Sync.QualityExpectedFromExportedStatus = expected
 	s.Sync.QualityStatusMismatch = hasBaseAtEval &&
-		isSyncQualityMappedStatus(s.Status) &&
+		isSyncQualityMappedStatus(effectiveStatus) &&
 		math.Abs(s.Sync.SyncQuality-expected) > 1e-9
+	s.Sync.QualityOriginalStatusAtEval = originalStatus
+	s.Sync.QualityEffectiveStatusAtEval = effectiveStatus
+	s.Sync.QualityOriginalValueAtEval = originalQuality
+	s.Sync.QualityEffectiveValueAtEval = effectiveQuality
+	s.Sync.QualityDemotedDFPeriodDisagree = qualityDemoted
+	s.Sync.QualityDemotedDFPeriodDisagreeReason = qualityDemotedReason
 	_ = source // reserved to keep diagnostics extension-compatible without behavior branching.
 	return quality
 }
@@ -672,6 +699,7 @@ func (s *IIDState) UpdateSyncEpoch(epochUS, phaseOffsetDeg float64, nAircraft in
 		return
 	}
 	s.refreshSyncQualityLocked("update_sync_epoch")
+	quality = s.Sync.SyncQuality
 	refICAO := uint32(0)
 	if s.RefICAO != nil {
 		refICAO = *s.RefICAO
@@ -1101,6 +1129,12 @@ func (s *IIDState) DebugStateSnapshot() DebugSnapshot {
 			}
 			out.GoDiagnosticQualityEvalAgeS = ageS
 		}
+		out.GoDiagnosticQualityDemotedDFPeriodDisagree = s.Sync.QualityDemotedDFPeriodDisagree
+		out.GoDiagnosticQualityDemotedReason = s.Sync.QualityDemotedDFPeriodDisagreeReason
+		out.GoDiagnosticQualityOriginalStatus = s.Sync.QualityOriginalStatusAtEval
+		out.GoDiagnosticQualityEffectiveStatus = s.Sync.QualityEffectiveStatusAtEval
+		out.GoDiagnosticQualityOriginalValue = s.Sync.QualityOriginalValueAtEval
+		out.GoDiagnosticQualityEffectiveValue = s.Sync.QualityEffectiveValueAtEval
 	}
 	out.ActiveAircraftEstimate = s.lastActiveAircraft
 	out.BurstRecordsTotal = len(s.records)

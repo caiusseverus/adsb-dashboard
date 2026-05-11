@@ -24,7 +24,7 @@ def _go_sync_for_gates(iid: int = 100, period_s: float = 4.0) -> dict:
     """Minimal Go sync dict with all readiness gates passing except slope trend."""
     return {
         "i": iid, "sp": True, "su": True, "sps": period_s, "sep": 1000.0, "sod": 10.0,
-        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": 2000.0, "rv": 1,
+        "sq": 0.9, "sj": 1.0, "snf": 10, "sh": False, "lu": time.time(), "rv": 1,
         "bps": period_s, "eps": period_s, "pag": True,
     }
 
@@ -58,8 +58,9 @@ def _inject_stable_slope_history(state: RadarState, iid: int, near_zero: bool = 
 def _inject_stable_period_history(state: RadarState, iid: int, period_s: float = 4.0) -> None:
     """Inject period history so the period stability gate evaluates as pass."""
     stable_values = [period_s + 0.0001 * (i % 3 - 1) for i in range(10)]
+    now = time.time()
     state._live_period_history[iid] = deque(
-        [{"ts": float(i), "period_base_s": v, "period_s": v, "period_correction_ppm": 0.0}
+        [{"ts": now - (len(stable_values) - 1 - i), "period_base_s": v, "period_s": v, "period_correction_ppm": 0.0}
          for i, v in enumerate(stable_values)],
         maxlen=80,
     )
@@ -648,9 +649,10 @@ def test_stage7r_population_validation_fields_present(monkeypatch):
 # 10. RADAR_SYNC_GO_REFINER_OPERATIONAL stays default-off
 # ===========================================================================
 
-def test_go_refiner_operational_default_off():
+def test_go_refiner_operational_default_off(monkeypatch):
     """RADAR_SYNC_GO_REFINER_OPERATIONAL must default to False."""
     import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False)
     assert getattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False) is False
 
 
