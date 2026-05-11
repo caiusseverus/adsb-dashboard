@@ -1,6 +1,8 @@
 import asyncio
 import json
 import time
+import traceback
+import sys
 from collections import deque
 try:
     import orjson as _orjson
@@ -264,6 +266,11 @@ _radar_core_position_last_sent: dict[str, tuple[float, float, int | None, float]
 _radar_core_position_sent: int = 0
 _radar_core_position_skipped: int = 0
 _timing_ws_timings: _deque[dict] = _deque(maxlen=400)
+_http_request_timings: _deque[dict] = _deque(maxlen=800)
+_http_inflight_requests: int = 0
+_stall_watchdog_thread: threading.Thread | None = None
+_stall_watchdog_stop = threading.Event()
+_perf_probe_thread: threading.Thread | None = None
 _BACKGROUND_QUEUE_BACKLOG_SKIP = 100
 _FM_MAX_IIDS_PER_CYCLE = 1
 _CI_MAX_IIDS_PER_CYCLE = 1
@@ -287,6 +294,70 @@ _TRAIL_HOUSEKEEPING_INTERVAL_S: float = 10.0
 _trail_housekeeping_last_ts: float = 0.0
 _VISIT_MERGE_INTERVAL_S: float = 86400.0  # once per day
 _visit_merge_last_ts: float = 0.0
+
+
+def _start_stall_watchdog() -> None:
+    """Background watchdog: dump Python stacks when loop heartbeat stalls."""
+    global _stall_watchdog_thread
+    if _stall_watchdog_thread is not None and _stall_watchdog_thread.is_alive():
+        return
+    _stall_watchdog_stop.clear()
+
+    def _run() -> None:
+        last_dump_ts = 0.0
+        while not _stall_watchdog_stop.wait(2.0):
+            hb = health_module.get_loop_heartbeat_ts()
+            now = time.time()
+            hb_age_s = (now - hb) if hb > 0 else None
+            if hb_age_s is not None and hb_age_s < 6.0:
+                continue
+            if now - last_dump_ts < 15.0:
+                continue
+            last_dump_ts = now
+            try:
+                frames = sys._current_frames()
+                hb_label = f"{hb_age_s:.3f}" if hb_age_s is not None else "none"
+                lines = [f"\n=== stall_watchdog ts={now:.3f} hb_age_s={hb_label} threads={len(frames)} ===\n"]
+                for th in threading.enumerate():
+                    frame = frames.get(th.ident) if th.ident is not None else None
+                    lines.append(f"\n--- thread name={th.name} ident={th.ident} alive={th.is_alive()} daemon={th.daemon} ---\n")
+                    if frame is not None:
+                        lines.extend(traceback.format_stack(frame))
+                with open("/tmp/backend_stall_stacks.log", "a", encoding="utf-8") as fh:
+                    fh.writelines(lines)
+            except Exception:
+                log.exception("stall_watchdog: failed to dump stacks")
+
+    _stall_watchdog_thread = threading.Thread(target=_run, daemon=True, name="stall-watchdog")
+    _stall_watchdog_thread.start()
+
+
+def _start_perf_probe() -> None:
+    """Background probe: persist lock/read latency samples for stall triage."""
+    global _perf_probe_thread
+    if _perf_probe_thread is not None and _perf_probe_thread.is_alive():
+        return
+
+    def _run() -> None:
+        while not _stall_watchdog_stop.wait(2.0):
+            t0 = time.perf_counter()
+            err = None
+            try:
+                radar_state.get_memory_stats()
+            except Exception as exc:
+                err = exc.__class__.__name__
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            try:
+                with open("/tmp/backend_perf_probe.log", "a", encoding="utf-8") as fh:
+                    fh.write(
+                        f"{time.time():.3f} probe=get_memory_stats elapsed_ms={elapsed_ms:.3f} "
+                        f"inflight={_http_inflight_requests} error={err or 'none'}\n"
+                    )
+            except Exception:
+                pass
+
+    _perf_probe_thread = threading.Thread(target=_run, daemon=True, name="perf-probe")
+    _perf_probe_thread.start()
 
 
 def _radar_core_runtime_stats(radar_state_stats: dict | None = None) -> dict:
@@ -924,7 +995,7 @@ async def _housekeeping_loop() -> None:
             now_ts = time.time()
             if now_ts - _trail_housekeeping_last_ts >= _TRAIL_HOUSEKEEPING_INTERVAL_S:
                 _trail_housekeeping_last_ts = now_ts
-                _trail_snap = _get_cycle_snapshot("full")
+                _trail_snap = await asyncio.to_thread(_get_cycle_snapshot, "full")
                 for _ac in _trail_snap["aircraft"]:
                     _record_track_point(_ac, now_ts)
 
@@ -951,7 +1022,7 @@ async def _notify_cast_loop() -> None:
         await asyncio.sleep(config.PUSH_INTERVAL_S)
         try:
             _notify_enabled = notifications.any_channel()
-            _cast_on = _cast_enabled()
+            _cast_on = await asyncio.to_thread(_cast_enabled)
             if not _notify_enabled and not _cast_on:
                 continue
 
@@ -962,7 +1033,7 @@ async def _notify_cast_loop() -> None:
                 _notify_snap_mode = memory_policy.get_policy()["snapshot_mode"]
             else:
                 _notify_snap_mode = "full"
-            snapshot = _get_cycle_snapshot(_notify_snap_mode)
+            snapshot = await asyncio.to_thread(_get_cycle_snapshot, _notify_snap_mode)
             now = time.time()
 
             # Refresh watchlist cache from DB every 30s
@@ -1040,7 +1111,7 @@ async def _broadcast_loop() -> None:
             else:
                 _snap_mode = "full"
             t_snap = time.perf_counter()
-            snapshot = _get_cycle_snapshot(_snap_mode)
+            snapshot = await asyncio.to_thread(_get_cycle_snapshot, _snap_mode)
             snapshot_ms = (time.perf_counter() - t_snap) * 1000
 
             # Record track points (rate-limited to 1/5s per aircraft inside TrackStore)
@@ -1776,6 +1847,8 @@ async def lifespan(app: FastAPI):
         _bg(_terrain_prewarm())
     _bg(run_position_quality_checker(position_quality_module._checker))
     _bg(health_module.loop_lag_sampler())
+    _start_stall_watchdog()
+    _start_perf_probe()
     _bg(_radar_loop())
     if _radar_core_client is not None:
         _bg(_radar_core_position_loop())
@@ -1785,7 +1858,7 @@ async def lifespan(app: FastAPI):
     if config.STAGE3_ENABLED:
         _bg(_aircraft_bearing_calibration_loop())
         _bg(_aircraft_localisation_loop())
-    health_module.register_context(_msg_queue, _clients)
+    health_module.register_context(_msg_queue, _clients, radar_state=radar_state)
 
     def _runtime_stats_payload() -> dict:
         radar_state_stats = radar_state.get_memory_stats()
@@ -1822,6 +1895,7 @@ async def lifespan(app: FastAPI):
         _radar_core_client.stop()
     if _radar_core_worker is not None:
         _radar_core_worker.stop()
+    _stall_watchdog_stop.set()
     # Cancel background tasks first; the explicit final DB write inside
     # _graceful_shutdown handles persistence — no need for _db_writer to finish.
     await _graceful_shutdown(_bg_tasks)
@@ -1873,6 +1947,50 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _request_timing_middleware(request, call_next):
+    global _http_inflight_requests
+    start = time.perf_counter()
+    wall_start = time.time()
+    _http_inflight_requests += 1
+    req_id = f"{int(wall_start * 1000)}-{_http_inflight_requests}"
+    log.info("http_start id=%s method=%s path=%s inflight=%d", req_id, request.method, request.url.path, _http_inflight_requests)
+    status_code = 500
+    error = None
+    try:
+        response = await call_next(request)
+        status_code = int(getattr(response, "status_code", 200))
+        return response
+    except Exception as exc:
+        error = exc.__class__.__name__
+        raise
+    finally:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        loop_lag_ms = float(getattr(health_module, "_loop_lag_ms", 0.0) or 0.0)
+        _http_request_timings.append({
+            "ts": wall_start,
+            "path": request.url.path,
+            "method": request.method,
+            "status": status_code,
+            "elapsed_ms": round(elapsed_ms, 3),
+            "loop_lag_ms": round(loop_lag_ms, 3),
+            "inflight_after": _http_inflight_requests - 1,
+            "error": error,
+        })
+        if elapsed_ms >= 500.0 or error is not None:
+            log.warning(
+                "http_end id=%s method=%s path=%s status=%s elapsed_ms=%.3f inflight_after=%d error=%s",
+                req_id,
+                request.method,
+                request.url.path,
+                status_code,
+                elapsed_ms,
+                _http_inflight_requests - 1,
+                error or "none",
+            )
+        _http_inflight_requests = max(0, _http_inflight_requests - 1)
 
 
 # ---------------------------------------------------------------------------
@@ -2354,11 +2472,12 @@ async def radar_iid_sync_websocket_endpoint(ws: WebSocket, iid: int) -> None:
             if now - last_rebuild >= 0.25:
                 global _ws_sync_rebuilds, _ws_sync_emissions
                 _ws_sync_rebuilds += 1
-                payload = radar_api.build_iid_sync_snapshot_payload(
+                payload = await asyncio.to_thread(
+                    radar_api.build_iid_sync_snapshot_payload,
                     radar_state,
                     iid,
-                    window_s=window_s,
-                    debug_limit=debug_limit,
+                    window_s,
+                    debug_limit,
                 )
                 last_rebuild = now
                 sequence = payload.get("sequence")
@@ -2414,11 +2533,12 @@ async def radar_iid_selected_state_websocket_endpoint(ws: WebSocket, iid: int) -
             if now - last_rebuild >= 0.25:
                 global _ws_selected_state_rebuilds, _ws_selected_state_emissions
                 _ws_selected_state_rebuilds += 1
-                payload = radar_api.build_selected_iid_page_state_payload(
+                payload = await asyncio.to_thread(
+                    radar_api.build_selected_iid_page_state_payload,
                     radar_state,
                     iid,
-                    window_s=window_s,
-                    debug_limit=debug_limit,
+                    window_s,
+                    debug_limit,
                 )
                 last_rebuild = now
                 sequence = payload.get("sequence")

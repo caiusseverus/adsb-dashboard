@@ -8,6 +8,7 @@ Two endpoints:
 
 import asyncio
 import pathlib
+import subprocess
 from collections.abc import Callable
 from fastapi import APIRouter
 
@@ -18,6 +19,25 @@ from db import stats_db
 
 # Callable registered by main.py at startup to avoid a circular import.
 _runtime_stats_fn: Callable[[], dict] | None = None
+
+
+def _runtime_git_sha() -> str | None:
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short=8", "HEAD"],
+                cwd=pathlib.Path(__file__).resolve().parent.parent,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            .strip()
+            or None
+        )
+    except Exception:
+        return None
+
+
+RUNTIME_GIT_SHA = _runtime_git_sha()
 
 
 def register_runtime_stats(fn: Callable[[], dict]) -> None:
@@ -78,9 +98,10 @@ async def get_status() -> dict:
         asyncio.to_thread(memory_policy.get_status),
         asyncio.to_thread(hires_buffer.stats),
     )
-    runtime = _runtime_stats_fn() if _runtime_stats_fn else {}
+    runtime = await asyncio.to_thread(_runtime_stats_fn) if _runtime_stats_fn else {}
     return {
         "config": {
+            "runtime_git_sha":            RUNTIME_GIT_SHA,
             "minute_stats_retention_days": _config.MINUTE_STATS_RETENTION_DAYS,
             "coverage_retention_days":     90,
             "acas_retention_days":         90,

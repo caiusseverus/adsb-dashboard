@@ -5752,7 +5752,7 @@ def test_stage10_live_unclassified_shape_with_go_sync_dict_reads_sync_diag_usabl
         phase_offset_deg=250.0,
         sync_quality=1.0,
         sync_jitter_deg=4.0,
-        last_sync_update_ts=1778447084.17937,
+        last_sync_update_ts=time.time(),
         source="go_frame_sync",
         usable=True,
         holdover=False,
@@ -5764,6 +5764,8 @@ def test_stage10_live_unclassified_shape_with_go_sync_dict_reads_sync_diag_usabl
         handoff_gate_failures={},
         period_refinement_status="stable",
         blocking_gate="go_readiness.unclassified_state",
+        last_sync_driving_fit_observation_age_s=0.2,
+        anchor_last_validation_age_s=0.2,
     )
     sync.go_sync_unusable_reason = None
     sync.go_diagnostic_go_sync_unusable_reason = ""
@@ -6130,6 +6132,71 @@ def test_fresh_go_evidence_without_burst_rows_uses_display_absence_reason():
     })
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(iid), state.get_go_live_sync_state(iid))
     assert payload["go_diagnostic_burst_rows_absence_reason"] == "no_display_burst_sync_rows"
+
+
+def test_anchor_trusted_demoted_when_phase_state_ts_is_stale():
+    sync = LiveSyncState(
+        iid=9921,
+        period_s=4.0,
+        phase_epoch_us=1_000_000.0,
+        phase_offset_deg=10.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=time.time() - 120.0,
+        source="go_frame_sync",
+        usable=True,
+        phase_basis="anchor_relative",
+        phase_status="trusted",
+        phase_anchor_icao="ABC123",
+        phase_anchor_status="selected",
+        phase_anchor_since_ts=time.time() - 2.0,
+        last_sync_driving_fit_observation_age_s=1.0,
+        anchor_last_validation_age_s=1.0,
+        burst_rows_absence_reason="",
+    )
+    payload = _live_sync_state_to_dict(sync, go_sync={"last_sync_driving_fit_observation_age_s": 1.0})
+    assert payload["phase_status_display"] != "anchor_trusted"
+    assert payload["phase_status_display"] == "anchor_retained_stale"
+
+
+def test_stale_fit_epoch_blocks_hysteresis_and_maps_to_go_evidence_fresh(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    sync = LiveSyncState(
+        iid=9922,
+        period_s=4.0,
+        phase_epoch_us=1_000_000.0,
+        phase_offset_deg=10.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=time.time() - 1.0,
+        source="go_frame_sync",
+        usable=True,
+        handoff_state="GO_REFINING",
+        handoff_reason="go_ready_pending_hysteresis",
+        period_refinement_status="stable",
+        go_operational_enabled=True,
+        go_operational_active=False,
+        blocking_gate="go_readiness_hysteresis",
+        fit_epoch_started_ts=time.time() - 120.0,
+        phase_basis="anchor_relative",
+        phase_status="trusted",
+        phase_anchor_icao="DEF456",
+        phase_anchor_status="selected",
+        phase_anchor_since_ts=time.time() - 2.0,
+        last_sync_driving_fit_observation_age_s=1.0,
+        anchor_last_validation_age_s=1.0,
+        burst_rows_absence_reason="no_display_burst_sync_rows",
+    )
+    sync.go_diagnostic_go_sync_usable_quality_ok = True
+    sync.go_diagnostic_go_sync_usable_holdover_ok = True
+    sync.go_diagnostic_go_sync_usable_period_agrees = True
+    sync.go_diagnostic_go_sync_usable_strict_gate_pass = True
+    sync.go_diagnostic_go_sync_unusable_reason = ""
+    payload = _live_sync_state_to_dict(sync, go_sync={"period_refinement_status": "stable"})
+    assert payload["handoff_reason"] != "go_ready_pending_hysteresis"
+    assert payload["go_operational_blocking_gate"] == "go_readiness.go_evidence_fresh"
+    assert payload["go_operational_blocking_reason"] == "stale_go_evidence"
 
 
 # --- FitInlierRatio tests (Stage 4R) ---

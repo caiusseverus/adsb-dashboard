@@ -54,6 +54,8 @@ async def get_perf() -> dict:
     _radar_queue = getattr(_main_module, "_radar_queue")
     _radar_queue_depth_samples = getattr(_main_module, "_radar_queue_depth_samples", [])
     _radar_ws_timings = getattr(_main_module, "_radar_ws_timings", [])
+    _http_request_timings = getattr(_main_module, "_http_request_timings", [])
+    _http_inflight_requests = int(getattr(_main_module, "_http_inflight_requests", 0) or 0)
     _radar_worker_timings = getattr(_main_module, "_radar_worker_timings", [])
     _timing_ws_timings = getattr(_main_module, "_timing_ws_timings", [])
     msg_t        = sorted(_state_module.msg_timings)
@@ -78,6 +80,8 @@ async def get_perf() -> dict:
     decoder_batch_t = list(_benchmark_module.decoder_batch_timings)
     beast_chunk_t = list(_beast_client_module.chunk_timings)
     radar_api_t = list(_radar_api_module.api_timings)
+    _radar_state = getattr(_main_module, "radar_state", None)
+    radar_lock_t = _radar_state.get_lock_timing_stats() if _radar_state is not None else {}
 
     def percentiles(data: list[float], scale: float = 1_000_000) -> dict:
         n = len(data)
@@ -127,6 +131,29 @@ async def get_perf() -> dict:
                 "cache_miss_count": sum(1 for value in values if value.get("cache_status") == "miss"),
             }
             for name, values in sorted(by_name.items())
+        }
+
+    def http_summary(samples: list[dict]) -> dict:
+        if not samples:
+            return {"samples": 0, "p50_ms": 0.0, "p95_ms": 0.0, "max_ms": 0.0, "by_path": {}}
+        lat = sorted(float(s.get("elapsed_ms", 0.0)) for s in samples)
+        by_path: dict[str, list[float]] = {}
+        for sample in samples:
+            path = str(sample.get("path", "unknown"))
+            by_path.setdefault(path, []).append(float(sample.get("elapsed_ms", 0.0)))
+        return {
+            "samples": len(samples),
+            "p50_ms": round(lat[min(len(lat) - 1, int(len(lat) * 0.50))], 3),
+            "p95_ms": round(lat[min(len(lat) - 1, int(len(lat) * 0.95))], 3),
+            "max_ms": round(lat[-1], 3),
+            "by_path": {
+                path: {
+                    "samples": len(vals),
+                    "avg_ms": round(sum(vals) / len(vals), 3),
+                    "max_ms": round(max(vals), 3),
+                }
+                for path, vals in sorted(by_path.items())
+            },
         }
 
     return {
@@ -288,6 +315,9 @@ async def get_perf() -> dict:
             "elapsed_avg": sample_avg(radar_api_t, "elapsed_ms"),
             "by_endpoint": endpoint_summary(radar_api_t),
         },
+        "http_requests_ms": http_summary(list(_http_request_timings)),
+        "http_inflight_requests": _http_inflight_requests,
+        "radar_lock_timing_ms": radar_lock_t,
         "beast_ingest_ms": {
             "samples": len(beast_chunk_t),
             "chunk_bytes_avg": sample_avg(beast_chunk_t, "chunk_bytes"),

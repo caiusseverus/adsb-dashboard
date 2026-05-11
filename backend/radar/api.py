@@ -1285,46 +1285,47 @@ async def get_iids(window_s: float = Query(default=600.0, ge=10, le=7200)):
     """All IIDs seen in the last window_s seconds with activity counts."""
     if _state is None:
         return {"iids": [], "window_s": window_s}
+    def _build() -> dict:
+        activity = _state.get_iid_activity(window_s)
+        models = _state.get_all_rotation_models()
+        now_wall = time.time()
+        latest_arrival_us = _state.get_latest_arrival_us()
 
-    activity = _state.get_iid_activity(window_s)
-    models = _state.get_all_rotation_models()
-    now_wall = time.time()
-    latest_arrival_us = _state.get_latest_arrival_us()
+        iids_out = []
+        for iid, entry in activity.items():
+            model = models.get(iid)
+            last_us = entry.get("last_us", 0)
+            if latest_arrival_us is not None and last_us <= latest_arrival_us:
+                last_seen = now_wall - ((latest_arrival_us - last_us) / 1_000_000.0)
+            else:
+                last_seen = now_wall
+            iids_out.append({
+                "iid": iid,
+                "count": entry["count"],
+                "last_seen": round(last_seen, 1),
+                "latest_icao": entry.get("latest_icao", ""),
+                "period_s": _state.get_authoritative_display_period_s(iid),
+                "period_std_s": _state.get_authoritative_display_period_std_s(iid),
+                "rpm": _state.get_authoritative_display_rpm(iid),
+                "status": model.status if model else None,
+                # Forward model fields
+                "fm_lat": model.fm_lat if model else None,
+                "fm_lon": model.fm_lon if model else None,
+                "fm_cep_m": model.fm_cep_m if model else None,
+                "fm_source": model.fm_source if model else None,
+                **_control_payload(model),
+            })
 
-    iids_out = []
-    for iid, entry in activity.items():
-        model = models.get(iid)
-        last_us = entry.get("last_us", 0)
-        if latest_arrival_us is not None and last_us <= latest_arrival_us:
-            last_seen = now_wall - ((latest_arrival_us - last_us) / 1_000_000.0)
-        else:
-            last_seen = now_wall
-        iids_out.append({
-            "iid": iid,
-            "count": entry["count"],
-            "last_seen": round(last_seen, 1),
-            "latest_icao": entry.get("latest_icao", ""),
-            "period_s": _state.get_authoritative_display_period_s(iid),
-            "period_std_s": _state.get_authoritative_display_period_std_s(iid),
-            "rpm": _state.get_authoritative_display_rpm(iid),
-            "status": model.status if model else None,
-            # Forward model fields
-            "fm_lat": model.fm_lat if model else None,
-            "fm_lon": model.fm_lon if model else None,
-            "fm_cep_m": model.fm_cep_m if model else None,
-            "fm_source": model.fm_source if model else None,
-            **_control_payload(model),
-        })
+        iids_out.sort(key=lambda x: x["iid"])
 
-    iids_out.sort(key=lambda x: x["iid"])
-
-    import config as _config
-    return {
-        "iids": iids_out,
-        "window_s": window_s,
-        "receiver_lat": getattr(_config, "RECEIVER_LAT", None),
-        "receiver_lon": getattr(_config, "RECEIVER_LON", None),
-    }
+        import config as _config
+        return {
+            "iids": iids_out,
+            "window_s": window_s,
+            "receiver_lat": getattr(_config, "RECEIVER_LAT", None),
+            "receiver_lon": getattr(_config, "RECEIVER_LON", None),
+        }
+    return await asyncio.to_thread(_build)
 
 
 @router.get("/iids/{iid}/timeline")
@@ -1408,7 +1409,13 @@ async def get_iid_sync_snapshot(
     payload = None
     cache_hit = False
     try:
-        payload = build_iid_sync_snapshot_payload(_state, iid, window_s=window_s, debug_limit=debug_limit)
+        payload = await asyncio.to_thread(
+            build_iid_sync_snapshot_payload,
+            _state,
+            iid,
+            window_s,
+            debug_limit,
+        )
         if _state is not None and hasattr(_state, "get_live_sync_snapshot_last_cache_hit"):
             cache_hit = _state.get_live_sync_snapshot_last_cache_hit(iid)
         if payload is not None:
@@ -1455,7 +1462,8 @@ async def get_iid_chart_history(
             return {"iid": iid, "available": False, "reason": "radar module not initialised"}
         _mbp = max_burst_points if max_burst_points > 0 else _cfg.CHART_MAX_BURST_RESIDUAL_POINTS
         _mdp = max_df11_points if max_df11_points > 0 else _cfg.CHART_MAX_DF11_RESIDUAL_POINTS
-        payload = _state.get_chart_history(
+        payload = await asyncio.to_thread(
+            _state.get_chart_history,
             iid,
             window_s=window_s,
             max_burst_points=_mbp,

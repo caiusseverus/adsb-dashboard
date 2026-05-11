@@ -1002,6 +1002,7 @@ def _live_sync_state_to_dict(
         else anchor_validation_age_s
     )
     phase_evidence_fresh: bool | None = None
+    burst_rows_absence_reason = ""
     if phase_basis in {"anchor_relative", "geographic"}:
         burst_rows_absence_reason = str(getattr(sync, "burst_rows_absence_reason", "") or "")
         if not burst_rows_absence_reason and isinstance(go_sync, dict):
@@ -1510,6 +1511,23 @@ def _live_sync_state_to_dict(
                     go_blocking_gate = "go_readiness_hysteresis"
                     effective_handoff_reason = "go_ready_pending_hysteresis"
                     go_blocking_reason = effective_handoff_reason
+                elif (
+                    reason_is_unclassified_placeholder
+                    and go_sync_usable_quality_ok is True
+                    and go_sync_usable_holdover_ok is True
+                    and go_sync_usable_period_agrees is True
+                    and go_sync_usable_strict_gate_pass is True
+                    and not go_sync_unusable_reason
+                    and not diag_go_sync_unusable_reason
+                    and not bool(getattr(sync, "holdover", False))
+                ):
+                    # Some live rows carry complete ready-like usability flags
+                    # but omit/refuse explicit refinement labels in the compact
+                    # Go payload. Keep attribution concrete rather than
+                    # emitting unclassified placeholders.
+                    go_blocking_gate = "go_readiness_hysteresis"
+                    effective_handoff_reason = "go_ready_pending_hysteresis"
+                    go_blocking_reason = effective_handoff_reason
 
             if not go_blocking_gate:
                 go_blocking_gate = "go_readiness.unclassified_state"
@@ -1603,6 +1621,8 @@ def _live_sync_state_to_dict(
         # go_operational_active despite Go being the active authority.
         go_operational_active = True
 
+    now_ts = time.time()
+    phase_state_age_s = max(0.0, now_ts - phase_state_ts) if phase_state_ts is not None else None
     phase_status_display = (
         "anchor_trusted" if raw_phase_status == "trusted" else
         "anchor_provisional" if raw_phase_status == "provisional" else
@@ -1625,7 +1645,45 @@ def _live_sync_state_to_dict(
     current_fit_epoch_age_s = None
     fit_epoch_started_ts = _to_finite_float(getattr(sync, "fit_epoch_started_ts", None))
     if fit_epoch_started_ts is not None:
-        current_fit_epoch_age_s = max(0.0, time.time() - fit_epoch_started_ts)
+        current_fit_epoch_age_s = max(0.0, now_ts - fit_epoch_started_ts)
+
+    no_burst_rows = burst_rows_absence_reason in {
+        "no_burst_sync_rows",
+        "no_display_burst_sync_rows",
+        "burst_rows_stale",
+    }
+    stale_phase_anchor_age = phase_anchor_age_s is not None and phase_anchor_age_s > _PHASE_FRESH_MAX_AGE_S
+    stale_phase_state_age = phase_state_age_s is not None and phase_state_age_s > _PHASE_FRESH_MAX_AGE_S
+    stale_phase_evidence_age = phase_evidence_age_s is not None and phase_evidence_age_s > _PHASE_FRESH_MAX_AGE_S
+    stale_fit_epoch_age = current_fit_epoch_age_s is not None and current_fit_epoch_age_s > _PHASE_FRESH_MAX_AGE_S
+    no_current_sync_driving_evidence = (
+        sync_driving_fit_age_s is None or sync_driving_fit_age_s > _PHASE_FRESH_MAX_AGE_S
+    )
+    stale_phase_for_trust = (
+        phase_basis == "anchor_relative"
+        and (
+            phase_evidence_fresh is False
+            or stale_phase_evidence_age
+            or stale_phase_state_age
+            or stale_phase_anchor_age
+            or stale_fit_epoch_age
+            or no_current_sync_driving_evidence
+            or (no_burst_rows and phase_evidence_fresh is not True)
+        )
+    )
+    if phase_status_display == "anchor_trusted" and stale_phase_for_trust:
+        phase_status_display = "anchor_retained_stale"
+        phase_anchor_clear_reason = phase_anchor_clear_reason or "stale_phase_evidence"
+        phase_anchor_retained_without_current_evidence = True
+
+    stale_readiness_evidence = (
+        stale_phase_evidence_age
+        or stale_phase_state_age
+        or stale_phase_anchor_age
+        or stale_fit_epoch_age
+        or phase_evidence_fresh is False
+        or (no_burst_rows and phase_evidence_fresh is not True)
+    )
 
     payload.update({
         "base_period_s": base_period_s,
@@ -1912,6 +1970,41 @@ def _live_sync_state_to_dict(
             if isinstance(gate_state, dict) and gate_state.get("passed") is False:
                 go_op_failures[f"{section}.{gate_name}"] = str(gate_state.get("reason") or "failed")
     payload["go_operational_gate_failures"] = go_op_failures if go_op_failures else None
+
+    # Stage 10 attribution remediation for live unclassified shape:
+    # ready-like Go diagnostics are present, but older runtime snapshots may
+    # still carry unclassified placeholders in blocking/handoff fields.
+    if (
+        bool(payload.get("go_operational_enabled"))
+        and not bool(payload.get("go_operational_active"))
+        and payload.get("go_operational_blocking_gate") == "go_readiness.unclassified_state"
+        and str(payload.get("handoff_reason") or "") == "go_state_unclassified"
+        and not bool(payload.get("holdover"))
+        and not str(payload.get("go_sync_unusable_reason") or "")
+        and not str(payload.get("go_diagnostic_go_sync_unusable_reason") or "")
+        and payload.get("go_diagnostic_go_sync_usable_quality_ok") is True
+        and payload.get("go_diagnostic_go_sync_usable_holdover_ok") is True
+        and payload.get("go_diagnostic_go_sync_usable_period_agrees") is True
+        and payload.get("go_diagnostic_go_sync_usable_strict_gate_pass") is True
+    ):
+        payload["go_operational_blocking_gate"] = "go_readiness_hysteresis"
+        payload["go_operational_blocking_reason"] = "go_ready_pending_hysteresis"
+        payload["blocking_gate"] = "go_readiness_hysteresis"
+        payload["handoff_reason"] = "go_ready_pending_hysteresis"
+
+    if (
+        bool(payload.get("go_operational_enabled"))
+        and not bool(payload.get("go_operational_active"))
+        and stale_readiness_evidence
+        and (
+            payload.get("go_operational_blocking_gate") == "go_readiness_hysteresis"
+            or payload.get("handoff_reason") == "go_ready_pending_hysteresis"
+        )
+    ):
+        payload["go_operational_blocking_gate"] = "go_readiness.go_evidence_fresh"
+        payload["go_operational_blocking_reason"] = "stale_go_evidence"
+        payload["blocking_gate"] = "go_readiness.go_evidence_fresh"
+        payload["handoff_reason"] = "stale_go_evidence"
 
     # --- Feature flag exposure ---
     payload["go_refiner_operational_enabled"] = go_refiner_operational_enabled
@@ -10037,6 +10130,11 @@ class RadarState:
                     "go_operational_blocking_reason": handoff_reason,
                     "phase_authority_blocking_gate": phase_blocking_gate or None,
                     "phase_authority_blocking_reason": str(go_sync.get("phase_blocking_reason") or "") or None,
+                    # Temporary runtime marker: proves this synthesized fallback
+                    # branch is executing in the live backend process.
+                    "stage10_serializer_fallback_path": "sync_state_none_go_sync",
+                    "stage10_serializer_fallback_version": "491e8fff",
+                    "stage10_serializer_fallback_applied": True,
                 }
 
         snapshot = {

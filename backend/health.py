@@ -9,6 +9,7 @@ import asyncio
 import logging
 import subprocess
 import time
+import traceback
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -70,16 +71,22 @@ def read_throttle_flags() -> dict | None:
 # Event-loop lag sampler — started as a background task by main.py
 # ---------------------------------------------------------------------------
 _loop_lag_ms: float = 0.0
+_loop_heartbeat_ts: float = 0.0
 
 
 async def loop_lag_sampler() -> None:
     """Measure asyncio event-loop lag by comparing intended vs actual sleep duration."""
-    global _loop_lag_ms
+    global _loop_lag_ms, _loop_heartbeat_ts
     while True:
         t0 = time.monotonic()
         await asyncio.sleep(1.0)
         elapsed = time.monotonic() - t0
         _loop_lag_ms = round((elapsed - 1.0) * 1000, 1)
+        _loop_heartbeat_ts = time.time()
+
+
+def get_loop_heartbeat_ts() -> float:
+    return float(_loop_heartbeat_ts)
 
 
 # ---------------------------------------------------------------------------
@@ -88,10 +95,11 @@ async def loop_lag_sampler() -> None:
 _context: dict = {}
 
 
-def register_context(msg_queue, clients: list) -> None:
+def register_context(msg_queue, clients: list, radar_state=None) -> None:
     """Register main.py objects so the health endpoint can read live values."""
     _context["msg_queue"] = msg_queue
     _context["clients"] = clients
+    _context["radar_state"] = radar_state
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +108,19 @@ def register_context(msg_queue, clients: list) -> None:
 
 @router.get("")
 async def get_health() -> dict:
+    radar_lock_runtime = None
+    radar_lock_type = None
+    radar_lock_snapshot_error = None
+    radar_state = _context.get("radar_state")
+    if radar_state is not None:
+        try:
+            radar_lock = getattr(radar_state, "_lock", None)
+            radar_lock_type = type(radar_lock).__name__ if radar_lock is not None else None
+            if radar_lock is not None and hasattr(radar_lock, "snapshot"):
+                radar_lock_runtime = radar_lock.snapshot()
+        except Exception:
+            radar_lock_snapshot_error = traceback.format_exc(limit=1)
+            radar_lock_runtime = None
     return {
         "cpu_temp_c":    read_pi_temp(),
         "cpu_percent":   read_cpu_percent(),
@@ -107,4 +128,9 @@ async def get_health() -> dict:
         "throttle":      read_throttle_flags(),
         "queue_depth":   _context["msg_queue"].qsize() if "msg_queue" in _context else None,
         "ws_clients":    len(_context["clients"])       if "clients"   in _context else None,
+        "radar_lock_runtime": radar_lock_runtime,
+        "radar_state_present": "radar_state" in _context and _context.get("radar_state") is not None,
+        "context_keys": sorted(_context.keys()),
+        "radar_lock_type": radar_lock_type,
+        "radar_lock_snapshot_error": radar_lock_snapshot_error,
     }
