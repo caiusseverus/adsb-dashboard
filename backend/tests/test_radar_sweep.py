@@ -6264,6 +6264,218 @@ def test_screenshot_shape_stale_anchor_not_emitted_as_trusted_and_gate_is_concre
     assert payload["handoff_reason"] != "go_state_unclassified"
 
 
+def test_trusted_anchor_with_fresh_evidence_and_old_phase_state_ts_remains_trusted():
+    """When phase_evidence_fresh=True and phase_evidence_age_s is fresh,
+    an old phase_state_ts must not demote the anchor to retained_stale."""
+    from radar.sync_models import LiveSyncState
+    now = time.time()
+    sync = LiveSyncState(
+        iid=9930,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=now - 500.0,  # old phase_state_ts
+        source="go_frame_sync",
+        usable=True,
+        handoff_state="GO_REFINED_READY",
+        handoff_reason="go_runtime_operational",
+        phase_basis="anchor_relative",
+        phase_status="trusted",
+        phase_anchor_icao="ABC123",
+        phase_anchor_status="selected",
+        phase_anchor_since_ts=now - 1.0,
+        last_sync_driving_fit_observation_age_s=1.0,  # fresh evidence
+        anchor_last_validation_age_s=1.0,              # fresh validation
+        fit_total_observations=50,
+        fit_icao_count=5,
+        phase_validation_status="confirmed",
+        phase_validation_contributors=50,
+        n_burst_obs_inliers=10,
+    )
+    payload = _live_sync_state_to_dict(sync, suppress_consistency_logging=True)
+    assert payload["phase_status_display"] == "anchor_trusted"
+    assert payload["phase_status"] == "trusted"
+    assert payload["phase_evidence_fresh"] is True
+    # Diagnostic fields still report the old state timestamp
+    assert payload.get("phase_state_ts") is not None
+
+
+def test_trusted_anchor_with_stale_evidence_demotes_to_retained_stale():
+    """When phase_evidence_fresh is false, anchor must demote regardless of other state."""
+    from radar.sync_models import LiveSyncState
+    now = time.time()
+    sync = LiveSyncState(
+        iid=9931,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=now,
+        source="go_frame_sync",
+        usable=True,
+        handoff_state="GO_REFINED_READY",
+        handoff_reason="go_runtime_operational",
+        phase_basis="anchor_relative",
+        phase_status="trusted",
+        phase_anchor_icao="ABC123",
+        phase_anchor_status="selected",
+        phase_anchor_since_ts=now - 1.0,
+        last_sync_driving_fit_observation_age_s=5000.0,  # stale evidence
+        anchor_last_validation_age_s=5000.0,              # stale validation
+        fit_total_observations=50,
+        fit_icao_count=5,
+    )
+    payload = _live_sync_state_to_dict(sync, suppress_consistency_logging=True)
+    assert payload["phase_status_display"] == "anchor_retained_stale"
+    assert payload["phase_evidence_fresh"] is False
+    assert payload["phase_anchor_retained_without_current_evidence"] is True
+
+
+def test_trusted_anchor_with_no_eligible_sync_driving_evidence_demotes():
+    """When no current eligible sync-driving evidence exists, anchor demotes."""
+    from radar.sync_models import LiveSyncState
+    now = time.time()
+    sync = LiveSyncState(
+        iid=9932,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=now,
+        source="go_frame_sync",
+        usable=True,
+        handoff_state="GO_REFINED_READY",
+        handoff_reason="go_runtime_operational",
+        phase_basis="anchor_relative",
+        phase_status="trusted",
+        phase_anchor_icao="ABC123",
+        phase_anchor_status="selected",
+        phase_anchor_since_ts=now - 1.0,
+        last_sync_driving_fit_observation_age_s=None,  # no sync-driving evidence
+        anchor_last_validation_age_s=None,
+        fit_total_observations=0,
+        fit_icao_count=0,
+    )
+    payload = _live_sync_state_to_dict(sync, suppress_consistency_logging=True)
+    assert payload["phase_status_display"] == "anchor_retained_stale"
+    assert payload["phase_anchor_retained_without_current_evidence"] is True
+
+
+def test_old_phase_state_ts_is_diagnostic_only_does_not_override_fresh_evidence():
+    """phase_state_age_s may be large while anchor_trusted when phase evidence is fresh."""
+    from radar.sync_models import LiveSyncState
+    now = time.time()
+    sync = LiveSyncState(
+        iid=9933,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=now - 3600.0,  # 1 hour old state timestamp
+        source="go_frame_sync",
+        usable=True,
+        handoff_state="GO_REFINED_READY",
+        handoff_reason="go_runtime_operational",
+        phase_basis="anchor_relative",
+        phase_status="trusted",
+        phase_anchor_icao="ABC123",
+        phase_anchor_status="selected",
+        phase_anchor_since_ts=now - 1.0,
+        last_sync_driving_fit_observation_age_s=0.5,  # very fresh evidence
+        anchor_last_validation_age_s=0.5,
+        fit_total_observations=100,
+        fit_icao_count=8,
+    )
+    payload = _live_sync_state_to_dict(sync, suppress_consistency_logging=True)
+    # Anchor must remain trusted despite very old phase_state_ts
+    assert payload["phase_status_display"] == "anchor_trusted"
+    assert payload["phase_evidence_fresh"] is True
+    # Diagnostic: phase_state_ts is old (≈ 1 hour ago)
+    phase_state_ts = payload.get("phase_state_ts")
+    assert phase_state_ts is not None
+    assert phase_state_ts < time.time() - 300.0
+    # But the anchor stays trusted because evidence is fresh
+
+
+def test_fit_epoch_observation_age_bridges_missing_sync_driving_evidence():
+    """When last_sync_driving_fit_observation_age_s is None but
+    fit_epoch_last_observation_age_s is available on LiveSyncState,
+    the fit epoch age must be used to compute sync_driving_fit_age_s
+    so that no_current_sync_driving_evidence is false and anchor
+    remains trusted."""
+    from radar.sync_models import LiveSyncState
+    now = time.time()
+    sync = LiveSyncState(
+        iid=9940,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=now - 10.0,
+        source="go_frame_sync",
+        usable=True,
+        handoff_state="GO_REFINED_READY",
+        handoff_reason="go_runtime_operational",
+        phase_basis="anchor_relative",
+        phase_status="trusted",
+        phase_anchor_icao="ABC123",
+        phase_anchor_status="selected",
+        phase_anchor_since_ts=now - 1.0,
+        last_sync_driving_fit_observation_age_s=None,  # missing
+        anchor_last_validation_age_s=None,              # missing
+        fit_epoch_last_observation_age_s=2.0,           # available from Go diagnostics
+        n_burst_obs_inliers=10,
+    )
+    payload = _live_sync_state_to_dict(sync, go_sync={}, suppress_consistency_logging=True)
+    # Anchor must remain trusted because fit_epoch_last_observation_age_s bridges
+    # the missing last_sync_driving_fit_observation_age_s
+    assert payload["phase_status_display"] == "anchor_trusted"
+    assert payload["phase_evidence_fresh"] is True
+
+
+def test_sync_driving_evidence_still_fails_when_all_sources_missing():
+    """When all evidence age sources are missing, the stale demotion
+    must still occur."""
+    from radar.sync_models import LiveSyncState
+    now = time.time()
+    sync = LiveSyncState(
+        iid=9941,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=now - 10.0,
+        source="go_frame_sync",
+        usable=True,
+        handoff_state="GO_REFINED_READY",
+        handoff_reason="go_runtime_operational",
+        phase_basis="anchor_relative",
+        phase_status="trusted",
+        phase_anchor_icao="ABC123",
+        phase_anchor_status="selected",
+        phase_anchor_since_ts=now - 1.0,
+        last_sync_driving_fit_observation_age_s=None,
+        anchor_last_validation_age_s=None,
+        fit_epoch_last_observation_age_s=None,  # also missing
+    )
+    payload = _live_sync_state_to_dict(sync, go_sync={}, suppress_consistency_logging=True)
+    assert payload["phase_status_display"] == "anchor_retained_stale"
+    assert payload["phase_anchor_retained_without_current_evidence"] is True
+
+
 def test_stale_go_evidence_exposes_absent_row_reason_and_observation_ages():
     state = RadarState()
     iid = 9911
@@ -6296,7 +6508,8 @@ def test_fresh_go_evidence_without_burst_rows_uses_display_absence_reason():
     assert payload["go_diagnostic_burst_rows_absence_reason"] == "no_display_burst_sync_rows"
 
 
-def test_anchor_trusted_demoted_when_phase_state_ts_is_stale():
+def test_anchor_trusted_remains_trusted_when_only_phase_state_ts_is_stale():
+    """Old phase_state_ts alone must not demote anchor when evidence is fresh."""
     sync = LiveSyncState(
         iid=9921,
         period_s=4.0,
@@ -6304,7 +6517,7 @@ def test_anchor_trusted_demoted_when_phase_state_ts_is_stale():
         phase_offset_deg=10.0,
         sync_quality=1.0,
         sync_jitter_deg=2.0,
-        last_sync_update_ts=time.time() - 120.0,
+        last_sync_update_ts=time.time() - 120.0,  # stale state timestamp
         source="go_frame_sync",
         usable=True,
         phase_basis="anchor_relative",
@@ -6312,13 +6525,15 @@ def test_anchor_trusted_demoted_when_phase_state_ts_is_stale():
         phase_anchor_icao="ABC123",
         phase_anchor_status="selected",
         phase_anchor_since_ts=time.time() - 2.0,
-        last_sync_driving_fit_observation_age_s=1.0,
+        last_sync_driving_fit_observation_age_s=1.0,  # fresh evidence
         anchor_last_validation_age_s=1.0,
         burst_rows_absence_reason="",
     )
     payload = _live_sync_state_to_dict(sync, go_sync={"last_sync_driving_fit_observation_age_s": 1.0})
-    assert payload["phase_status_display"] != "anchor_trusted"
-    assert payload["phase_status_display"] == "anchor_retained_stale"
+    # Anchor remains trusted because evidence is fresh, even with old phase_state_ts
+    assert payload["phase_status_display"] == "anchor_trusted"
+    # phase_state_ts is old but diagnostic-only
+    assert payload.get("phase_state_ts") is not None
 
 
 def test_stale_fit_epoch_blocks_hysteresis_and_maps_to_go_evidence_fresh(monkeypatch):

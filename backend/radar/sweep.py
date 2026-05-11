@@ -397,6 +397,9 @@ def _build_go_diagnostic_fields(
             "holdover": getattr(sync, "holdover", None),
             "holdover_reason": getattr(sync, "holdover_reason", None),
             "last_updated": getattr(sync, "last_sync_update_ts", None),
+            "fit_epoch_last_observation_age_s": getattr(sync, "fit_epoch_last_observation_age_s", None),
+            "last_sync_driving_fit_observation_age_s": getattr(sync, "last_sync_driving_fit_observation_age_s", None),
+            "anchor_last_validation_age_s": getattr(sync, "anchor_last_validation_age_s", None),
         }
     base_period_s = go_payload.get("base_period_s")
     period_delta_s = go_payload.get("period_delta_s")
@@ -1332,9 +1335,15 @@ def _live_sync_state_to_dict(
     sync_driving_fit_age_s = _to_finite_float(getattr(sync, "last_sync_driving_fit_observation_age_s", None))
     if sync_driving_fit_age_s is None and isinstance(go_sync, dict):
         sync_driving_fit_age_s = _to_finite_float(go_sync.get("last_sync_driving_fit_observation_age_s"))
+    if sync_driving_fit_age_s is None:
+        sync_driving_fit_age_s = _to_finite_float(getattr(sync, "fit_epoch_last_observation_age_s", None))
+    if sync_driving_fit_age_s is None and isinstance(go_sync, dict):
+        sync_driving_fit_age_s = _to_finite_float(go_sync.get("fit_epoch_last_observation_age_s"))
     anchor_validation_age_s = _to_finite_float(getattr(sync, "anchor_last_validation_age_s", None))
     if anchor_validation_age_s is None and isinstance(go_sync, dict):
         anchor_validation_age_s = _to_finite_float(go_sync.get("anchor_last_validation_age_s"))
+    if anchor_validation_age_s is None:
+        anchor_validation_age_s = _to_finite_float(getattr(sync, "fit_epoch_last_observation_age_s", None))
     phase_evidence_age_s = (
         sync_driving_fit_age_s
         if sync_driving_fit_age_s is not None
@@ -2003,7 +2012,6 @@ def _live_sync_state_to_dict(
         and (
             phase_evidence_fresh is False
             or stale_phase_evidence_age
-            or stale_phase_state_age
             or stale_phase_anchor_age
             or stale_fit_epoch_age
             or no_current_sync_driving_evidence
