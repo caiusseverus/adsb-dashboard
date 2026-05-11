@@ -1749,6 +1749,50 @@ def test_go_sync_snapshot_without_live_sync_state_serializes_nonactive_go_blocke
     assert sync_state["go_operational_blocking_gate"] == "go_readiness.go_sync_state_usable"
     assert sync_state["go_operational_blocking_gate"] != "phase_readiness.phase_basis_supported"
     assert sync_state["phase_authority_blocking_gate"] == "phase_readiness.phase_basis_supported"
+    assert sync_state["strict_gate_pass"] is False
+    assert sync_state["strict_gate_fail_reason"] in {"strict_gate_failed", "go_sync_unusable"}
+    assert sync_state["strict_gate_ref_icao"] is None
+    assert sync_state["strict_gate_fit_obs"] == 0
+    assert sync_state["strict_gate_fit_icaos"] == 0
+    assert sync_state["strict_gate_fit_span_s"] in {None, 0.0}
+    assert sync_state["strict_gate_thresholds_used"]["strict_gate_pass_required"] is True
+
+
+def test_go_sync_snapshot_quality_below_threshold_exports_quality_components(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    state = RadarState()
+    state._go_sync_states_by_iid[171] = {
+        "source": "go_frame_sync",
+        "go_sync_unusable_reason": "quality_below_threshold",
+        "period_refinement_status": "stable",
+        "status_at_quality_eval": "SINGLE_RADAR",
+        "exported_rotation_status": "SINGLE_RADAR",
+        "has_base_period_at_quality_eval": True,
+        "quality_formula_path": "syncQuality(status,has_base_period)",
+        "quality_status_mismatch": False,
+        "quality_expected_from_exported_status": 1.0,
+        "go_diagnostic_sync_quality": 0.2,
+        "quality_eval_seq": 9,
+        "quality_eval_age_s": 0.5,
+        "go_sync_usable_quality_ok": False,
+    }
+    snapshot = state.get_live_sync_snapshot(171, window_s=90.0, debug_limit=20)
+    sync_state = snapshot["sync_state"]
+    assert sync_state is not None
+    assert sync_state["go_operational_active"] is False
+    assert sync_state["go_operational_blocking_gate"] == "go_readiness.go_sync_state_usable"
+    assert sync_state["go_sync_unusable_reason"] == "quality_below_threshold"
+    assert sync_state["quality_gate_fail_reason"] == "quality_below_threshold"
+    assert sync_state["status_at_quality_eval"] == "SINGLE_RADAR"
+    assert sync_state["exported_rotation_status"] == "SINGLE_RADAR"
+    assert sync_state["has_base_period_at_quality_eval"] is True
+    assert sync_state["quality_formula_path"] == "syncQuality(status,has_base_period)"
+    assert sync_state["quality_status_mismatch"] is False
+    assert sync_state["expected_quality_from_status"] == pytest.approx(1.0)
+    assert sync_state["sync_quality"] == pytest.approx(0.2)
+    assert sync_state["quality_eval_seq"] == 9
+    assert sync_state["quality_eval_age_s"] == pytest.approx(0.5)
 
 
 def test_go_sync_snapshot_without_live_sync_state_ready_like_maps_to_hysteresis(monkeypatch):

@@ -673,6 +673,125 @@ def _build_discontinuity_population_diagnostics(
     return diagnostics
 
 
+def _build_go_promotion_failure_diagnostic_aliases(payload: dict, go_sync: dict | None = None) -> dict:
+    """Expose compact, analysis-friendly aliases for Go promotion diagnostics.
+
+    This is diagnostics-only mapping from existing exported fields; no behavior
+    or threshold logic is changed here.
+    """
+    go_payload = go_sync if isinstance(go_sync, dict) else {}
+    ref_icao = payload.get("go_diagnostic_last_update_epoch_ref_icao") or payload.get("last_update_epoch_ref_icao")
+    phase_anchor_icao = payload.get("phase_anchor_icao")
+    phase_anchor_candidates = payload.get("phase_anchor_candidates") or []
+    candidate_icaos: set[str] = set()
+    if isinstance(phase_anchor_candidates, list):
+        for row in phase_anchor_candidates:
+            if isinstance(row, dict):
+                icao = str(row.get("icao") or "").strip()
+                if icao:
+                    candidate_icaos.add(icao)
+    strict_gate_residual_deg = payload.get("go_diagnostic_last_update_epoch_residual_deg")
+    strict_gate_abs_residual_deg = (
+        abs(float(strict_gate_residual_deg))
+        if _is_finite_number(strict_gate_residual_deg)
+        else None
+    )
+    strict_gate_pass = payload.get("go_diagnostic_go_sync_usable_strict_gate_pass")
+    if strict_gate_pass is None:
+        reason_probe = str(payload.get("go_sync_unusable_reason") or payload.get("go_diagnostic_go_sync_unusable_reason") or "")
+        if reason_probe == "strict_gate_failed":
+            strict_gate_pass = False
+    strict_gate_fail_reason = None if strict_gate_pass is True else (
+        payload.get("go_sync_unusable_reason")
+        or payload.get("go_diagnostic_go_sync_unusable_reason")
+        or payload.get("go_operational_blocking_reason")
+    )
+
+    quality_gate_fail_reason = None
+    go_sync_unusable_reason = str(payload.get("go_sync_unusable_reason") or "")
+    if go_sync_unusable_reason == "quality_below_threshold":
+        quality_gate_fail_reason = "quality_below_threshold"
+    elif payload.get("go_diagnostic_go_sync_usable_quality_ok") is False:
+        quality_gate_fail_reason = "quality_check_failed"
+
+    strict_thresholds = {
+        # Existing threshold-like diagnostic hints exported by Go, not recomputed.
+        "quality_ok_required": True,
+        "holdover_ok_required": True,
+        "period_agrees_required": True,
+        "strict_gate_pass_required": True,
+        "hard_bound_limit_s": payload.get("go_diagnostic_hard_bound_limit_s"),
+        "hard_bound_limit_ppm": payload.get("go_diagnostic_hard_bound_limit_ppm"),
+    }
+    strict_gate_fit_obs = payload.get("go_diagnostic_fit_observation_count")
+    strict_gate_fit_icaos = payload.get("go_diagnostic_fit_icao_count")
+    strict_gate_fit_span_s = payload.get("go_diagnostic_fit_span_s")
+    if strict_gate_pass is False:
+        if strict_gate_fit_obs is None:
+            strict_gate_fit_obs = 0
+        if strict_gate_fit_icaos is None:
+            strict_gate_fit_icaos = 0
+        if strict_gate_fit_span_s is None:
+            strict_gate_fit_span_s = 0.0
+
+    return {
+        # Strict gate diagnostics
+        "strict_gate_pass": strict_gate_pass,
+        "strict_gate_fail_reason": strict_gate_fail_reason,
+        "strict_gate_thresholds_used": strict_thresholds,
+        "strict_gate_residual_deg": strict_gate_residual_deg,
+        "strict_gate_abs_residual_deg": strict_gate_abs_residual_deg,
+        "strict_gate_ref_icao": ref_icao or None,
+        "strict_gate_ref_pos_age_s": payload.get("go_diagnostic_last_update_epoch_ref_pos_age_s") or payload.get("last_update_epoch_ref_pos_age_s"),
+        "strict_gate_ref_range_nm": go_payload.get("last_update_epoch_ref_range_nm"),
+        "strict_gate_n_aircraft": payload.get("go_diagnostic_last_update_epoch_n_aircraft") or payload.get("last_update_epoch_n_aircraft"),
+        "strict_gate_fit_obs": strict_gate_fit_obs,
+        "strict_gate_fit_icaos": strict_gate_fit_icaos,
+        "strict_gate_fit_span_s": strict_gate_fit_span_s,
+        "strict_gate_min_fit_obs": go_payload.get("go_sync_usable_min_fit_obs"),
+        "strict_gate_min_fit_icaos": go_payload.get("go_sync_usable_min_fit_icaos"),
+        "strict_gate_min_fit_span_s": go_payload.get("go_sync_usable_min_fit_span_s"),
+        "strict_gate_reference_changed": bool(
+            payload.get("go_diagnostic_phase_offset_discontinuity_reference_changed")
+            or go_payload.get("reference_changed_recently")
+        ),
+        "strict_gate_anchor_changed": bool(
+            str(payload.get("go_diagnostic_fit_epoch_reset_reason") or "") == "anchor_changed"
+            or str(payload.get("fit_epoch_reset_reason") or "") == "anchor_changed"
+            or str(payload.get("phase_anchor_replacement_reason") or "") != ""
+        ),
+        "strict_gate_population_state": payload.get("population_validation_state") or payload.get("phase_validation_status"),
+        "strict_gate_recent_hard_rejects": payload.get("go_diagnostic_consecutive_hard_residual_rejects"),
+        "strict_gate_last_epoch_age_s": payload.get("go_diagnostic_sync_epoch_age_s") or payload.get("sync_epoch_age_s"),
+        "strict_gate_last_update_outcome": payload.get("go_diagnostic_last_update_epoch_outcome") or payload.get("last_update_epoch_outcome"),
+        # Quality gate diagnostics
+        "sync_quality": payload.get("go_diagnostic_sync_quality", payload.get("sync_quality")),
+        "sync_quality_threshold": go_payload.get("go_sync_usable_quality_threshold"),
+        "status_at_quality_eval": payload.get("go_diagnostic_status_at_quality_eval"),
+        "exported_rotation_status": payload.get("go_diagnostic_exported_rotation_status"),
+        "has_base_period_at_quality_eval": payload.get("go_diagnostic_has_base_period_at_quality_eval"),
+        "quality_formula_path": payload.get("go_diagnostic_quality_formula_path"),
+        "quality_status_mismatch": payload.get("go_diagnostic_quality_status_mismatch"),
+        "expected_quality_from_status": payload.get("go_diagnostic_quality_expected_from_exported_status"),
+        "base_period_present": bool(_is_finite_number(payload.get("python_base_period_s"))),
+        "quality_eval_seq": payload.get("go_diagnostic_quality_eval_seq"),
+        "quality_eval_age_s": payload.get("go_diagnostic_quality_eval_age_s"),
+        "quality_gate_fail_reason": quality_gate_fail_reason,
+        # Reference / outlier diagnostics
+        "strict_gate_reference_in_anchor_candidates": (
+            bool(ref_icao) and str(ref_icao) in candidate_icaos
+        ),
+        "strict_gate_reference_suspicious_outlier": (
+            bool(ref_icao)
+            and str(payload.get("suspicious_icao_last_reason") or "") != ""
+        ),
+        "strict_gate_reference_suspicious_reason": payload.get("suspicious_icao_last_reason"),
+        "strict_gate_reference_failure_count": go_payload.get("strict_gate_reference_failure_count"),
+        "strict_gate_reference_outlier_count": go_payload.get("strict_gate_reference_outlier_count"),
+        "strict_gate_current_anchor_icao": phase_anchor_icao,
+    }
+
+
 def _dual_basis_row_match_key(row: dict) -> tuple[str | None, float]:
     icao = row.get("icao")
     ts = row.get("beam_center_us")
@@ -1881,6 +2000,7 @@ def _live_sync_state_to_dict(
     })
 
     payload.update(_build_go_diagnostic_fields(sync, go_sync=go_sync))
+    payload.update(_build_go_promotion_failure_diagnostic_aliases(payload, go_sync=go_sync))
     payload["transition_quarantine_count"] = int(
         (go_sync or {}).get(
             "transition_quarantine_count",
@@ -10130,12 +10250,43 @@ class RadarState:
                     "go_operational_blocking_reason": handoff_reason,
                     "phase_authority_blocking_gate": phase_blocking_gate or None,
                     "phase_authority_blocking_reason": str(go_sync.get("phase_blocking_reason") or "") or None,
+                    "go_diagnostic_go_sync_usable_quality_ok": go_sync.get("go_diagnostic_go_sync_usable_quality_ok", go_sync.get("go_sync_usable_quality_ok")),
+                    "go_diagnostic_go_sync_usable_holdover_ok": go_sync.get("go_diagnostic_go_sync_usable_holdover_ok", go_sync.get("go_sync_usable_holdover_ok")),
+                    "go_diagnostic_go_sync_usable_period_agrees": go_sync.get("go_diagnostic_go_sync_usable_period_agrees", go_sync.get("go_sync_usable_period_agrees")),
+                    "go_diagnostic_go_sync_usable_strict_gate_pass": go_sync.get("go_diagnostic_go_sync_usable_strict_gate_pass", go_sync.get("go_sync_usable_strict_gate_pass")),
+                    "go_diagnostic_go_sync_unusable_reason": diag_unusable_reason or None,
+                    "go_diagnostic_sync_quality": go_sync.get("go_diagnostic_sync_quality"),
+                    "go_diagnostic_status_at_quality_eval": go_sync.get("status_at_quality_eval"),
+                    "go_diagnostic_exported_rotation_status": go_sync.get("exported_rotation_status"),
+                    "go_diagnostic_has_base_period_at_quality_eval": go_sync.get("has_base_period_at_quality_eval"),
+                    "go_diagnostic_quality_formula_path": go_sync.get("quality_formula_path"),
+                    "go_diagnostic_quality_status_mismatch": go_sync.get("quality_status_mismatch"),
+                    "go_diagnostic_quality_expected_from_exported_status": go_sync.get("quality_expected_from_exported_status"),
+                    "go_diagnostic_quality_eval_seq": go_sync.get("quality_eval_seq"),
+                    "go_diagnostic_quality_eval_age_s": go_sync.get("quality_eval_age_s"),
+                    "go_diagnostic_fit_observation_count": go_sync.get("fit_observation_count"),
+                    "go_diagnostic_fit_icao_count": go_sync.get("fit_icao_count"),
+                    "go_diagnostic_fit_span_s": go_sync.get("fit_span_s"),
+                    "go_diagnostic_last_update_epoch_residual_deg": go_sync.get("last_update_epoch_residual_deg"),
+                    "go_diagnostic_last_update_epoch_outcome": go_sync.get("last_update_epoch_outcome"),
+                    "go_diagnostic_last_update_epoch_ref_icao": go_sync.get("last_update_epoch_ref_icao"),
+                    "go_diagnostic_last_update_epoch_ref_pos_age_s": go_sync.get("last_update_epoch_ref_pos_age_s"),
+                    "go_diagnostic_last_update_epoch_n_aircraft": go_sync.get("last_update_epoch_n_aircraft"),
+                    "go_diagnostic_sync_epoch_age_s": go_sync.get("sync_epoch_age_s"),
+                    "go_diagnostic_consecutive_hard_residual_rejects": go_sync.get("consecutive_hard_residual_rejects"),
+                    "go_diagnostic_phase_offset_discontinuity_reference_changed": go_sync.get("phase_offset_discontinuity_reference_changed"),
+                    "go_diagnostic_hard_bound_limit_s": go_sync.get("hard_bound_limit_s"),
+                    "go_diagnostic_hard_bound_limit_ppm": go_sync.get("hard_bound_limit_ppm"),
+                    "suspicious_icao_last_reason": go_sync.get("suspicious_icao_last_reason"),
+                    "phase_anchor_icao": go_sync.get("phase_anchor_icao"),
+                    "phase_anchor_candidates": go_sync.get("phase_anchor_candidates") or [],
                     # Temporary runtime marker: proves this synthesized fallback
                     # branch is executing in the live backend process.
                     "stage10_serializer_fallback_path": "sync_state_none_go_sync",
                     "stage10_serializer_fallback_version": "491e8fff",
                     "stage10_serializer_fallback_applied": True,
                 }
+                sync_state.update(_build_go_promotion_failure_diagnostic_aliases(sync_state, go_sync=go_sync))
 
         snapshot = {
             "type": "radar_sync",
