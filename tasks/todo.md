@@ -71,3 +71,36 @@
 - Added transport + mapping for quality-eval fields, explicit quality diagnostics unavailable-reason fallback, and strict gate primary/subreason diagnostics (diagnostic-only).
 - Targeted backend tests passed; full radar-core Go test run could not complete in this sandbox due toolchain/cache environment constraints.
 - Live 5-minute capture could not be run because no backend process was reachable on `127.0.0.1:8000` in this sandbox session.
+
+## 2026-05-15 Post-Cleanup Blocker Baseline (Current Build)
+
+- [x] Capture fresh 10-minute sync-snapshot-only baseline from localhost:8000 for top 20-30 active IIDs (compact rows only).
+- [x] Produce compact-row dataset and limited raw exemplars per blocker class with no behavior/policy changes.
+- [x] Compute requested distributions/counters/evidence: handoff dwell, blocker gates, reasons, strict-gate primary reasons, quarantine, stale-anchor trust violations, unclassified/missing blocker recurrence, hard residual reject counters.
+- [x] Compare best active IID versus typical blocked IID using the captured window.
+- [x] Classify remaining blockers into expected conservative gating, real data/support limitation, likely bug, instrumentation ambiguity.
+- [x] Add review summary and exactly one next action recommendation.
+
+### Review
+- Fresh 10-minute capture succeeded (`3000` compact sync-snapshot rows, `0` failures) for top 25 active IIDs.
+- Handoff-state and handoff-reason fields are populated and show active conservative gating behavior (`GO_REFINING`, `GO_REFINED_READY`, `HOLDOVER`).
+- Compact snapshot blocker-attribution/quality/strict/quarantine fields requested for this baseline were null for all rows in this runtime (`go_operational_blocking_gate`, strict-gate primary reason, quality-below-threshold status, holdover reason, quarantine counters), yielding `go_state_unclassified_or_missing_blocker_rows=3000`.
+- Stale-anchor trust violation count stayed at `0` in this window.
+- Single next action recommendation: restore compact snapshot propagation of Go blocker/strict/quality/quarantine fields, then rerun this same baseline protocol unchanged.
+
+## 2026-05-15 Compact Blocker Baseline Extraction Fix
+
+- [x] Compare raw sync-snapshot payload vs compact extraction for representative live rows and confirm mismatch source.
+- [x] Fix compact extraction mapping to read blocker/quality/strict/quarantine fields from current `sync_state` paths with explicit alias fallbacks.
+- [x] Remove lossy `or`-style fallback behavior for zero/false preservation via explicit `None`-aware selection.
+- [x] Add extraction tests with representative fixture shapes, including zero/non-zero counters and false/empty-string values.
+- [x] Re-run exact 10-minute compact baseline and verify acceptance checks on non-active blocker attribution and go-runtime active consistency.
+
+### Review
+- Root cause confirmed in extraction path, not runtime sync behavior: the baseline script read many fields from outdated top-level paths instead of `sync_state`/diagnostic aliases.
+- Added `tools/blocker_baseline_compact.py` with `extract_compact_row()` and side-by-side raw-vs-compact evidence output.
+- Added `backend/tests/test_blocker_baseline_compact.py` (3 tests passing) to lock field mapping and zero/false preservation.
+- Final rerun (`blocker_baseline_compact_fixed_r2_20260515T230753Z_*`) produced consistent compact output:
+  - non-active + sync_state-present rows with missing `go_operational_blocking_gate`: `0/2760`
+  - `handoff_reason=go_runtime_operational` rows with `go_operational_active!=true`: `0/240`
+  - stale evidence equivalent boolean surfaced (`True:720`, `False:2280`)
