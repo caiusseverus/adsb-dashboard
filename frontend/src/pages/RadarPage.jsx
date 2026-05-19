@@ -2553,7 +2553,129 @@ function SyncModeStatusPanel({
   )
 }
 
-function PhaseAnchorPanel({ syncState, observations, candidates, identity }) {
+function PhaseAnchorPanel({ iid, syncState, observations, candidates, identity }) {
+  const [geoCalForm, setGeoCalForm] = useState({
+    offsetDeg: '',
+    maxAgeS: '1800',
+    confidence: '',
+    notes: '',
+    locationLat: '',
+    locationLon: '',
+  })
+  const [geoCalBusy, setGeoCalBusy] = useState(false)
+  const [geoCalError, setGeoCalError] = useState(null)
+  const [geoCalApiStatus, setGeoCalApiStatus] = useState(null)
+
+  const refreshGeoCalibration = useCallback(async () => {
+    if (iid == null) return
+    setGeoCalBusy(true)
+    setGeoCalError(null)
+    try {
+      const response = await fetch(`${API_BASE}/api/radar/iids/${iid}/geographic_phase_calibration`)
+      if (!response.ok) {
+        setGeoCalError(`Refresh failed: HTTP ${response.status}`)
+        return
+      }
+      const payload = await response.json()
+      setGeoCalApiStatus(payload)
+    } catch {
+      setGeoCalError('Refresh failed')
+    } finally {
+      setGeoCalBusy(false)
+    }
+  }, [iid])
+
+  useEffect(() => {
+    if (iid == null) {
+      setGeoCalApiStatus(null)
+      return
+    }
+    refreshGeoCalibration()
+  }, [iid, refreshGeoCalibration])
+
+  useEffect(() => {
+    setGeoCalForm(prev => ({
+      ...prev,
+      confidence: syncState?.geographic_phase_confidence_operator != null ? String(syncState.geographic_phase_confidence_operator) : prev.confidence,
+      notes: syncState?.geographic_phase_notes ?? prev.notes,
+      locationLat: syncState?.geographic_phase_location_lat != null ? String(syncState.geographic_phase_location_lat) : prev.locationLat,
+      locationLon: syncState?.geographic_phase_location_lon != null ? String(syncState.geographic_phase_location_lon) : prev.locationLon,
+    }))
+  }, [syncState?.geographic_phase_confidence_operator, syncState?.geographic_phase_notes, syncState?.geographic_phase_location_lat, syncState?.geographic_phase_location_lon])
+
+  const saveGeoCalibration = useCallback(async () => {
+    if (iid == null) return
+    const offset = Number(geoCalForm.offsetDeg)
+    const maxAge = Number(geoCalForm.maxAgeS)
+    const confidence = geoCalForm.confidence.trim() === '' ? null : Number(geoCalForm.confidence)
+    const locationLat = geoCalForm.locationLat.trim() === '' ? null : Number(geoCalForm.locationLat)
+    const locationLon = geoCalForm.locationLon.trim() === '' ? null : Number(geoCalForm.locationLon)
+    if (!Number.isFinite(offset)) {
+      setGeoCalError('offset_deg must be a finite number')
+      return
+    }
+    if (!Number.isFinite(maxAge) || maxAge <= 0) {
+      setGeoCalError('max_age_s must be a positive number')
+      return
+    }
+    if (confidence != null && !Number.isFinite(confidence)) {
+      setGeoCalError('confidence must be numeric when provided')
+      return
+    }
+    if (locationLat != null && !Number.isFinite(locationLat)) {
+      setGeoCalError('location_lat must be numeric when provided')
+      return
+    }
+    if (locationLon != null && !Number.isFinite(locationLon)) {
+      setGeoCalError('location_lon must be numeric when provided')
+      return
+    }
+    setGeoCalBusy(true)
+    setGeoCalError(null)
+    try {
+      const response = await fetch(`${API_BASE}/api/radar/iids/${iid}/geographic_phase_calibration`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          offset_deg: offset,
+          max_age_s: maxAge,
+          confidence_operator: confidence,
+          notes: geoCalForm.notes.trim() || null,
+          location_lat: locationLat,
+          location_lon: locationLon,
+        }),
+      })
+      const payload = await response.json().catch(() => null)
+      setGeoCalApiStatus(payload)
+      if (!response.ok || payload?.updated === false) {
+        setGeoCalError(payload?.reason ? `Save failed: ${payload.reason}` : `Save failed: HTTP ${response.status}`)
+        return
+      }
+    } catch {
+      setGeoCalError('Save failed')
+    } finally {
+      setGeoCalBusy(false)
+    }
+  }, [geoCalForm, iid])
+
+  const clearGeoCalibration = useCallback(async () => {
+    if (iid == null) return
+    setGeoCalBusy(true)
+    setGeoCalError(null)
+    try {
+      const response = await fetch(`${API_BASE}/api/radar/iids/${iid}/geographic_phase_calibration`, { method: 'DELETE' })
+      const payload = await response.json().catch(() => null)
+      setGeoCalApiStatus(payload)
+      if (!response.ok) {
+        setGeoCalError(`Clear failed: HTTP ${response.status}`)
+      }
+    } catch {
+      setGeoCalError('Clear failed')
+    } finally {
+      setGeoCalBusy(false)
+    }
+  }, [iid])
+
   if (!syncState) {
     return (
       <div style={{ padding: '6px 8px', marginBottom: '0.5rem', border: '1px solid #30363d', borderRadius: '4px', background: '#0b0f14' }}>
@@ -2570,7 +2692,7 @@ function PhaseAnchorPanel({ syncState, observations, candidates, identity }) {
   const impliedRows = (observations || [])
     .filter(obs => isFiniteValue(obs?.implied_phase_offset_deg))
     .slice(-160)
-  const anchorReferenceOffsetDeg = useMemo(() => {
+  const anchorReferenceOffsetDeg = (() => {
     if (!anchorIcao) return null
     let latest = null
     let latestTs = -Infinity
@@ -2583,20 +2705,20 @@ function PhaseAnchorPanel({ syncState, observations, candidates, identity }) {
       }
     }
     return latest ? Number(latest.implied_phase_offset_deg) : null
-  }, [anchorIcao, impliedRows])
-  const anchorRelativeDelta = useCallback((obs) => {
+  })()
+  const anchorRelativeDelta = (obs) => {
     if (!obs || !isFiniteValue(obs.implied_phase_offset_deg) || !Number.isFinite(Number(anchorReferenceOffsetDeg))) {
       return null
     }
     return circularDeltaDeg(obs.implied_phase_offset_deg, anchorReferenceOffsetDeg)
-  }, [anchorReferenceOffsetDeg])
-  const candidateStatusPriority = useCallback((status) => {
+  }
+  const candidateStatusPriority = (status) => {
     if (status === 'selected') return 0
     if (status === 'candidate') return 1
     if (status === 'rejected') return 2
     return 3
-  }, [])
-  const candidateRows = useMemo(() => {
+  }
+  const candidateRows = (() => {
     return [...candidateRowsRaw].sort((a, b) => {
       const aAnchor = a?.icao === anchorIcao ? 0 : 1
       const bAnchor = b?.icao === anchorIcao ? 0 : 1
@@ -2605,8 +2727,8 @@ function PhaseAnchorPanel({ syncState, observations, candidates, identity }) {
       if (statusDiff !== 0) return statusDiff
       return String(a?.icao ?? '').localeCompare(String(b?.icao ?? ''))
     })
-  }, [anchorIcao, candidateRowsRaw, candidateStatusPriority])
-  const latestImpliedRows = useMemo(() => {
+  })()
+  const latestImpliedRows = (() => {
     const latestByIcao = new Map()
     for (const obs of impliedRows) {
       const key = String(obs?.icao ?? '')
@@ -2628,7 +2750,7 @@ function PhaseAnchorPanel({ syncState, observations, candidates, identity }) {
       if (statusDiff !== 0) return statusDiff
       return aIcao.localeCompare(bIcao)
     })
-  }, [anchorIcao, candidateRows, candidateStatusPriority, impliedRows])
+  })()
 
   const scatterW = 520
   const scatterH = 132
@@ -2748,6 +2870,63 @@ function PhaseAnchorPanel({ syncState, observations, candidates, identity }) {
           {Number.isFinite(Number(identity?.phaseStateTs)) ? new Date(Number(identity.phaseStateTs) * 1000).toLocaleTimeString() : '—'}
         </span></span>
         <span className={styles.metricPill}>Anchor ICAO <span className={styles.metricValue}>{identity?.anchorIcao ?? anchorIcao ?? '—'}</span></span>
+      </div>
+      <div style={{ border: '1px solid #30363d', background: '#0f141b', padding: '8px', marginBottom: '8px' }}>
+        <div style={{ color: '#c9d1d9', fontWeight: 600, marginBottom: '4px' }}>Manual Geographic Phase Calibration</div>
+        <div style={{ color: '#8b949e', fontSize: '0.74rem', marginBottom: '6px' }}>
+          Manual geographic phase calibration makes this radar localisation-capable only while current sync is operational. Incorrect offsets produce incorrect bearings.
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '8px', fontSize: '0.72rem' }}>
+          <span className={styles.metricPill}>Geographic status <span className={styles.metricValue}>{syncState.geographic_phase_status ?? '—'}</span></span>
+          <span className={styles.metricPill}>Geo invalid reason <span className={styles.metricValue}>{syncState.geographic_phase_invalid_reason ?? '—'}</span></span>
+          <span className={styles.metricPill}>Geo source <span className={styles.metricValue}>{syncState.geographic_phase_source ?? '—'}</span></span>
+          <span className={styles.metricPill}>Geo age <span className={styles.metricValue}>{Number.isFinite(Number(syncState.geographic_phase_age_s)) ? `${Number(syncState.geographic_phase_age_s).toFixed(0)}s` : '—'}</span></span>
+          <span className={styles.metricPill}>Geo confidence <span className={styles.metricValue}>{fmtNumber(syncState.geographic_phase_confidence_operator, 2)}</span></span>
+          <span className={styles.metricPill}>Localisation-safe phase <span className={styles.metricValue} style={{ color: localisationSafePhase ? '#3fb950' : '#ff7b72' }}>{localisationSafePhase ? 'yes' : 'no'}</span></span>
+          <span className={styles.metricPill}>Safe reason <span className={styles.metricValue}>{syncState.localisation_safe_phase_reason ?? '—'}</span></span>
+          <span className={styles.metricPill}>Underlying basis <span className={styles.metricValue}>{syncState.underlying_phase_basis ?? '—'}</span></span>
+          <span className={styles.metricPill}>Underlying authority <span className={styles.metricValue}>{syncState.underlying_phase_authority ?? '—'}</span></span>
+          <span className={styles.metricPill}>Geographic offset (active) <span className={styles.metricValue}>{fmtNumber(syncState.phase_offset_geographic_deg, 2, '°')}</span></span>
+          {syncState.geographic_phase_notes && (
+            <span className={styles.metricPill}>Calibration note <span className={styles.metricValue}>{syncState.geographic_phase_notes}</span></span>
+          )}
+          {syncState.geographic_phase_notes && /test/i.test(String(syncState.geographic_phase_notes)) && (
+            <span className={styles.metricPill} style={{ color: '#d29922' }}>Calibration note type <span className={styles.metricValue}>test-only</span></span>
+          )}
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '8px', marginBottom: '8px' }}>
+          <label style={{ color: '#8b949e', fontSize: '0.72rem' }}>offset_deg
+            <input className={styles.controlInput} value={geoCalForm.offsetDeg} onChange={e => setGeoCalForm(prev => ({ ...prev, offsetDeg: e.target.value }))} />
+          </label>
+          <label style={{ color: '#8b949e', fontSize: '0.72rem' }}>max_age_s
+            <input className={styles.controlInput} value={geoCalForm.maxAgeS} onChange={e => setGeoCalForm(prev => ({ ...prev, maxAgeS: e.target.value }))} />
+          </label>
+          <label style={{ color: '#8b949e', fontSize: '0.72rem' }}>confidence
+            <input className={styles.controlInput} value={geoCalForm.confidence} onChange={e => setGeoCalForm(prev => ({ ...prev, confidence: e.target.value }))} />
+          </label>
+          <label style={{ color: '#8b949e', fontSize: '0.72rem' }}>location_lat (optional)
+            <input className={styles.controlInput} value={geoCalForm.locationLat} onChange={e => setGeoCalForm(prev => ({ ...prev, locationLat: e.target.value }))} />
+          </label>
+          <label style={{ color: '#8b949e', fontSize: '0.72rem' }}>location_lon (optional)
+            <input className={styles.controlInput} value={geoCalForm.locationLon} onChange={e => setGeoCalForm(prev => ({ ...prev, locationLon: e.target.value }))} />
+          </label>
+          <label style={{ color: '#8b949e', fontSize: '0.72rem', gridColumn: '1 / -1' }}>notes
+            <input className={styles.controlInput} value={geoCalForm.notes} onChange={e => setGeoCalForm(prev => ({ ...prev, notes: e.target.value }))} />
+          </label>
+        </div>
+        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+          <button type="button" className={styles.actionButton} onClick={saveGeoCalibration} disabled={geoCalBusy || iid == null}>Save calibration</button>
+          <button type="button" className={styles.actionButton} onClick={clearGeoCalibration} disabled={geoCalBusy || iid == null}>Clear calibration</button>
+          <button type="button" className={styles.actionButton} onClick={refreshGeoCalibration} disabled={geoCalBusy || iid == null}>Refresh status</button>
+        </div>
+        {geoCalError && (
+          <div style={{ color: '#ff7b72', fontSize: '0.72rem', marginTop: '6px' }}>{geoCalError}</div>
+        )}
+        {geoCalApiStatus && (
+          <div style={{ color: '#8b949e', fontSize: '0.72rem', marginTop: '6px' }}>
+            API status: {geoCalApiStatus.status ?? '—'} {geoCalApiStatus.reason ? `(${geoCalApiStatus.reason})` : ''}
+          </div>
+        )}
       </div>
 
       {phaseBasis === 'anchor_relative' && syncState.phase_anchor_replacement_reason && (
@@ -3780,6 +3959,7 @@ function RotationAlignmentPanel({
       />
 
       <PhaseAnchorPanel
+        iid={iid}
         syncState={syncState}
         observations={filteredObservations}
         candidates={burstTimeline?.phase_anchor_candidates}
