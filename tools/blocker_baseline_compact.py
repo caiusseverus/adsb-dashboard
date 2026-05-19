@@ -23,6 +23,11 @@ def _pick(*vals: Any) -> Any:
     return None
 
 
+def _pick_exact(*vals: Any) -> Any:
+    """Like _pick, but named to emphasize that 0/False/'' are preserved."""
+    return _pick(*vals)
+
+
 def extract_compact_row(payload: dict[str, Any], iid: int, ts: float) -> dict[str, Any]:
     ss = payload.get("sync_state") or {}
 
@@ -57,6 +62,20 @@ def extract_compact_row(payload: dict[str, Any], iid: int, ts: float) -> dict[st
     )
     handoff_reason = _pick(ss.get("handoff_reason"), payload.get("handoff_reason"))
     go_operational_blocking_gate = _pick(ss.get("go_operational_blocking_gate"), payload.get("go_operational_blocking_gate"))
+    go_evidence_fresh = _pick(
+        ss.get("go_evidence_fresh"),
+        payload.get("go_evidence_fresh"),
+    )
+    stale_go_evidence_reason = _pick(
+        ss.get("stale_go_evidence_reason"),
+        payload.get("stale_go_evidence_reason"),
+    )
+    if stale_go_evidence_reason is None:
+        if handoff_reason == "stale_go_evidence":
+            stale_go_evidence_reason = "handoff_reason_stale_go_evidence"
+        elif go_operational_blocking_gate == "go_readiness.go_evidence_fresh":
+            stale_go_evidence_reason = "go_blocking_gate_evidence_fresh"
+
     if stale_go_evidence_raw is None:
         stale_go_evidence = (
             handoff_reason == "stale_go_evidence"
@@ -69,12 +88,31 @@ def extract_compact_row(payload: dict[str, Any], iid: int, ts: float) -> dict[st
             or go_operational_blocking_gate == "go_readiness.go_evidence_fresh"
         )
 
+    last_update_epoch_residual_deg = _pick(
+        ss.get("last_update_epoch_residual_deg"),
+        ss.get("go_diagnostic_last_update_epoch_residual_deg"),
+        payload.get("last_update_epoch_residual_deg"),
+    )
+
     return {
         "iid": iid,
         "timestamp": ts,
         "sync_state_present": bool(payload.get("sync_state") is not None),
         "go_operational_enabled": _pick(ss.get("go_operational_enabled"), payload.get("go_operational_enabled")),
         "go_operational_active": _pick(ss.get("go_operational_active"), payload.get("go_operational_active")),
+        "go_operational_ready_streak": _pick(ss.get("go_operational_ready_streak"), payload.get("go_operational_ready_streak")),
+        "go_operational_promotion_threshold": _pick(ss.get("go_operational_promotion_threshold"), payload.get("go_operational_promotion_threshold")),
+        "go_operational_ready_streak_age_s": _pick(ss.get("go_operational_ready_streak_age_s"), payload.get("go_operational_ready_streak_age_s")),
+        "go_operational_last_ready_ts": _pick(ss.get("go_operational_last_ready_ts"), payload.get("go_operational_last_ready_ts")),
+        "go_operational_last_not_ready_ts": _pick(ss.get("go_operational_last_not_ready_ts"), payload.get("go_operational_last_not_ready_ts")),
+        "go_operational_streak_reset_reason": _pick(ss.get("go_operational_streak_reset_reason"), payload.get("go_operational_streak_reset_reason")),
+        "go_operational_streak_reset_gate": _pick(ss.get("go_operational_streak_reset_gate"), payload.get("go_operational_streak_reset_gate")),
+        "go_operational_streak_reset_handoff_reason": _pick(ss.get("go_operational_streak_reset_handoff_reason"), payload.get("go_operational_streak_reset_handoff_reason")),
+        "go_operational_soft_failure_active": _pick(ss.get("go_operational_soft_failure_active"), payload.get("go_operational_soft_failure_active")),
+        "go_operational_soft_failure_until_ts": _pick(ss.get("go_operational_soft_failure_until_ts"), payload.get("go_operational_soft_failure_until_ts")),
+        "go_operational_soft_failure_remaining_s": _pick(ss.get("go_operational_soft_failure_remaining_s"), payload.get("go_operational_soft_failure_remaining_s")),
+        "go_operational_soft_failure_reason": _pick(ss.get("go_operational_soft_failure_reason"), payload.get("go_operational_soft_failure_reason")),
+        "go_operational_hysteresis_decision": _pick(ss.get("go_operational_hysteresis_decision"), payload.get("go_operational_hysteresis_decision")),
         "go_operational_blocking_gate": go_operational_blocking_gate,
         "blocking_gate": _pick(ss.get("blocking_gate"), payload.get("blocking_gate")),
         "handoff_state": _pick(ss.get("handoff_state"), payload.get("handoff_state")),
@@ -91,10 +129,141 @@ def extract_compact_row(payload: dict[str, Any], iid: int, ts: float) -> dict[st
         "transition_quarantine_count": tq_count,
         "transition_quarantine_fit_excluded_count": tq_fit_excl,
         "transition_quarantine_hard_reject_suppressed_count": tq_hard_supp,
+        "transition_quarantine_last_reason": _pick(
+            ss.get("transition_quarantine_last_reason"),
+            ss.get("go_diagnostic_transition_quarantine_last_reason"),
+            payload.get("transition_quarantine_last_reason"),
+        ),
         "stale_go_evidence": stale_go_evidence,
+        "stale_go_evidence_reason": stale_go_evidence_reason,
+        "stale_go_evidence_raw": _pick(ss.get("stale_go_evidence_raw"), payload.get("stale_go_evidence_raw")),
+        "stale_go_evidence_effective": _pick(ss.get("stale_go_evidence_effective"), payload.get("stale_go_evidence_effective")),
+        "stale_go_evidence_computed_from": _pick(ss.get("stale_go_evidence_computed_from"), payload.get("stale_go_evidence_computed_from")),
+        "stale_go_evidence_suppressed_by_fresh_source": _pick(
+            ss.get("stale_go_evidence_suppressed_by_fresh_source"),
+            payload.get("stale_go_evidence_suppressed_by_fresh_source"),
+        ),
+        "stale_go_evidence_suppressed_reason": _pick(
+            ss.get("stale_go_evidence_suppressed_reason"),
+            payload.get("stale_go_evidence_suppressed_reason"),
+        ),
+        "go_evidence_fresh": go_evidence_fresh,
         "phase_status_display": _pick(ss.get("phase_status_display"), payload.get("phase_status_display")),
         "phase_evidence_fresh": _pick(ss.get("phase_evidence_fresh"), payload.get("phase_evidence_fresh")),
         "phase_evidence_age_s": _pick(ss.get("phase_evidence_age_s"), payload.get("phase_evidence_age_s")),
+        "phase_evidence_age_source": _pick(ss.get("phase_evidence_age_source"), payload.get("phase_evidence_age_source")),
+        "sync_driving_evidence_age_source": _pick(ss.get("sync_driving_evidence_age_source"), payload.get("sync_driving_evidence_age_source")),
+        "last_go_evidence_event_age_s": _pick(ss.get("last_go_evidence_event_age_s"), payload.get("last_go_evidence_event_age_s")),
+        "last_eligible_burst_observation_age_s": _pick(ss.get("last_eligible_burst_observation_age_s"), payload.get("last_eligible_burst_observation_age_s")),
+        "last_sync_driving_fit_observation_age_s": _pick(ss.get("last_sync_driving_fit_observation_age_s"), payload.get("last_sync_driving_fit_observation_age_s")),
+        "fit_epoch_last_observation_age_s": _pick(ss.get("fit_epoch_last_observation_age_s"), ss.get("go_diagnostic_fit_epoch_last_observation_age_s"), payload.get("fit_epoch_last_observation_age_s")),
+        "burst_rows_absence_reason": _pick(ss.get("burst_rows_absence_reason"), ss.get("go_diagnostic_burst_rows_absence_reason"), payload.get("burst_rows_absence_reason")),
+        "fit_counters_source": _pick(ss.get("fit_counters_source"), ss.get("go_diagnostic_fit_counters_source"), payload.get("fit_counters_source")),
+        "slope_ema": _pick(ss.get("slope_ema_deg_per_s"), ss.get("go_diagnostic_slope_ema_deg_per_s"), payload.get("slope_ema")),
+        "slope_std": _pick(ss.get("slope_std_deg_per_s"), ss.get("go_diagnostic_slope_std_deg_per_s"), payload.get("slope_std"), payload.get("slope_sigma")),
+        "slope_converged": _pick(ss.get("slope_converged"), payload.get("slope_converged")),
+        "slope_not_converged_reason": _pick(ss.get("slope_trend_state"), payload.get("slope_not_converged_reason")),
+        "slope_not_converged_subreason": _pick(ss.get("slope_not_converged_subreason"), payload.get("slope_not_converged_subreason")),
+        "slope_near_zero_window_pass": _pick(ss.get("slope_near_zero_window_pass"), payload.get("slope_near_zero_window_pass")),
+        "slope_near_zero_window_duration_s": _pick(ss.get("slope_near_zero_window_duration_s"), payload.get("slope_near_zero_window_duration_s")),
+        "slope_near_zero_required_duration_s": _pick(ss.get("slope_near_zero_required_duration_s"), payload.get("slope_near_zero_required_duration_s")),
+        "slope_near_zero_threshold_deg_s": _pick(ss.get("slope_near_zero_threshold_deg_s"), payload.get("slope_near_zero_threshold_deg_s")),
+        "slope_near_zero_max_abs_slope_deg_s": _pick(ss.get("slope_near_zero_max_abs_slope_deg_s"), payload.get("slope_near_zero_max_abs_slope_deg_s")),
+        "slope_near_zero_sample_count": _pick(ss.get("slope_near_zero_sample_count"), payload.get("slope_near_zero_sample_count")),
+        "slope_near_zero_fail_reason": _pick(ss.get("slope_near_zero_fail_reason"), payload.get("slope_near_zero_fail_reason")),
+        "slope_regression_pass": _pick(ss.get("slope_regression_pass"), payload.get("slope_regression_pass")),
+        "slope_regression_window_s": _pick(ss.get("slope_regression_window_s"), payload.get("slope_regression_window_s")),
+        "slope_regression_r2": _pick(ss.get("slope_regression_r2"), payload.get("slope_regression_r2")),
+        "slope_regression_r2_min": _pick(ss.get("slope_regression_r2_min"), payload.get("slope_regression_r2_min")),
+        "slope_regression_trend_deg_s2": _pick(ss.get("slope_regression_trend_deg_s2"), payload.get("slope_regression_trend_deg_s2")),
+        "slope_regression_trend_direction": _pick(ss.get("slope_regression_trend_direction"), payload.get("slope_regression_trend_direction")),
+        "slope_regression_sample_count": _pick(ss.get("slope_regression_sample_count"), payload.get("slope_regression_sample_count")),
+        "slope_regression_fail_reason": _pick(ss.get("slope_regression_fail_reason"), payload.get("slope_regression_fail_reason")),
+        "proposed_period_delta_s": _pick(ss.get("proposed_delta_s"), ss.get("go_diagnostic_proposed_delta_s"), payload.get("proposed_period_delta_s")),
+        "applied_period_delta_s": _pick(ss.get("applied_delta_s"), ss.get("go_diagnostic_applied_delta_s"), payload.get("applied_period_delta_s")),
+        "current_period_delta_s": _pick(ss.get("current_delta_s"), ss.get("go_diagnostic_current_delta_s"), payload.get("current_period_delta_s")),
+        "period_delta_stdev_s": _pick(ss.get("period_delta_stdev_s"), payload.get("period_delta_stdev_s")),
+        "refinement_status": _pick(ss.get("go_diagnostic_refinement_status"), ss.get("period_refinement_status"), payload.get("refinement_status")),
+        "refinement_history_obs": _pick(ss.get("go_diagnostic_fit_observation_count"), ss.get("fit_observation_count"), payload.get("refinement_history_obs")),
+        "refinement_history_icaos": _pick(ss.get("go_diagnostic_fit_icao_count"), ss.get("fit_icao_count"), payload.get("refinement_history_icaos")),
+        "refinement_history_span_s": _pick(ss.get("go_diagnostic_fit_span_s"), ss.get("fit_span_s"), payload.get("refinement_history_span_s")),
+        "fit_observation_count": _pick(ss.get("fit_observation_count"), ss.get("go_diagnostic_fit_observation_count"), payload.get("fit_observation_count")),
+        "fit_icao_count": _pick(ss.get("fit_icao_count"), ss.get("go_diagnostic_fit_icao_count"), payload.get("fit_icao_count")),
+        "fit_span_s": _pick(ss.get("fit_span_s"), ss.get("go_diagnostic_fit_span_s"), payload.get("fit_span_s")),
+        "current_fit_epoch_age_s": _pick(ss.get("current_fit_epoch_age_s"), ss.get("go_diagnostic_current_fit_epoch_age_s"), payload.get("current_fit_epoch_age_s")),
+        "strict_gate_pass": _pick(ss.get("strict_gate_pass"), payload.get("strict_gate_pass")),
+        "strict_epoch_required_min_aircraft": _pick(ss.get("strict_epoch_required_min_aircraft"), ss.get("strict_gate_min_fit_obs"), payload.get("strict_epoch_required_min_aircraft")),
+        "strict_epoch_required_ref_age_s": _pick(ss.get("strict_epoch_required_ref_age_s"), payload.get("strict_epoch_required_ref_age_s")),
+        "strict_epoch_actual_n_aircraft": _pick(ss.get("strict_gate_n_aircraft"), payload.get("strict_epoch_actual_n_aircraft")),
+        "strict_epoch_actual_ref_age_s": _pick(ss.get("strict_gate_ref_pos_age_s"), payload.get("strict_epoch_actual_ref_age_s")),
+        "last_update_epoch_n_aircraft": _pick(ss.get("last_update_epoch_n_aircraft"), payload.get("last_update_epoch_n_aircraft")),
+        "last_update_epoch_ref_icao": _pick(ss.get("last_update_epoch_ref_icao"), payload.get("last_update_epoch_ref_icao")),
+        "last_update_epoch_ref_pos_age_s": _pick(ss.get("last_update_epoch_ref_pos_age_s"), payload.get("last_update_epoch_ref_pos_age_s")),
+        "last_update_epoch_ref_range_nm": _pick(ss.get("strict_gate_ref_range_nm"), payload.get("last_update_epoch_ref_range_nm")),
+        "last_update_epoch_residual_deg": last_update_epoch_residual_deg,
+        "last_update_epoch_abs_residual_deg": abs(last_update_epoch_residual_deg) if isinstance(last_update_epoch_residual_deg, (int, float)) else None,
+        "last_update_epoch_outcome": _pick(ss.get("go_diagnostic_last_update_epoch_outcome"), ss.get("strict_gate_last_update_outcome"), payload.get("last_update_epoch_outcome")),
+        "reacquire_support_obs_count": _pick(ss.get("go_diagnostic_reacquire_support_obs_count"), payload.get("reacquire_support_obs_count")),
+        "reacquire_support_icao_count": _pick(ss.get("go_diagnostic_reacquire_support_icao_count"), payload.get("reacquire_support_icao_count")),
+        "consecutive_hard_residual_rejects": _pick(ss.get("go_diagnostic_consecutive_hard_residual_rejects"), ss.get("consecutive_hard_residual_rejects"), payload.get("consecutive_hard_residual_rejects")),
+        "phase_offset_discontinuity_count": _pick(ss.get("phase_offset_discontinuity_count"), payload.get("phase_offset_discontinuity_count")),
+        "phase_offset_discontinuity_rebased_gradual_drift_count": _pick(ss.get("phase_offset_discontinuity_rebased_gradual_drift_count"), payload.get("phase_offset_discontinuity_rebased_gradual_drift_count")),
+        "fit_epoch_reset_reason": _pick(ss.get("fit_epoch_reset_reason"), ss.get("go_diagnostic_fit_epoch_reset_reason"), payload.get("fit_epoch_reset_reason")),
+        "fit_epoch_id": _pick(ss.get("fit_epoch_id"), ss.get("go_diagnostic_fit_epoch_id"), payload.get("fit_epoch_id")),
+        "hard_bound_reject_count": _pick(ss.get("hard_bound_reject_count"), ss.get("go_diagnostic_consecutive_hard_bound_rejects"), payload.get("hard_bound_reject_count")),
+        "slew_limited_count": _pick(ss.get("slew_limited_count"), payload.get("slew_limited_count")),
+        "holdover_entered_ts": _pick_exact(ss.get("holdover_entered_ts"), payload.get("holdover_entered_ts")),
+        "holdover_age_s": _pick_exact(ss.get("holdover_age_s"), payload.get("holdover_age_s")),
+        "holdover_last_transition_ts": _pick_exact(ss.get("holdover_last_transition_ts"), payload.get("holdover_last_transition_ts")),
+        "holdover_exit_attempted": _pick_exact(ss.get("holdover_exit_attempted"), payload.get("holdover_exit_attempted")),
+        "holdover_exit_allowed": _pick_exact(ss.get("holdover_exit_allowed"), payload.get("holdover_exit_allowed")),
+        "holdover_exit_block_reason": _pick_exact(ss.get("holdover_exit_block_reason"), payload.get("holdover_exit_block_reason")),
+        "holdover_exit_first_failed_gate": _pick_exact(ss.get("holdover_exit_first_failed_gate"), payload.get("holdover_exit_first_failed_gate")),
+        "reacquire_valid_period": _pick_exact(ss.get("reacquire_valid_period"), payload.get("reacquire_valid_period")),
+        "reacquire_valid_ref_icao": _pick_exact(ss.get("reacquire_valid_ref_icao"), payload.get("reacquire_valid_ref_icao")),
+        "reacquire_ref_position_present": _pick_exact(ss.get("reacquire_ref_position_present"), payload.get("reacquire_ref_position_present")),
+        "reacquire_ref_pos_age_s": _pick_exact(ss.get("reacquire_ref_pos_age_s"), payload.get("reacquire_ref_pos_age_s")),
+        "reacquire_ref_pos_age_limit_s": _pick_exact(ss.get("reacquire_ref_pos_age_limit_s"), payload.get("reacquire_ref_pos_age_limit_s")),
+        "reacquire_ref_pos_fresh": _pick_exact(ss.get("reacquire_ref_pos_fresh"), payload.get("reacquire_ref_pos_fresh")),
+        "reacquire_n_aircraft": _pick_exact(ss.get("reacquire_n_aircraft"), payload.get("reacquire_n_aircraft")),
+        "reacquire_min_aircraft": _pick_exact(ss.get("reacquire_min_aircraft"), payload.get("reacquire_min_aircraft")),
+        "reacquire_aircraft_count_ok": _pick_exact(ss.get("reacquire_aircraft_count_ok"), payload.get("reacquire_aircraft_count_ok")),
+        "reacquire_support_obs_count": _pick_exact(
+            ss.get("reacquire_support_obs_count"),
+            ss.get("go_diagnostic_reacquire_support_obs_count"),
+            payload.get("reacquire_support_obs_count"),
+        ),
+        "reacquire_support_obs_min": _pick_exact(ss.get("reacquire_support_obs_min"), payload.get("reacquire_support_obs_min")),
+        "reacquire_support_obs_ok": _pick_exact(ss.get("reacquire_support_obs_ok"), payload.get("reacquire_support_obs_ok")),
+        "reacquire_support_icao_count": _pick_exact(
+            ss.get("reacquire_support_icao_count"),
+            ss.get("go_diagnostic_reacquire_support_icao_count"),
+            payload.get("reacquire_support_icao_count"),
+        ),
+        "reacquire_support_icao_min": _pick_exact(ss.get("reacquire_support_icao_min"), payload.get("reacquire_support_icao_min")),
+        "reacquire_support_icao_ok": _pick_exact(ss.get("reacquire_support_icao_ok"), payload.get("reacquire_support_icao_ok")),
+        "reacquire_effective_obs_count": _pick_exact(ss.get("reacquire_effective_obs_count"), payload.get("reacquire_effective_obs_count")),
+        "reacquire_effective_icao_count": _pick_exact(ss.get("reacquire_effective_icao_count"), payload.get("reacquire_effective_icao_count")),
+        "reacquire_fit_support_ok": _pick_exact(ss.get("reacquire_fit_support_ok"), payload.get("reacquire_fit_support_ok")),
+        "reacquire_hard_reject_streak": _pick_exact(ss.get("reacquire_hard_reject_streak"), payload.get("reacquire_hard_reject_streak")),
+        "reacquire_min_hard_reject_streak": _pick_exact(ss.get("reacquire_min_hard_reject_streak"), payload.get("reacquire_min_hard_reject_streak")),
+        "reacquire_hard_reject_streak_ok": _pick_exact(ss.get("reacquire_hard_reject_streak_ok"), payload.get("reacquire_hard_reject_streak_ok")),
+        "reacquire_fallback_hard_rejects_min": _pick_exact(ss.get("reacquire_fallback_hard_rejects_min"), payload.get("reacquire_fallback_hard_rejects_min")),
+        "reacquire_last_accepted_epoch_age_s": _pick_exact(ss.get("reacquire_last_accepted_epoch_age_s"), payload.get("reacquire_last_accepted_epoch_age_s")),
+        "reacquire_fallback_age_limit_s": _pick_exact(ss.get("reacquire_fallback_age_limit_s"), payload.get("reacquire_fallback_age_limit_s")),
+        "reacquire_last_accepted_age_ok": _pick_exact(ss.get("reacquire_last_accepted_age_ok"), payload.get("reacquire_last_accepted_age_ok")),
+        "reacquire_fallback_allowed": _pick_exact(ss.get("reacquire_fallback_allowed"), payload.get("reacquire_fallback_allowed")),
+        "reacquire_hard_reject_condition_ok": _pick_exact(ss.get("reacquire_hard_reject_condition_ok"), payload.get("reacquire_hard_reject_condition_ok")),
+        "reacquire_current_hard_reject": _pick_exact(ss.get("reacquire_current_hard_reject"), payload.get("reacquire_current_hard_reject")),
+        "reacquire_exit_trigger_seen": _pick_exact(ss.get("reacquire_exit_trigger_seen"), payload.get("reacquire_exit_trigger_seen")),
+        "reacquire_can_reacquire_base": _pick_exact(ss.get("reacquire_can_reacquire_base"), payload.get("reacquire_can_reacquire_base")),
+        "reacquire_hidden_gate_name": _pick_exact(ss.get("reacquire_hidden_gate_name"), payload.get("reacquire_hidden_gate_name")),
+        "reacquire_hidden_gate_pass": _pick_exact(ss.get("reacquire_hidden_gate_pass"), payload.get("reacquire_hidden_gate_pass")),
+        "reacquire_temporal_pending": _pick_exact(ss.get("reacquire_temporal_pending"), payload.get("reacquire_temporal_pending")),
+        "reacquire_exit_code_path": _pick_exact(ss.get("reacquire_exit_code_path"), payload.get("reacquire_exit_code_path")),
+        "reacquire_exit_decision": _pick_exact(ss.get("reacquire_exit_decision"), payload.get("reacquire_exit_decision")),
+        "reacquire_exit_decision_reason": _pick_exact(ss.get("reacquire_exit_decision_reason"), payload.get("reacquire_exit_decision_reason")),
+        "reacquire_all_gates_pass": _pick_exact(ss.get("reacquire_all_gates_pass"), payload.get("reacquire_all_gates_pass")),
     }
 
 
@@ -103,6 +272,14 @@ def side_by_side(raw_payload: dict[str, Any], compact: dict[str, Any]) -> dict[s
     return {
         "raw_sync_state.go_operational_active": ss.get("go_operational_active"),
         "compact.go_operational_active": compact.get("go_operational_active"),
+        "raw_sync_state.go_operational_ready_streak": ss.get("go_operational_ready_streak"),
+        "compact.go_operational_ready_streak": compact.get("go_operational_ready_streak"),
+        "raw_sync_state.go_operational_promotion_threshold": ss.get("go_operational_promotion_threshold"),
+        "compact.go_operational_promotion_threshold": compact.get("go_operational_promotion_threshold"),
+        "raw_sync_state.go_operational_hysteresis_decision": ss.get("go_operational_hysteresis_decision"),
+        "compact.go_operational_hysteresis_decision": compact.get("go_operational_hysteresis_decision"),
+        "raw_sync_state.go_operational_soft_failure_active": ss.get("go_operational_soft_failure_active"),
+        "compact.go_operational_soft_failure_active": compact.get("go_operational_soft_failure_active"),
         "raw_sync_state.handoff_state": ss.get("handoff_state"),
         "compact.handoff_state": compact.get("handoff_state"),
         "raw_sync_state.handoff_reason": ss.get("handoff_reason"),

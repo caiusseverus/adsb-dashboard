@@ -1333,12 +1333,19 @@ def _live_sync_state_to_dict(
         return float(value)
 
     sync_driving_fit_age_s = _to_finite_float(getattr(sync, "last_sync_driving_fit_observation_age_s", None))
+    sync_driving_evidence_age_source = "sync.last_sync_driving_fit_observation_age_s" if sync_driving_fit_age_s is not None else None
     if sync_driving_fit_age_s is None and isinstance(go_sync, dict):
         sync_driving_fit_age_s = _to_finite_float(go_sync.get("last_sync_driving_fit_observation_age_s"))
+        if sync_driving_fit_age_s is not None:
+            sync_driving_evidence_age_source = "go_sync.last_sync_driving_fit_observation_age_s"
     if sync_driving_fit_age_s is None:
         sync_driving_fit_age_s = _to_finite_float(getattr(sync, "fit_epoch_last_observation_age_s", None))
+        if sync_driving_fit_age_s is not None:
+            sync_driving_evidence_age_source = "sync.fit_epoch_last_observation_age_s"
     if sync_driving_fit_age_s is None and isinstance(go_sync, dict):
         sync_driving_fit_age_s = _to_finite_float(go_sync.get("fit_epoch_last_observation_age_s"))
+        if sync_driving_fit_age_s is not None:
+            sync_driving_evidence_age_source = "go_sync.fit_epoch_last_observation_age_s"
     anchor_validation_age_s = _to_finite_float(getattr(sync, "anchor_last_validation_age_s", None))
     if anchor_validation_age_s is None and isinstance(go_sync, dict):
         anchor_validation_age_s = _to_finite_float(go_sync.get("anchor_last_validation_age_s"))
@@ -1348,6 +1355,11 @@ def _live_sync_state_to_dict(
         sync_driving_fit_age_s
         if sync_driving_fit_age_s is not None
         else anchor_validation_age_s
+    )
+    phase_evidence_age_source = (
+        sync_driving_evidence_age_source
+        if sync_driving_fit_age_s is not None
+        else ("sync.anchor_last_validation_age_s" if anchor_validation_age_s is not None else None)
     )
     phase_evidence_fresh: bool | None = None
     burst_rows_absence_reason = ""
@@ -1645,6 +1657,18 @@ def _live_sync_state_to_dict(
     effective_handoff_reason = handoff_reason
     go_operational_blocking_gate = None
     go_operational_blocking_reason = None
+    stage10_ready_like_mapping_seen = False
+    stage10_ready_like_mapping_result = None
+    stage10_ready_like_mapping_source = None
+    stage10_unclassified_final_fallback = False
+    stage10_unclassified_final_fallback_reason = None
+    stage10_eval_readylike_not_started_candidate = None
+    stage10_eval_go_sync_usable_quality_ok = None
+    stage10_eval_go_sync_usable_holdover_ok = None
+    stage10_eval_go_sync_usable_period_agrees = None
+    stage10_eval_go_sync_usable_strict_gate_pass = None
+    stage10_eval_go_diag_refinement_status = None
+    stage10_eval_used_diag_usable_fallback = None
 
     is_active_go_operational = (
         period_authority == "go_refined"
@@ -1670,9 +1694,26 @@ def _live_sync_state_to_dict(
                     return True
                 if v in {"false", "0", "no", "off"}:
                     return False
+            # Handle non-primitive bool-like values (for example numpy/scalar wrappers)
+            # by normalizing their string form.
+            v = str(value).strip().lower()
+            if v in {"true", "1", "yes", "on"}:
+                return True
+            if v in {"false", "0", "no", "off"}:
+                return False
             return None
 
-        if not blocking_gate and isinstance(handoff_gate_failures, dict):
+        def _resolve_usable_bool(primary: object, diagnostic: object) -> tuple[bool | None, bool]:
+            """Return (value, used_diagnostic_fallback)."""
+            primary_norm = _bool_or_none(primary)
+            if primary_norm is not None:
+                return primary_norm, False
+            return _bool_or_none(diagnostic), True
+
+        blocking_gate_is_unclassified_placeholder = str(blocking_gate or "") == "go_readiness.unclassified_state"
+        if (not blocking_gate or blocking_gate_is_unclassified_placeholder) and isinstance(handoff_gate_failures, dict):
+            if blocking_gate_is_unclassified_placeholder:
+                blocking_gate = None
             for section_name in ("python_base", "go_readiness", "phase_readiness"):
                 gates = handoff_gate_failures.get(section_name) or {}
                 if not isinstance(gates, dict):
@@ -1696,7 +1737,7 @@ def _live_sync_state_to_dict(
                         phase_blocking_reason = str(gate_state.get("reason") or candidate_gate)
                     continue
                 blocking_gate = candidate_gate
-                if not effective_handoff_reason:
+                if not effective_handoff_reason or str(effective_handoff_reason) == "go_state_unclassified":
                     effective_handoff_reason = str(gate_state.get("reason") or blocking_gate)
                 break
 
@@ -1716,73 +1757,74 @@ def _live_sync_state_to_dict(
                 go_sync_unusable_reason = str(go_sync.get("go_sync_unusable_reason") or "").strip()
             holdover_reason = str(getattr(sync, "holdover_reason", "") or "").strip()
             period_ref_status = str(period_refinement_status or "").strip()
-            if (not period_ref_status or period_ref_status == "unavailable") and isinstance(go_sync, dict):
-                period_ref_status = str(go_sync.get("period_refinement_status") or period_ref_status or "").strip()
+            if isinstance(go_sync, dict):
+                go_sync_period_ref_status = str(go_sync.get("period_refinement_status") or "").strip()
+                if (
+                    go_sync_period_ref_status in {"insufficient_history", "unavailable"}
+                    or not period_ref_status
+                    or period_ref_status == "unavailable"
+                ):
+                    period_ref_status = go_sync_period_ref_status or period_ref_status
             contamination_state = str(getattr(sync, "contamination_state", "") or "").strip()
             diag_go_sync_unusable_reason = str(getattr(sync, "go_diagnostic_go_sync_unusable_reason", "") or "").strip()
             go_diag_refinement_status = str((go_sync or {}).get("period_refinement_status") or "").strip() if isinstance(go_sync, dict) else ""
             if not go_diag_refinement_status:
                 go_diag_refinement_status = str(getattr(sync, "period_refinement_status", "") or "").strip()
-            go_sync_usable_quality_ok = _bool_or_none(
+            go_refinement_status_for_ready = (
+                go_diag_refinement_status
+                or period_ref_status
+                or str(period_refinement_status or "").strip()
+            )
+            primary_quality_ok = (
                 (go_sync or {}).get("go_sync_usable_quality_ok")
-                if isinstance(go_sync, dict) else
-                getattr(sync, "go_sync_usable_quality_ok", None)
+                if isinstance(go_sync, dict) else getattr(sync, "go_sync_usable_quality_ok", None)
             )
-            if go_sync_usable_quality_ok is None:
-                go_sync_usable_quality_ok = _bool_or_none(
-                    (go_sync or {}).get("go_diagnostic_go_sync_usable_quality_ok")
-                    if isinstance(go_sync, dict) else
-                    getattr(sync, "go_diagnostic_go_sync_usable_quality_ok", None)
-                )
-            if go_sync_usable_quality_ok is None:
-                go_sync_usable_quality_ok = _bool_or_none(
-                    getattr(sync, "go_diagnostic_go_sync_usable_quality_ok", None)
-                )
-            go_sync_usable_holdover_ok = _bool_or_none(
+            diag_quality_ok = (
+                (go_sync or {}).get("go_diagnostic_go_sync_usable_quality_ok")
+                if isinstance(go_sync, dict) and (go_sync or {}).get("go_diagnostic_go_sync_usable_quality_ok") is not None
+                else getattr(sync, "go_diagnostic_go_sync_usable_quality_ok", None)
+            )
+            go_sync_usable_quality_ok, quality_used_diag = _resolve_usable_bool(primary_quality_ok, diag_quality_ok)
+
+            primary_holdover_ok = (
                 (go_sync or {}).get("go_sync_usable_holdover_ok")
-                if isinstance(go_sync, dict) else
-                getattr(sync, "go_sync_usable_holdover_ok", None)
+                if isinstance(go_sync, dict) else getattr(sync, "go_sync_usable_holdover_ok", None)
             )
-            if go_sync_usable_holdover_ok is None:
-                go_sync_usable_holdover_ok = _bool_or_none(
-                    (go_sync or {}).get("go_diagnostic_go_sync_usable_holdover_ok")
-                    if isinstance(go_sync, dict) else
-                    getattr(sync, "go_diagnostic_go_sync_usable_holdover_ok", None)
-                )
-            if go_sync_usable_holdover_ok is None:
-                go_sync_usable_holdover_ok = _bool_or_none(
-                    getattr(sync, "go_diagnostic_go_sync_usable_holdover_ok", None)
-                )
-            go_sync_usable_period_agrees = _bool_or_none(
+            diag_holdover_ok = (
+                (go_sync or {}).get("go_diagnostic_go_sync_usable_holdover_ok")
+                if isinstance(go_sync, dict) and (go_sync or {}).get("go_diagnostic_go_sync_usable_holdover_ok") is not None
+                else getattr(sync, "go_diagnostic_go_sync_usable_holdover_ok", None)
+            )
+            go_sync_usable_holdover_ok, holdover_used_diag = _resolve_usable_bool(primary_holdover_ok, diag_holdover_ok)
+
+            primary_period_agrees = (
                 (go_sync or {}).get("go_sync_usable_period_agrees")
-                if isinstance(go_sync, dict) else
-                getattr(sync, "go_sync_usable_period_agrees", None)
+                if isinstance(go_sync, dict) else getattr(sync, "go_sync_usable_period_agrees", None)
             )
-            if go_sync_usable_period_agrees is None:
-                go_sync_usable_period_agrees = _bool_or_none(
-                    (go_sync or {}).get("go_diagnostic_go_sync_usable_period_agrees")
-                    if isinstance(go_sync, dict) else
-                    getattr(sync, "go_diagnostic_go_sync_usable_period_agrees", None)
-                )
-            if go_sync_usable_period_agrees is None:
-                go_sync_usable_period_agrees = _bool_or_none(
-                    getattr(sync, "go_diagnostic_go_sync_usable_period_agrees", None)
-                )
-            go_sync_usable_strict_gate_pass = _bool_or_none(
+            diag_period_agrees = (
+                (go_sync or {}).get("go_diagnostic_go_sync_usable_period_agrees")
+                if isinstance(go_sync, dict) and (go_sync or {}).get("go_diagnostic_go_sync_usable_period_agrees") is not None
+                else getattr(sync, "go_diagnostic_go_sync_usable_period_agrees", None)
+            )
+            go_sync_usable_period_agrees, period_used_diag = _resolve_usable_bool(primary_period_agrees, diag_period_agrees)
+
+            primary_strict_pass = (
                 (go_sync or {}).get("go_sync_usable_strict_gate_pass")
-                if isinstance(go_sync, dict) else
-                getattr(sync, "go_sync_usable_strict_gate_pass", None)
+                if isinstance(go_sync, dict) else getattr(sync, "go_sync_usable_strict_gate_pass", None)
             )
-            if go_sync_usable_strict_gate_pass is None:
-                go_sync_usable_strict_gate_pass = _bool_or_none(
-                    (go_sync or {}).get("go_diagnostic_go_sync_usable_strict_gate_pass")
-                    if isinstance(go_sync, dict) else
-                    getattr(sync, "go_diagnostic_go_sync_usable_strict_gate_pass", None)
-                )
-            if go_sync_usable_strict_gate_pass is None:
-                go_sync_usable_strict_gate_pass = _bool_or_none(
-                    getattr(sync, "go_diagnostic_go_sync_usable_strict_gate_pass", None)
-                )
+            diag_strict_pass = (
+                (go_sync or {}).get("go_diagnostic_go_sync_usable_strict_gate_pass")
+                if isinstance(go_sync, dict) and (go_sync or {}).get("go_diagnostic_go_sync_usable_strict_gate_pass") is not None
+                else getattr(sync, "go_diagnostic_go_sync_usable_strict_gate_pass", None)
+            )
+            go_sync_usable_strict_gate_pass, strict_used_diag = _resolve_usable_bool(primary_strict_pass, diag_strict_pass)
+            used_diag_usable_fallback = any((quality_used_diag, holdover_used_diag, period_used_diag, strict_used_diag))
+            stage10_eval_go_sync_usable_quality_ok = go_sync_usable_quality_ok
+            stage10_eval_go_sync_usable_holdover_ok = go_sync_usable_holdover_ok
+            stage10_eval_go_sync_usable_period_agrees = go_sync_usable_period_agrees
+            stage10_eval_go_sync_usable_strict_gate_pass = go_sync_usable_strict_gate_pass
+            stage10_eval_go_diag_refinement_status = go_refinement_status_for_ready
+            stage10_eval_used_diag_usable_fallback = used_diag_usable_fallback
             go_blocking_gate = (
                 str(blocking_gate)
                 if blocking_gate and str(blocking_gate).startswith(("python_base.", "go_readiness."))
@@ -1802,23 +1844,37 @@ def _live_sync_state_to_dict(
                     go_blocking_gate = mapped_gate
                 elif go_sync_unusable_reason or diag_go_sync_unusable_reason:
                     go_blocking_gate = "go_readiness.go_sync_state_usable"
-                    if not effective_handoff_reason:
+                    if not effective_handoff_reason or reason_is_unclassified_placeholder:
                         effective_handoff_reason = go_sync_unusable_reason or diag_go_sync_unusable_reason
                     go_blocking_reason = effective_handoff_reason
                 elif period_ref_status in {"insufficient_history", "unavailable"}:
                     go_blocking_gate = "go_readiness.go_refinement_history_sufficient"
-                    if not effective_handoff_reason:
+                    if not effective_handoff_reason or reason_is_unclassified_placeholder:
                         effective_handoff_reason = "go_refinement_history_insufficient"
                     go_blocking_reason = effective_handoff_reason
                 elif go_diag_refinement_status in {"insufficient_history", "unavailable"}:
                     go_blocking_gate = "go_readiness.go_refinement_history_sufficient"
-                    if not effective_handoff_reason:
+                    if not effective_handoff_reason or reason_is_unclassified_placeholder:
                         effective_handoff_reason = "go_refinement_history_insufficient"
                     go_blocking_reason = effective_handoff_reason
                 elif bool(getattr(sync, "holdover", False)) or holdover_reason:
                     go_blocking_gate = "go_readiness.go_not_holdover"
-                    if not effective_handoff_reason:
+                    if not effective_handoff_reason or reason_is_unclassified_placeholder:
                         effective_handoff_reason = holdover_reason or "go_holdover"
+                    go_blocking_reason = effective_handoff_reason
+                elif (
+                    go_sync_usable_quality_ok is False
+                    or go_sync_usable_period_agrees is False
+                    or go_sync_usable_strict_gate_pass is False
+                ):
+                    go_blocking_gate = "go_readiness.go_sync_state_usable"
+                    if not effective_handoff_reason or reason_is_unclassified_placeholder:
+                        if go_sync_usable_quality_ok is False:
+                            effective_handoff_reason = "quality_below_threshold"
+                        elif go_sync_usable_period_agrees is False:
+                            effective_handoff_reason = "period_disagreement"
+                        else:
+                            effective_handoff_reason = "strict_gate_failed"
                     go_blocking_reason = effective_handoff_reason
                 elif contamination_state == "contaminated":
                     go_blocking_gate = "go_readiness.go_contamination_state"
@@ -1826,36 +1882,11 @@ def _live_sync_state_to_dict(
                         effective_handoff_reason = "contamination"
                     go_blocking_reason = effective_handoff_reason
                 elif (
-                    go_diag_refinement_status == "stable"
-                    and go_sync_usable_quality_ok is True
-                    and go_sync_usable_holdover_ok is True
-                    and go_sync_usable_period_agrees is True
-                    and go_sync_usable_strict_gate_pass is True
-                ):
-                    # Go diagnostics indicate readiness components are satisfied,
-                    # but no concrete gate snapshot arrived with this state.
-                    # In Stage 10 this corresponds to pending operational streak.
-                    go_blocking_gate = "go_readiness_hysteresis"
-                    if not effective_handoff_reason or reason_is_unclassified_placeholder:
-                        effective_handoff_reason = "go_ready_pending_hysteresis"
-                    go_blocking_reason = effective_handoff_reason
-                elif (
-                    reason_is_unclassified_placeholder
-                    and str(effective_handoff_state or "") == "GO_REFINING"
-                    and go_diag_refinement_status == "stable"
-                    and not go_sync_unusable_reason
-                    and not diag_go_sync_unusable_reason
-                    and not bool(getattr(sync, "holdover", False))
-                ):
-                    # Captured stale-unclassified shape: diagnostics indicate
-                    # refining/stable readiness path but no explicit failed gate
-                    # snapshot was attached. Attribute to hysteresis instead of
-                    # emitting unclassified placeholders.
-                    go_blocking_gate = "go_readiness_hysteresis"
-                    effective_handoff_reason = "go_ready_pending_hysteresis"
-                    go_blocking_reason = effective_handoff_reason
-                elif (
-                    reason_is_unclassified_placeholder
+                    str(getattr(sync, "go_operational_hysteresis_decision", "") or "").strip() == "pending"
+                    and int(getattr(sync, "go_operational_promotion_threshold", 0) or 0) > 0
+                    and int(getattr(sync, "go_operational_ready_streak", 0) or 0)
+                    < int(getattr(sync, "go_operational_promotion_threshold", 0) or 0)
+                    and go_refinement_status_for_ready == "stable"
                     and go_sync_usable_quality_ok is True
                     and go_sync_usable_holdover_ok is True
                     and go_sync_usable_period_agrees is True
@@ -1864,24 +1895,55 @@ def _live_sync_state_to_dict(
                     and not diag_go_sync_unusable_reason
                     and not bool(getattr(sync, "holdover", False))
                 ):
-                    # Some live rows carry complete ready-like usability flags
-                    # but omit/refuse explicit refinement labels in the compact
-                    # Go payload. Keep attribution concrete rather than
-                    # emitting unclassified placeholders.
+                    # Pending promotion hysteresis is a real staged-readiness
+                    # state. Emit hysteresis only when explicit pending-state
+                    # diagnostics are present and thresholded.
                     go_blocking_gate = "go_readiness_hysteresis"
                     effective_handoff_reason = "go_ready_pending_hysteresis"
                     go_blocking_reason = effective_handoff_reason
+                elif (
+                    str(getattr(sync, "go_operational_hysteresis_decision", "") or "").strip() in {"", "none", "null"}
+                    and int(getattr(sync, "go_operational_promotion_threshold", 0) or 0) == 0
+                    and int(getattr(sync, "go_operational_ready_streak", 0) or 0) == 0
+                    and go_refinement_status_for_ready == "stable"
+                    and go_sync_usable_quality_ok is True
+                    and go_sync_usable_holdover_ok is True
+                    and go_sync_usable_period_agrees is True
+                    and go_sync_usable_strict_gate_pass is True
+                    and not go_sync_unusable_reason
+                    and not diag_go_sync_unusable_reason
+                    and not bool(getattr(sync, "holdover", False))
+                ):
+                    # Ready-like state with no started streak/threshold is a
+                    # deterministic hysteresis-attribution state, not unknown.
+                    go_blocking_gate = "go_readiness_hysteresis"
+                    effective_handoff_reason = "go_ready_hysteresis_not_started"
+                    go_blocking_reason = effective_handoff_reason
+                    stage10_ready_like_mapping_seen = True
+                    stage10_ready_like_mapping_result = effective_handoff_reason
+                    stage10_ready_like_mapping_source = (
+                        "diagnostic_go_sync_usable_fallback"
+                        if used_diag_usable_fallback else
+                        "live_serializer"
+                    )
+                    stage10_eval_readylike_not_started_candidate = True
                 elif phase_evidence_fresh is False:
                     go_blocking_gate = "go_readiness.go_evidence_fresh"
                     if not effective_handoff_reason or reason_is_unclassified_placeholder:
                         effective_handoff_reason = "stale_go_evidence"
                     go_blocking_reason = effective_handoff_reason
+                else:
+                    stage10_eval_readylike_not_started_candidate = False
 
             if not go_blocking_gate:
                 go_blocking_gate = "go_readiness.unclassified_state"
+                stage10_unclassified_final_fallback = True
+                stage10_unclassified_final_fallback_reason = "go_blocking_gate_unresolved_after_stage10_precedence"
             if not effective_handoff_reason:
                 effective_handoff_reason = "go_state_unclassified"
                 go_blocking_reason = effective_handoff_reason
+                if not stage10_unclassified_final_fallback_reason:
+                    stage10_unclassified_final_fallback_reason = "effective_handoff_reason_unresolved"
             if not blocking_gate:
                 blocking_gate = go_blocking_gate
             go_operational_blocking_gate = go_blocking_gate
@@ -1943,7 +2005,14 @@ def _live_sync_state_to_dict(
         diag_period_agrees = _diag_bool(getattr(sync, "go_diagnostic_go_sync_usable_period_agrees", None))
         diag_strict_pass = _diag_bool(getattr(sync, "go_diagnostic_go_sync_usable_strict_gate_pass", None))
         diag_unusable_reason = str(getattr(sync, "go_diagnostic_go_sync_unusable_reason", "") or "").strip()
+        diag_hysteresis_pending = str(getattr(sync, "go_operational_hysteresis_decision", "") or "").strip() == "pending"
+        diag_hysteresis_threshold = int(getattr(sync, "go_operational_promotion_threshold", 0) or 0)
+        diag_hysteresis_streak = int(getattr(sync, "go_operational_ready_streak", 0) or 0)
         if (
+            diag_hysteresis_pending
+            and diag_hysteresis_threshold > 0
+            and diag_hysteresis_streak < diag_hysteresis_threshold
+            and
             diag_refinement_status == "stable"
             and diag_quality_ok is True
             and diag_holdover_ok is True
@@ -2000,10 +2069,17 @@ def _live_sync_state_to_dict(
         "no_display_burst_sync_rows",
         "burst_rows_stale",
     }
+    no_burst_rows_strict = burst_rows_absence_reason in {
+        "no_burst_sync_rows",
+        "burst_rows_stale",
+    }
     stale_phase_anchor_age = phase_anchor_age_s is not None and phase_anchor_age_s > _PHASE_FRESH_MAX_AGE_S
     stale_phase_state_age = phase_state_age_s is not None and phase_state_age_s > _PHASE_FRESH_MAX_AGE_S
     stale_phase_evidence_age = phase_evidence_age_s is not None and phase_evidence_age_s > _PHASE_FRESH_MAX_AGE_S
     stale_fit_epoch_age = current_fit_epoch_age_s is not None and current_fit_epoch_age_s > _PHASE_FRESH_MAX_AGE_S
+    sync_driving_evidence_fresh = (
+        sync_driving_fit_age_s is not None and sync_driving_fit_age_s <= _PHASE_FRESH_MAX_AGE_S
+    )
     no_current_sync_driving_evidence = (
         sync_driving_fit_age_s is None or sync_driving_fit_age_s > _PHASE_FRESH_MAX_AGE_S
     )
@@ -2023,14 +2099,59 @@ def _live_sync_state_to_dict(
         phase_anchor_clear_reason = phase_anchor_clear_reason or "stale_phase_evidence"
         phase_anchor_retained_without_current_evidence = True
 
+    stale_phase_state_effective = (
+        stale_phase_state_age
+        and phase_evidence_fresh is not True
+        and not sync_driving_evidence_fresh
+    )
+    stale_fit_epoch_effective = (
+        stale_fit_epoch_age
+        and phase_evidence_fresh is not True
+        and not sync_driving_evidence_fresh
+    )
     stale_readiness_evidence = (
         stale_phase_evidence_age
-        or stale_phase_state_age
+        or stale_phase_state_effective
         or stale_phase_anchor_age
-        or stale_fit_epoch_age
+        or stale_fit_epoch_effective
         or phase_evidence_fresh is False
-        or (no_burst_rows and phase_evidence_fresh is not True)
+        or (
+            no_burst_rows_strict
+            and phase_evidence_fresh is not True
+            and not sync_driving_evidence_fresh
+        )
     )
+    stale_go_evidence_suppressed_by_fresh_source = bool(
+        stale_readiness_evidence
+        and (phase_evidence_fresh is True or sync_driving_evidence_fresh)
+        and burst_rows_absence_reason == "no_display_burst_sync_rows"
+    )
+    stale_readiness_evidence_effective = (
+        stale_readiness_evidence and not stale_go_evidence_suppressed_by_fresh_source
+    )
+    stale_go_evidence_suppressed_reason = None
+    if stale_go_evidence_suppressed_by_fresh_source:
+        if phase_evidence_fresh is True:
+            stale_go_evidence_suppressed_reason = "phase_evidence_fresh_true"
+        elif sync_driving_evidence_fresh:
+            stale_go_evidence_suppressed_reason = "sync_driving_evidence_fresh_true"
+        else:
+            stale_go_evidence_suppressed_reason = "fresh_source_available"
+    stale_go_evidence_computed_from: list[str] = []
+    if stale_phase_evidence_age:
+        stale_go_evidence_computed_from.append("phase_evidence_age")
+    if stale_phase_state_effective:
+        stale_go_evidence_computed_from.append("phase_state_age")
+    if stale_phase_anchor_age:
+        stale_go_evidence_computed_from.append("phase_anchor_age")
+    if stale_fit_epoch_effective:
+        stale_go_evidence_computed_from.append("current_fit_epoch_age")
+    if phase_evidence_fresh is False:
+        stale_go_evidence_computed_from.append("phase_evidence_fresh_false")
+    if no_burst_rows_strict and phase_evidence_fresh is not True and not sync_driving_evidence_fresh:
+        stale_go_evidence_computed_from.append("strict_no_burst_rows_without_fresh_evidence")
+    if not stale_go_evidence_computed_from:
+        stale_go_evidence_computed_from.append("none")
 
     payload.update({
         "base_period_s": base_period_s,
@@ -2057,6 +2178,19 @@ def _live_sync_state_to_dict(
             "go_diagnostic_shadow" if source == "go_frame_sync" else
             "sync_state_unavailable"
         ),
+        "stage10_attribution_cleanup_version": "stage10_attr_cleanup_20260518_v1",
+        "stage10_ready_like_mapping_seen": stage10_ready_like_mapping_seen,
+        "stage10_ready_like_mapping_result": stage10_ready_like_mapping_result,
+        "stage10_ready_like_mapping_source": stage10_ready_like_mapping_source,
+        "stage10_unclassified_final_fallback": stage10_unclassified_final_fallback,
+        "stage10_unclassified_final_fallback_reason": stage10_unclassified_final_fallback_reason,
+        "stage10_eval_readylike_not_started_candidate": stage10_eval_readylike_not_started_candidate,
+        "stage10_eval_go_sync_usable_quality_ok": stage10_eval_go_sync_usable_quality_ok,
+        "stage10_eval_go_sync_usable_holdover_ok": stage10_eval_go_sync_usable_holdover_ok,
+        "stage10_eval_go_sync_usable_period_agrees": stage10_eval_go_sync_usable_period_agrees,
+        "stage10_eval_go_sync_usable_strict_gate_pass": stage10_eval_go_sync_usable_strict_gate_pass,
+        "stage10_eval_go_diag_refinement_status": stage10_eval_go_diag_refinement_status,
+        "stage10_eval_used_diag_usable_fallback": stage10_eval_used_diag_usable_fallback,
         "last_handoff_transition_ts": last_handoff_transition_ts,
         "handoff_gate_failures": handoff_gate_failures,
         "phase_basis": phase_basis,
@@ -2069,6 +2203,8 @@ def _live_sync_state_to_dict(
         "phase_state_ts": phase_state_ts,
         "phase_evidence_age_s": phase_evidence_age_s,
         "phase_evidence_fresh": phase_evidence_fresh,
+        "phase_evidence_age_source": phase_evidence_age_source,
+        "sync_driving_evidence_age_source": sync_driving_evidence_age_source,
         "phase_offset_deg": float(getattr(sync, "phase_offset_deg") or 0.0),
         "phase_offset_basis": phase_offset_basis,
         "phase_offset_geographic_deg": typed_phase_offset_geographic,
@@ -2088,6 +2224,11 @@ def _live_sync_state_to_dict(
         ),
         "phase_anchor_retention_reason": getattr(sync, "phase_anchor_retention_reason", None),
         "phase_anchor_retained_without_current_evidence": phase_anchor_retained_without_current_evidence,
+        "stale_go_evidence_raw": bool(stale_readiness_evidence),
+        "stale_go_evidence_effective": bool(stale_readiness_evidence_effective),
+        "stale_go_evidence_computed_from": stale_go_evidence_computed_from,
+        "stale_go_evidence_suppressed_by_fresh_source": stale_go_evidence_suppressed_by_fresh_source,
+        "stale_go_evidence_suppressed_reason": stale_go_evidence_suppressed_reason,
         "phase_anchor_score": float(getattr(sync, "phase_anchor_score") or 0.0),
         "phase_anchor_obs_count": int(getattr(sync, "phase_anchor_obs_count") or 0),
         "phase_validation_status": str(getattr(sync, "phase_validation_status") or "unavailable"),
@@ -2114,6 +2255,19 @@ def _live_sync_state_to_dict(
         "python_base_period_s": base_period_s,
         "go_operational_enabled": bool(go_refiner_operational_enabled),
         "go_operational_active": go_operational_active,
+        "go_operational_ready_streak": getattr(sync, "go_operational_ready_streak", None),
+        "go_operational_promotion_threshold": getattr(sync, "go_operational_promotion_threshold", None),
+        "go_operational_ready_streak_age_s": getattr(sync, "go_operational_ready_streak_age_s", None),
+        "go_operational_last_ready_ts": getattr(sync, "go_operational_last_ready_ts", None),
+        "go_operational_last_not_ready_ts": getattr(sync, "go_operational_last_not_ready_ts", None),
+        "go_operational_streak_reset_reason": getattr(sync, "go_operational_streak_reset_reason", None),
+        "go_operational_streak_reset_gate": getattr(sync, "go_operational_streak_reset_gate", None),
+        "go_operational_streak_reset_handoff_reason": getattr(sync, "go_operational_streak_reset_handoff_reason", None),
+        "go_operational_soft_failure_active": getattr(sync, "go_operational_soft_failure_active", None),
+        "go_operational_soft_failure_until_ts": getattr(sync, "go_operational_soft_failure_until_ts", None),
+        "go_operational_soft_failure_remaining_s": getattr(sync, "go_operational_soft_failure_remaining_s", None),
+        "go_operational_soft_failure_reason": getattr(sync, "go_operational_soft_failure_reason", None),
+        "go_operational_hysteresis_decision": getattr(sync, "go_operational_hysteresis_decision", None),
         "operational_source_path": _source_path_from_period_authority(period_authority),
         "consistency_warnings": consistency_warnings,
         "fit_icao_count": getattr(sync, "fit_icao_count", None),
@@ -2195,6 +2349,206 @@ def _live_sync_state_to_dict(
         "population_authority_source": "current_sync_state.population_validation_state",
     })
 
+    # --- Holdover/Reacquire decision trace (diagnostic only; no behavior impact) ---
+    _holdover_now_ts = time.time()
+    _holdover = bool(getattr(sync, "holdover", False))
+    _holdover_entered_ts = getattr(sync, "holdover_entered_ts", None)
+    _holdover_last_transition_ts = getattr(sync, "holdover_last_transition_ts", None)
+    _reacquire_ref_pos_age_s = getattr(sync, "last_update_epoch_ref_pos_age_s", None)
+    _reacquire_ref_pos_age_limit_s = _to_finite_float(getattr(sync, "strict_epoch_required_ref_age_s", None))
+    if _reacquire_ref_pos_age_limit_s is None:
+        _reacquire_ref_pos_age_limit_s = _to_finite_float((go_sync or {}).get("strict_epoch_required_ref_age_s")) if isinstance(go_sync, dict) else None
+    if _reacquire_ref_pos_age_limit_s is None:
+        _reacquire_ref_pos_age_limit_s = _PHASE_FRESH_MAX_AGE_S
+    _reacquire_min_aircraft_val = _to_finite_float((go_sync or {}).get("reacquire_min_aircraft")) if isinstance(go_sync, dict) else None
+    if _reacquire_min_aircraft_val is None:
+        _reacquire_min_aircraft_val = _to_finite_float(getattr(sync, "strict_epoch_required_min_aircraft", None))
+    if _reacquire_min_aircraft_val is None and isinstance(go_sync, dict):
+        _reacquire_min_aircraft_val = _to_finite_float((go_sync or {}).get("strict_epoch_required_min_aircraft"))
+    _reacquire_min_aircraft = int(_reacquire_min_aircraft_val) if _reacquire_min_aircraft_val is not None else 2
+    _reacquire_support_obs_min_val = (
+        _to_finite_float((go_sync or {}).get("reacquire_support_obs_min"))
+        if isinstance(go_sync, dict) else None
+    )
+    _reacquire_support_obs_min = int(_reacquire_support_obs_min_val) if _reacquire_support_obs_min_val is not None else 12
+    _reacquire_support_icao_min_val = (
+        _to_finite_float((go_sync or {}).get("reacquire_support_icao_min"))
+        if isinstance(go_sync, dict) else None
+    )
+    _reacquire_support_icao_min = int(_reacquire_support_icao_min_val) if _reacquire_support_icao_min_val is not None else 3
+    _reacquire_min_hard_reject_streak_val = (
+        _to_finite_float((go_sync or {}).get("reacquire_min_hard_reject_streak"))
+        if isinstance(go_sync, dict) else None
+    )
+    _reacquire_min_hard_reject_streak = int(_reacquire_min_hard_reject_streak_val) if _reacquire_min_hard_reject_streak_val is not None else 3
+    _reacquire_last_accepted_epoch_age_s = (
+        _to_finite_float((go_sync or {}).get("reacquire_last_accepted_epoch_age_s"))
+        if isinstance(go_sync, dict) else None
+    )
+    _reacquire_fallback_age_limit_s = (
+        _to_finite_float((go_sync or {}).get("reacquire_fallback_age_limit_s"))
+        if isinstance(go_sync, dict) else None
+    )
+    if _reacquire_fallback_age_limit_s is None:
+        _reacquire_fallback_age_limit_s = 30.0
+    _reacquire_valid_period = bool(_finite_positive(getattr(sync, "period_s", None)))
+    _reacquire_valid_ref_icao = bool(str(getattr(sync, "last_update_epoch_ref_icao", "") or ""))
+    _reacquire_ref_position_present = _reacquire_ref_pos_age_s is not None
+    _reacquire_ref_pos_fresh = (
+        (_reacquire_ref_pos_age_s is not None)
+        and (_to_finite_float(_reacquire_ref_pos_age_s) is not None)
+        and (float(_reacquire_ref_pos_age_s) <= float(_reacquire_ref_pos_age_limit_s))
+    )
+    _reacquire_n_aircraft = int(getattr(sync, "last_update_epoch_n_aircraft", 0) or 0)
+    _reacquire_aircraft_count_ok = _reacquire_n_aircraft >= _reacquire_min_aircraft
+    _reacquire_support_obs_count = int((go_sync or {}).get("reacquire_support_obs_count") or 0) if isinstance(go_sync, dict) else 0
+    _reacquire_support_obs_ok = _reacquire_support_obs_count >= _reacquire_support_obs_min
+    _reacquire_support_icao_count = int((go_sync or {}).get("reacquire_support_icao_count") or 0) if isinstance(go_sync, dict) else 0
+    _reacquire_support_icao_ok = _reacquire_support_icao_count >= _reacquire_support_icao_min
+    _fit_obs_count = int((go_sync or {}).get("fit_observation_count") or 0) if isinstance(go_sync, dict) else int(getattr(sync, "fit_total_observations", 0) or 0)
+    _fit_icao_count = int((go_sync or {}).get("fit_icao_count") or 0) if isinstance(go_sync, dict) else int(getattr(sync, "fit_icao_count", 0) or 0)
+    _reacquire_effective_obs_count = max(_fit_obs_count, _reacquire_support_obs_count)
+    _reacquire_effective_icao_count = max(_fit_icao_count, _reacquire_support_icao_count)
+    _reacquire_fit_support_ok = (
+        _reacquire_effective_obs_count >= _reacquire_support_obs_min
+        and _reacquire_effective_icao_count >= _reacquire_support_icao_min
+    )
+    _reacquire_hard_reject_streak = int(getattr(sync, "consecutive_hard_residual_rejects", 0) or 0)
+    _reacquire_hard_reject_streak_ok = _reacquire_hard_reject_streak >= _reacquire_min_hard_reject_streak
+    _reacquire_fallback_allowed = bool((go_sync or {}).get("reacquire_fallback_allowed", False)) if isinstance(go_sync, dict) else False
+    _reacquire_fallback_hard_rejects_min = int(_to_finite_float((go_sync or {}).get("reacquire_fallback_hard_rejects_min")) or 8) if isinstance(go_sync, dict) else 8
+    _reacquire_last_accepted_age_ok = (
+        _reacquire_last_accepted_epoch_age_s is not None
+        and float(_reacquire_last_accepted_epoch_age_s) >= float(_reacquire_fallback_age_limit_s)
+    )
+    _reacquire_hard_reject_condition_ok = bool(
+        _reacquire_hard_reject_streak >= _reacquire_min_hard_reject_streak
+        or (
+            _reacquire_hard_reject_streak >= _reacquire_fallback_hard_rejects_min
+            and _reacquire_last_accepted_age_ok
+        )
+    )
+    _reacquire_current_hard_reject = bool(getattr(sync, "last_update_epoch_reject_reason", None) == "hard_residual_reject")
+    _reacquire_exit_trigger_seen = bool(_holdover and _reacquire_current_hard_reject)
+    _reacquire_can_reacquire_base = all((
+        _reacquire_valid_period,
+        _reacquire_valid_ref_icao,
+        _reacquire_ref_position_present,
+        _reacquire_ref_pos_fresh,
+        _reacquire_aircraft_count_ok,
+        _reacquire_fit_support_ok,
+    ))
+    _reacquire_all_gates_pass = all((
+        _reacquire_can_reacquire_base,
+        _reacquire_hard_reject_condition_ok,
+        _reacquire_exit_trigger_seen,
+    ))
+    _holdover_failed_gates = [
+        ("reacquire_valid_period", _reacquire_valid_period),
+        ("reacquire_valid_ref_icao", _reacquire_valid_ref_icao),
+        ("reacquire_ref_position_present", _reacquire_ref_position_present),
+        ("reacquire_ref_pos_fresh", _reacquire_ref_pos_fresh),
+        ("reacquire_aircraft_count", _reacquire_aircraft_count_ok),
+        ("reacquire_fit_support", _reacquire_fit_support_ok),
+        ("reacquire_hard_reject_condition", _reacquire_hard_reject_condition_ok),
+        ("reacquire_exit_trigger_hard_residual", _reacquire_exit_trigger_seen),
+    ]
+    _holdover_exit_first_failed_gate = next((name for name, ok in _holdover_failed_gates if not ok), None)
+    _holdover_exit_allowed = bool(_holdover and _reacquire_all_gates_pass)
+    _holdover_exit_attempted = bool(
+        _holdover and (
+            _reacquire_support_obs_count > 0
+            or _reacquire_support_icao_count > 0
+            or _reacquire_n_aircraft > 0
+        )
+    )
+    _holdover_exit_block_reason = (
+        None
+        if _holdover_exit_allowed
+        else (_holdover_exit_first_failed_gate if _holdover else None)
+    )
+    _reacquire_temporal_pending = bool(_holdover and _reacquire_all_gates_pass)
+    payload.update({
+        "holdover_entered_ts": _holdover_entered_ts,
+        "holdover_age_s": (
+            max(0.0, _holdover_now_ts - float(_holdover_entered_ts))
+            if _holdover and _holdover_entered_ts is not None else None
+        ),
+        "holdover_last_transition_ts": _holdover_last_transition_ts,
+        "holdover_exit_attempted": _holdover_exit_attempted,
+        "holdover_exit_allowed": _holdover_exit_allowed if _holdover else False,
+        "holdover_exit_block_reason": _holdover_exit_block_reason,
+        "holdover_exit_first_failed_gate": _holdover_exit_first_failed_gate,
+        "reacquire_valid_period": _reacquire_valid_period,
+        "reacquire_valid_ref_icao": _reacquire_valid_ref_icao,
+        "reacquire_ref_position_present": _reacquire_ref_position_present,
+        "reacquire_ref_pos_age_s": _reacquire_ref_pos_age_s,
+        "reacquire_ref_pos_age_limit_s": _reacquire_ref_pos_age_limit_s,
+        "reacquire_ref_pos_fresh": _reacquire_ref_pos_fresh,
+        "reacquire_n_aircraft": _reacquire_n_aircraft,
+        "reacquire_min_aircraft": _reacquire_min_aircraft,
+        "reacquire_aircraft_count_ok": _reacquire_aircraft_count_ok,
+        "reacquire_support_obs_count": _reacquire_support_obs_count,
+        "reacquire_support_obs_min": _reacquire_support_obs_min,
+        "reacquire_support_obs_ok": _reacquire_support_obs_ok,
+        "reacquire_support_icao_count": _reacquire_support_icao_count,
+        "reacquire_support_icao_min": _reacquire_support_icao_min,
+        "reacquire_support_icao_ok": _reacquire_support_icao_ok,
+        "reacquire_effective_obs_count": _reacquire_effective_obs_count,
+        "reacquire_effective_icao_count": _reacquire_effective_icao_count,
+        "reacquire_fit_support_ok": _reacquire_fit_support_ok,
+        "reacquire_hard_reject_streak": _reacquire_hard_reject_streak,
+        "reacquire_min_hard_reject_streak": _reacquire_min_hard_reject_streak,
+        "reacquire_hard_reject_streak_ok": _reacquire_hard_reject_streak_ok,
+        "reacquire_fallback_hard_rejects_min": _reacquire_fallback_hard_rejects_min,
+        "reacquire_last_accepted_epoch_age_s": _reacquire_last_accepted_epoch_age_s,
+        "reacquire_fallback_age_limit_s": _reacquire_fallback_age_limit_s,
+        "reacquire_last_accepted_age_ok": _reacquire_last_accepted_age_ok,
+        "reacquire_fallback_allowed": _reacquire_fallback_allowed,
+        "reacquire_hard_reject_condition_ok": _reacquire_hard_reject_condition_ok,
+        "reacquire_current_hard_reject": _reacquire_current_hard_reject,
+        "reacquire_exit_trigger_seen": _reacquire_exit_trigger_seen,
+        "reacquire_can_reacquire_base": _reacquire_can_reacquire_base,
+        "reacquire_exit_code_path": "holdover_hard_residual_reject_branch_only",
+        "reacquire_exit_decision": (
+            "reacquired_provisional_or_exit_holdover" if _reacquire_all_gates_pass
+            else "holdover_retained"
+        ),
+        "reacquire_exit_decision_reason": (
+            "all_reacquire_conditions_met_but_holdover_state_still_true_temporal_or_missed_exit"
+            if _reacquire_temporal_pending
+            else (
+                "all_reacquire_conditions_met_on_hard_reject_epoch"
+                if _reacquire_all_gates_pass
+                else (_holdover_exit_first_failed_gate or "not_in_holdover")
+            )
+        ),
+        "reacquire_temporal_pending": _reacquire_temporal_pending,
+        "reacquire_hidden_gate_name": (
+            "reacquire_exit_state_not_applied"
+            if _reacquire_temporal_pending
+            else (
+                _holdover_exit_first_failed_gate
+                if _holdover_exit_first_failed_gate in {"reacquire_exit_trigger_hard_residual", "reacquire_hard_reject_condition", "reacquire_fit_support"}
+                else None
+            )
+        ),
+        "reacquire_hidden_gate_pass": (
+            False
+            if _reacquire_temporal_pending
+            else (
+                None
+                if _holdover_exit_first_failed_gate is None
+                else (
+                    False
+                    if _holdover_exit_first_failed_gate in {"reacquire_exit_trigger_hard_residual", "reacquire_hard_reject_condition", "reacquire_fit_support"}
+                    else None
+                )
+            )
+        ),
+        "reacquire_all_gates_pass": _reacquire_all_gates_pass,
+    })
+
     # --- Stage 3R diagnostic summaries derived from handoff gate results ---
     _hgf = handoff_gate_failures  # shorthand
     _py_gates = _hgf.get("python_base", {})
@@ -2217,6 +2571,81 @@ def _live_sync_state_to_dict(
                 else (_go_gates.get("go_slope_converged", {}).get("reason") or "not_evaluated")
             )
         ) if _go_gates else None,
+        "slope_not_converged_reason": (
+            (
+                _go_gates.get("go_slope_converged", {}).get("reason")
+                if _go_gates.get("go_slope_converged", {}).get("passed") is False
+                else None
+            )
+        ) if _go_gates else None,
+        "slope_converged": (
+            _go_gates.get("go_slope_converged", {}).get("passed")
+            if _go_gates else None
+        ),
+        "slope_near_zero_window_pass": (
+            _go_gates.get("go_slope_converged", {}).get("slope_near_zero_window_pass")
+            if _go_gates else None
+        ),
+        "slope_near_zero_window_duration_s": (
+            _go_gates.get("go_slope_converged", {}).get("slope_near_zero_window_duration_s")
+            if _go_gates else None
+        ),
+        "slope_near_zero_required_duration_s": (
+            _go_gates.get("go_slope_converged", {}).get("slope_near_zero_required_duration_s")
+            if _go_gates else None
+        ),
+        "slope_near_zero_threshold_deg_s": (
+            _go_gates.get("go_slope_converged", {}).get("slope_near_zero_threshold_deg_s")
+            if _go_gates else None
+        ),
+        "slope_near_zero_max_abs_slope_deg_s": (
+            _go_gates.get("go_slope_converged", {}).get("slope_near_zero_max_abs_slope_deg_s")
+            if _go_gates else None
+        ),
+        "slope_near_zero_sample_count": (
+            _go_gates.get("go_slope_converged", {}).get("slope_near_zero_sample_count")
+            if _go_gates else None
+        ),
+        "slope_near_zero_fail_reason": (
+            _go_gates.get("go_slope_converged", {}).get("slope_near_zero_fail_reason")
+            if _go_gates else None
+        ),
+        "slope_regression_pass": (
+            _go_gates.get("go_slope_converged", {}).get("slope_regression_pass")
+            if _go_gates else None
+        ),
+        "slope_regression_window_s": (
+            _go_gates.get("go_slope_converged", {}).get("slope_regression_window_s")
+            if _go_gates else None
+        ),
+        "slope_regression_r2": (
+            _go_gates.get("go_slope_converged", {}).get("slope_regression_r2")
+            if _go_gates else None
+        ),
+        "slope_regression_r2_min": (
+            _go_gates.get("go_slope_converged", {}).get("slope_regression_r2_min")
+            if _go_gates else None
+        ),
+        "slope_regression_trend_deg_s2": (
+            _go_gates.get("go_slope_converged", {}).get("slope_regression_trend_deg_s2")
+            if _go_gates else None
+        ),
+        "slope_regression_trend_direction": (
+            _go_gates.get("go_slope_converged", {}).get("slope_regression_trend_direction")
+            if _go_gates else None
+        ),
+        "slope_regression_sample_count": (
+            _go_gates.get("go_slope_converged", {}).get("slope_regression_sample_count")
+            if _go_gates else None
+        ),
+        "slope_regression_fail_reason": (
+            _go_gates.get("go_slope_converged", {}).get("slope_regression_fail_reason")
+            if _go_gates else None
+        ),
+        "slope_not_converged_subreason": (
+            _go_gates.get("go_slope_converged", {}).get("slope_not_converged_subreason")
+            if _go_gates else None
+        ),
         "phase_authority_reason": next(
             (
                 str(v.get("reason") or k)
@@ -2226,6 +2655,14 @@ def _live_sync_state_to_dict(
             None,
         ),
     })
+    if payload.get("slope_converged") is False:
+        fit_reset_reason = str(payload.get("fit_epoch_reset_reason") or "")
+        if str(payload.get("handoff_reason") or "").startswith("go_soft_failure_holdover:"):
+            payload["slope_not_converged_subreason"] = "soft_failure_hold"
+        elif fit_reset_reason in {"phase_offset_discontinuity", "reference_changed", "anchor_changed"}:
+            payload["slope_not_converged_subreason"] = "recent_reset_or_rebase"
+        elif not payload.get("slope_not_converged_subreason"):
+            payload["slope_not_converged_subreason"] = "unknown"
 
     payload.update(_build_go_diagnostic_fields(sync, go_sync=go_sync))
     payload.update(_build_go_promotion_failure_diagnostic_aliases(payload, go_sync=go_sync))
@@ -2258,6 +2695,22 @@ def _live_sync_state_to_dict(
     payload["transition_quarantine_window_s"] = (go_sync or {}).get(
         "transition_quarantine_window_s",
         payload.get("transition_quarantine_window_s"),
+    )
+    payload["phase_offset_discontinuity_count"] = (go_sync or {}).get(
+        "phase_offset_discontinuity_count",
+        payload.get("phase_offset_discontinuity_count"),
+    )
+    payload["phase_offset_discontinuity_rebased_gradual_drift_count"] = (go_sync or {}).get(
+        "phase_offset_discontinuity_rebased_gradual_drift_count",
+        payload.get("phase_offset_discontinuity_rebased_gradual_drift_count"),
+    )
+    payload["hard_bound_reject_count"] = (go_sync or {}).get(
+        "hard_bound_reject_count",
+        payload.get("go_diagnostic_consecutive_hard_bound_rejects"),
+    )
+    payload["slew_limited_count"] = (go_sync or {}).get(
+        "slew_limited_count",
+        payload.get("slew_limited_count"),
     )
 
     # --- Python shadow refinement fields (present when Python runs as shadow) ---
@@ -2320,13 +2773,17 @@ def _live_sync_state_to_dict(
     payload["go_operational_gate_failures"] = go_op_failures if go_op_failures else None
 
     # Stage 10 attribution remediation for live unclassified shape:
-    # ready-like Go diagnostics are present, but older runtime snapshots may
-    # still carry unclassified placeholders in blocking/handoff fields.
+    # emit hysteresis attribution only when explicit pending-state diagnostics
+    # indicate promotion hysteresis is actually active.
     if (
         bool(payload.get("go_operational_enabled"))
         and not bool(payload.get("go_operational_active"))
         and payload.get("go_operational_blocking_gate") == "go_readiness.unclassified_state"
         and str(payload.get("handoff_reason") or "") == "go_state_unclassified"
+        and str(payload.get("go_operational_hysteresis_decision") or "") == "pending"
+        and int(payload.get("go_operational_promotion_threshold") or 0) > 0
+        and int(payload.get("go_operational_ready_streak") or 0)
+        < int(payload.get("go_operational_promotion_threshold") or 0)
         and not bool(payload.get("holdover"))
         and not str(payload.get("go_sync_unusable_reason") or "")
         and not str(payload.get("go_diagnostic_go_sync_unusable_reason") or "")
@@ -2343,7 +2800,7 @@ def _live_sync_state_to_dict(
     if (
         bool(payload.get("go_operational_enabled"))
         and not bool(payload.get("go_operational_active"))
-        and stale_readiness_evidence
+        and stale_readiness_evidence_effective
         and (
             payload.get("go_operational_blocking_gate") == "go_readiness_hysteresis"
             or payload.get("handoff_reason") == "go_ready_pending_hysteresis"
@@ -2735,6 +3192,7 @@ class RadarState:
         self._go_sync_states_by_iid: dict[int, dict] = {}
         self._go_operational_by_iid: dict[int, bool] = {}
         self._go_operational_ready_streak_by_iid: dict[int, int] = {}
+        self._go_operational_ready_streak_started_ts_by_iid: dict[int, float] = {}
         self._go_operational_soft_failure_until_by_iid: dict[int, float] = {}
         # Hysteresis hold for population-based anchor demotion.
         # Maps (iid, anchor_icao) -> expiry_wall_ts.  Once an anchor is demoted
@@ -4868,25 +5326,69 @@ class RadarState:
         """
         history = self._live_slope_history.get(iid)
         if not history:
-            return _gate_value(False, "insufficient_slope_history")
+            return {
+                **_gate_value(False, "insufficient_slope_history"),
+                "slope_converged": False,
+                "slope_not_converged_subreason": "insufficient_slope_samples",
+                "slope_near_zero_window_pass": False,
+                "slope_near_zero_window_duration_s": 0.0,
+                "slope_near_zero_required_duration_s": _SLOPE_TREND_NEAR_ZERO_MIN_S,
+                "slope_near_zero_threshold_deg_s": _SLOPE_TREND_NEAR_ZERO_THRESHOLD_DEG_S,
+                "slope_near_zero_max_abs_slope_deg_s": None,
+                "slope_near_zero_sample_count": 0,
+                "slope_near_zero_fail_reason": "insufficient_slope_samples",
+                "slope_regression_pass": False,
+                "slope_regression_window_s": _SLOPE_TREND_REGRESSION_WINDOW_S,
+                "slope_regression_r2": None,
+                "slope_regression_r2_min": _SLOPE_TREND_REGRESSION_R2_MIN,
+                "slope_regression_trend_deg_s2": None,
+                "slope_regression_trend_direction": "unknown",
+                "slope_regression_sample_count": 0,
+                "slope_regression_fail_reason": "insufficient_slope_samples",
+            }
 
         now_ts = time.time()
 
         # Condition 1: near-zero sustained for >= 10 seconds.
-        recent_10s = [e for e in history if (now_ts - float(e.get("ts") or 0.0)) <= 10.0]
-        if len(recent_10s) >= 2:
-            oldest_ts_in_window = min(float(e.get("ts") or 0.0) for e in recent_10s)
-            if (now_ts - oldest_ts_in_window) >= 9.5:
-                all_near_zero = all(
-                    abs(float(e.get("residual_slope_deg_per_s") or 0.0)) < _SLOPE_TREND_NEAR_ZERO_THRESHOLD_DEG_S
-                    for e in recent_10s
-                )
-                if all_near_zero:
-                    return _gate_value(True, "near_zero_sustained")
+        recent_10s = [
+            e for e in history
+            if (now_ts - float(e.get("ts") or 0.0)) <= _SLOPE_TREND_NEAR_ZERO_MIN_S
+        ]
+        near_zero_sample_count = len(recent_10s)
+        near_zero_oldest_ts = min((float(e.get("ts") or 0.0) for e in recent_10s), default=None)
+        near_zero_window_duration_s = (
+            max(0.0, now_ts - near_zero_oldest_ts) if near_zero_oldest_ts is not None else 0.0
+        )
+        near_zero_slack_required_s = _SLOPE_TREND_NEAR_ZERO_MIN_S - 0.5
+        near_zero_max_abs_slope_deg_s = max(
+            (abs(float(e.get("residual_slope_deg_per_s") or 0.0)) for e in recent_10s),
+            default=None,
+        )
+        near_zero_window_pass = False
+        near_zero_fail_reason = "unknown"
+        if near_zero_sample_count < 2 or near_zero_window_duration_s < near_zero_slack_required_s:
+            near_zero_fail_reason = "near_zero_window_short"
+        elif (
+            near_zero_max_abs_slope_deg_s is not None
+            and near_zero_max_abs_slope_deg_s >= _SLOPE_TREND_NEAR_ZERO_THRESHOLD_DEG_S
+        ):
+            near_zero_fail_reason = "near_zero_slope_too_large"
+        else:
+            near_zero_window_pass = True
+            near_zero_fail_reason = None
 
         # Condition 2: regression over last 30s shows decreasing magnitude with R² >= 0.5.
-        recent_30s = [e for e in history if (now_ts - float(e.get("ts") or 0.0)) <= 30.0]
-        if len(recent_30s) >= 3:
+        recent_30s = [
+            e for e in history
+            if (now_ts - float(e.get("ts") or 0.0)) <= _SLOPE_TREND_REGRESSION_WINDOW_S
+        ]
+        regression_sample_count = len(recent_30s)
+        regression_pass = False
+        regression_r2 = None
+        regression_trend_deg_s2 = None
+        regression_trend_direction = "unknown"
+        regression_fail_reason = "unknown"
+        if regression_sample_count >= 3:
             xs = [float(e.get("ts") or 0.0) for e in recent_30s]
             ys = [abs(float(e.get("residual_slope_deg_per_s") or 0.0)) for e in recent_30s]
             n = len(xs)
@@ -4896,16 +5398,118 @@ class RadarState:
             ss_xx = sum((x - mean_x) ** 2 for x in xs)
             ss_yy = sum((y - mean_y) ** 2 for y in ys)
             if ss_xx > 0 and ss_yy > 0:
-                r_sq = (ss_xy ** 2) / (ss_xx * ss_yy)
-                slope_regression = ss_xy / ss_xx  # negative = decreasing over time
-                if slope_regression < 0 and r_sq >= _SLOPE_TREND_REGRESSION_R2_MIN:
-                    return _gate_value(True, "slope_magnitude_decreasing")
+                regression_r2 = (ss_xy ** 2) / (ss_xx * ss_yy)
+                regression_trend_deg_s2 = ss_xy / ss_xx  # negative = decreasing over time
+                if regression_trend_deg_s2 < 0:
+                    regression_trend_direction = "decreasing"
+                elif regression_trend_deg_s2 > 0:
+                    regression_trend_direction = "increasing"
+                else:
+                    regression_trend_direction = "flat"
+                if (
+                    regression_trend_deg_s2 < 0
+                    and regression_r2 >= _SLOPE_TREND_REGRESSION_R2_MIN
+                ):
+                    regression_pass = True
+                    regression_fail_reason = None
+                elif regression_trend_deg_s2 >= 0:
+                    regression_fail_reason = "regression_not_decreasing"
+                else:
+                    regression_fail_reason = "regression_r2_too_low"
+            else:
+                regression_fail_reason = "regression_r2_too_low"
+        else:
+            regression_fail_reason = "insufficient_slope_samples"
+
+        if near_zero_window_pass:
+            return {
+                **_gate_value(True, "near_zero_sustained"),
+                "slope_converged": True,
+                "slope_not_converged_subreason": None,
+                "slope_near_zero_window_pass": True,
+                "slope_near_zero_window_duration_s": near_zero_window_duration_s,
+                "slope_near_zero_required_duration_s": _SLOPE_TREND_NEAR_ZERO_MIN_S,
+                "slope_near_zero_threshold_deg_s": _SLOPE_TREND_NEAR_ZERO_THRESHOLD_DEG_S,
+                "slope_near_zero_max_abs_slope_deg_s": near_zero_max_abs_slope_deg_s,
+                "slope_near_zero_sample_count": near_zero_sample_count,
+                "slope_near_zero_fail_reason": None,
+                "slope_regression_pass": regression_pass,
+                "slope_regression_window_s": _SLOPE_TREND_REGRESSION_WINDOW_S,
+                "slope_regression_r2": regression_r2,
+                "slope_regression_r2_min": _SLOPE_TREND_REGRESSION_R2_MIN,
+                "slope_regression_trend_deg_s2": regression_trend_deg_s2,
+                "slope_regression_trend_direction": regression_trend_direction,
+                "slope_regression_sample_count": regression_sample_count,
+                "slope_regression_fail_reason": regression_fail_reason,
+            }
+        if regression_pass:
+            return {
+                **_gate_value(True, "slope_magnitude_decreasing"),
+                "slope_converged": True,
+                "slope_not_converged_subreason": None,
+                "slope_near_zero_window_pass": False,
+                "slope_near_zero_window_duration_s": near_zero_window_duration_s,
+                "slope_near_zero_required_duration_s": _SLOPE_TREND_NEAR_ZERO_MIN_S,
+                "slope_near_zero_threshold_deg_s": _SLOPE_TREND_NEAR_ZERO_THRESHOLD_DEG_S,
+                "slope_near_zero_max_abs_slope_deg_s": near_zero_max_abs_slope_deg_s,
+                "slope_near_zero_sample_count": near_zero_sample_count,
+                "slope_near_zero_fail_reason": near_zero_fail_reason,
+                "slope_regression_pass": True,
+                "slope_regression_window_s": _SLOPE_TREND_REGRESSION_WINDOW_S,
+                "slope_regression_r2": regression_r2,
+                "slope_regression_r2_min": _SLOPE_TREND_REGRESSION_R2_MIN,
+                "slope_regression_trend_deg_s2": regression_trend_deg_s2,
+                "slope_regression_trend_direction": regression_trend_direction,
+                "slope_regression_sample_count": regression_sample_count,
+                "slope_regression_fail_reason": None,
+            }
 
         # Insufficient history: blocking.
         if len(history) < 2:
-            return _gate_value(False, "insufficient_slope_history")
+            subreason = "insufficient_slope_samples"
+            reason = "insufficient_slope_history"
+        elif regression_fail_reason == "regression_not_decreasing":
+            subreason = "regression_not_decreasing"
+            reason = "slope_not_converged"
+        elif near_zero_fail_reason == "near_zero_slope_too_large":
+            subreason = "near_zero_slope_too_large"
+            reason = "slope_not_converged"
+        elif near_zero_fail_reason == "near_zero_window_short" and regression_sample_count < 3:
+            subreason = "near_zero_window_short"
+            reason = "slope_not_converged"
+        elif regression_fail_reason == "regression_r2_too_low":
+            subreason = "regression_r2_too_low"
+            reason = "slope_not_converged"
+        elif near_zero_fail_reason == "near_zero_window_short":
+            subreason = "near_zero_window_short"
+            reason = "slope_not_converged"
+        elif regression_fail_reason == "insufficient_slope_samples":
+            subreason = "insufficient_slope_samples"
+            reason = "insufficient_slope_history"
+        else:
+            subreason = "unknown"
+            reason = "slope_not_converged"
 
-        return _gate_value(False, "slope_not_converged")
+        return {
+            **_gate_value(False, reason),
+            "slope_converged": False,
+            "slope_not_converged_subreason": subreason,
+            "slope_near_zero_window_pass": False,
+            "slope_near_zero_window_duration_s": near_zero_window_duration_s,
+            "slope_near_zero_required_duration_s": _SLOPE_TREND_NEAR_ZERO_MIN_S,
+            "slope_near_zero_threshold_deg_s": _SLOPE_TREND_NEAR_ZERO_THRESHOLD_DEG_S,
+            "slope_near_zero_max_abs_slope_deg_s": near_zero_max_abs_slope_deg_s,
+            "slope_near_zero_sample_count": near_zero_sample_count,
+            "slope_near_zero_fail_reason": near_zero_fail_reason,
+            "slope_regression_pass": False,
+            "slope_regression_window_s": _SLOPE_TREND_REGRESSION_WINDOW_S,
+            "slope_regression_r2": regression_r2,
+            "slope_regression_r2_min": _SLOPE_TREND_REGRESSION_R2_MIN,
+            "slope_regression_trend_deg_s2": regression_trend_deg_s2,
+            "slope_regression_trend_direction": regression_trend_direction,
+            "slope_regression_sample_count": regression_sample_count,
+            "slope_regression_fail_reason": regression_fail_reason,
+        }
 
     def _evaluate_python_base_validity_gates_locked(self, iid: int) -> dict:
         sync = self._live_sync_states.get(iid)
@@ -5421,6 +6025,13 @@ class RadarState:
         import config as _cfg
         _go_operational_enabled = bool(getattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", False))
         sync.go_operational_enabled = _go_operational_enabled
+        sync.go_operational_promotion_threshold = _GO_OPERATIONAL_PROMOTION_CONSECUTIVE
+        sync.go_operational_ready_streak = int(self._go_operational_ready_streak_by_iid.get(iid, 0) or 0)
+        sync.go_operational_hysteresis_decision = "blocked"
+        sync.go_operational_soft_failure_until_ts = None
+        sync.go_operational_soft_failure_remaining_s = None
+        sync.go_operational_soft_failure_active = False
+        sync.go_operational_soft_failure_reason = None
 
         def _first_blocking_reason(gates: dict, default_reason: str) -> tuple[str, str]:
             for gate_name, gate_state in gates.items():
@@ -5438,8 +6049,29 @@ class RadarState:
             blocking_gate: str | None = None,
             operational_active: bool = False,
         ) -> None:
+            now_state_ts = time.time()
+            streak_started_ts = self._go_operational_ready_streak_started_ts_by_iid.get(iid)
+            streak = int(self._go_operational_ready_streak_by_iid.get(iid, 0) or 0)
+            soft_until = self._go_operational_soft_failure_until_by_iid.get(iid)
             sync.blocking_gate = blocking_gate
             sync.go_operational_active = operational_active
+            sync.go_operational_ready_streak = streak
+            sync.go_operational_promotion_threshold = _GO_OPERATIONAL_PROMOTION_CONSECUTIVE
+            sync.go_operational_ready_streak_age_s = (
+                max(0.0, now_state_ts - float(streak_started_ts))
+                if streak_started_ts is not None else None
+            )
+            sync.go_operational_soft_failure_until_ts = (
+                float(soft_until) if soft_until is not None else None
+            )
+            sync.go_operational_soft_failure_active = bool(
+                soft_until is not None and now_state_ts < float(soft_until)
+            )
+            sync.go_operational_soft_failure_remaining_s = (
+                max(0.0, float(soft_until) - now_state_ts)
+                if soft_until is not None and now_state_ts < float(soft_until)
+                else None
+            )
             self._set_handoff_state_locked(
                 iid, sync,
                 handoff_state=handoff_state,
@@ -5455,8 +6087,19 @@ class RadarState:
             gate_name, reason = _first_blocking_reason(py_gates["gates"], "missing_python_base_period")
             sync.usable = False
             self._go_operational_by_iid[iid] = False
+            prev_streak = int(self._go_operational_ready_streak_by_iid.get(iid, 0) or 0)
             self._go_operational_ready_streak_by_iid[iid] = 0
+            self._go_operational_ready_streak_started_ts_by_iid.pop(iid, None)
             self._go_operational_soft_failure_until_by_iid.pop(iid, None)
+            now_ts = time.time()
+            sync.go_operational_last_not_ready_ts = now_ts
+            if prev_streak > 0:
+                sync.go_operational_streak_reset_reason = reason
+                sync.go_operational_streak_reset_gate = gate_name
+                sync.go_operational_streak_reset_handoff_reason = reason
+                sync.go_operational_hysteresis_decision = "reset"
+            else:
+                sync.go_operational_hysteresis_decision = "blocked"
             _apply_state(
                 handoff_state="BOOTSTRAPPING_PY",
                 handoff_reason=reason,
@@ -5475,8 +6118,19 @@ class RadarState:
         if not go_present:
             sync.usable = False
             self._go_operational_by_iid[iid] = False
+            prev_streak = int(self._go_operational_ready_streak_by_iid.get(iid, 0) or 0)
             self._go_operational_ready_streak_by_iid[iid] = 0
+            self._go_operational_ready_streak_started_ts_by_iid.pop(iid, None)
             self._go_operational_soft_failure_until_by_iid.pop(iid, None)
+            now_ts = time.time()
+            sync.go_operational_last_not_ready_ts = now_ts
+            if prev_streak > 0:
+                sync.go_operational_streak_reset_reason = "go_sync_absent"
+                sync.go_operational_streak_reset_gate = "go_state_present"
+                sync.go_operational_streak_reset_handoff_reason = "go_sync_absent"
+                sync.go_operational_hysteresis_decision = "reset"
+            else:
+                sync.go_operational_hysteresis_decision = "blocked"
             _apply_state(
                 handoff_state="BASE_PERIOD_READY",
                 handoff_reason="go_sync_absent",
@@ -5491,8 +6145,19 @@ class RadarState:
         if go_holdover:
             sync.usable = False
             self._go_operational_by_iid[iid] = False
+            prev_streak = int(self._go_operational_ready_streak_by_iid.get(iid, 0) or 0)
             self._go_operational_ready_streak_by_iid[iid] = 0
+            self._go_operational_ready_streak_started_ts_by_iid.pop(iid, None)
             self._go_operational_soft_failure_until_by_iid.pop(iid, None)
+            now_ts = time.time()
+            sync.go_operational_last_not_ready_ts = now_ts
+            if prev_streak > 0:
+                sync.go_operational_streak_reset_reason = "go_holdover"
+                sync.go_operational_streak_reset_gate = "go_not_holdover"
+                sync.go_operational_streak_reset_handoff_reason = "go_holdover"
+                sync.go_operational_hysteresis_decision = "reset"
+            else:
+                sync.go_operational_hysteresis_decision = "blocked"
             _apply_state(
                 handoff_state="HOLDOVER",
                 handoff_reason="go_holdover",
@@ -5513,8 +6178,19 @@ class RadarState:
             gate_name, reason = _first_blocking_reason(go_gates["gates"], "go_base_disagrees_with_python_base")
             sync.usable = False
             self._go_operational_by_iid[iid] = False
+            prev_streak = int(self._go_operational_ready_streak_by_iid.get(iid, 0) or 0)
             self._go_operational_ready_streak_by_iid[iid] = 0
+            self._go_operational_ready_streak_started_ts_by_iid.pop(iid, None)
             self._go_operational_soft_failure_until_by_iid.pop(iid, None)
+            now_ts = time.time()
+            sync.go_operational_last_not_ready_ts = now_ts
+            if prev_streak > 0:
+                sync.go_operational_streak_reset_reason = reason
+                sync.go_operational_streak_reset_gate = gate_name
+                sync.go_operational_streak_reset_handoff_reason = reason
+                sync.go_operational_hysteresis_decision = "reset"
+            else:
+                sync.go_operational_hysteresis_decision = "blocked"
             _apply_state(
                 handoff_state="UNTRUSTED",
                 handoff_reason=reason,
@@ -5550,7 +6226,17 @@ class RadarState:
         go_base_accepted = go_base_valid is True and go_base_agrees is True
         if not go_gates["go_ready"]:
             gate_name, reason = _first_blocking_reason(go_gates["gates"], "go_not_ready")
+            prev_streak = int(self._go_operational_ready_streak_by_iid.get(iid, 0) or 0)
             self._go_operational_ready_streak_by_iid[iid] = 0
+            self._go_operational_ready_streak_started_ts_by_iid.pop(iid, None)
+            sync.go_operational_last_not_ready_ts = now_ts
+            if prev_streak > 0:
+                sync.go_operational_streak_reset_reason = reason
+                sync.go_operational_streak_reset_gate = gate_name
+                sync.go_operational_streak_reset_handoff_reason = reason
+                sync.go_operational_hysteresis_decision = "reset"
+            else:
+                sync.go_operational_hysteresis_decision = "blocked"
             if hard_failure:
                 self._go_operational_soft_failure_until_by_iid.pop(iid, None)
             elif self._go_operational_by_iid.get(iid, False):
@@ -5560,6 +6246,11 @@ class RadarState:
                 if now_ts < soft_failure_until:
                     sync.usable = True
                     self._go_operational_by_iid[iid] = True
+                    sync.go_operational_hysteresis_decision = "soft_hold"
+                    sync.go_operational_soft_failure_active = True
+                    sync.go_operational_soft_failure_until_ts = soft_failure_until
+                    sync.go_operational_soft_failure_remaining_s = max(0.0, soft_failure_until - now_ts)
+                    sync.go_operational_soft_failure_reason = reason
                     phase_authority = "go_runtime" if phase_eval["phase_ready"] else "py_anchor_relative"
                     _apply_state(
                         handoff_state="GO_REFINED_READY",
@@ -5598,10 +6289,17 @@ class RadarState:
 
         # Step 6: All Go gates pass. Operational flag determines whether Go is used.
         self._go_operational_soft_failure_until_by_iid.pop(iid, None)
+        sync.go_operational_soft_failure_active = False
+        sync.go_operational_soft_failure_until_ts = None
+        sync.go_operational_soft_failure_remaining_s = None
+        sync.go_operational_soft_failure_reason = None
         if not _go_operational_enabled:
             sync.usable = False
             self._go_operational_by_iid[iid] = False
             self._go_operational_ready_streak_by_iid[iid] = 0
+            self._go_operational_ready_streak_started_ts_by_iid.pop(iid, None)
+            sync.go_operational_last_not_ready_ts = now_ts
+            sync.go_operational_hysteresis_decision = "blocked"
             _apply_state(
                 handoff_state="GO_REFINED_READY",
                 handoff_reason="go_ready_flag_disabled",
@@ -5612,10 +6310,14 @@ class RadarState:
             return
 
         ready_streak += 1
+        if ready_streak == 1:
+            self._go_operational_ready_streak_started_ts_by_iid[iid] = now_ts
+        sync.go_operational_last_ready_ts = now_ts
         self._go_operational_ready_streak_by_iid[iid] = ready_streak
         if ready_streak < _GO_OPERATIONAL_PROMOTION_CONSECUTIVE:
             sync.usable = False
             self._go_operational_by_iid[iid] = False
+            sync.go_operational_hysteresis_decision = "pending"
             _apply_state(
                 handoff_state="GO_REFINED_READY",
                 handoff_reason="go_ready_pending_hysteresis",
@@ -5629,6 +6331,7 @@ class RadarState:
         # Operational: Go is period authority. Phase authority is separate.
         sync.usable = True
         self._go_operational_by_iid[iid] = True
+        sync.go_operational_hysteresis_decision = "promoted"
         phase_authority = "go_runtime" if phase_eval["phase_ready"] else "py_anchor_relative"
         _apply_state(
             handoff_state="GO_REFINED_READY",
@@ -5637,6 +6340,12 @@ class RadarState:
             sync_authority="go_runtime",
             phase_authority=phase_authority,
             operational_active=True,
+        )
+        sync.go_operational_ready_streak = int(self._go_operational_ready_streak_by_iid.get(iid, 0) or 0)
+        streak_started_ts = self._go_operational_ready_streak_started_ts_by_iid.get(iid)
+        sync.go_operational_ready_streak_age_s = (
+            max(0.0, now_ts - float(streak_started_ts))
+            if streak_started_ts is not None else None
         )
 
     @staticmethod
@@ -5876,6 +6585,23 @@ class RadarState:
 
         go_sync_unusable_reason = str(go_sync.get("go_sync_unusable_reason") or "")
         holdover = bool(go_sync.get("holdover", False))
+        prev_holdover = bool(getattr(existing, "holdover", False)) if existing is not None else False
+        prev_holdover_entered_ts = getattr(existing, "holdover_entered_ts", None) if existing is not None else None
+        prev_holdover_last_transition_ts = getattr(existing, "holdover_last_transition_ts", None) if existing is not None else None
+        holdover_entered_ts = (
+            float(prev_holdover_entered_ts)
+            if holdover and prev_holdover and prev_holdover_entered_ts is not None
+            else (last_updated if holdover else None)
+        )
+        holdover_last_transition_ts = (
+            last_updated
+            if existing is None or holdover != prev_holdover
+            else (
+                float(prev_holdover_last_transition_ts)
+                if prev_holdover_last_transition_ts is not None
+                else None
+            )
+        )
         period_agrees = bool(go_sync.get("go_sync_usable_period_agrees", False))
         strict_gate_pass = bool(go_sync.get("go_sync_usable_strict_gate_pass", False))
         population_state = str(getattr(existing, "population_validation_state", "") or "") if existing is not None else ""
@@ -6097,6 +6823,8 @@ class RadarState:
             fit_segment_count=int(go_sync.get("fit_segment_count") or 0),
             slope_sign_convention=str(go_sync.get("slope_sign_convention") or "") or None,
             holdover_reason=str(go_sync.get("holdover_reason") or "") or None,
+            holdover_entered_ts=holdover_entered_ts,
+            holdover_last_transition_ts=holdover_last_transition_ts,
             holdover_quality_gate_failed=int(go_sync.get("holdover_quality_gate_failed") or 0),
             holdover_missing_df_base_period=int(go_sync.get("holdover_missing_df_base_period") or 0),
             holdover_hard_residual_reject=int(go_sync.get("holdover_hard_residual_reject") or 0),
@@ -10473,7 +11201,14 @@ class RadarState:
                         if not handoff_reason:
                             handoff_reason = "go_refinement_history_insufficient"
                 if not go_blocking_gate:
+                    pending_decision = str(go_sync.get("go_operational_hysteresis_decision") or "").strip() == "pending"
+                    pending_threshold = int(go_sync.get("go_operational_promotion_threshold") or 0)
+                    pending_streak = int(go_sync.get("go_operational_ready_streak") or 0)
                     ready_like = (
+                        pending_decision
+                        and pending_threshold > 0
+                        and pending_streak < pending_threshold
+                        and
                         refinement_status == "stable"
                         and bool(go_sync.get("go_diagnostic_go_sync_usable_quality_ok", go_sync.get("go_sync_usable_quality_ok")))
                         and bool(go_sync.get("go_diagnostic_go_sync_usable_holdover_ok", go_sync.get("go_sync_usable_holdover_ok")))
@@ -10483,6 +11218,39 @@ class RadarState:
                     if ready_like:
                         go_blocking_gate = "go_readiness_hysteresis"
                         handoff_reason = handoff_reason or "go_ready_pending_hysteresis"
+                if not go_blocking_gate:
+                    decision_key = str(go_sync.get("go_operational_hysteresis_decision") or "").strip().lower()
+                    threshold = int(go_sync.get("go_operational_promotion_threshold") or 0)
+                    streak = int(go_sync.get("go_operational_ready_streak") or 0)
+                    ready_like_not_started = (
+                        decision_key in {"", "none", "null"}
+                        and threshold == 0
+                        and streak == 0
+                        and refinement_status == "stable"
+                        and bool(go_sync.get("go_diagnostic_go_sync_usable_quality_ok", go_sync.get("go_sync_usable_quality_ok")))
+                        and bool(go_sync.get("go_diagnostic_go_sync_usable_holdover_ok", go_sync.get("go_sync_usable_holdover_ok")))
+                        and bool(go_sync.get("go_diagnostic_go_sync_usable_period_agrees", go_sync.get("go_sync_usable_period_agrees")))
+                        and bool(go_sync.get("go_diagnostic_go_sync_usable_strict_gate_pass", go_sync.get("go_sync_usable_strict_gate_pass")))
+                        and not go_sync_unusable_reason
+                        and not diag_unusable_reason
+                        and not holdover
+                    )
+                    if ready_like_not_started:
+                        go_blocking_gate = "go_readiness_hysteresis"
+                        handoff_reason = handoff_reason or "go_ready_hysteresis_not_started"
+                if not go_blocking_gate:
+                    quality_ok = go_sync.get("go_diagnostic_go_sync_usable_quality_ok", go_sync.get("go_sync_usable_quality_ok"))
+                    period_ok = go_sync.get("go_diagnostic_go_sync_usable_period_agrees", go_sync.get("go_sync_usable_period_agrees"))
+                    strict_ok = go_sync.get("go_diagnostic_go_sync_usable_strict_gate_pass", go_sync.get("go_sync_usable_strict_gate_pass"))
+                    if quality_ok is False or period_ok is False or strict_ok is False:
+                        go_blocking_gate = "go_readiness.go_sync_state_usable"
+                        if not handoff_reason:
+                            if quality_ok is False:
+                                handoff_reason = "quality_below_threshold"
+                            elif period_ok is False:
+                                handoff_reason = "period_disagreement"
+                            else:
+                                handoff_reason = "strict_gate_failed"
                 if not go_blocking_gate and phase_evidence_fresh is False:
                     go_blocking_gate = "go_readiness.go_evidence_fresh"
                     if not handoff_reason:
@@ -10509,6 +11277,19 @@ class RadarState:
                     "phase_evidence_fresh": phase_evidence_fresh,
                     "go_operational_enabled": True,
                     "go_operational_active": False,
+                    "go_operational_ready_streak": go_sync.get("go_operational_ready_streak"),
+                    "go_operational_promotion_threshold": go_sync.get("go_operational_promotion_threshold"),
+                    "go_operational_ready_streak_age_s": go_sync.get("go_operational_ready_streak_age_s"),
+                    "go_operational_last_ready_ts": go_sync.get("go_operational_last_ready_ts"),
+                    "go_operational_last_not_ready_ts": go_sync.get("go_operational_last_not_ready_ts"),
+                    "go_operational_streak_reset_reason": go_sync.get("go_operational_streak_reset_reason"),
+                    "go_operational_streak_reset_gate": go_sync.get("go_operational_streak_reset_gate"),
+                    "go_operational_streak_reset_handoff_reason": go_sync.get("go_operational_streak_reset_handoff_reason"),
+                    "go_operational_soft_failure_active": go_sync.get("go_operational_soft_failure_active"),
+                    "go_operational_soft_failure_until_ts": go_sync.get("go_operational_soft_failure_until_ts"),
+                    "go_operational_soft_failure_remaining_s": go_sync.get("go_operational_soft_failure_remaining_s"),
+                    "go_operational_soft_failure_reason": go_sync.get("go_operational_soft_failure_reason"),
+                    "go_operational_hysteresis_decision": go_sync.get("go_operational_hysteresis_decision"),
                     "go_operational_blocking_gate": go_blocking_gate,
                     "go_operational_blocking_reason": handoff_reason,
                     "phase_authority_blocking_gate": phase_blocking_gate or None,
