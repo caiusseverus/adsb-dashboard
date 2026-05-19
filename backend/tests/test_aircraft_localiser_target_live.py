@@ -152,6 +152,16 @@ class FakeRadarState:
         return sorted(dets, key=lambda d: d.wall_ts, reverse=True)
 
 
+class FakeRadarStateAllAuthoritative(FakeRadarState):
+    """Expose all sync states through Stage3 accessors for authority-plumbing tests."""
+
+    def get_all_stage3_live_sync_states(self):
+        return dict(self._syncs)
+
+    def get_stage3_live_sync_state(self, iid):
+        return self._syncs.get(iid)
+
+
 def _make_localiser(radar_state):
     loc = AircraftLocaliser(
         radar_state=radar_state,
@@ -277,6 +287,57 @@ def test_stage3_selection_ignores_go_frame_sync_states():
     assert sel["accepted"] == []
     assert sel["per_radar_reasons"][1] == REASON_ABSOLUTE_PHASE_UNTRUSTED
     assert radar_state.get_stage3_live_waveform_bins(1) == []
+
+
+def test_go_operational_period_visible_in_rejection_diagnostics():
+    now = __import__("time").time()
+    models = {1: _radar_iid(lat=51.05, lon=-1.05)}
+    syncs = {1: _sync(1, source="go_frame_sync", period_s=11.5)}
+    syncs[1].go_operational_active = True
+    syncs[1].period_authority = "go_refined"
+    syncs[1].sync_authority = "go_runtime"
+    syncs[1].phase_authority = "unavailable"
+    det_by_icao = {"ABC": [_det(1, "ABC", now - 0.5, arrival_us=999_999.0)]}
+    loc = _make_localiser(FakeRadarStateAllAuthoritative(models, syncs, det_by_icao))
+
+    sel = loc.select_authoritative_observations("ABC", None, now)
+
+    assert sel["accepted"] == []
+    assert sel["per_radar_reasons"][1] == REASON_ABSOLUTE_PHASE_UNTRUSTED
+    decision = sel["per_radar_decisions"][1]
+    assert decision["period_used_s"] == pytest.approx(11.5)
+    assert decision["period_authority_used"] == "go_refined"
+    assert decision["sync_authority_used"] == "go_runtime"
+    assert decision["go_operational_period_available"] is True
+    assert decision["go_operational_period_available_but_not_used"] is True
+
+
+def test_anchor_relative_phase_rejection_sets_diagnostic_flag():
+    now = __import__("time").time()
+    models = {1: _radar_iid(lat=51.05, lon=-1.05)}
+    syncs = {1: _sync(1, source="multi_aircraft_burst", phase_anchor_status="selected", phase_anchor_icao="A1")}
+    syncs[1].phase_basis = "anchor_relative"
+    det_by_icao = {"ABC": [_det(1, "ABC", now - 0.2)]}
+    loc = _make_localiser(FakeRadarStateAllAuthoritative(models, syncs, det_by_icao))
+    sel = loc.select_authoritative_observations("ABC", None, now)
+    assert sel["per_radar_reasons"][1] == REASON_PHASE_BASIS_ANCHOR_RELATIVE
+    assert sel["per_radar_decisions"][1]["phase_anchor_relative_rejected"] is True
+
+
+def test_geographic_absolute_phase_is_accepted_for_live_observation_selection():
+    now = __import__("time").time()
+    models = {1: _radar_iid(lat=51.05, lon=-1.05)}
+    syncs = {1: _sync(1, source="multi_aircraft_burst", phase_anchor_status="selected", phase_anchor_icao="A1")}
+    syncs[1].phase_basis = "geographic"
+    syncs[1].phase_is_absolute = True
+    syncs[1].phase_offset_geographic_deg = 40.0
+    det_by_icao = {"ABC": [_det(1, "ABC", now - 0.2)]}
+    loc = _make_localiser(FakeRadarStateAllAuthoritative(models, syncs, det_by_icao))
+    sel = loc.select_authoritative_observations("ABC", None, now)
+    assert 1 not in sel["per_radar_reasons"]
+    assert len(sel["accepted"]) == 1
+    assert sel["per_radar_decisions"][1]["phase_basis_used"] == "geographic"
+    assert sel["per_radar_decisions"][1]["phase_absolute_used"] is True
 
 
 def test_stale_observation_produces_rejected_ray_not_accepted():

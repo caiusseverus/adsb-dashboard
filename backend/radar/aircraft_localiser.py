@@ -1294,6 +1294,42 @@ class AircraftLocaliser:
         accepted: list[RadarBearingObservation] = []
         rejected_rays: list[Stage3LiveRay] = []
         per_radar_reasons: dict[int, str] = {}
+        per_radar_decisions: dict[int, dict] = {}
+
+        def _decision(sync_state: LiveSyncState | None, raw_sync_state: LiveSyncState | None, rejection_reason: str | None) -> dict:
+            subject = sync_state if sync_state is not None else raw_sync_state
+            phase_basis = self._derive_phase_basis(subject) if subject is not None else None
+            phase_absolute = bool(getattr(subject, "phase_is_absolute", False)) if subject is not None else False
+            period_authority = str(getattr(subject, "period_authority", "") or "") if subject is not None else ""
+            sync_authority = str(getattr(subject, "sync_authority", "") or "") if subject is not None else ""
+            phase_authority = str(getattr(subject, "phase_authority", "") or "") if subject is not None else ""
+            go_operational_active = bool(getattr(subject, "go_operational_active", False)) if subject is not None else False
+            go_operational_period_available = bool(
+                subject is not None
+                and (
+                    go_operational_active
+                    or period_authority == "go_refined"
+                    or sync_authority == "go_runtime"
+                )
+            )
+            return {
+                "sync_source_used": str(getattr(subject, "source", "") or "") if subject is not None else None,
+                "sync_authority_used": sync_authority or None,
+                "period_authority_used": period_authority or None,
+                "period_used_s": float(getattr(subject, "period_s", 0.0) or 0.0) if subject is not None else None,
+                "phase_basis_used": phase_basis,
+                "phase_authority_used": phase_authority or None,
+                "phase_absolute_used": phase_absolute,
+                "go_operational_active_used": go_operational_active,
+                "go_operational_period_available": go_operational_period_available,
+                "go_operational_period_available_but_not_used": bool(
+                    go_operational_period_available and rejection_reason is not None
+                ),
+                "phase_anchor_relative_rejected": bool(
+                    rejection_reason == REASON_PHASE_BASIS_ANCHOR_RELATIVE
+                ),
+                "rejection_reason": rejection_reason,
+            }
 
         for iid, auth, _model in eligible:
             if iid_subset is not None and iid not in iid_subset:
@@ -1308,21 +1344,29 @@ class AircraftLocaliser:
             if sync_state is None:
                 raw_sync_state = all_sync_states.get(iid)
                 if raw_sync_state is None or raw_sync_state.period_s <= 0:
-                    per_radar_reasons[iid] = REASON_NO_SYNC
+                    reason = REASON_NO_SYNC
                 elif not raw_sync_state.usable:
-                    per_radar_reasons[iid] = REASON_SYNC_QUALITY_LOW
+                    reason = REASON_SYNC_QUALITY_LOW
                 else:
-                    per_radar_reasons[iid] = REASON_ABSOLUTE_PHASE_UNTRUSTED
+                    reason = REASON_ABSOLUTE_PHASE_UNTRUSTED
+                per_radar_reasons[iid] = reason
+                per_radar_decisions[iid] = _decision(sync_state, raw_sync_state, reason)
                 continue
             if not sync_state.usable:
-                per_radar_reasons[iid] = REASON_SYNC_QUALITY_LOW
+                reason = REASON_SYNC_QUALITY_LOW
+                per_radar_reasons[iid] = reason
+                per_radar_decisions[iid] = _decision(sync_state, all_sync_states.get(iid), reason)
                 continue
             if sync_state.period_s <= 0:
-                per_radar_reasons[iid] = REASON_NO_SYNC
+                reason = REASON_NO_SYNC
+                per_radar_reasons[iid] = reason
+                per_radar_decisions[iid] = _decision(sync_state, all_sync_states.get(iid), reason)
                 continue
 
             if not self._sync_state_has_trusted_absolute_phase(sync_state):
-                per_radar_reasons[iid] = REASON_ABSOLUTE_PHASE_UNTRUSTED
+                reason = REASON_ABSOLUTE_PHASE_UNTRUSTED
+                per_radar_reasons[iid] = reason
+                per_radar_decisions[iid] = _decision(sync_state, all_sync_states.get(iid), reason)
                 continue
 
             # Stage 6 geographic-phase gate: localisation/ray generation must
@@ -1332,7 +1376,9 @@ class AircraftLocaliser:
             # construction.
             geo_ok, geo_reason = self._sync_state_has_geographic_phase(sync_state)
             if not geo_ok:
-                per_radar_reasons[iid] = geo_reason or REASON_PHASE_NOT_GEOGRAPHIC
+                reason = geo_reason or REASON_PHASE_NOT_GEOGRAPHIC
+                per_radar_reasons[iid] = reason
+                per_radar_decisions[iid] = _decision(sync_state, all_sync_states.get(iid), reason)
                 continue
 
             # Pull all recent detections for this ICAO from the shared buffer.
@@ -1341,7 +1387,9 @@ class AircraftLocaliser:
             )
             detections = [d for d in detections if d.iid == iid]
             if not detections:
-                per_radar_reasons[iid] = REASON_NO_DETECTIONS
+                reason = REASON_NO_DETECTIONS
+                per_radar_reasons[iid] = reason
+                per_radar_decisions[iid] = _decision(sync_state, all_sync_states.get(iid), reason)
                 continue
 
             # detections are returned newest-first — select the newest that passes
@@ -1363,7 +1411,9 @@ class AircraftLocaliser:
             # systematically under-estimate uncertainty when sync jitter is the
             # dominant term.  Shared sync state is never mutated.
             if chosen is None:
-                per_radar_reasons[iid] = REASON_STALE_OBSERVATION
+                reason = REASON_STALE_OBSERVATION
+                per_radar_reasons[iid] = reason
+                per_radar_decisions[iid] = _decision(sync_state, all_sync_states.get(iid), reason)
                 # Emit a rejection ray from the newest stale detection so the
                 # evidence layer can show operators which radars fell behind.
                 stale = detections[0]
@@ -1381,11 +1431,15 @@ class AircraftLocaliser:
                 chosen, sync_state, auth["lat"], auth["lon"], cal,
             )
             if obs is None:
-                per_radar_reasons[iid] = REASON_OBS_BUILD_FAILED
+                reason = REASON_OBS_BUILD_FAILED
+                per_radar_reasons[iid] = reason
+                per_radar_decisions[iid] = _decision(sync_state, all_sync_states.get(iid), reason)
                 continue
 
             if not self._bearing_matches_current_truth(obs, chosen, auth["lat"], auth["lon"]):
-                per_radar_reasons[iid] = REASON_BEARING_TRUTH_MISMATCH
+                reason = REASON_BEARING_TRUTH_MISMATCH
+                per_radar_reasons[iid] = reason
+                per_radar_decisions[iid] = _decision(sync_state, all_sync_states.get(iid), reason)
                 rejected_rays.append(self._obs_to_live_ray(
                     obs, icao, now_ts,
                     accepted=False, rejection_reason=REASON_BEARING_TRUTH_MISMATCH,
@@ -1393,11 +1447,13 @@ class AircraftLocaliser:
                 continue
 
             accepted.append(obs)
+            per_radar_decisions[iid] = _decision(sync_state, all_sync_states.get(iid), None)
 
         return {
             "accepted": accepted,
             "rejected_rays": rejected_rays,
             "per_radar_reasons": per_radar_reasons,
+            "per_radar_decisions": per_radar_decisions,
         }
 
     @staticmethod
@@ -1449,6 +1505,7 @@ class AircraftLocaliser:
         accepted_obs: list[RadarBearingObservation] = selection["accepted"]
         rejected_rays: list[Stage3LiveRay] = selection["rejected_rays"]
         per_radar_reasons: dict[int, str] = selection["per_radar_reasons"]
+        per_radar_decisions: dict[int, dict] = selection.get("per_radar_decisions", {})
 
         # Build the authoritative display rays.  The accepted set is also the
         # solver input; the two paths cannot diverge by construction.
@@ -1460,6 +1517,7 @@ class AircraftLocaliser:
         reasons = {
             "ts": now_ts,
             "per_radar": per_radar_reasons,
+            "per_radar_decisions": per_radar_decisions,
             "global": None,
         }
 
@@ -1938,6 +1996,13 @@ class AircraftLocaliser:
             if sync is not None:
                 sync_summary[str(iid_key)] = {
                     "sync_source": sync.source,
+                    "sync_authority": getattr(sync, "sync_authority", None),
+                    "period_authority": getattr(sync, "period_authority", None),
+                    "phase_authority": getattr(sync, "phase_authority", None),
+                    "go_operational_active": bool(getattr(sync, "go_operational_active", False)),
+                    "period_used_s": sync.period_s,
+                    "phase_basis": self._derive_phase_basis(sync),
+                    "phase_is_absolute": bool(getattr(sync, "phase_is_absolute", False)),
                     "sync_quality": sync.sync_quality,
                     "sync_usable": sync.usable,
                     "sync_jitter_deg": sync.sync_jitter_deg,

@@ -13078,15 +13078,36 @@ class RadarState:
 
     _STAGE3_SYNC_SOURCES = frozenset({"multi_aircraft_burst"})
 
+    @staticmethod
+    def _is_stage3_sync_authoritative(sync: LiveSyncState | None) -> bool:
+        """Return True if a sync state is eligible for Stage 3 localiser intake.
+
+        Stage 3 historically accepted only Python `multi_aircraft_burst` source.
+        To align intake with promoted authority semantics, also allow Go frame
+        sync once it is operationally promoted.
+        """
+        if sync is None:
+            return False
+        source = str(getattr(sync, "source", "") or "")
+        if source in RadarState._STAGE3_SYNC_SOURCES:
+            return True
+        if source != "go_frame_sync":
+            return False
+        if bool(getattr(sync, "go_operational_active", False)):
+            return True
+        period_authority = str(getattr(sync, "period_authority", "") or "")
+        sync_authority = str(getattr(sync, "sync_authority", "") or "")
+        return period_authority == "go_refined" or sync_authority == "go_runtime"
+
     def get_stage3_live_sync_state(self, iid: int) -> LiveSyncState | None:
         """Return the Stage 3-authoritative sync state for one IID.
 
-        Stage 3 aircraft localisation requires the Python `multi_aircraft_burst`
-        sync model.  Earlier bootstrap sources remain available through the
-        general live-sync getters but are intentionally excluded here.
+        Stage 3 aircraft localisation consumes promoted authoritative sync
+        states.  Python `multi_aircraft_burst` remains valid, and promoted Go
+        runtime sync is included once operational authority is active.
         """
         sync = self._live_sync_states.get(iid)
-        if sync is None or sync.source not in self._STAGE3_SYNC_SOURCES:
+        if not self._is_stage3_sync_authoritative(sync):
             return None
         return sync
 
@@ -13095,7 +13116,7 @@ class RadarState:
         return {
             iid: sync
             for iid, sync in self._live_sync_states.items()
-            if sync.source in self._STAGE3_SYNC_SOURCES
+            if self._is_stage3_sync_authoritative(sync)
         }
 
     def get_go_live_sync_state(self, iid: int) -> dict | None:

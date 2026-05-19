@@ -8340,3 +8340,60 @@ def test_sync_snapshot_stage10_hysteresis_diagnostics_fields():
     assert payload["go_operational_soft_failure_remaining_s"] == 0.0
     assert payload["go_operational_soft_failure_reason"] == ""
     assert payload["go_operational_hysteresis_decision"] == "pending"
+
+
+def test_stage3_sync_accessor_includes_promoted_go_runtime_sync():
+    state = RadarState()
+    go_sync = LiveSyncState(
+        iid=901,
+        period_s=4.2,
+        phase_epoch_us=1_000.0,
+        phase_offset_deg=20.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=time.time(),
+        source="go_frame_sync",
+        usable=True,
+        period_authority="go_refined",
+        sync_authority="go_runtime",
+        go_operational_active=True,
+    )
+    state._live_sync_states[901] = go_sync
+    assert state.get_stage3_live_sync_state(901) is go_sync
+    assert 901 in state.get_all_stage3_live_sync_states()
+
+
+def test_stage3_sync_accessor_keeps_python_fallback_when_go_not_operational():
+    state = RadarState()
+    py_sync = LiveSyncState(
+        iid=902,
+        period_s=4.0,
+        phase_epoch_us=1_000.0,
+        phase_offset_deg=20.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=time.time(),
+        source="multi_aircraft_burst",
+        usable=True,
+    )
+    go_sync = LiveSyncState(
+        iid=903,
+        period_s=4.0,
+        phase_epoch_us=1_000.0,
+        phase_offset_deg=20.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=time.time(),
+        source="go_frame_sync",
+        usable=True,
+        period_authority="py_base",
+        sync_authority="py_bootstrap",
+        go_operational_active=False,
+    )
+    state._live_sync_states[902] = py_sync
+    state._live_sync_states[903] = go_sync
+    assert state.get_stage3_live_sync_state(902) is py_sync
+    assert state.get_stage3_live_sync_state(903) is None
+    all_stage3 = state.get_all_stage3_live_sync_states()
+    assert 902 in all_stage3
+    assert 903 not in all_stage3
