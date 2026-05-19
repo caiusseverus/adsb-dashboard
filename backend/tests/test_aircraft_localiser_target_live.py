@@ -31,6 +31,7 @@ from radar.aircraft_localiser import (
     REASON_PHASE_BASIS_ANCHOR_RELATIVE,
     REASON_PHASE_BASIS_SWEEP_EPOCH_ONLY,
     REASON_PHASE_NOT_GEOGRAPHIC,
+    REASON_LOCALISATION_SAFE_PHASE_FALSE,
     REASON_STALE_OBSERVATION,
     REASON_SYNC_QUALITY_LOW,
     _ray_intersection_enu,
@@ -150,6 +151,23 @@ class FakeRadarState:
         # Newest-first, matching the real implementation.
         dets = list(self._detections.get(icao, []))
         return sorted(dets, key=lambda d: d.wall_ts, reverse=True)
+
+    def get_live_sync_state_payload(self, iid, sync=None, **kwargs):
+        subject = sync if sync is not None else self._syncs.get(iid)
+        if subject is None:
+            return {}
+        return {
+            "phase_basis": getattr(subject, "phase_basis", None),
+            "phase_is_absolute": bool(getattr(subject, "phase_is_absolute", False)),
+            "phase_offset_geographic_deg": getattr(subject, "phase_offset_geographic_deg", None),
+            "phase_authority": getattr(subject, "phase_authority", None),
+            "period_authority": getattr(subject, "period_authority", None),
+            "sync_authority": getattr(subject, "sync_authority", None),
+            "localisation_safe_phase": bool(getattr(subject, "localisation_safe_phase", False)),
+            "localisation_safe_phase_reason": getattr(subject, "localisation_safe_phase_reason", None),
+            "geographic_phase_status": getattr(subject, "geographic_phase_status", None),
+            "geographic_phase_invalid_reason": getattr(subject, "geographic_phase_invalid_reason", None),
+        }
 
 
 class FakeRadarStateAllAuthoritative(FakeRadarState):
@@ -331,6 +349,8 @@ def test_geographic_absolute_phase_is_accepted_for_live_observation_selection():
     syncs[1].phase_basis = "geographic"
     syncs[1].phase_is_absolute = True
     syncs[1].phase_offset_geographic_deg = 40.0
+    syncs[1].localisation_safe_phase = True
+    syncs[1].localisation_safe_phase_reason = "ok"
     det_by_icao = {"ABC": [_det(1, "ABC", now - 0.2)]}
     loc = _make_localiser(FakeRadarStateAllAuthoritative(models, syncs, det_by_icao))
     sel = loc.select_authoritative_observations("ABC", None, now)
@@ -338,6 +358,21 @@ def test_geographic_absolute_phase_is_accepted_for_live_observation_selection():
     assert len(sel["accepted"]) == 1
     assert sel["per_radar_decisions"][1]["phase_basis_used"] == "geographic"
     assert sel["per_radar_decisions"][1]["phase_absolute_used"] is True
+
+
+def test_geographic_phase_rejected_when_localisation_safe_false():
+    now = __import__("time").time()
+    models = {1: _radar_iid(lat=51.05, lon=-1.05)}
+    syncs = {1: _sync(1, source="multi_aircraft_burst", phase_anchor_status="selected", phase_anchor_icao="A1")}
+    syncs[1].phase_basis = "geographic"
+    syncs[1].phase_is_absolute = True
+    syncs[1].phase_offset_geographic_deg = 40.0
+    syncs[1].localisation_safe_phase = False
+    syncs[1].localisation_safe_phase_reason = "calibration_stale"
+    det_by_icao = {"ABC": [_det(1, "ABC", now - 0.2)]}
+    loc = _make_localiser(FakeRadarStateAllAuthoritative(models, syncs, det_by_icao))
+    sel = loc.select_authoritative_observations("ABC", None, now)
+    assert sel["per_radar_reasons"][1] == REASON_LOCALISATION_SAFE_PHASE_FALSE
 
 
 def test_stale_observation_produces_rejected_ray_not_accepted():

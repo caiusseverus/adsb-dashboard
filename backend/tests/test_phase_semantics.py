@@ -332,6 +332,7 @@ class TestGeographicPhaseGate:
             "phase_basis": "geographic",
             "phase_is_absolute": True,
             "phase_offset_geographic_deg": 45.0,
+            "localisation_safe_phase": True,
         }
         ok, reason = AircraftLocaliser._sync_state_has_geographic_phase(sync, sync_state_dict=sync_dict)
         assert ok is True

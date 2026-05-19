@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import logging
 import math as _math
+import json
 import statistics
 import threading
 import time
 import traceback
 from collections import defaultdict, deque
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Any
 
 try:
@@ -204,6 +206,7 @@ _SLOPE_TREND_REGRESSION_R2_MIN = 0.5
 _PERIOD_STABILITY_MIN_SAMPLES = 3
 _GO_OPERATIONAL_PROMOTION_CONSECUTIVE = 3
 _GO_OPERATIONAL_SOFT_FAILURE_HOLD_S = 3.0
+_GEOGRAPHIC_PHASE_OFFSET_CONVENTION = "bearing=sync_phase+offset"
 
 _perf_lock = threading.Lock()
 df11_event_timings: deque[float] = deque(maxlen=4000)
@@ -1270,6 +1273,7 @@ def _live_sync_state_to_dict(
     py_shadow: dict | None = None,
     authority_transitions: list[dict] | None = None,
     go_refiner_operational_enabled: bool | None = None,
+    manual_geographic_eval: dict | None = None,
     *,
     suppress_consistency_logging: bool = False,
 ) -> dict:
@@ -2811,6 +2815,54 @@ def _live_sync_state_to_dict(
         payload["blocking_gate"] = "go_readiness.go_evidence_fresh"
         payload["handoff_reason"] = "stale_go_evidence"
 
+    geo_eval = manual_geographic_eval if isinstance(manual_geographic_eval, dict) else None
+    if geo_eval is None:
+        geo_eval = {
+            "active": False,
+            "status": "absent",
+            "reason": "calibration_absent",
+            "record": None,
+            "age_s": None,
+        }
+    geo_record = geo_eval.get("record") if isinstance(geo_eval.get("record"), dict) else {}
+    underlying_phase_basis = payload.get("phase_basis")
+    underlying_phase_authority = payload.get("phase_authority")
+    localisation_safe_phase = bool(geo_eval.get("active", False))
+    localisation_safe_phase_reason = str(
+        geo_eval.get("reason") or ("ok" if localisation_safe_phase else "calibration_absent")
+    )
+    payload.update({
+        "geographic_phase_calibrated": bool(geo_record.get("geographic_phase_calibrated", False)),
+        "geographic_phase_offset_deg": geo_record.get("geographic_phase_offset_deg"),
+        "geographic_phase_offset_convention": geo_record.get("geographic_phase_offset_convention")
+            or _GEOGRAPHIC_PHASE_OFFSET_CONVENTION,
+        "geographic_phase_source": geo_record.get("geographic_phase_source"),
+        "geographic_phase_calibrated_at_ts": geo_record.get("geographic_phase_calibrated_at_ts"),
+        "geographic_phase_valid_until_ts": geo_record.get("geographic_phase_valid_until_ts"),
+        "geographic_phase_max_age_s": geo_record.get("geographic_phase_max_age_s"),
+        "geographic_phase_confidence_operator": geo_record.get("geographic_phase_confidence_operator"),
+        "geographic_phase_notes": geo_record.get("geographic_phase_notes"),
+        "geographic_phase_location_lat": geo_record.get("geographic_phase_location_lat"),
+        "geographic_phase_location_lon": geo_record.get("geographic_phase_location_lon"),
+        "geographic_phase_receiver_id": geo_record.get("geographic_phase_receiver_id"),
+        "geographic_phase_receiver_source": geo_record.get("geographic_phase_receiver_source"),
+        "geographic_phase_epoch_us": geo_record.get("geographic_phase_epoch_us"),
+        "geographic_phase_status": str(geo_eval.get("status") or "absent"),
+        "geographic_phase_invalid_reason": None if localisation_safe_phase else localisation_safe_phase_reason,
+        "geographic_phase_age_s": geo_eval.get("age_s"),
+        "localisation_safe_phase": localisation_safe_phase,
+        "localisation_safe_phase_reason": localisation_safe_phase_reason,
+        "underlying_phase_basis": underlying_phase_basis,
+        "underlying_phase_authority": underlying_phase_authority,
+    })
+    if localisation_safe_phase:
+        payload["phase_basis"] = "geographic"
+        payload["phase_is_absolute"] = True
+        payload["phase_absolute_available"] = True
+        payload["phase_authority"] = "geographic_manual"
+        payload["phase_offset_geographic_deg"] = float(geo_eval.get("phase_offset_geographic_deg"))
+        payload["phase_status_display"] = "geographic_calibrated"
+
     # --- Feature flag exposure ---
     payload["go_refiner_operational_enabled"] = go_refiner_operational_enabled
 
@@ -3292,6 +3344,10 @@ class RadarState:
         # ------------------------------------------------------------------
         # Per-IID live sync state; updated each time a sweep frame is completed.
         self._live_sync_states: dict[int, LiveSyncState] = {}
+        self._geographic_phase_calibration_by_iid: dict[int, dict] = {}
+        self._geographic_phase_store_path = (
+            Path(__file__).resolve().parents[1] / "data" / "geographic_phase_calibration.json"
+        )
         # Per-IID rolling buffer of aligned burst observations for the Python sync solver.
         # Each entry is one dominant-family burst with a known ADS-B position and
         # pre-computed geometric bearing.
@@ -3333,6 +3389,7 @@ class RadarState:
         # Signature: (iid: int, frame: SweepFrame, period_s: float) -> None
         # Kept for backwards-compat / tests, but the hot path now uses the per-IID
         # mailbox below rather than invoking this callback inline.
+        self._load_geographic_phase_calibration_store_locked()
         self.per_frame_solve_callback = None
 
         # Shadow tap for radar-core Stage 1.
@@ -3397,6 +3454,204 @@ class RadarState:
     # ------------------------------------------------------------------
     # Frame ingestion
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalise_manual_geographic_offset_deg(offset_deg: float) -> float:
+        return float(offset_deg) % 360.0
+
+    @staticmethod
+    def _manual_geographic_receiver_context(receiver_lat: float, receiver_lon: float) -> dict:
+        return {
+            "receiver_source": "radar_state_receiver",
+            "location_lat": float(receiver_lat),
+            "location_lon": float(receiver_lon),
+        }
+
+    def _load_geographic_phase_calibration_store_locked(self) -> None:
+        try:
+            raw = json.loads(self._geographic_phase_store_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            self._geographic_phase_calibration_by_iid = {}
+            return
+        except Exception as exc:
+            log.warning("geographic phase calibration store unreadable, starting empty: %s", exc)
+            self._geographic_phase_calibration_by_iid = {}
+            return
+        if not isinstance(raw, dict):
+            self._geographic_phase_calibration_by_iid = {}
+            return
+        records = raw.get("records")
+        if not isinstance(records, dict):
+            self._geographic_phase_calibration_by_iid = {}
+            return
+        out: dict[int, dict] = {}
+        for iid_key, rec in records.items():
+            try:
+                iid = int(iid_key)
+            except Exception:
+                continue
+            if isinstance(rec, dict):
+                out[iid] = dict(rec)
+        self._geographic_phase_calibration_by_iid = out
+
+    def _save_geographic_phase_calibration_store_locked(self) -> None:
+        try:
+            self._geographic_phase_store_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": 1,
+                "offset_convention": _GEOGRAPHIC_PHASE_OFFSET_CONVENTION,
+                "updated_ts": time.time(),
+                "records": {str(iid): rec for iid, rec in self._geographic_phase_calibration_by_iid.items()},
+            }
+            self._geographic_phase_store_path.write_text(
+                json.dumps(payload, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            log.warning("failed writing geographic phase calibration store: %s", exc)
+
+    def get_geographic_phase_calibration(self, iid: int) -> dict | None:
+        with self._lock:
+            rec = self._geographic_phase_calibration_by_iid.get(iid)
+            return dict(rec) if isinstance(rec, dict) else None
+
+    def set_geographic_phase_calibration(self, iid: int, record: dict) -> dict:
+        now_ts = time.time()
+        offset_deg = record.get("offset_deg")
+        if not _is_finite_number(offset_deg):
+            raise ValueError("offset_deg_must_be_finite")
+        normalized_offset = self._normalise_manual_geographic_offset_deg(float(offset_deg))
+        valid_until_ts = record.get("valid_until_ts")
+        max_age_s = record.get("max_age_s")
+        if valid_until_ts is not None and not _is_finite_number(valid_until_ts):
+            raise ValueError("valid_until_ts_must_be_finite")
+        if max_age_s is not None and (not _is_finite_number(max_age_s) or float(max_age_s) <= 0.0):
+            raise ValueError("max_age_s_must_be_positive_finite")
+        if valid_until_ts is None and max_age_s is None:
+            raise ValueError("either_valid_until_ts_or_max_age_s_required")
+        if valid_until_ts is not None and float(valid_until_ts) <= now_ts:
+            raise ValueError("valid_until_ts_must_be_future")
+        confidence = record.get("confidence_operator")
+        if confidence is not None and (not _is_finite_number(confidence) or not (0.0 <= float(confidence) <= 1.0)):
+            raise ValueError("confidence_operator_must_be_0_to_1")
+        notes = record.get("notes")
+        if notes is not None and not isinstance(notes, str):
+            raise ValueError("notes_must_be_string")
+        lat = record.get("location_lat")
+        lon = record.get("location_lon")
+        if lat is not None and (not _is_finite_number(lat) or not (-90.0 <= float(lat) <= 90.0)):
+            raise ValueError("location_lat_invalid")
+        if lon is not None and (not _is_finite_number(lon) or not (-180.0 <= float(lon) <= 180.0)):
+            raise ValueError("location_lon_invalid")
+
+        context = self._manual_geographic_receiver_context(self._receiver_lat, self._receiver_lon)
+        rec = {
+            "geographic_phase_calibrated": True,
+            "geographic_phase_offset_deg": normalized_offset,
+            "geographic_phase_offset_convention": _GEOGRAPHIC_PHASE_OFFSET_CONVENTION,
+            "geographic_phase_source": "manual_calibration",
+            "geographic_phase_calibrated_at_ts": now_ts,
+            "geographic_phase_valid_until_ts": float(valid_until_ts) if valid_until_ts is not None else None,
+            "geographic_phase_max_age_s": float(max_age_s) if max_age_s is not None else None,
+            "geographic_phase_confidence_operator": float(confidence) if confidence is not None else None,
+            "geographic_phase_notes": notes.strip() if isinstance(notes, str) and notes.strip() else None,
+            "geographic_phase_location_lat": float(lat) if lat is not None else context["location_lat"],
+            "geographic_phase_location_lon": float(lon) if lon is not None else context["location_lon"],
+            "geographic_phase_receiver_id": str(record.get("receiver_id") or "") or None,
+            "geographic_phase_receiver_source": str(record.get("receiver_source") or context["receiver_source"]),
+            "geographic_phase_epoch_us": float(record["epoch_us"]) if _is_finite_number(record.get("epoch_us")) else None,
+            "created_by": "api_manual_put",
+        }
+        with self._lock:
+            self._geographic_phase_calibration_by_iid[iid] = rec
+            self._save_geographic_phase_calibration_store_locked()
+        return dict(rec)
+
+    def clear_geographic_phase_calibration(self, iid: int) -> bool:
+        with self._lock:
+            existed = iid in self._geographic_phase_calibration_by_iid
+            if existed:
+                self._geographic_phase_calibration_by_iid.pop(iid, None)
+                self._save_geographic_phase_calibration_store_locked()
+            return existed
+
+    def evaluate_geographic_phase_calibration(
+        self,
+        iid: int,
+        sync: LiveSyncState | None,
+        go_sync: dict | None = None,
+    ) -> dict:
+        with self._lock:
+            rec = dict(self._geographic_phase_calibration_by_iid.get(iid) or {})
+        if not rec:
+            return {"active": False, "status": "absent", "reason": "calibration_absent", "record": None}
+        if not sync:
+            return {"active": False, "status": "invalid", "reason": "sync_state_missing", "record": rec}
+        if not bool(rec.get("geographic_phase_calibrated", False)):
+            return {"active": False, "status": "invalid", "reason": "calibration_flag_false", "record": rec}
+        if str(rec.get("geographic_phase_offset_convention") or "") != _GEOGRAPHIC_PHASE_OFFSET_CONVENTION:
+            return {"active": False, "status": "invalid", "reason": "unsupported_convention", "record": rec}
+        offset = rec.get("geographic_phase_offset_deg")
+        if not _is_finite_number(offset):
+            return {"active": False, "status": "invalid", "reason": "invalid_offset", "record": rec}
+        now_ts = time.time()
+        calibrated_at = rec.get("geographic_phase_calibrated_at_ts")
+        valid_until = rec.get("geographic_phase_valid_until_ts")
+        max_age_s = rec.get("geographic_phase_max_age_s")
+        age_s = None
+        if _is_finite_number(calibrated_at):
+            age_s = max(0.0, now_ts - float(calibrated_at))
+        if _is_finite_number(valid_until) and now_ts > float(valid_until):
+            return {"active": False, "status": "stale", "reason": "calibration_expired", "record": rec, "age_s": age_s}
+        if _is_finite_number(max_age_s):
+            if not _is_finite_number(calibrated_at):
+                return {"active": False, "status": "invalid", "reason": "calibration_missing_timestamp", "record": rec}
+            if age_s is not None and age_s > float(max_age_s):
+                return {"active": False, "status": "stale", "reason": "calibration_stale", "record": rec, "age_s": age_s}
+
+        stored_lat = rec.get("geographic_phase_location_lat")
+        stored_lon = rec.get("geographic_phase_location_lon")
+        if _is_finite_number(stored_lat) and abs(float(stored_lat) - float(self._receiver_lat)) > 1e-6:
+            return {"active": False, "status": "invalid", "reason": "context_mismatch_receiver_lat", "record": rec, "age_s": age_s}
+        if _is_finite_number(stored_lon) and abs(float(stored_lon) - float(self._receiver_lon)) > 1e-6:
+            return {"active": False, "status": "invalid", "reason": "context_mismatch_receiver_lon", "record": rec, "age_s": age_s}
+
+        if bool(getattr(sync, "holdover", False)):
+            return {"active": False, "status": "invalid", "reason": "holdover_active", "record": rec, "age_s": age_s}
+        if not bool(getattr(sync, "usable", False)):
+            return {"active": False, "status": "invalid", "reason": "sync_not_usable", "record": rec, "age_s": age_s}
+        if not bool(getattr(sync, "go_operational_active", False)):
+            return {"active": False, "status": "invalid", "reason": "go_not_operational", "record": rec, "age_s": age_s}
+        if str(getattr(sync, "period_authority", "") or "") != "go_refined":
+            return {"active": False, "status": "invalid", "reason": "period_authority_not_go_refined", "record": rec, "age_s": age_s}
+
+        predicted_sync_phase_deg = float(getattr(sync, "phase_offset_deg", 0.0) or 0.0)
+        geographic_offset = self._normalise_manual_geographic_offset_deg(predicted_sync_phase_deg + float(offset))
+        return {
+            "active": True,
+            "status": "valid",
+            "reason": "ok",
+            "record": rec,
+            "age_s": age_s,
+            "phase_offset_geographic_deg": geographic_offset,
+        }
+
+    def get_geographic_phase_calibration_status(self, iid: int) -> dict:
+        sync = self.get_live_sync_state(iid)
+        go_sync = self.get_go_live_sync_state(iid)
+        eval_result = self.evaluate_geographic_phase_calibration(iid, sync, go_sync)
+        record = eval_result.get("record") if isinstance(eval_result.get("record"), dict) else {}
+        return {
+            "iid": iid,
+            "status": eval_result.get("status"),
+            "reason": eval_result.get("reason"),
+            "active": bool(eval_result.get("active", False)),
+            "age_s": eval_result.get("age_s"),
+            "localisation_safe_phase": bool(eval_result.get("active", False)),
+            "localisation_safe_phase_reason": eval_result.get("reason"),
+            "calibration": record or None,
+            "phase_offset_geographic_deg": eval_result.get("phase_offset_geographic_deg"),
+        }
 
     def _record_lock_timing(self, op: str, wait_s: float, hold_s: float) -> None:
         self._lock_timing_seq += 1
@@ -7664,7 +7919,12 @@ class RadarState:
             event_buf = self._live_burst_residual_events.setdefault(
                 iid, deque()
             )
-            sync_snapshot = _live_sync_state_to_dict(sync, go_sync=dict(self._go_sync_states_by_iid.get(iid) or {}), suppress_consistency_logging=True)
+            sync_snapshot = self.get_live_sync_state_payload(
+                iid,
+                sync=sync,
+                go_sync=dict(self._go_sync_states_by_iid.get(iid) or {}),
+                suppress_consistency_logging=True,
+            )
             event = self._build_recorded_residual_event(
                 iid=iid,
                 icao=icao,
@@ -7928,7 +8188,12 @@ class RadarState:
             timing_class = "early"
         else:
             timing_class = "late"
-        sync_snapshot = _live_sync_state_to_dict(sync, go_sync=go_sync, suppress_consistency_logging=True)
+        sync_snapshot = self.get_live_sync_state_payload(
+            iid,
+            sync=sync,
+            go_sync=go_sync,
+            suppress_consistency_logging=True,
+        )
         event = self._build_recorded_residual_event(
             iid=iid,
             icao=icao,
@@ -8025,7 +8290,12 @@ class RadarState:
         elif bearing_deg is None:
             fit_reject_reason = "missing_geometry"
         fit_eligible = fit_reject_reason is None
-        sync_snapshot = _live_sync_state_to_dict(sync, go_sync=go_sync, suppress_consistency_logging=True)
+        sync_snapshot = self.get_live_sync_state_payload(
+            iid,
+            sync=sync,
+            go_sync=go_sync,
+            suppress_consistency_logging=True,
+        )
         event = self._build_recorded_residual_event(
             iid=iid,
             icao=str(evidence.get("icao") or ""),
@@ -10504,8 +10774,9 @@ class RadarState:
                 "recomputed_df11_residual_observations": [],
                 "residual_chart_default_mode": "recorded",
                 "projection_basis_options": projection_basis_options,
-                "sync_state": _live_sync_state_to_dict(
-                    sync,
+                "sync_state": self.get_live_sync_state_payload(
+                    iid,
+                    sync=sync,
                     go_sync=go_sync,
                     py_shadow=self._py_shadow_sync_states.get(iid),
                     authority_transitions=self._period_authority_transitions.get(iid),
@@ -10575,8 +10846,9 @@ class RadarState:
                     entries,
                     source=residual_source,
                 )
-            sync_state_payload = _live_sync_state_to_dict(
-                sync,
+            sync_state_payload = self.get_live_sync_state_payload(
+                iid,
+                sync=sync,
                 go_sync=go_sync,
                 py_shadow=self._py_shadow_sync_states.get(iid),
                 authority_transitions=self._period_authority_transitions.get(iid),
@@ -10935,8 +11207,9 @@ class RadarState:
             iid_events=iid_events_for_df11,
             latest_arrival_us=latest_arrival_us_for_iid,
         )
-        sync_state_payload = _live_sync_state_to_dict(
-            sync,
+        sync_state_payload = self.get_live_sync_state_payload(
+            iid,
+            sync=sync,
             go_sync=go_sync,
             py_shadow=self._py_shadow_sync_states.get(iid),
             authority_transitions=self._period_authority_transitions.get(iid),
@@ -11131,8 +11404,9 @@ class RadarState:
         sequence = self._live_sync_snapshot_seq.get(iid, 0) + 1
         self._live_sync_snapshot_seq[iid] = sequence
 
-        sync_state = _live_sync_state_to_dict(
-            sync,
+        sync_state = self.get_live_sync_state_payload(
+            iid,
+            sync=sync,
             go_sync=go_sync,
             py_shadow=py_shadow,
             authority_transitions=authority_transitions,
@@ -12410,7 +12684,7 @@ class RadarState:
         return {
             "iid": iid,
             "available": True,
-            "sync_state": _live_sync_state_to_dict(sync),
+            "sync_state": self.get_live_sync_state_payload(iid, sync=sync),
             "summary": summary,
             "observations": observations,
             "observation_model_diagnostics": observation_model_diagnostics,
@@ -13071,6 +13345,32 @@ class RadarState:
     def get_live_sync_state(self, iid: int) -> LiveSyncState | None:
         """Return the current live sync state for one IID, or None."""
         return self._live_sync_states.get(iid)
+
+    def get_live_sync_state_payload(
+        self,
+        iid: int,
+        sync: LiveSyncState | None = None,
+        go_sync: dict | None = None,
+        py_shadow: dict | None = None,
+        authority_transitions: list[dict] | None = None,
+        go_refiner_operational_enabled: bool | None = None,
+        *,
+        suppress_consistency_logging: bool = False,
+    ) -> dict:
+        subject = sync if sync is not None else self._live_sync_states.get(iid)
+        if subject is None:
+            return {}
+        go_subject = go_sync if go_sync is not None else self.get_go_live_sync_state(iid)
+        manual_eval = self.evaluate_geographic_phase_calibration(iid, subject, go_subject)
+        return _live_sync_state_to_dict(
+            subject,
+            go_sync=go_subject,
+            py_shadow=py_shadow,
+            authority_transitions=authority_transitions,
+            go_refiner_operational_enabled=go_refiner_operational_enabled,
+            manual_geographic_eval=manual_eval,
+            suppress_consistency_logging=suppress_consistency_logging,
+        )
 
     def get_all_live_sync_states(self) -> dict[int, LiveSyncState]:
         """Return a snapshot of all current live sync states."""

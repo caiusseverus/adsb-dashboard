@@ -23,7 +23,6 @@ from .sweep import (
     PRIMARY_CONFIDENCE_TARGET,
     SECONDARY_CONFIDENCE_TARGET,
     _confidence_from_support,
-    _live_sync_state_to_dict,
     detect_bursts,
 )
 from .localiser import _bearing_deg, _haversine_m
@@ -124,6 +123,19 @@ class ManualPositionPayload(BaseModel):
 
 class UnresolvablePayload(BaseModel):
     reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class GeographicPhaseCalibrationPayload(BaseModel):
+    offset_deg: float
+    max_age_s: Optional[float] = Field(default=None, gt=0.0, le=60.0 * 60.0 * 24.0 * 365.0)
+    valid_until_ts: Optional[float] = None
+    confidence_operator: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    notes: Optional[str] = Field(default=None, max_length=500)
+    location_lat: Optional[float] = Field(default=None, ge=-90.0, le=90.0)
+    location_lon: Optional[float] = Field(default=None, ge=-180.0, le=180.0)
+    receiver_id: Optional[str] = Field(default=None, max_length=120)
+    receiver_source: Optional[str] = Field(default=None, max_length=120)
+    epoch_us: Optional[float] = None
 
 
 def _get_fm():
@@ -1690,6 +1702,51 @@ async def set_iid_manual_position(iid: int, payload: ManualPositionPayload):
     return {"iid": iid, "updated": True, "persisted": True, **_control_payload(_state.get_rotation_model(iid))}
 
 
+@router.get("/iids/{iid}/geographic_phase_calibration")
+async def get_geographic_phase_calibration(iid: int):
+    if _state is None:
+        return {"iid": iid, "available": False, "reason": "radar module not initialised"}
+    return _state.get_geographic_phase_calibration_status(iid)
+
+
+@router.put("/iids/{iid}/geographic_phase_calibration")
+async def put_geographic_phase_calibration(iid: int, payload: GeographicPhaseCalibrationPayload):
+    if _state is None:
+        return {"iid": iid, "updated": False, "reason": "radar module not initialised"}
+    try:
+        _state.set_geographic_phase_calibration(
+            iid,
+            {
+                "offset_deg": payload.offset_deg,
+                "max_age_s": payload.max_age_s,
+                "valid_until_ts": payload.valid_until_ts,
+                "confidence_operator": payload.confidence_operator,
+                "notes": payload.notes,
+                "location_lat": payload.location_lat,
+                "location_lon": payload.location_lon,
+                "receiver_id": payload.receiver_id,
+                "receiver_source": payload.receiver_source,
+                "epoch_us": payload.epoch_us,
+            },
+        )
+    except ValueError as exc:
+        return {"iid": iid, "updated": False, "reason": str(exc)}
+    return {"iid": iid, "updated": True, **_state.get_geographic_phase_calibration_status(iid)}
+
+
+@router.delete("/iids/{iid}/geographic_phase_calibration")
+async def delete_geographic_phase_calibration(iid: int):
+    if _state is None:
+        return {"iid": iid, "cleared": False, "reason": "radar module not initialised"}
+    cleared = _state.clear_geographic_phase_calibration(iid)
+    return {
+        "iid": iid,
+        "cleared": bool(cleared),
+        "reason": None if cleared else "calibration_absent",
+        **_state.get_geographic_phase_calibration_status(iid),
+    }
+
+
 @router.post("/iids/{iid}/lock-position")
 async def lock_iid_position(iid: int):
     """Lock the operator-supplied manual position as authoritative."""
@@ -2699,8 +2756,9 @@ def build_selected_iid_page_state_payload(
         operational_sync = state.get_live_sync_state(iid)
         import config as _cfg
         sync_state = (
-            _live_sync_state_to_dict(
-                operational_sync,
+            state.get_live_sync_state_payload(
+                iid,
+                sync=operational_sync,
                 go_sync=go_runtime_sync,
                 py_shadow=state.get_py_shadow_sync_state(iid),
                 authority_transitions=state.get_period_authority_transitions(iid),

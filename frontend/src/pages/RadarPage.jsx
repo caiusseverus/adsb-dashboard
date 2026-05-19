@@ -2644,6 +2644,10 @@ function PhaseAnchorPanel({ syncState, observations, candidates, identity }) {
   const tdLeft = { textAlign: 'left', padding: '2px 5px', borderTop: '1px solid #21262d' }
 
   const phaseBasis = syncState.phase_basis ?? 'sweep_epoch_only'
+  const localisationSafePhase = Boolean(syncState.localisation_safe_phase)
+  const geographicPhaseStatus = syncState.geographic_phase_status ?? 'absent'
+  const geographicPhaseReason = syncState.geographic_phase_invalid_reason ?? syncState.localisation_safe_phase_reason ?? null
+  const geographicPhaseAgeS = Number(syncState.geographic_phase_age_s)
   const phaseLabel = phaseBasis === 'sweep_epoch_only' ? 'Sweep-relative phase'
     : phaseBasis === 'anchor_relative' ? 'Anchor-relative phase'
     : phaseBasis === 'geographic' ? 'Geographic phase'
@@ -2697,6 +2701,16 @@ function PhaseAnchorPanel({ syncState, observations, candidates, identity }) {
               {syncState.phase_blocking_reason && (
                 <span className={styles.metricPill} style={{ color: '#ff7b72' }} title="Why the gate is failing">Reason <span className={styles.metricValue}>{syncState.phase_blocking_reason}</span></span>
               )}
+              <span className={styles.metricPill}>Geographic calibration <span className={styles.metricValue}>{geographicPhaseStatus}</span></span>
+              <span className={styles.metricPill}>Localisation-safe phase <span className={styles.metricValue} style={{ color: localisationSafePhase ? '#3fb950' : '#ff7b72' }}>{localisationSafePhase ? 'yes' : 'no'}</span></span>
+              <span className={styles.metricPill}>Calibration age <span className={styles.metricValue}>{Number.isFinite(geographicPhaseAgeS) ? `${Math.max(0, geographicPhaseAgeS).toFixed(0)}s` : '—'}</span></span>
+              <span className={styles.metricPill}>Calibration source <span className={styles.metricValue}>{syncState.geographic_phase_source ?? '—'}</span></span>
+              {syncState.geographic_phase_notes && (
+                <span className={styles.metricPill}>Calibration notes <span className={styles.metricValue}>{syncState.geographic_phase_notes}</span></span>
+              )}
+              {geographicPhaseReason && (
+                <span className={styles.metricPill} style={{ color: '#ff7b72' }}>Geo reason <span className={styles.metricValue}>{geographicPhaseReason}</span></span>
+              )}
             </>
           )}
           {phaseBasis === 'geographic' && (
@@ -2706,6 +2720,13 @@ function PhaseAnchorPanel({ syncState, observations, candidates, identity }) {
               <span className={styles.metricPill}>Radar beam direction known</span>
               <span className={styles.metricPill}>Offset <span className={styles.metricValue}>{fmtNumber(syncState.phase_offset_geographic_deg, 2, '°')}</span></span>
               <span className={styles.metricPill}>Validation <span className={styles.metricValue}>{syncState.phase_validation_status || '—'}</span></span>
+              <span className={styles.metricPill}>Geographic calibration <span className={styles.metricValue}>{geographicPhaseStatus}</span></span>
+              <span className={styles.metricPill}>Localisation-safe phase <span className={styles.metricValue} style={{ color: localisationSafePhase ? '#3fb950' : '#ff7b72' }}>{localisationSafePhase ? 'yes' : 'no'}</span></span>
+              <span className={styles.metricPill}>Calibration age <span className={styles.metricValue}>{Number.isFinite(geographicPhaseAgeS) ? `${Math.max(0, geographicPhaseAgeS).toFixed(0)}s` : '—'}</span></span>
+              <span className={styles.metricPill}>Calibration source <span className={styles.metricValue}>{syncState.geographic_phase_source ?? '—'}</span></span>
+              {syncState.geographic_phase_notes && (
+                <span className={styles.metricPill}>Calibration notes <span className={styles.metricValue}>{syncState.geographic_phase_notes}</span></span>
+              )}
             </>
           )}
           {phaseBasis === 'unavailable' && (

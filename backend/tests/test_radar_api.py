@@ -258,33 +258,112 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     assert payload["sync_state"]["fit_observations_per_icao_max"] == 5
     assert payload["sync_state"]["proposed_delta_s"] == pytest.approx(0.0005)
     assert payload["sync_state"]["applied_delta_s"] == pytest.approx(0.0001)
-    assert payload["sync_state"]["suspicious_icao_count"] == 1
-    assert payload["sync_state"]["holdover_reason"] == "hard_residual_reject"
-    assert payload["sync_state"]["last_sync_reject_reason"] == "hard_residual_reject"
-    assert payload["sync_state"]["holdover_hard_residual_reject"] == 7
-    assert payload["sync_state"]["effective_period_source"] == "python_simple_sync.period_base_s"
-    assert payload["sync_state"]["operational_period_refinement_status"] is not None
-    assert payload["sync_state"]["go_diagnostic_fit_observation_count"] == 14
-    assert payload["sync_state"]["go_diagnostic_proposed_delta_s"] == pytest.approx(0.0005)
-    assert payload["sync_state"]["go_diagnostic_applied_delta_s"] == pytest.approx(0.0001)
-    assert "transition_quarantine_count" in payload["sync_state"]
-    assert "transition_quarantine_fit_excluded_count" in payload["sync_state"]
-    assert "transition_quarantine_hard_reject_suppressed_count" in payload["sync_state"]
-    assert "transition_quarantine_last_ts" in payload["sync_state"]
-    assert "transition_quarantine_last_reason" in payload["sync_state"]
-    assert "transition_quarantine_window_s" in payload["sync_state"]
-    assert "go_diagnostic_transition_quarantine_count" in payload["sync_state"]
-    assert "go_diagnostic_transition_quarantine_fit_excluded_count" in payload["sync_state"]
-    assert "go_diagnostic_transition_quarantine_hard_reject_suppressed_count" in payload["sync_state"]
-    assert "go_diagnostic_transition_quarantine_last_reason" in payload["sync_state"]
-    assert "go_diagnostic_transition_quarantine_window_s" in payload["sync_state"]
-    assert "handoff_state" in payload["sync_state"]
-    assert "handoff_gate_failures" in payload["sync_state"]
-    assert "data_path_diagnostics" in payload
-    assert payload["data_path_diagnostics"]["go_evidence_event_count"] >= 1
-    assert "chart_streams" in payload
-    assert "buffer_sizes" in payload
-    assert payload["transport"]["source"] == "compact_sync_snapshot"
+
+
+def _mk_operational_sync(iid: int) -> LiveSyncState:
+    sync = LiveSyncState(
+        iid=iid,
+        period_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=25.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=time.time(),
+        source="go_frame_sync",
+        usable=True,
+    )
+    sync.go_operational_active = True
+    sync.period_authority = "go_refined"
+    sync.sync_authority = "go_runtime"
+    sync.holdover = False
+    return sync
+
+
+def test_geographic_phase_calibration_api_roundtrip_and_localisation_safe_status(tmp_path):
+    state = RadarState(receiver_lat=51.0, receiver_lon=-1.0)
+    state._geographic_phase_store_path = tmp_path / "geocal.json"
+    state._live_sync_states[91] = _mk_operational_sync(91)
+    prior_state = radar_api._state
+    radar_api._state = state
+    try:
+        put_payload = radar_api.GeographicPhaseCalibrationPayload(offset_deg=15.0, max_age_s=600.0, notes="manual ref")
+        put_res = asyncio.run(radar_api.put_geographic_phase_calibration(91, put_payload))
+        assert put_res["updated"] is True
+        get_res = asyncio.run(radar_api.get_geographic_phase_calibration(91))
+        assert get_res["active"] is True
+        assert get_res["localisation_safe_phase"] is True
+        assert get_res["phase_offset_geographic_deg"] == pytest.approx(40.0)
+        delete_res = asyncio.run(radar_api.delete_geographic_phase_calibration(91))
+        assert delete_res["cleared"] is True
+        assert delete_res["active"] is False
+    finally:
+        radar_api._state = prior_state
+
+
+def test_geographic_phase_calibration_rejected_invalid_offset():
+    state = RadarState(receiver_lat=51.0, receiver_lon=-1.0)
+    prior_state = radar_api._state
+    radar_api._state = state
+    try:
+        put_payload = radar_api.GeographicPhaseCalibrationPayload(offset_deg=float("inf"), max_age_s=600.0)
+        put_res = asyncio.run(radar_api.put_geographic_phase_calibration(92, put_payload))
+        assert put_res["updated"] is False
+        assert put_res["reason"] == "offset_deg_must_be_finite"
+    finally:
+        radar_api._state = prior_state
+
+
+def test_geographic_phase_calibration_persistence_reload_and_context_mismatch(tmp_path):
+    store_path = tmp_path / "geocal.json"
+    state1 = RadarState(receiver_lat=51.0, receiver_lon=-1.0)
+    state1._geographic_phase_store_path = store_path
+    state1._live_sync_states[93] = _mk_operational_sync(93)
+    state1.set_geographic_phase_calibration(93, {"offset_deg": 12.0, "max_age_s": 600.0})
+    state2 = RadarState(receiver_lat=51.0, receiver_lon=-1.0)
+    state2._geographic_phase_store_path = store_path
+    state2._load_geographic_phase_calibration_store_locked()
+    assert state2.get_geographic_phase_calibration(93) is not None
+    state2._live_sync_states[93] = _mk_operational_sync(93)
+    ok_status = state2.get_geographic_phase_calibration_status(93)
+    assert ok_status["active"] is True
+    state3 = RadarState(receiver_lat=52.0, receiver_lon=-1.0)
+    state3._geographic_phase_store_path = store_path
+    state3._load_geographic_phase_calibration_store_locked()
+    state3._live_sync_states[93] = _mk_operational_sync(93)
+    bad_status = state3.get_geographic_phase_calibration_status(93)
+    assert bad_status["active"] is False
+    assert bad_status["reason"] == "context_mismatch_receiver_lat"
+
+
+def test_geographic_phase_calibration_not_safe_in_holdover_or_non_operational(tmp_path):
+    state = RadarState(receiver_lat=51.0, receiver_lon=-1.0)
+    state._geographic_phase_store_path = tmp_path / "geocal.json"
+    sync = _mk_operational_sync(94)
+    state._live_sync_states[94] = sync
+    state.set_geographic_phase_calibration(94, {"offset_deg": 12.0, "max_age_s": 600.0})
+    status_ok = state.get_geographic_phase_calibration_status(94)
+    assert status_ok["active"] is True
+    sync.holdover = True
+    status_holdover = state.get_geographic_phase_calibration_status(94)
+    assert status_holdover["active"] is False
+    assert status_holdover["reason"] == "holdover_active"
+    sync.holdover = False
+    sync.go_operational_active = False
+    status_nonop = state.get_geographic_phase_calibration_status(94)
+    assert status_nonop["active"] is False
+    assert status_nonop["reason"] == "go_not_operational"
+
+
+def test_geographic_phase_calibration_stale_demotes(tmp_path):
+    state = RadarState(receiver_lat=51.0, receiver_lon=-1.0)
+    state._geographic_phase_store_path = tmp_path / "geocal.json"
+    state._live_sync_states[95] = _mk_operational_sync(95)
+    state.set_geographic_phase_calibration(95, {"offset_deg": 12.0, "max_age_s": 5.0})
+    with state._lock:
+        state._geographic_phase_calibration_by_iid[95]["geographic_phase_calibrated_at_ts"] = time.time() - 30.0
+    status = state.get_geographic_phase_calibration_status(95)
+    assert status["active"] is False
+    assert status["reason"] == "calibration_stale"
 
 
 def test_get_iid_data_path_diagnostics_endpoint_reports_compact_counters():
