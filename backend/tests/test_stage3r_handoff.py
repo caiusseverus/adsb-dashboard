@@ -291,8 +291,10 @@ def test_period_stability_gate_insufficient_when_no_history():
 # 5. Stage 8 contamination detection — flag-disabled baseline
 # ===========================================================================
 
-def test_contamination_flag_disabled_emits_typed_stage8_stub():
+def test_contamination_flag_disabled_emits_typed_stage8_stub(monkeypatch):
     """When RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED=False, gate emits typed Stage-8 stub."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED", False)
     state = _make_state_with_python_model(3001)
     state.update_go_iid_state(_go_sync_for_gates(3001, 4.0))
     go_gates = state._evaluate_go_readiness_gates_locked(3001, 4.0)
@@ -301,8 +303,10 @@ def test_contamination_flag_disabled_emits_typed_stage8_stub():
     assert contamination_gate.get("passed") is None
 
 
-def test_contamination_flag_disabled_sync_has_typed_state():
+def test_contamination_flag_disabled_sync_has_typed_state(monkeypatch):
     """When flag disabled, LiveSyncState stores typed non-operative contamination state."""
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED", False)
     state = _make_state_with_python_model(3002)
     state.update_go_iid_state(_go_sync_for_gates(3002, 4.0))
     state._evaluate_go_readiness_gates_locked(3002, 4.0)

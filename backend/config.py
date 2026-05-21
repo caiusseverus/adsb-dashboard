@@ -268,9 +268,9 @@ RADAR_SYNC_GO_REFINER_OPERATIONAL: bool = _bool("RADAR_SYNC_GO_REFINER_OPERATION
 RADAR_SYNC_POPULATION_MONITOR_ENABLED: bool = _bool("RADAR_SYNC_POPULATION_MONITOR_ENABLED", True)
 # Phase-family contamination detection: when True, contamination blocks operational Go
 # authority (sync_authority=go_runtime) and phase authority from a contaminated family.
-# Default False (diagnostic-only): contamination is computed and exposed in the API
-# but does not block authority transitions.
-RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED: bool = _bool("RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED", False)
+# Default True (Stage 8 active). Roll back immediately with
+# RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED=false.
+RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED: bool = _bool("RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED", True)
 
 # ---------------------------------------------------------------------------
 # Stage 3 — aircraft localisation from known radar bearings

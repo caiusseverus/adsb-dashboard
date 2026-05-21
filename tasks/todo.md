@@ -1,3 +1,18 @@
+## 2026-05-21 Stage 8 Kickoff
+
+- [x] Run impact analysis for Stage 8 kickoff config toggle before edit.
+- [x] Enable Stage 8 contamination gating by default via `RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED` while preserving rollback through env flag.
+- [x] Run focused contamination/authority tests to confirm typed gate behavior and non-contamination paths remain stable.
+- [x] Document Stage 8 kickoff outcome and any immediate follow-up tasks.
+
+### Review
+- Stage 8 runtime kickoff completed by setting `RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED` default to `True` in `backend/config.py`.
+- Immediate rollback path remains intact: set `RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED=false`.
+- Updated disabled-path tests to explicitly monkeypatch flag false (no reliance on default).
+- Verification:
+  - `uv run --directory backend pytest tests/test_stage3r_handoff.py -q` -> 54 passed
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -q -k contamination` -> 1 passed
+
 ## 2026-05-21 Pre-Stage-8 Structural Cleanup (Stage 3/6/7)
 
 - [x] Audit and patch Stage 6 `phase_absolute_available` semantics in `LiveSyncState` serialization/normalization paths (no behavior policy change).
