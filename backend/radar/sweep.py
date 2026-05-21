@@ -630,6 +630,53 @@ def _build_go_diagnostic_fields(
         "go_diagnostic_transition_quarantine_hard_reject_suppressed_count": transition_quarantine_hard_reject_suppressed_count,
         "go_diagnostic_transition_quarantine_last_reason": transition_quarantine_last_reason,
         "go_diagnostic_transition_quarantine_window_s": transition_quarantine_window_s,
+        "go_diagnostic_retained_go_delta_rate_s_per_s_10s": go_payload.get("retained_go_delta_rate_s_per_s_10s"),
+        "go_diagnostic_retained_go_delta_rate_s_per_s_30s": go_payload.get("retained_go_delta_rate_s_per_s_30s"),
+        "go_diagnostic_retained_go_delta_rate_s_per_s_60s": go_payload.get("retained_go_delta_rate_s_per_s_60s"),
+        "go_diagnostic_proposed_delta_rate_s_per_s_10s": go_payload.get("proposed_delta_rate_s_per_s_10s"),
+        "go_diagnostic_proposed_delta_rate_s_per_s_30s": go_payload.get("proposed_delta_rate_s_per_s_30s"),
+        "go_diagnostic_proposed_delta_rate_s_per_s_60s": go_payload.get("proposed_delta_rate_s_per_s_60s"),
+        "go_diagnostic_applied_delta_rate_s_per_s_10s": go_payload.get("applied_delta_rate_s_per_s_10s"),
+        "go_diagnostic_applied_delta_rate_s_per_s_30s": go_payload.get("applied_delta_rate_s_per_s_30s"),
+        "go_diagnostic_applied_delta_rate_s_per_s_60s": go_payload.get("applied_delta_rate_s_per_s_60s"),
+        "go_diagnostic_retained_go_delta_abs_movement_s_10s": go_payload.get("retained_go_delta_abs_movement_s_10s"),
+        "go_diagnostic_retained_go_delta_abs_movement_s_30s": go_payload.get("retained_go_delta_abs_movement_s_30s"),
+        "go_diagnostic_retained_go_delta_abs_movement_s_60s": go_payload.get("retained_go_delta_abs_movement_s_60s"),
+        "go_diagnostic_proposed_delta_abs_movement_s_10s": go_payload.get("proposed_delta_abs_movement_s_10s"),
+        "go_diagnostic_proposed_delta_abs_movement_s_30s": go_payload.get("proposed_delta_abs_movement_s_30s"),
+        "go_diagnostic_proposed_delta_abs_movement_s_60s": go_payload.get("proposed_delta_abs_movement_s_60s"),
+        "go_diagnostic_applied_delta_abs_movement_s_10s": go_payload.get("applied_delta_abs_movement_s_10s"),
+        "go_diagnostic_applied_delta_abs_movement_s_30s": go_payload.get("applied_delta_abs_movement_s_30s"),
+        "go_diagnostic_applied_delta_abs_movement_s_60s": go_payload.get("applied_delta_abs_movement_s_60s"),
+        "go_diagnostic_slope_target_moving_10s": go_payload.get("slope_target_moving_10s"),
+        "go_diagnostic_slope_target_moving_30s": go_payload.get("slope_target_moving_30s"),
+        "go_diagnostic_slope_target_moving_60s": go_payload.get("slope_target_moving_60s"),
+        "go_diagnostic_slope_target_movement_reason": go_payload.get("slope_target_movement_reason"),
+        "go_diagnostic_shadow_delta_freeze_variant_a_would_pass": go_payload.get("shadow_delta_freeze_variant_a_would_pass"),
+        "go_diagnostic_shadow_delta_freeze_variant_b_would_pass": go_payload.get("shadow_delta_freeze_variant_b_would_pass"),
+        "go_diagnostic_shadow_delta_stability_variant_c_would_pass": go_payload.get("shadow_delta_stability_variant_c_would_pass"),
+        "go_diagnostic_shadow_delta_freeze_would_promote": go_payload.get("shadow_delta_freeze_would_promote"),
+        "go_diagnostic_shadow_delta_freeze_blocker_if_not": go_payload.get("shadow_delta_freeze_blocker_if_not"),
+        "go_diagnostic_shadow_delta_freeze_safety_class": go_payload.get("shadow_delta_freeze_safety_class"),
+        "go_diagnostic_shadow_delta_freeze_safety_flags": go_payload.get("shadow_delta_freeze_safety_flags"),
+        "go_diagnostic_shadow_delta_freeze_residual_abs_p95": go_payload.get("shadow_delta_freeze_residual_abs_p95"),
+        "go_diagnostic_shadow_delta_freeze_recent_holdover": go_payload.get("shadow_delta_freeze_recent_holdover"),
+        "go_diagnostic_shadow_delta_freeze_recent_hard_reject": go_payload.get("shadow_delta_freeze_recent_hard_reject"),
+        "go_diagnostic_shadow_delta_freeze_recent_transition": go_payload.get("shadow_delta_freeze_recent_transition"),
+        "go_diagnostic_shadow_delta_freeze_support_ok": go_payload.get("shadow_delta_freeze_support_ok"),
+        "go_diagnostic_shadow_delta_freeze_strict_ok": go_payload.get("shadow_delta_freeze_strict_ok"),
+        "go_diagnostic_shadow_freeze_candidate_count_10m": go_payload.get("shadow_freeze_candidate_count_10m"),
+        "go_diagnostic_shadow_freeze_safe_candidate_count_10m": go_payload.get("shadow_freeze_safe_candidate_count_10m"),
+        "go_diagnostic_shadow_freeze_unsafe_candidate_count_10m": go_payload.get("shadow_freeze_unsafe_candidate_count_10m"),
+        "go_diagnostic_shadow_freeze_transition_contaminated_count_10m": go_payload.get("shadow_freeze_transition_contaminated_count_10m"),
+        "go_diagnostic_shadow_freeze_promote_opportunity_count_10m": go_payload.get("shadow_freeze_promote_opportunity_count_10m"),
+        "go_diagnostic_shadow_freeze_false_positive_risk_count_10m": go_payload.get("shadow_freeze_false_positive_risk_count_10m"),
+        "go_diagnostic_shadow_freeze_candidate_count_30m": go_payload.get("shadow_freeze_candidate_count_30m"),
+        "go_diagnostic_shadow_freeze_safe_candidate_count_30m": go_payload.get("shadow_freeze_safe_candidate_count_30m"),
+        "go_diagnostic_shadow_freeze_unsafe_candidate_count_30m": go_payload.get("shadow_freeze_unsafe_candidate_count_30m"),
+        "go_diagnostic_shadow_freeze_transition_contaminated_count_30m": go_payload.get("shadow_freeze_transition_contaminated_count_30m"),
+        "go_diagnostic_shadow_freeze_promote_opportunity_count_30m": go_payload.get("shadow_freeze_promote_opportunity_count_30m"),
+        "go_diagnostic_shadow_freeze_false_positive_risk_count_30m": go_payload.get("shadow_freeze_false_positive_risk_count_30m"),
     }
 
 
@@ -853,6 +900,10 @@ def _build_go_promotion_failure_diagnostic_aliases(payload: dict, go_sync: dict 
         payload.get("go_diagnostic_compact_period_diagnostic_reason"),
         payload.get("compact_period_diagnostic_reason"),
     )
+    slope_target_movement_reason = _first_non_none(
+        payload.get("slope_target_movement_reason"),
+        payload.get("go_diagnostic_slope_target_movement_reason"),
+    )
     if (
         compact_period_agrees_with_df is None
         and "compact_period_agrees_with_df" not in payload
@@ -993,6 +1044,191 @@ def _build_go_promotion_failure_diagnostic_aliases(payload: dict, go_sync: dict 
         "compact_period_disagreement_s": compact_period_disagreement_s,
         "compact_period_disagreement_ppm": compact_period_disagreement_ppm,
         "compact_period_diagnostic_reason": compact_period_diagnostic_reason,
+        "retained_go_delta_rate_s_per_s_10s": _first_non_none(
+            payload.get("retained_go_delta_rate_s_per_s_10s"),
+            payload.get("go_diagnostic_retained_go_delta_rate_s_per_s_10s"),
+        ),
+        "retained_go_delta_rate_s_per_s_30s": _first_non_none(
+            payload.get("retained_go_delta_rate_s_per_s_30s"),
+            payload.get("go_diagnostic_retained_go_delta_rate_s_per_s_30s"),
+        ),
+        "retained_go_delta_rate_s_per_s_60s": _first_non_none(
+            payload.get("retained_go_delta_rate_s_per_s_60s"),
+            payload.get("go_diagnostic_retained_go_delta_rate_s_per_s_60s"),
+        ),
+        "proposed_delta_rate_s_per_s_10s": _first_non_none(
+            payload.get("proposed_delta_rate_s_per_s_10s"),
+            payload.get("go_diagnostic_proposed_delta_rate_s_per_s_10s"),
+        ),
+        "proposed_delta_rate_s_per_s_30s": _first_non_none(
+            payload.get("proposed_delta_rate_s_per_s_30s"),
+            payload.get("go_diagnostic_proposed_delta_rate_s_per_s_30s"),
+        ),
+        "proposed_delta_rate_s_per_s_60s": _first_non_none(
+            payload.get("proposed_delta_rate_s_per_s_60s"),
+            payload.get("go_diagnostic_proposed_delta_rate_s_per_s_60s"),
+        ),
+        "applied_delta_rate_s_per_s_10s": _first_non_none(
+            payload.get("applied_delta_rate_s_per_s_10s"),
+            payload.get("go_diagnostic_applied_delta_rate_s_per_s_10s"),
+        ),
+        "applied_delta_rate_s_per_s_30s": _first_non_none(
+            payload.get("applied_delta_rate_s_per_s_30s"),
+            payload.get("go_diagnostic_applied_delta_rate_s_per_s_30s"),
+        ),
+        "applied_delta_rate_s_per_s_60s": _first_non_none(
+            payload.get("applied_delta_rate_s_per_s_60s"),
+            payload.get("go_diagnostic_applied_delta_rate_s_per_s_60s"),
+        ),
+        "retained_go_delta_abs_movement_s_10s": _first_non_none(
+            payload.get("retained_go_delta_abs_movement_s_10s"),
+            payload.get("go_diagnostic_retained_go_delta_abs_movement_s_10s"),
+        ),
+        "retained_go_delta_abs_movement_s_30s": _first_non_none(
+            payload.get("retained_go_delta_abs_movement_s_30s"),
+            payload.get("go_diagnostic_retained_go_delta_abs_movement_s_30s"),
+        ),
+        "retained_go_delta_abs_movement_s_60s": _first_non_none(
+            payload.get("retained_go_delta_abs_movement_s_60s"),
+            payload.get("go_diagnostic_retained_go_delta_abs_movement_s_60s"),
+        ),
+        "proposed_delta_abs_movement_s_10s": _first_non_none(
+            payload.get("proposed_delta_abs_movement_s_10s"),
+            payload.get("go_diagnostic_proposed_delta_abs_movement_s_10s"),
+        ),
+        "proposed_delta_abs_movement_s_30s": _first_non_none(
+            payload.get("proposed_delta_abs_movement_s_30s"),
+            payload.get("go_diagnostic_proposed_delta_abs_movement_s_30s"),
+        ),
+        "proposed_delta_abs_movement_s_60s": _first_non_none(
+            payload.get("proposed_delta_abs_movement_s_60s"),
+            payload.get("go_diagnostic_proposed_delta_abs_movement_s_60s"),
+        ),
+        "applied_delta_abs_movement_s_10s": _first_non_none(
+            payload.get("applied_delta_abs_movement_s_10s"),
+            payload.get("go_diagnostic_applied_delta_abs_movement_s_10s"),
+        ),
+        "applied_delta_abs_movement_s_30s": _first_non_none(
+            payload.get("applied_delta_abs_movement_s_30s"),
+            payload.get("go_diagnostic_applied_delta_abs_movement_s_30s"),
+        ),
+        "applied_delta_abs_movement_s_60s": _first_non_none(
+            payload.get("applied_delta_abs_movement_s_60s"),
+            payload.get("go_diagnostic_applied_delta_abs_movement_s_60s"),
+        ),
+        "slope_target_moving_10s": _first_non_none(
+            payload.get("slope_target_moving_10s"),
+            payload.get("go_diagnostic_slope_target_moving_10s"),
+        ),
+        "slope_target_moving_30s": _first_non_none(
+            payload.get("slope_target_moving_30s"),
+            payload.get("go_diagnostic_slope_target_moving_30s"),
+        ),
+        "slope_target_moving_60s": _first_non_none(
+            payload.get("slope_target_moving_60s"),
+            payload.get("go_diagnostic_slope_target_moving_60s"),
+        ),
+        "slope_target_movement_reason": slope_target_movement_reason,
+        "shadow_delta_freeze_variant_a_would_pass": _first_non_none(
+            payload.get("shadow_delta_freeze_variant_a_would_pass"),
+            payload.get("go_diagnostic_shadow_delta_freeze_variant_a_would_pass"),
+        ),
+        "shadow_delta_freeze_variant_b_would_pass": _first_non_none(
+            payload.get("shadow_delta_freeze_variant_b_would_pass"),
+            payload.get("go_diagnostic_shadow_delta_freeze_variant_b_would_pass"),
+        ),
+        "shadow_delta_stability_variant_c_would_pass": _first_non_none(
+            payload.get("shadow_delta_stability_variant_c_would_pass"),
+            payload.get("go_diagnostic_shadow_delta_stability_variant_c_would_pass"),
+        ),
+        "shadow_delta_freeze_would_promote": _first_non_none(
+            payload.get("shadow_delta_freeze_would_promote"),
+            payload.get("go_diagnostic_shadow_delta_freeze_would_promote"),
+        ),
+        "shadow_delta_freeze_blocker_if_not": _first_non_none(
+            payload.get("shadow_delta_freeze_blocker_if_not"),
+            payload.get("go_diagnostic_shadow_delta_freeze_blocker_if_not"),
+        ),
+        "shadow_delta_freeze_safety_class": _first_non_none(
+            payload.get("shadow_delta_freeze_safety_class"),
+            payload.get("go_diagnostic_shadow_delta_freeze_safety_class"),
+        ),
+        "shadow_delta_freeze_safety_flags": _first_non_none(
+            payload.get("shadow_delta_freeze_safety_flags"),
+            payload.get("go_diagnostic_shadow_delta_freeze_safety_flags"),
+        ),
+        "shadow_delta_freeze_residual_abs_p95": _first_non_none(
+            payload.get("shadow_delta_freeze_residual_abs_p95"),
+            payload.get("go_diagnostic_shadow_delta_freeze_residual_abs_p95"),
+        ),
+        "shadow_delta_freeze_recent_holdover": _first_non_none(
+            payload.get("shadow_delta_freeze_recent_holdover"),
+            payload.get("go_diagnostic_shadow_delta_freeze_recent_holdover"),
+        ),
+        "shadow_delta_freeze_recent_hard_reject": _first_non_none(
+            payload.get("shadow_delta_freeze_recent_hard_reject"),
+            payload.get("go_diagnostic_shadow_delta_freeze_recent_hard_reject"),
+        ),
+        "shadow_delta_freeze_recent_transition": _first_non_none(
+            payload.get("shadow_delta_freeze_recent_transition"),
+            payload.get("go_diagnostic_shadow_delta_freeze_recent_transition"),
+        ),
+        "shadow_delta_freeze_support_ok": _first_non_none(
+            payload.get("shadow_delta_freeze_support_ok"),
+            payload.get("go_diagnostic_shadow_delta_freeze_support_ok"),
+        ),
+        "shadow_delta_freeze_strict_ok": _first_non_none(
+            payload.get("shadow_delta_freeze_strict_ok"),
+            payload.get("go_diagnostic_shadow_delta_freeze_strict_ok"),
+        ),
+        "shadow_freeze_candidate_count_10m": _first_non_none(
+            payload.get("shadow_freeze_candidate_count_10m"),
+            payload.get("go_diagnostic_shadow_freeze_candidate_count_10m"),
+        ),
+        "shadow_freeze_safe_candidate_count_10m": _first_non_none(
+            payload.get("shadow_freeze_safe_candidate_count_10m"),
+            payload.get("go_diagnostic_shadow_freeze_safe_candidate_count_10m"),
+        ),
+        "shadow_freeze_unsafe_candidate_count_10m": _first_non_none(
+            payload.get("shadow_freeze_unsafe_candidate_count_10m"),
+            payload.get("go_diagnostic_shadow_freeze_unsafe_candidate_count_10m"),
+        ),
+        "shadow_freeze_transition_contaminated_count_10m": _first_non_none(
+            payload.get("shadow_freeze_transition_contaminated_count_10m"),
+            payload.get("go_diagnostic_shadow_freeze_transition_contaminated_count_10m"),
+        ),
+        "shadow_freeze_promote_opportunity_count_10m": _first_non_none(
+            payload.get("shadow_freeze_promote_opportunity_count_10m"),
+            payload.get("go_diagnostic_shadow_freeze_promote_opportunity_count_10m"),
+        ),
+        "shadow_freeze_false_positive_risk_count_10m": _first_non_none(
+            payload.get("shadow_freeze_false_positive_risk_count_10m"),
+            payload.get("go_diagnostic_shadow_freeze_false_positive_risk_count_10m"),
+        ),
+        "shadow_freeze_candidate_count_30m": _first_non_none(
+            payload.get("shadow_freeze_candidate_count_30m"),
+            payload.get("go_diagnostic_shadow_freeze_candidate_count_30m"),
+        ),
+        "shadow_freeze_safe_candidate_count_30m": _first_non_none(
+            payload.get("shadow_freeze_safe_candidate_count_30m"),
+            payload.get("go_diagnostic_shadow_freeze_safe_candidate_count_30m"),
+        ),
+        "shadow_freeze_unsafe_candidate_count_30m": _first_non_none(
+            payload.get("shadow_freeze_unsafe_candidate_count_30m"),
+            payload.get("go_diagnostic_shadow_freeze_unsafe_candidate_count_30m"),
+        ),
+        "shadow_freeze_transition_contaminated_count_30m": _first_non_none(
+            payload.get("shadow_freeze_transition_contaminated_count_30m"),
+            payload.get("go_diagnostic_shadow_freeze_transition_contaminated_count_30m"),
+        ),
+        "shadow_freeze_promote_opportunity_count_30m": _first_non_none(
+            payload.get("shadow_freeze_promote_opportunity_count_30m"),
+            payload.get("go_diagnostic_shadow_freeze_promote_opportunity_count_30m"),
+        ),
+        "shadow_freeze_false_positive_risk_count_30m": _first_non_none(
+            payload.get("shadow_freeze_false_positive_risk_count_30m"),
+            payload.get("go_diagnostic_shadow_freeze_false_positive_risk_count_30m"),
+        ),
         "refined_effective_period_s": refined_effective_period_s,
         "refined_effective_period_agrees_with_df": refined_effective_period_agrees_with_df,
         "refined_effective_period_disagreement_s": refined_effective_period_disagreement_s,
@@ -1387,14 +1623,15 @@ def _live_sync_state_to_dict(
     typed_phase_absolute_available = bool(getattr(sync, "phase_absolute_available", False))
     typed_phase_trust_reason = getattr(sync, "phase_trust_reason", None)
 
-    # Compute phase_absolute_available from phase_offset_geographic_deg when
-    # the typed field is not yet populated (backward compat).
-    if typed_phase_absolute_available:
-        phase_absolute_available = True
-    elif _is_finite_number(typed_phase_offset_geographic):
-        phase_absolute_available = True
-    else:
-        phase_absolute_available = False
+    # phase_absolute_available is explicit and conservative:
+    # true only for geographic + absolute with finite geographic offset.
+    typed_phase_basis = str(getattr(sync, "phase_basis", "") or "")
+    phase_absolute_available = bool(
+        typed_phase_absolute_available
+        and typed_phase_basis == "geographic"
+        and typed_phase_is_absolute
+        and _is_finite_number(typed_phase_offset_geographic)
+    )
 
     # phase_is_absolute mirrors phase_absolute_available by default.
     # A deliberately separate trust gate could be added later via a distinct
@@ -2565,14 +2802,27 @@ def _live_sync_state_to_dict(
             if _period_stable_gate.get("passed") is True
             else (_period_stable_gate.get("reason") or None)
         ) if _py_gates else None,
-        "contamination_state": getattr(sync, "contamination_state", None) or (
-            _go_gates.get("go_contamination_state", {}).get("reason") or "not_evaluated"
-        ) if _go_gates else "not_evaluated",
+        "contamination_state": (
+            getattr(sync, "contamination_state", None)
+            or (
+                "insufficient_data"
+                if _go_gates
+                else "insufficient_data"
+            )
+        ),
+        "contamination_gate_reason": (
+            getattr(sync, "contamination_reason", None)
+            or (
+                (_go_gates.get("go_contamination_state", {}).get("reason") or "stage8_not_available_stub")
+                if _go_gates
+                else "stage8_not_available_stub"
+            )
+        ),
         "slope_trend_state": (
             (
                 (_go_gates.get("go_slope_converged", {}).get("reason") or "converged")
                 if _go_gates.get("go_slope_converged", {}).get("passed") is True
-                else (_go_gates.get("go_slope_converged", {}).get("reason") or "not_evaluated")
+                else (_go_gates.get("go_slope_converged", {}).get("reason") or "insufficient_slope_history")
             )
         ) if _go_gates else None,
         "slope_not_converged_reason": (
@@ -2850,6 +3100,63 @@ def _live_sync_state_to_dict(
         "geographic_phase_status": str(geo_eval.get("status") or "absent"),
         "geographic_phase_invalid_reason": None if localisation_safe_phase else localisation_safe_phase_reason,
         "geographic_phase_age_s": geo_eval.get("age_s"),
+        "geographic_phase_gate_calibration_record_present": bool(
+            (geo_eval.get("gates") or {}).get("geographic_phase_gate_calibration_record_present", False)
+        ),
+        "geographic_phase_gate_offset_finite": bool(
+            (geo_eval.get("gates") or {}).get("geographic_phase_gate_offset_finite", False)
+        ),
+        "geographic_phase_gate_convention_valid": bool(
+            (geo_eval.get("gates") or {}).get("geographic_phase_gate_convention_valid", False)
+        ),
+        "geographic_phase_gate_not_stale": bool(
+            (geo_eval.get("gates") or {}).get("geographic_phase_gate_not_stale", False)
+        ),
+        "geographic_phase_gate_context_match": bool(
+            (geo_eval.get("gates") or {}).get("geographic_phase_gate_context_match", False)
+        ),
+        "geographic_phase_gate_sync_present": bool(
+            (geo_eval.get("gates") or {}).get("geographic_phase_gate_sync_present", False)
+        ),
+        "geographic_phase_gate_sync_usable": bool(
+            (geo_eval.get("gates") or {}).get("geographic_phase_gate_sync_usable", False)
+        ),
+        "geographic_phase_gate_go_operational_active": bool(
+            (geo_eval.get("gates") or {}).get("geographic_phase_gate_go_operational_active", False)
+        ),
+        "geographic_phase_gate_period_authority_go_refined": bool(
+            (geo_eval.get("gates") or {}).get("geographic_phase_gate_period_authority_go_refined", False)
+        ),
+        "geographic_phase_gate_not_holdover": bool(
+            (geo_eval.get("gates") or {}).get("geographic_phase_gate_not_holdover", False)
+        ),
+        "geographic_phase_gate_all_pass": bool(
+            (geo_eval.get("gates") or {}).get("geographic_phase_gate_all_pass", False)
+        ),
+        "geographic_phase_first_failed_gate": geo_eval.get("first_failed_gate"),
+        "geographic_phase_operational_predicate_source": (geo_eval.get("raw") or {}).get(
+            "geographic_phase_operational_predicate_source"
+        ),
+        "geographic_phase_raw_sync_usable": (geo_eval.get("raw") or {}).get("geographic_phase_raw_sync_usable"),
+        "geographic_phase_raw_go_operational_active": (geo_eval.get("raw") or {}).get(
+            "geographic_phase_raw_go_operational_active"
+        ),
+        "geographic_phase_raw_period_authority": (geo_eval.get("raw") or {}).get(
+            "geographic_phase_raw_period_authority"
+        ),
+        "geographic_phase_raw_sync_authority": (geo_eval.get("raw") or {}).get(
+            "geographic_phase_raw_sync_authority"
+        ),
+        "geographic_phase_raw_holdover": (geo_eval.get("raw") or {}).get("geographic_phase_raw_holdover"),
+        "geographic_phase_raw_handoff_state": (geo_eval.get("raw") or {}).get("geographic_phase_raw_handoff_state"),
+        "geographic_phase_raw_handoff_reason": (geo_eval.get("raw") or {}).get("geographic_phase_raw_handoff_reason"),
+        "geographic_phase_raw_go_operational_blocking_gate": (geo_eval.get("raw") or {}).get(
+            "geographic_phase_raw_go_operational_blocking_gate"
+        ),
+        "geographic_phase_raw_source": (geo_eval.get("raw") or {}).get("geographic_phase_raw_source"),
+        "geographic_phase_raw_phase_basis_before_overlay": (geo_eval.get("raw") or {}).get(
+            "geographic_phase_raw_phase_basis_before_overlay"
+        ),
         "localisation_safe_phase": localisation_safe_phase,
         "localisation_safe_phase_reason": localisation_safe_phase_reason,
         "underlying_phase_basis": underlying_phase_basis,
@@ -2970,16 +3277,21 @@ def _normalise_phase_fields(payload: dict) -> dict:
         pass
 
     # Enforce phase_absolute_available consistency:
-    # must be True when phase_offset_geographic_deg is finite, False otherwise.
+    # true only for geographic + absolute + finite geographic offset.
     geographic_offset_finite = (
         phase_offset_geographic_deg is not None
         and _is_finite_number(phase_offset_geographic_deg)
     )
-    if geographic_offset_finite and not phase_absolute_available:
-        warnings.append("phase_absolute_available_normalised_to_true_geographic_offset_present")
+    absolute_available_expected = (
+        phase_basis == "geographic"
+        and phase_is_absolute
+        and geographic_offset_finite
+    )
+    if absolute_available_expected and not phase_absolute_available:
+        warnings.append("phase_absolute_available_normalised_to_true_geographic_absolute_offset_present")
         phase_absolute_available = True
-    if not geographic_offset_finite and phase_absolute_available:
-        warnings.append("phase_absolute_available_normalised_to_false_no_geographic_offset")
+    if not absolute_available_expected and phase_absolute_available:
+        warnings.append("phase_absolute_available_normalised_to_false_not_geographic_absolute")
         phase_absolute_available = False
 
     return {
@@ -3344,6 +3656,13 @@ class RadarState:
         # ------------------------------------------------------------------
         # Per-IID live sync state; updated each time a sweep frame is completed.
         self._live_sync_states: dict[int, LiveSyncState] = {}
+        self._SYNC_EVENT_HISTORY_MAX = 50
+        self._SYNC_EVENT_DELTA_EPSILON_S = 1e-9
+        self._sync_event_history_by_iid: dict[int, deque] = {}
+        self._sync_event_last_signature_by_iid: dict[int, dict] = {}
+        self._shadow_freeze_monitor_history_by_iid: dict[int, deque] = {}
+        self._shadow_freeze_monitor_last_by_iid: dict[int, dict] = {}
+        self._shadow_freeze_monitor_revision_by_iid: dict[int, int] = {}
         self._geographic_phase_calibration_by_iid: dict[int, dict] = {}
         self._geographic_phase_store_path = (
             Path(__file__).resolve().parents[1] / "data" / "geographic_phase_calibration.json"
@@ -3581,19 +3900,108 @@ class RadarState:
         sync: LiveSyncState | None,
         go_sync: dict | None = None,
     ) -> dict:
+        gates = {
+            "geographic_phase_gate_calibration_record_present": False,
+            "geographic_phase_gate_offset_finite": False,
+            "geographic_phase_gate_convention_valid": False,
+            "geographic_phase_gate_not_stale": False,
+            "geographic_phase_gate_context_match": False,
+            "geographic_phase_gate_sync_present": False,
+            "geographic_phase_gate_sync_usable": False,
+            "geographic_phase_gate_go_operational_active": False,
+            "geographic_phase_gate_period_authority_go_refined": False,
+            "geographic_phase_gate_not_holdover": False,
+            "geographic_phase_gate_all_pass": False,
+        }
+        raw_values = {
+            "geographic_phase_raw_sync_usable": bool(getattr(sync, "usable", False)) if sync is not None else None,
+            "geographic_phase_raw_go_operational_active": bool(getattr(sync, "go_operational_active", False)) if sync is not None else None,
+            "geographic_phase_raw_period_authority": (str(getattr(sync, "period_authority", "") or "") if sync is not None else None),
+            "geographic_phase_raw_sync_authority": (str(getattr(sync, "sync_authority", "") or "") if sync is not None else None),
+            "geographic_phase_raw_holdover": bool(getattr(sync, "holdover", False)) if sync is not None else None,
+            "geographic_phase_raw_handoff_state": (str(getattr(sync, "handoff_state", "") or "") if sync is not None else None),
+            "geographic_phase_raw_handoff_reason": (str(getattr(sync, "handoff_reason", "") or "") if sync is not None else None),
+            "geographic_phase_raw_go_operational_blocking_gate": (
+                str(getattr(sync, "go_operational_blocking_gate", "") or "") if sync is not None else None
+            ),
+            "geographic_phase_raw_source": (str(getattr(sync, "source", "") or "") if sync is not None else None),
+            "geographic_phase_raw_phase_basis_before_overlay": (
+                str(getattr(sync, "phase_basis", "") or "") if sync is not None else None
+            ),
+            "geographic_phase_operational_predicate_source": "live_sync_state",
+        }
+
+        def _result(
+            *,
+            active: bool,
+            status: str,
+            reason: str,
+            record: dict | None,
+            age_s: float | None = None,
+            phase_offset_geographic_deg: float | None = None,
+            first_failed_gate: str | None = None,
+        ) -> dict:
+            output = {
+                "active": active,
+                "status": status,
+                "reason": reason,
+                "record": record,
+                "age_s": age_s,
+                "gates": dict(gates),
+                "first_failed_gate": first_failed_gate,
+                "raw": dict(raw_values),
+            }
+            if phase_offset_geographic_deg is not None:
+                output["phase_offset_geographic_deg"] = phase_offset_geographic_deg
+            return output
+
         with self._lock:
             rec = dict(self._geographic_phase_calibration_by_iid.get(iid) or {})
         if not rec:
-            return {"active": False, "status": "absent", "reason": "calibration_absent", "record": None}
+            return _result(
+                active=False,
+                status="absent",
+                reason="calibration_absent",
+                record=None,
+                first_failed_gate="geographic_phase_gate_calibration_record_present",
+            )
+        gates["geographic_phase_gate_calibration_record_present"] = True
         if not sync:
-            return {"active": False, "status": "invalid", "reason": "sync_state_missing", "record": rec}
+            return _result(
+                active=False,
+                status="invalid",
+                reason="sync_state_missing",
+                record=rec,
+                first_failed_gate="geographic_phase_gate_sync_present",
+            )
+        gates["geographic_phase_gate_sync_present"] = True
         if not bool(rec.get("geographic_phase_calibrated", False)):
-            return {"active": False, "status": "invalid", "reason": "calibration_flag_false", "record": rec}
+            return _result(
+                active=False,
+                status="invalid",
+                reason="calibration_flag_false",
+                record=rec,
+                first_failed_gate="geographic_phase_gate_calibration_record_present",
+            )
         if str(rec.get("geographic_phase_offset_convention") or "") != _GEOGRAPHIC_PHASE_OFFSET_CONVENTION:
-            return {"active": False, "status": "invalid", "reason": "unsupported_convention", "record": rec}
+            return _result(
+                active=False,
+                status="invalid",
+                reason="unsupported_convention",
+                record=rec,
+                first_failed_gate="geographic_phase_gate_convention_valid",
+            )
+        gates["geographic_phase_gate_convention_valid"] = True
         offset = rec.get("geographic_phase_offset_deg")
         if not _is_finite_number(offset):
-            return {"active": False, "status": "invalid", "reason": "invalid_offset", "record": rec}
+            return _result(
+                active=False,
+                status="invalid",
+                reason="invalid_offset",
+                record=rec,
+                first_failed_gate="geographic_phase_gate_offset_finite",
+            )
+        gates["geographic_phase_gate_offset_finite"] = True
         now_ts = time.time()
         calibrated_at = rec.get("geographic_phase_calibrated_at_ts")
         valid_until = rec.get("geographic_phase_valid_until_ts")
@@ -3602,39 +4010,109 @@ class RadarState:
         if _is_finite_number(calibrated_at):
             age_s = max(0.0, now_ts - float(calibrated_at))
         if _is_finite_number(valid_until) and now_ts > float(valid_until):
-            return {"active": False, "status": "stale", "reason": "calibration_expired", "record": rec, "age_s": age_s}
+            return _result(
+                active=False,
+                status="stale",
+                reason="calibration_expired",
+                record=rec,
+                age_s=age_s,
+                first_failed_gate="geographic_phase_gate_not_stale",
+            )
         if _is_finite_number(max_age_s):
             if not _is_finite_number(calibrated_at):
-                return {"active": False, "status": "invalid", "reason": "calibration_missing_timestamp", "record": rec}
+                return _result(
+                    active=False,
+                    status="invalid",
+                    reason="calibration_missing_timestamp",
+                    record=rec,
+                    first_failed_gate="geographic_phase_gate_not_stale",
+                )
             if age_s is not None and age_s > float(max_age_s):
-                return {"active": False, "status": "stale", "reason": "calibration_stale", "record": rec, "age_s": age_s}
+                return _result(
+                    active=False,
+                    status="stale",
+                    reason="calibration_stale",
+                    record=rec,
+                    age_s=age_s,
+                    first_failed_gate="geographic_phase_gate_not_stale",
+                )
+        gates["geographic_phase_gate_not_stale"] = True
 
         stored_lat = rec.get("geographic_phase_location_lat")
         stored_lon = rec.get("geographic_phase_location_lon")
         if _is_finite_number(stored_lat) and abs(float(stored_lat) - float(self._receiver_lat)) > 1e-6:
-            return {"active": False, "status": "invalid", "reason": "context_mismatch_receiver_lat", "record": rec, "age_s": age_s}
+            return _result(
+                active=False,
+                status="invalid",
+                reason="context_mismatch_receiver_lat",
+                record=rec,
+                age_s=age_s,
+                first_failed_gate="geographic_phase_gate_context_match",
+            )
         if _is_finite_number(stored_lon) and abs(float(stored_lon) - float(self._receiver_lon)) > 1e-6:
-            return {"active": False, "status": "invalid", "reason": "context_mismatch_receiver_lon", "record": rec, "age_s": age_s}
+            return _result(
+                active=False,
+                status="invalid",
+                reason="context_mismatch_receiver_lon",
+                record=rec,
+                age_s=age_s,
+                first_failed_gate="geographic_phase_gate_context_match",
+            )
+        gates["geographic_phase_gate_context_match"] = True
 
         if bool(getattr(sync, "holdover", False)):
-            return {"active": False, "status": "invalid", "reason": "holdover_active", "record": rec, "age_s": age_s}
+            return _result(
+                active=False,
+                status="invalid",
+                reason="holdover_active",
+                record=rec,
+                age_s=age_s,
+                first_failed_gate="geographic_phase_gate_not_holdover",
+            )
+        gates["geographic_phase_gate_not_holdover"] = True
         if not bool(getattr(sync, "usable", False)):
-            return {"active": False, "status": "invalid", "reason": "sync_not_usable", "record": rec, "age_s": age_s}
+            return _result(
+                active=False,
+                status="invalid",
+                reason="sync_not_usable",
+                record=rec,
+                age_s=age_s,
+                first_failed_gate="geographic_phase_gate_sync_usable",
+            )
+        gates["geographic_phase_gate_sync_usable"] = True
         if not bool(getattr(sync, "go_operational_active", False)):
-            return {"active": False, "status": "invalid", "reason": "go_not_operational", "record": rec, "age_s": age_s}
+            return _result(
+                active=False,
+                status="invalid",
+                reason="go_not_operational",
+                record=rec,
+                age_s=age_s,
+                first_failed_gate="geographic_phase_gate_go_operational_active",
+            )
+        gates["geographic_phase_gate_go_operational_active"] = True
         if str(getattr(sync, "period_authority", "") or "") != "go_refined":
-            return {"active": False, "status": "invalid", "reason": "period_authority_not_go_refined", "record": rec, "age_s": age_s}
+            return _result(
+                active=False,
+                status="invalid",
+                reason="period_authority_not_go_refined",
+                record=rec,
+                age_s=age_s,
+                first_failed_gate="geographic_phase_gate_period_authority_go_refined",
+            )
+        gates["geographic_phase_gate_period_authority_go_refined"] = True
 
         predicted_sync_phase_deg = float(getattr(sync, "phase_offset_deg", 0.0) or 0.0)
         geographic_offset = self._normalise_manual_geographic_offset_deg(predicted_sync_phase_deg + float(offset))
-        return {
-            "active": True,
-            "status": "valid",
-            "reason": "ok",
-            "record": rec,
-            "age_s": age_s,
-            "phase_offset_geographic_deg": geographic_offset,
-        }
+        gates["geographic_phase_gate_all_pass"] = True
+        return _result(
+            active=True,
+            status="valid",
+            reason="ok",
+            record=rec,
+            age_s=age_s,
+            phase_offset_geographic_deg=geographic_offset,
+            first_failed_gate=None,
+        )
 
     def get_geographic_phase_calibration_status(self, iid: int) -> dict:
         sync = self.get_live_sync_state(iid)
@@ -3651,7 +4129,464 @@ class RadarState:
             "localisation_safe_phase_reason": eval_result.get("reason"),
             "calibration": record or None,
             "phase_offset_geographic_deg": eval_result.get("phase_offset_geographic_deg"),
+            "geographic_phase_gate_calibration_record_present": bool(
+                (eval_result.get("gates") or {}).get("geographic_phase_gate_calibration_record_present", False)
+            ),
+            "geographic_phase_gate_offset_finite": bool(
+                (eval_result.get("gates") or {}).get("geographic_phase_gate_offset_finite", False)
+            ),
+            "geographic_phase_gate_convention_valid": bool(
+                (eval_result.get("gates") or {}).get("geographic_phase_gate_convention_valid", False)
+            ),
+            "geographic_phase_gate_not_stale": bool(
+                (eval_result.get("gates") or {}).get("geographic_phase_gate_not_stale", False)
+            ),
+            "geographic_phase_gate_context_match": bool(
+                (eval_result.get("gates") or {}).get("geographic_phase_gate_context_match", False)
+            ),
+            "geographic_phase_gate_sync_present": bool(
+                (eval_result.get("gates") or {}).get("geographic_phase_gate_sync_present", False)
+            ),
+            "geographic_phase_gate_sync_usable": bool(
+                (eval_result.get("gates") or {}).get("geographic_phase_gate_sync_usable", False)
+            ),
+            "geographic_phase_gate_go_operational_active": bool(
+                (eval_result.get("gates") or {}).get("geographic_phase_gate_go_operational_active", False)
+            ),
+            "geographic_phase_gate_period_authority_go_refined": bool(
+                (eval_result.get("gates") or {}).get("geographic_phase_gate_period_authority_go_refined", False)
+            ),
+            "geographic_phase_gate_not_holdover": bool(
+                (eval_result.get("gates") or {}).get("geographic_phase_gate_not_holdover", False)
+            ),
+            "geographic_phase_gate_all_pass": bool(
+                (eval_result.get("gates") or {}).get("geographic_phase_gate_all_pass", False)
+            ),
+            "geographic_phase_first_failed_gate": eval_result.get("first_failed_gate"),
+            "geographic_phase_operational_predicate_source": (eval_result.get("raw") or {}).get(
+                "geographic_phase_operational_predicate_source"
+            ),
+            "geographic_phase_raw_sync_usable": (eval_result.get("raw") or {}).get("geographic_phase_raw_sync_usable"),
+            "geographic_phase_raw_go_operational_active": (eval_result.get("raw") or {}).get(
+                "geographic_phase_raw_go_operational_active"
+            ),
+            "geographic_phase_raw_period_authority": (eval_result.get("raw") or {}).get(
+                "geographic_phase_raw_period_authority"
+            ),
+            "geographic_phase_raw_sync_authority": (eval_result.get("raw") or {}).get(
+                "geographic_phase_raw_sync_authority"
+            ),
+            "geographic_phase_raw_holdover": (eval_result.get("raw") or {}).get("geographic_phase_raw_holdover"),
+            "geographic_phase_raw_handoff_state": (eval_result.get("raw") or {}).get(
+                "geographic_phase_raw_handoff_state"
+            ),
+            "geographic_phase_raw_handoff_reason": (eval_result.get("raw") or {}).get(
+                "geographic_phase_raw_handoff_reason"
+            ),
+            "geographic_phase_raw_go_operational_blocking_gate": (eval_result.get("raw") or {}).get(
+                "geographic_phase_raw_go_operational_blocking_gate"
+            ),
+            "geographic_phase_raw_source": (eval_result.get("raw") or {}).get("geographic_phase_raw_source"),
+            "geographic_phase_raw_phase_basis_before_overlay": (eval_result.get("raw") or {}).get(
+                "geographic_phase_raw_phase_basis_before_overlay"
+            ),
         }
+
+    @staticmethod
+    def _sync_quality_bucket(sync_quality: object) -> str:
+        if not _is_finite_number(sync_quality):
+            return "unknown"
+        value = float(sync_quality)
+        if value < 0.3:
+            return "low"
+        if value < 0.7:
+            return "medium"
+        return "high"
+
+    @staticmethod
+    def _compute_slope_target_movement_metrics(
+        update_history: list[dict] | deque,
+        now_ts: float,
+    ) -> dict:
+        windows = (10.0, 30.0, 60.0)
+        metrics: dict[str, object] = {}
+        samples: list[dict] = []
+        for row in list(update_history or ()):
+            ts = row.get("ts")
+            if not _is_finite_number(ts):
+                continue
+            samples.append({
+                "ts": float(ts),
+                "retained": row.get("retained_go_delta_s"),
+                "proposed": row.get("proposed_delta_s"),
+                "applied": row.get("applied_delta_s"),
+            })
+
+        def _movement_for(field: str, window_s: float) -> tuple[float | None, float | None]:
+            in_window = [r for r in samples if (now_ts - r["ts"]) <= window_s]
+            if len(in_window) < 2:
+                return None, None
+            in_window.sort(key=lambda r: r["ts"])
+            first = next((r for r in in_window if _is_finite_number(r.get(field))), None)
+            last = next((r for r in reversed(in_window) if _is_finite_number(r.get(field))), None)
+            if first is None or last is None:
+                return None, None
+            dt = max(0.0, float(last["ts"]) - float(first["ts"]))
+            if dt <= 0.0:
+                return None, None
+            delta = float(last[field]) - float(first[field])
+            return (delta / dt), abs(delta)
+
+        reasons: list[str] = []
+        for window_s in windows:
+            win = int(window_s)
+            retained_rate, retained_abs = _movement_for("retained", window_s)
+            proposed_rate, proposed_abs = _movement_for("proposed", window_s)
+            applied_rate, applied_abs = _movement_for("applied", window_s)
+            metrics[f"retained_go_delta_rate_s_per_s_{win}s"] = retained_rate
+            metrics[f"retained_go_delta_abs_movement_s_{win}s"] = retained_abs
+            metrics[f"proposed_delta_rate_s_per_s_{win}s"] = proposed_rate
+            metrics[f"proposed_delta_abs_movement_s_{win}s"] = proposed_abs
+            metrics[f"applied_delta_rate_s_per_s_{win}s"] = applied_rate
+            metrics[f"applied_delta_abs_movement_s_{win}s"] = applied_abs
+            moving = any(
+                _is_finite_number(v) and abs(float(v)) > 0.0
+                for v in (retained_abs, proposed_abs, applied_abs)
+            )
+            metrics[f"slope_target_moving_{win}s"] = bool(moving)
+            if moving:
+                reasons.append(f"nonzero_delta_movement_{win}s")
+            elif all(v is None for v in (retained_abs, proposed_abs, applied_abs)):
+                reasons.append(f"insufficient_delta_history_{win}s")
+        metrics["slope_target_movement_reason"] = ",".join(reasons) if reasons else "no_movement_detected"
+        return metrics
+
+    @staticmethod
+    def _classify_shadow_delta_freeze_safety(
+        *,
+        strict_ok: bool,
+        support_ok: bool,
+        holdover: bool,
+        transition_contaminated: bool,
+        residual_abs: float | None,
+        hard_reject_streak: int,
+    ) -> str:
+        if not strict_ok or not support_ok:
+            return "insufficient_support_or_strict"
+        if holdover or transition_contaminated:
+            return "transition_contaminated"
+        if residual_abs is not None and residual_abs > 45.0:
+            return "unsafe_residual_risk"
+        if hard_reject_streak > 0:
+            return "unsafe_hard_reject_risk"
+        return "safe_candidate"
+
+    def _compute_shadow_delta_freeze_monitor_sample_locked(
+        self,
+        iid: int,
+        *,
+        now_ts: float,
+        sync: LiveSyncState | None,
+        go_sync: dict | None,
+        movement: dict,
+    ) -> dict:
+        go = go_sync or {}
+        strict_ok = bool(go.get("go_sync_usable_strict_gate_pass", getattr(sync, "update_epoch_last_strict_gate_pass", False)))
+        fit_obs = int(go.get("fit_observation_count") or getattr(sync, "fit_total_observations", 0) or 0)
+        fit_icaos = int(go.get("fit_icao_count") or getattr(sync, "fit_icao_count", 0) or 0)
+        support_ok = fit_obs >= 120 and fit_icaos >= 20
+        holdover = bool(go.get("holdover", getattr(sync, "holdover", False)))
+        slope_near_zero_pass = bool(go.get("slope_near_zero_window_pass", False))
+        slope_regression_pass = bool(go.get("slope_regression_pass", False))
+        slope_converged = slope_near_zero_pass or slope_regression_pass
+        near_zero_short = str(go.get("slope_near_zero_fail_reason") or "") == "near_zero_window_short"
+        reg_not_dec = str(go.get("slope_regression_fail_reason") or "") == "regression_not_decreasing"
+        moving10 = bool(movement.get("slope_target_moving_10s"))
+        moving30 = bool(movement.get("slope_target_moving_30s"))
+
+        # Approximation note: this is a bounded-cost runtime proxy, not a full
+        # residual recomputation under counterfactual frozen delta.
+        variant_a_pass = bool(slope_converged or (support_ok and strict_ok and ((near_zero_short and moving10) or (reg_not_dec and moving30))))
+        variant_b_pass = bool(slope_converged or (support_ok and strict_ok and (moving30 and (near_zero_short or reg_not_dec))))
+        retained_abs_30 = (
+            float(movement.get("retained_go_delta_abs_movement_s_30s"))
+            if _is_finite_number(movement.get("retained_go_delta_abs_movement_s_30s"))
+            else 0.0
+        )
+        applied_abs_30 = (
+            float(movement.get("applied_delta_abs_movement_s_30s"))
+            if _is_finite_number(movement.get("applied_delta_abs_movement_s_30s"))
+            else 0.0
+        )
+        stable_30s = retained_abs_30 <= 0.01 and applied_abs_30 <= 0.01
+        variant_c_pass = bool(stable_30s and slope_converged)
+
+        recent_events = list(self._sync_event_history_by_iid.get(iid, ()))
+        recent_10m = [
+            e for e in recent_events
+            if _is_finite_number(e.get("ts")) and (now_ts - float(e.get("ts"))) <= 600.0
+        ]
+        recent_30m = [
+            e for e in recent_events
+            if _is_finite_number(e.get("ts")) and (now_ts - float(e.get("ts"))) <= 1800.0
+        ]
+        recent_holdover = any(bool(e.get("holdover")) for e in recent_10m)
+        recent_hard_reject = any(int(e.get("hard_bound_reject_count") or 0) > 0 for e in recent_10m)
+        recent_transition = any(str(e.get("event_type") or "") in {"handoff_state", "handoff_reason"} for e in recent_10m)
+        hard_reject_streak = int(go.get("consecutive_hard_residual_rejects") or 0)
+        residual_abs = (
+            abs(float(go.get("last_update_epoch_residual_deg")))
+            if _is_finite_number(go.get("last_update_epoch_residual_deg"))
+            else None
+        )
+
+        transition_contaminated = bool(recent_holdover or recent_transition)
+        safety_class = self._classify_shadow_delta_freeze_safety(
+            strict_ok=strict_ok,
+            support_ok=support_ok,
+            holdover=holdover,
+            transition_contaminated=transition_contaminated,
+            residual_abs=residual_abs,
+            hard_reject_streak=hard_reject_streak,
+        )
+        would_promote = bool((variant_a_pass or variant_b_pass) and strict_ok and support_ok and safety_class == "safe_candidate")
+        blocker = None
+        if not would_promote:
+            if not strict_ok:
+                blocker = "strict_gate_failed"
+            elif not support_ok:
+                blocker = "insufficient_support"
+            elif holdover:
+                blocker = "holdover"
+            elif safety_class == "transition_contaminated":
+                blocker = "transition_contaminated"
+            elif safety_class == "unsafe_residual_risk":
+                blocker = "unsafe_residual_risk"
+            elif safety_class == "unsafe_hard_reject_risk":
+                blocker = "unsafe_hard_reject_risk"
+            elif not (variant_a_pass or variant_b_pass):
+                blocker = "shadow_slope_not_converged"
+            else:
+                blocker = "unknown"
+
+        sample = {
+            "ts": now_ts,
+            "shadow_delta_freeze_variant_a_would_pass": variant_a_pass,
+            "shadow_delta_freeze_variant_b_would_pass": variant_b_pass,
+            "shadow_delta_stability_variant_c_would_pass": variant_c_pass,
+            "shadow_delta_freeze_would_promote": would_promote,
+            "shadow_delta_freeze_blocker_if_not": blocker,
+            "shadow_delta_freeze_safety_class": safety_class,
+            "shadow_delta_freeze_safety_flags": {
+                "strict_ok": strict_ok,
+                "support_ok": support_ok,
+                "holdover": holdover,
+                "recent_transition_contamination": transition_contaminated,
+                "recent_hard_reject": recent_hard_reject,
+                "approximation": "proxy_based_no_counterfactual_residual_recompute",
+            },
+            "shadow_delta_freeze_residual_abs_p95": residual_abs,
+            "shadow_delta_freeze_recent_holdover": recent_holdover,
+            "shadow_delta_freeze_recent_hard_reject": recent_hard_reject,
+            "shadow_delta_freeze_recent_transition": recent_transition,
+            "shadow_delta_freeze_support_ok": support_ok,
+            "shadow_delta_freeze_strict_ok": strict_ok,
+            "shadow_freeze_candidate_count_10m": sum(1 for e in recent_10m if bool(e.get("strict_gate_pass"))),
+            "shadow_freeze_candidate_count_30m": sum(1 for e in recent_30m if bool(e.get("strict_gate_pass"))),
+            "shadow_freeze_safe_candidate_count_10m": 0,
+            "shadow_freeze_safe_candidate_count_30m": 0,
+            "shadow_freeze_unsafe_candidate_count_10m": 0,
+            "shadow_freeze_unsafe_candidate_count_30m": 0,
+            "shadow_freeze_transition_contaminated_count_10m": 0,
+            "shadow_freeze_transition_contaminated_count_30m": 0,
+            "shadow_freeze_promote_opportunity_count_10m": 0,
+            "shadow_freeze_promote_opportunity_count_30m": 0,
+            "shadow_freeze_false_positive_risk_count_10m": 0,
+            "shadow_freeze_false_positive_risk_count_30m": 0,
+        }
+        return sample
+
+    @staticmethod
+    def _shadow_freeze_rollup_counts(samples: list[dict], window_s: float) -> dict[str, int]:
+        now_ts = time.time()
+        rows = [s for s in samples if _is_finite_number(s.get("ts")) and (now_ts - float(s.get("ts"))) <= window_s]
+        out = {
+            "shadow_freeze_candidate_count": 0,
+            "shadow_freeze_safe_candidate_count": 0,
+            "shadow_freeze_unsafe_candidate_count": 0,
+            "shadow_freeze_transition_contaminated_count": 0,
+            "shadow_freeze_promote_opportunity_count": 0,
+            "shadow_freeze_false_positive_risk_count": 0,
+        }
+        for row in rows:
+            strict_ok = bool(row.get("shadow_delta_freeze_strict_ok"))
+            support_ok = bool(row.get("shadow_delta_freeze_support_ok"))
+            if strict_ok and support_ok:
+                out["shadow_freeze_candidate_count"] += 1
+            if row.get("shadow_delta_freeze_safety_class") == "safe_candidate":
+                out["shadow_freeze_safe_candidate_count"] += 1
+            if row.get("shadow_delta_freeze_safety_class") in {"unsafe_residual_risk", "unsafe_hard_reject_risk"}:
+                out["shadow_freeze_unsafe_candidate_count"] += 1
+            if row.get("shadow_delta_freeze_safety_class") == "transition_contaminated":
+                out["shadow_freeze_transition_contaminated_count"] += 1
+            if bool(row.get("shadow_delta_freeze_would_promote")):
+                out["shadow_freeze_promote_opportunity_count"] += 1
+            if (
+                bool(row.get("shadow_delta_freeze_would_promote"))
+                and bool(row.get("shadow_delta_freeze_recent_hard_reject"))
+            ):
+                out["shadow_freeze_false_positive_risk_count"] += 1
+        return out
+
+    def _sync_event_snapshot_locked(self, iid: int, sync: LiveSyncState | None, go_sync: dict | None) -> dict:
+        movement = self._compute_slope_target_movement_metrics(
+            self._live_period_update_history.get(iid) or (),
+            now_ts=time.time(),
+        )
+        fit_obs = int((go_sync or {}).get("fit_observation_count") or getattr(sync, "fit_total_observations", 0) or 0)
+        fit_icaos = int((go_sync or {}).get("fit_icao_count") or getattr(sync, "fit_icao_count", 0) or 0)
+        fit_span = (go_sync or {}).get("fit_span_s")
+        if fit_span is None:
+            fit_span = getattr(sync, "fit_span_s", None)
+        return {
+            "ts": time.time(),
+            "iid": iid,
+            "handoff_state": str(getattr(sync, "handoff_state", "") or "") if sync else None,
+            "handoff_reason": str(getattr(sync, "handoff_reason", "") or "") if sync else None,
+            "blocking_gate": str(getattr(sync, "go_operational_blocking_gate", "") or "") if sync else None,
+            "go_operational_active": bool(getattr(sync, "go_operational_active", False)) if sync else False,
+            "sync_authority": str(getattr(sync, "sync_authority", "") or "") if sync else None,
+            "period_authority": str(getattr(sync, "period_authority", "") or "") if sync else None,
+            "effective_period_source": str(getattr(sync, "effective_period_source", "") or "") if sync else None,
+            "base_period_s": getattr(sync, "base_period_s", None) if sync else None,
+            "operational_period_s": getattr(sync, "period_s", None) if sync else None,
+            "retained_go_delta_s": (go_sync or {}).get("current_delta_s"),
+            "proposed_delta_s": (go_sync or {}).get("proposed_delta_s"),
+            "applied_delta_s": (go_sync or {}).get("applied_delta_s"),
+            "slope_ema": getattr(sync, "residual_slope_ema_deg_per_s", None) if sync else None,
+            "slope_std": getattr(sync, "residual_slope_std_deg_per_s", None) if sync else None,
+            "slope_regression_r2": (go_sync or {}).get("slope_regression_r2"),
+            "slope_regression_trend_deg_s2": (go_sync or {}).get("slope_regression_trend_deg_s2"),
+            "slope_near_zero_window_duration_s": (go_sync or {}).get("slope_near_zero_window_duration_s"),
+            "slope_near_zero_max_abs_slope_deg_s": (go_sync or {}).get("slope_near_zero_max_abs_slope_deg_s"),
+            "slope_not_converged_subreason": (go_sync or {}).get("slope_not_converged_subreason"),
+            "fit_obs": fit_obs,
+            "fit_icaos": fit_icaos,
+            "fit_span_s": fit_span,
+            "fit_epoch_id": (go_sync or {}).get("fit_epoch_id"),
+            "fit_epoch_reset_reason": (go_sync or {}).get("fit_epoch_reset_reason"),
+            "strict_gate_pass": (go_sync or {}).get("go_sync_usable_strict_gate_pass"),
+            "holdover": bool(getattr(sync, "holdover", False)) if sync else bool((go_sync or {}).get("holdover", False)),
+            "holdover_reason": str(getattr(sync, "holdover_reason", "") or "") if sync else str((go_sync or {}).get("holdover_reason") or ""),
+            "reacquire_decision": (go_sync or {}).get("sync_reacquired_provisional"),
+            "last_update_epoch_abs_residual_deg": getattr(sync, "last_update_epoch_abs_residual_deg", None) if sync else None,
+            "hard_bound_reject_count": (go_sync or {}).get("hard_bound_reject_count"),
+            "slew_limited_count": (go_sync or {}).get("slew_limited_count"),
+            "phase_offset_discontinuity_count": (go_sync or {}).get("phase_offset_discontinuity_count"),
+            "phase_offset_discontinuity_rebased_gradual_drift_count": (go_sync or {}).get("phase_offset_discontinuity_rebased_gradual_drift_count"),
+            "phase_basis": str(getattr(sync, "phase_basis", "") or "") if sync else None,
+            "phase_authority": str(getattr(sync, "phase_authority", "") or "") if sync else None,
+            "phase_is_absolute": bool(getattr(sync, "phase_is_absolute", False)) if sync else False,
+            "sync_quality": getattr(sync, "sync_quality", None) if sync else None,
+            **movement,
+        }
+
+    def _append_sync_event_locked(
+        self,
+        iid: int,
+        event_type: str,
+        previous_value: object,
+        new_value: object,
+        sync: LiveSyncState | None,
+        go_sync: dict | None,
+    ) -> None:
+        history = self._sync_event_history_by_iid.get(iid)
+        if history is None:
+            history = deque(maxlen=self._SYNC_EVENT_HISTORY_MAX)
+            self._sync_event_history_by_iid[iid] = history
+        event = self._sync_event_snapshot_locked(iid, sync, go_sync)
+        event.update({
+            "event_type": event_type,
+            "previous_value": previous_value,
+            "new_value": new_value,
+        })
+        history.append(event)
+
+    def _record_sync_convergence_events_locked(self, iid: int) -> None:
+        sync = self._live_sync_states.get(iid)
+        go_sync = self._go_sync_states_by_iid.get(iid)
+        current = {
+            "handoff_state": str(getattr(sync, "handoff_state", "") or "") if sync else None,
+            "handoff_reason": str(getattr(sync, "handoff_reason", "") or "") if sync else None,
+            "go_operational_blocking_gate": str(getattr(sync, "go_operational_blocking_gate", "") or "") if sync else None,
+            "go_operational_active": bool(getattr(sync, "go_operational_active", False)) if sync else False,
+            "sync_authority": str(getattr(sync, "sync_authority", "") or "") if sync else None,
+            "period_authority": str(getattr(sync, "period_authority", "") or "") if sync else None,
+            "effective_period_source": str(getattr(sync, "effective_period_source", "") or "") if sync else None,
+            "slope_not_converged_subreason": (go_sync or {}).get("slope_not_converged_subreason"),
+            "slope_near_zero_fail_reason": (go_sync or {}).get("slope_near_zero_fail_reason"),
+            "slope_regression_fail_reason": (go_sync or {}).get("slope_regression_fail_reason"),
+            "fit_epoch_id": (go_sync or {}).get("fit_epoch_id"),
+            "fit_epoch_reset_reason": (go_sync or {}).get("fit_epoch_reset_reason"),
+            "phase_offset_discontinuity_count": int((go_sync or {}).get("phase_offset_discontinuity_count") or 0),
+            "phase_offset_discontinuity_rebased_gradual_drift_count": int((go_sync or {}).get("phase_offset_discontinuity_rebased_gradual_drift_count") or 0),
+            "hard_bound_reject_count": int((go_sync or {}).get("hard_bound_reject_count") or 0),
+            "slew_limited_count": int((go_sync or {}).get("slew_limited_count") or 0),
+            "retained_go_delta_s": (go_sync or {}).get("current_delta_s"),
+            "proposed_delta_s": (go_sync or {}).get("proposed_delta_s"),
+            "applied_delta_s": (go_sync or {}).get("applied_delta_s"),
+            "holdover": bool(getattr(sync, "holdover", False)) if sync else bool((go_sync or {}).get("holdover", False)),
+            "reacquire_decision": (go_sync or {}).get("sync_reacquired_provisional"),
+            "strict_gate_pass": (go_sync or {}).get("go_sync_usable_strict_gate_pass"),
+            "sync_quality_bucket": self._sync_quality_bucket(getattr(sync, "sync_quality", None) if sync else None),
+            "phase_basis": str(getattr(sync, "phase_basis", "") or "") if sync else None,
+            "phase_authority": str(getattr(sync, "phase_authority", "") or "") if sync else None,
+            "phase_is_absolute": bool(getattr(sync, "phase_is_absolute", False)) if sync else False,
+            **self._compute_slope_target_movement_metrics(
+                self._live_period_update_history.get(iid) or (),
+                now_ts=time.time(),
+            ),
+        }
+        previous = self._sync_event_last_signature_by_iid.get(iid)
+        self._sync_event_last_signature_by_iid[iid] = dict(current)
+        if previous is None:
+            self._append_sync_event_locked(iid, "sync_event_seed", None, current, sync, go_sync)
+            return
+        for key, value in current.items():
+            prev = previous.get(key)
+            if key in {"retained_go_delta_s", "proposed_delta_s", "applied_delta_s"}:
+                if _is_finite_number(prev) and _is_finite_number(value):
+                    if abs(float(value) - float(prev)) <= self._SYNC_EVENT_DELTA_EPSILON_S:
+                        continue
+                elif prev is None and value is None:
+                    continue
+            elif prev == value:
+                continue
+            self._append_sync_event_locked(iid, key, prev, value, sync, go_sync)
+
+    def get_sync_event_history(
+        self,
+        iid: int,
+        *,
+        limit: int | None = None,
+        event_type: str | None = None,
+        since_s: float | None = None,
+    ) -> list[dict]:
+        with self._lock:
+            rows = list(self._sync_event_history_by_iid.get(iid, ()))
+        now_ts = time.time()
+        out: list[dict] = []
+        for row in reversed(rows):
+            if event_type and str(row.get("event_type") or "") != event_type:
+                continue
+            ts = row.get("ts")
+            if since_s is not None and _is_finite_number(ts):
+                if (now_ts - float(ts)) > float(since_s):
+                    continue
+            out.append(dict(row))
+            if limit is not None and limit > 0 and len(out) >= int(limit):
+                break
+        return out
 
     def _record_lock_timing(self, op: str, wait_s: float, hold_s: float) -> None:
         self._lock_timing_seq += 1
@@ -4070,6 +5005,9 @@ class RadarState:
             "n_total_observations": fit_total,
             "n_fit_icaos": int(msg.get("fc") or 0),
             "fit_span_s": fit_span_s,
+            "retained_go_delta_s": getattr(sync, "current_delta_s", None),
+            "proposed_delta_s": getattr(sync, "proposed_delta_s", None),
+            "applied_delta_s": getattr(sync, "applied_delta_s", None),
         })
         self._live_slope_history.setdefault(
             iid, deque(maxlen=_SYNC_DIAGNOSTIC_HISTORY_MAX)
@@ -4094,6 +5032,43 @@ class RadarState:
             "period_base_s": sync.period_base_s,
             "period_correction_ppm": sync.period_correction_ppm,
         })
+        movement = self._compute_slope_target_movement_metrics(
+            self._live_period_update_history.get(iid) or (),
+            now_ts=ts,
+        )
+        go_sync = dict(self._go_sync_states_by_iid.get(iid) or {})
+        shadow_sample = self._compute_shadow_delta_freeze_monitor_sample_locked(
+            iid,
+            now_ts=ts,
+            sync=sync,
+            go_sync=go_sync,
+            movement=movement,
+        )
+        shadow_history = self._shadow_freeze_monitor_history_by_iid.setdefault(
+            iid, deque(maxlen=_SYNC_DIAGNOSTIC_HISTORY_MAX)
+        )
+        shadow_history.append(shadow_sample)
+        # Rolling counters over recent monitor samples.
+        roll10 = self._shadow_freeze_rollup_counts(list(shadow_history), 600.0)
+        roll30 = self._shadow_freeze_rollup_counts(list(shadow_history), 1800.0)
+        shadow_sample.update({
+            "shadow_freeze_candidate_count_10m": roll10["shadow_freeze_candidate_count"],
+            "shadow_freeze_safe_candidate_count_10m": roll10["shadow_freeze_safe_candidate_count"],
+            "shadow_freeze_unsafe_candidate_count_10m": roll10["shadow_freeze_unsafe_candidate_count"],
+            "shadow_freeze_transition_contaminated_count_10m": roll10["shadow_freeze_transition_contaminated_count"],
+            "shadow_freeze_promote_opportunity_count_10m": roll10["shadow_freeze_promote_opportunity_count"],
+            "shadow_freeze_false_positive_risk_count_10m": roll10["shadow_freeze_false_positive_risk_count"],
+            "shadow_freeze_candidate_count_30m": roll30["shadow_freeze_candidate_count"],
+            "shadow_freeze_safe_candidate_count_30m": roll30["shadow_freeze_safe_candidate_count"],
+            "shadow_freeze_unsafe_candidate_count_30m": roll30["shadow_freeze_unsafe_candidate_count"],
+            "shadow_freeze_transition_contaminated_count_30m": roll30["shadow_freeze_transition_contaminated_count"],
+            "shadow_freeze_promote_opportunity_count_30m": roll30["shadow_freeze_promote_opportunity_count"],
+            "shadow_freeze_false_positive_risk_count_30m": roll30["shadow_freeze_false_positive_risk_count"],
+        })
+        self._shadow_freeze_monitor_last_by_iid[iid] = dict(shadow_sample)
+        self._shadow_freeze_monitor_revision_by_iid[iid] = (
+            self._shadow_freeze_monitor_revision_by_iid.get(iid, 0) + 1
+        )
         self._go_sync_diagnostic_history_revision[iid] = (
             self._go_sync_diagnostic_history_revision.get(iid, 0) + 1
         )
@@ -5786,7 +6761,7 @@ class RadarState:
         if sync_is_python and _is_finite_number(getattr(sync, "last_sync_update_ts", None)):
             fresh_data = (now_ts - float(sync.last_sync_update_ts)) <= self._LIVE_SYNC_OBS_RETENTION_S
         gates["fresh_data"] = _gate_value(fresh_data, None if fresh_data is not False else "python_sync_stale")
-        gates["harmonic_ambiguity"] = _gate_value(None, "not_evaluated")
+        gates["harmonic_ambiguity"] = _gate_value(None, "harmonic_ambiguity_unimplemented_stub")
         py_base = None
         if (
             sync_is_python
@@ -5839,17 +6814,27 @@ class RadarState:
         c_state = contamination["state"]
         c_reason = contamination["reason"]
         if c_state == "disabled":
-            gates["go_contamination_state"] = _gate_value(None, "contamination_detection_disabled")
+            gates["go_contamination_state"] = _gate_value(None, "stage8_not_available_stub")
         elif c_state == "contaminated":
             gates["go_contamination_state"] = _gate_value(False, c_reason)
         elif c_state == "single_family":
             gates["go_contamination_state"] = _gate_value(True, c_reason)
-        else:
+        elif c_state == "insufficient_data":
             gates["go_contamination_state"] = _gate_value(None, c_reason)
+        else:
+            gates["go_contamination_state"] = _gate_value(None, c_reason or "insufficient_family_data")
         sync = self._live_sync_states.get(iid)
         if sync is not None:
-            sync.contamination_state = c_state
-            sync.contamination_reason = str(c_reason) if c_reason else None
+            typed_state = c_state
+            typed_reason = str(c_reason) if c_reason else None
+            if c_state == "disabled":
+                typed_state = "insufficient_data"
+                typed_reason = "stage8_not_available_stub"
+            elif c_state not in {"contaminated", "single_family", "insufficient_data"}:
+                typed_state = "insufficient_data"
+                typed_reason = typed_reason or "insufficient_family_data"
+            sync.contamination_state = typed_state
+            sync.contamination_reason = typed_reason
             sync.contamination_total_observations = contamination["total_observations"]
             sync.contamination_distinct_icaos = contamination["distinct_icaos"]
             sync.contamination_primary_observations = contamination["primary_observations"]
@@ -6099,8 +7084,8 @@ class RadarState:
         gates: dict[str, dict] = {}
         if sync is None:
             gates["phase_basis_supported"] = _gate_value(False, "sync_state_absent")
-            gates["phase_anchor_age_fresh"] = _gate_value(None, "not_evaluated")
-            gates["population_validated"] = _gate_value(None, "not_evaluated")
+            gates["phase_anchor_age_fresh"] = _gate_value(None, "insufficient_data")
+            gates["population_validated"] = _gate_value(None, "insufficient_data")
             gates["phase_state_trusted"] = _gate_value(False, "phase_state_unavailable")
             return {"phase_ready": False, "gates": gates, "phase_basis": "sweep_epoch_only"}
 
@@ -7358,6 +8343,7 @@ class RadarState:
                     source="go_frame_sync",
                 )
                 self._ingest_go_frame_sync_diagnostic_locked(iid, go_sync)
+                self._record_sync_convergence_events_locked(iid)
             else:
                 self._go_sync_states_by_iid.pop(iid, None)
                 existing_ref = (self._go_reference_aircraft_by_iid.get(iid) or {}).get("ref_icao")
@@ -7368,6 +8354,7 @@ class RadarState:
                     event_ts=float(iid_state.get("lu") or time.time()),
                     source="go_frame_sync",
                 )
+                self._record_sync_convergence_events_locked(iid)
 
     def _stage3_detection_from_go_observation(self, entry: dict) -> Stage3LiveDetection:
         return Stage3LiveDetection(
@@ -10105,6 +11092,11 @@ class RadarState:
             self._live_burst_residual_events.clear()
             self._live_df11_recorded_residual_events.clear()
             self._live_sync_states.clear()
+            self._sync_event_history_by_iid.clear()
+            self._sync_event_last_signature_by_iid.clear()
+            self._shadow_freeze_monitor_history_by_iid.clear()
+            self._shadow_freeze_monitor_last_by_iid.clear()
+            self._shadow_freeze_monitor_revision_by_iid.clear()
             self._last_simple_sync_update_ts.clear()
             self._live_icao_sync_quality.clear()
             self._live_period_update_history.clear()
@@ -11393,6 +12385,7 @@ class RadarState:
             update_history = list(self._live_period_update_history.get(iid) or [])
             slope_history = list(self._live_slope_history.get(iid) or [])
             period_history = list(self._live_period_history.get(iid) or [])
+            shadow_freeze_last = dict(self._shadow_freeze_monitor_last_by_iid.get(iid) or {})
             py_shadow = self._py_shadow_sync_states.get(iid)
             authority_transitions = self._period_authority_transitions.get(iid)
             sync_horizons = self._sync_horizons_payload(sync, display_window_s=window_s)
@@ -11403,6 +12396,14 @@ class RadarState:
 
         sequence = self._live_sync_snapshot_seq.get(iid, 0) + 1
         self._live_sync_snapshot_seq[iid] = sequence
+        slope_target_movement = self._compute_slope_target_movement_metrics(
+            update_history,
+            now_ts=time.time(),
+        )
+        shadow_freeze_monitor = dict(shadow_freeze_last or {})
+        if go_sync is not None:
+            go_sync.update(slope_target_movement)
+            go_sync.update(shadow_freeze_monitor)
 
         sync_state = self.get_live_sync_state_payload(
             iid,
@@ -11611,6 +12612,9 @@ class RadarState:
                     "stage10_serializer_fallback_applied": True,
                 }
                 sync_state.update(_build_go_promotion_failure_diagnostic_aliases(sync_state, go_sync=go_sync))
+        if sync_state:
+            sync_state.update(slope_target_movement)
+            sync_state.update(shadow_freeze_monitor)
 
         snapshot = {
             "type": "radar_sync",
@@ -11630,6 +12634,8 @@ class RadarState:
             "period_update_history": update_history,
             "slope_history": slope_history,
             "period_history": period_history,
+            **slope_target_movement,
+            **shadow_freeze_monitor,
             "sync_horizons": sync_horizons,
             "period_authority_transitions": authority_transitions,
             "transport": {"source": "compact_sync_snapshot", "cached": False},
@@ -11675,6 +12681,7 @@ class RadarState:
             getattr(sync, "population_validation_state", None) if sync is not None else None,
             getattr(sync, "fit_total_observations", 0) if sync is not None else 0,
             getattr(sync, "period_refinement_status", None) if sync is not None else None,
+            self._shadow_freeze_monitor_revision_by_iid.get(iid, 0),
             burst_recorded_len,
             df11_recorded_len,
             burst_residual_seq,

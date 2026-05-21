@@ -291,23 +291,24 @@ def test_period_stability_gate_insufficient_when_no_history():
 # 5. Stage 8 contamination detection — flag-disabled baseline
 # ===========================================================================
 
-def test_contamination_flag_disabled_emits_disabled():
-    """When RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED=False, gate emits disabled."""
+def test_contamination_flag_disabled_emits_typed_stage8_stub():
+    """When RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED=False, gate emits typed Stage-8 stub."""
     state = _make_state_with_python_model(3001)
     state.update_go_iid_state(_go_sync_for_gates(3001, 4.0))
     go_gates = state._evaluate_go_readiness_gates_locked(3001, 4.0)
     contamination_gate = go_gates["gates"].get("go_contamination_state", {})
-    assert contamination_gate.get("reason") == "contamination_detection_disabled"
+    assert contamination_gate.get("reason") == "stage8_not_available_stub"
     assert contamination_gate.get("passed") is None
 
 
-def test_contamination_flag_disabled_sync_has_state():
-    """When flag disabled, LiveSyncState gets contamination_state='disabled'."""
+def test_contamination_flag_disabled_sync_has_typed_state():
+    """When flag disabled, LiveSyncState stores typed non-operative contamination state."""
     state = _make_state_with_python_model(3002)
     state.update_go_iid_state(_go_sync_for_gates(3002, 4.0))
     state._evaluate_go_readiness_gates_locked(3002, 4.0)
     sync = state.get_live_sync_state(3002)
-    assert sync.contamination_state == "disabled"
+    assert sync.contamination_state == "insufficient_data"
+    assert sync.contamination_reason == "stage8_not_available_stub"
 
 
 def test_contamination_disabled_nonblocking_for_authority():
@@ -317,6 +318,22 @@ def test_contamination_disabled_nonblocking_for_authority():
     go_gates = state._evaluate_go_readiness_gates_locked(3003, 4.0)
     contamination_gate = go_gates["gates"].get("go_contamination_state", {})
     assert contamination_gate.get("passed") is not False
+
+
+def test_stage3_operational_gate_reasons_do_not_emit_not_evaluated():
+    """Operative Stage 3/10 gate outputs must use typed reasons, never not_evaluated."""
+    state = _make_state_with_python_model(30031)
+    state.update_go_iid_state(_go_sync_for_gates(30031, 4.0))
+    py_gates = state._evaluate_python_base_validity_gates_locked(30031)["gates"]
+    go_gates = state._evaluate_go_readiness_gates_locked(30031, 4.0)["gates"]
+    phase = state._evaluate_phase_authority_gates_locked(30031, state.get_live_sync_state(30031))["gates"]
+    all_reasons = [
+        v.get("reason")
+        for gate_map in (py_gates, go_gates, phase)
+        for v in gate_map.values()
+        if isinstance(v, dict)
+    ]
+    assert "not_evaluated" not in all_reasons
 
 
 # ===========================================================================

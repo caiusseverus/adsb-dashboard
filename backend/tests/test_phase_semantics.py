@@ -838,6 +838,40 @@ class TestPhaseAbsoluteAvailable:
         assert payload["phase_absolute_available"] is True
         assert payload["phase_is_absolute"] is True
 
+    def test_absolute_available_false_for_anchor_relative_even_with_geographic_offset(self):
+        from radar.sync_models import LiveSyncState
+        from radar.sweep import _live_sync_state_to_dict
+        sync = LiveSyncState(
+            iid=1, period_s=5.0, phase_epoch_us=0.0, phase_offset_deg=20.0,
+            sync_quality=0.9, sync_jitter_deg=2.0, last_sync_update_ts=0.0,
+            source="multi_aircraft_burst", usable=True,
+            phase_basis="anchor_relative",
+            phase_is_absolute=False,
+            phase_absolute_available=True,  # legacy/mis-set input
+            phase_offset_geographic_deg=12.0,
+        )
+        payload = _live_sync_state_to_dict(sync)
+        assert payload["phase_basis"] == "anchor_relative"
+        assert payload["phase_is_absolute"] is False
+        assert payload["phase_absolute_available"] is False
+
+    def test_absolute_available_false_for_sweep_epoch_only(self):
+        from radar.sync_models import LiveSyncState
+        from radar.sweep import _live_sync_state_to_dict
+        sync = LiveSyncState(
+            iid=1, period_s=5.0, phase_epoch_us=0.0, phase_offset_deg=20.0,
+            sync_quality=0.9, sync_jitter_deg=2.0, last_sync_update_ts=0.0,
+            source="multi_aircraft_burst", usable=True,
+            phase_basis="sweep_epoch_only",
+            phase_is_absolute=False,
+            phase_absolute_available=True,  # legacy/mis-set input
+            phase_offset_geographic_deg=12.0,
+        )
+        payload = _live_sync_state_to_dict(sync)
+        assert payload["phase_basis"] == "sweep_epoch_only"
+        assert payload["phase_is_absolute"] is False
+        assert payload["phase_absolute_available"] is False
+
     def test_normalise_enforces_absolute_available_consistency(self):
         from radar.sweep import _normalise_phase_fields
         payload = _normalise_phase_fields({
@@ -867,6 +901,14 @@ class TestPhaseAbsoluteAvailable:
         assert "phase_absolute_available_normalised_to_true" in str(
             payload["consistency_warnings"]
         )
+
+
+class TestPhaseTerminologyGuard:
+    def test_anchor_relative_is_not_described_as_absolute_or_geographic(self):
+        import pathlib
+        text = (pathlib.Path(__file__).resolve().parents[1] / "radar" / "sweep.py").read_text(encoding="utf-8")
+        assert "anchor_relative:\n        Phase is relative to a selected anchor aircraft or anchor-derived frame." in text
+        assert "It is NOT a known geographic beam direction." in text
 
 
 class TestPhaseIsAbsoluteOnlyForGeographic:

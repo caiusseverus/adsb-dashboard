@@ -260,6 +260,63 @@ def test_get_iid_sync_snapshot_reports_bootstrap_reason_and_consistent_source_la
     assert payload["sync_state"]["applied_delta_s"] == pytest.approx(0.0001)
 
 
+def test_get_iid_sync_snapshot_propagates_population_demoted_typed_fields(monkeypatch):
+    import radar.sweep as sweep_module
+
+    monkeypatch.setattr(sweep_module.time, "time", lambda: 2_000.0)
+    state = RadarState()
+    iid = 24
+    state._models[iid] = RadarIID(iid=iid, status="CHECK_MULTI", period_s=4.0, primary_support_count=7)
+    state._live_sync_states[iid] = LiveSyncState(
+        iid=iid,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=20.0,
+        sync_quality=0.9,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=2_000.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        phase_basis="anchor_relative",
+        phase_anchor_icao="ABC123",
+        phase_anchor_status="population_demoted",
+        phase_trust_reason="population_demoted",
+        population_validation_state="fail",
+        population_validation_reason="population_demoted",
+    )
+
+    payload = radar_api.build_iid_sync_snapshot_payload(state, iid, window_s=60.0, debug_limit=20)
+    sync_state = payload["sync_state"]
+    assert sync_state["phase_anchor_status"] == "population_demoted"
+    assert sync_state["phase_trust_reason"] == "population_demoted"
+    assert sync_state["population_validation_state"] == "fail"
+    assert sync_state["population_validation_reason"] == "population_demoted"
+
+
+def test_get_iid_sync_event_history_endpoint_filters_and_ordering():
+    state = RadarState()
+    iid = 72
+    now_ts = time.time()
+    state._sync_event_history_by_iid[iid] = deque([
+        {"ts": now_ts - 30.0, "iid": iid, "event_type": "handoff_state", "previous_value": "A", "new_value": "B"},
+        {"ts": now_ts - 10.0, "iid": iid, "event_type": "holdover", "previous_value": False, "new_value": True},
+        {"ts": now_ts - 5.0, "iid": iid, "event_type": "holdover", "previous_value": True, "new_value": False},
+    ], maxlen=state._SYNC_EVENT_HISTORY_MAX)
+
+    prior_state = radar_api._state
+    radar_api._state = state
+    try:
+        payload = asyncio.run(radar_api.get_iid_sync_event_history(iid, limit=2, event_type="holdover", since_s=20.0))
+    finally:
+        radar_api._state = prior_state
+
+    assert payload["available"] is True
+    assert payload["count"] == 2
+    assert [event["event_type"] for event in payload["events"]] == ["holdover", "holdover"]
+    assert payload["events"][0]["ts"] > payload["events"][1]["ts"]
+
+
 def _mk_operational_sync(iid: int) -> LiveSyncState:
     sync = LiveSyncState(
         iid=iid,
