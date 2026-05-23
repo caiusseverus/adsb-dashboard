@@ -35,6 +35,9 @@ def test_extract_compact_fields_and_preserve_zero_false_values():
             "go_operational_soft_failure_reason": "",
             "go_operational_hysteresis_decision": "pending",
             "go_operational_blocking_gate": "go_readiness.go_sync_state_usable",
+            "readiness_state": "sync_unusable",
+            "readiness_reason": "strict_gate_failed",
+            "readiness_blocking_gate": "go_readiness.go_sync_state_usable",
             "blocking_gate": "go_sync_state_usable",
             "handoff_state": "GO_REFINING",
             "handoff_reason": "strict_gate_failed",
@@ -97,6 +100,50 @@ def test_extract_compact_fields_and_preserve_zero_false_values():
             "reacquire_fallback_age_limit_s": 0.0,
             "reacquire_fallback_allowed": False,
             "reacquire_all_gates_pass": False,
+            "reacquire_ref_selection_source": "retained_epoch",
+            "reacquire_ref_selection_reason": "reference_present_without_current_epoch_match",
+            "reacquire_ref_icao_current_epoch_present": False,
+            "reacquire_ref_icao_fit_pool_present": True,
+            "reacquire_ref_icao_support_pool_present": True,
+            "reacquire_better_ref_candidate_available": True,
+            "reacquire_better_ref_candidate_icao": "DEF456",
+            "reacquire_better_ref_candidate_pos_age_s": 1.2,
+            "reacquire_better_ref_candidate_obs_count": 6,
+            "reacquire_better_ref_candidate_fit_eligible": True,
+            "reacquire_ref_replacement_suppressed_reason": "reference_not_replaced_by_design",
+            "shadow_reacquire_with_best_fresh_ref": True,
+            "shadow_ref_candidate_icao": "DEF456",
+            "shadow_ref_candidate_age_s": 1.2,
+            "shadow_ref_candidate_residual_deg": 7.5,
+            "shadow_ref_candidate_support_obs": 6,
+            "shadow_ref_candidate_support_icaos": 2,
+            "shadow_all_reacquire_gates_pass_with_candidate": False,
+            "shadow_safety_flags": ["fit_support_not_ok"],
+            "shadow_delta_freeze_variant_a_would_pass": False,
+            "shadow_delta_freeze_variant_b_would_pass": False,
+            "shadow_delta_stability_variant_c_would_pass": False,
+            "shadow_delta_freeze_would_promote": False,
+            "shadow_delta_freeze_blocker_if_not": "insufficient_support",
+            "shadow_delta_freeze_safety_class": "insufficient_support_or_strict",
+            "shadow_delta_freeze_safety_flags": {"strict_ok": False, "support_ok": False},
+            "shadow_delta_freeze_residual_abs_p95": 0.0,
+            "shadow_delta_freeze_recent_holdover": False,
+            "shadow_delta_freeze_recent_hard_reject": False,
+            "shadow_delta_freeze_recent_transition": False,
+            "shadow_delta_freeze_support_ok": False,
+            "shadow_delta_freeze_strict_ok": False,
+            "shadow_freeze_candidate_count_10m": 0,
+            "shadow_freeze_safe_candidate_count_10m": 0,
+            "shadow_freeze_unsafe_candidate_count_10m": 0,
+            "shadow_freeze_transition_contaminated_count_10m": 0,
+            "shadow_freeze_promote_opportunity_count_10m": 0,
+            "shadow_freeze_false_positive_risk_count_10m": 0,
+            "shadow_freeze_candidate_count_30m": 0,
+            "shadow_freeze_safe_candidate_count_30m": 0,
+            "shadow_freeze_unsafe_candidate_count_30m": 0,
+            "shadow_freeze_transition_contaminated_count_30m": 0,
+            "shadow_freeze_promote_opportunity_count_30m": 0,
+            "shadow_freeze_false_positive_risk_count_30m": 0,
         }
     }
 
@@ -118,6 +165,9 @@ def test_extract_compact_fields_and_preserve_zero_false_values():
     assert row["go_operational_soft_failure_reason"] == ""
     assert row["go_operational_hysteresis_decision"] == "pending"
     assert row["go_operational_blocking_gate"] == "go_readiness.go_sync_state_usable"
+    assert row["readiness_state"] == "sync_unusable"
+    assert row["readiness_reason"] == "strict_gate_failed"
+    assert row["readiness_blocking_gate"] == "go_readiness.go_sync_state_usable"
     assert row["blocking_gate"] == "go_sync_state_usable"
     assert row["handoff_state"] == "GO_REFINING"
     assert row["handoff_reason"] == "strict_gate_failed"
@@ -163,6 +213,34 @@ def test_extract_compact_fields_and_preserve_zero_false_values():
     assert row["reacquire_support_icao_count"] == 0
     assert row["reacquire_support_obs_ok"] is False
     assert row["reacquire_support_icao_ok"] is False
+    assert row["reacquire_ref_selection_source"] == "retained_epoch"
+    assert row["reacquire_better_ref_candidate_icao"] == "DEF456"
+    assert row["shadow_ref_candidate_icao"] == "DEF456"
+    assert row["shadow_all_reacquire_gates_pass_with_candidate"] is False
+    assert row["shadow_delta_freeze_variant_a_would_pass"] is False
+    assert row["shadow_delta_freeze_variant_b_would_pass"] is False
+    assert row["shadow_delta_stability_variant_c_would_pass"] is False
+    assert row["shadow_delta_freeze_would_promote"] is False
+    assert row["shadow_delta_freeze_blocker_if_not"] == "insufficient_support"
+    assert row["shadow_delta_freeze_safety_class"] == "insufficient_support_or_strict"
+    assert row["shadow_delta_freeze_residual_abs_p95"] == 0.0
+    assert row["shadow_delta_freeze_recent_holdover"] is False
+    assert row["shadow_delta_freeze_recent_hard_reject"] is False
+    assert row["shadow_delta_freeze_recent_transition"] is False
+    assert row["shadow_delta_freeze_support_ok"] is False
+    assert row["shadow_delta_freeze_strict_ok"] is False
+    assert row["shadow_freeze_candidate_count_10m"] == 0
+    assert row["shadow_freeze_safe_candidate_count_10m"] == 0
+    assert row["shadow_freeze_unsafe_candidate_count_10m"] == 0
+    assert row["shadow_freeze_transition_contaminated_count_10m"] == 0
+    assert row["shadow_freeze_promote_opportunity_count_10m"] == 0
+    assert row["shadow_freeze_false_positive_risk_count_10m"] == 0
+    assert row["shadow_freeze_candidate_count_30m"] == 0
+    assert row["shadow_freeze_safe_candidate_count_30m"] == 0
+    assert row["shadow_freeze_unsafe_candidate_count_30m"] == 0
+    assert row["shadow_freeze_transition_contaminated_count_30m"] == 0
+    assert row["shadow_freeze_promote_opportunity_count_30m"] == 0
+    assert row["shadow_freeze_false_positive_risk_count_30m"] == 0
 
 
 def test_extract_compact_fallbacks_from_diagnostic_aliases_and_top_level():

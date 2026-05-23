@@ -99,6 +99,8 @@ function pickFirstDefined(...values) {
 
 export function formatOperationalBlocker(syncState) {
   const raw = syncState ?? {}
+  const readinessState = String(raw.readiness_state ?? '')
+  const readinessReason = String(raw.readiness_reason ?? '')
   const handoffState = String(raw.handoff_state ?? '')
   const handoffReason = String(raw.handoff_reason ?? '')
   const blockingGate = String(raw.go_operational_blocking_gate ?? '')
@@ -144,6 +146,90 @@ export function formatOperationalBlocker(syncState) {
         ...facts,
       ],
       raw,
+    }
+  }
+
+  if (readinessState && readinessState !== 'unknown') {
+    if (readinessState === 'holdover') {
+      facts.push({ label: 'Holdover reason', value: holdoverReason || readinessReason || 'unspecified' })
+      if (holdoverExitFailedGate) facts.push({ label: 'Failed gate', value: holdoverExitFailedGate })
+      return {
+        category: 'holdover/reacquire blocked',
+        title: 'Holdover / Reacquire blocked',
+        explanation: `Holdover: waiting for reacquire support; failed gate: ${holdoverExitFailedGate || readinessReason || 'unknown'}.`,
+        facts,
+        raw,
+      }
+    }
+    if (readinessState === 'sync_unusable') {
+      facts.push({ label: 'Unusable reason', value: humanizeSyncReason(readinessReason || syncUnusableReason || 'unknown') })
+      return {
+        category: 'sync unusable',
+        title: 'Sync unusable',
+        explanation: `Sync unusable: ${humanizeSyncReason(readinessReason || syncUnusableReason || 'unknown')}.`,
+        facts,
+        raw,
+      }
+    }
+    if (readinessState === 'hysteresis_not_started' || readinessState === 'pending_hysteresis') {
+      facts.push({ label: 'Ready streak', value: readyStreak != null ? String(readyStreak) : '—' })
+      facts.push({ label: 'Threshold', value: readyThreshold != null ? String(readyThreshold) : '—' })
+      return {
+        category: 'hysteresis pending / not started',
+        title: 'Hysteresis pending',
+        explanation:
+          readinessState === 'hysteresis_not_started'
+            ? 'Hysteresis not started: waiting for first ready streak sample.'
+            : 'Hysteresis pending: ready streak below promotion threshold.',
+        facts,
+        raw,
+      }
+    }
+    if (readinessState === 'slope_not_converged') {
+      return {
+        category: 'slope not converged',
+        title: 'Slope not converged',
+        explanation: `Slope not converged: ${humanizeSyncReason(readinessReason || 'not_converged')}.`,
+        facts,
+        raw,
+      }
+    }
+    if (readinessState === 'insufficient_contributing_icaos' || readinessState === 'bootstrap') {
+      facts.push({ label: 'Fit ICAOs', value: fitIcaoCount != null ? String(fitIcaoCount) : '—' })
+      return {
+        category: 'insufficient contributing ICAOs / Python base',
+        title: 'Bootstrap support insufficient',
+        explanation: 'Bootstrap: not enough contributing ICAOs.',
+        facts,
+        raw,
+      }
+    }
+    if (readinessState === 'refinement_history_insufficient') {
+      return {
+        category: 'refinement history insufficient',
+        title: 'Refinement history insufficient',
+        explanation: 'Refinement history insufficient: waiting for enough fit history.',
+        facts,
+        raw,
+      }
+    }
+    if (readinessState === 'contamination_blocked') {
+      return {
+        category: 'contamination blocked',
+        title: 'Contamination blocked',
+        explanation: `Contamination blocked: ${humanizeSyncReason(readinessReason || 'contamination_detected')}.`,
+        facts,
+        raw,
+      }
+    }
+    if (readinessState === 'phase_not_ready') {
+      return {
+        category: 'geographic phase not localisation-safe',
+        title: 'Phase not localisation-safe',
+        explanation: `Phase not localisation-safe: ${humanizeSyncReason(readinessReason || 'phase_not_ready')}.`,
+        facts,
+        raw,
+      }
     }
   }
 

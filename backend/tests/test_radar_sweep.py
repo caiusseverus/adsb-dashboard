@@ -767,6 +767,20 @@ def test_burst_residual_recorded_events_are_immutable_across_period_change(monke
     assert "contamination_gate_reason" in recorded[0]
     assert recorded[0]["event_sync_authority"] == recorded[0]["sync_authority"]
     assert recorded[0]["event_handoff_state"] == recorded[0]["handoff_state"]
+    assert recorded[0]["event_time_basis"] == "beam_center_us"
+    assert recorded[0]["residual_basis"] == "runtime_effective"
+    assert recorded[0]["residual_basis_period_s"] == recorded[0]["event_effective_period_s"]
+    assert recorded[0]["residual_basis_phase_offset_deg"] == recorded[0]["event_phase_offset_deg"]
+    assert recorded[0]["residual_basis_authority"] == recorded[0]["event_period_authority"]
+    assert recorded[0]["classifier_input"] is True
+    assert recorded[0]["chart_only_diagnostic"] is False
+    assert "sync_seq" in recorded[0]
+    assert "dominant_family_id" in recorded[0]
+    assert "secondary_family_id" in recorded[0]
+    assert "reference_icao" in recorded[0]
+    assert "anchor_icao" in recorded[0]
+    assert "anchor_status" in recorded[0]
+    assert "anchor_trust" in recorded[0]
     assert recorded[0]["residual_deg"] == pytest.approx(first_recorded["residual_deg"])
     assert recorded[0]["classification"] == first_recorded["classification"]
     assert recorded[0]["display_residual_class"] == first_recorded["display_residual_class"]
@@ -776,6 +790,66 @@ def test_burst_residual_recorded_events_are_immutable_across_period_change(monke
     assert payload["residual_chart_default_mode"] == "recorded"
     assert len(recomputed) == 2
     assert abs(recomputed[0]["residual_deg"] - recorded[0]["residual_deg"]) > 0.01
+    assert recorded[0]["event_effective_period_s"] == pytest.approx(4.0)
+    assert recorded[0]["event_phase_offset_deg"] != pytest.approx(recorded[1]["event_phase_offset_deg"])
+
+
+def test_recorded_residual_event_chart_only_and_null_optional_fields():
+    state = RadarState()
+    sync_snapshot = {
+        "base_period_s": 4.0,
+        "period_delta_s": 0.0,
+        "effective_period_s": 4.0,
+        "period_authority": "py_base",
+        "sync_authority": "py_bootstrap",
+        "phase_authority": "py_bootstrap",
+        "phase_basis": "sweep_epoch_only",
+        "phase_is_absolute": False,
+        "phase_offset_deg": 12.0,
+        "phase_offset_basis": "relative",
+        "phase_epoch_us": 1000.0,
+        "handoff_state": "GO_REFINING",
+        "handoff_reason": "strict_gate_failed",
+        "period_refinement_status": "insufficient_history",
+        "contamination_state": "insufficient_data",
+        "contamination_reason": "insufficient_data",
+        "contamination_gate_reason": "insufficient_data",
+    }
+    row = state._build_recorded_residual_event(
+        iid=1,
+        icao="ABC123",
+        wall_ts=1000.0,
+        arrival_beast_us=1_000_000.0,
+        beam_center_us=1_000_000.0,
+        centroid_timestamp_us=1_000_000.0,
+        residual_deg=55.0,
+        display_residual_class="burst_residual",
+        sync_snapshot=sync_snapshot,
+        sync_revision=7,
+        reject_reason="residual_gate",
+        predicted_deg=120.0,
+        bearing_deg=175.0,
+        range_nm=12.3,
+        n_replies=3,
+        signal_dbfs=-15.0,
+        sync_update_eligible=False,
+        fit_eligible=False,
+        classification="rejected",
+        timing_class=None,
+        event_kind="burst",
+        corrected_residual_deg=55.0,
+        pos_age_s=0.5,
+        dominant_family=False,
+    )
+    assert row["classifier_input"] is False
+    assert row["chart_only_diagnostic"] is True
+    assert row["sync_update_eligible"] is False
+    assert row["fit_eligible"] is False
+    assert row["hard_reject_reason"] == "wrapped_abs_residual_gt_50deg"
+    assert row["soft_reason"] is None
+    assert "secondary_family_id" in row and row["secondary_family_id"] is None
+    assert "reference_icao" in row and row["reference_icao"] is None
+    assert "anchor_icao" in row and row["anchor_icao"] is None
 
 
 def test_burst_residual_recorded_events_prune_by_window_timestamp():
@@ -1922,6 +1996,8 @@ def test_go_sync_snapshot_without_live_sync_state_serializes_nonactive_go_blocke
     assert sync_state["go_operational_enabled"] is True
     assert sync_state["go_operational_active"] is False
     assert sync_state["go_operational_blocking_gate"] == "go_readiness.go_sync_state_usable"
+    assert sync_state["readiness_state"] == "sync_unusable"
+    assert sync_state["readiness_reason"] == "strict_gate_failed"
     assert sync_state["go_operational_blocking_gate"] != "phase_readiness.phase_basis_supported"
     assert sync_state["phase_authority_blocking_gate"] == "phase_readiness.phase_basis_supported"
     assert sync_state["strict_gate_pass"] is False
@@ -2092,6 +2168,8 @@ def test_go_sync_snapshot_without_live_sync_state_ready_like_maps_to_hysteresis(
     assert sync_state is not None
     assert sync_state["go_operational_active"] is False
     assert sync_state["go_operational_blocking_gate"] == "go_readiness_hysteresis"
+    assert sync_state["readiness_state"] == "hysteresis_not_started"
+    assert sync_state["readiness_reason"] == "go_ready_hysteresis_not_started"
     assert sync_state["handoff_reason"] == "go_ready_hysteresis_not_started"
     assert sync_state["handoff_reason"] != "go_state_unclassified"
 
@@ -4155,6 +4233,9 @@ def test_holdover_reacquire_trace_first_failed_stale_ref_position():
     )
     assert payload["holdover_exit_allowed"] is False
     assert payload["holdover_exit_first_failed_gate"] == "reacquire_ref_pos_fresh"
+    assert payload["reacquire_ref_selection_source"] == "fit_history"
+    assert payload["reacquire_ref_icao_fit_pool_present"] is True
+    assert payload["reacquire_ref_icao_support_pool_present"] is True
 
 
 def test_holdover_reacquire_trace_first_failed_support_obs_and_icaos():
@@ -4235,6 +4316,51 @@ def test_holdover_reacquire_trace_all_gates_pass_exit_allowed():
     assert payload["holdover_exit_first_failed_gate"] is None
     assert payload["reacquire_temporal_pending"] is True
     assert payload["reacquire_hidden_gate_name"] == "reacquire_exit_state_not_applied"
+
+
+def test_holdover_reacquire_reference_selection_and_shadow_fields_passthrough():
+    sync = LiveSyncState(
+        iid=405,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=time.time(),
+        source="go_frame_sync",
+        usable=False,
+        holdover=True,
+        holdover_reason="stale_reference_position",
+        holdover_entered_ts=time.time() - 8.0,
+        holdover_last_transition_ts=time.time() - 8.0,
+        last_update_epoch_ref_icao="ABC123",
+        last_update_epoch_ref_pos_age_s=12.0,
+        last_update_epoch_n_aircraft=2,
+    )
+    payload = sweep._live_sync_state_to_dict(
+        sync,
+        go_sync={
+            "reacquire_support_obs_count": 12,
+            "reacquire_support_icao_count": 3,
+            "reacquire_min_aircraft": 2,
+            "fit_observation_count": 12,
+            "fit_icao_count": 3,
+            "strict_epoch_required_ref_age_s": 8.0,
+            "reacquire_better_ref_candidate_available": True,
+            "reacquire_better_ref_candidate_icao": "DEF456",
+            "reacquire_better_ref_candidate_pos_age_s": 1.7,
+            "reacquire_better_ref_candidate_obs_count": 6,
+            "reacquire_better_ref_candidate_fit_eligible": True,
+            "shadow_reacquire_with_best_fresh_ref": True,
+            "shadow_ref_candidate_residual_deg": 7.5,
+        },
+    )
+    assert payload["reacquire_better_ref_candidate_available"] is True
+    assert payload["reacquire_better_ref_candidate_icao"] == "DEF456"
+    assert payload["shadow_reacquire_with_best_fresh_ref"] is True
+    assert payload["shadow_ref_candidate_icao"] == "DEF456"
+    assert payload["shadow_all_reacquire_gates_pass_with_candidate"] is False
 
 
 def test_go_handoff_rejects_period_disagreement():
@@ -6730,6 +6856,185 @@ def test_stage10_active_go_with_phase_failure_uses_phase_blocker_not_go_blocker(
     assert payload["go_operational_blocking_gate"] is None
     assert payload["phase_authority_blocking_gate"] == "phase_readiness.phase_basis_supported"
     assert payload["phase_authority_blocking_reason"] == "phase_basis_not_supported"
+
+
+def test_stage10_readiness_state_operational(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    sync = LiveSyncState(
+        iid=19001,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=time.time(),
+        source="go_frame_sync",
+        usable=True,
+        period_authority="go_refined",
+        sync_authority="go_runtime",
+        handoff_state="GO_REFINED_READY",
+        handoff_reason="go_runtime_operational",
+        go_operational_active=True,
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["readiness_state"] == "operational"
+    assert payload["readiness_reason"] == "go_runtime_operational"
+
+
+def test_stage10_readiness_state_holdover(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    sync = LiveSyncState(
+        iid=19002,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=time.time(),
+        source="go_frame_sync",
+        usable=False,
+        holdover=True,
+        holdover_reason="insufficient_aircraft",
+        handoff_state="HOLDOVER",
+        handoff_reason="go_holdover",
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["readiness_state"] == "holdover"
+    assert payload["readiness_reason"] in {"go_holdover", "insufficient_aircraft", "reacquire_valid_ref_icao"}
+
+
+def test_stage10_readiness_state_sync_unusable(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    sync = LiveSyncState(
+        iid=19003,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.4,
+        sync_jitter_deg=8.0,
+        last_sync_update_ts=time.time(),
+        source="go_frame_sync",
+        usable=False,
+        handoff_state="GO_REFINING",
+        handoff_reason="quality_below_threshold",
+        blocking_gate="go_readiness.go_sync_state_usable",
+    )
+    sync.go_sync_unusable_reason = "quality_below_threshold"
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["readiness_state"] == "sync_unusable"
+    assert payload["readiness_reason"] == "quality_below_threshold"
+
+
+def test_stage10_readiness_state_hysteresis_not_started(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    sync = LiveSyncState(
+        iid=19004,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=time.time(),
+        source="go_frame_sync",
+        usable=False,
+        handoff_state="GO_REFINING",
+        handoff_reason="go_ready_hysteresis_not_started",
+        blocking_gate="go_readiness_hysteresis",
+    )
+    payload = sweep._live_sync_state_to_dict(
+        sync,
+        go_sync={
+            "period_refinement_status": "stable",
+            "go_sync_usable_quality_ok": True,
+            "go_sync_usable_holdover_ok": True,
+            "go_sync_usable_period_agrees": True,
+            "go_sync_usable_strict_gate_pass": True,
+        },
+    )
+    assert payload["readiness_state"] == "hysteresis_not_started"
+    assert payload["readiness_reason"] == "go_ready_hysteresis_not_started"
+
+
+def test_stage10_readiness_state_contamination_blocked(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    sync = LiveSyncState(
+        iid=19005,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=time.time(),
+        source="go_frame_sync",
+        usable=False,
+        handoff_state="GO_REFINING",
+        handoff_reason="contamination_detected",
+        blocking_gate="go_readiness.contamination_free",
+        contamination_state="contaminated",
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["readiness_state"] == "contamination_blocked"
+    assert payload["readiness_reason"] == "contamination_detected"
+
+
+def test_stage10_readiness_state_phase_not_ready_not_go_blocker_when_active(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    sync = LiveSyncState(
+        iid=19006,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=time.time(),
+        source="go_frame_sync",
+        usable=True,
+        period_authority="go_refined",
+        sync_authority="go_runtime",
+        handoff_state="GO_REFINED_READY",
+        handoff_reason="go_runtime_operational",
+        go_operational_active=True,
+        phase_blocking_gate="phase_basis_supported",
+        phase_blocking_reason="phase_basis_not_supported",
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["go_operational_blocking_gate"] is None
+    assert payload["readiness_state"] == "operational"
+
+
+def test_stage10_readiness_state_unknown_only_for_unknown_shapes(monkeypatch):
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_GO_REFINER_OPERATIONAL", True)
+    sync = LiveSyncState(
+        iid=19007,
+        period_s=4.0,
+        period_base_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=1.0,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=time.time(),
+        source="go_frame_sync",
+        usable=False,
+        handoff_state="GO_REFINING",
+        handoff_reason="mystery_blocker",
+        blocking_gate="go_readiness.custom_debug_gate",
+    )
+    payload = sweep._live_sync_state_to_dict(sync)
+    assert payload["readiness_state"] == "unknown"
+    assert payload["readiness_reason"] == "mystery_blocker"
 
 
 def test_go_quality_transient_retains_trusted_anchor_relative_phase():

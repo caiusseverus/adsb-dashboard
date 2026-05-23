@@ -418,3 +418,96 @@
 - Added backend lifecycle diagnostics and full status exposure so failures are explicit (`radar_core_running/pid/connected/last_error`).
 - Hardened radar-core main shutdown signal path and synchronized shared map access across ingest/ticker goroutines (`builders`, `states`, `accumulators`, `revisions`) to prevent runtime concurrency panics.
 - Final 900s validation window (`...radarcore_fixed_r3...`) completed with radar-core still running/connected at window end.
+
+## 2026-05-23 IID 33 Reacquire Reference Selection Audit (Stale/Sticky)
+
+- [ ] Run GitNexus impact analysis for the specific Go/Python symbols to edit for diagnostics-only additions and report blast radius/risk.
+- [ ] Trace `radar-core` reacquire reference selection lifecycle end-to-end: selection source, update/clear conditions, validity checks, and position-age computation.
+- [ ] Add diagnostics-only fields for reference-selection source/presence/replacement evidence and suppression reason (no policy/threshold/gate behavior changes).
+- [ ] Add compact-capture extraction coverage and analysis script updates for new diagnostics and shadow-only best-fresh-reference evaluation fields.
+- [ ] Add/adjust tests for new diagnostic fields and behavior-preserving defaults.
+- [ ] Run targeted tests.
+- [ ] Run fresh 10-minute IID 33 capture with new diagnostics and produce summary artifact.
+- [ ] Run shadow-only replacement analysis on capture rows and classify safety/risk.
+- [ ] Add review summary with code-path findings, diagnostics added, IID 33 rerun metrics, shadow results, and recommendation.
+
+### Review
+- GitNexus impact:
+  - `IIDState.RefreshReference` (`radar-core/iid/state.go`) risk `LOW`.
+  - `SyncState.UpdateEpoch` (`radar-core/iid/sync.go`) risk `LOW`.
+  - `IIDState.DebugStateSnapshot` (`radar-core/iid/state.go`) risk `CRITICAL`; changes kept additive-only for diagnostics fields.
+- Code-path audit findings:
+  - Reference selection is performed in `radar-core/iid/ref.go:SelectReference` over current retained burst records, with freshness preference (fresh ADS-B position <= 8s) and hysteresis suppressed when current reference is not fresh.
+  - Reference is refreshed in `radar-core/iid/state.go:RefreshReference`; if dominant-family candidates disappear, reference may be cleared.
+  - Reacquire gate checks are enforced in `radar-core/iid/sync.go:UpdateEpoch` and `canReacquireInHoldover` using current update-epoch fields (`refICAO`, `refPosAgeS`, `nAircraft`) plus fit/reacquire support counters.
+  - Backend holdover/reacquire panel diagnostics are synthesized in `backend/radar/sweep.py` from sync/go snapshot fields.
+- Diagnostics-only implementation:
+  - Added additive snapshot diagnostics in `backend/radar/sweep.py`:
+    - `reacquire_ref_selection_source`, `reacquire_ref_selection_reason`
+    - `reacquire_ref_icao_current_epoch_present`, `reacquire_ref_icao_fit_pool_present`, `reacquire_ref_icao_support_pool_present`
+    - `reacquire_better_ref_candidate_*`, `reacquire_ref_replacement_suppressed_reason`
+    - `shadow_reacquire_with_best_fresh_ref`, `shadow_ref_candidate_*`, `shadow_all_reacquire_gates_pass_with_candidate`, `shadow_safety_flags`
+  - Added compact extraction coverage in `tools/blocker_baseline_compact.py`.
+- Tests:
+  - `uv run --directory backend pytest tests/test_radar_sweep.py -k "holdover_reacquire_trace" -q` passed.
+  - `uv run --directory backend pytest tests/test_radar_sweep.py::test_holdover_reacquire_trace_first_failed_stale_ref_position tests/test_radar_sweep.py::test_holdover_reacquire_reference_selection_and_shadow_fields_passthrough tests/test_blocker_baseline_compact.py -q` passed.
+- Live capture blocker:
+  - IID 33 capture attempts completed with `successful samples: 0, failed samples: 600`:
+    - `tasks/radar_sync_baseline/sync_capture_iid33_iid33_refsel_audit_20260523T162144Z.ndjson`
+    - `tasks/radar_sync_baseline/sync_capture_iid33_iid33_refsel_audit_r2_20260523T163223Z.ndjson`
+  - Backend endpoint became unreachable during/after capture in this environment, preventing required 10-minute IID 33 rerun summary and shadow outcome classification from live data.
+
+## 2026-05-23 Stage 9 Residual Metadata Completeness
+
+- [x] Audit residual event emit paths (burst, DF11, recorded/recomputed/chart rows, Stage 8 family capture rows).
+- [x] Add missing immutable Stage 9 metadata fields to recorded residual events without changing classification/gating behavior.
+- [x] Preserve new fields in residual-family capture export rows.
+- [x] Add/adjust tests for metadata presence, chart-only labeling, classifier-input labeling, null-safe optional fields, and immutability-relevant basis fields.
+- [x] Run targeted backend tests.
+- [x] Run short live IID 33 residual-family capture and verify completeness across available row classes.
+
+### Review
+- Implementation (no policy/threshold/logic changes):
+  - `backend/radar/sweep.py`
+    - Added Stage 9 identity/basis/classification/context fields in `_build_recorded_residual_event` (e.g. `event_key`, `event_time_basis`, `residual_basis_*`, `classifier_input`, `chart_only_diagnostic`, `hard_reject_reason`, `soft_reason`, `reference_icao`, `anchor_*`, `dominant_family_id`, `secondary_family_id`).
+    - Added `sync_seq` alias assignment in `_append_recorded_event` from per-IID event sequence.
+  - `tools/radar_sync_capture.py`
+    - Extended residual-family export rows to include Stage 9 basis/authority/context aliases and sequence fields.
+- Tests:
+  - `uv run --directory backend pytest tests/test_radar_sweep.py::test_burst_residual_recorded_events_are_immutable_across_period_change tests/test_radar_sweep.py::test_recorded_residual_event_chart_only_and_null_optional_fields tests/test_radar_sync_capture.py tests/test_stage8_family_replay.py tests/test_blocker_baseline_compact.py -q` -> `12 passed`.
+- Live validation artifacts:
+  - Capture: `tasks/radar_sync_baseline/sync_capture_iid33_stage9_meta_check_20260523T173244Z.ndjson` (`20/20` successful samples).
+  - Completeness summary: `tasks/radar_sync_baseline/sync_capture_iid33_stage9_meta_check_20260523T173244Z_stage9_meta_summary.json` (500 residual-family rows; required Stage 9 keys present on all exported rows).
+- IID 33 chart-only DF11 example (from prior IID33 capture): `tasks/radar_sync_baseline/iid33_df11_chart_only_stage9_example.json`.
+- GitNexus impact:
+  - `tools/radar_sync_capture.py:run_capture` -> risk `LOW`.
+  - Symbol lookup for `backend/radar/sweep.py` private helpers (`_build_recorded_residual_event`, `_append_recorded_event`) returned `UNKNOWN` (index symbol resolution gap for these private methods).
+
+## 2026-05-23 Stage 10 Readiness State Audit/Alignment
+
+- [x] Audit existing Stage 10 readiness fields and define deterministic typed mapping precedence (`readiness_state`, `readiness_reason`).
+- [x] Add additive backend readiness summary fields in sync serialization without changing promotion/gating behavior.
+- [x] Preserve existing fields and emit readiness derivation source inputs for auditability.
+- [x] Add backend tests for operational/holdover/sync-unusable/slope/contamination/hysteresis/bootstrap/stale-evidence/phase-not-ready/unknown fallback handling.
+- [x] Update frontend "Why not operational?" formatter to prefer typed readiness fields when present, fallback to legacy mapping otherwise.
+- [x] Add frontend unit tests for readiness-field preference and fallback behavior.
+- [x] Run targeted backend/frontend tests.
+- [x] Run 10-minute compact capture and summarize readiness distributions, unknown count, and mismatch count.
+- [x] Add review summary with readiness mapping table, validation artifacts, remaining unknown shapes, and completion recommendation.
+
+### Review
+- Added typed Stage 10 readiness aliases in `backend/radar/sweep.py`:
+  - `readiness_state`, `readiness_reason`, `readiness_blocking_gate`, `readiness_source_fields`.
+- Deterministic precedence is diagnostics-only and does not alter blocking/promotion logic.
+- Added fallback-path readiness emission in compact sync snapshot branch (`sync_state is None + go_sync fallback`) so compact rows are fully typed.
+- Updated frontend formatter (`frontend/src/utils/radarSync.js`) to prefer readiness aliases when present; legacy heuristics remain fallback.
+- Added/updated tests:
+  - `backend/tests/test_radar_sweep.py` (readiness mappings + compact fallback coverage)
+  - `backend/tests/test_blocker_baseline_compact.py` (readiness fields extraction)
+  - `frontend/src/utils/radarSync.test.js` (readiness preference behavior)
+- Validation capture (host backend, 600s):
+  - Rows: `tasks/radar_sync_baseline/blocker_baseline_compact_stage10_readiness_audit_r4_20260523T221659Z_rows.jsonl`
+  - Summary: `tasks/radar_sync_baseline/blocker_baseline_compact_stage10_readiness_audit_r4_20260523T221659Z_summary.json`
+  - Side-by-side: `tasks/radar_sync_baseline/blocker_baseline_compact_stage10_readiness_audit_r4_20260523T221659Z_raw_vs_compact.json`
+  - Readiness distribution (3000 rows): operational 101, holdover 1366, sync_unusable 912, hysteresis_not_started 234, pending_hysteresis 121, slope_not_converged 247, refinement_history_insufficient 19.
+  - Unknown count: 0; null count: 0; mismatch count vs handoff/blocker consistency checks: 0.

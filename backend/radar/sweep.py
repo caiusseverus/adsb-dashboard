@@ -1503,6 +1503,120 @@ def _emit_consistency_warning(iid: int | str | None, reason: str, suppress: bool
     log.warning("sync source consistency warning for iid=%s: %s", iid, reason)
 
 
+def _derive_stage10_readiness_fields(payload: dict) -> dict:
+    """Build a typed readiness summary from existing Stage 10 diagnostics.
+
+    This is serialization-only attribution; it must not change runtime gating
+    or promotion decisions.
+    """
+    raw_blocking_gate = str(payload.get("go_operational_blocking_gate") or payload.get("blocking_gate") or "")
+    handoff_state = str(payload.get("handoff_state") or "")
+    handoff_reason = str(payload.get("handoff_reason") or "")
+    holdover = bool(payload.get("holdover"))
+    holdover_reason = str(payload.get("holdover_reason") or "")
+    sync_unusable_reason = str(payload.get("go_sync_unusable_reason") or "")
+    refinement_status = str(
+        payload.get("operational_period_refinement_status")
+        or payload.get("period_refinement_status")
+        or payload.get("refinement_status")
+        or ""
+    )
+    contamination_state = str(payload.get("contamination_state") or "")
+    stale_evidence = bool(payload.get("stale_go_evidence_effective"))
+    go_operational_active = bool(payload.get("go_operational_active"))
+    go_operational_enabled = bool(payload.get("go_operational_enabled"))
+    phase_blocking_gate = str(payload.get("phase_blocking_gate") or payload.get("phase_authority_blocking_gate") or "")
+    phase_blocking_reason = str(payload.get("phase_blocking_reason") or payload.get("phase_authority_blocking_reason") or "")
+    source_fields: list[str] = []
+
+    def _result(state: str, reason: str, *fields: str) -> dict:
+        for field in fields:
+            if field and field not in source_fields:
+                source_fields.append(field)
+        return {
+            "readiness_state": state,
+            "readiness_reason": reason,
+            "readiness_blocking_gate": raw_blocking_gate or None,
+            "readiness_source_fields": source_fields,
+        }
+
+    if go_operational_active:
+        return _result("operational", "go_runtime_operational", "go_operational_active", "handoff_state")
+    if holdover or handoff_state == "HOLDOVER" or raw_blocking_gate == "go_readiness.go_not_holdover":
+        reason = (
+            str(payload.get("holdover_exit_first_failed_gate") or "")
+            or holdover_reason
+            or handoff_reason
+            or "go_holdover"
+        )
+        return _result("holdover", reason, "holdover", "holdover_reason", "holdover_exit_first_failed_gate")
+    if sync_unusable_reason or raw_blocking_gate == "go_readiness.go_sync_state_usable":
+        return _result(
+            "sync_unusable",
+            sync_unusable_reason or handoff_reason or "go_sync_unusable",
+            "go_sync_unusable_reason",
+            "go_operational_blocking_gate",
+        )
+    if raw_blocking_gate in {"go_readiness_hysteresis", "go_readiness.go_readiness_hysteresis"}:
+        if handoff_reason == "go_ready_hysteresis_not_started":
+            return _result("hysteresis_not_started", handoff_reason, "handoff_reason", "go_operational_blocking_gate")
+        return _result(
+            "pending_hysteresis",
+            handoff_reason or "go_ready_pending_hysteresis",
+            "handoff_reason",
+            "go_operational_ready_streak",
+            "go_operational_promotion_threshold",
+        )
+    if (
+        raw_blocking_gate == "go_readiness.go_refinement_history_sufficient"
+        or handoff_reason in {"go_refinement_history_insufficient", "insufficient_history"}
+        or refinement_status == "insufficient_history"
+    ):
+        return _result(
+            "refinement_history_insufficient",
+            handoff_reason or "go_refinement_history_insufficient",
+            "period_refinement_status",
+            "go_operational_blocking_gate",
+        )
+    if "contributing_icaos" in raw_blocking_gate or handoff_reason in {"insufficient_contributing_icaos", "insufficient_support"}:
+        return _result("insufficient_contributing_icaos", handoff_reason or "insufficient_contributing_icaos", "handoff_reason")
+    if raw_blocking_gate == "go_readiness.slope_converged" or handoff_reason == "slope_not_converged":
+        slope_reason = (
+            str(payload.get("slope_not_converged_subreason") or "")
+            or str(payload.get("slope_regression_fail_reason") or "")
+            or str(payload.get("slope_near_zero_fail_reason") or "")
+            or handoff_reason
+            or "slope_not_converged"
+        )
+        return _result("slope_not_converged", slope_reason, "slope_not_converged_subreason", "go_operational_blocking_gate")
+    if raw_blocking_gate == "go_readiness.go_evidence_fresh" or handoff_reason == "stale_go_evidence" or stale_evidence:
+        return _result("stale_evidence", "stale_go_evidence", "stale_go_evidence_effective", "go_operational_blocking_gate")
+    if (
+        raw_blocking_gate == "go_readiness.contamination_free"
+        or handoff_reason == "contamination_detected"
+        or contamination_state == "contaminated"
+    ):
+        return _result(
+            "contamination_blocked",
+            handoff_reason or "contamination_detected",
+            "contamination_state",
+            "contamination_reason",
+            "go_operational_blocking_gate",
+        )
+    if raw_blocking_gate.startswith("phase_readiness.") or phase_blocking_gate:
+        return _result(
+            "phase_not_ready",
+            phase_blocking_reason or handoff_reason or "phase_basis_not_supported",
+            "phase_blocking_gate",
+            "phase_blocking_reason",
+        )
+    if handoff_state in {"BOOTSTRAPPING_PY", "BASE_PERIOD_READY"}:
+        return _result("bootstrap", handoff_reason or "insufficient_history", "handoff_state", "handoff_reason")
+    if not go_operational_enabled:
+        return _result("unavailable", handoff_reason or "operational_refiner_disabled", "go_operational_enabled")
+    return _result("unknown", handoff_reason or "go_state_unclassified", "handoff_state", "handoff_reason")
+
+
 def _live_sync_state_to_dict(
     sync: "LiveSyncState",
     go_sync: dict | None = None,
@@ -2633,7 +2747,11 @@ def _live_sync_state_to_dict(
     if _reacquire_fallback_age_limit_s is None:
         _reacquire_fallback_age_limit_s = 30.0
     _reacquire_valid_period = bool(_finite_positive(getattr(sync, "period_s", None)))
-    _reacquire_valid_ref_icao = bool(str(getattr(sync, "last_update_epoch_ref_icao", "") or ""))
+    _reacquire_ref_icao_value = str(getattr(sync, "last_update_epoch_ref_icao", "") or "").strip().upper()
+    _reacquire_valid_ref_icao = bool(_reacquire_ref_icao_value)
+    _reacquire_input_ref_icao_value = str(getattr(sync, "last_update_epoch_input_reference_icao", "") or "").strip().upper()
+    if not _reacquire_input_ref_icao_value and isinstance(go_sync, dict):
+        _reacquire_input_ref_icao_value = str(go_sync.get("last_update_epoch_input_reference_icao") or "").strip().upper()
     _reacquire_ref_position_present = _reacquire_ref_pos_age_s is not None
     _reacquire_ref_pos_fresh = (
         (_reacquire_ref_pos_age_s is not None)
@@ -2709,6 +2827,93 @@ def _live_sync_state_to_dict(
         else (_holdover_exit_first_failed_gate if _holdover else None)
     )
     _reacquire_temporal_pending = bool(_holdover and _reacquire_all_gates_pass)
+    _ref_selection_source = "unavailable"
+    _ref_selection_reason = "no_reference_icao"
+    if _reacquire_valid_ref_icao:
+        if _reacquire_input_ref_icao_value and _reacquire_ref_icao_value == _reacquire_input_ref_icao_value:
+            _ref_selection_source = "current_epoch"
+            _ref_selection_reason = "last_update_epoch_ref_matches_input_reference"
+        elif str(getattr(sync, "last_update_epoch_outcome", "") or "") in {"accepted", "provisional_reacquire"}:
+            _ref_selection_source = "last_accepted_epoch"
+            _ref_selection_reason = "reference_from_last_accepted_update_epoch"
+        else:
+            _ref_selection_source = "retained_epoch"
+            _ref_selection_reason = "reference_present_without_current_epoch_match"
+
+    _support_icao_set: set[str] = set()
+    _fit_icao_set: set[str] = set()
+    if _reacquire_input_ref_icao_value:
+        _support_icao_set.add(_reacquire_input_ref_icao_value)
+    if _reacquire_valid_ref_icao:
+        if _reacquire_fit_support_ok:
+            _fit_icao_set.add(_reacquire_ref_icao_value)
+        if _reacquire_support_obs_count > 0 or _reacquire_support_icao_count > 0:
+            _support_icao_set.add(_reacquire_ref_icao_value)
+    _ref_present_current_epoch = bool(
+        _reacquire_input_ref_icao_value
+        and (_reacquire_input_ref_icao_value in _support_icao_set)
+    )
+    _ref_present_fit_pool = bool(
+        _reacquire_ref_icao_value
+        and (_reacquire_ref_icao_value in _fit_icao_set)
+    )
+    _ref_present_support_pool = bool(
+        _reacquire_ref_icao_value
+        and (_reacquire_ref_icao_value in _support_icao_set)
+    )
+    if _ref_selection_source == "retained_epoch":
+        if _ref_present_fit_pool:
+            _ref_selection_source = "fit_history"
+            _ref_selection_reason = "reference_present_in_fit_pool_not_current_epoch_input"
+        elif _ref_present_support_pool:
+            _ref_selection_source = "support_pool"
+            _ref_selection_reason = "reference_present_in_support_pool_not_current_epoch_input"
+
+    _best_candidate_icao = str((go_sync or {}).get("reacquire_better_ref_candidate_icao") or "").strip().upper() if isinstance(go_sync, dict) else ""
+    _best_candidate_age_s = _to_finite_float((go_sync or {}).get("reacquire_better_ref_candidate_pos_age_s")) if isinstance(go_sync, dict) else None
+    _best_candidate_obs_count = int((go_sync or {}).get("reacquire_better_ref_candidate_obs_count") or 0) if isinstance(go_sync, dict) else 0
+    _best_candidate_fit_eligible = (go_sync or {}).get("reacquire_better_ref_candidate_fit_eligible") if isinstance(go_sync, dict) else None
+    _best_candidate_residual_deg = _to_finite_float((go_sync or {}).get("shadow_ref_candidate_residual_deg")) if isinstance(go_sync, dict) else None
+    _better_ref_candidate_available = bool(
+        (go_sync or {}).get("reacquire_better_ref_candidate_available")
+    ) if isinstance(go_sync, dict) else False
+    _replacement_suppressed_reason = None
+    if _better_ref_candidate_available:
+        if _reacquire_ref_pos_fresh:
+            _replacement_suppressed_reason = "current_reference_already_fresh"
+        elif not _reacquire_aircraft_count_ok:
+            _replacement_suppressed_reason = "insufficient_current_epoch_aircraft"
+        elif not _reacquire_fit_support_ok:
+            _replacement_suppressed_reason = "insufficient_fit_support"
+        elif not _reacquire_exit_trigger_seen:
+            _replacement_suppressed_reason = "reacquire_trigger_not_active"
+        else:
+            _replacement_suppressed_reason = "reference_not_replaced_by_design"
+
+    _shadow_reacquire_with_best_fresh_ref = bool(
+        (go_sync or {}).get("shadow_reacquire_with_best_fresh_ref")
+    ) if isinstance(go_sync, dict) else bool(
+        _holdover
+        and not _reacquire_ref_pos_fresh
+        and _better_ref_candidate_available
+    )
+    _shadow_all_gates_pass_with_candidate = bool(
+        _shadow_reacquire_with_best_fresh_ref
+        and _reacquire_valid_period
+        and _reacquire_aircraft_count_ok
+        and _reacquire_fit_support_ok
+        and _reacquire_hard_reject_condition_ok
+        and _reacquire_exit_trigger_seen
+    )
+    _shadow_safety_flags = []
+    if _shadow_reacquire_with_best_fresh_ref:
+        if _best_candidate_residual_deg is not None and abs(_best_candidate_residual_deg) > 50.0:
+            _shadow_safety_flags.append("candidate_residual_hard_reject")
+        if not _reacquire_aircraft_count_ok:
+            _shadow_safety_flags.append("aircraft_count_not_ok")
+        if not _reacquire_fit_support_ok:
+            _shadow_safety_flags.append("fit_support_not_ok")
+
     payload.update({
         "holdover_entered_ts": _holdover_entered_ts,
         "holdover_age_s": (
@@ -2788,6 +2993,25 @@ def _live_sync_state_to_dict(
             )
         ),
         "reacquire_all_gates_pass": _reacquire_all_gates_pass,
+        "reacquire_ref_selection_source": _ref_selection_source,
+        "reacquire_ref_selection_reason": _ref_selection_reason,
+        "reacquire_ref_icao_current_epoch_present": _ref_present_current_epoch,
+        "reacquire_ref_icao_fit_pool_present": _ref_present_fit_pool,
+        "reacquire_ref_icao_support_pool_present": _ref_present_support_pool,
+        "reacquire_better_ref_candidate_available": _better_ref_candidate_available,
+        "reacquire_better_ref_candidate_icao": _best_candidate_icao or None,
+        "reacquire_better_ref_candidate_pos_age_s": _best_candidate_age_s,
+        "reacquire_better_ref_candidate_obs_count": _best_candidate_obs_count,
+        "reacquire_better_ref_candidate_fit_eligible": _best_candidate_fit_eligible,
+        "reacquire_ref_replacement_suppressed_reason": _replacement_suppressed_reason,
+        "shadow_reacquire_with_best_fresh_ref": _shadow_reacquire_with_best_fresh_ref,
+        "shadow_ref_candidate_icao": (_best_candidate_icao or None) if _shadow_reacquire_with_best_fresh_ref else None,
+        "shadow_ref_candidate_age_s": _best_candidate_age_s if _shadow_reacquire_with_best_fresh_ref else None,
+        "shadow_ref_candidate_residual_deg": _best_candidate_residual_deg if _shadow_reacquire_with_best_fresh_ref else None,
+        "shadow_ref_candidate_support_obs": _best_candidate_obs_count if _shadow_reacquire_with_best_fresh_ref else None,
+        "shadow_ref_candidate_support_icaos": (1 if _best_candidate_icao else 0) if _shadow_reacquire_with_best_fresh_ref else None,
+        "shadow_all_reacquire_gates_pass_with_candidate": _shadow_all_gates_pass_with_candidate,
+        "shadow_safety_flags": _shadow_safety_flags if _shadow_reacquire_with_best_fresh_ref else [],
     })
 
     # --- Stage 3R diagnostic summaries derived from handoff gate results ---
@@ -3175,6 +3399,7 @@ def _live_sync_state_to_dict(
 
     # --- Enforce phase semantics invariants before serialisation ---
     payload = _normalise_phase_fields(payload)
+    payload.update(_derive_stage10_readiness_fields(payload))
 
     return payload
 
@@ -4923,11 +5148,13 @@ class RadarState:
             seq = self._chart_burst_residual_seq.get(iid, 0) + 1
             self._chart_burst_residual_seq[iid] = seq
             event["event_seq"] = seq
+            event["sync_seq"] = seq
         elif event_kind == "df11":
             counters["appended_df11_total"] += 1
             seq = self._chart_df11_residual_seq.get(iid, 0) + 1
             self._chart_df11_residual_seq[iid] = seq
             event["event_seq"] = seq
+            event["sync_seq"] = seq
         cutoff_ts = now_ts - self._LIVE_BURST_RESIDUAL_EVENTS_RETENTION_S
         while event_buf and float(event_buf[0].get("wall_ts") or now_ts) < cutoff_ts:
             event_buf.popleft()
@@ -9032,18 +9259,44 @@ class RadarState:
     ) -> dict:
         timestamp_component = f"{float(centroid_timestamp_us):.3f}"
         event_id = f"{int(iid)}:{event_kind}:{str(icao)}:{timestamp_component}"
+        event_time_basis = "beam_center_us" if event_kind == "burst" else "arrival_beast_us"
+        period_authority = sync_snapshot.get("period_authority")
+        sync_authority = sync_snapshot.get("sync_authority")
+        phase_authority = sync_snapshot.get("phase_authority")
+        phase_basis = sync_snapshot.get("phase_basis")
+        phase_offset_deg = float(sync_snapshot.get("phase_offset_deg") or 0.0)
+        effective_period_s = sync_snapshot.get("effective_period_s")
+        base_period_s = sync_snapshot.get("base_period_s")
+        reference_icao = (
+            sync_snapshot.get("strict_gate_ref_icao")
+            or sync_snapshot.get("last_update_epoch_ref_icao")
+            or sync_snapshot.get("go_diagnostic_last_update_epoch_ref_icao")
+        )
+        anchor_icao = sync_snapshot.get("phase_anchor_icao")
+        anchor_status = sync_snapshot.get("phase_anchor_status")
+        phase_status = sync_snapshot.get("phase_status")
+        phase_status_display = sync_snapshot.get("phase_status_display")
+        residual_class = classification
+        hard_reject_reason = "wrapped_abs_residual_gt_50deg" if classification == "rejected" else None
+        soft_reason = "soft_residual_weighting" if classification == "soft" else None
         return {
             "event_id": event_id,
             "event_kind": event_kind,
+            "event_key": event_id,
             "wall_ts": float(wall_ts),
+            "timestamp": float(wall_ts),
             "arrival_beast_us": float(arrival_beast_us),
             "beam_center_us": float(beam_center_us),
             "iid": int(iid),
             "icao": str(icao),
             "centroid_timestamp_us": float(centroid_timestamp_us),
+            "event_time_basis": event_time_basis,
             "residual_deg": float(residual_deg),
-            "residual_class": classification,
+            "residual_class": residual_class,
             "residual_basis": "runtime_effective",
+            "residual_basis_period_s": effective_period_s,
+            "residual_basis_phase_offset_deg": phase_offset_deg,
+            "residual_basis_authority": period_authority,
             "display_residual_class": display_residual_class,
             "classification": classification,
             "timing_class": timing_class,
@@ -9062,36 +9315,44 @@ class RadarState:
             "signal_dbfs": float(signal_dbfs) if signal_dbfs is not None else None,
             "sync_update_eligible": bool(sync_update_eligible),
             "fit_eligible": bool(fit_eligible),
+            "classifier_input": bool(fit_eligible),
+            "chart_only_diagnostic": not bool(fit_eligible),
             "dominant_family": bool(dominant_family) if dominant_family is not None else bool(sync_update_eligible),
             "refinement_status": sync_snapshot.get("period_refinement_status"),
             "reject_reason": reject_reason,
             "exclusion_reason": reject_reason,
-            "base_period_s": sync_snapshot.get("base_period_s"),
+            "hard_reject_reason": hard_reject_reason,
+            "soft_reason": soft_reason,
+            "base_period_s": base_period_s,
             "period_delta_s": sync_snapshot.get("period_delta_s"),
-            "effective_period_s": sync_snapshot.get("effective_period_s"),
-            "period_authority": sync_snapshot.get("period_authority"),
-            "sync_authority": sync_snapshot.get("sync_authority"),
-            "phase_authority": sync_snapshot.get("phase_authority"),
-            "event_base_period_s": sync_snapshot.get("base_period_s"),
+            "effective_period_s": effective_period_s,
+            "period_authority": period_authority,
+            "sync_authority": sync_authority,
+            "phase_authority": phase_authority,
+            "event_base_period_s": base_period_s,
             "event_period_delta_s": sync_snapshot.get("period_delta_s"),
-            "event_effective_period_s": sync_snapshot.get("effective_period_s"),
-            "event_period_authority": sync_snapshot.get("period_authority"),
-            "event_sync_authority": sync_snapshot.get("sync_authority"),
-            "event_phase_authority": sync_snapshot.get("phase_authority"),
-            "phase_basis": sync_snapshot.get("phase_basis"),
-            "event_phase_basis": sync_snapshot.get("phase_basis"),
+            "event_effective_period_s": effective_period_s,
+            "event_period_authority": period_authority,
+            "event_sync_authority": sync_authority,
+            "event_phase_authority": phase_authority,
+            "phase_basis": phase_basis,
+            "event_phase_basis": phase_basis,
             "phase_is_absolute": bool(sync_snapshot.get("phase_is_absolute", False)),
             "event_phase_is_absolute": bool(sync_snapshot.get("phase_is_absolute", False)),
-            "phase_offset_deg": float(sync_snapshot.get("phase_offset_deg") or 0.0),
-            "event_phase_offset_deg": float(sync_snapshot.get("phase_offset_deg") or 0.0),
+            "phase_offset_deg": phase_offset_deg,
+            "event_phase_offset_deg": phase_offset_deg,
             "phase_offset_basis": sync_snapshot.get("phase_offset_basis"),
             "event_phase_offset_basis": sync_snapshot.get("phase_offset_basis"),
             "phase_offset_geographic_deg": sync_snapshot.get("phase_offset_geographic_deg"),
             "event_phase_offset_geographic_deg": sync_snapshot.get("phase_offset_geographic_deg"),
-            "phase_anchor_icao": sync_snapshot.get("phase_anchor_icao"),
-            "event_phase_anchor_icao": sync_snapshot.get("phase_anchor_icao"),
-            "phase_anchor_status": sync_snapshot.get("phase_anchor_status"),
-            "event_phase_anchor_status": sync_snapshot.get("phase_anchor_status"),
+            "phase_anchor_icao": anchor_icao,
+            "event_phase_anchor_icao": anchor_icao,
+            "phase_anchor_status": anchor_status,
+            "event_phase_anchor_status": anchor_status,
+            "anchor_icao": anchor_icao,
+            "anchor_status": anchor_status,
+            "anchor_trust": phase_status_display or phase_status,
+            "reference_icao": reference_icao,
             "phase_epoch_us": float(sync_snapshot.get("phase_epoch_us") or 0.0),
             "event_phase_epoch_us": float(sync_snapshot.get("phase_epoch_us") or 0.0),
             "effective_period_source": sync_snapshot.get("effective_period_source"),
@@ -9109,12 +9370,15 @@ class RadarState:
             "event_handoff_state": sync_snapshot.get("handoff_state"),
             "event_handoff_reason": sync_snapshot.get("handoff_reason"),
             "sync_revision": int(sync_revision),
+            "sync_seq": None,
             "family_id": "unclassified",
             "family_role": "unclassified",
             "family_assignment_reason": "pending_stage8_family_assignment",
             "contamination_state": sync_snapshot.get("contamination_state"),
             "contamination_reason": sync_snapshot.get("contamination_reason"),
             "contamination_gate_reason": sync_snapshot.get("contamination_gate_reason"),
+            "dominant_family_id": sync_snapshot.get("contamination_dominant_family_id"),
+            "secondary_family_id": sync_snapshot.get("contamination_secondary_family_id"),
         }
 
     def _annotate_stage8_family_roles(self, iid: int, rows: list[dict]) -> dict:
@@ -12775,6 +13039,7 @@ class RadarState:
                     "stage10_serializer_fallback_applied": True,
                 }
                 sync_state.update(_build_go_promotion_failure_diagnostic_aliases(sync_state, go_sync=go_sync))
+                sync_state.update(_derive_stage10_readiness_fields(sync_state))
         if sync_state:
             sync_state.update(slope_target_movement)
             sync_state.update(shadow_freeze_monitor)

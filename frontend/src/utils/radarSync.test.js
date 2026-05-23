@@ -208,6 +208,29 @@ describe('radarSync', () => {
       assert.match(result.explanation, /Bootstrap:/)
     })
 
+    it('prefers typed readiness hysteresis fields when present', () => {
+      const result = formatOperationalBlocker({
+        readiness_state: 'hysteresis_not_started',
+        readiness_reason: 'go_ready_hysteresis_not_started',
+        handoff_reason: 'go_holdover',
+        go_operational_blocking_gate: 'go_readiness.go_not_holdover',
+      })
+      assert.strictEqual(result.category, 'hysteresis pending / not started')
+      assert.match(result.explanation, /Hysteresis not started:/)
+    })
+
+    it('prefers typed readiness holdover when current readiness says holdover', () => {
+      const result = formatOperationalBlocker({
+        readiness_state: 'holdover',
+        readiness_reason: 'reacquire_ref_pos_fresh',
+        holdover_exit_first_failed_gate: 'reacquire_ref_pos_fresh',
+        holdover_reason: 'insufficient_aircraft',
+        go_operational_blocking_gate: 'go_readiness_hysteresis',
+      })
+      assert.strictEqual(result.category, 'holdover/reacquire blocked')
+      assert.match(result.explanation, /Holdover:/)
+    })
+
     it('formats non-geographic phase', () => {
       const result = formatOperationalBlocker({
         localisation_safe_phase: false,
