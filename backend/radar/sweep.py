@@ -6810,13 +6810,15 @@ class RadarState:
         holdover = bool(go_sync.get("holdover", False)) if present else False
         gates["go_not_holdover"] = _gate_value((not holdover) if present else None, None if not holdover else "go_holdover")
         # Stage 8: real phase-family contamination detection.
+        import config as _cfg
         contamination = self._detect_contamination_locked(iid)
+        contamination_enabled = bool(getattr(_cfg, "RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED", False))
         c_state = contamination["state"]
         c_reason = contamination["reason"]
-        if c_state == "disabled":
-            gates["go_contamination_state"] = _gate_value(None, "stage8_not_available_stub")
-        elif c_state == "contaminated":
+        if c_state == "contaminated" and contamination_enabled:
             gates["go_contamination_state"] = _gate_value(False, c_reason)
+        elif c_state == "contaminated" and not contamination_enabled:
+            gates["go_contamination_state"] = _gate_value(None, "contamination_detected_nonblocking_flag_disabled")
         elif c_state == "single_family":
             gates["go_contamination_state"] = _gate_value(True, c_reason)
         elif c_state == "insufficient_data":
@@ -6827,10 +6829,7 @@ class RadarState:
         if sync is not None:
             typed_state = c_state
             typed_reason = str(c_reason) if c_reason else None
-            if c_state == "disabled":
-                typed_state = "insufficient_data"
-                typed_reason = "stage8_not_available_stub"
-            elif c_state not in {"contaminated", "single_family", "insufficient_data"}:
+            if c_state not in {"contaminated", "single_family", "insufficient_data"}:
                 typed_state = "insufficient_data"
                 typed_reason = typed_reason or "insufficient_family_data"
             sync.contamination_state = typed_state
@@ -6842,6 +6841,15 @@ class RadarState:
             sync.contamination_secondary_icaos = contamination["secondary_icaos"]
             sync.contamination_family_separation_deg = contamination["family_separation_deg"]
             sync.contamination_secondary_support_ratio = contamination["secondary_support_ratio"]
+            sync.contamination_family_count = int(contamination.get("family_count") or 0)
+            sync.contamination_confidence = contamination.get("confidence")
+            sync.contamination_dominant_family_id = contamination.get("dominant_family_id")
+            sync.contamination_secondary_family_id = contamination.get("secondary_family_id")
+            sync.contamination_primary_icaos = int(contamination.get("primary_icaos") or 0)
+            sync.contamination_primary_spread_deg = contamination.get("primary_spread_deg")
+            sync.contamination_secondary_spread_deg = contamination.get("secondary_spread_deg")
+            sync.contamination_inlier_count = int(contamination.get("inlier_count") or 0)
+            sync.contamination_outlier_count = int(contamination.get("outlier_count") or 0)
         gates["go_period_stable"] = self._evaluate_period_stability_gate_locked(iid)
         gates["go_slope_converged"] = self._evaluate_slope_trend_gate_locked(iid)
         effective = float(go_sync["effective_period_s"]) if present and _finite_positive(go_sync.get("effective_period_s")) else None
@@ -6888,14 +6896,6 @@ class RadarState:
         """
         import config as _cfg
         enabled = bool(getattr(_cfg, "RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED", False))
-        if not enabled:
-            return {
-                "state": "disabled", "reason": "contamination_detection_disabled",
-                "total_observations": 0, "distinct_icaos": 0,
-                "primary_observations": 0, "secondary_observations": 0,
-                "secondary_icaos": 0, "family_separation_deg": None,
-                "secondary_support_ratio": None,
-            }
 
         sync = self._live_sync_states.get(iid)
         event_buf = self._live_burst_residual_events.get(iid)
@@ -6905,7 +6905,11 @@ class RadarState:
                 "total_observations": 0, "distinct_icaos": 0,
                 "primary_observations": 0, "secondary_observations": 0,
                 "secondary_icaos": 0, "family_separation_deg": None,
-                "secondary_support_ratio": None,
+                "secondary_support_ratio": None, "family_count": 0,
+                "confidence": None, "enabled": enabled,
+                "dominant_family_id": None, "secondary_family_id": None,
+                "primary_icaos": 0, "primary_spread_deg": None, "secondary_spread_deg": None,
+                "inlier_count": 0, "outlier_count": 0,
             }
 
         period_s = float(getattr(sync, "period_s", 0.0) or 0.0) if sync else 0.0
@@ -6935,7 +6939,11 @@ class RadarState:
                 "total_observations": total_obs, "distinct_icaos": distinct_icaos,
                 "primary_observations": 0, "secondary_observations": 0,
                 "secondary_icaos": 0, "family_separation_deg": None,
-                "secondary_support_ratio": None,
+                "secondary_support_ratio": None, "family_count": 0,
+                "confidence": None, "enabled": enabled,
+                "dominant_family_id": None, "secondary_family_id": None,
+                "primary_icaos": 0, "primary_spread_deg": None, "secondary_spread_deg": None,
+                "inlier_count": 0, "outlier_count": total_obs,
             }
 
         icaos_with_enough = [icao for icao, residuals in by_icao.items()
@@ -6946,7 +6954,11 @@ class RadarState:
                 "total_observations": total_obs, "distinct_icaos": len(icaos_with_enough),
                 "primary_observations": 0, "secondary_observations": 0,
                 "secondary_icaos": 0, "family_separation_deg": None,
-                "secondary_support_ratio": None,
+                "secondary_support_ratio": None, "family_count": 0,
+                "confidence": None, "enabled": enabled,
+                "dominant_family_id": None, "secondary_family_id": None,
+                "primary_icaos": 0, "primary_spread_deg": None, "secondary_spread_deg": None,
+                "inlier_count": 0, "outlier_count": total_obs,
             }
 
         per_icao_median: dict[str, float] = {}
@@ -6964,7 +6976,11 @@ class RadarState:
                 "total_observations": total_obs, "distinct_icaos": len(per_icao_median),
                 "primary_observations": 0, "secondary_observations": 0,
                 "secondary_icaos": 0, "family_separation_deg": None,
-                "secondary_support_ratio": None,
+                "secondary_support_ratio": None, "family_count": 0,
+                "confidence": None, "enabled": enabled,
+                "dominant_family_id": None, "secondary_family_id": None,
+                "primary_icaos": 0, "primary_spread_deg": None, "secondary_spread_deg": None,
+                "inlier_count": 0, "outlier_count": total_obs,
             }
 
         # Find the dominant ICAO by observation count and use its median as
@@ -6980,7 +6996,11 @@ class RadarState:
                 "total_observations": total_obs, "distinct_icaos": len(per_icao_median),
                 "primary_observations": 0, "secondary_observations": 0,
                 "secondary_icaos": 0, "family_separation_deg": None,
-                "secondary_support_ratio": None,
+                "secondary_support_ratio": None, "family_count": 0,
+                "confidence": None, "enabled": enabled,
+                "dominant_family_id": None, "secondary_family_id": None,
+                "primary_icaos": 0, "primary_spread_deg": None, "secondary_spread_deg": None,
+                "inlier_count": 0, "outlier_count": total_obs,
             }
 
         # Build primary cluster: all ICAOs with median within tolerance of
@@ -7008,8 +7028,16 @@ class RadarState:
                 "total_observations": total_obs, "distinct_icaos": len(per_icao_median),
                 "primary_observations": primary_count, "secondary_observations": secondary_count,
                 "secondary_icaos": len(secondary_icaos), "family_separation_deg": None,
-                "secondary_support_ratio": None,
+                "secondary_support_ratio": None, "family_count": 1,
+                "confidence": None, "enabled": enabled,
+                "dominant_family_id": "primary", "secondary_family_id": None,
+                "primary_icaos": len(primary_icaos), "primary_spread_deg": None, "secondary_spread_deg": None,
+                "inlier_count": primary_count + secondary_count, "outlier_count": max(0, total_obs - (primary_count + secondary_count)),
             }
+
+        computable_obs = sum(per_icao_count.values())
+        outlier_count = max(0, total_obs - computable_obs)
+        primary_spread = _circular_mad_deg(primary_medians, primary_center)
 
         secondary_n_icaos = len(secondary_icaos)
         if secondary_n_icaos < self._CONTAMINATION_SECONDARY_MIN_ICAOS:
@@ -7019,6 +7047,10 @@ class RadarState:
                 "primary_observations": primary_count, "secondary_observations": secondary_count,
                 "secondary_icaos": secondary_n_icaos, "family_separation_deg": None,
                 "secondary_support_ratio": round(secondary_count / max(total_obs, 1), 3),
+                "family_count": 1, "confidence": round(primary_count / max(total_obs, 1), 3), "enabled": enabled,
+                "dominant_family_id": "primary", "secondary_family_id": None,
+                "primary_icaos": len(primary_icaos), "primary_spread_deg": primary_spread, "secondary_spread_deg": None,
+                "inlier_count": primary_count + secondary_count, "outlier_count": outlier_count,
             }
 
         if secondary_count < self._CONTAMINATION_SECONDARY_MIN_OBS:
@@ -7028,6 +7060,10 @@ class RadarState:
                 "primary_observations": primary_count, "secondary_observations": secondary_count,
                 "secondary_icaos": secondary_n_icaos, "family_separation_deg": None,
                 "secondary_support_ratio": round(secondary_count / max(total_obs, 1), 3),
+                "family_count": 1, "confidence": round(primary_count / max(total_obs, 1), 3), "enabled": enabled,
+                "dominant_family_id": "primary", "secondary_family_id": None,
+                "primary_icaos": len(primary_icaos), "primary_spread_deg": primary_spread, "secondary_spread_deg": None,
+                "inlier_count": primary_count + secondary_count, "outlier_count": outlier_count,
             }
 
         support_ratio = secondary_count / max(total_obs, 1)
@@ -7038,6 +7074,10 @@ class RadarState:
                 "primary_observations": primary_count, "secondary_observations": secondary_count,
                 "secondary_icaos": secondary_n_icaos, "family_separation_deg": None,
                 "secondary_support_ratio": round(support_ratio, 3),
+                "family_count": 1, "confidence": round(primary_count / max(total_obs, 1), 3), "enabled": enabled,
+                "dominant_family_id": "primary", "secondary_family_id": None,
+                "primary_icaos": len(primary_icaos), "primary_spread_deg": primary_spread, "secondary_spread_deg": None,
+                "inlier_count": primary_count + secondary_count, "outlier_count": outlier_count,
             }
 
         secondary_medians = [per_icao_median[icao] for icao in secondary_icaos]
@@ -7050,6 +7090,10 @@ class RadarState:
                 "primary_observations": primary_count, "secondary_observations": secondary_count,
                 "secondary_icaos": secondary_n_icaos, "family_separation_deg": None,
                 "secondary_support_ratio": round(support_ratio, 3),
+                "family_count": 1, "confidence": round(primary_count / max(total_obs, 1), 3), "enabled": enabled,
+                "dominant_family_id": "primary", "secondary_family_id": None,
+                "primary_icaos": len(primary_icaos), "primary_spread_deg": primary_spread, "secondary_spread_deg": None,
+                "inlier_count": primary_count + secondary_count, "outlier_count": outlier_count,
             }
 
         family_sep = abs(_circular_delta_deg(secondary_center, primary_center) or 0.0)
@@ -7060,6 +7104,10 @@ class RadarState:
                 "primary_observations": primary_count, "secondary_observations": secondary_count,
                 "secondary_icaos": secondary_n_icaos, "family_separation_deg": round(family_sep, 1),
                 "secondary_support_ratio": round(support_ratio, 3),
+                "family_count": 1, "confidence": round(primary_count / max(total_obs, 1), 3), "enabled": enabled,
+                "dominant_family_id": "primary", "secondary_family_id": None,
+                "primary_icaos": len(primary_icaos), "primary_spread_deg": primary_spread, "secondary_spread_deg": None,
+                "inlier_count": primary_count + secondary_count, "outlier_count": outlier_count,
             }
 
         secondary_spread = _circular_mad_deg(secondary_medians, secondary_center)
@@ -7070,7 +7118,16 @@ class RadarState:
                 "primary_observations": primary_count, "secondary_observations": secondary_count,
                 "secondary_icaos": secondary_n_icaos, "family_separation_deg": round(family_sep, 1),
                 "secondary_support_ratio": round(support_ratio, 3),
+                "family_count": 1, "confidence": round(primary_count / max(total_obs, 1), 3), "enabled": enabled,
+                "dominant_family_id": "primary", "secondary_family_id": None,
+                "primary_icaos": len(primary_icaos), "primary_spread_deg": primary_spread, "secondary_spread_deg": secondary_spread,
+                "inlier_count": primary_count + secondary_count, "outlier_count": outlier_count,
             }
+
+        separation_conf = min(1.0, family_sep / max(self._CONTAMINATION_FAMILY_SEPARATION_DEG, 1.0))
+        support_conf = min(1.0, support_ratio / max(self._CONTAMINATION_SECONDARY_SUPPORT_RATIO, 0.001))
+        icao_conf = min(1.0, secondary_n_icaos / max(float(self._CONTAMINATION_SECONDARY_MIN_ICAOS), 1.0))
+        contamination_confidence = round(min(separation_conf, support_conf, icao_conf), 3)
 
         return {
             "state": "contaminated", "reason": f"secondary_family_detected_sep_{family_sep:.1f}deg_{secondary_n_icaos}icaos",
@@ -7078,6 +7135,10 @@ class RadarState:
             "primary_observations": primary_count, "secondary_observations": secondary_count,
             "secondary_icaos": secondary_n_icaos, "family_separation_deg": round(family_sep, 1),
             "secondary_support_ratio": round(support_ratio, 3),
+            "family_count": 2, "confidence": contamination_confidence, "enabled": enabled,
+            "dominant_family_id": "primary", "secondary_family_id": "secondary",
+            "primary_icaos": len(primary_icaos), "primary_spread_deg": primary_spread, "secondary_spread_deg": secondary_spread,
+            "inlier_count": primary_count + secondary_count, "outlier_count": outlier_count,
         }
 
     def _evaluate_phase_authority_gates_locked(self, iid: int, sync: LiveSyncState | None) -> dict:
@@ -8981,6 +9042,7 @@ class RadarState:
             "icao": str(icao),
             "centroid_timestamp_us": float(centroid_timestamp_us),
             "residual_deg": float(residual_deg),
+            "residual_class": classification,
             "residual_basis": "runtime_effective",
             "display_residual_class": display_residual_class,
             "classification": classification,
@@ -8994,6 +9056,7 @@ class RadarState:
                 else (float(residual_deg) if bearing_deg is not None else None)
             ),
             "pos_age_s": float(pos_age_s) if pos_age_s is not None else None,
+            "position_age_s": float(pos_age_s) if pos_age_s is not None else None,
             "aircraft_position_age_s": float(pos_age_s) if pos_age_s is not None else None,
             "n_replies": int(n_replies) if n_replies is not None else None,
             "signal_dbfs": float(signal_dbfs) if signal_dbfs is not None else None,
@@ -9002,6 +9065,7 @@ class RadarState:
             "dominant_family": bool(dominant_family) if dominant_family is not None else bool(sync_update_eligible),
             "refinement_status": sync_snapshot.get("period_refinement_status"),
             "reject_reason": reject_reason,
+            "exclusion_reason": reject_reason,
             "base_period_s": sync_snapshot.get("base_period_s"),
             "period_delta_s": sync_snapshot.get("period_delta_s"),
             "effective_period_s": sync_snapshot.get("effective_period_s"),
@@ -9045,7 +9109,104 @@ class RadarState:
             "event_handoff_state": sync_snapshot.get("handoff_state"),
             "event_handoff_reason": sync_snapshot.get("handoff_reason"),
             "sync_revision": int(sync_revision),
+            "family_id": "unclassified",
+            "family_role": "unclassified",
+            "family_assignment_reason": "pending_stage8_family_assignment",
+            "contamination_state": sync_snapshot.get("contamination_state"),
+            "contamination_reason": sync_snapshot.get("contamination_reason"),
+            "contamination_gate_reason": sync_snapshot.get("contamination_gate_reason"),
         }
+
+    def _annotate_stage8_family_roles(self, iid: int, rows: list[dict]) -> dict:
+        """Annotate rows with per-residual Stage 8 family role diagnostics."""
+        with self._lock:
+            contamination = self._detect_contamination_locked(iid)
+            sync = self._live_sync_states.get(iid)
+        state = str(contamination.get("state") or "insufficient_data")
+        reason = str(contamination.get("reason") or "insufficient_data")
+        gate_reason = (
+            "contamination_detected"
+            if state == "contaminated"
+            else reason
+        )
+        now_ts = time.time()
+        period_s = float(getattr(sync, "period_s", 0.0) or 0.0) if sync else 0.0
+        window_s = self._CONTAMINATION_DETECTION_WINDOW_BASE_S
+        if period_s > 0:
+            window_s = max(period_s * 6.0 * 3.0, self._CONTAMINATION_DETECTION_WINDOW_BASE_S)
+        cutoff_ts = now_ts - window_s
+
+        by_icao: dict[str, list[float]] = defaultdict(list)
+        for row in rows:
+            wall_ts = float(row.get("wall_ts") or 0.0)
+            if wall_ts < cutoff_ts:
+                continue
+            if not bool(row.get("fit_eligible")):
+                continue
+            icao = str(row.get("icao") or "")
+            if not icao or icao == "000000":
+                continue
+            residual = row.get("residual_deg")
+            if not _is_finite_number(residual):
+                continue
+            by_icao[icao].append(float(residual))
+
+        per_icao_median: dict[str, float] = {}
+        per_icao_count: dict[str, int] = {}
+        for icao, residuals in by_icao.items():
+            if len(residuals) < self._CONTAMINATION_PER_ICAO_MIN_OBS:
+                continue
+            med = _median_float(residuals)
+            if med is None:
+                continue
+            per_icao_median[icao] = med
+            per_icao_count[icao] = len(residuals)
+
+        primary_icaos: set[str] = set()
+        secondary_icaos: set[str] = set()
+        if per_icao_median:
+            sorted_icaos = sorted(per_icao_median, key=lambda icao: per_icao_count[icao], reverse=True)
+            primary_seed = per_icao_median[sorted_icaos[0]]
+            for icao in per_icao_median:
+                delta = abs(_circular_delta_deg(per_icao_median[icao], primary_seed) or 0.0)
+                if delta <= self._CONTAMINATION_PRIMARY_TOLERANCE_DEG:
+                    primary_icaos.add(icao)
+                else:
+                    secondary_icaos.add(icao)
+
+        for row in rows:
+            row["contamination_state"] = state
+            row["contamination_reason"] = reason
+            row["contamination_gate_reason"] = gate_reason
+            row["dominant_family"] = bool(row.get("sync_update_eligible", False))
+            row["classifier_input"] = bool(row.get("fit_eligible", False))
+            row["chart_only_diagnostic"] = not bool(row.get("fit_eligible", False))
+            row["exclusion_reason"] = (
+                str(row.get("reject_reason") or "not_fit_eligible")
+                if not bool(row.get("fit_eligible", False))
+                else None
+            )
+
+            icao = str(row.get("icao") or "")
+            if not bool(row.get("fit_eligible", False)):
+                row["family_id"] = "unclassified"
+                row["family_role"] = "unclassified"
+                row["family_assignment_reason"] = "not_fit_eligible_for_stage8"
+                continue
+            if icao in primary_icaos:
+                row["family_id"] = "primary"
+                row["family_role"] = "dominant"
+                row["family_assignment_reason"] = "icao_median_within_primary_tolerance"
+                continue
+            if icao in secondary_icaos:
+                row["family_id"] = "secondary"
+                row["family_role"] = "secondary"
+                row["family_assignment_reason"] = "icao_median_outside_primary_tolerance"
+                continue
+            row["family_id"] = "unclassified"
+            row["family_role"] = "outlier"
+            row["family_assignment_reason"] = "insufficient_icao_support_or_missing_median"
+        return contamination
 
     def _build_recorded_event_diagnostics(
         self,
@@ -11721,6 +11882,8 @@ class RadarState:
             latest_arrival_us=latest_arrival_us_for_iid,
             window_s=window_s,
         )
+        self._annotate_stage8_family_roles(iid, residual_events)
+        self._annotate_stage8_family_roles(iid, recorded_df11_residual_observations)
         projection_basis_options = [
             {
                 "id": "recorded_event_basis",

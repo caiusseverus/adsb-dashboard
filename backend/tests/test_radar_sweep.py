@@ -236,6 +236,163 @@ def test_reinforce_radar_characteristics_does_not_grow_support_without_direct_co
     assert iid_model.primary_support_count == 3
 
 
+def _mk_sync_for_event_history(iid: int) -> LiveSyncState:
+    sync = LiveSyncState(
+        iid=iid,
+        period_s=4.0,
+        phase_epoch_us=1000.0,
+        phase_offset_deg=10.0,
+        sync_quality=0.8,
+        sync_jitter_deg=1.0,
+        last_sync_update_ts=time.time(),
+        source="go_frame_sync",
+        usable=True,
+    )
+    sync.handoff_state = "GO_REFINING"
+    sync.handoff_reason = "slope_not_converged"
+    sync.go_operational_blocking_gate = "go_readiness.go_slope_converged"
+    sync.sync_authority = "py_bootstrap"
+    sync.period_authority = "py_base"
+    sync.effective_period_source = "base"
+    sync.phase_basis = "sweep_epoch_only"
+    sync.phase_authority = "py_bootstrap"
+    sync.phase_is_absolute = False
+    sync.holdover = False
+    return sync
+
+
+def test_sync_event_history_records_core_gate_and_epoch_changes():
+    state = RadarState()
+    iid = 20
+    sync = _mk_sync_for_event_history(iid)
+    with state._lock:
+        state._live_sync_states[iid] = sync
+        state._go_sync_states_by_iid[iid] = {
+            "fit_epoch_id": 1,
+            "fit_epoch_reset_reason": "init",
+            "slope_not_converged_subreason": "regression_not_decreasing",
+            "holdover": False,
+            "go_sync_usable_strict_gate_pass": True,
+        }
+        state._record_sync_convergence_events_locked(iid)
+        state._go_sync_states_by_iid[iid]["fit_epoch_id"] = 2
+        state._go_sync_states_by_iid[iid]["fit_epoch_reset_reason"] = "phase_offset_discontinuity_rebased_gradual_drift"
+        state._go_sync_states_by_iid[iid]["slope_not_converged_subreason"] = "recent_reset_or_rebase"
+        state._record_sync_convergence_events_locked(iid)
+    events = state.get_sync_event_history(iid, limit=20)
+    event_types = [event["event_type"] for event in events]
+    assert "fit_epoch_id" in event_types
+    assert "fit_epoch_reset_reason" in event_types
+    assert "slope_not_converged_subreason" in event_types
+
+
+def test_sync_event_history_records_holdover_enter_and_exit():
+    state = RadarState()
+    iid = 42
+    sync = _mk_sync_for_event_history(iid)
+    with state._lock:
+        state._live_sync_states[iid] = sync
+        state._go_sync_states_by_iid[iid] = {"holdover": False}
+        state._record_sync_convergence_events_locked(iid)
+        sync.holdover = True
+        state._go_sync_states_by_iid[iid]["holdover"] = True
+        state._record_sync_convergence_events_locked(iid)
+        sync.holdover = False
+        state._go_sync_states_by_iid[iid]["holdover"] = False
+        state._record_sync_convergence_events_locked(iid)
+    holdover_events = [event for event in state.get_sync_event_history(iid, limit=20) if event["event_type"] == "holdover"]
+    assert len(holdover_events) >= 2
+    assert {event["new_value"] for event in holdover_events} >= {True, False}
+
+
+def test_sync_event_history_respects_max_length():
+    state = RadarState()
+    iid = 52
+    sync = _mk_sync_for_event_history(iid)
+    with state._lock:
+        state._SYNC_EVENT_HISTORY_MAX = 5
+        state._live_sync_states[iid] = sync
+        state._go_sync_states_by_iid[iid] = {"fit_epoch_id": 0}
+        state._record_sync_convergence_events_locked(iid)
+        for idx in range(1, 15):
+            state._go_sync_states_by_iid[iid]["fit_epoch_id"] = idx
+            state._record_sync_convergence_events_locked(iid)
+    events = state.get_sync_event_history(iid, limit=100)
+    assert len(events) == 5
+
+
+def test_shadow_monitor_does_not_change_handoff_state():
+    state = RadarState()
+    iid = 99
+    sync = _mk_sync_for_event_history(iid)
+    before_state = sync.handoff_state
+    before_reason = sync.handoff_reason
+    with state._lock:
+        state._live_sync_states[iid] = sync
+        state._go_sync_states_by_iid[iid] = {
+            "fit_observation_count": 256,
+            "fit_icao_count": 56,
+            "fit_span_s": 60.0,
+            "go_sync_usable_strict_gate_pass": True,
+            "holdover": False,
+            "slope_near_zero_window_pass": False,
+            "slope_regression_pass": False,
+            "slope_near_zero_fail_reason": "near_zero_window_short",
+            "slope_regression_fail_reason": "regression_not_decreasing",
+            "last_update_epoch_residual_deg": 10.0,
+        }
+        state._live_period_update_history[iid] = deque(
+            [
+                {"ts": time.time() - 5.0, "retained_go_delta_s": 0.001, "proposed_delta_s": 0.001, "applied_delta_s": 0.001},
+                {"ts": time.time(), "retained_go_delta_s": 0.002, "proposed_delta_s": 0.002, "applied_delta_s": 0.002},
+            ],
+            maxlen=sweep._SYNC_DIAGNOSTIC_HISTORY_MAX,
+        )
+        state._append_go_sync_diagnostic_history_locked(
+            iid,
+            msg={"ts": time.time(), "fw": 30.0, "dw": 60.0, "fs": 60.0, "ft": 256, "fe": 256, "fc": 56, "rs": 0.1},
+            sync=sync,
+        )
+    assert sync.handoff_state == before_state
+    assert sync.handoff_reason == before_reason
+
+
+def test_shadow_safe_candidate_classification():
+    klass = RadarState._classify_shadow_delta_freeze_safety(
+        strict_ok=True,
+        support_ok=True,
+        holdover=False,
+        transition_contaminated=False,
+        residual_abs=12.0,
+        hard_reject_streak=0,
+    )
+    assert klass == "safe_candidate"
+
+
+def test_shadow_unsafe_residual_classification():
+    klass = RadarState._classify_shadow_delta_freeze_safety(
+        strict_ok=True,
+        support_ok=True,
+        holdover=False,
+        transition_contaminated=False,
+        residual_abs=90.0,
+        hard_reject_streak=0,
+    )
+    assert klass == "unsafe_residual_risk"
+
+
+def test_shadow_transition_contaminated_classification():
+    klass = RadarState._classify_shadow_delta_freeze_safety(
+        strict_ok=True,
+        support_ok=True,
+        holdover=False,
+        transition_contaminated=True,
+        residual_abs=10.0,
+        hard_reject_streak=0,
+    )
+    assert klass == "transition_contaminated"
+
+
 def test_reset_iid_clears_in_memory_learning_state():
     state = RadarState()
     state._iid_events = deque([
@@ -601,6 +758,13 @@ def test_burst_residual_recorded_events_are_immutable_across_period_change(monke
     assert recorded[0]["event_effective_period_s"] == pytest.approx(4.0)
     assert recorded[1]["event_effective_period_s"] == pytest.approx(5.0)
     assert recorded[0]["event_period_authority"] == recorded[0]["period_authority"]
+    assert "residual_class" in recorded[0]
+    assert "family_id" in recorded[0]
+    assert "family_role" in recorded[0]
+    assert "family_assignment_reason" in recorded[0]
+    assert "contamination_state" in recorded[0]
+    assert "contamination_reason" in recorded[0]
+    assert "contamination_gate_reason" in recorded[0]
     assert recorded[0]["event_sync_authority"] == recorded[0]["sync_authority"]
     assert recorded[0]["event_handoff_state"] == recorded[0]["handoff_state"]
     assert recorded[0]["residual_deg"] == pytest.approx(first_recorded["residual_deg"])

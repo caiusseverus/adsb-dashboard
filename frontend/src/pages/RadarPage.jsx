@@ -28,6 +28,9 @@ import {
   selectCurrentSyncState,
   isWindowedPopulationAnchorMismatch,
   formatHardResidualRejectCounters,
+  formatOperationalBlocker,
+  classifyResidualDiagnosticRow,
+  summarizeResidualDiagnostics,
 } from '../utils/radarSync'
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:8000'
@@ -3057,7 +3060,7 @@ function RotationAlignmentPanel({
 }) {
   const [alignmentMode, setAlignmentMode] = useState(BURST_SYNC_VIEW_MODE_RESIDUALS)
   const [residualChartMode, setResidualChartMode] = useState(RESIDUAL_CHART_MODE_RECORDED)
-  const [syncDrivingOnlyMode, setSyncDrivingOnlyMode] = useState('all')
+  const [syncDrivingOnlyMode, setSyncDrivingOnlyMode] = useState('sync')
   const [showDf11Overlay, setShowDf11Overlay] = useState('show')
   const [resetting, setResetting] = useState(false)
   const [refOverride, setRefOverride] = useState(null)
@@ -3128,6 +3131,10 @@ function RotationAlignmentPanel({
   const legacyIcaosRaw = Array.isArray(legacyTimeline?.icaos) ? legacyTimeline.icaos : []
   const syncState = selectCurrentSyncState(syncSnapshot, burstTimeline)
   const hardRejectCounters = formatHardResidualRejectCounters(syncState)
+  const operationalBlocker = useMemo(
+    () => formatOperationalBlocker(syncState),
+    [syncState],
+  )
   const phaseIdentity = useMemo(() => ({
     source: syncSnapshot?.transport?.source ?? 'compact_sync_snapshot',
     syncSequence: syncSnapshot?.sequence ?? streamStatus.sequence ?? null,
@@ -3268,11 +3275,8 @@ function RotationAlignmentPanel({
     const sampleUs = Number(obs?.beam_center_us ?? 0)
     if (!Number.isFinite(sampleUs) || sampleUs < windowStartUs || sampleUs > windowEndUs) return false
     if (selectedIcao && obs?.icao !== selectedIcao) return false
-    if (syncDrivingOnlyMode === 'sync' && !(
-      obs.sync_update_eligible === true
-      && obs.fit_eligible === true
-      && obs.event_kind === 'burst'
-    )) return false
+    const meta = classifyResidualDiagnosticRow(obs)
+    if (syncDrivingOnlyMode === 'sync' && !meta.classifierInput) return false
     return true
   })
   const activeProjectionOption = projectionBasisOptions.find(option => option?.id === activeRecomputedBasis)
@@ -3288,7 +3292,7 @@ function RotationAlignmentPanel({
   const inlierCount = filteredObservations.filter(obs => obs.classification === 'inlier').length
   const softCount = filteredObservations.filter(obs => obs.classification === 'soft').length
   const rejectedCount = filteredObservations.filter(obs => obs.classification === 'rejected').length
-  const syncDrivingCount = filteredObservations.filter(obs => obs?.sync_update_eligible === true && obs?.fit_eligible === true && obs?.event_kind === 'burst').length
+  const syncDrivingCount = filteredObservations.filter(obs => classifyResidualDiagnosticRow(obs).classifierInput).length
   const nonSyncDrivingCount = filteredObservations.length - syncDrivingCount
   // Full-population counts (before syncDrivingOnlyMode filter)
   const allFilteredObs = observations.filter(obs => {
@@ -3300,8 +3304,8 @@ function RotationAlignmentPanel({
   const fullInlierCount = allFilteredObs.filter(obs => obs.classification === 'inlier').length
   const fullSoftCount = allFilteredObs.filter(obs => obs.classification === 'soft').length
   const fullRejectedCount = allFilteredObs.filter(obs => obs.classification === 'rejected').length
-  const fullNonSyncBurstCount = allFilteredObs.filter(obs => obs?.sync_update_eligible === false || obs?.fit_eligible === false || obs?.event_kind !== 'burst').length
-  const fullSyncFitCount = allFilteredObs.filter(obs => obs?.sync_update_eligible === true && obs?.fit_eligible === true && obs?.event_kind === 'burst').length
+  const fullNonSyncBurstCount = allFilteredObs.filter(obs => !classifyResidualDiagnosticRow(obs).classifierInput).length
+  const fullSyncFitCount = allFilteredObs.filter(obs => classifyResidualDiagnosticRow(obs).classifierInput).length
   const fullDfEarlyCount = allDf11ResidualDots.filter(dot => dot.timing_class === 'early').length
   const fullDfOnTimeCount = allDf11ResidualDots.filter(dot => dot.timing_class === 'on_time').length
   const fullDfLateCount = allDf11ResidualDots.filter(dot => dot.timing_class === 'late').length
@@ -3336,6 +3340,10 @@ function RotationAlignmentPanel({
   const dfEarlyCount = visibleDf11ResidualDots.filter(dot => dot.timing_class === 'early').length
   const dfOnTimeCount = visibleDf11ResidualDots.filter(dot => dot.timing_class === 'on_time').length
   const dfLateCount = visibleDf11ResidualDots.filter(dot => dot.timing_class === 'late').length
+  const residualDiagSummary = useMemo(
+    () => summarizeResidualDiagnostics(allFilteredObs, allDf11ResidualDots),
+    [allFilteredObs, allDf11ResidualDots],
+  )
   const sortedLegacyIcaos = useMemo(() => [...legacyIcaosRaw].sort((a, b) => {
     if ((b.arrivals_us?.length ?? 0) !== (a.arrivals_us?.length ?? 0)) {
       return (b.arrivals_us?.length ?? 0) - (a.arrivals_us?.length ?? 0)
@@ -3743,6 +3751,47 @@ function RotationAlignmentPanel({
           <span className={styles.metricPill}>
             Period <span className={styles.metricValue}>{shownPeriodS != null ? `${shownPeriodS.toFixed(4)}s` : '—'}</span>
           </span>
+          <div
+            style={{
+              flexBasis: '100%',
+              border: '1px solid #30363d',
+              borderRadius: '8px',
+              padding: '0.6rem 0.7rem',
+              background: '#0f141b',
+            }}
+          >
+            <div style={{ color: '#8b949e', fontSize: '0.72rem', marginBottom: '4px' }}>Why not operational?</div>
+            <div style={{ display: 'flex', gap: '0.55rem', alignItems: 'center', flexWrap: 'wrap' }}>
+              <span className={styles.metricPill} style={{ margin: 0 }}>
+                Primary reason <span className={styles.metricValue}>{operationalBlocker.title}</span>
+              </span>
+              <span style={{ color: '#c9d1d9', fontSize: '0.8rem' }}>{operationalBlocker.explanation}</span>
+            </div>
+            <div style={{ display: 'flex', gap: '0.45rem', flexWrap: 'wrap', marginTop: '0.45rem' }}>
+              {operationalBlocker.facts.map((fact, idx) => (
+                <span key={`${fact.label}-${idx}`} className={styles.metricPill} style={{ margin: 0 }}>
+                  {fact.label} <span className={styles.metricValue}>{fact.value}</span>
+                </span>
+              ))}
+            </div>
+            <details style={{ marginTop: '0.45rem' }}>
+              <summary style={{ cursor: 'pointer', color: '#8b949e', fontSize: '0.75rem' }}>Raw diagnostics</summary>
+              <pre
+                style={{
+                  marginTop: '0.4rem',
+                  padding: '0.5rem',
+                  border: '1px solid #21262d',
+                  borderRadius: '6px',
+                  background: '#0b1016',
+                  color: '#8b949e',
+                  fontSize: '0.7rem',
+                  overflowX: 'auto',
+                }}
+              >
+                {JSON.stringify(operationalBlocker.raw ?? {}, null, 2)}
+              </pre>
+            </details>
+          </div>
           {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS && residualChartMode === RESIDUAL_CHART_MODE_RECOMPUTED && (
             <span className={styles.metricPill} style={{ color: '#d29922' }}>
               Recomputed current projection
@@ -3919,12 +3968,14 @@ function RotationAlignmentPanel({
           </span>
           {alignmentMode === BURST_SYNC_VIEW_MODE_RESIDUALS ? (
             <>
-              <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#3fb950' }} />Burst inlier</span>
-              <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#d29922' }} />Burst soft</span>
-              <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#ff7b72' }} />Burst rejected</span>
-              <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#58a6ff' }} />DF11 early</span>
+              <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#3fb950' }} />Burst inlier (classifier-fit)</span>
+              <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#d29922' }} />Burst soft (diagnostic)</span>
+              <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#ff7b72' }} />Burst rejected (diagnostic)</span>
+              <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#58a6ff' }} />DF11 early (diagnostic-only)</span>
               <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#3fb950' }} />DF11 on time</span>
-              <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#ff7b72' }} />DF11 late</span>
+              <span className={styles.legendChip}><span style={{ ...legendDotStyle, background: '#ff7b72' }} />DF11 late (diagnostic-only)</span>
+              <span className={styles.legendChip}><span style={{ ...legendDotStyle, border: '1px solid #ffd166', background: '#3fb950' }} />Stage 8 dominant family</span>
+              <span className={styles.legendChip}><span style={{ ...legendDotStyle, border: '1px solid #ffd166', background: '#d29922' }} />Stage 8 secondary/outlier</span>
             </>
           ) : (
             <>
@@ -4148,10 +4199,10 @@ function RotationAlignmentPanel({
                           cy={residualToY(Number(dot.residual_deg ?? 0))}
                           r={1.9}
                           fill={timingClassColor(dot.timing_class)}
-                          opacity={0.62}
+                          opacity={0.35}
                         >
                           <title>
-                            {`${dot.icao ?? 'DF11'} ${(dot.timing_class ?? '').replace('_', ' ')} ${displayedResidualBasis} residual ${Number(dot.residual_deg ?? 0).toFixed(2)}°`}
+                            {`${dot.icao ?? 'DF11'} ${(dot.timing_class ?? '').replace('_', ' ')} ${displayedResidualBasis} residual ${Number(dot.residual_deg ?? 0).toFixed(2)}° | classifier input: no | sync update eligible: ${dot?.sync_update_eligible === true ? 'yes' : 'no'} | fit eligible: ${dot?.fit_eligible === true ? 'yes' : 'no'} | family ${dot?.family_id ?? 'unknown'} / ${dot?.family_role ?? 'unknown'} | reject ${dot?.reject_reason ?? dot?.exclusion_reason ?? 'n/a'} | residual class ${dot?.residual_class ?? dot?.display_residual_class ?? 'unknown'} | stage8 ${dot?.contamination_state ?? 'unknown'} (${dot?.contamination_reason ?? 'unknown'})`}
                           </title>
                         </circle>
                       ))
@@ -4161,7 +4212,13 @@ function RotationAlignmentPanel({
                     const displayedResidual = burstResidualValue(obs)
                     const y = residualToY(displayedResidual)
                     const weight = Number(obs.weight ?? 0)
-                    const syncEligible = obs?.sync_update_eligible === true && obs?.fit_eligible === true && obs?.event_kind === 'burst'
+                    const rowMeta = classifyResidualDiagnosticRow(obs)
+                    const syncEligible = rowMeta.classifierInput
+                    const familyAccent = rowMeta.familyRole === 'dominant'
+                      ? '#3fb950'
+                      : (rowMeta.familyRole === 'secondary' || rowMeta.familyRole === 'outlier')
+                        ? '#d29922'
+                        : null
                     const radiusBase = syncEligible ? 2.7 : 2.1
                     const radius = Math.max(radiusBase, Math.min(5.4, radiusBase + weight * 2.2))
                     return (
@@ -4171,12 +4228,12 @@ function RotationAlignmentPanel({
                         cy={y}
                         r={radius}
                         fill={burstSyncClassColor(obs.classification)}
-                        opacity={syncEligible ? 0.9 : 0.6}
-                        stroke={selectedIcao === obs.icao ? '#ffd166' : syncEligible ? 'none' : '#30363d'}
-                        strokeWidth={selectedIcao === obs.icao ? 1.2 : syncEligible ? 0 : 0.8}
+                        opacity={syncEligible ? 0.92 : 0.45}
+                        stroke={selectedIcao === obs.icao ? '#ffd166' : (familyAccent ?? (syncEligible ? 'none' : '#30363d'))}
+                        strokeWidth={selectedIcao === obs.icao ? 1.2 : (familyAccent ? 1.1 : (syncEligible ? 0 : 0.8))}
                       >
                         <title>
-                          {`${obs.icao} ${burstResidualLabel} ${Number(displayedResidual ?? 0).toFixed(2)}° | predicted ${Number(obs.predicted_deg ?? 0).toFixed(1)}° | replies ${obs.n_replies ?? 0}${syncEligible ? '' : ' | non-sync-driving'}${
+                          {`${obs.icao} ${burstResidualLabel} ${Number(displayedResidual ?? 0).toFixed(2)}° | predicted ${Number(obs.predicted_deg ?? 0).toFixed(1)}° | replies ${obs.n_replies ?? 0} | classifier input: ${rowMeta.classifierInput ? 'yes' : 'no'} | sync update eligible: ${rowMeta.syncUpdateEligible ? 'yes' : 'no'} | fit eligible: ${rowMeta.fitEligible ? 'yes' : 'no'} | family ${rowMeta.familyId}/${rowMeta.familyRole} | reject ${rowMeta.rejectReason ?? rowMeta.exclusionReason ?? 'n/a'} | residual class ${rowMeta.residualClass} | stage8 ${rowMeta.contaminationState} (${rowMeta.contaminationReason})${
                             residualChartMode === RESIDUAL_CHART_MODE_RECORDED
                               ? ` | event authority ${formatAuthorityLabel(obs.event_period_authority ?? obs.period_authority)} / ${formatAuthorityLabel(obs.event_sync_authority ?? obs.sync_authority)} | event handoff ${formatAuthorityLabel(obs.event_handoff_state ?? obs.handoff_state)} | event effective ${fmtNumber(obs.event_effective_period_s ?? obs.effective_period_s, 4, 's')} | event Δ ${fmtNumber((obs.event_period_delta_s ?? obs.period_delta_s) != null ? Number(obs.event_period_delta_s ?? obs.period_delta_s) * 1000 : null, 3, 'ms')}`
                               : ''
@@ -4209,6 +4266,15 @@ function RotationAlignmentPanel({
                     {' · '}Sync-fit only: {syncDrivingCount} of {fullInlierCount + fullSoftCount + fullRejectedCount} burst points · {fullNonSyncBurstCount} excluded diagnostics · {fullDfOnTimeCount + fullDfEarlyCount + fullDfLateCount} DF11 hidden
                   </>
                 )}
+              </div>
+              <div style={{ fontSize: '0.74rem', color: '#8b949e', marginTop: '0.3rem', textAlign: 'center' }}>
+                Classifier inputs {residualDiagSummary.classifierInputs} · Chart-only diagnostics {residualDiagSummary.chartOnlyDiagnostics}
+                {` · DF11 early/late diagnostics ${residualDiagSummary.df11Early + residualDiagSummary.df11Late}`}
+                {` · Stage 8 ${residualDiagSummary.contaminationState} (${residualDiagSummary.contaminationReason})`}
+                {` · Families dominant ${residualDiagSummary.dominantFamilyCount} secondary ${residualDiagSummary.secondaryFamilyCount} outlier ${residualDiagSummary.outlierFamilyCount}`}
+              </div>
+              <div style={{ fontSize: '0.70rem', color: '#8b949e', marginTop: '0.2rem', textAlign: 'center' }}>
+                Large DF11 early/late bands are diagnostic only and are not used for Stage 8 contamination classification.
               </div>
               {allFilteredObs.length + allDf11ResidualDots.length > 0 && (
                 <div style={{ color: '#8b949e', fontSize: '0.66rem', marginTop: '2px', display: 'flex', flexWrap: 'wrap', gap: '8px' }}>

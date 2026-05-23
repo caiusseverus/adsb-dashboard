@@ -7,6 +7,9 @@ import {
   selectCurrentSyncState,
   isWindowedPopulationAnchorMismatch,
   formatHardResidualRejectCounters,
+  formatOperationalBlocker,
+  classifyResidualDiagnosticRow,
+  summarizeResidualDiagnostics,
 } from './radarSync.js'
 
 describe('radarSync', () => {
@@ -123,6 +126,164 @@ describe('radarSync', () => {
       })
       assert.strictEqual(counters.primaryLabel, '2 consecutive / 9 epoch-reject total')
       assert.strictEqual(counters.holdoverLabel, '4')
+    })
+  })
+
+  describe('formatOperationalBlocker', () => {
+    it('formats active state', () => {
+      const result = formatOperationalBlocker({ go_operational_active: true, handoff_state: 'GO_REFINED' })
+      assert.strictEqual(result.category, 'operational active')
+      assert.match(result.explanation, /Operational:/)
+    })
+
+    it('formats holdover/reacquire blocked', () => {
+      const result = formatOperationalBlocker({
+        holdover: true,
+        holdover_reason: 'holdover_sync_invalid',
+        holdover_exit_first_failed_gate: 'reacquire_fit_support',
+        go_diagnostic_reacquire_support_obs_count: 4,
+        go_diagnostic_reacquire_support_icao_count: 1,
+      })
+      assert.strictEqual(result.category, 'holdover/reacquire blocked')
+      assert.match(result.explanation, /Holdover:/)
+    })
+
+    it('does not prioritize stale holdover diagnostics over current hysteresis blocker', () => {
+      const result = formatOperationalBlocker({
+        holdover: false,
+        go_operational_blocking_gate: 'go_readiness_hysteresis',
+        handoff_reason: 'go_ready_hysteresis_not_started',
+        holdover_reason: 'holdover_sync_invalid',
+        holdover_exit_first_failed_gate: 'reacquire_valid_ref_icao',
+      })
+      assert.strictEqual(result.category, 'hysteresis pending / not started')
+      assert.match(result.explanation, /Hysteresis not started:/)
+    })
+
+    it('keeps holdover blocker when current gate is go_not_holdover', () => {
+      const result = formatOperationalBlocker({
+        holdover: false,
+        go_operational_blocking_gate: 'go_not_holdover',
+        holdover_reason: 'holdover_sync_invalid',
+        holdover_exit_first_failed_gate: 'reacquire_valid_ref_icao',
+      })
+      assert.strictEqual(result.category, 'holdover/reacquire blocked')
+      assert.match(result.explanation, /Holdover:/)
+    })
+
+    it('formats slope blocked', () => {
+      const result = formatOperationalBlocker({
+        handoff_reason: 'slope_not_converged',
+        slope_regression_fail_reason: 'regression_trend_not_decreasing',
+      })
+      assert.strictEqual(result.category, 'slope not converged')
+      assert.match(result.explanation, /Slope not converged:/)
+    })
+
+    it('formats sync unusable', () => {
+      const result = formatOperationalBlocker({
+        go_sync_unusable_reason: 'strict_gate_fail',
+        strict_gate_pass: false,
+      })
+      assert.strictEqual(result.category, 'sync unusable')
+      assert.match(result.explanation, /Sync unusable:/)
+    })
+
+    it('formats hysteresis pending', () => {
+      const result = formatOperationalBlocker({
+        handoff_reason: 'go_ready_pending_hysteresis',
+        go_operational_ready_streak: 2,
+        go_operational_promotion_threshold: 4,
+      })
+      assert.strictEqual(result.category, 'hysteresis pending / not started')
+      assert.match(result.explanation, /Hysteresis pending:/)
+    })
+
+    it('formats bootstrap/icao blocked', () => {
+      const result = formatOperationalBlocker({
+        go_operational_blocking_gate: 'go_readiness.contributing_icaos',
+        go_diagnostic_fit_icao_count: 1,
+      })
+      assert.strictEqual(result.category, 'insufficient contributing ICAOs / Python base')
+      assert.match(result.explanation, /Bootstrap:/)
+    })
+
+    it('formats non-geographic phase', () => {
+      const result = formatOperationalBlocker({
+        localisation_safe_phase: false,
+        phase_basis: 'anchor_relative',
+        phase_is_absolute: false,
+      })
+      assert.strictEqual(result.category, 'geographic phase not localisation-safe')
+      assert.match(result.explanation, /Phase not localisation-safe:/)
+    })
+
+    it('falls back to unknown', () => {
+      const result = formatOperationalBlocker({
+        handoff_state: 'GO_REFINING',
+        handoff_reason: 'mystery_blocker',
+      })
+      assert.strictEqual(result.category, 'unknown')
+      assert.match(result.explanation, /Unknown blocker:/)
+    })
+  })
+
+  describe('classifyResidualDiagnosticRow', () => {
+    it('labels classifier input rows as classifier_input', () => {
+      const row = classifyResidualDiagnosticRow({
+        event_kind: 'burst',
+        fit_eligible: true,
+        classifier_input: true,
+        family_id: 'primary',
+        family_role: 'dominant',
+      })
+      assert.strictEqual(row.classifierInput, true)
+      assert.strictEqual(row.group, 'classifier_input')
+      assert.strictEqual(row.familyRole, 'dominant')
+    })
+
+    it('labels DF11 rows as diagnostic-only when not fit eligible', () => {
+      const row = classifyResidualDiagnosticRow({
+        event_kind: 'df11',
+        display_residual_class: 'df11_late',
+        fit_eligible: false,
+      })
+      assert.strictEqual(row.classifierInput, false)
+      assert.strictEqual(row.chartOnlyDiagnostic, true)
+      assert.strictEqual(row.group, 'df11_diagnostic')
+    })
+
+    it('fails safely on missing fields', () => {
+      const row = classifyResidualDiagnosticRow({})
+      assert.strictEqual(row.group, 'chart_only_diagnostic')
+      assert.strictEqual(row.familyId, 'unknown')
+      assert.strictEqual(row.familyRole, 'unknown')
+      assert.strictEqual(row.contaminationState, 'unknown')
+    })
+  })
+
+  describe('summarizeResidualDiagnostics', () => {
+    it('summarizes family and df11 diagnostics counts', () => {
+      const summary = summarizeResidualDiagnostics(
+        [
+          { event_kind: 'burst', fit_eligible: true, classifier_input: true, family_role: 'dominant', contamination_state: 'insufficient_data', contamination_reason: 'x' },
+          { event_kind: 'burst', fit_eligible: false, chart_only_diagnostic: true, family_role: 'outlier' },
+          { event_kind: 'burst', fit_eligible: true, family_role: 'secondary' },
+        ],
+        [
+          { timing_class: 'early' },
+          { timing_class: 'late' },
+          { timing_class: 'on_time' },
+        ],
+      )
+      assert.strictEqual(summary.classifierInputs, 2)
+      assert.strictEqual(summary.chartOnlyDiagnostics, 1)
+      assert.strictEqual(summary.df11Early, 1)
+      assert.strictEqual(summary.df11Late, 1)
+      assert.strictEqual(summary.dominantFamilyCount, 1)
+      assert.strictEqual(summary.secondaryFamilyCount, 1)
+      assert.strictEqual(summary.outlierFamilyCount, 1)
+      assert.strictEqual(summary.contaminationState, 'insufficient_data')
     })
   })
 })

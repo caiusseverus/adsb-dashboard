@@ -218,6 +218,71 @@
 
 - [x] Compare raw sync-snapshot payload vs compact extraction for representative live rows and confirm mismatch source.
 - [x] Fix compact extraction mapping to read blocker/quality/strict/quarantine fields from current `sync_state` paths with explicit alias fallbacks.
+
+## 2026-05-23 Stage 8 Per-Residual Family Capture/Replay Artifacts
+
+- [x] Run GitNexus impact analysis for Stage 8 residual-event capture/replay symbols and record blast radius/risk (note any index coverage gaps).
+- [x] Add debug-only per-residual family capture fields onto recorded residual events with bounded caps (per-IID, per-run, selected-IID filtering) and no policy/threshold behavior changes.
+- [x] Add capture script support for residual-family export mode and artifact output paths.
+- [x] Add replay validator tool that recomputes Stage 8 family classification evidence from captured per-residual rows and emits per-IID decomposition/report summaries.
+- [x] Add tests for required capture fields, cap enforcement, replay consistency, and chart-only diagnostics exclusion from classifier input.
+- [x] Run targeted backend/tool tests and validate diagnostics-disabled non-regression behavior.
+- [x] Run 10–15 minute capture for IID 33 + IID 20 (if active) + one clean comparator IID and generate replay summaries.
+- [x] Answer IID 33-specific contamination/classifier-vs-chart questions from generated artifacts.
+- [x] Add review summary with artifact paths, decomposition findings, and recommendation.
+
+### Review
+- GitNexus impact:
+  - `tools/radar_sync_capture.py:run_capture` impact risk `LOW` (direct caller `main` only).
+  - `backend/radar/sweep.py` symbol-level impact unavailable: GitNexus analyzer scope extraction currently fails for `sweep.py`, so symbol index coverage is incomplete in this repo state.
+- Implementation:
+  - Added per-residual family fields/aliases in recorded residual event payloads and Stage 8 row role attribution (`family_id`, `family_role`, `family_assignment_reason`, `classifier_input`, `chart_only_diagnostic`, contamination fields).
+  - Added bounded residual-family capture mode to `tools/radar_sync_capture.py` with `--selected-iids`, `--per-iid-cap`, `--run-cap`.
+  - Added replay summarizer `tools/stage8_family_replay.py`.
+- Tests:
+  - `uv run --directory backend pytest tests/test_radar_sync_capture.py tests/test_stage8_family_replay.py tests/test_radar_sweep.py -q` -> `280 passed`.
+- Artifacts:
+  - Capture: `tasks/radar_sync_baseline/sync_capture_all_stage8_family_capture_20260523_20260523T144925Z.ndjson`
+  - Replay summary: `tasks/radar_sync_baseline/stage8_family_replay_summary_20260523T1459Z.json`
+- Live decomposition highlights:
+  - IID 33: `contamination_state=insufficient_data`, `secondary_family_count=0`; dominant fit-classified rows are primary burst rows, while DF11 early/late rows are non-fit diagnostic/chart-only rows.
+  - IID 20: `contamination_state=insufficient_data`, `secondary_family_count=0`.
+  - IID 3 comparator: `contamination_state=single_family`; secondary-labeled rows present but separation remains below contamination threshold and does not classify as contaminated.
+- Recommendation:
+  - Keep Stage 8 default-on.
+  - Improve diagnostics labeling/visibility for chart-only rows vs classifier-input rows (especially DF11 early/late bands) to reduce IID 33-style ambiguity.
+
+## 2026-05-23 Residual Chart Labeling/Segregation For Stage 8 Diagnostics
+
+- [x] Run GitNexus impact analysis for frontend residual chart symbols before edit and record risk.
+- [x] Add frontend row classification helper for Stage 8 residual diagnostics labels and fail-safe unknown handling.
+- [x] Update residual chart rendering to visually segregate classifier-input rows vs chart-only diagnostics, including DF11 diagnostic muting/toggle semantics.
+- [x] Expand per-point tooltip metadata with classifier/sync/fit/family/exclusion/contamination fields.
+- [x] Add compact chart summary text for classifier inputs, diagnostics, DF11 bands, Stage 8 state/family counts, and explicit diagnostic-only disclaimer.
+- [x] Add/update frontend unit tests for classification helper behavior and missing-field safety.
+- [x] Run frontend tests/build and add review notes with IID 33 validation outcome.
+
+### Review
+- Impact analysis:
+  - `frontend/src/pages/RadarPage.jsx:RadarPage` risk `LOW`.
+  - `frontend/src/utils/radarSync.js:formatOperationalBlocker` risk `LOW`.
+- Frontend changes (no backend policy/threshold changes):
+  - Added helper exports in `frontend/src/utils/radarSync.js`:
+    - `classifyResidualDiagnosticRow(row)`
+    - `summarizeResidualDiagnostics(observations, df11Dots)`
+  - Updated `RadarPage` residual view:
+    - default emphasis now starts with classifier-input rows (`sync-fit only` view default),
+    - DF11 residual dots are explicitly diagnostic-only in legend and rendered muted,
+    - burst points now visually accent Stage 8 family role (dominant/secondary/outlier),
+    - per-point tooltips include classifier/sync/fit/family/exclusion/residual/Stage 8 fields,
+    - compact summary line added for classifier inputs, chart-only diagnostics, DF11 early/late diagnostics, Stage 8 state/reason, family counts,
+    - explicit disclaimer added: DF11 early/late bands are diagnostic-only and not Stage 8 classifier inputs.
+- Tests:
+  - `node --test frontend/src/utils/radarSync.test.js` passed.
+  - `cd frontend && npm run build` passed.
+- IID 33 validation target:
+  - UI now directly labels/segregates DF11 early/late rows as diagnostic-only and no longer presents them as equivalent to classifier-input burst-fit rows.
+  - Summary text keys Stage 8 status to row fields (`insufficient_data` from IID 33 capture artifacts) and avoids contamination implication when state is not contaminated.
 - [x] Remove lossy `or`-style fallback behavior for zero/false preservation via explicit `None`-aware selection.
 - [x] Add extraction tests with representative fixture shapes, including zero/non-zero counters and false/empty-string values.
 - [x] Re-run exact 10-minute compact baseline and verify acceptance checks on non-active blocker attribution and go-runtime active consistency.
@@ -318,3 +383,38 @@
 - Implemented rolling sync-convergence event history recorder and API endpoint.
 - Added targeted sweep/API tests for core event capture, holdover enter/exit, max-length cap, and endpoint filtering/order.
 - Completed 600s live capture on IIDs 20/42/52/72/40 and produced per-IID event-pattern summary in terminal report.
+
+## 2026-05-22 Radar-core defunct child handling + Stage 8 runtime health hardening
+
+- [ ] Run impact analysis for radar-core manager/status symbols before edits and report blast radius.
+- [ ] Trace backend-managed radar-core spawn/monitor/shutdown path (worker/client/main/status), including reap/wait behavior and socket failure path.
+- [ ] Implement zombie-safe process state handling: reap exited child, clear stale handle, publish explicit running/defunct/exit state.
+- [ ] Extend `/api/status` config/runtime fields with contamination/go-refiner/radar-core runtime flags and compatibility-safe keys.
+- [ ] Add backend tests for child exit/reap status semantics and new status flags.
+- [ ] Restart backend and verify runtime identity (single listener, radar-core running/non-defunct or explicit unavailable).
+- [ ] Re-run 10-15 minute Stage 8 default-on capture and compare contamination distribution + go-active dwell to previous run.
+- [ ] Update review summary in `tasks/todo.md`.
+
+### Review
+- Investigated backend-managed radar-core lifecycle: process exits were detectable but not explicitly normalized into runtime health fields.
+- Implemented worker-side exited-process normalization in `RadarCoreWorker.stats()` path: exited child is marked `state=exited`, handle cleared, and runtime `last_error` populated with exit/stderr context.
+- Added worker health fields (`running`, `defunct`) and surfaced explicit runtime keys in `/api/status` for contamination/go-refiner/radar-core operational flags and radar-core runtime status.
+- Added tests: exited worker process reports non-running/exited state; `/api/status` exposes new config/runtime fields while retaining legacy keys.
+- Re-ran Stage 8 900s capture on patched runtime and produced post-fix artifacts for comparison.
+
+
+
+## 2026-05-22 Radar-core exit=2 investigation and runtime stabilization
+
+- [x] Capture runtime failure details (status/logs/socket/cmd/user/permissions).
+- [x] Reproduce radar-core manually and under backend-managed runtime.
+- [x] Harden backend worker lifecycle/status reporting and stderr capture.
+- [x] Fix radar-core concurrency/lifecycle defects causing runtime exit=2.
+- [x] Add/update tests for worker lifecycle idempotency/stale socket and status fields.
+- [x] Rebuild radar-core and rerun 10–15 minute Stage 8 validation capture.
+
+### Review
+- Root symptom reproduced under managed runtime: radar-core intermittently exited with code 2 after several minutes.
+- Added backend lifecycle diagnostics and full status exposure so failures are explicit (`radar_core_running/pid/connected/last_error`).
+- Hardened radar-core main shutdown signal path and synchronized shared map access across ingest/ticker goroutines (`builders`, `states`, `accumulators`, `revisions`) to prevent runtime concurrency panics.
+- Final 900s validation window (`...radarcore_fixed_r3...`) completed with radar-core still running/connected at window end.
