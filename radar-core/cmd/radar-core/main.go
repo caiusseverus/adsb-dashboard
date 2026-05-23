@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -67,10 +68,18 @@ func main() {
 	stop := make(chan struct{})
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigs)
+	var stopOnce sync.Once
+	requestStop := func(reason string, attrs ...any) {
+		stopOnce.Do(func() {
+			slog.Info("radar-core: shutting down", append([]any{"reason", reason}, attrs...)...)
+			close(stop)
+		})
+	}
 	go func() {
-		sig := <-sigs
-		slog.Info("radar-core: shutting down", "signal", sig)
-		close(stop)
+		for sig := range sigs {
+			requestStop("signal", "signal", sig)
+		}
 	}()
 
 	go engine.runRotationTicker(stop)
@@ -96,6 +105,7 @@ func envDebugEnabled(key string) bool {
 // engine wires the ingest, burst, output, IID state, position cache, and
 // frame accumulator stages.
 type engine struct {
+	mapMu        sync.RWMutex
 	writer       *output.Writer
 	builders     map[uint8]*burst.Builder     // per IID; only accessed from the ingest goroutine
 	states       map[uint8]*iid.IIDState      // per IID; thread-safe via IIDState.mu
@@ -141,10 +151,10 @@ func (e *engine) handlers() ingest.Handlers {
 	}
 }
 
-// onRadarEvent is called from the ingest goroutine — no lock needed for builders/states maps.
 func (e *engine) onRadarEvent(msg *protocol.RadarEvent) {
 	e.eventsIn.Add(1)
 
+	e.mapMu.Lock()
 	b, ok := e.builders[msg.IID]
 	if !ok {
 		b = burst.NewBuilder(msg.IID)
@@ -170,6 +180,7 @@ func (e *engine) onRadarEvent(msg *protocol.RadarEvent) {
 		}
 		e.accumulators[msg.IID] = acc
 	}
+	e.mapMu.Unlock()
 
 	var sigPtr *float64
 	if msg.SignalDBFS != nil {
@@ -312,7 +323,10 @@ func (e *engine) computeSyncPopulationDiagnostics(s *iid.IIDState, refICAO uint3
 	if stateSnap.BurstRecordsICAOs > len(seenRaw) {
 		diag.excludedOutsideWindow = stateSnap.BurstRecordsICAOs - len(seenRaw)
 	}
-	if acc, ok := e.accumulators[s.IID]; ok {
+	e.mapMu.RLock()
+	acc, ok := e.accumulators[s.IID]
+	e.mapMu.RUnlock()
+	if ok {
 		accDiag := acc.Diagnostics()
 		diag.frameObservationCount = accDiag.OpenFrameNObs
 	}
@@ -331,7 +345,10 @@ func (e *engine) maybeObserveRefinementResidual(s *iid.IIDState, f *burst.FiredB
 	observedBearingDeg := bearingDeg(cfg.ReceiverLat, cfg.ReceiverLon, pos.Lat, pos.Lon)
 	refPosAgeS := time.Since(pos.TS).Seconds()
 	nAircraft := 1
-	if b, ok := e.builders[s.IID]; ok {
+	e.mapMu.RLock()
+	b, ok := e.builders[s.IID]
+	e.mapMu.RUnlock()
+	if ok {
 		nAircraft = b.ActiveICAOs()
 	}
 	dominantFamily := false
@@ -531,11 +548,13 @@ func (e *engine) onConfigUpdate(msg *protocol.ConfigUpdate) {
 			return
 		}
 		iidNum := uint8(parsed)
+		e.mapMu.Lock()
 		s, ok := e.states[iidNum]
 		if !ok {
 			s = iid.NewIIDState(iidNum)
 			e.states[iidNum] = s
 		}
+		e.mapMu.Unlock()
 		s.SetBasePeriod(period)
 		e.emitIIDState(iidNum, s, 0)
 		slog.Info("radar-core: IID DF base period updated", "iid", iidNum, "base_period_s", period)
@@ -579,12 +598,15 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 	defer func() {
 		e.profiler.Observe("snapshot_export", time.Since(tSnapshot))
 	}()
+	e.mapMu.RLock()
+	activeIIDs := len(e.builders)
+	e.mapMu.RUnlock()
 	payload := map[string]interface{}{
 		"uptime_s":       time.Since(e.start).Seconds(),
 		"events_in":      e.eventsIn.Load(),
 		"bursts_fired":   e.burstsFired.Load(),
 		"frames_emitted": e.framesEmitted.Load(),
-		"active_iids":    len(e.builders),
+		"active_iids":    activeIIDs,
 	}
 	if scope == "health" {
 		return payload
@@ -601,7 +623,18 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 
 	iidsPayload := map[string]interface{}{}
 	stableIIDs := map[string]rcexport.IIDSnapshot{}
+	e.mapMu.RLock()
+	states := make(map[uint8]*iid.IIDState, len(e.states))
 	for iidNum, s := range e.states {
+		states[iidNum] = s
+	}
+	accumulators := make(map[uint8]*frame.Accumulator, len(e.accumulators))
+	for iidNum, acc := range e.accumulators {
+		accumulators[iidNum] = acc
+	}
+	e.mapMu.RUnlock()
+
+	for iidNum, s := range states {
 		if targetIID != nil && iidNum != *targetIID {
 			continue
 		}
@@ -925,7 +958,7 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 			RetainedBurstSpan: snap.BurstRecordsRetainedSpanS,
 		}
 
-		if acc, ok := e.accumulators[iidNum]; ok {
+		if acc, ok := accumulators[iidNum]; ok {
 			accDiag := acc.Diagnostics()
 			iidPayload["frame_accumulator"] = map[string]interface{}{
 				"completed_frames":                accDiag.FrameIndex,
@@ -1025,13 +1058,18 @@ func (e *engine) buildSnapshotPayload(scope string) map[string]interface{} {
 }
 
 func (e *engine) onResetIID(msg *protocol.ResetIID) {
-	if b, ok := e.builders[msg.IID]; ok {
+	e.mapMu.RLock()
+	b, bOK := e.builders[msg.IID]
+	s, sOK := e.states[msg.IID]
+	a, aOK := e.accumulators[msg.IID]
+	e.mapMu.RUnlock()
+	if bOK {
 		b.Reset()
 	}
-	if s, ok := e.states[msg.IID]; ok {
+	if sOK {
 		s.Reset()
 	}
-	if a, ok := e.accumulators[msg.IID]; ok {
+	if aOK {
 		a.Reset()
 	}
 	e.fmState.Reset(msg.IID)
@@ -1047,8 +1085,10 @@ func minInt(a, b int) int {
 }
 
 func (e *engine) emitIIDState(iidNum uint8, s *iid.IIDState, nBurstRecords uint16) {
+	e.mapMu.Lock()
 	e.revisions[iidNum]++
 	rev := e.revisions[iidNum]
+	e.mapMu.Unlock()
 
 	status, periodS, rpm, _ := s.Snapshot()
 	syncQuality, refICAO := s.SyncSnapshot()
@@ -1868,7 +1908,14 @@ func (e *engine) runRotationTicker(stop <-chan struct{}) {
 }
 
 func (e *engine) analyseAllIIDs() {
+	e.mapMu.RLock()
+	states := make(map[uint8]*iid.IIDState, len(e.states))
 	for iidNum, s := range e.states {
+		states[iidNum] = s
+	}
+	e.mapMu.RUnlock()
+
+	for iidNum, s := range states {
 		records := s.TakeIfDirty()
 		if records == nil {
 			continue
@@ -1898,13 +1945,16 @@ func (e *engine) runHealthTicker(stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
+			e.mapMu.RLock()
+			activeIIDs := len(e.builders)
+			e.mapMu.RUnlock()
 			e.writer.SendHealth(&protocol.Health{
 				MsgType:       protocol.MsgHealth,
 				UptimeS:       time.Since(e.start).Seconds(),
 				EventsIn:      e.eventsIn.Load(),
 				BurstsFired:   e.burstsFired.Load(),
 				FramesEmitted: e.framesEmitted.Load(),
-				ActiveIIDs:    uint8(len(e.builders)),
+				ActiveIIDs:    uint8(activeIIDs),
 			})
 		}
 	}

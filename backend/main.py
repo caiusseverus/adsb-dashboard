@@ -367,6 +367,10 @@ def _radar_core_runtime_stats(radar_state_stats: dict | None = None) -> dict:
 
     client_stats = _radar_core_client.stats() if _radar_core_client is not None else {}
     worker_stats = _radar_core_worker.stats() if _radar_core_worker is not None else {}
+    worker_pid = worker_stats.get("pid")
+    worker_running = bool(worker_stats.get("running", False))
+    worker_defunct = bool(worker_stats.get("defunct", False))
+    worker_exit_code = worker_stats.get("exit_code")
     latest_health = client_stats.get("latest_health") or {}
     latest_snapshot = client_stats.get("latest_snapshot") or {}
     go_frames_emitted = latest_snapshot.get("frames_emitted", latest_health.get("fe"))
@@ -387,6 +391,12 @@ def _radar_core_runtime_stats(radar_state_stats: dict | None = None) -> dict:
         ),
         "socket_path": config.RADAR_CORE_SOCKET,
         "binary_path": config.RADAR_CORE_BINARY,
+        "radar_core_pid": worker_pid,
+        "radar_core_running": worker_running,
+        "radar_core_defunct": worker_defunct,
+        "radar_core_exit_code": worker_exit_code,
+        "radar_core_connected": bool(client_stats.get("connected", False)),
+        "radar_core_last_error": worker_stats.get("last_error"),
         "client_connected": bool(client_stats.get("connected", False)),
         "events_sent_to_worker": int(client_stats.get("events_sent", 0)),
         "position_updates_sent_to_worker": int(client_stats.get("position_updates_sent", 0)),

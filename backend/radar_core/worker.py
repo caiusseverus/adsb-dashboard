@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -25,6 +26,25 @@ def _socket_is_listening(socket_path: str, timeout_s: float = 0.25) -> bool:
             client.close()
         except OSError:
             pass
+
+
+def _pid_is_defunct(pid: int | None) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        st = os.stat(f"/proc/{pid}")
+    except OSError:
+        return False
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as f:
+            fields = f.read().split()
+    except OSError:
+        return False
+    if len(fields) < 3:
+        return False
+    return fields[2] == "Z"
 
 
 class RadarCoreWorker:
@@ -63,6 +83,35 @@ class RadarCoreWorker:
         self._socket_ready_thread: threading.Thread | None = None
         self._socket_ready_stop = threading.Event()
 
+    @staticmethod
+    def _stderr_summary(lines: list[str], max_lines: int = 6) -> str | None:
+        if not lines:
+            return None
+        filtered = [ln for ln in lines if ln]
+        if not filtered:
+            return None
+        if len(filtered) <= max_lines * 2:
+            return " | ".join(filtered)
+        head = filtered[:max_lines]
+        tail = filtered[-max_lines:]
+        return " | ".join(head + ["..."] + tail)
+
+    def _update_process_state_locked(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        exit_code = process.poll()
+        if exit_code is None:
+            return
+        stderr_hint = self._stderr_summary(list(self._stderr_tail))
+        if self._state in {"running", "launching"}:
+            self._state = "exited"
+        if self._last_error is None:
+            base = f"radar-core exited (exit={exit_code})"
+            self._last_error = f"{base}; stderr={stderr_hint}" if stderr_hint else base
+        self._started_by_backend = False
+        self._process = None
+
     def _start_socket_ready_prober(self) -> None:
         """Start a daemon thread that probes socket_ready every 2s into a cache."""
         def _probe_loop() -> None:
@@ -76,6 +125,10 @@ class RadarCoreWorker:
     def start(self) -> bool:
         """Start worker in managed mode, or wait for external readiness."""
         with self._lock:
+            self._update_process_state_locked()
+            if self._process is not None and self._process.poll() is None:
+                self._state = "running"
+                return True
             self._last_error = None
             self._state = "starting"
             self._started_by_backend = False
@@ -120,6 +173,7 @@ class RadarCoreWorker:
 
     def stats(self) -> dict:
         with self._lock:
+            self._update_process_state_locked()
             process = self._process
             state = self._state
             started_by_backend = self._started_by_backend
@@ -129,6 +183,7 @@ class RadarCoreWorker:
 
         pid = process.pid if process is not None else None
         exit_code = process.poll() if process is not None else None
+        defunct = _pid_is_defunct(pid)
         socket_exists = os.path.exists(self._socket_path)
         socket_ready = self._socket_ready_cache  # updated by background prober; never blocks
 
@@ -142,6 +197,8 @@ class RadarCoreWorker:
             "socket_exists": socket_exists,
             "socket_ready": socket_ready,
             "pid": pid,
+            "running": bool(pid is not None and exit_code is None and not defunct),
+            "defunct": defunct,
             "exit_code": exit_code,
             "startup_timeout_s": self._startup_timeout_s,
             "last_error": last_error,
@@ -230,7 +287,7 @@ class RadarCoreWorker:
                 return True
             exit_code = process.poll()
             if exit_code is not None:
-                stderr_hint = self.stats().get("last_stderr")
+                stderr_hint = self._stderr_summary(list(self._stderr_tail))
                 with self._lock:
                     self._state = "error"
                     base = f"radar-core exited before readiness (exit={exit_code})"
@@ -244,7 +301,7 @@ class RadarCoreWorker:
                 f"radar-core socket did not become ready at {self._socket_path!r} "
                 f"within {self._startup_timeout_s:.1f}s"
             )
-            stderr_hint = self._stderr_tail[-1] if self._stderr_tail else None
+            stderr_hint = self._stderr_summary(list(self._stderr_tail))
             self._last_error = f"{base}; stderr={stderr_hint}" if stderr_hint else base
         self._terminate_process(process)
         return False

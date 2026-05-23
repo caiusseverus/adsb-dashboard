@@ -1448,6 +1448,33 @@ async def get_iid_sync_snapshot(
         )
 
 
+@router.get("/iids/{iid}/sync-event-history")
+async def get_iid_sync_event_history(
+    iid: int,
+    limit: int = Query(default=50, ge=1, le=500),
+    event_type: str | None = Query(default=None),
+    since_s: float | None = Query(default=None, gt=0.0, le=3600.0 * 24.0),
+):
+    """Return rolling convergence-relevant sync events for one IID."""
+    if _state is None:
+        return {"iid": iid, "available": False, "reason": "radar module not initialised", "events": []}
+    events = _state.get_sync_event_history(
+        iid,
+        limit=limit,
+        event_type=event_type,
+        since_s=since_s,
+    )
+    return {
+        "iid": iid,
+        "available": True,
+        "limit": limit,
+        "event_type": event_type,
+        "since_s": since_s,
+        "count": len(events),
+        "events": events,
+    }
+
+
 @router.get("/iids/{iid}/chart-history")
 async def get_iid_chart_history(
     iid: int,

@@ -189,6 +189,15 @@ class LiveSyncState:
     contamination_secondary_icaos: int = 0
     contamination_family_separation_deg: float | None = None
     contamination_secondary_support_ratio: float | None = None
+    contamination_family_count: int = 0
+    contamination_confidence: float | None = None
+    contamination_dominant_family_id: str | None = None
+    contamination_secondary_family_id: str | None = None
+    contamination_primary_icaos: int = 0
+    contamination_primary_spread_deg: float | None = None
+    contamination_secondary_spread_deg: float | None = None
+    contamination_inlier_count: int = 0
+    contamination_outlier_count: int = 0
     phase_blocking_gate: str | None = None
     phase_blocking_reason: str | None = None
     blocking_gate: str | None = None

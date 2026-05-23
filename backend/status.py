@@ -102,6 +102,10 @@ async def get_status() -> dict:
     return {
         "config": {
             "runtime_git_sha":            RUNTIME_GIT_SHA,
+            "RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED": _config.RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED,
+            "RADAR_SYNC_GO_REFINER_OPERATIONAL": _config.RADAR_SYNC_GO_REFINER_OPERATIONAL,
+            "RADAR_CORE_ENABLED": _config.RADAR_CORE_ENABLED,
+            "RADAR_CORE_MANAGED": _config.RADAR_CORE_MANAGED,
             "minute_stats_retention_days": _config.MINUTE_STATS_RETENTION_DAYS,
             "coverage_retention_days":     90,
             "acas_retention_days":         90,
@@ -139,6 +143,15 @@ async def get_status() -> dict:
             "client_queue_depths": runtime.get("ws_client_queue_depths", []),
         },
         "radar_core": runtime.get("radar_core", {}),
+        "runtime": {
+            "radar_core_pid": runtime.get("radar_core", {}).get("radar_core_pid"),
+            "radar_core_running": runtime.get("radar_core", {}).get("radar_core_running"),
+            "radar_core_defunct": runtime.get("radar_core", {}).get("radar_core_defunct"),
+            "radar_core_exit_code": runtime.get("radar_core", {}).get("radar_core_exit_code"),
+            "radar_core_socket_path": runtime.get("radar_core", {}).get("socket_path") or _config.RADAR_CORE_SOCKET,
+            "radar_core_connected": runtime.get("radar_core", {}).get("radar_core_connected"),
+            "radar_core_last_error": runtime.get("radar_core", {}).get("radar_core_last_error"),
+        },
         "in_memory_state": {
             "aircraft_state": runtime.get("aircraft_state", {}),
             "cast":           runtime.get("cast", {}),

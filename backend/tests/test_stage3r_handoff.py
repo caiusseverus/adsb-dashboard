@@ -291,28 +291,44 @@ def test_period_stability_gate_insufficient_when_no_history():
 # 5. Stage 8 contamination detection — flag-disabled baseline
 # ===========================================================================
 
-def test_contamination_flag_disabled_emits_typed_stage8_stub(monkeypatch):
-    """When RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED=False, gate emits typed Stage-8 stub."""
+def test_contamination_flag_disabled_nonblocking_even_if_detected(monkeypatch):
+    """With flag disabled, contaminated diagnosis is preserved but gate is non-blocking."""
     import config as _cfg
+    state = _setup_contamination_test(monkeypatch, 3001)
     monkeypatch.setattr(_cfg, "RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED", False)
-    state = _make_state_with_python_model(3001)
+    events = []
+    for icao in ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD"]:
+        for r in [-2.0, -0.5, 0.5, 2.0]:
+            events.append((icao, r))
+    for icao in ["EEEEEE", "FFFFFF"]:
+        for r in [58.0, 59.0, 61.0, 62.0]:
+            events.append((icao, r))
+    _inject_burst_residual_events(state, 3001, events)
     state.update_go_iid_state(_go_sync_for_gates(3001, 4.0))
     go_gates = state._evaluate_go_readiness_gates_locked(3001, 4.0)
     contamination_gate = go_gates["gates"].get("go_contamination_state", {})
-    assert contamination_gate.get("reason") == "stage8_not_available_stub"
+    assert contamination_gate.get("reason") == "contamination_detected_nonblocking_flag_disabled"
     assert contamination_gate.get("passed") is None
 
 
-def test_contamination_flag_disabled_sync_has_typed_state(monkeypatch):
-    """When flag disabled, LiveSyncState stores typed non-operative contamination state."""
+def test_contamination_flag_disabled_sync_retains_detected_state(monkeypatch):
+    """When flag disabled, contamination diagnosis still populates sync state fields."""
     import config as _cfg
-    monkeypatch.setattr(_cfg, "RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED", False)
     state = _make_state_with_python_model(3002)
+    monkeypatch.setattr(_cfg, "RADAR_SYNC_CONTAMINATION_DETECTION_ENABLED", False)
+    events = []
+    for icao in ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD"]:
+        for r in [-2.0, -0.5, 0.5, 2.0]:
+            events.append((icao, r))
+    for icao in ["EEEEEE", "FFFFFF"]:
+        for r in [58.0, 59.0, 61.0, 62.0]:
+            events.append((icao, r))
+    _inject_burst_residual_events(state, 3002, events)
     state.update_go_iid_state(_go_sync_for_gates(3002, 4.0))
     state._evaluate_go_readiness_gates_locked(3002, 4.0)
     sync = state.get_live_sync_state(3002)
-    assert sync.contamination_state == "insufficient_data"
-    assert sync.contamination_reason == "stage8_not_available_stub"
+    assert sync.contamination_state == "contaminated"
+    assert "secondary_family_detected" in str(sync.contamination_reason)
 
 
 def test_contamination_disabled_nonblocking_for_authority():
@@ -599,7 +615,7 @@ def test_snapshot_exposes_contamination_state(monkeypatch):
     payload = sweep._live_sync_state_to_dict(state.get_live_sync_state(6002))
     assert "contamination_state" in payload
     assert payload["contamination_state"] != "not_evaluated"
-    assert payload["contamination_state"] in ("single_family", "insufficient_data", "disabled")
+    assert payload["contamination_state"] in ("single_family", "insufficient_data", "contaminated")
 
 
 def test_snapshot_exposes_slope_trend_state(monkeypatch):
@@ -1028,6 +1044,15 @@ def test_contamination_diagnostic_fields_in_snapshot(monkeypatch):
     assert payload["contamination_family_separation_deg"] >= 25.0
     assert payload["contamination_secondary_support_ratio"] is not None
     assert payload["contamination_secondary_support_ratio"] >= 0.25
+    assert payload["contamination_family_count"] == 2
+    assert payload["contamination_confidence"] is not None
+    assert payload["contamination_dominant_family_id"] == "primary"
+    assert payload["contamination_secondary_family_id"] == "secondary"
+    assert payload["contamination_primary_icaos"] >= 1
+    assert payload["contamination_primary_spread_deg"] is not None
+    assert payload["contamination_secondary_spread_deg"] is not None
+    assert payload["contamination_inlier_count"] >= payload["contamination_primary_observations"]
+    assert payload["contamination_outlier_count"] >= 0
 
 
 def test_incoherent_secondary_no_contamination(monkeypatch):
@@ -1045,3 +1070,46 @@ def test_incoherent_secondary_no_contamination(monkeypatch):
     _inject_burst_residual_events(state, 9108, events)
     result = state._detect_contamination_locked(9108)
     assert result["state"] in ("single_family", "insufficient_data")
+
+
+def test_wrap_boundary_clusters_treated_as_single_family(monkeypatch):
+    """Clusters near +175 and -175 are circularly close and must not false-positive."""
+    state = _setup_contamination_test(monkeypatch, 9109)
+    events = []
+    for icao in ["AAAAAA", "BBBBBB", "CCCCCC"]:
+        for r in [174.0, 176.0, -176.0, -174.0]:
+            events.append((icao, r))
+    for icao in ["DDDDDD", "EEEEEE"]:
+        for r in [175.0, -175.0, 173.5, -173.5]:
+            events.append((icao, r))
+    _inject_burst_residual_events(state, 9109, events)
+    result = state._detect_contamination_locked(9109)
+    assert result["state"] != "contaminated"
+
+
+def test_weak_secondary_family_not_contaminated(monkeypatch):
+    """Secondary family below support threshold remains non-blocking."""
+    state = _setup_contamination_test(monkeypatch, 9110)
+    events = []
+    for icao in ["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD", "EEEEEE"]:
+        for r in [-2.0, -0.5, 0.5, 2.0]:
+            events.append((icao, r))
+    # Secondary family too weak: only one ICAO with two observations.
+    events.extend([("FFFFFF", 80.0), ("FFFFFF", 82.0)])
+    _inject_burst_residual_events(state, 9110, events)
+    result = state._detect_contamination_locked(9110)
+    assert result["state"] in {"single_family", "insufficient_data"}
+
+
+def test_diffuse_noise_not_forced_to_contaminated(monkeypatch):
+    """Broad diffuse noise without stable secondary family should not false-positive."""
+    state = _setup_contamination_test(monkeypatch, 9111)
+    events = []
+    # Wide spread with no coherent secondary centroid.
+    noise = [-160.0, -120.0, -80.0, -40.0, 0.0, 40.0, 80.0, 120.0, 160.0]
+    for idx, icao in enumerate(["AAAAAA", "BBBBBB", "CCCCCC", "DDDDDD", "EEEEEE", "FFFFFF"]):
+        for r in noise[idx:idx + 4]:
+            events.append((icao, r))
+    _inject_burst_residual_events(state, 9111, events)
+    result = state._detect_contamination_locked(9111)
+    assert result["state"] in {"single_family", "insufficient_data"}

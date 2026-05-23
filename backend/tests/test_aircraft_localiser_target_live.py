@@ -360,6 +360,27 @@ def test_geographic_absolute_phase_is_accepted_for_live_observation_selection():
     assert sel["per_radar_decisions"][1]["phase_absolute_used"] is True
 
 
+def test_geographic_manual_phase_acceptance_exposes_authority_diagnostics():
+    now = __import__("time").time()
+    models = {1: _radar_iid(lat=51.05, lon=-1.05)}
+    syncs = {1: _sync(1, source="multi_aircraft_burst", phase_anchor_status="selected", phase_anchor_icao="A1")}
+    syncs[1].phase_basis = "geographic"
+    syncs[1].phase_is_absolute = True
+    syncs[1].phase_authority = "geographic_manual"
+    syncs[1].phase_offset_geographic_deg = 55.0
+    syncs[1].localisation_safe_phase = True
+    syncs[1].localisation_safe_phase_reason = "ok"
+    det_by_icao = {"ABC": [_det(1, "ABC", now - 0.2)]}
+    loc = _make_localiser(FakeRadarStateAllAuthoritative(models, syncs, det_by_icao))
+    sel = loc.select_authoritative_observations("ABC", None, now)
+    assert 1 not in sel["per_radar_reasons"]
+    decision = sel["per_radar_decisions"][1]
+    assert decision["phase_authority_used"] == "geographic_manual"
+    assert decision["phase_basis_used"] == "geographic"
+    assert decision["phase_absolute_used"] is True
+    assert decision["localisation_safe_phase"] is True
+
+
 def test_geographic_phase_rejected_when_localisation_safe_false():
     now = __import__("time").time()
     models = {1: _radar_iid(lat=51.05, lon=-1.05)}

@@ -165,3 +165,11 @@ def test_residual_family_capture_includes_required_fields_and_caps(tmp_path, mon
         "period_authority", "sync_authority", "source_path",
     ):
         assert key in row
+    for key in (
+        "event_time_basis", "residual_basis", "residual_basis_period_s",
+        "residual_basis_phase_offset_deg", "residual_basis_authority",
+        "phase_authority", "hard_reject_reason", "soft_reason",
+        "sync_revision", "sync_seq", "reference_icao", "anchor_icao",
+        "anchor_status", "anchor_trust", "dominant_family_id", "secondary_family_id",
+    ):
+        assert key in row

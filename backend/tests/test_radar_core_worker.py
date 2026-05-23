@@ -1,5 +1,7 @@
 import os
 import socket
+import subprocess
+import sys
 import textwrap
 
 from radar_core.worker import RadarCoreWorker
@@ -111,3 +113,72 @@ def test_radar_core_worker_reports_missing_binary(tmp_path):
     stats = worker.stats()
     assert stats["state"] == "error"
     assert "not found" in (stats["last_error"] or "")
+
+
+def test_radar_core_worker_removes_stale_socket_file(tmp_path):
+    fake_bin = tmp_path / "fake-radar-core"
+    sock_path = tmp_path / "run" / "radar-core.sock"
+    _write_fake_radar_core(str(fake_bin))
+    sock_path.parent.mkdir(parents=True, exist_ok=True)
+    sock_path.write_text("stale", encoding="utf-8")
+
+    worker = RadarCoreWorker(
+        binary_path=str(fake_bin),
+        socket_path=str(sock_path),
+        managed=True,
+        startup_timeout_s=3.0,
+    )
+
+    assert worker.start() is True
+    stats = worker.stats()
+    assert stats["running"] is True
+    assert stats["socket_exists"] is True
+    worker.stop()
+
+
+def test_radar_core_worker_start_is_idempotent_while_running(tmp_path):
+    fake_bin = tmp_path / "fake-radar-core"
+    sock_path = tmp_path / "run" / "radar-core.sock"
+    _write_fake_radar_core(str(fake_bin))
+
+    worker = RadarCoreWorker(
+        binary_path=str(fake_bin),
+        socket_path=str(sock_path),
+        managed=True,
+        startup_timeout_s=3.0,
+    )
+
+    assert worker.start() is True
+    first = worker.stats()
+    assert first["pid"] is not None
+
+    assert worker.start() is True
+    second = worker.stats()
+    assert second["pid"] == first["pid"]
+    assert second["running"] is True
+
+    worker.stop()
+
+
+def test_radar_core_worker_marks_exited_process_not_running(tmp_path):
+    sock_path = tmp_path / "run" / "radar-core.sock"
+    worker = RadarCoreWorker(
+        binary_path=sys.executable,
+        socket_path=str(sock_path),
+        managed=True,
+        startup_timeout_s=0.5,
+    )
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=2.0)
+    worker._process = proc
+    worker._started_by_backend = True
+    worker._state = "running"
+
+    stats = worker.stats()
+    assert stats["running"] is False
+    assert stats["exit_code"] is None
+    assert stats["pid"] is None
+    assert stats["state"] == "exited"
+    assert "exit=0" in (stats["last_error"] or "")
+    assert worker.stats()["started_by_backend"] is False
