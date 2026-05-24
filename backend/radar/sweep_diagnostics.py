@@ -16,6 +16,10 @@ except Exception:  # pragma: no cover
     RADAR_SYNC_MOTION_COMP_PHASE_ENABLED = True
     RADAR_SYNC_PROP_DELAY_ENABLED = True
 
+_DF11_VERIFY_MEDIUM_SAMPLE_COUNT = 30
+_DF11_VERIFY_HIGH_SAMPLE_COUNT = 100
+_DF11_VERIFY_TIE_EPSILON_SCORE = 1.0
+
 if TYPE_CHECKING:
     pass
 
@@ -489,6 +493,188 @@ def build_df11_residual_observations(
             "residual_source": "df11",
         })
     return results
+
+
+def _finite_residuals(rows: list[dict]) -> list[float]:
+    residuals: list[float] = []
+    for row in rows or []:
+        value = row.get("residual_deg")
+        try:
+            residual = float(value)
+        except (TypeError, ValueError):
+            continue
+        if _math.isfinite(residual):
+            residuals.append(residual)
+    return residuals
+
+
+def _quantile_abs(values: list[float], q: float) -> float | None:
+    clean = sorted(abs(v) for v in values if _math.isfinite(v))
+    if not clean:
+        return None
+    if len(clean) == 1:
+        return clean[0]
+    pos = (len(clean) - 1) * q
+    lo = int(_math.floor(pos))
+    hi = int(_math.ceil(pos))
+    if lo == hi:
+        return clean[lo]
+    frac = pos - lo
+    return clean[lo] + (clean[hi] - clean[lo]) * frac
+
+
+def _circular_mean_deg(values: list[float]) -> float | None:
+    if not values:
+        return None
+    sin_sum = sum(_math.sin(_math.radians(v)) for v in values)
+    cos_sum = sum(_math.cos(_math.radians(v)) for v in values)
+    if abs(sin_sum) < 1e-12 and abs(cos_sum) < 1e-12:
+        return None
+    return (_math.degrees(_math.atan2(sin_sum, cos_sum)) + 360.0) % 360.0
+
+
+def _circular_delta_deg(a: float, b: float) -> float:
+    return (a - b + 540.0) % 360.0 - 180.0
+
+
+def _residual_spread_deg(values: list[float]) -> float | None:
+    mean = _circular_mean_deg(values)
+    if mean is None or not values:
+        return None
+    return sum(abs(_circular_delta_deg(v, mean)) for v in values) / len(values)
+
+
+def summarise_df11_alignment(rows: list[dict], on_time_threshold_deg: float) -> dict:
+    residuals = _finite_residuals(rows)
+    on_time = early = late = 0
+    for residual in residuals:
+        abs_res = abs(residual)
+        if abs_res <= on_time_threshold_deg:
+            on_time += 1
+        elif residual > 0:
+            early += 1
+        else:
+            late += 1
+    spread = _residual_spread_deg(residuals)
+    p50 = _quantile_abs(residuals, 0.50)
+    p95 = _quantile_abs(residuals, 0.95)
+    p99 = _quantile_abs(residuals, 0.99)
+    # Lower is better. Weight tails and circular scatter so a low median cannot
+    # hide a visibly wandering beam line.
+    score_parts = [v for v in (p50, p95, spread) if v is not None]
+    score = None
+    if score_parts:
+        score = (p50 or 0.0) + (p95 or 0.0) + (spread or 0.0)
+    return {
+        "sample_count": len(residuals),
+        "on_time_count": on_time,
+        "early_count": early,
+        "late_count": late,
+        "residual_abs_p50_deg": p50,
+        "residual_abs_p95_deg": p95,
+        "residual_abs_p99_deg": p99,
+        "residual_spread_deg": spread,
+        "circular_spread_deg": spread,
+        "jitter_estimate_deg": p95,
+        "alignment_score": score,
+    }
+
+
+def _df11_event_key(row: dict) -> tuple[object, object, object]:
+    return (
+        row.get("event_id"),
+        row.get("icao"),
+        row.get("arrival_beast_us") or row.get("raw_arrival_us") or row.get("beam_center_us"),
+    )
+
+
+def _same_event_rows(base_rows: list[dict], refined_rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    base_by_key = {
+        _df11_event_key(row): row
+        for row in base_rows or []
+        if _df11_event_key(row)[1] is not None and _df11_event_key(row)[2] is not None
+    }
+    refined_by_key = {
+        _df11_event_key(row): row
+        for row in refined_rows or []
+        if _df11_event_key(row)[1] is not None and _df11_event_key(row)[2] is not None
+    }
+    common = sorted(base_by_key.keys() & refined_by_key.keys(), key=lambda key: str(key))
+    return [base_by_key[key] for key in common], [refined_by_key[key] for key in common]
+
+
+def build_df11_shadow_verification_payload(
+    *,
+    base_rows: list[dict] | None,
+    refined_rows: list[dict] | None,
+    window_s: float,
+    on_time_threshold_deg: float,
+) -> dict:
+    same_base_rows, same_refined_rows = _same_event_rows(base_rows or [], refined_rows or [])
+    base = summarise_df11_alignment(same_base_rows, on_time_threshold_deg)
+    refined = summarise_df11_alignment(same_refined_rows, on_time_threshold_deg)
+    base_score = base.get("alignment_score")
+    refined_score = refined.get("alignment_score")
+    sample_count = int(base.get("sample_count") or 0)
+    if not base_rows and not refined_rows:
+        reason = "no_df11_projection_rows"
+    elif not base_rows:
+        reason = "base_projection_unavailable"
+    elif not refined_rows:
+        reason = "refined_projection_unavailable"
+    elif sample_count <= 0:
+        reason = "no_common_df11_samples"
+    elif base_score is None or refined_score is None:
+        reason = "insufficient_residual_metrics"
+    else:
+        reason = "ok"
+    delta = None
+    better = None
+    if base_score is not None and refined_score is not None:
+        delta = refined_score - base_score
+        better = refined_score < base_score
+    if sample_count >= _DF11_VERIFY_HIGH_SAMPLE_COUNT:
+        confidence = "high"
+    elif sample_count >= _DF11_VERIFY_MEDIUM_SAMPLE_COUNT:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    if reason != "ok":
+        state = "unavailable" if reason in {"no_df11_projection_rows", "base_projection_unavailable", "refined_projection_unavailable"} else "insufficient_data"
+    elif sample_count < _DF11_VERIFY_MEDIUM_SAMPLE_COUNT:
+        state = "insufficient_data"
+    elif delta is None:
+        state = "insufficient_data"
+    elif abs(delta) <= _DF11_VERIFY_TIE_EPSILON_SCORE:
+        state = "tied"
+    elif delta < 0:
+        state = "refined_better"
+    else:
+        state = "refined_worse"
+    if state == "refined_worse":
+        blocker = "df11_refined_worse_than_base"
+    elif state in {"unavailable", "insufficient_data"}:
+        blocker = "df11_insufficient_verification"
+    else:
+        blocker = "none"
+    return {
+        "df11_base_alignment_score": base_score,
+        "df11_refined_alignment_score": refined_score,
+        "df11_refined_better_than_base": better,
+        "df11_refined_alignment_delta": delta,
+        "df11_refined_on_time_count": refined.get("on_time_count"),
+        "df11_base_on_time_count": base.get("on_time_count"),
+        "df11_refined_residual_spread_deg": refined.get("residual_spread_deg"),
+        "df11_base_residual_spread_deg": base.get("residual_spread_deg"),
+        "df11_verification_window_s": float(window_s),
+        "df11_verification_sample_count": sample_count,
+        "df11_verification_reason": reason,
+        "df11_verification_state": state,
+        "df11_verification_confidence": confidence,
+        "df11_verification_blocker_if_enforced": blocker,
+        "df11_base_alignment": base,
+        "df11_refined_alignment": refined,
+    }
 
 
 def go_burst_sync_timeline_snapshot(state: Any, iid: int, window_s: float) -> list["AlignedBurstSyncObs"]:

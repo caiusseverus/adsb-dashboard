@@ -20,6 +20,24 @@ def test_extract_compact_fields_and_preserve_zero_false_values():
     payload = {
         "sync_state": {
             "go_operational_enabled": True,
+            "period_authority": "go_refined",
+            "sync_authority": "go_runtime",
+            "phase_basis": "sweep_epoch_only",
+            "phase_absolute_available": False,
+            "df11_base_alignment_score": 12.0,
+            "df11_refined_alignment_score": 18.0,
+            "df11_refined_better_than_base": False,
+            "df11_refined_alignment_delta": 6.0,
+            "df11_refined_on_time_count": 3,
+            "df11_base_on_time_count": 7,
+            "df11_refined_residual_spread_deg": 8.0,
+            "df11_base_residual_spread_deg": 4.0,
+            "df11_verification_window_s": 90.0,
+            "df11_verification_sample_count": 10,
+            "df11_verification_reason": "ok",
+            "df11_verification_state": "refined_worse",
+            "df11_verification_confidence": "medium",
+            "df11_verification_blocker_if_enforced": "df11_refined_worse_than_base",
             "go_operational_active": False,
             "go_operational_ready_streak": 0,
             "go_operational_promotion_threshold": 3,
@@ -150,6 +168,24 @@ def test_extract_compact_fields_and_preserve_zero_false_values():
     row = mod.extract_compact_row(payload, iid=1, ts=123.0)
 
     assert row["go_operational_enabled"] is True
+    assert row["period_authority"] == "go_refined"
+    assert row["sync_authority"] == "go_runtime"
+    assert row["phase_basis"] == "sweep_epoch_only"
+    assert row["phase_absolute_available"] is False
+    assert row["df11_base_alignment_score"] == 12.0
+    assert row["df11_refined_alignment_score"] == 18.0
+    assert row["df11_refined_better_than_base"] is False
+    assert row["df11_refined_alignment_delta"] == 6.0
+    assert row["df11_refined_on_time_count"] == 3
+    assert row["df11_base_on_time_count"] == 7
+    assert row["df11_refined_residual_spread_deg"] == 8.0
+    assert row["df11_base_residual_spread_deg"] == 4.0
+    assert row["df11_verification_window_s"] == 90.0
+    assert row["df11_verification_sample_count"] == 10
+    assert row["df11_verification_reason"] == "ok"
+    assert row["df11_verification_state"] == "refined_worse"
+    assert row["df11_verification_confidence"] == "medium"
+    assert row["df11_verification_blocker_if_enforced"] == "df11_refined_worse_than_base"
     assert row["go_operational_active"] is False
     assert row["go_operational_ready_streak"] == 0
     assert row["go_operational_promotion_threshold"] == 3

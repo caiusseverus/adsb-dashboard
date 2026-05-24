@@ -79,6 +79,7 @@ from .sweep_diagnostics import (
     build_compact_residual_observations_from_entries as _build_compact_residual_observations_from_entries_helper,
     build_compact_sync_debug_payload as _build_compact_sync_debug_payload_helper,
     build_df11_residual_observations as _build_df11_residual_observations_helper,
+    build_df11_shadow_verification_payload as _build_df11_shadow_verification_payload_helper,
     build_display_retention_diagnostic as _build_display_retention_diagnostic_helper,
     build_live_sync_retention_diagnostics as _build_live_sync_retention_diagnostics_helper,
     build_sync_mode_diagnostics as _build_sync_mode_diagnostics_helper,
@@ -12365,6 +12366,12 @@ class RadarState:
                     "authority_label": "go_diagnostic_shadow",
                     "immutable": False,
                 })
+            sync_state_payload.update(_build_df11_shadow_verification_payload_helper(
+                base_rows=recomputed_df11_by_basis.get("compact_bootstrap"),
+                refined_rows=recomputed_df11_by_basis.get("go_runtime_diagnostic"),
+                window_s=window_s,
+                on_time_threshold_deg=_DF11_RESIDUAL_ON_TIME_THRESHOLD_DEG,
+            ))
 
             burst_sync_diagnostic = {
                 "last_multisync_ts": float(sync.last_sync_update_ts),
@@ -12726,6 +12733,12 @@ class RadarState:
                 "authority_label": "go_diagnostic_shadow",
                 "immutable": False,
             })
+        sync_state_payload.update(_build_df11_shadow_verification_payload_helper(
+            base_rows=recomputed_df11_by_basis.get("compact_bootstrap"),
+            refined_rows=recomputed_df11_by_basis.get("go_runtime_diagnostic"),
+            window_s=window_s,
+            on_time_threshold_deg=_DF11_RESIDUAL_ON_TIME_THRESHOLD_DEG,
+        ))
 
         return {
             "observations": residual_events,
@@ -12816,6 +12829,12 @@ class RadarState:
             py_shadow = self._py_shadow_sync_states.get(iid)
             authority_transitions = self._period_authority_transitions.get(iid)
             sync_horizons = self._sync_horizons_payload(sync, display_window_s=window_s)
+            latest_arrival_us_for_iid = self._iid_latest_arrival_us.get(iid)
+            df11_cutoff_us = (latest_arrival_us_for_iid or 0.0) - window_s * 1_000_000.0
+            iid_events_for_df11 = [
+                event for event in self._df11_residual_events
+                if event[0] >= df11_cutoff_us and event[1] == iid
+            ]
         finally:
             hold_s = time.perf_counter() - t_hold_start
             self._lock.release()
@@ -13043,6 +13062,52 @@ class RadarState:
         if sync_state:
             sync_state.update(slope_target_movement)
             sync_state.update(shadow_freeze_monitor)
+            base_rows = None
+            refined_rows = None
+            if sync is not None:
+                base_period_s = sync_state.get("base_period_s")
+                if _is_finite_number(base_period_s) and float(base_period_s) > 0.0:
+                    base_sync = _clone_sync_for_projection(
+                        sync,
+                        period_s=float(base_period_s),
+                        period_base_s=float(base_period_s),
+                        source=getattr(sync, "source", None),
+                        usable=True,
+                    )
+                    base_rows = self._build_df11_residual_observations(
+                        sync=base_sync,
+                        iid_events=iid_events_for_df11,
+                        latest_arrival_us=latest_arrival_us_for_iid,
+                    )
+
+                go_effective_period_s = go_sync.get("effective_period_s") or go_sync.get("period_s")
+                go_base_period_s = go_sync.get("base_period_s") or go_effective_period_s
+                if (
+                    _is_finite_number(go_effective_period_s)
+                    and _is_finite_number(go_base_period_s)
+                    and _is_finite_number(go_sync.get("phase_epoch_us"))
+                    and _is_finite_number(go_sync.get("phase_offset_deg"))
+                ):
+                    refined_sync = _clone_sync_for_projection(
+                        sync,
+                        period_s=float(go_effective_period_s),
+                        period_base_s=float(go_base_period_s),
+                        phase_epoch_us=float(go_sync["phase_epoch_us"]),
+                        phase_offset_deg=float(go_sync["phase_offset_deg"]),
+                        source="go_frame_sync",
+                        usable=True,
+                    )
+                    refined_rows = self._build_df11_residual_observations(
+                        sync=refined_sync,
+                        iid_events=iid_events_for_df11,
+                        latest_arrival_us=latest_arrival_us_for_iid,
+                    )
+            sync_state.update(_build_df11_shadow_verification_payload_helper(
+                base_rows=base_rows,
+                refined_rows=refined_rows,
+                window_s=window_s,
+                on_time_threshold_deg=_DF11_RESIDUAL_ON_TIME_THRESHOLD_DEG,
+            ))
 
         snapshot = {
             "type": "radar_sync",

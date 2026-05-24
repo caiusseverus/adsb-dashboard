@@ -4695,6 +4695,8 @@ def test_df11_residual_dots_use_retained_residual_event_history(monkeypatch):
         last_sync_update_ts=1_000.0,
         source="multi_aircraft_burst",
         usable=True,
+        period_base_s=4.0,
+        base_period_s=4.0,
     )
     state._live_burst_timeline_obs[8] = deque([
         AlignedBurstSyncObs(
@@ -4730,8 +4732,114 @@ def test_df11_residual_dots_use_retained_residual_event_history(monkeypatch):
 
     payload = state.get_burst_sync_timeline(8, window_s=300.0)
 
-    assert [event[2] for event in seen_events] == ["OLD300", "RECENT"]
+    assert [event[2] for event in seen_events[:2]] == ["OLD300", "RECENT"]
     assert [dot["icao"] for dot in payload["df11_residual_observations"]] == ["OLD300", "RECENT"]
+    assert payload["sync_state"]["df11_verification_reason"] == "refined_projection_unavailable"
+    assert payload["sync_state"]["df11_base_alignment_score"] is None
+    assert payload["sync_state"]["df11_refined_alignment_score"] is None
+
+
+def test_live_sync_snapshot_exposes_df11_shadow_verification_fields(monkeypatch):
+    state = RadarState()
+    state._models[8] = RadarIID(iid=8, status="SINGLE_RADAR", period_s=4.0)
+    state._live_sync_states[8] = LiveSyncState(
+        iid=8,
+        period_s=4.0,
+        phase_epoch_us=0.0,
+        phase_offset_deg=0.0,
+        sync_quality=1.0,
+        sync_jitter_deg=2.0,
+        last_sync_update_ts=1_000.0,
+        source="multi_aircraft_burst",
+        usable=True,
+        period_base_s=4.0,
+        base_period_s=4.0,
+    )
+    state._go_sync_states_by_iid[8] = {
+        "period_s": 4.0,
+        "effective_period_s": 4.0,
+        "base_period_s": 4.0,
+        "phase_epoch_us": 0.0,
+        "phase_offset_deg": 0.0,
+    }
+    state._df11_residual_events = deque([
+        (10_000_000.0, 8, "AAAAAA", -20.0),
+        (11_000_000.0, 8, "BBBBBB", -21.0),
+        (12_000_000.0, 8, "CCCCCC", -22.0),
+    ], maxlen=sweep._IID_EVENTS_MAX)
+    state._iid_latest_arrival_us[8] = 12_000_000.0
+
+    def fake_build_df11_residuals(**kwargs):
+        residual_deg = 2.0 if kwargs["sync"].source != "go_frame_sync" else 20.0
+        return [
+            {"icao": icao, "arrival_beast_us": arrival_us, "residual_deg": residual_deg}
+            for arrival_us, _iid, icao, _signal in kwargs["iid_events"]
+        ]
+
+    monkeypatch.setattr(state, "_build_df11_residual_observations", fake_build_df11_residuals)
+
+    snapshot = state.get_live_sync_snapshot(8, window_s=90.0, debug_limit=20)
+    sync_state = snapshot["sync_state"]
+
+    assert sync_state["df11_verification_reason"] == "ok"
+    assert sync_state["df11_verification_sample_count"] == 3
+    assert sync_state["df11_base_alignment_score"] < sync_state["df11_refined_alignment_score"]
+    assert sync_state["df11_refined_better_than_base"] is False
+    assert sync_state["df11_verification_state"] == "insufficient_data"
+    assert sync_state["df11_verification_confidence"] == "low"
+    assert sync_state["df11_verification_blocker_if_enforced"] == "df11_insufficient_verification"
+
+
+def test_df11_shadow_verification_scores_base_vs_refined_without_policy_effect():
+    payload = sweep_diagnostics.build_df11_shadow_verification_payload(
+        base_rows=[
+            {"icao": "A", "arrival_beast_us": 1.0, "residual_deg": 1.0},
+            {"icao": "B", "arrival_beast_us": 2.0, "residual_deg": -2.0},
+            {"icao": "C", "arrival_beast_us": 3.0, "residual_deg": 4.0},
+        ],
+        refined_rows=[
+            {"icao": "A", "arrival_beast_us": 1.0, "residual_deg": 10.0},
+            {"icao": "B", "arrival_beast_us": 2.0, "residual_deg": -18.0},
+            {"icao": "C", "arrival_beast_us": 3.0, "residual_deg": 24.0},
+        ],
+        window_s=90.0,
+        on_time_threshold_deg=6.0,
+    )
+
+    assert payload["df11_verification_reason"] == "ok"
+    assert payload["df11_verification_window_s"] == pytest.approx(90.0)
+    assert payload["df11_verification_sample_count"] == 3
+    assert payload["df11_base_on_time_count"] == 3
+    assert payload["df11_refined_on_time_count"] == 0
+    assert payload["df11_refined_better_than_base"] is False
+    assert payload["df11_refined_alignment_delta"] > 0
+    assert payload["df11_base_residual_spread_deg"] < payload["df11_refined_residual_spread_deg"]
+    assert payload["df11_verification_state"] == "insufficient_data"
+    assert payload["df11_verification_confidence"] == "low"
+    assert payload["df11_verification_blocker_if_enforced"] == "df11_insufficient_verification"
+
+
+def test_df11_shadow_verification_classifies_sustained_refined_worse():
+    base_rows = [
+        {"icao": f"A{i:03d}", "arrival_beast_us": float(i), "residual_deg": 2.0}
+        for i in range(40)
+    ]
+    refined_rows = [
+        {"icao": f"A{i:03d}", "arrival_beast_us": float(i), "residual_deg": 20.0}
+        for i in range(40)
+    ]
+
+    payload = sweep_diagnostics.build_df11_shadow_verification_payload(
+        base_rows=base_rows,
+        refined_rows=refined_rows,
+        window_s=90.0,
+        on_time_threshold_deg=6.0,
+    )
+
+    assert payload["df11_verification_reason"] == "ok"
+    assert payload["df11_verification_state"] == "refined_worse"
+    assert payload["df11_verification_confidence"] == "medium"
+    assert payload["df11_verification_blocker_if_enforced"] == "df11_refined_worse_than_base"
 
 
 def test_on_df11_batch_skips_burst_builder_in_radar_core_mode(monkeypatch):
